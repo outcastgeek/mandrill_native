@@ -39,6 +39,7 @@ quote = { workspace = true }
 sqlx-macros-core = { workspace = true, features = ["macros", "_rt-tokio", "sqlx-toml"] }
 sqlx-turso-core = { version = "0.1.0", path = "../sqlx_turso_core", features = ["macros"] }
 syn = { workspace = true, features = ["full", "parsing"] }
+syn-sqlx = { workspace = true, features = ["full", "parsing"] }
 
 [lints]
 workspace = true

@@ -8,12 +8,12 @@ default = []
 
 [dependencies]
 effect-macros = { path = "../effect_macros" }
-event-listener = "5.4"
+event-listener = "5.4.2"
 futures-util = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-futures-executor = "0.3.32"
+futures-executor = "0.3.34"
 
 [lints]
 workspace = true

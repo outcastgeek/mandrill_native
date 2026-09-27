@@ -102,9 +102,8 @@ fn expression(expr: &Expr, path: &TokenStream) -> TokenStream {
         let arms = expr.arms.iter().map(|arm| {
             let attrs = &arm.attrs;
             let pattern = &arm.pat;
-            let guard = arm.guard.as_ref().map(|(_, guard)| quote!(if #guard));
             let body = expression(&arm.body, path);
-            quote_spanned!(arm.span()=> #(#attrs)* #pattern #guard => { #body },)
+            quote_spanned!(arm.span()=> #(#attrs)* #pattern => { #body },)
         });
         return quote_spanned!(expr.span()=> #(#attrs)* match #value { #(#arms)* });
     }

@@ -98,7 +98,7 @@ fn expand_query(input: TokenStream2) -> TokenStream {
         Err(error) => return error.to_compile_error().into(),
     };
 
-    let input: QueryMacroInput = match syn::parse2(input) {
+    let input: QueryMacroInput = match syn_sqlx::parse2(input) {
         Ok(input) => input,
         Err(error) => return error.to_compile_error().into(),
     };

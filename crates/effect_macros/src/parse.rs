@@ -137,9 +137,9 @@ fn workflow_expression(expr: &Expr) -> syn::Result<()> {
     if let Expr::Match(expr) = expr {
         pure(&expr.expr)?;
         for arm in &expr.arms {
-            if let Some((_, guard)) = &arm.guard {
-                pure(guard)?;
-            }
+            let mut visitor = Validate { error: None };
+            visitor.visit_pat(&arm.pat);
+            visitor.error.map_or(Ok(()), Err)?;
             workflow_expression(&arm.body)?;
         }
         return Ok(());

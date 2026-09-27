@@ -30,11 +30,11 @@ impl Audit {
         };
         let presentation = presentation
             || match (self.file.to_str(), literal) {
-                (Some("packages/effect_app/src/main.rs"), syn::Lit::Str(value)) => matches!(
+                (Some("crates/effect_app/src/main.rs"), syn::Lit::Str(value)) => matches!(
                     value.value().as_str(),
                     "Input, output, and staging paths must be distinct" | "{diagnostic:?}"
                 ),
-                (Some("packages/effect_app/src/lib.rs"), syn::Lit::Str(value)) => matches!(
+                (Some("crates/effect_app/src/lib.rs"), syn::Lit::Str(value)) => matches!(
                     value.value().as_str(),
                     "{sum}"
                         | "sum={} input_bytes={}"
@@ -193,7 +193,7 @@ fn production_literals_match_the_reviewed_semantic_inventory()
         }
     }
     let workspace = crates.parent().ok_or("crates has no workspace parent")?;
-    for file in source_files(&workspace.join("packages/effect_app/src"))? {
+    for file in source_files(&workspace.join("crates/effect_app/src"))? {
         let relative = file.strip_prefix(workspace)?.to_owned();
         violations.extend(audit(relative, &std::fs::read_to_string(file)?)?);
     }

@@ -20,31 +20,33 @@ resolver = "3"
 [workspace.dependencies]
 async-stream = "0.3.6"
 chrono = "0.4.45"
-clap = "4.5.48"
-either = "1.15.0"
+clap = "4.6.7"
+either = "1.18.0"
 futures-core = "0.3.34"
 futures-util = "0.3.34"
 log = "0.4.34"
 percent-encoding = "2.3.2"
-proc-macro-crate = "3.4.0"
-proc-macro2 = "1.0.101"
-quote = "1.0.40"
-rustls = { version = "0.23.44", default-features = false, features = ["ring"] }
-serde = "1.0.228"
-serde_json = "1.0.145"
+proc-macro-crate = "3.5.0"
+proc-macro2 = "1.0.107"
+quote = "1.0.47"
+rustls = { version = "0.23.45", default-features = false, features = ["ring"] }
+serde = "1.0.229"
+serde_json = "1.0.151"
 sqlx = { path = "crates/sqlx", package = "sqlx-turso-sqlx", default-features = false, features = ["derive", "runtime-tokio"] }
 sqlx-upstream = { package = "sqlx", version = "=0.9.0", default-features = false }
 sqlx-core = { version = "=0.9.0", default-features = false, features = ["offline"] }
 sqlx-macros = { version = "=0.9.0", default-features = false }
 sqlx-macros-core = { version = "=0.9.0", default-features = false }
-syn = "2.0.106"
-time = "0.3.44"
+syn = "3.0.6"
+# SQLx 0.9 exposes QueryMacroInput through Syn 2's Parse trait.
+syn-sqlx = { package = "syn", version = "2.0.119" }
+time = "0.3.55"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1.44"
-turso = { version = "0.8.0-pre.11", default-features = false }
-turso_parser = { version = "=0.8.0-pre.11" }
+turso = { version = "0.8.0-pre.13", default-features = false }
+turso_parser = { version = "=0.8.0-pre.13" }
 url = "2.5.8"
-uuid = "1.18.1"
+uuid = "1.26.1"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
