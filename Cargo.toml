@@ -1,0 +1,89 @@
+[workspace]
+members = [
+    "native_build/rust_async",
+    "crates/native_interop",
+    "crates/sqlx",
+    "crates/sqlx_turso",
+    "crates/sqlx_turso_cli",
+    "crates/sqlx_turso_core",
+    "crates/sqlx_turso_macros",
+    "crates/effect",
+    "crates/effect_macros",
+    "crates/effect_tokio",
+    "crates/effect_rayon",
+    "crates/effect_native_runtime",
+    "crates/effect_tracing",
+    "crates/effect_app",
+]
+resolver = "3"
+
+[workspace.dependencies]
+async-stream = "0.3.6"
+chrono = "0.4.45"
+clap = "4.5.48"
+either = "1.15.0"
+futures-core = "0.3.34"
+futures-util = "0.3.34"
+log = "0.4.34"
+percent-encoding = "2.3.2"
+proc-macro-crate = "3.4.0"
+proc-macro2 = "1.0.101"
+quote = "1.0.40"
+rustls = { version = "0.23.44", default-features = false, features = ["ring"] }
+serde = "1.0.228"
+serde_json = "1.0.145"
+sqlx = { path = "crates/sqlx", package = "sqlx-turso-sqlx", default-features = false, features = ["derive", "runtime-tokio"] }
+sqlx-upstream = { package = "sqlx", version = "=0.9.0", default-features = false }
+sqlx-core = { version = "=0.9.0", default-features = false, features = ["offline"] }
+sqlx-macros = { version = "=0.9.0", default-features = false }
+sqlx-macros-core = { version = "=0.9.0", default-features = false }
+syn = "2.0.106"
+time = "0.3.44"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1.44"
+turso = { version = "0.8.0-pre.11", default-features = false }
+turso_parser = { version = "=0.8.0-pre.11" }
+url = "2.5.8"
+uuid = "1.18.1"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+indexing_slicing = "deny"
+fallible_impl_from = "deny"
+wildcard_enum_match_arm = "deny"
+unneeded_field_pattern = "deny"
+fn_params_excessive_bools = "deny"
+must_use_candidate = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+disallowed_methods = "deny"
+
+[workspace.lints.rust]
+warnings = { level = "deny", priority = -1 }
+dead_code = "deny"
+unused_imports = "deny"
+unused_must_use = "deny"
+unused_variables = "deny"
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false
+
+[profile.release]
+debug = 0
+codegen-units = 1
+incremental = false
+lto = true
+opt-level = "s"
+strip = true

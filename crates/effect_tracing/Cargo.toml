@@ -1,0 +1,12 @@
+[package]
+name = "effect-tracing"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+effect = { path = "../effect" }
+tracing = { workspace = true }
+[lints]
+workspace = true
+
+[dev-dependencies]
+futures-executor = "0.3.32"

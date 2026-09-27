@@ -1,0 +1,9 @@
+[package]
+name = "effect-rayon"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+effect = { path = "../effect" }
+rayon = "1.12.0"
+[lints]
+workspace = true

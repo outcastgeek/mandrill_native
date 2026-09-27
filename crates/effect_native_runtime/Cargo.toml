@@ -1,0 +1,10 @@
+[package]
+name = "effect-native-runtime"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+effect = { path = "../effect" }
+native-async-runtime = { path = "../../native_build/rust_async" }
+futures-util = { workspace = true }
+[lints]
+workspace = true

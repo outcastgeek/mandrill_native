@@ -1,0 +1,374 @@
+use crate::LibraryDefect;
+use crate::internal::destruction::FlatDrop;
+use crate::internal::outcome;
+use crate::internal::runtime::{self, Context, Finish, Step};
+use crate::internal::workflow::{self, Workflow};
+use crate::scope::{Registered, Scope};
+use crate::{Cancellation, Defect, Effect, Exit, PrimaryOutcomeRef};
+use futures_util::FutureExt;
+use std::future::Future;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{Arc, RwLock};
+
+/// Awaited, single-use cleanup. Its factories can consume an owned resource
+/// without requiring Clone or constructing a reusable future around it.
+#[must_use = "a release must be returned to its resource binding"]
+pub struct Release<E: Send + 'static, R: Send + Sync + 'static = ()> {
+    workflow: Workflow<(), E, R>,
+}
+
+impl<E: Send + 'static, R: Send + Sync + 'static> Release<E, R> {
+    pub fn sync(callback: impl FnOnce() + Send + 'static) -> Self {
+        Self::try_sync(move || {
+            callback();
+            Ok(())
+        })
+    }
+
+    pub fn try_sync(callback: impl FnOnce() -> Result<(), E> + Send + 'static) -> Self {
+        Self {
+            workflow: Workflow::new(move |_, _, finish| {
+                let result = catch_unwind(AssertUnwindSafe(callback));
+                runtime::finish(
+                    finish,
+                    match result {
+                        Ok(Ok(())) => Exit::Success(()),
+                        Ok(Err(error)) => Exit::Fail(error),
+                        Err(panic) => Exit::Die(Defect::from_panic(panic)),
+                    },
+                )
+            }),
+        }
+    }
+
+    pub fn from_future<F: Future<Output = ()> + Send + 'static>(
+        factory: impl FnOnce(Cancellation) -> F + Send + 'static,
+    ) -> Self {
+        Self::try_future(move |token| async move {
+            factory(token).await;
+            Ok(())
+        })
+    }
+
+    pub fn try_future<F: Future<Output = Result<(), E>> + Send + 'static>(
+        factory: impl FnOnce(Cancellation) -> F + Send + 'static,
+    ) -> Self {
+        Self {
+            workflow: Workflow::new(move |_, context, finish| {
+                match catch_unwind(AssertUnwindSafe(|| factory(context.cancellation.clone()))) {
+                    Err(panic) => runtime::finish(finish, Exit::Die(Defect::from_panic(panic))),
+                    Ok(pending) => Step::Suspended(Box::pin(async move {
+                        let result = AssertUnwindSafe(pending).catch_unwind().await;
+                        runtime::finish(
+                            finish,
+                            match result {
+                                Ok(Ok(())) => Exit::Success(()),
+                                Ok(Err(error)) => Exit::Fail(error),
+                                Err(panic) => Exit::Die(Defect::from_panic(panic)),
+                            },
+                        )
+                    })),
+                }
+            }),
+        }
+    }
+
+    pub fn from_effect(program: Effect<(), E, R>) -> Self {
+        Self {
+            workflow: Workflow::new(move |env, context, finish| {
+                program.execute(env, context, finish)
+            }),
+        }
+    }
+
+    pub(crate) fn execute(self, env: Arc<R>, context: Context, finish: Finish<(), E>) -> Step {
+        self.workflow.execute(env, context, finish)
+    }
+}
+
+/// Access handle valid only until the binding's body finishes. Cloning or
+/// returning this handle does not extend the underlying resource lifetime.
+pub struct ResourceValue<T> {
+    value: Arc<RwLock<Option<T>>>,
+}
+
+impl<T> Clone for ResourceValue<T> {
+    fn clone(&self) -> Self {
+        Self {
+            value: Arc::clone(&self.value),
+        }
+    }
+}
+
+impl<T> ResourceValue<T> {
+    fn new(value: T) -> Self {
+        Self {
+            value: Arc::new(RwLock::new(Some(value))),
+        }
+    }
+
+    /// Synchronous, short access. A borrowed reference cannot escape this call.
+    /// Never wait for resource release while inside this callback.
+    pub fn with<A>(&self, access: impl FnOnce(&T) -> A) -> Result<A, Defect> {
+        let value = self
+            .value
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match value.as_ref() {
+            Some(value) => Ok(access(value)),
+            None => Err(Defect::from(LibraryDefect::ResourceScopeEnded)),
+        }
+    }
+
+    fn invalidate(&self) -> Option<T> {
+        self.value
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+impl<T: Send + Sync + 'static> ResourceValue<T> {
+    /// Effectful access reports a closed handle as a defect. Copy owned data
+    /// while inside the callback; references cannot cross an async suspension.
+    pub fn access<A, E, R>(
+        &self,
+        access: impl Fn(&T) -> A + Send + Sync + 'static,
+    ) -> Effect<A, E, R>
+    where
+        A: Send + 'static,
+        E: Send + 'static,
+        R: Send + Sync + 'static,
+    {
+        let handle = self.clone();
+        Effect::ready(move |_, _| match handle.with(&access) {
+            Ok(value) => Exit::Success(value),
+            Err(defect) => Exit::Die(defect),
+        })
+    }
+}
+
+// Abandonment cannot await release, but must invalidate every escaped handle
+// and relinquish the owned value. Run/scope guards report ownership loss.
+struct ResourceOwner<T> {
+    handle: ResourceValue<T>,
+}
+
+impl<T> ResourceOwner<T> {
+    fn new(handle: ResourceValue<T>) -> Self {
+        Self { handle }
+    }
+
+    fn take(&self) -> Option<T> {
+        self.handle.invalidate()
+    }
+}
+
+impl<T> Drop for ResourceOwner<T> {
+    fn drop(&mut self) {
+        drop(self.take());
+    }
+}
+
+type Releaser<T, E, R> =
+    Arc<dyn for<'outcome> Fn(T, PrimaryOutcomeRef<'outcome, E>) -> Release<E, R> + Send + Sync>;
+
+/// Declares acquisition and release together before work begins.
+/// The body receives an invalidatable handle, not an escaping Arc<T>.
+#[must_use = "use the resource binding to establish its release obligation"]
+pub struct ResourceBinding<
+    T: Send + Sync + 'static,
+    E: Send + 'static,
+    R: Send + Sync + 'static = (),
+> {
+    acquire: Effect<T, E, R>,
+    release: Releaser<T, E, R>,
+}
+
+impl<T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Clone
+    for ResourceBinding<T, E, R>
+{
+    fn clone(&self) -> Self {
+        Self {
+            acquire: self.acquire.clone(),
+            release: Arc::clone(&self.release),
+        }
+    }
+}
+
+impl<T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
+    ResourceBinding<T, E, R>
+{
+    pub fn new(
+        acquire: Effect<T, E, R>,
+        release: impl for<'outcome> Fn(T, PrimaryOutcomeRef<'outcome, E>) -> Release<E, R>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            acquire,
+            release: Arc::new(release),
+        }
+    }
+
+    /// Acquire, use, invalidate, and await protected release before publication.
+    /// To survive observer loss, execute through a retained owned-run driver.
+    pub fn use_with<A: Send + 'static>(
+        self,
+        use_resource: impl Fn(ResourceValue<T>) -> Effect<A, E, R> + Send + Sync + 'static,
+    ) -> Effect<A, E, R> {
+        let use_resource = Arc::new(use_resource);
+        workflow::reusable(move || {
+            let use_resource = Arc::clone(&use_resource);
+            self.clone().bind_run(move |handle| {
+                let body = use_resource(handle);
+                Workflow::new(move |env, context, finish| body.execute(env, context, finish))
+            })
+        })
+    }
+
+    pub(crate) fn bind_run<A: Send + 'static>(
+        self,
+        use_resource: impl FnOnce(ResourceValue<T>) -> Workflow<A, E, R> + Send + 'static,
+    ) -> Workflow<A, E, R> {
+        Workflow::new(move |env, context, finish| {
+            let release = Arc::clone(&self.release);
+            let use_resource = FlatDrop::new(Box::new(use_resource));
+            self.acquire.clone().execute(
+                Arc::clone(&env),
+                context.clone(),
+                runtime::continuation(move |acquired| {
+                    match acquired.into_failure() {
+                        Err(failure) => runtime::finish(finish, failure),
+                        Ok(resource) => {
+                            // Ownership is installed before checking cancellation
+                            // or invoking the user body factory after raw success.
+                            let handle = ResourceValue::new(resource);
+                            let owner = ResourceOwner::new(handle.clone());
+                            let release_env = Arc::clone(&env);
+                            let release_context = context.clone();
+                            let after_body = runtime::continuation(move |result| {
+                                let result = runtime::publish(result, &release_context);
+                                let cleanup = catch_unwind(AssertUnwindSafe(|| {
+                                    owner.take().map(|value| release(value, result.primary()))
+                                }));
+                                let cleanup = match cleanup {
+                                    Ok(Some(cleanup)) => cleanup,
+                                    Ok(None) => {
+                                        return runtime::finish(
+                                            finish,
+                                            outcome::append_cleanup(
+                                                result,
+                                                Exit::Die(Defect::from(
+                                                    LibraryDefect::ResourceReleasedTwice,
+                                                )),
+                                            ),
+                                        );
+                                    }
+                                    Err(panic) => {
+                                        return runtime::finish(
+                                            finish,
+                                            outcome::append_cleanup(
+                                                result,
+                                                Exit::Die(Defect::from_panic(panic)),
+                                            ),
+                                        );
+                                    }
+                                };
+                                let protected = release_context.protected();
+                                cleanup.execute(
+                                    release_env,
+                                    protected,
+                                    runtime::continuation(move |cleanup| {
+                                        let result = runtime::publish(result, &release_context);
+                                        runtime::finish(
+                                            finish,
+                                            outcome::append_cleanup(result, cleanup),
+                                        )
+                                    }),
+                                )
+                            });
+                            if context.cancelled() {
+                                return runtime::finish(after_body, Exit::Interrupted);
+                            }
+                            match catch_unwind(AssertUnwindSafe(|| {
+                                use_resource.take().map(|use_resource| use_resource(handle))
+                            })) {
+                                Ok(Some(body)) => body.execute(env, context, after_body),
+                                Ok(None) => runtime::finish(
+                                    after_body,
+                                    Exit::Die(Defect::from(LibraryDefect::ResourceBodyConsumed)),
+                                ),
+                                Err(panic) => runtime::finish(
+                                    after_body,
+                                    Exit::Die(Defect::from_panic(panic)),
+                                ),
+                            }
+                        }
+                    }
+                }),
+            )
+        })
+    }
+
+    pub(crate) fn acquire_scoped(self, scope: Scope<E>) -> Effect<ResourceValue<T>, E, R> {
+        Effect::new(move |env, context, finish| {
+            let scope = scope.clone();
+            let release = Arc::clone(&self.release);
+            self.acquire.clone().execute(
+                Arc::clone(&env),
+                context.clone(),
+                runtime::continuation(move |acquired| match acquired.into_failure() {
+                    Err(failure) => runtime::finish(finish, failure),
+                    Ok(resource) => {
+                        // Register raw ownership before any cancellation checkpoint.
+                        let handle = ResourceValue::new(resource);
+                        let owner = ResourceOwner::new(handle.clone());
+                        let abandoned = handle.clone();
+                        let finalizer = Registered::with_abandon(
+                            move |finish| match catch_unwind(AssertUnwindSafe(|| {
+                                owner
+                                    .take()
+                                    .map(|resource| release(resource, PrimaryOutcomeRef::Succeeded))
+                            })) {
+                                Ok(Some(cleanup)) => {
+                                    cleanup.execute(env, context.protected(), finish)
+                                }
+                                Ok(None) => runtime::finish(
+                                    finish,
+                                    Exit::Die(Defect::from(LibraryDefect::ResourceReleasedTwice)),
+                                ),
+                                Err(panic) => {
+                                    runtime::finish(finish, Exit::Die(Defect::from_panic(panic)))
+                                }
+                            },
+                            move || drop(abandoned.invalidate()),
+                        );
+                        scope.register_or_release(finalizer, handle, finish)
+                    }
+                }),
+            )
+        })
+    }
+}
+
+impl<E: Send + 'static, R: Send + Sync + 'static> Release<E, R> {
+    /// An owned cleanup future that can preserve several failures and all Exit
+    /// families. Factory/poll unwinds become release defects under protection.
+    pub fn from_exit_future<F: Future<Output = Exit<(), E>> + Send + 'static>(
+        factory: impl FnOnce(Cancellation) -> F + Send + 'static,
+    ) -> Self {
+        Self {
+            workflow: Workflow::new(move |_, context, finish| {
+                Step::Suspended(Box::pin(async move {
+                    let result = AssertUnwindSafe(async { factory(context.cancellation).await })
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|panic| Exit::Die(Defect::from_panic(panic)));
+                    runtime::finish(finish, result)
+                }))
+            }),
+        }
+    }
+}

@@ -1,0 +1,89 @@
+[package]
+name = "sqlx-turso-sqlx"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "sqlx"
+
+[features]
+default = ["any", "json", "macros", "migrate", "runtime-tokio"]
+_rt-async-global-executor = ["sqlx-upstream/_rt-async-global-executor"]
+_rt-async-std = ["sqlx-upstream/_rt-async-std"]
+_rt-smol = ["sqlx-upstream/_rt-smol"]
+_rt-tokio = ["sqlx-upstream/_rt-tokio"]
+_sqlite = ["sqlx-upstream/_sqlite"]
+_unstable-all-types = [
+    "bigdecimal",
+    "bit-vec",
+    "bstr",
+    "chrono",
+    "ipnet",
+    "ipnetwork",
+    "json",
+    "mac_address",
+    "rust_decimal",
+    "time",
+    "uuid",
+]
+_unstable-docs = ["all-databases", "_unstable-all-types", "sqlx-upstream/_unstable-docs"]
+all-databases = ["any", "mysql", "postgres", "sqlite"]
+any = ["sqlx-upstream/any", "sqlx-turso-core/any"]
+bigdecimal = ["sqlx-upstream/bigdecimal", "sqlx-turso-core/bigdecimal", "sqlx-turso-macros?/bigdecimal"]
+bit-vec = ["sqlx-upstream/bit-vec", "sqlx-turso-core/bit-vec", "sqlx-turso-macros?/bit-vec"]
+bstr = ["sqlx-upstream/bstr", "sqlx-turso-core/bstr"]
+chrono = ["sqlx-upstream/chrono", "sqlx-turso-core/chrono", "sqlx-turso-macros?/chrono"]
+derive = ["sqlx-upstream/derive"]
+ipnet = ["sqlx-upstream/ipnet", "sqlx-turso-core/ipnet", "sqlx-turso-macros?/ipnet"]
+ipnetwork = ["sqlx-upstream/ipnetwork", "sqlx-turso-core/ipnetwork", "sqlx-turso-macros?/ipnetwork"]
+json = ["sqlx-upstream/json", "sqlx-turso-core/json"]
+mac_address = ["sqlx-upstream/mac_address", "sqlx-turso-core/mac_address", "sqlx-turso-macros?/mac_address"]
+macros = ["derive", "dep:sqlx-turso-macros", "sqlx-upstream/macros"]
+migrate = ["sqlx-upstream/migrate", "sqlx-turso-core/migrate"]
+mysql = ["sqlx-upstream/mysql", "sqlx-turso-macros?/mysql"]
+mysql-rsa = ["sqlx-upstream/mysql-rsa", "sqlx-turso-macros?/mysql-rsa"]
+postgres = ["sqlx-upstream/postgres", "sqlx-turso-macros?/postgres"]
+regexp = ["sqlx-upstream/regexp"]
+runtime-async-global-executor = ["sqlx-upstream/runtime-async-global-executor", "sqlx-turso-macros?/_rt-async-global-executor"]
+runtime-async-std = ["sqlx-upstream/runtime-async-std", "sqlx-turso-macros?/_rt-async-std"]
+runtime-smol = ["sqlx-upstream/runtime-smol", "sqlx-turso-macros?/_rt-smol"]
+runtime-tokio = ["sqlx-upstream/runtime-tokio", "sqlx-turso-core/runtime-tokio", "sqlx-turso-macros?/_rt-tokio"]
+rust_decimal = ["sqlx-upstream/rust_decimal", "sqlx-turso-core/rust_decimal", "sqlx-turso-macros?/rust_decimal"]
+sqlite = ["sqlx-upstream/sqlite", "sqlx-turso-macros?/sqlite"]
+sqlite-bundled = ["sqlx-upstream/sqlite-bundled", "sqlx-turso-macros?/sqlite"]
+sqlite-deserialize = ["sqlx-upstream/sqlite-deserialize"]
+sqlite-load-extension = ["sqlx-upstream/sqlite-load-extension", "sqlx-turso-macros?/sqlite-load-extension"]
+sqlite-preupdate-hook = ["sqlx-upstream/sqlite-preupdate-hook"]
+sqlite-unbundled = ["sqlx-upstream/sqlite-unbundled", "sqlx-turso-macros?/sqlite-unbundled"]
+sqlite-unlock-notify = ["sqlx-upstream/sqlite-unlock-notify"]
+sqlx-toml = ["sqlx-upstream/sqlx-toml", "sqlx-turso-macros?/sqlx-toml"]
+time = ["sqlx-upstream/time", "sqlx-turso-core/time", "sqlx-turso-macros?/time"]
+tls-native-tls = ["sqlx-upstream/tls-native-tls", "sqlx-turso-macros?/_tls-native-tls"]
+tls-none = ["sqlx-upstream/tls-none"]
+tls-rustls = ["sqlx-upstream/tls-rustls"]
+tls-rustls-aws-lc-rs = ["sqlx-upstream/tls-rustls-aws-lc-rs", "sqlx-turso-macros?/_tls-rustls-aws-lc-rs"]
+tls-rustls-ring = ["sqlx-upstream/tls-rustls-ring"]
+tls-rustls-ring-native-roots = ["sqlx-upstream/tls-rustls-ring-native-roots", "sqlx-turso-macros?/_tls-rustls-ring-native-roots"]
+tls-rustls-ring-webpki = ["sqlx-upstream/tls-rustls-ring-webpki", "sqlx-turso-macros?/_tls-rustls-ring-webpki"]
+uuid = ["sqlx-upstream/uuid", "sqlx-turso-core/uuid", "sqlx-turso-macros?/uuid"]
+
+sync = ["sqlx-turso-core/sync"]
+fts = ["sqlx-turso-core/fts"]
+io-memory-yield = ["sqlx-turso-core/io-memory-yield"]
+mimalloc = ["sqlx-turso-core/mimalloc"]
+pure-rust-crypto = ["sqlx-turso-core/pure-rust-crypto"]
+stacker = ["sqlx-turso-core/stacker"]
+test-helper = ["sqlx-turso-core/test-helper"]
+turso-default = ["sqlx-turso-core/turso-default"]
+
+[dependencies]
+sqlx-upstream = { workspace = true }
+sqlx-core = { workspace = true }
+sqlx-turso-core = { version = "0.1.0", path = "../sqlx_turso_core", default-features = false }
+sqlx-turso-macros = { version = "0.1.0", path = "../sqlx_turso_macros", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

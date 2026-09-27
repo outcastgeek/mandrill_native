@@ -1,0 +1,19 @@
+[package]
+name = "effect"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+
+[dependencies]
+effect-macros = { path = "../effect_macros" }
+event-listener = "5.4"
+futures-util = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+futures-executor = "0.3.32"
+
+[lints]
+workspace = true

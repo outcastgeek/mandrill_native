@@ -1,0 +1,250 @@
+use crate::cache::Entry;
+use crate::internal::runtime::{self, Step};
+use crate::{
+    Cache, CacheCapacity, CacheConfig, Defect, Effect, Exit, HasClock, HasTaskSpawner,
+    LibraryDefect, Release, Scope, SharedValue,
+};
+use std::sync::{
+    Arc, Mutex, Weak,
+    atomic::{AtomicBool, Ordering},
+};
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum CachePartition {
+    Default,
+    Named(Arc<str>),
+}
+struct Key<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
+    identity: Weak<K>,
+    partition: CachePartition,
+    load: Mutex<Option<Effect<A, E, ()>>>,
+}
+type Associations<K, A, E> = Mutex<Vec<Weak<Entry<Key<K, A, E>, A, E>>>>;
+struct Inner<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
+    cache: Cache<Key<K, A, E>, A, E>,
+    entries: Associations<K, A, E>,
+    closed: AtomicBool,
+}
+pub struct WeakCache<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
+    inner: Arc<Inner<K, A, E>>,
+}
+impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Clone for WeakCache<K, A, E> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+/// Consumer ownership keeps a settled weak-cache association alive. The cache
+/// itself has weak key AND weak entry references. This is deliberately weaker
+/// retention than a tracing-GC ephemeron: dropping the last consumer handle may
+/// cause a miss even while the key lives. A value-to-key reference cannot make
+/// a successful settled association keep itself alive through the cache.
+pub struct WeakCacheValue<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
+    entry: Arc<Entry<Key<K, A, E>, A, E>>,
+    value: SharedValue<A>,
+}
+impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Clone
+    for WeakCacheValue<K, A, E>
+{
+    fn clone(&self) -> Self {
+        Self {
+            entry: Arc::clone(&self.entry),
+            value: self.value.clone(),
+        }
+    }
+}
+impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> WeakCacheValue<K, A, E> {
+    pub fn with<B>(&self, inspect: impl FnOnce(&A) -> B) -> Result<B, Defect> {
+        self.value.with(inspect)
+    }
+}
+impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> WeakCache<K, A, E> {
+    pub fn make<R: HasClock + HasTaskSpawner + Send + Sync + 'static>(
+        scope: Scope<SharedValue<E>>,
+    ) -> Effect<Self, SharedValue<E>, R> {
+        let config = CacheConfig {
+            equal: Arc::new(|left: &Key<K, A, E>, right: &Key<K, A, E>| {
+                left.identity.ptr_eq(&right.identity) && left.partition == right.partition
+            }),
+            ttl: None,
+            capacity: CacheCapacity::NoRetention,
+            cache_failure: Arc::new(|_| false),
+        };
+        let build = Cache::make(scope.clone(), config, |key: &Key<K, A, E>| {
+            let program = key
+                .load
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            match program {
+                Some(program) => program.provide_some(|_: &R| ()),
+                None => Effect::die(Defect::from(LibraryDefect::WeakCacheLoadConsumed)),
+            }
+        });
+        build.flat_map(move |cache| {
+            let cache = Self {
+                inner: Arc::new(Inner {
+                    cache,
+                    entries: Mutex::new(Vec::new()),
+                    closed: AtomicBool::new(false),
+                }),
+            };
+            let close = cache.clone();
+            let registered = scope.add_release(move || {
+                let close = close.clone();
+                Release::sync(move || close.close_index())
+            });
+            registered.map(move |()| cache.clone())
+        })
+    }
+    fn close_index(&self) {
+        self.inner.closed.store(true, Ordering::Release);
+        let entries = std::mem::take(
+            &mut *self
+                .inner
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for entry in entries.into_iter().filter_map(|entry| entry.upgrade()) {
+            entry.invalidate_association();
+        }
+    }
+    pub fn get<R: Send + Sync + 'static>(
+        &self,
+        key: &Arc<K>,
+        load: impl Fn() -> Effect<A, E, R> + Send + Sync + 'static,
+    ) -> Effect<WeakCacheValue<K, A, E>, SharedValue<E>, R> {
+        self.get_partition(CachePartition::Default, key, load)
+    }
+    pub fn get_partition<R: Send + Sync + 'static>(
+        &self,
+        partition: CachePartition,
+        key: &Arc<K>,
+        load: impl Fn() -> Effect<A, E, R> + Send + Sync + 'static,
+    ) -> Effect<WeakCacheValue<K, A, E>, SharedValue<E>, R> {
+        let cache = self.clone();
+        let identity = Arc::downgrade(key);
+        let load = Arc::new(load);
+        Effect::new(move |env, context, finish| {
+            let cache = cache.clone();
+            let identity = identity.clone();
+            let partition = partition.clone();
+            let load = Arc::clone(&load);
+            Step::Suspended(Box::pin(async move {
+                let work = async {
+                    if cache.inner.closed.load(Ordering::Acquire) || cache.inner.cache.is_closed() {
+                        return Exit::Die(Defect::from(LibraryDefect::CacheClosed));
+                    }
+                    if identity.upgrade().is_none() {
+                        return Exit::Die(Defect::from(LibraryDefect::WeakCacheKeyDropped));
+                    }
+                    let existing = {
+                        let mut entries = cache
+                            .inner
+                            .entries
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        entries.retain(|entry| entry.strong_count() != usize::default());
+                        entries.iter().filter_map(Weak::upgrade).find(|entry| {
+                            entry.key.identity.ptr_eq(&identity)
+                                && entry.key.partition == partition
+                                && !entry.is_invalidated()
+                        })
+                    };
+                    let entry = match existing {
+                        Some(entry) => entry,
+                        None => {
+                            let recipe = Effect::defer(move || load()).provide(env);
+                            let key = Arc::new(Key {
+                                identity,
+                                partition,
+                                load: Mutex::new(Some(recipe)),
+                            });
+                            match cache.inner.cache.select_entry(key, &context).await {
+                                Ok(Some(entry)) => {
+                                    cache
+                                        .inner
+                                        .entries
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .push(Arc::downgrade(&entry));
+                                    entry
+                                }
+                                Ok(None) => return Exit::Interrupted,
+                                Err(defect) => return Exit::Die(defect),
+                            }
+                        }
+                    };
+
+                    match cache
+                        .inner
+                        .cache
+                        .observe_value(&entry, context.cancellation)
+                        .await
+                    {
+                        Exit::Success(value) => Exit::Success(WeakCacheValue { entry, value }),
+                        Exit::Fail(error) => Exit::Fail(error),
+                        Exit::Die(defect) => Exit::Die(defect),
+                        Exit::Interrupted => Exit::Interrupted,
+                        Exit::FinalizationFailed(details) => Exit::FinalizationFailed(details),
+                    }
+                };
+                let outcome =
+                    futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(work))
+                        .await
+                        .unwrap_or_else(|panic| Exit::Die(Defect::from_panic(panic)));
+                runtime::finish(finish, outcome)
+            }))
+        })
+    }
+    pub fn invalidate<R: Send + Sync + 'static>(
+        &self,
+        key: &Arc<K>,
+    ) -> Effect<(), SharedValue<E>, R> {
+        let cache = self.clone();
+        let identity = Arc::downgrade(key);
+        Effect::defer(move || {
+            let selected = {
+                let mut entries = cache
+                    .inner
+                    .entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let selected = entries
+                    .iter()
+                    .filter_map(Weak::upgrade)
+                    .filter(|entry| entry.key.identity.ptr_eq(&identity))
+                    .collect::<Vec<_>>();
+                entries.retain(|entry| {
+                    entry
+                        .upgrade()
+                        .is_some_and(|entry| !entry.key.identity.ptr_eq(&identity))
+                });
+                selected
+            };
+            let mut retire = Vec::new();
+            for entry in selected {
+                entry.invalidate_association();
+                retire.push(cache.inner.cache.invalidate(Key {
+                    identity: identity.clone(),
+                    partition: entry.key.partition.clone(),
+                    load: Mutex::new(None),
+                }));
+            }
+            Effect::all(retire).map(|_| ())
+        })
+        .uninterruptible()
+    }
+    pub fn shutdown<R: Send + Sync + 'static>(
+        &self,
+    ) -> Effect<crate::PoolEndStatus, SharedValue<E>, R> {
+        let cache = self.clone();
+        Effect::defer(move || {
+            cache.close_index();
+            cache.inner.cache.shutdown()
+        })
+        .uninterruptible()
+    }
+}

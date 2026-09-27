@@ -1,0 +1,10 @@
+[package]
+name = "effect-tokio"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+effect = { path = "../effect" }
+tokio = { workspace = true, features = ["sync", "time"] }
+futures-util = { workspace = true }
+[lints]
+workspace = true

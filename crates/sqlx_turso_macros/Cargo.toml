@@ -1,0 +1,44 @@
+[package]
+name = "sqlx-turso-macros"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+proc-macro = true
+
+[features]
+_rt-async-global-executor = ["sqlx-macros-core/_rt-async-global-executor"]
+_rt-async-std = ["sqlx-macros-core/_rt-async-std"]
+_rt-smol = ["sqlx-macros-core/_rt-smol"]
+_rt-tokio = ["sqlx-macros-core/_rt-tokio"]
+_tls-native-tls = ["sqlx-macros-core/_tls-native-tls"]
+_tls-rustls-aws-lc-rs = ["sqlx-macros-core/_tls-rustls-aws-lc-rs"]
+_tls-rustls-ring-native-roots = ["sqlx-macros-core/_tls-rustls-ring-native-roots"]
+_tls-rustls-ring-webpki = ["sqlx-macros-core/_tls-rustls-ring-webpki"]
+bigdecimal = ["sqlx-turso-core/bigdecimal"]
+bit-vec = ["sqlx-turso-core/bit-vec"]
+chrono = ["sqlx-turso-core/chrono"]
+ipnet = ["sqlx-turso-core/ipnet"]
+ipnetwork = ["sqlx-turso-core/ipnetwork"]
+mac_address = ["sqlx-turso-core/mac_address"]
+mysql = ["sqlx-macros-core/mysql"]
+mysql-rsa = ["sqlx-macros-core/mysql-rsa"]
+postgres = ["sqlx-macros-core/postgres"]
+rust_decimal = ["sqlx-turso-core/rust_decimal"]
+time = ["sqlx-turso-core/time"]
+uuid = ["sqlx-turso-core/uuid"]
+sqlite = ["sqlx-macros-core/sqlite"]
+sqlite-load-extension = ["sqlx-macros-core/sqlite-load-extension"]
+sqlite-unbundled = ["sqlx-macros-core/sqlite-unbundled"]
+sqlx-toml = ["sqlx-macros-core/sqlx-toml"]
+
+[dependencies]
+proc-macro-crate = { workspace = true }
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+sqlx-macros-core = { workspace = true, features = ["macros", "_rt-tokio", "sqlx-toml"] }
+sqlx-turso-core = { version = "0.1.0", path = "../sqlx_turso_core", features = ["macros"] }
+syn = { workspace = true, features = ["full", "parsing"] }
+
+[lints]
+workspace = true

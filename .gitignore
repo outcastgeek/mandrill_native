@@ -1,0 +1,10 @@
+.zig-cache/
+zig-out/
+zig-pkg/
+.lake/
+target/
+node_modules/
+
+.sqlx/
+scratch/
+.idea/

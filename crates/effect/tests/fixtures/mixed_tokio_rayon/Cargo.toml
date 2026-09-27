@@ -1,0 +1,17 @@
+[package]
+name = "effect-mixed-consumer"
+version = "0.1.0"
+edition = "2024"
+[workspace]
+[dependencies]
+effect = { path = "../../.." }
+effect-tokio = { path = "../../../../effect_tokio" }
+effect-rayon = { path = "../../../../effect_rayon" }
+effect-native-runtime = { path = "../../../../effect_native_runtime" }
+native-async-runtime = { path = "../../../../../native_build/rust_async" }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "time", "sync"] }
+rayon = "1.12.0"
+futures-executor = "0.3.32"
+futures-util = "0.3.34"
+[lints.rust]
+warnings = "deny"

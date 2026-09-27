@@ -1,0 +1,19 @@
+[package]
+name = "effect-neutral-consumer"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[features]
+default = ["effect-defaults"]
+effect-defaults = ["fx/default"]
+
+[dependencies]
+fx = { package = "effect", path = "../../..", default-features = false }
+
+[dev-dependencies]
+futures-executor = "0.3.34"
+
+[lints.rust]
+warnings = "deny"

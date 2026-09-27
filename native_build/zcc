@@ -1,0 +1,42 @@
+#!/bin/sh
+set -eu
+
+target=${ZIG_RUST_TARGET:?ZIG_RUST_TARGET is required}
+zig_exe=${ZIG_RUST_ZIG:-zig}
+
+case "$target" in
+  x86_64-unknown-linux-gnu) zig_target=x86_64-linux-gnu ;;
+  aarch64-unknown-linux-gnu) zig_target=aarch64-linux-gnu ;;
+  x86_64-unknown-linux-musl) zig_target=x86_64-linux-musl ;;
+  aarch64-unknown-linux-musl) zig_target=aarch64-linux-musl ;;
+  x86_64-pc-windows-gnu) zig_target=x86_64-windows-gnu ;;
+  aarch64-pc-windows-gnullvm) zig_target=aarch64-windows-gnu ;;
+  x86_64-apple-darwin) zig_target=x86_64-macos ;;
+  aarch64-apple-darwin) zig_target=aarch64-macos ;;
+  x86_64-linux-android|aarch64-linux-android)
+    ndk=${ZIG_RUST_ANDROID_NDK:?Android Rust targets require -Dandroid-ndk}
+    api=${ZIG_RUST_ANDROID_API:-24}
+    case "$(uname -s)-$(uname -m)" in
+      Darwin-*) host=darwin-x86_64 ;;
+      Linux-aarch64|Linux-arm64) host=linux-aarch64 ;;
+      Linux-*) host=linux-x86_64 ;;
+      *) echo "unsupported Android NDK host" >&2; exit 1 ;;
+    esac
+    case "$target" in
+      x86_64-linux-android) clang=x86_64-linux-android${api}-clang ;;
+      aarch64-linux-android) clang=aarch64-linux-android${api}-clang ;;
+    esac
+    exec "$ndk/toolchains/llvm/prebuilt/$host/bin/$clang" "$@"
+    ;;
+  x86_64-apple-ios|aarch64-apple-ios|aarch64-apple-ios-sim)
+    case "$target" in
+      aarch64-apple-ios) sdk=iphoneos; apple_target=arm64-apple-ios ;;
+      aarch64-apple-ios-sim) sdk=iphonesimulator; apple_target=arm64-apple-ios-simulator ;;
+      x86_64-apple-ios) sdk=iphonesimulator; apple_target=x86_64-apple-ios-simulator ;;
+    esac
+    exec xcrun --sdk "$sdk" clang -target "$apple_target" "$@"
+    ;;
+  *) echo "unsupported Rust target: $target" >&2; exit 1 ;;
+esac
+
+exec "$zig_exe" cc -target "$zig_target" "$@"

@@ -1,0 +1,4 @@
+disallowed-methods = [
+    { path = "std::process::exit", reason = "Exiting the process is not allowed in this codebase." },
+    { path = "std::process::abort", reason = "Aborting the process is not allowed in this codebase." },
+]

@@ -1,0 +1,16 @@
+[package]
+name = "sqlx-turso-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "sqlx-turso"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

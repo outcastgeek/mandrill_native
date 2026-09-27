@@ -1,0 +1,64 @@
+[package]
+name = "sqlx_turso"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = [
+    "any",
+    "bigdecimal",
+    "bit-vec",
+    "bstr",
+    "chrono",
+    "fts",
+    "json",
+    "ipnet",
+    "ipnetwork",
+    "mac_address",
+    "macros",
+    "migrate",
+    "mimalloc",
+    "offline",
+    "runtime-tokio",
+    "rust_decimal",
+    "sync",
+    "time",
+    "uuid",
+]
+runtime-tokio = ["sqlx/runtime-tokio", "sqlx-turso-core/runtime-tokio"]
+macros = ["dep:sqlx-turso-macros", "sqlx/macros", "sqlx-turso-core/macros"]
+any = ["sqlx/any", "sqlx-turso-core/any"]
+bstr = ["sqlx/bstr", "sqlx-turso-core/bstr"]
+bigdecimal = ["sqlx/bigdecimal", "sqlx-turso-core/bigdecimal", "sqlx-turso-macros?/bigdecimal"]
+bit-vec = ["sqlx/bit-vec", "sqlx-turso-core/bit-vec", "sqlx-turso-macros?/bit-vec"]
+ipnet = ["sqlx/ipnet", "sqlx-turso-core/ipnet", "sqlx-turso-macros?/ipnet"]
+ipnetwork = ["sqlx/ipnetwork", "sqlx-turso-core/ipnetwork", "sqlx-turso-macros?/ipnetwork"]
+mac_address = ["sqlx/mac_address", "sqlx-turso-core/mac_address", "sqlx-turso-macros?/mac_address"]
+rust_decimal = ["sqlx/rust_decimal", "sqlx-turso-core/rust_decimal", "sqlx-turso-macros?/rust_decimal"]
+sync = ["sqlx-turso-core/sync"]
+fts = ["sqlx-turso-core/fts"]
+io-memory-yield = ["sqlx-turso-core/io-memory-yield"]
+mimalloc = ["sqlx-turso-core/mimalloc"]
+pure-rust-crypto = ["sqlx-turso-core/pure-rust-crypto"]
+stacker = ["sqlx-turso-core/stacker"]
+test-helper = ["sqlx-turso-core/test-helper"]
+turso-default = ["sqlx-turso-core/turso-default", "turso/default"]
+migrate = ["sqlx/migrate", "sqlx-turso-core/migrate"]
+offline = ["sqlx-turso-core/offline"]
+chrono = ["sqlx/chrono", "sqlx-turso-core/chrono", "sqlx-turso-macros?/chrono"]
+json = ["sqlx/json", "sqlx-turso-core/json"]
+time = ["sqlx/time", "sqlx-turso-core/time", "sqlx-turso-macros?/time"]
+uuid = ["sqlx/uuid", "sqlx-turso-core/uuid", "sqlx-turso-macros?/uuid"]
+
+[dependencies]
+sqlx = { workspace = true }
+sqlx-turso-core = { version = "0.1.0", path = "../sqlx_turso_core", default-features = false }
+sqlx-turso-macros = { version = "0.1.0", path = "../sqlx_turso_macros", optional = true }
+turso = { workspace = true }
+
+[dev-dependencies]
+rustls = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

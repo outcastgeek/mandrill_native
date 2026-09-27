@@ -1,0 +1,55 @@
+[package]
+name = "sqlx-turso-core"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["runtime-tokio"]
+runtime-tokio = ["sqlx-core/_rt-tokio"]
+any = ["sqlx-core/any"]
+bstr = ["sqlx-core/bstr"]
+bigdecimal = ["sqlx-core/bigdecimal"]
+bit-vec = ["sqlx-core/bit-vec"]
+ipnet = ["sqlx-core/ipnet"]
+ipnetwork = ["sqlx-core/ipnetwork"]
+mac_address = ["sqlx-core/mac_address"]
+rust_decimal = ["sqlx-core/rust_decimal"]
+sync = ["turso/sync"]
+fts = ["turso/fts"]
+io-memory-yield = ["turso/io_memory_yield"]
+mimalloc = ["turso/mimalloc"]
+pure-rust-crypto = ["turso/pure-rust-crypto"]
+stacker = ["turso/stacker"]
+test-helper = ["turso/test_helper"]
+turso-default = ["turso/default"]
+migrate = ["sqlx-core/migrate"]
+offline = ["dep:serde", "dep:serde_json", "sqlx-core/offline"]
+macros = ["offline", "dep:sqlx-macros-core", "sqlx-macros-core/macros", "sqlx-macros-core/_rt-tokio", "sqlx-macros-core/sqlx-toml"]
+chrono = ["dep:chrono", "sqlx-core/chrono"]
+json = ["dep:serde", "dep:serde_json", "sqlx-core/json"]
+time = ["dep:time", "sqlx-core/time"]
+uuid = ["dep:uuid", "sqlx-core/uuid"]
+
+[dependencies]
+chrono = { workspace = true, optional = true }
+either = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
+log = { workspace = true }
+percent-encoding = { workspace = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sqlx-core = { workspace = true }
+sqlx-macros-core = { workspace = true, optional = true }
+time = { workspace = true, features = ["formatting", "macros", "parsing"], optional = true }
+tokio = { workspace = true, features = ["sync"] }
+turso = { workspace = true }
+turso_parser = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

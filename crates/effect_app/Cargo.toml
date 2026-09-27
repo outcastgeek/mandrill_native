@@ -1,0 +1,18 @@
+[package]
+name = "effect-app"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+effect = { path = "../../crates/effect" }
+effect-tokio = { path = "../../crates/effect_tokio" }
+effect-rayon = { path = "../../crates/effect_rayon" }
+effect-native-runtime = { path = "../../crates/effect_native_runtime" }
+native-async-runtime = { path = "../../native_build/rust_async" }
+tokio = { workspace = true, features = ["fs", "signal"] }
+rayon = "1.12.0"
+futures-util = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+[lints]
+workspace = true

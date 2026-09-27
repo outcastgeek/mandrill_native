@@ -1,0 +1,1 @@
+SELECT CAST(43 AS INTEGER) AS `value!: i64`

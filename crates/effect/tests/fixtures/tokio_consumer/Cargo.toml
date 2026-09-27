@@ -1,0 +1,16 @@
+[package]
+name = "effect-tokio-consumer"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+fx = { package = "effect", path = "../../.." }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "time"] }
+
+[dev-dependencies]
+futures-executor = "0.3.34"
+
+[lints.rust]
+warnings = "deny"
