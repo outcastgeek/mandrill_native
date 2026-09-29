@@ -1,3 +1,5 @@
+//! Typed submission and observation of Cluster requests.
+
 use super::{
     AcceptancePolicy, AcceptedRequest, ClusterAddress, ClusterMessageStore, ClusterObserverId,
     ClusterRequestId, DurableClusterMessageStore, HasClusterMessageStore, MessageAcceptance,
@@ -12,34 +14,67 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
+/// A typed failure while sending, observing, or decoding an addressed request.
+///
+/// # Type parameters
+/// - `Backend`: Backend-specific error or provider type.
 pub enum ClusterClientError<Backend> {
+    /// The request failed its declared schema validation. Retains the `SchemaIssue` detail.
     RequestSchema(SchemaIssue),
+    /// The reply failed its declared schema validation. Retains the `SchemaIssue` detail.
     ReplySchema(SchemaIssue),
+    /// RPC framing or envelope validation failed. Retains the `RpcWireError` detail.
     Wire(RpcWireError),
     /// The provider may have accepted the request before acknowledgement was
     /// lost. Reconcile by stable request ID before deciding to submit again.
     UncertainAcceptance {
+        /// The request being handled. Type: `ClusterRequestId`.
         request: ClusterRequestId,
+        /// The underlying failure or provider cause. Type: `Backend`.
         source: Backend,
     },
+    /// The selected store rejected or failed the operation. Retains the `Backend` detail.
     Store(Backend),
+    /// The required reply frame is missing.
     MissingReplyFrame,
+    /// Unexpected additional reply frames were present.
     ExtraReplyFrames,
+    /// The reply operation differs from the required or recorded value.
     ReplyOperationMismatch,
+    /// The reply correlation differs from the required or recorded value.
     ReplyCorrelationMismatch,
+    /// The reply kind differs from the required or recorded value.
     ReplyKindMismatch,
+    /// The received chunks is invalid in the current protocol state.
     UnexpectedChunks,
+    /// An owned input was already consumed.
     InputConsumed,
 }
 
+/// The recorded state currently visible to a client polling an addressed request.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 pub enum ClusterPoll<A, E> {
-    Pending { disposition: MessageDisposition },
+    /// The request is accepted but its reply has not been recorded.
+    Pending {
+        /// Current message-delivery state. Type: `MessageDisposition`.
+        disposition: MessageDisposition,
+    },
+    /// The operation completed and its outcome is available. Carries `Result<A, E>`.
     Completed(Result<A, E>),
 }
 
-/// Typed unary Cluster client backed by atomic message acceptance. A submit
+/// A typed client for submitting addressed messages and observing recorded replies.
 /// only records work; a separate owner/runner performs execution. Observer
 /// cancellation never changes the saved message's execution state.
+///
+/// # Type parameters
+/// - `Q`: Request type.
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
+/// - `Backend`: Backend-specific error or provider type.
 pub struct ClusterClient<Q, A, E, Backend>
 where
     Q: Send + 'static,
@@ -60,6 +95,20 @@ where
     Backend: Send + 'static,
 {
     #[must_use]
+    /// Construct a `ClusterClient` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `Backend`: Backend-specific error or provider type.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `Q`: Request type.
+    ///
+    /// # Parameters
+    /// - `operation` (`RpcOperation<Q, A, E>`): Typed operation definition or callback selected for execution.
+    /// - `policy` (`RpcEnvelopePolicy`): The caller-supplied behavior policy.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(operation: RpcOperation<Q, A, E>, policy: RpcEnvelopePolicy) -> Self {
         Self {
             operation,
@@ -71,6 +120,25 @@ where
     /// Admission that requires acknowledged requests to survive the store's
     /// documented restart boundary. The in-memory store cannot satisfy this
     /// bound, while ordinary `submit` remains available for volatile use.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type.
+    /// - `E`: Domain-error type.
+    /// - `Backend`: Backend-specific error or provider type.
+    /// - `R`: Environment type. Additional bound: `HasClusterMessageStore + Send + Sync + 'static`. Additional bound: `:Store: DurableClusterMessageStore<Error = Backend>`.
+    /// - `Q`: Request type.
+    ///
+    /// # Parameters
+    /// - `address` (`ClusterAddress`): Stable destination address of the entity receiving this request.
+    /// - `request_id` (`ClusterRequestId`): The request id supplied to this operation.
+    /// - `request` (`Q`): The typed request to process.
+    /// - `call` (`RpcCallId`): Identity and contents of the selected RPC call.
+    /// - `accepted_at` (`UtcMillis`): The accepted at supplied to this operation.
+    /// - `acceptance` (`AcceptancePolicy`): The acceptance supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<MessageAcceptance, ClusterClientError<Backend>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn submit_durable<R>(
         &self,
         address: ClusterAddress,
@@ -87,6 +155,26 @@ where
         self.submit(address, request_id, request, call, accepted_at, acceptance)
     }
 
+    /// Transfer accepted work to the selected provider for independent execution.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type.
+    /// - `E`: Domain-error type.
+    /// - `Backend`: Backend-specific error or provider type.
+    /// - `R`: Environment type. Additional bound: `HasClusterMessageStore + Send + Sync + 'static`. Additional bound: `:Store: ClusterMessageStore<Error = Backend>`.
+    /// - `Q`: Request type.
+    ///
+    /// # Parameters
+    /// - `address` (`ClusterAddress`): Stable destination address of the entity receiving this request.
+    /// - `request_id` (`ClusterRequestId`): The request id supplied to this operation.
+    /// - `request` (`Q`): The typed request to process.
+    /// - `call` (`RpcCallId`): Identity and contents of the selected RPC call.
+    /// - `accepted_at` (`UtcMillis`): The accepted at supplied to this operation.
+    /// - `acceptance` (`AcceptancePolicy`): The acceptance supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<MessageAcceptance, ClusterClientError<Backend>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn submit<R>(
         &self,
         address: ClusterAddress,
@@ -169,6 +257,24 @@ where
         })
     }
 
+    /// Inspect the current state without waiting for a later change.
+    ///
+    /// # Type parameters
+    /// - `Q`: Request type.
+    /// - `Backend`: Backend-specific error or provider type.
+    /// - `R`: Environment type. Additional bound: `HasClusterMessageStore + Send + Sync + 'static`. Additional bound: `:Store: ClusterMessageStore<Error = Backend>`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `address` (`ClusterAddress`): Stable destination address of the entity receiving this request.
+    /// - `request` (`ClusterRequestId`): The typed request to process.
+    /// - `observer` (`ClusterObserverId`): Stable identity of the client observing recorded results.
+    /// - `call` (`RpcCallId`): Identity and contents of the selected RPC call.
+    ///
+    /// # Returns
+    /// Type: `Effect<ClusterPoll<A, E>, ClusterClientError<Backend>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn poll<R>(
         &self,
         address: ClusterAddress,
@@ -208,6 +314,23 @@ where
         })
     }
 
+    /// Record that the selected observer has consumed the reply.
+    ///
+    /// # Type parameters
+    /// - `Q`: Request type.
+    /// - `A`: Application value type.
+    /// - `E`: Domain-error type.
+    /// - `Backend`: Backend-specific error or provider type.
+    /// - `R`: Environment type. Additional bound: `HasClusterMessageStore + Send + Sync + 'static`. Additional bound: `:Store: ClusterMessageStore<Error = Backend>`.
+    ///
+    /// # Parameters
+    /// - `address` (`ClusterAddress`): Stable destination address of the entity receiving this request.
+    /// - `request` (`ClusterRequestId`): The typed request to process.
+    /// - `observer` (`ClusterObserverId`): Stable identity of the client observing recorded results.
+    ///
+    /// # Returns
+    /// Type: `Effect<StoreMutation, ClusterClientError<Backend>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn acknowledge_reply<R>(
         &self,
         address: ClusterAddress,
@@ -226,6 +349,23 @@ where
         })
     }
 
+    /// Remove an observer without discarding authoritative work.
+    ///
+    /// # Type parameters
+    /// - `Q`: Request type.
+    /// - `A`: Application value type.
+    /// - `E`: Domain-error type.
+    /// - `Backend`: Backend-specific error or provider type.
+    /// - `R`: Environment type. Additional bound: `HasClusterMessageStore + Send + Sync + 'static`. Additional bound: `:Store: ClusterMessageStore<Error = Backend>`.
+    ///
+    /// # Parameters
+    /// - `address` (`ClusterAddress`): Stable destination address of the entity receiving this request.
+    /// - `request` (`ClusterRequestId`): The typed request to process.
+    /// - `observer` (`ClusterObserverId`): Stable identity of the client observing recorded results.
+    ///
+    /// # Returns
+    /// Type: `Effect<bool, ClusterClientError<Backend>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn detach_observer<R>(
         &self,
         address: ClusterAddress,
@@ -245,6 +385,21 @@ where
     }
 }
 
+///
+/// # Type parameters
+/// - `Q`: Request payload type. Additional bound: `Send + 'static`.
+/// - `A`: Successful application-value type. Additional bound: `Send + 'static`.
+/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
+/// - `Backend`: Backend-specific error or provider type. Additional bound: `Send + 'static`.
+///
+/// # Parameters
+/// - `operation` (`&RpcOperation<Q, A, E>`): Typed operation definition or callback selected for execution.
+/// - `call` (`&RpcCallId`): Identity and contents of the selected RPC call.
+/// - `reply` (`&SavedReply`): The reply supplied to this operation.
+/// - `policy` (`RpcEnvelopePolicy`): The caller-supplied behavior policy.
+///
+/// # Returns
+/// Type: `Result<Result<A, E>, ClusterClientError<Backend>>`.
 fn decode_reply<Q, A, E, Backend>(
     operation: &RpcOperation<Q, A, E>,
     call: &RpcCallId,

@@ -1,15 +1,23 @@
+//! Lazy recursive schema preparation.
+
 use crate::schema::{
     ParseLimits, SchemaAst, SchemaIssue, SchemaIssueKind, SchemaResource, SchemaShape,
 };
 use std::collections::BTreeSet;
 
 #[derive(Clone, Copy)]
+/// Typed prepared structure used by schema internal preparation.
 pub(crate) struct PreparedStructure {
     nodes: usize,
     depth: usize,
 }
 
 impl PreparedStructure {
+    /// # Parameters
+    /// - `limits` (`ParseLimits`): Explicit resource bounds enforced while processing this input.
+    ///
+    /// # Returns
+    /// Type: `Result<(), SchemaIssue>`.
     pub(crate) fn within(self, limits: ParseLimits) -> Result<(), SchemaIssue> {
         if self.nodes > limits.nodes.get() {
             return Err(SchemaIssue::new(SchemaIssueKind::LimitExceeded {
@@ -25,6 +33,7 @@ impl PreparedStructure {
     }
 }
 
+/// Variants of frame used by schema internal preparation.
 enum Frame {
     Enter(SchemaAst, usize),
     Leave(usize),
@@ -33,6 +42,13 @@ enum Frame {
 /// Preparation counts every acyclic occurrence, including shared nodes.
 /// A back-edge terminates at the recursive reference; value parsing still
 /// applies its depth and node limits to each actual recursive value.
+///
+/// # Parameters
+/// - `root` (`&SchemaAst`): The root supplied to this operation.
+/// - `limits` (`ParseLimits`): Explicit resource bounds enforced while processing this input.
+///
+/// # Returns
+/// Type: `Result<PreparedStructure, SchemaIssue>`.
 pub(crate) fn prepare_structure(
     root: &SchemaAst,
     limits: ParseLimits,
@@ -155,6 +171,13 @@ pub(crate) fn prepare_structure(
     Ok(PreparedStructure { nodes, depth })
 }
 
+///
+/// # Parameters
+/// - `resource` (`SchemaResource`): The resource supplied to this operation.
+///
+/// # Returns
+/// Type: `SchemaIssue`.
+/// Returns `SchemaIssue`.
 fn limit(resource: SchemaResource) -> SchemaIssue {
     SchemaIssue::new(SchemaIssueKind::LimitExceeded { resource })
 }

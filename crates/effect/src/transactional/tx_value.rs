@@ -1,3 +1,5 @@
+//! Value ownership requirements for transactional cells.
+
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::Hash;

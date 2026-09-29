@@ -1,3 +1,5 @@
+//! Named recoverable workflow deadlines.
+
 use super::{
     DeadlineClear, DeadlineWait, DeadlineWake, HasWorkflowEngine, RecordedDeadline, WorkflowEngine,
     WorkflowRunId, WorkflowSnapshot,
@@ -5,11 +7,23 @@ use super::{
 use crate::{Effect, HasWallClock, WallClock};
 
 #[derive(Debug)]
+/// An engine or time-provider failure while waiting on a recorded deadline.
+///
+/// # Type parameters
+/// - `EngineError`: Error returned by the workflow engine.
+/// - `ClockError`: Error returned by the clock capability.
 pub enum DurableClockError<EngineError, ClockError> {
+    /// The workflow engine rejected or could not complete the operation. Retains the `EngineError` detail.
     Engine(EngineError),
+    /// The selected clock could not schedule or observe the requested time. Retains the `ClockError` detail.
     Clock(ClockError),
 }
 
+/// Type alias for durable clock effect in workflow durable clock.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `R`: Environment type.
 pub type DurableClockEffect<A, R> = Effect<
     A,
     DurableClockError<
@@ -25,6 +39,17 @@ pub type DurableClockEffect<A, R> = Effect<
 pub struct DurableClock;
 
 impl DurableClock {
+    /// Record and wait for a durable deadline using the workflow engine and clock.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Additional bound: `HasWorkflowEngine + HasWallClock + Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `deadline` (`RecordedDeadline`): The deadline for the pending operation.
+    ///
+    /// # Returns
+    /// Type: `DurableClockEffect<DeadlineWait, R>`.
     pub fn wait_until<R>(
         run: WorkflowRunId,
         deadline: RecordedDeadline,
@@ -48,6 +73,18 @@ impl DurableClock {
             })
     }
 
+    /// Record a deadline so replay can recover the same scheduling decision.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Additional bound: `HasWorkflowEngine + Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `deadline` (`RecordedDeadline`): The deadline for the pending operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<WorkflowSnapshot, <<R as HasWorkflowEngine>::Engine as WorkflowEngine>::Error, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn schedule<R>(
         run: WorkflowRunId,
         deadline: RecordedDeadline,
@@ -62,6 +99,18 @@ impl DurableClock {
         })
     }
 
+    /// Remove a recorded deadline after its wait is no longer needed.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Additional bound: `HasWorkflowEngine + Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `expected` (`RecordedDeadline`): Value or revision required for the proposed state transition.
+    ///
+    /// # Returns
+    /// Type: `Effect<DeadlineClear, <<R as HasWorkflowEngine>::Engine as WorkflowEngine>::Error, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn clear<R>(
         run: WorkflowRunId,
         expected: RecordedDeadline,
@@ -76,6 +125,13 @@ impl DurableClock {
         })
     }
 
+    /// Resume recorded waits whose deadlines have become due.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Additional bound: `HasWorkflowEngine + HasWallClock + Send + Sync + 'static`.
+    ///
+    /// # Returns
+    /// Type: `DurableClockEffect<Vec<WorkflowRunId>, R>`.
     pub fn wake_due<R>() -> DurableClockEffect<Vec<WorkflowRunId>, R>
     where
         R: HasWorkflowEngine + HasWallClock + Send + Sync + 'static,
@@ -93,6 +149,16 @@ impl DurableClock {
     }
 
     /// Wake one recorded deadline only if it has not been rescheduled.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Additional bound: `HasWorkflowEngine + HasWallClock + Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `expected` (`RecordedDeadline`): Value or revision required for the proposed state transition.
+    ///
+    /// # Returns
+    /// Type: `DurableClockEffect<DeadlineWake, R>`.
     pub fn wake_one<R>(
         run: WorkflowRunId,
         expected: RecordedDeadline,

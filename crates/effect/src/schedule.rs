@@ -1,3 +1,5 @@
+//! Composable retry and repeat scheduling decisions.
+
 use crate::internal::destruction::FlatDrop;
 use crate::internal::outcome;
 use crate::internal::runtime::{self, Context, Finish, Step};
@@ -10,41 +12,79 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug)]
+/// Schedule sampling that adds no random jitter.
 pub struct Deterministic;
 #[derive(Clone, Copy, Debug)]
+/// Schedule sampling that draws jitter from an environment random capability.
 pub struct Randomized;
+/// Supplies values used when a schedule requests randomized sampling.
 pub trait ScheduleSampling<R>: Send + Sync + 'static {
+    /// # Type parameters
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `env` (`&R`): The environment supplying this operation's capabilities.
+    ///
+    /// # Returns
+    /// Type: `Result<Option<UnitInterval>, Defect>`.
     fn sample(env: &R) -> Result<Option<UnitInterval>, Defect>;
 }
 impl<R> ScheduleSampling<R> for Deterministic {
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type.
+    ///
+    /// # Returns
+    /// Type: `Result<Option<UnitInterval>, Defect>`.
     fn sample(_: &R) -> Result<Option<UnitInterval>, Defect> {
         Ok(None)
     }
 }
 impl<R: HasRandom> ScheduleSampling<R> for Randomized {
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `env` (`&R`): The environment supplying this operation's capabilities.
+    ///
+    /// # Returns
+    /// Type: `Result<Option<UnitInterval>, Defect>`.
     fn sample(env: &R) -> Result<Option<UnitInterval>, Defect> {
         env.random().sample().map(Some)
     }
 }
+/// Combines two schedule sampling requirements into one capability.
 pub trait CombineSampling<S> {
+    /// Combined sampling capability produced by this composition.
     type Combined: Send + Sync + 'static;
 }
 impl CombineSampling<Deterministic> for Deterministic {
+    /// Type alias for combined in schedule.
     type Combined = Deterministic;
 }
 impl CombineSampling<Randomized> for Deterministic {
+    /// Type alias for combined in schedule.
     type Combined = Randomized;
 }
 impl CombineSampling<Deterministic> for Randomized {
+    /// Type alias for combined in schedule.
     type Combined = Randomized;
 }
 impl CombineSampling<Randomized> for Randomized {
+    /// Type alias for combined in schedule.
     type Combined = Randomized;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+/// A validated multiplier for exponential schedule delays.
 pub struct GrowthFactor(f64);
 impl GrowthFactor {
+    /// # Parameters
+    /// - `value` (`f64`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, LibraryDefect>`.
     pub const fn new(value: f64) -> Result<Self, LibraryDefect> {
         if value.is_finite() && value >= NonZeroU8::MIN.get() as f64 {
             Ok(Self(value))
@@ -53,13 +93,21 @@ impl GrowthFactor {
         }
     }
     #[must_use]
+    /// # Returns
+    /// Type: `f64`.
     pub const fn get(self) -> f64 {
         self.0
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
+/// A validated nonnegative factor for schedule calculations.
 pub struct NonnegativeFactor(f64);
 impl NonnegativeFactor {
+    /// # Parameters
+    /// - `value` (`f64`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, LibraryDefect>`.
     pub const fn new(value: f64) -> Result<Self, LibraryDefect> {
         if value.is_finite() && value >= u8::MIN as f64 {
             Ok(Self(value))
@@ -68,22 +116,48 @@ impl NonnegativeFactor {
         }
     }
     #[must_use]
+    /// # Returns
+    /// Type: `f64`.
     pub const fn get(self) -> f64 {
         self.0
     }
 }
 
+/// A schedule step that either continues with its next delay or stops.
+///
+/// # Type parameters
+/// - `I`: Input type. Bound or type: `'static`.
+/// - `O`: Output type. Bound or type: `'static`.
+/// - `S`: Service or storage type. Bound or type: `'static = Deterministic`.
 pub enum ScheduleDecision<I: 'static, O: 'static, S: 'static = Deterministic> {
+    /// End the schedule without producing another step. Contains `O`.
     Stop(O),
+    /// Continue with the next schedule or workflow step.
     Continue {
+        /// The output produced by this operation. Type: `O`.
         output: O,
+        /// Time to wait before the next schedule decision. Type: `Duration`.
         delay: Duration,
+        /// Next position after the current record. Type: `Schedule<I, O, S>`.
         next: Schedule<I, O, S>,
     },
+    /// The  failed validation. Carries `Defect`.
     Invalid(Defect),
 }
+/// Type alias for policy in schedule.
+///
+/// # Type parameters
+/// - `I`: Input type.
+/// - `O`: Output type.
+/// - `S`: Service or storage type.
 type Policy<I, O, S> =
     Arc<dyn Fn(&I, Duration, Option<UnitInterval>) -> ScheduleDecision<I, O, S> + Send + Sync>;
+/// Type alias for transition in schedule.
+///
+/// # Type parameters
+/// - `State`: Stored state type.
+/// - `I`: Input type.
+/// - `O`: Output type.
 type Transition<State, I, O> = Arc<
     dyn Fn(
             &State,
@@ -94,10 +168,19 @@ type Transition<State, I, O> = Arc<
         + Send
         + Sync,
 >;
+/// A reusable policy for retries, repeats, and time-based recurrence.
+///
+/// # Type parameters
+/// - `I`: Input type. Bound or type: `'static`.
+/// - `O`: Output type. Bound or type: `'static`.
+/// - `S`: Service or storage type. Bound or type: `'static = Deterministic`.
 pub struct Schedule<I: 'static, O: 'static, S: 'static = Deterministic> {
     policy: FlatDrop<Policy<I, O, S>>,
 }
 impl<I: 'static, O: 'static, S: 'static> Clone for Schedule<I, O, S> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             policy: self.policy.clone(),
@@ -106,6 +189,18 @@ impl<I: 'static, O: 'static, S: 'static> Clone for Schedule<I, O, S> {
 }
 impl<I: 'static, O: 'static, S: Send + Sync + 'static> Schedule<I, O, S> {
     #[must_use]
+    /// Construct a `Schedule` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `I`: Input type.
+    /// - `O`: Output type.
+    /// - `S`: Service or store type.
+    ///
+    /// # Parameters
+    /// - `policy` (`impl Fn(&I, Duration, Option<UnitInterval>) -> ScheduleDecision<I, O, S> + Send + Sync + 'static`): The caller-supplied behavior policy.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(
         policy: impl Fn(&I, Duration, Option<UnitInterval>) -> ScheduleDecision<I, O, S>
         + Send
@@ -116,6 +211,20 @@ impl<I: 'static, O: 'static, S: Send + Sync + 'static> Schedule<I, O, S> {
             policy: FlatDrop::new(Arc::new(policy)),
         }
     }
+    /// Evaluate one scheduling decision from the current state and input.
+    ///
+    /// # Type parameters
+    /// - `I`: Input type.
+    /// - `O`: Output type.
+    /// - `S`: Service or store type.
+    ///
+    /// # Parameters
+    /// - `input` (`&I`): The input value or factory consumed by this operation.
+    /// - `elapsed` (`Duration`): The elapsed supplied to this operation.
+    /// - `sample` (`Option<UnitInterval>`): The sample supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `ScheduleDecision<I, O, S>`.
     pub fn step(
         &self,
         input: &I,
@@ -128,6 +237,20 @@ impl<I: 'static, O: 'static, S: Send + Sync + 'static> Schedule<I, O, S> {
         }
     }
     #[must_use]
+    /// Build a schedule by repeatedly applying the supplied state transition.
+    ///
+    /// # Type parameters
+    /// - `S`: Service or storage type. Bound: `Send + Sync + 'static`.
+    /// - `State`: Bounds: `Send + Sync + 'static`.
+    /// - `I`: Input type.
+    /// - `O`: Output type.
+    ///
+    /// # Parameters
+    /// - `state` (`State`): Current or replacement state owned by this operation.
+    /// - `next` (`impl Fn( &State, &I, Duration, Option<UnitInterval>, ) -> Result<(O, Option<(Duration, State)>), Defect> + Send + Sync + 'static`): Next value or state produced by the transition.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn unfold<State: Send + Sync + 'static>(
         state: State,
         next: impl Fn(
@@ -142,6 +265,18 @@ impl<I: 'static, O: 'static, S: Send + Sync + 'static> Schedule<I, O, S> {
     ) -> Self {
         Self::unfold_shared(state, Arc::new(next))
     }
+    ///
+    /// # Type parameters
+    /// - `State`: Bounds: `Send + Sync + 'static`.
+    /// - `I`: Input type.
+    /// - `O`: Output type.
+    ///
+    /// # Parameters
+    /// - `state` (`State`): Current or replacement state owned by this operation.
+    /// - `next` (`Transition<State, I, O>`): Next value or state produced by the transition.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn unfold_shared<State: Send + Sync + 'static>(
         state: State,
         next: Transition<State, I, O>,
@@ -159,6 +294,18 @@ impl<I: 'static, O: 'static, S: Send + Sync + 'static> Schedule<I, O, S> {
         )
     }
     #[must_use]
+    /// Stop this schedule once its elapsed-time bound is reached.
+    ///
+    /// # Type parameters
+    /// - `I`: Input type. Bound: `'static`.
+    /// - `O`: Output type. Bound: `'static`.
+    /// - `S`: Service or storage type. Bound: `Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `limit` (`Duration`): The caller-supplied limit.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn up_to(self, limit: Duration) -> Self {
         Self::new(
             move |input, elapsed, sample| match self.step(input, elapsed, sample) {
@@ -181,6 +328,19 @@ impl<I: 'static, O: 'static, S: Send + Sync + 'static> Schedule<I, O, S> {
             },
         )
     }
+    /// Add environment-supplied random variation to the schedule delays.
+    ///
+    /// # Type parameters
+    /// - `S`: Service or storage type. Bound: `Send + Sync + 'static`.
+    /// - `I`: Input type.
+    /// - `O`: Output type.
+    ///
+    /// # Parameters
+    /// - `minimum` (`NonnegativeFactor`): Lower bound enforced by this policy.
+    /// - `maximum` (`NonnegativeFactor`): Upper bound enforced by this policy.
+    ///
+    /// # Returns
+    /// Type: `Result<Schedule<I, O, Randomized>, LibraryDefect>`.
     pub fn jitter(
         self,
         minimum: NonnegativeFactor,
@@ -191,6 +351,18 @@ impl<I: 'static, O: 'static, S: Send + Sync + 'static> Schedule<I, O, S> {
         }
         Ok(self.jitter_validated(minimum, maximum))
     }
+    ///
+    /// # Type parameters
+    /// - `I`: Input type.
+    /// - `O`: Output type.
+    ///
+    /// # Parameters
+    /// - `minimum` (`NonnegativeFactor`): Lower bound enforced by this policy.
+    /// - `maximum` (`NonnegativeFactor`): Upper bound enforced by this policy.
+    ///
+    /// # Returns
+    /// Type: `Schedule<I, O, Randomized>`.
+    /// Returns `Schedule<I, O, Randomized>`.
     fn jitter_validated(
         self,
         minimum: NonnegativeFactor,
@@ -226,6 +398,20 @@ impl<I: 'static, O: 'static, S: Send + Sync + 'static> Schedule<I, O, S> {
         })
     }
     #[must_use]
+    /// Continue only while both schedules continue, combining their delays.
+    ///
+    /// # Type parameters
+    /// - `P`: Payload type. Bounds: `'static`.
+    /// - `T`: Value or item type. Bounds: `Send + Sync + 'static`.
+    /// - `I`: Input type.
+    /// - `O`: Output type.
+    /// - `S`: Service or store type.
+    ///
+    /// # Parameters
+    /// - `right` (`Schedule<I, P, T>`): Right-hand operation composed with this one.
+    ///
+    /// # Returns
+    /// Type: `Schedule<I, (O, P), S::Combined>`.
     pub fn intersect<P: 'static, T: Send + Sync + 'static>(
         self,
         right: Schedule<I, P, T>,
@@ -267,6 +453,16 @@ impl<I: 'static, O: 'static, S: Send + Sync + 'static> Schedule<I, O, S> {
 }
 impl<I: 'static> Schedule<I, usize> {
     #[must_use]
+    /// Continue for the caller-specified number of recurrences.
+    ///
+    /// # Type parameters
+    /// - `I`: Input type. Bound: `'static`.
+    ///
+    /// # Parameters
+    /// - `count` (`usize`): Caller-selected number of iterations, values, or permits.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn recurs(count: usize) -> Self {
         Self::unfold(usize::default(), move |index, _, _, _| {
             let next = if *index < count {
@@ -281,6 +477,16 @@ impl<I: 'static> Schedule<I, usize> {
         })
     }
     #[must_use]
+    /// Continue with the caller-specified delay between decisions.
+    ///
+    /// # Type parameters
+    /// - `I`: Input type. Bound: `'static`.
+    ///
+    /// # Parameters
+    /// - `delay` (`Duration`): The delay supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn spaced(delay: Duration) -> Self {
         Self::unfold(usize::default(), move |index, _, _, _| {
             let next = index
@@ -290,6 +496,17 @@ impl<I: 'static> Schedule<I, usize> {
         })
     }
     #[must_use]
+    /// Grow each delay by a validated factor until the schedule stops.
+    ///
+    /// # Type parameters
+    /// - `I`: Input type. Bound: `'static`.
+    ///
+    /// # Parameters
+    /// - `initial` (`Duration`): Initial value used before any state transition.
+    /// - `factor` (`GrowthFactor`): The factor supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn exponential(initial: Duration, factor: GrowthFactor) -> Self {
         Self::unfold(
             (usize::default(), initial),
@@ -305,14 +522,41 @@ impl<I: 'static> Schedule<I, usize> {
     }
 }
 
+/// Selects the failure for retry or the success for repetition from an exit.
 trait Selection<A, E> {
+    /// Type alias for input in schedule.
     type Input;
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `outcome` (`&Exit<A, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+    ///
+    /// # Returns
+    /// Type: `Option<&Self::Input>`.
+    /// Returns the value when present, or `None`.
     fn selected(outcome: &Exit<A, E>) -> Option<&Self::Input>;
 }
+/// Typed retry used by schedule.
 struct Retry;
+/// Typed repeat used by schedule.
 struct Repeat;
 impl<A, E> Selection<A, E> for Retry {
+    /// Type alias for input in schedule.
     type Input = E;
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `outcome` (`&Exit<A, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+    ///
+    /// # Returns
+    /// Type: `Option<&E>`.
+    /// Returns the value when present, or `None`.
     fn selected(outcome: &Exit<A, E>) -> Option<&E> {
         match outcome {
             Exit::Fail(error) => Some(error),
@@ -323,7 +567,19 @@ impl<A, E> Selection<A, E> for Retry {
     }
 }
 impl<A, E> Selection<A, E> for Repeat {
+    /// Type alias for input in schedule.
     type Input = A;
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `outcome` (`&Exit<A, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+    ///
+    /// # Returns
+    /// Type: `Option<&A>`.
+    /// Returns the value when present, or `None`.
     fn selected(outcome: &Exit<A, E>) -> Option<&A> {
         match outcome {
             Exit::Success(value) => Some(value),
@@ -331,6 +587,26 @@ impl<A, E> Selection<A, E> for Repeat {
         }
     }
 }
+///
+/// # Type parameters
+/// - `A`: Successful application-value type. Additional bound: `Send + 'static`.
+/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type supplying required capabilities. Additional bound: `HasClock + Send + Sync + 'static`.
+/// - `O`: Output or terminal value type. Additional bound: `Send + 'static`.
+/// - `S`: State or store value type. Additional bound: `ScheduleSampling<R>`.
+/// - `T`: Stored or transferred value type. Additional bound: `Selection<A, E> + Send + 'static`. Additional bound: `:Input: 'static`.
+///
+/// # Parameters
+/// - `program` (`Effect<A, E, R>`): Lazy Effect description executed or transformed here.
+/// - `schedule` (`Schedule<T::Input, O, S>`): The schedule supplied to this operation.
+/// - `started` (`Duration`): The started supplied to this operation.
+/// - `env` (`Arc<R>`): The environment supplying this operation's capabilities.
+/// - `context` (`Context`): Execution context carrying cancellation, scope, and trace state.
+/// - `finish` (`Finish<A, E>`): Continuation receiving the complete terminal outcome.
+///
+/// # Returns
+/// Type: `Step`.
+/// Returns `Step`.
 fn attempt<A, E, R, O, S, T>(
     program: Effect<A, E, R>,
     schedule: Schedule<T::Input, O, S>,
@@ -426,6 +702,22 @@ where
         }),
     )
 }
+///
+/// # Type parameters
+/// - `A`: Successful application-value type. Additional bound: `Send + 'static`.
+/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type supplying required capabilities. Additional bound: `HasClock + Send + Sync + 'static`.
+/// - `O`: Output or terminal value type. Additional bound: `Send + 'static`.
+/// - `S`: State or store value type. Additional bound: `ScheduleSampling<R>`.
+/// - `T`: Stored or transferred value type. Additional bound: `Selection<A, E> + Send + 'static`. Additional bound: `:Input: 'static`.
+///
+/// # Parameters
+/// - `program` (`Effect<A, E, R>`): Lazy Effect description executed or transformed here.
+/// - `schedule` (`Schedule<T::Input, O, S>`): The schedule supplied to this operation.
+///
+/// # Returns
+/// Type: `Effect<A, E, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 fn iterate<A, E, R, O, S, T>(
     program: Effect<A, E, R>,
     schedule: Schedule<T::Input, O, S>,
@@ -455,12 +747,40 @@ where
     })
 }
 impl<A: Send + 'static, E: Send + 'static, R: HasClock + Send + Sync + 'static> Effect<A, E, R> {
+    /// Describe another attempt under the supplied retry policy.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bound: `HasClock + Send + Sync + 'static`.
+    /// - `O`: Output type. Bounds: `Send + 'static`.
+    /// - `S`: Service or storage type. Bounds: `ScheduleSampling<R>`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `schedule` (`Schedule<E, O, S>`): The schedule supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn retry<O: Send + 'static, S: ScheduleSampling<R>>(
         self,
         schedule: Schedule<E, O, S>,
     ) -> Self {
         iterate::<A, E, R, O, S, Retry>(self, schedule)
     }
+    /// Re-execute a successful Effect while this schedule continues.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bound: `HasClock + Send + Sync + 'static`.
+    /// - `O`: Output type. Bounds: `Send + 'static`.
+    /// - `S`: Service or storage type. Bounds: `ScheduleSampling<R>`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `schedule` (`Schedule<A, O, S>`): The schedule supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn repeat<O: Send + 'static, S: ScheduleSampling<R>>(
         self,
         schedule: Schedule<A, O, S>,

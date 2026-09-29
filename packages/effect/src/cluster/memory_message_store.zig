@@ -9,6 +9,11 @@ const ownership_contract = @import("cluster_capabilities.zig");
 const messages = @import("message_store.zig");
 const ClusterError = @import("cluster_error.zig").Error;
 
+/// Construct an in-memory message store provider with caller-owned runtime resources.
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `now: comptime fn (*const R) deadlines.WallInstant`: Compile-time caller-supplied time or cursor boundary used for ordering and retention.
+/// Returns (`type`): in-memory message-store implementation using caller-owned runtime resources.
 pub fn MemoryMessageStore(
     comptime R: type,
     comptime now: fn (*const R) deadlines.WallInstant,
@@ -69,6 +74,12 @@ pub fn MemoryMessageStore(
         items: std.array_list.Managed(Item),
         closed: bool = false,
 
+        /// Create an in-memory message store with the supplied ownership fence.
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `fence: ownership_contract.Fence`: Ownership fence checked before applying this transition.
+        /// Returns (`Self`): a store bound to the caller environment and fence.
         pub fn init(env: *const R, fence: ownership_contract.Fence) Self {
             if (R == void or !@hasField(R, "allocator") or @FieldType(R, "allocator") != std.mem.Allocator)
                 @compileError("MemoryMessageStore requires caller allocator in R");
@@ -82,6 +93,10 @@ pub fn MemoryMessageStore(
             };
         }
 
+        /// Expose this implementation through its capability interface.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`Store`): A capability adapter referencing the selected implementation; keep its backing state alive while in use.
         pub fn capability(self: *Self) Store {
             return Store.fromProvider(self, &.{
                 .accept = acceptEffect,
@@ -517,6 +532,12 @@ pub fn MemoryMessageStore(
         /// Reclaim only terminal, acknowledged records after their declared
         /// retention deadline. An unfinished request or an unacknowledged
         /// streaming chunk remains claimable/readable even past that date.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`outcomes.Exit(usize, Failure)`): Carries `usize` on `.success` or `Failure` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn pruneExpired(self: *Self, env: *const R) outcomes.Exit(usize, Failure) {
             const instant = now(env);
             self.mutex.lockUncancelable(self.io);
@@ -542,12 +563,20 @@ pub fn MemoryMessageStore(
             return .{ .success = removed };
         }
 
+        /// Stop the capability and release its retained resources.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn shutdown(self: *Self) void {
             self.mutex.lockUncancelable(self.io);
             self.closed = true;
             self.mutex.unlock(self.io);
         }
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             self.shutdown();
             for (self.items.items) |*item| item.deinit();

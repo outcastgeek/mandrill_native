@@ -10,12 +10,18 @@ const outcomes = @import("../outcome.zig");
 const Issue = @import("../schema/schema_issue.zig").Issue;
 const frame = @import("schema_binary.zig");
 
+/// Count uses `u32` as its stable representation in this module.
 pub const Count = u32;
+/// Explicit limits for frame bytes, collection items, and nesting depth.
 pub const Limits = struct {
     frame: frame.Limits,
     max_collection_items: usize,
     max_depth: usize,
 
+    /// Check whether this value satisfies its structural invariants.
+    /// Parameters:
+    /// - `self: Limits`: Receiver passed by value: the struct itself is copied, while any referenced storage keeps its original ownership and lifetime.
+    /// Returns (`bool`): `true` when frame limits validate and collection/depth bounds are positive.
     pub fn valid(self: Limits) bool {
         return self.frame.valid() and self.max_collection_items > 0 and self.max_depth > 0;
     }
@@ -198,20 +204,35 @@ fn decodeValue(comptime T: type, allocator: std.mem.Allocator, cursor: *Cursor, 
 
 /// All variable-size fields borrow this arena, which is released with the
 /// decoded value. Move the owner as a unit; do not retain fields after deinit.
+///
+/// Parameters:
+/// - `T: comptime type`: Value type stored or transported by the returned component.
+/// Returns (`type`): decoded value owner retaining the arena for variable-size fields.
 pub fn Decoded(comptime T: type) type {
     return struct {
         const Self = @This();
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         value: T,
         arena: *std.heap.ArenaAllocator,
         allocator: std.mem.Allocator,
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             self.arena.deinit();
             self.allocator.destroy(self.arena);
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!Self`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const Self) error{OutOfMemory}!Self {
             const target = try self.allocator.create(std.heap.ArenaAllocator);
             target.* = std.heap.ArenaAllocator.init(self.allocator);
@@ -251,6 +272,12 @@ fn cloneValue(comptime T: type, value: T, allocator: std.mem.Allocator) error{Ou
     };
 }
 
+/// Define a typed codec with its compile-time value and representation types.
+/// Parameters:
+/// - `T: comptime type`: Value type stored or transported by the returned component.
+/// - `schema_name: comptime []const u8`: Compile-time typed codec/schema fixing the corresponding decoded and encoded
+///   value types.
+/// Returns (`type`): binary codec derived from the compile-time Zig value shape and explicit limits.
 pub fn Codec(comptime T: type, comptime schema_name: []const u8) type {
     comptime {
         if (!supported(T)) @compileError("binary schema supports only scalar, enum, optional, array, immutable slice, struct and tagged-union values");
@@ -258,6 +285,15 @@ pub fn Codec(comptime T: type, comptime schema_name: []const u8) type {
             @compileError("binary schema name must be nonempty UTF-8");
     }
     return struct {
+        /// Encode a value into its wire representation.
+        /// Parameters:
+        /// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
+        ///   joined it.
+        /// - `limits: Limits`: Caller-selected, validated behavior or resource bounds; no hidden default
+        ///   is installed.
+        /// Returns (`outcomes.Exit(outcomes.OwnedSlice(u8), Issue)`): Carries `outcomes.OwnedSlice(u8)` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn encode(env: anytype, value: *const T, limits: Limits) outcomes.Exit(outcomes.OwnedSlice(u8), Issue) {
             if (!limits.valid()) return .{ .fail = Issue.init(env, .definition, .size_limit) };
             var payload = std.array_list.Managed(u8).init(env.allocator);
@@ -270,6 +306,15 @@ pub fn Codec(comptime T: type, comptime schema_name: []const u8) type {
             return frame.encode(env, schema_name, payload.items, limits.frame);
         }
 
+        /// Decode a value from its wire representation.
+        /// Parameters:
+        /// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `bytes: []const u8`: Borrowed input; keep its owner alive until the operation has copied or
+        ///   joined it.
+        /// - `limits: Limits`: Caller-selected, validated behavior or resource bounds; no hidden default
+        ///   is installed.
+        /// Returns (`outcomes.Exit(Decoded(T), Issue)`): Carries `Decoded(T)` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn decode(env: anytype, bytes: []const u8, limits: Limits) outcomes.Exit(Decoded(T), Issue) {
             if (!limits.valid()) return .{ .fail = Issue.init(env, .definition, .size_limit) };
             const view = switch (frame.inspect(bytes, limits.frame)) {

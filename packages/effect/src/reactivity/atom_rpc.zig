@@ -7,18 +7,33 @@ const registry = @import("atom_registry.zig");
 const query = @import("query.zig");
 const services = @import("../services.zig");
 
+/// Specialize the typed mutation report outcome for reactivity operations.
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// Returns (`type`): typed result of a remote atom mutation and its invalidation status.
 pub fn MutationReport(comptime A: type) type {
     return struct {
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         reply: A,
         invalidation: outcomes.Exit(@import("invalidation_registry.zig").InvalidateResult, registry.Error),
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *@This()) void {
             outcomes.discardPayload(&self.reply);
             self.invalidation.deinit();
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
             var reply = try outcomes.clonePayload(self.reply);
             errdefer outcomes.discardPayload(&reply);
@@ -33,6 +48,15 @@ pub fn MutationReport(comptime A: type) type {
 
 /// The query state is registered before its first refresh. Its normal
 /// generation and dirty-bit rules reject obsolete RPC completions.
+///
+/// Parameters:
+/// - `Client: comptime type`: Compile-time typed RPC client interface.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `select_request: comptime fn (*const R) *const Client.Request`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_state: comptime fn (*const R) *query.State(Client.Success, Client.Failure)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// Returns (`effects.Effect(void, query.Error(Client.Failure), R)`): atom value fetched over RPC and published locally.
 pub fn refresh(
     comptime Client: type,
     comptime R: type,
@@ -46,6 +70,18 @@ pub fn refresh(
     }.evaluate);
 }
 
+/// Refresh only when the atom or query is stale.
+/// Parameters:
+/// - `Client: comptime type`: Compile-time typed RPC client interface.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `select_request: comptime fn (*const R) *const Client.Request`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_state: comptime fn (*const R) *query.State(Client.Success, Client.Failure)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_clock: comptime fn (*const R) services.Clock`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `force: comptime bool`: Compile-time choice to bypass normal freshness or reuse checks.
+/// Returns (`effects.Effect(void, query.Error(Client.Failure), R)`): atom refresh performed only when local state is stale.
 pub fn refreshIfStale(
     comptime Client: type,
     comptime R: type,
@@ -61,10 +97,20 @@ pub fn refreshIfStale(
     }.evaluate, force);
 }
 
+/// `StreamRun` cases: `completed`, `refresh_required`.
 pub const StreamRun = enum { completed, refresh_required };
 
 /// Scoped RPC events publish through the query's generation gate. A change
 /// received during the stream closes the stream and asks its owner to rerun.
+///
+/// Parameters:
+/// - `Client: comptime type`: Compile-time typed RPC client interface.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `select_request: comptime fn (*const R) *const Client.Request`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_state: comptime fn (*const R) *query.State(Client.Event, Client.Failure)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// Returns (`effects.Effect(StreamRun, query.Error(Client.Failure), R)`): query state updated from the remote atom stream.
 pub fn streamIntoQuery(
     comptime Client: type,
     comptime R: type,
@@ -149,6 +195,17 @@ pub fn streamIntoQuery(
 
 /// A successful remote reply is kept even if local invalidation fails. The
 /// caller can inspect the nested Exit and reconcile from authoritative data.
+///
+/// Parameters:
+/// - `Client: comptime type`: Compile-time typed RPC client interface.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `select_request: comptime fn (*const R) *const Client.Request`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_registry: comptime fn (*const R) *registry.Registry`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_key: comptime fn (*const R) []const u8`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// Returns (`effects.Effect(MutationReport(Client.Success), Client.Failure, R)`): remote atom mutation acknowledgement and local invalidation status.
 pub fn mutate(
     comptime Client: type,
     comptime R: type,

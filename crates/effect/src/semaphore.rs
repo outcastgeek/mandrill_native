@@ -1,3 +1,5 @@
+//! Cancellation-safe permits for bounded concurrency.
+
 use crate::internal::notification::notify_all;
 use crate::internal::runtime::{self, Step};
 use crate::{Cancellation, Defect, Effect, Exit, Release, ResourceValue, Scope};
@@ -9,17 +11,32 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A typed failure to acquire or use a semaphore permit.
 pub enum SemaphoreError {
+    /// The initial permits failed validation.
     InvalidInitialPermits,
+    /// The configured capacity bound was exceeded.
     CapacityExceeded,
+    /// The request needs more permits than the semaphore can hold.
     RequestExceedsCapacity,
+    /// No further waiter id can be allocated without exceeding its range.
     WaiterIdExhausted,
+    /// A permit would be released or consumed inconsistently.
     PermitAccountingViolation,
+    /// The partition key was already moved into an earlier execution.
     PartitionKeyConsumed,
+    /// The provider has closed admission for new work.
     Closed,
 }
 
 impl std::fmt::Display for SemaphoreError {
+    ///
+    /// # Parameters
+    /// - `formatter` (`&mut std::fmt::Formatter<'_>`): Destination formatter used by the Rust formatting trait.
+    ///
+    /// # Returns
+    /// Type: `std::fmt::Result`.
+    /// Returns `std::fmt::Result`.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(self, formatter)
     }
@@ -27,6 +44,7 @@ impl std::fmt::Display for SemaphoreError {
 
 impl std::error::Error for SemaphoreError {}
 
+/// Typed state used by semaphore.
 struct State {
     available: usize,
     issued: usize,
@@ -35,6 +53,7 @@ struct State {
     closed: bool,
 }
 
+/// Typed inner used by semaphore.
 struct Inner {
     state: Mutex<State>,
     changed: Event,
@@ -58,10 +77,24 @@ pub struct SemaphorePermit {
 
 impl Semaphore {
     #[must_use]
+    /// Create a semaphore with every permit initially available.
+    ///
+    /// # Parameters
+    /// - `capacity` (`NonZeroUsize`): The caller-supplied capacity bound.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn full(capacity: NonZeroUsize) -> Self {
         Self::with_available(capacity, capacity.get())
     }
 
+    ///
+    /// # Parameters
+    /// - `capacity` (`NonZeroUsize`): The caller-supplied capacity bound.
+    /// - `available` (`usize`): The available supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn with_available(capacity: NonZeroUsize, available: usize) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -78,6 +111,14 @@ impl Semaphore {
         }
     }
 
+    /// Construct a `Semaphore` from its required inputs and explicit policies.
+    ///
+    /// # Parameters
+    /// - `capacity` (`NonZeroUsize`): The caller-supplied capacity bound.
+    /// - `initially_available` (`usize`): The initially available supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, SemaphoreError>`.
     pub fn new(capacity: NonZeroUsize, initially_available: usize) -> Result<Self, SemaphoreError> {
         if initially_available > capacity.get() {
             return Err(SemaphoreError::InvalidInitialPermits);
@@ -85,6 +126,18 @@ impl Semaphore {
         Ok(Self::with_available(capacity, initially_available))
     }
 
+    /// Create a `Semaphore` through the declared Effect and environment capabilities.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `capacity` (`NonZeroUsize`): The caller-supplied capacity bound.
+    /// - `initially_available` (`usize`): The initially available supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<Self, SemaphoreError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn make<R: Send + Sync + 'static>(
         capacity: NonZeroUsize,
         initially_available: usize,
@@ -96,10 +149,17 @@ impl Semaphore {
     }
 
     #[must_use]
+    /// Return the configured maximum number of permits.
+    ///
+    /// # Returns
+    /// Type: `NonZeroUsize`.
     pub fn capacity(&self) -> NonZeroUsize {
         self.inner.capacity
     }
 
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     pub(crate) fn is_idle_indexed(&self) -> bool {
         if Arc::strong_count(&self.inner) != NonZeroUsize::MIN.get() {
             return false;
@@ -112,6 +172,14 @@ impl Semaphore {
         state.available == self.inner.capacity.get() && state.waiters.is_empty()
     }
 
+    /// Report the capacity currently available for new work.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Returns
+    /// Type: `Effect<usize, SemaphoreError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn available<R: Send + Sync + 'static>(&self) -> Effect<usize, SemaphoreError, R> {
         let semaphore = self.clone();
         Effect::sync(move || {
@@ -126,6 +194,16 @@ impl Semaphore {
 
     /// Mint permits only within the caller-declared capacity. This can open a
     /// semaphore constructed with fewer initially available permits.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `count` (`NonZeroUsize`): Caller-selected number of iterations, values, or permits.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), SemaphoreError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn add_permits<R: Send + Sync + 'static>(
         &self,
         count: NonZeroUsize,
@@ -157,6 +235,17 @@ impl Semaphore {
         })
     }
 
+    /// Attempt to take a permit immediately without waiting.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `count` (`NonZeroUsize`): Caller-selected number of iterations, values, or permits.
+    ///
+    /// # Returns
+    /// Type: `Effect<Option<SemaphorePermit>, SemaphoreError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn try_acquire<R: Send + Sync + 'static>(
         &self,
         count: NonZeroUsize,
@@ -188,6 +277,17 @@ impl Semaphore {
         })
     }
 
+    /// Acquire a resource and register the matching release obligation.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `count` (`NonZeroUsize`): Caller-selected number of iterations, values, or permits.
+    ///
+    /// # Returns
+    /// Type: `Effect<SemaphorePermit, SemaphoreError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn acquire<R: Send + Sync + 'static>(
         &self,
         count: NonZeroUsize,
@@ -206,6 +306,18 @@ impl Semaphore {
         })
     }
 
+    /// Acquire the resource under a scope that owns its release.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `scope` (`&Scope<SemaphoreError>`): Owner that joins child work and releases resources at close.
+    /// - `count` (`NonZeroUsize`): Caller-selected number of iterations, values, or permits.
+    ///
+    /// # Returns
+    /// Type: `Effect<ResourceValue<SemaphorePermit>, SemaphoreError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn acquire_scoped<R: Send + Sync + 'static>(
         &self,
         scope: &Scope<SemaphoreError>,
@@ -218,11 +330,21 @@ impl Semaphore {
 
     /// Closing rejects pending/new acquisition, but already acquired guards
     /// retain ownership and can release normally. The first close wins.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Returns
+    /// Type: `Effect<bool, SemaphoreError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn close<R: Send + Sync + 'static>(&self) -> Effect<bool, SemaphoreError, R> {
         let semaphore = self.clone();
         Effect::sync(move || semaphore.close_now())
     }
 
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     pub(crate) fn close_now(&self) -> bool {
         let first = {
             let mut state = self
@@ -244,6 +366,14 @@ impl Semaphore {
         first
     }
 
+    ///
+    /// # Parameters
+    /// - `count` (`NonZeroUsize`): Caller-selected number of iterations, values, or permits.
+    /// - `cancellation` (`Cancellation`): The cancellation token for this operation.
+    ///
+    /// # Returns
+    /// Type: `Exit<SemaphorePermit, SemaphoreError>`.
+    /// Returns `Exit<SemaphorePermit, SemaphoreError>`.
     async fn acquire_owned(
         &self,
         count: NonZeroUsize,
@@ -324,12 +454,16 @@ impl Semaphore {
     }
 }
 
+/// Typed wait registration used by semaphore.
 struct WaitRegistration {
     inner: Arc<Inner>,
     id: Option<u64>,
 }
 
 impl Drop for WaitRegistration {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         if let Some(id) = self.id.take() {
             let removed = self
@@ -348,6 +482,10 @@ impl Drop for WaitRegistration {
 }
 
 impl SemaphorePermit {
+    /// Return a permit to the semaphore without awaiting another operation.
+    ///
+    /// # Returns
+    /// Type: `Result<bool, SemaphoreError>`.
     pub fn release_now(&mut self) -> Result<bool, SemaphoreError> {
         let Some(inner) = self.inner.take() else {
             return Ok(false);
@@ -373,6 +511,9 @@ impl SemaphorePermit {
 }
 
 impl Drop for SemaphorePermit {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         let _ = catch_unwind(AssertUnwindSafe(|| self.release_now()));
     }

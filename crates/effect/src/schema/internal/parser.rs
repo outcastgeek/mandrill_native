@@ -1,3 +1,5 @@
+//! Bounded JSON parsing and structural checks.
+
 use super::super::{
     DuplicateFields, JsonValue, ParseLimits, ParsePolicy, SchemaErrorMode, SchemaIssue,
     SchemaIssueKind, SchemaResource, UnknownFields,
@@ -11,6 +13,10 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 #[derive(Clone, Copy)]
+/// Typed json seed used by schema internal parser.
+///
+/// # Type parameters
+/// - `'a`: Lifetime parameter.
 struct JsonSeed<'a> {
     policy: ParsePolicy,
     depth: usize,
@@ -19,12 +25,28 @@ struct JsonSeed<'a> {
 }
 
 impl<'a> JsonSeed<'a> {
+    ///
+    /// # Type parameters
+    /// - `Error`: Bounds: `de::Error`.
+    ///
+    /// # Parameters
+    /// - `issue` (`SchemaIssue`): The issue supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Error`.
+    /// Returns `Error`.
     fn reject<Error: de::Error>(&self, issue: SchemaIssue) -> Error {
         let error = Error::custom(issue.to_string());
         *self.failure.borrow_mut() = Some(issue);
         error
     }
 
+    ///
+    /// # Type parameters
+    /// - `Error`: Bounds: `de::Error`.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, Error>`.
     fn child<Error: de::Error>(&self) -> Result<Self, Error> {
         let depth = self.depth.checked_add(1).ok_or_else(|| {
             self.reject(SchemaIssue::new(SchemaIssueKind::LimitExceeded {
@@ -36,8 +58,18 @@ impl<'a> JsonSeed<'a> {
 }
 
 impl<'de> DeserializeSeed<'de> for JsonSeed<'_> {
+    /// Type alias for value in schema internal parser.
     type Value = JsonValue;
 
+    ///
+    /// # Type parameters
+    /// - `D`: Bounds: `de::Deserializer<'de>`.
+    ///
+    /// # Parameters
+    /// - `deserializer` (`D`): The deserializer supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self::Value, D::Error>`.
     fn deserialize<D: de::Deserializer<'de>>(
         self,
         deserializer: D,
@@ -66,13 +98,24 @@ impl<'de> DeserializeSeed<'de> for JsonSeed<'_> {
     }
 }
 
+/// Typed overflow seed used by schema internal parser.
+///
+/// # Type parameters
+/// - `'a`: Lifetime parameter.
 struct OverflowSeed<'a> {
     failure: &'a RefCell<Option<SchemaIssue>>,
 }
 
 impl<'de> DeserializeSeed<'de> for OverflowSeed<'_> {
+    /// Type alias for value in schema internal parser.
     type Value = ();
 
+    ///
+    /// # Type parameters
+    /// - `D`: Bounds: `de::Deserializer<'de>`.
+    ///
+    /// # Returns
+    /// Type: `Result<Self::Value, D::Error>`.
     fn deserialize<D: de::Deserializer<'de>>(self, _: D) -> Result<Self::Value, D::Error> {
         let issue = exceeded(SchemaResource::Width);
         let error = <D::Error as de::Error>::custom(issue.to_string());
@@ -82,39 +125,122 @@ impl<'de> DeserializeSeed<'de> for OverflowSeed<'_> {
 }
 
 impl<'de> Visitor<'de> for JsonSeed<'_> {
+    /// Type alias for value in schema internal parser.
     type Value = JsonValue;
 
+    ///
+    /// # Parameters
+    /// - `formatter` (`&mut fmt::Formatter<'_>`): Destination formatter used by the Rust formatting trait.
+    ///
+    /// # Returns
+    /// Type: `fmt::Result`.
+    /// Returns `fmt::Result`.
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("JSON value")
     }
 
+    ///
+    /// # Type parameters
+    /// - `E`: Bounds: `de::Error`.
+    ///
+    /// # Returns
+    /// Type: `Result<Self::Value, E>`.
     fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
         Ok(JsonValue::Null)
     }
+    ///
+    /// # Type parameters
+    /// - `E`: Bounds: `de::Error`.
+    ///
+    /// # Returns
+    /// Type: `Result<Self::Value, E>`.
     fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
         Ok(JsonValue::Null)
     }
+    ///
+    /// # Type parameters
+    /// - `E`: Bounds: `de::Error`.
+    ///
+    /// # Parameters
+    /// - `value` (`bool`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self::Value, E>`.
     fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
         Ok(JsonValue::Bool(value))
     }
+    ///
+    /// # Type parameters
+    /// - `E`: Bounds: `de::Error`.
+    ///
+    /// # Parameters
+    /// - `value` (`i64`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self::Value, E>`.
     fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
         Ok(JsonValue::Number(value.into()))
     }
+    ///
+    /// # Type parameters
+    /// - `E`: Bounds: `de::Error`.
+    ///
+    /// # Parameters
+    /// - `value` (`u64`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self::Value, E>`.
     fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
         Ok(JsonValue::Number(value.into()))
     }
+    ///
+    /// # Type parameters
+    /// - `E`: Bounds: `de::Error`.
+    ///
+    /// # Parameters
+    /// - `value` (`f64`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self::Value, E>`.
     fn visit_f64<E: de::Error>(self, value: f64) -> Result<Self::Value, E> {
         serde_json::Number::from_f64(value)
             .map(JsonValue::Number)
             .ok_or_else(|| self.reject(SchemaIssue::new(SchemaIssueKind::NonFinite)))
     }
+    ///
+    /// # Type parameters
+    /// - `E`: Bounds: `de::Error`.
+    ///
+    /// # Parameters
+    /// - `value` (`&str`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self::Value, E>`.
     fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
         Ok(JsonValue::String(value.to_owned()))
     }
+    ///
+    /// # Type parameters
+    /// - `E`: Bounds: `de::Error`.
+    ///
+    /// # Parameters
+    /// - `value` (`String`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self::Value, E>`.
     fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
         Ok(JsonValue::String(value))
     }
 
+    ///
+    /// # Type parameters
+    /// - `S`: Bounds: `SeqAccess<'de>`.
+    ///
+    /// # Parameters
+    /// - `sequence` (`S`): Ordered stream position used to reject gaps or duplicates.
+    ///
+    /// # Returns
+    /// Type: `Result<Self::Value, S::Error>`.
     fn visit_seq<S: SeqAccess<'de>>(self, mut sequence: S) -> Result<Self::Value, S::Error> {
         let child = self.child()?;
         let mut values = Vec::new();
@@ -136,6 +262,15 @@ impl<'de> Visitor<'de> for JsonSeed<'_> {
         Ok(JsonValue::Array(values))
     }
 
+    ///
+    /// # Type parameters
+    /// - `M`: Bounds: `MapAccess<'de>`.
+    ///
+    /// # Parameters
+    /// - `map` (`M`): The map supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self::Value, M::Error>`.
     fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
         let child = self.child()?;
         let mut object = serde_json::Map::new();
@@ -164,6 +299,12 @@ impl<'de> Visitor<'de> for JsonSeed<'_> {
     }
 }
 
+/// # Parameters
+/// - `text` (`&str`): Input text parsed or emitted by this operation.
+/// - `policy` (`ParsePolicy`): The caller-supplied behavior policy.
+///
+/// # Returns
+/// Type: `Result<JsonValue, SchemaIssue>`.
 pub(crate) fn parse_json(text: &str, policy: ParsePolicy) -> Result<JsonValue, SchemaIssue> {
     if text.len() > policy.limits.bytes.get() {
         return Err(exceeded(SchemaResource::Bytes));
@@ -196,6 +337,12 @@ pub(crate) fn parse_json(text: &str, policy: ParsePolicy) -> Result<JsonValue, S
 
 /// Fixed versioned wire records reject duplicate fields before constructing
 /// a value. Their own decoders validate the exact allowed field set.
+///
+/// # Parameters
+/// - `limits` (`ParseLimits`): Explicit resource bounds enforced while processing this input.
+///
+/// # Returns
+/// Type: `ParsePolicy`.
 pub(crate) const fn strict_wire_policy(limits: ParseLimits) -> ParsePolicy {
     ParsePolicy {
         limits,
@@ -205,6 +352,12 @@ pub(crate) const fn strict_wire_policy(limits: ParseLimits) -> ParsePolicy {
     }
 }
 
+/// # Parameters
+/// - `input` (`&[u8]`): The input value or factory consumed by this operation.
+/// - `policy` (`ParsePolicy`): The caller-supplied behavior policy.
+///
+/// # Returns
+/// Type: `Result<JsonValue, SchemaIssue>`.
 pub(crate) fn parse_json_bytes(
     input: &[u8],
     policy: ParsePolicy,
@@ -220,6 +373,7 @@ pub(crate) fn parse_json_bytes(
     parse_json(text, policy)
 }
 
+/// Typed bounded writer used by schema internal parser.
 struct BoundedWriter {
     count: usize,
     limit: usize,
@@ -227,6 +381,13 @@ struct BoundedWriter {
 }
 
 impl Write for BoundedWriter {
+    ///
+    /// # Parameters
+    /// - `bytes` (`&[u8]`): Encoded bytes to validate, decode, write, or transfer.
+    ///
+    /// # Returns
+    /// Type: `io::Result<usize>`.
+    /// Returns `io::Result<usize>`.
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         match self.count.checked_add(bytes.len()) {
             Some(count) if count <= self.limit => {
@@ -240,17 +401,35 @@ impl Write for BoundedWriter {
         }
     }
 
+    ///
+    /// # Returns
+    /// Type: `io::Result<()>`.
+    /// Returns `io::Result<()>`.
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
 
+///
+/// # Parameters
+/// - `resource` (`SchemaResource`): The resource supplied to this operation.
+///
+/// # Returns
+/// Type: `SchemaIssue`.
+/// Returns `SchemaIssue`.
 fn exceeded(resource: SchemaResource) -> SchemaIssue {
     SchemaIssue::new(SchemaIssueKind::LimitExceeded { resource })
 }
 
 /// Bounded, iterative traversal. Shared schema nodes do not discount repeated
 /// value occurrences from depth/node/width limits.
+///
+/// # Parameters
+/// - `value` (`&JsonValue`): Value read, transformed, encoded, or stored by this operation.
+/// - `limits` (`&ParseLimits`): Explicit resource bounds enforced while processing this input.
+///
+/// # Returns
+/// Type: `Result<(), SchemaIssue>`.
 pub(crate) fn check_limits(value: &JsonValue, limits: &ParseLimits) -> Result<(), SchemaIssue> {
     let mut nodes = 0usize;
     let mut pending = vec![(value, 1usize)];
@@ -308,6 +487,12 @@ pub(crate) fn check_limits(value: &JsonValue, limits: &ParseLimits) -> Result<()
     }
 }
 
+/// # Parameters
+/// - `value` (`&JsonValue`): Value read, transformed, encoded, or stored by this operation.
+/// - `limits` (`&ParseLimits`): Explicit resource bounds enforced while processing this input.
+///
+/// # Returns
+/// Type: `Result<Vec<u8>, SchemaIssue>`.
 pub(crate) fn encode_json_bytes(
     value: &JsonValue,
     limits: &ParseLimits,

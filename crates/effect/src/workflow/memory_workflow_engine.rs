@@ -1,3 +1,5 @@
+//! Independent in-memory execution and replay.
+
 use super::{
     CancellationOutcome, ChildWait, CompensationState, DeadlineClear, DeadlineWait, DeadlineWake,
     EncodedWorkflowOutcome, RecordedActivity, RecordedChild, RecordedCompensation,
@@ -12,6 +14,7 @@ use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 #[derive(Default)]
+/// Typed state used by workflow memory workflow engine.
 struct State {
     definitions: BTreeMap<(WorkflowDefinitionId, WorkflowVersion), Arc<[u8]>>,
     runs: BTreeMap<WorkflowRunId, WorkflowSnapshot>,
@@ -19,6 +22,9 @@ struct State {
 }
 
 impl State {
+    ///
+    /// # Returns
+    /// Type: `Result<(), WorkflowEngineError>`.
     fn ensure_live(&self) -> Result<(), WorkflowEngineError> {
         if self.shutdown {
             Err(WorkflowEngineError::EngineShutdown)
@@ -28,6 +34,12 @@ impl State {
     }
 }
 
+///
+/// # Parameters
+/// - `state` (`&Arc<Mutex<State>>`): Current or replacement state owned by this operation.
+///
+/// # Returns
+/// Type: `Result<MutexGuard<'_, State>, WorkflowEngineError>`.
 fn lock_live(state: &Arc<Mutex<State>>) -> Result<MutexGuard<'_, State>, WorkflowEngineError> {
     let guard = state
         .lock()
@@ -36,6 +48,12 @@ fn lock_live(state: &Arc<Mutex<State>>) -> Result<MutexGuard<'_, State>, Workflo
     Ok(guard)
 }
 
+///
+/// # Parameters
+/// - `snapshot` (`&WorkflowSnapshot`): The snapshot supplied to this operation.
+///
+/// # Returns
+/// Type: `Result<(), WorkflowEngineError>`.
 fn validate_records(snapshot: &WorkflowSnapshot) -> Result<(), WorkflowEngineError> {
     if matches!(
         snapshot.status,
@@ -109,20 +127,30 @@ fn validate_records(snapshot: &WorkflowSnapshot) -> Result<(), WorkflowEngineErr
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The behavior chosen when a workflow engine stops admitting work.
 pub enum WorkflowShutdownPolicy {
+    /// Retain the failed record for a later recovery attempt.
     PreserveForRecovery,
+    /// Request interruption even when work is currently active.
     ForceInterrupt,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The running and settled work accounted for during engine shutdown.
 pub struct WorkflowShutdownReport {
+    /// Whether shutdown had already begun before this request. Type: `bool`.
     pub already_shutdown: bool,
+    /// Count of runs abandoned during engine shutdown. Type: `usize`.
     pub abandoned: usize,
+    /// Count of runs interrupted during engine shutdown. Type: `usize`.
     pub interrupted: usize,
 }
 
+/// An explicit compatibility mapping for changing a recorded workflow definition.
 pub struct WorkflowMigration {
+    /// Previously registered workflow definition. Type: `WorkflowRegistration`.
     pub from: WorkflowRegistration,
+    /// Replacement workflow definition used by the migration. Type: `WorkflowRegistration`.
     pub to: WorkflowRegistration,
     transform: Arc<
         dyn Fn(WorkflowSnapshot) -> Result<WorkflowSnapshot, WorkflowEngineError> + Send + Sync,
@@ -131,6 +159,15 @@ pub struct WorkflowMigration {
 
 impl WorkflowMigration {
     #[must_use]
+    /// Construct a `WorkflowMigration` from its required inputs and explicit policies.
+    ///
+    /// # Parameters
+    /// - `from` (`WorkflowRegistration`): The from supplied to this operation.
+    /// - `to` (`WorkflowRegistration`): The to supplied to this operation.
+    /// - `transform` (`impl Fn(WorkflowSnapshot) -> Result<WorkflowSnapshot, WorkflowEngineError> + Send + Sync + 'static`): Callback applied to the selected value or error.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(
         from: WorkflowRegistration,
         to: WorkflowRegistration,
@@ -147,8 +184,11 @@ impl WorkflowMigration {
     }
 }
 
+/// The rule used to validate and resume recorded workflow histories.
 pub enum WorkflowReplayPolicy {
+    /// Reject input that violates the declared representation.
     Strict,
+    /// Apply an explicitly registered workflow compatibility migration. Contains `Vec<WorkflowMigration>`.
     Migrate(Vec<WorkflowMigration>),
 }
 
@@ -162,10 +202,22 @@ pub struct MemoryWorkflowEngine {
 
 impl MemoryWorkflowEngine {
     #[must_use]
+    /// Construct a `MemoryWorkflowEngine` from its required inputs and explicit policies.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Reconstruct state from the supplied recorded snapshot.
+    ///
+    /// # Parameters
+    /// - `definitions` (`impl IntoIterator<Item = WorkflowRegistration>`): The definitions supplied to this operation.
+    /// - `snapshots` (`impl IntoIterator<Item = WorkflowSnapshot>`): Recorded states used to reconstruct workflow or projection state.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, WorkflowEngineError>`.
     pub fn restore(
         definitions: impl IntoIterator<Item = WorkflowRegistration>,
         snapshots: impl IntoIterator<Item = WorkflowSnapshot>,
@@ -175,6 +227,14 @@ impl MemoryWorkflowEngine {
 
     /// Recover retained records against an explicit wall-clock observation.
     /// Deadlines due at this instant become ready during reconstruction.
+    ///
+    /// # Parameters
+    /// - `definitions` (`impl IntoIterator<Item = WorkflowRegistration>`): The definitions supplied to this operation.
+    /// - `snapshots` (`impl IntoIterator<Item = WorkflowSnapshot>`): Recorded states used to reconstruct workflow or projection state.
+    /// - `now` (`UtcMillis`): The caller-supplied current time.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, WorkflowEngineError>`.
     pub fn restore_at(
         definitions: impl IntoIterator<Item = WorkflowRegistration>,
         snapshots: impl IntoIterator<Item = WorkflowSnapshot>,
@@ -183,6 +243,15 @@ impl MemoryWorkflowEngine {
         Self::restore_with_policy_at(definitions, snapshots, WorkflowReplayPolicy::Strict, now)
     }
 
+    /// Rebuild a memory engine from snapshots under an explicit replay policy.
+    ///
+    /// # Parameters
+    /// - `definitions` (`impl IntoIterator<Item = WorkflowRegistration>`): The definitions supplied to this operation.
+    /// - `snapshots` (`impl IntoIterator<Item = WorkflowSnapshot>`): Recorded states used to reconstruct workflow or projection state.
+    /// - `policy` (`WorkflowReplayPolicy`): The caller-supplied behavior policy.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, WorkflowEngineError>`.
     pub fn restore_with_policy(
         definitions: impl IntoIterator<Item = WorkflowRegistration>,
         snapshots: impl IntoIterator<Item = WorkflowSnapshot>,
@@ -191,6 +260,16 @@ impl MemoryWorkflowEngine {
         Self::restore_internal(definitions, snapshots, policy, None)
     }
 
+    /// Rebuild snapshots as of the supplied instant under the replay policy.
+    ///
+    /// # Parameters
+    /// - `definitions` (`impl IntoIterator<Item = WorkflowRegistration>`): The definitions supplied to this operation.
+    /// - `snapshots` (`impl IntoIterator<Item = WorkflowSnapshot>`): Recorded states used to reconstruct workflow or projection state.
+    /// - `policy` (`WorkflowReplayPolicy`): The caller-supplied behavior policy.
+    /// - `now` (`UtcMillis`): The caller-supplied current time.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, WorkflowEngineError>`.
     pub fn restore_with_policy_at(
         definitions: impl IntoIterator<Item = WorkflowRegistration>,
         snapshots: impl IntoIterator<Item = WorkflowSnapshot>,
@@ -200,6 +279,15 @@ impl MemoryWorkflowEngine {
         Self::restore_internal(definitions, snapshots, policy, Some(now))
     }
 
+    ///
+    /// # Parameters
+    /// - `definitions` (`impl IntoIterator<Item = WorkflowRegistration>`): The definitions supplied to this operation.
+    /// - `snapshots` (`impl IntoIterator<Item = WorkflowSnapshot>`): Recorded states used to reconstruct workflow or projection state.
+    /// - `policy` (`WorkflowReplayPolicy`): The caller-supplied behavior policy.
+    /// - `now` (`Option<UtcMillis>`): The caller-supplied current time.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, WorkflowEngineError>`.
     fn restore_internal(
         definitions: impl IntoIterator<Item = WorkflowRegistration>,
         snapshots: impl IntoIterator<Item = WorkflowSnapshot>,
@@ -348,6 +436,10 @@ impl MemoryWorkflowEngine {
     }
 
     #[must_use]
+    /// Capture every registered run’s current replayable state.
+    ///
+    /// # Returns
+    /// Type: `Vec<WorkflowSnapshot>`.
     pub fn snapshot_all(&self) -> Vec<WorkflowSnapshot> {
         self.state
             .lock()
@@ -359,6 +451,10 @@ impl MemoryWorkflowEngine {
     }
 
     #[must_use]
+    /// Borrow the workflow definitions registered with this engine.
+    ///
+    /// # Returns
+    /// Type: `Vec<WorkflowRegistration>`.
     pub fn definitions(&self) -> Vec<WorkflowRegistration> {
         self.state
             .lock()
@@ -376,6 +472,12 @@ impl MemoryWorkflowEngine {
     /// Stop this process-local engine atomically. Recovery keeps retained
     /// records, while forced interruption is an explicit unsafe policy for
     /// running external work whose final outcome may be uncertain.
+    ///
+    /// # Parameters
+    /// - `policy` (`WorkflowShutdownPolicy`): The caller-supplied behavior policy.
+    ///
+    /// # Returns
+    /// Type: `WorkflowShutdownReport`.
     pub fn shutdown(&self, policy: WorkflowShutdownPolicy) -> WorkflowShutdownReport {
         let mut state = self
             .state
@@ -420,6 +522,13 @@ impl MemoryWorkflowEngine {
     }
 }
 
+///
+/// # Parameters
+/// - `runs` (`&BTreeMap<WorkflowRunId, WorkflowSnapshot>`): The runs supplied to this operation.
+/// - `root` (`&WorkflowRunId`): The root supplied to this operation.
+///
+/// # Returns
+/// Type: `Result<Vec<WorkflowRunId>, WorkflowEngineError>`.
 fn descendants(
     runs: &BTreeMap<WorkflowRunId, WorkflowSnapshot>,
     root: &WorkflowRunId,
@@ -450,6 +559,13 @@ fn descendants(
     Ok(result)
 }
 
+///
+/// # Parameters
+/// - `runs` (`&mut BTreeMap<WorkflowRunId, WorkflowSnapshot>`): The runs supplied to this operation.
+/// - `child` (`&WorkflowRunId`): Child workflow or scope-owned task being observed.
+///
+/// # Returns
+/// Type: `()`.
 fn wake_parent(runs: &mut BTreeMap<WorkflowRunId, WorkflowSnapshot>, child: &WorkflowRunId) {
     for snapshot in runs.values_mut() {
         if snapshot.status == WorkflowStatus::Suspended
@@ -464,8 +580,16 @@ fn wake_parent(runs: &mut BTreeMap<WorkflowRunId, WorkflowSnapshot>, child: &Wor
 }
 
 impl WorkflowEngine for MemoryWorkflowEngine {
+    /// Type alias for error in workflow memory workflow engine.
     type Error = WorkflowEngineError;
 
+    ///
+    /// # Parameters
+    /// - `definition` (`WorkflowRegistration`): The definition supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn register(&self, definition: WorkflowRegistration) -> Effect<(), Self::Error> {
         let state = Arc::clone(&self.state);
         Effect::try_sync(
@@ -488,6 +612,14 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `handle` (`WorkflowHandle`): Owned or borrowed capability handle kept live through this operation.
+    /// - `encoded_input` (`Arc<[u8]>`): The encoded input supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<WorkflowSnapshot, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn start(
         &self,
         handle: WorkflowHandle,
@@ -532,6 +664,13 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    ///
+    /// # Returns
+    /// Type: `Effect<Option<WorkflowSnapshot>, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn inspect(&self, run: WorkflowRunId) -> Effect<Option<WorkflowSnapshot>, Self::Error> {
         let state = Arc::clone(&self.state);
         Effect::sync(move || {
@@ -544,6 +683,15 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         })
     }
 
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `expected` (`WorkflowStatus`): Value or revision required for the proposed state transition.
+    /// - `next` (`WorkflowStatus`): Next value or state produced by the transition.
+    ///
+    /// # Returns
+    /// Type: `Effect<WorkflowSnapshot, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn transition(
         &self,
         run: WorkflowRunId,
@@ -593,6 +741,17 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `activity` (`WorkflowActivityId`): The activity supplied to this operation.
+    /// - `attempt` (`NonZeroU32`): Ordinal execution or delivery attempt being recorded.
+    /// - `encoded_input` (`Arc<[u8]>`): The encoded input supplied to this operation.
+    /// - `outcome` (`EncodedWorkflowOutcome`): Complete terminal outcome, including expected errors and cleanup failures.
+    ///
+    /// # Returns
+    /// Type: `Effect<RecordedActivity, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn record_activity(
         &self,
         run: WorkflowRunId,
@@ -648,6 +807,15 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `activity` (`WorkflowActivityId`): The activity supplied to this operation.
+    /// - `attempt` (`NonZeroU32`): Ordinal execution or delivery attempt being recorded.
+    ///
+    /// # Returns
+    /// Type: `Effect<Option<RecordedActivity>, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn inspect_activity(
         &self,
         run: WorkflowRunId,
@@ -674,6 +842,14 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `parent` (`WorkflowRunId`): Parent scope, span, or workflow identity.
+    /// - `child` (`RecordedChild`): Child workflow or scope-owned task being observed.
+    ///
+    /// # Returns
+    /// Type: `Effect<RecordedChild, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn link_child(
         &self,
         parent: WorkflowRunId,
@@ -754,6 +930,14 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `parent` (`WorkflowRunId`): Parent scope, span, or workflow identity.
+    /// - `child` (`WorkflowRunId`): Child workflow or scope-owned task being observed.
+    ///
+    /// # Returns
+    /// Type: `Effect<ChildWait, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn wait_child(
         &self,
         parent: WorkflowRunId,
@@ -814,6 +998,14 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `deadline` (`RecordedDeadline`): The deadline for the pending operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<WorkflowSnapshot, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn set_deadline(
         &self,
         run: WorkflowRunId,
@@ -847,6 +1039,14 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `expected` (`RecordedDeadline`): Value or revision required for the proposed state transition.
+    ///
+    /// # Returns
+    /// Type: `Effect<DeadlineClear, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn clear_deadline(
         &self,
         run: WorkflowRunId,
@@ -885,6 +1085,13 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `now` (`UtcMillis`): The caller-supplied current time.
+    ///
+    /// # Returns
+    /// Type: `Effect<Vec<WorkflowRunId>, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn wake_due(&self, now: UtcMillis) -> Effect<Vec<WorkflowRunId>, Self::Error> {
         let state = Arc::clone(&self.state);
         Effect::try_sync(
@@ -910,6 +1117,15 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `expected` (`RecordedDeadline`): Value or revision required for the proposed state transition.
+    /// - `now` (`UtcMillis`): The caller-supplied current time.
+    ///
+    /// # Returns
+    /// Type: `Effect<DeadlineWake, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn wake_deadline(
         &self,
         run: WorkflowRunId,
@@ -942,6 +1158,15 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `deadline` (`RecordedDeadline`): The deadline for the pending operation.
+    /// - `now` (`UtcMillis`): The caller-supplied current time.
+    ///
+    /// # Returns
+    /// Type: `Effect<DeadlineWait, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn wait_deadline(
         &self,
         run: WorkflowRunId,
@@ -983,6 +1208,14 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `signal` (`RecordedSignal`): Named value delivered to a waiting workflow.
+    ///
+    /// # Returns
+    /// Type: `Effect<RecordedSignal, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn deliver_signal(
         &self,
         run: WorkflowRunId,
@@ -1034,6 +1267,15 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `signal` (`WorkflowSignalId`): Named value delivered to a waiting workflow.
+    /// - `version` (`WorkflowVersion`): Registered schema, event, or workflow compatibility version.
+    ///
+    /// # Returns
+    /// Type: `Effect<Option<RecordedSignal>, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn inspect_signal(
         &self,
         run: WorkflowRunId,
@@ -1063,6 +1305,15 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `signal` (`WorkflowSignalId`): Named value delivered to a waiting workflow.
+    /// - `version` (`WorkflowVersion`): Registered schema, event, or workflow compatibility version.
+    ///
+    /// # Returns
+    /// Type: `Effect<SignalWait, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn wait_signal(
         &self,
         run: WorkflowRunId,
@@ -1117,6 +1368,15 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `identity` (`WorkflowCompensationId`): Stable identity used to deduplicate or find this record.
+    /// - `order` (`NonZeroU32`): The order supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<RecordedCompensation, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn register_compensation(
         &self,
         run: WorkflowRunId,
@@ -1168,6 +1428,15 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `identity` (`WorkflowCompensationId`): Stable identity used to deduplicate or find this record.
+    /// - `outcome` (`EncodedWorkflowOutcome`): Complete terminal outcome, including expected errors and cleanup failures.
+    ///
+    /// # Returns
+    /// Type: `Effect<RecordedCompensation, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn finish_compensation(
         &self,
         run: WorkflowRunId,
@@ -1203,6 +1472,13 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    ///
+    /// # Returns
+    /// Type: `Effect<Vec<RecordedCompensation>, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn pending_compensations(
         &self,
         run: WorkflowRunId,
@@ -1230,6 +1506,14 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `race` (`WorkflowRaceId`): Stable identity or definition of the durable race.
+    ///
+    /// # Returns
+    /// Type: `Effect<Option<RecordedRace>, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn inspect_race(
         &self,
         run: WorkflowRunId,
@@ -1255,6 +1539,14 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `race` (`RecordedRace`): Stable identity or definition of the durable race.
+    ///
+    /// # Returns
+    /// Type: `Effect<RecordedRace, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn record_race(
         &self,
         run: WorkflowRunId,
@@ -1301,6 +1593,14 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `outcome` (`EncodedWorkflowOutcome`): Complete terminal outcome, including expected errors and cleanup failures.
+    ///
+    /// # Returns
+    /// Type: `Effect<WorkflowSnapshot, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn complete(
         &self,
         run: WorkflowRunId,
@@ -1351,6 +1651,13 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    ///
+    /// # Returns
+    /// Type: `Effect<CancellationOutcome, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn cancel(&self, run: WorkflowRunId) -> Effect<CancellationOutcome, Self::Error> {
         let state = Arc::clone(&self.state);
         Effect::try_sync(
@@ -1404,6 +1711,13 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    ///
+    /// # Returns
+    /// Type: `Effect<CancellationOutcome, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn force_interrupt(&self, run: WorkflowRunId) -> Effect<CancellationOutcome, Self::Error> {
         let state = Arc::clone(&self.state);
         Effect::try_sync(

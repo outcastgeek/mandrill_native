@@ -1,3 +1,5 @@
+//! A one-way synchronization signal with cancellation-aware waiting.
+
 use crate::internal::notification::notify_all;
 use crate::internal::runtime::{self, Step};
 use crate::{Effect, Exit};
@@ -7,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Default)]
+/// Typed state used by latch.
 struct State {
     opened: AtomicBool,
     changed: Event,
@@ -22,15 +25,36 @@ pub struct Latch {
 
 impl Latch {
     #[must_use]
+    /// Construct a `Latch` from its required inputs and explicit policies.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Create a `Latch` through the declared Effect and environment capabilities.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bounds: `Send + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Returns
+    /// Type: `Effect<Self, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn make<E: Send + 'static, R: Send + Sync + 'static>() -> Effect<Self, E, R> {
         Effect::sync(Self::new)
     }
 
     /// True only for the first opening. All current/future waits can proceed.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bounds: `Send + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Returns
+    /// Type: `Effect<bool, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn open<E: Send + 'static, R: Send + Sync + 'static>(&self) -> Effect<bool, E, R> {
         let latch = self.clone();
         Effect::sync(move || {
@@ -42,6 +66,15 @@ impl Latch {
         })
     }
 
+    /// Wait cooperatively until the latch opens.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bounds: `Send + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn await_open<E: Send + 'static, R: Send + Sync + 'static>(&self) -> Effect<(), E, R> {
         let latch = self.clone();
         Effect::new(move |_, context, finish| {

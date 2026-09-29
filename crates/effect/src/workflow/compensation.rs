@@ -1,3 +1,5 @@
+//! Recorded compensation identities and outcomes.
+
 use super::encoding::{decode_json, encode_json};
 use super::{
     CompensationState, EncodedWorkflowOutcome, HasWorkflowEngine, WorkflowCodecError,
@@ -7,55 +9,108 @@ use crate::{Defect, Effect, Exit, Finalization, JsonValue, ParseLimits, PureCode
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 
+/// Type alias for engine error in workflow compensation.
+///
+/// # Type parameters
+/// - `R`: Environment type.
 type EngineError<R> = <<R as HasWorkflowEngine>::Engine as WorkflowEngine>::Error;
 
 #[derive(Debug)]
+/// A failure while recording or executing compensation for a workflow run.
+///
+/// # Type parameters
+/// - `EngineError`: Error returned by the workflow engine.
+/// - `BodyError`: Error produced by the registered workflow body.
 pub enum CompensationRunError<EngineError, BodyError> {
+    /// The workflow engine rejected or could not complete the operation. Retains the `EngineError` detail.
     Engine(EngineError),
+    /// The registered application body failed. Retains the `BodyError` detail.
     Body(BodyError),
+    /// Encoding or decoding the typed value failed. Retains the `WorkflowCodecError` detail.
     Codec(WorkflowCodecError),
+    /// Completion may have committed; the recorded outcome could not be confirmed.
     UncertainCompletion {
+        /// Stable identity used for deduplication or lookup. Type: `WorkflowCompensationId`.
         identity: WorkflowCompensationId,
+        /// The underlying failure or provider cause. Type: `EngineError`.
         source: EngineError,
     },
+    /// The recorded compensation differs from the value produced during replay.
     RecordedCompensationMismatch,
+    /// An owned input was already consumed.
     InputConsumed,
 }
 
 #[derive(Debug)]
+/// The original workflow failure together with compensation results.
+///
+/// # Type parameters
+/// - `Original`: Original failure type retained alongside a later failure.
+/// - `DomainError`: Expected domain-error type.
+/// - `EngineError`: Error returned by the workflow engine.
+/// - `BodyError`: Error produced by the registered workflow body.
 pub enum CompensatedFailure<Original, DomainError, EngineError, BodyError> {
+    /// The original operation failed before cleanup. Retains the `Original` detail.
     Original(Original),
+    /// The original operation failed and cleanup also reported domain.
     OriginalAndDomain {
+        /// Value recorded before this transition. Type: `Original`.
         original: Original,
+        /// Recorded recovery action for this workflow step. Type: `DomainError`.
         compensation: DomainError,
     },
+    /// The original operation failed and cleanup also reported execution.
     OriginalAndExecution {
+        /// Value recorded before this transition. Type: `Original`.
         original: Original,
+        /// Recorded recovery action for this workflow step. Type: `CompensationRunError<EngineError, BodyError>`.
         compensation: CompensationRunError<EngineError, BodyError>,
     },
+    /// The original operation failed and cleanup also reported defect.
     OriginalAndDefect {
+        /// Value recorded before this transition. Type: `Original`.
         original: Original,
+        /// Defect retained from the failed compensation step. Type: `Defect`.
         defect: Defect,
     },
+    /// The original operation failed and cleanup also reported interruption.
     OriginalAndInterruption {
+        /// Value recorded before this transition. Type: `Original`.
         original: Original,
     },
+    /// The original operation failed and cleanup also reported finalization.
     OriginalAndFinalization {
+        /// Value recorded before this transition. Type: `Original`.
         original: Original,
+        /// Original outcome and ordered cleanup failures retained together. Type: `Finalization<CompensationRunError<EngineError, BodyError>>`.
         details: Finalization<CompensationRunError<EngineError, BodyError>>,
     },
+    /// An owned input was already consumed.
     InputConsumed,
 }
 
+/// A registered recovery action associated with a durable workflow step.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 pub struct WorkflowCompensation<A, E> {
+    /// Stable identity used for deduplication or lookup. Type: `WorkflowCompensationId`.
     pub identity: WorkflowCompensationId,
+    /// Stable acceptance or delivery order. Type: `NonZeroU32`.
     pub order: NonZeroU32,
+    /// Codec or representation identity for successful results. Type: `PureCodec<A, JsonValue>`.
     pub success: PureCodec<A, JsonValue>,
+    /// The typed error carried by this result. Type: `PureCodec<E, JsonValue>`.
     pub error: PureCodec<E, JsonValue>,
+    /// Explicit resource bounds applied to this operation. Type: `ParseLimits`.
     pub limits: ParseLimits,
 }
 
 impl<A, E> Clone for WorkflowCompensation<A, E> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             identity: self.identity.clone(),
@@ -68,6 +123,17 @@ impl<A, E> Clone for WorkflowCompensation<A, E> {
 }
 
 impl<A: Send + 'static, E: Send + 'static> WorkflowCompensation<A, E> {
+    /// Encode the typed value using this definition’s declared representation.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `result` (`&Result<A, E>`): The result to record or return.
+    ///
+    /// # Returns
+    /// Type: `Result<EncodedWorkflowOutcome, WorkflowCodecError>`.
     pub fn encode(
         &self,
         result: &Result<A, E>,
@@ -92,6 +158,17 @@ impl<A: Send + 'static, E: Send + 'static> WorkflowCompensation<A, E> {
         })
     }
 
+    /// Validate the encoded input and reconstruct its typed value.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `outcome` (`&EncodedWorkflowOutcome`): Complete terminal outcome, including expected errors and cleanup failures.
+    ///
+    /// # Returns
+    /// Type: `Result<Result<A, E>, WorkflowCodecError>`.
     pub fn decode(
         &self,
         outcome: &EncodedWorkflowOutcome,
@@ -115,6 +192,20 @@ impl<A: Send + 'static, E: Send + 'static> WorkflowCompensation<A, E> {
     /// A missing completion record on recovery means the body may run again;
     /// the body receives its stable compensation identity as an idempotency
     /// key for the external operation.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Additional bound: `HasWorkflowEngine + Send + Sync + 'static`.
+    /// - `BodyError`: Error produced by the registered workflow body. Additional bound: `Send + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `body` (`impl Fn(WorkflowCompensationId) -> Effect<Result<A, E>, BodyError, R> + Send + Sync + 'static`): Application callback or effect executed inside the owning scope.
+    ///
+    /// # Returns
+    /// Type: `Effect<Result<A, E>, CompensationRunError<EngineError<R>, BodyError>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn run<R, BodyError>(
         &self,
         run: WorkflowRunId,
@@ -201,6 +292,22 @@ impl<A: Send + 'static, E: Send + 'static> WorkflowCompensation<A, E> {
 
     /// Preserve the original failure even when compensation has its own
     /// typed domain, body, codec or uncertain journal failure.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Additional bound: `HasWorkflowEngine + Send + Sync + 'static`.
+    /// - `Original`: Original failure type retained alongside a later failure. Additional bound: `Send + 'static`.
+    /// - `BodyError`: Error produced by the registered workflow body. Additional bound: `Send + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `original` (`Original`): The original supplied to this operation.
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `body` (`impl Fn(WorkflowCompensationId) -> Effect<Result<A, E>, BodyError, R> + Send + Sync + 'static`): Application callback or effect executed inside the owning scope.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), CompensatedFailure<Original, E, EngineError<R>, BodyError>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn on_failure<R, Original, BodyError>(
         &self,
         original: Original,

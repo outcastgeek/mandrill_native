@@ -1,4 +1,13 @@
 //! Procedural Rust block syntax for the executor-independent Effect kernel.
+//!
+//! Applications normally import these macros through `effect`, which re-exports
+//! them beside the types they construct. Macro invocations are checked and
+//! expanded at compile time. `effect!` binds Effect steps with Rust's `?` and
+//! preserves ordinary Rust control flow; the schema, RPC, workflow, event,
+//! reactive, and transactional macros construct typed definitions in their
+//! respective domains. Expansion does not create a runtime or choose a
+//! provider. Consult the `effect` crate's `guide` and feature modules for the
+//! resulting contracts and examples.
 mod async_expand;
 mod descriptor_expand;
 mod durable_expand;
@@ -14,6 +23,12 @@ use syn::parse_macro_input;
 
 /// Construct a lazy reusable Effect with macro-local `?` binding.
 #[proc_macro]
+/// # Parameters
+/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub fn effect(input: TokenStream) -> TokenStream {
     let statements = parse_macro_input!(input with syn::Block::parse_within);
     match expand::expand(statements) {
@@ -25,6 +40,12 @@ pub fn effect(input: TokenStream) -> TokenStream {
 /// Derive checked JSON record or tagged-enum codecs from typed field codecs
 /// and an explicit parse policy.
 #[proc_macro]
+/// # Parameters
+/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub fn schema(input: TokenStream) -> TokenStream {
     let definition = parse_macro_input!(input as schema_expand::SchemaInput);
     match schema_expand::expand(definition) {
@@ -35,6 +56,12 @@ pub fn schema(input: TokenStream) -> TokenStream {
 
 /// Build a tagged enum codec with explicit wire tags and envelope fields.
 #[proc_macro]
+/// # Parameters
+/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub fn schema_enum(input: TokenStream) -> TokenStream {
     let definition = parse_macro_input!(input as schema_enum_expand::SchemaEnumInput);
     schema_enum_expand::expand(definition)
@@ -44,6 +71,12 @@ pub fn schema_enum(input: TokenStream) -> TokenStream {
 
 /// Pair stable request identity, success/error codecs, and record policy.
 #[proc_macro]
+/// # Parameters
+/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub fn persistable(input: TokenStream) -> TokenStream {
     let definition = parse_macro_input!(input as persistable_expand::PersistableInput);
     match persistable_expand::expand(definition) {
@@ -57,6 +90,12 @@ pub fn persistable(input: TokenStream) -> TokenStream {
 /// retry; clone an owned source explicitly only when its ownership requires it.
 /// A bound step must be a Transaction; Effect and Future values do not typecheck.
 #[proc_macro]
+/// # Parameters
+/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub fn transaction(input: TokenStream) -> TokenStream {
     let statements = parse_macro_input!(input with syn::Block::parse_within);
     match transaction_expand::expand(statements) {
@@ -66,6 +105,14 @@ pub fn transaction(input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
+/// Expand a typed event declaration into its identity and codec definition.
+///
+/// # Parameters
+/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub fn event(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as descriptor_expand::NamedFields);
     descriptor_expand::event(fields)
@@ -74,6 +121,14 @@ pub fn event(input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
+/// Expand a stable event-group declaration into checked Rust items.
+///
+/// # Parameters
+/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub fn event_group(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as descriptor_expand::NamedFields);
     descriptor_expand::event_group(fields)
@@ -82,6 +137,14 @@ pub fn event_group(input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
+/// Expand a typed event projection definition and its fold contract.
+///
+/// # Parameters
+/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub fn projection(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as descriptor_expand::NamedFields);
     descriptor_expand::projection(fields)
@@ -92,6 +155,12 @@ pub fn projection(input: TokenStream) -> TokenStream {
 /// Compose durable operations, or define a typed workflow with `id`, codecs,
 /// compatibility, limits and a durable `run` closure.
 #[proc_macro]
+/// # Parameters
+/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub fn workflow(input: TokenStream) -> TokenStream {
     let tokens: proc_macro2::TokenStream = input.into();
     let result = match syn::parse2::<descriptor_expand::NamedFields>(tokens.clone()) {
@@ -108,6 +177,12 @@ pub fn workflow(input: TokenStream) -> TokenStream {
 /// or run an existing description with a zero-argument Effect body. Ordinary
 /// Effect operations are confined to that body, not workflow coordination.
 #[proc_macro]
+/// # Parameters
+/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub fn activity(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as descriptor_expand::NamedFields);
     descriptor_expand::activity(fields)
@@ -116,6 +191,14 @@ pub fn activity(input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
+/// Expand a workflow identity, version, and codec definition.
+///
+/// # Parameters
+/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub fn workflow_definition(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as descriptor_expand::NamedFields);
     descriptor_expand::workflow_definition(fields)
@@ -124,6 +207,14 @@ pub fn workflow_definition(input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
+/// Expand a named activity identity and typed codec definition.
+///
+/// # Parameters
+/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub fn activity_definition(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as descriptor_expand::NamedFields);
     descriptor_expand::activity_definition(fields)
@@ -132,6 +223,14 @@ pub fn activity_definition(input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
+/// Expand a unary RPC operation with typed request and reply codecs.
+///
+/// # Parameters
+/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub fn rpc_operation(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as descriptor_expand::NamedFields);
     descriptor_expand::rpc_operation(fields)
@@ -140,6 +239,14 @@ pub fn rpc_operation(input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
+/// Expand a streaming RPC operation with typed item and terminal codecs.
+///
+/// # Parameters
+/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub fn rpc_stream_operation(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as descriptor_expand::NamedFields);
     descriptor_expand::rpc_stream_operation(fields)
@@ -148,6 +255,14 @@ pub fn rpc_stream_operation(input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
+/// Expand a protocol with its first required typed handler.
+///
+/// # Parameters
+/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub fn rpc_protocol(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as descriptor_expand::NamedFields);
     descriptor_expand::rpc_protocol(fields)
@@ -156,6 +271,14 @@ pub fn rpc_protocol(input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
+/// Expand a streaming protocol with its first required typed handler.
+///
+/// # Parameters
+/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub fn rpc_stream_protocol(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as descriptor_expand::NamedFields);
     descriptor_expand::rpc_stream_protocol(fields)
@@ -164,6 +287,14 @@ pub fn rpc_stream_protocol(input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
+/// Expand a typed wrapper around unary RPC client or server handling.
+///
+/// # Parameters
+/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub fn rpc_middleware(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as descriptor_expand::NamedFields);
     descriptor_expand::rpc_middleware(fields)
@@ -172,6 +303,14 @@ pub fn rpc_middleware(input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
+/// Expand a typed wrapper around streaming RPC handling.
+///
+/// # Parameters
+/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub fn rpc_stream_middleware(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as descriptor_expand::NamedFields);
     descriptor_expand::rpc_stream_middleware(fields)
@@ -180,6 +319,14 @@ pub fn rpc_stream_middleware(input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
+/// Expand an addressed entity dispatcher with checked typed handlers.
+///
+/// # Parameters
+/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub fn entity(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as descriptor_expand::NamedFields);
     descriptor_expand::entity(fields)
@@ -189,6 +336,12 @@ pub fn entity(input: TokenStream) -> TokenStream {
 
 /// Construct a typed writable source atom with an explicit publication policy.
 #[proc_macro]
+/// # Parameters
+/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub fn reactive_source(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as descriptor_expand::NamedFields);
     descriptor_expand::reactive_source(fields)
@@ -198,6 +351,12 @@ pub fn reactive_source(input: TokenStream) -> TokenStream {
 
 /// Construct a derived atom; its evaluator body is lowered through `effect!`.
 #[proc_macro]
+/// # Parameters
+/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub fn reactive_derived(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as descriptor_expand::NamedFields);
     descriptor_expand::reactive_derived(fields)
@@ -207,6 +366,12 @@ pub fn reactive_derived(input: TokenStream) -> TokenStream {
 
 /// Construct a query whose typed dependency set drives scoped invalidation.
 #[proc_macro]
+/// # Parameters
+/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub fn reactive_query(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as descriptor_expand::NamedFields);
     descriptor_expand::reactive_query(fields)
@@ -216,6 +381,12 @@ pub fn reactive_query(input: TokenStream) -> TokenStream {
 
 /// Pair an Effect snapshot reader with a typed Stream change source.
 #[proc_macro]
+/// # Parameters
+/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub fn reactive_bridge(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as descriptor_expand::NamedFields);
     descriptor_expand::reactive_bridge(fields)

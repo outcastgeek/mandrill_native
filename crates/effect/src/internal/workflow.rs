@@ -1,3 +1,5 @@
+//! Typed binding bridge for the effect macro.
+
 use super::destruction::FlatDrop;
 use super::runtime::{self, Context, Finish, Step};
 use crate::LibraryDefect;
@@ -5,15 +7,36 @@ use crate::{Defect, Effect, Exit, ResourceBinding, ResourceValue};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
+/// Type alias for operation in internal workflow.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
+/// - `R`: Environment type.
 type Operation<A, E, R> = Box<dyn FnOnce(Arc<R>, Context, Finish<A, E>) -> Step + Send>;
 
 /// Single-run typed construction used by `effect!`; contains no public runtime access.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
+/// - `R`: Environment type. Bound or type: `Send + Sync + 'static`.
 pub struct Workflow<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> {
     operation: FlatDrop<Operation<A, E, R>>,
     check_cancellation: bool,
 }
 
 impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Workflow<A, E, R> {
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `operation` (`impl FnOnce(Arc<R>, Context, Finish<A, E>) -> Step + Send + 'static`): Typed operation definition or callback selected for execution.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub(crate) fn new(
         operation: impl FnOnce(Arc<R>, Context, Finish<A, E>) -> Step + Send + 'static,
     ) -> Self {
@@ -23,12 +46,34 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Workflow<A,
         }
     }
 
+    /// # Type parameters
+    /// - `R`: Environment type. Bound: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `outcome` (`Exit<A, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub(crate) fn from_exit(outcome: Exit<A, E>) -> Self {
         let mut workflow = Self::new(move |_, _, finish| runtime::finish(finish, outcome));
         workflow.check_cancellation = false;
         workflow
     }
 
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `env` (`Arc<R>`): The environment supplying this operation's capabilities.
+    /// - `context` (`Context`): Execution context carrying cancellation, scope, and trace state.
+    /// - `finish` (`Finish<A, E>`): Continuation receiving the complete terminal outcome.
+    ///
+    /// # Returns
+    /// Type: `Step`.
     pub(crate) fn execute(self, env: Arc<R>, context: Context, finish: Finish<A, E>) -> Step {
         runtime::more(move || {
             if self.check_cancellation && context.cancelled() {
@@ -47,6 +92,16 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Workflow<A,
 
 /// Move this run's value into its success channel without requiring Clone.
 #[must_use]
+/// # Type parameters
+/// - `A`: Application value type. Bounds: `Send + 'static`.
+/// - `E`: Domain-error type. Bounds: `Send + 'static`.
+/// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `value` (`A`): Value read, transformed, encoded, or stored by this operation.
+///
+/// # Returns
+/// Type: `Workflow<A, E, R>`.
 pub fn success<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static>(
     value: A,
 ) -> Workflow<A, E, R> {
@@ -54,6 +109,17 @@ pub fn success<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static>(
 }
 
 /// Single-use lazy block for control-flow expansion.
+///
+/// # Type parameters
+/// - `A`: Application value type. Additional bound: `Send + 'static`.
+/// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type. Additional bound: `Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `factory` (`impl FnOnce() -> Workflow<A, E, R> + Send + 'static`): Factory invoked to create fresh data for an execution.
+///
+/// # Returns
+/// Type: `Workflow<A, E, R>`.
 pub fn defer<A, E, R>(
     factory: impl FnOnce() -> Workflow<A, E, R> + Send + 'static,
 ) -> Workflow<A, E, R>
@@ -72,6 +138,18 @@ where
 
 /// Typed binding; the continuation is invoked once for this run and only on success.
 #[must_use]
+/// # Type parameters
+/// - `P`: Payload type. Additional bound: `Bindable<E, R>`.
+/// - `B`: Transformed value type. Additional bound: `Send + 'static`.
+/// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type. Additional bound: `Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `program` (`P`): Lazy Effect description executed or transformed here.
+/// - `next` (`impl FnOnce(P::Value) -> Workflow<B, E, R> + Send + 'static`): Next value or state produced by the transition.
+///
+/// # Returns
+/// Type: `Workflow<B, E, R>`.
 pub fn bind<P, B, E, R>(
     program: P,
     next: impl FnOnce(P::Value) -> Workflow<B, E, R> + Send + 'static,
@@ -86,6 +164,7 @@ where
 }
 
 mod sealed {
+    /// Seals the Effect binding bridge to supported workflow operations.
     pub trait Sealed {}
     impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Sealed
         for crate::Effect<A, E, R>
@@ -103,7 +182,18 @@ mod sealed {
 
 /// Safe macro dispatch for ordinary effects and typed ownership declarations.
 pub trait Bindable<E: Send + 'static, R: Send + Sync + 'static>: sealed::Sealed {
+    /// Value admitted by this sealed macro binding.
     type Value: Send + 'static;
+    /// # Type parameters
+    /// - `B`: Transformed value type. Bounds: `Send + 'static`.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `next` (`impl FnOnce(Self::Value) -> Workflow<B, E, R> + Send + 'static`): Next value or state produced by the transition.
+    ///
+    /// # Returns
+    /// Type: `Workflow<B, E, R>`.
     fn bind_workflow<B: Send + 'static>(
         self,
         next: impl FnOnce(Self::Value) -> Workflow<B, E, R> + Send + 'static,
@@ -113,7 +203,21 @@ pub trait Bindable<E: Send + 'static, R: Send + Sync + 'static>: sealed::Sealed 
 impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Bindable<E, R>
     for Effect<A, E, R>
 {
+    /// Type alias for value in internal workflow.
     type Value = A;
+    ///
+    /// # Type parameters
+    /// - `B`: Bounds: `Send + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `next` (`impl FnOnce(A) -> Workflow<B, E, R> + Send + 'static`): Next value or state produced by the transition.
+    ///
+    /// # Returns
+    /// Type: `Workflow<B, E, R>`.
+    /// Returns `Workflow<B, E, R>`.
     fn bind_workflow<B: Send + 'static>(
         self,
         next: impl FnOnce(A) -> Workflow<B, E, R> + Send + 'static,
@@ -125,7 +229,21 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Bindable<E,
 impl<T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Bindable<E, R>
     for ResourceBinding<T, E, R>
 {
+    /// Type alias for value in internal workflow.
     type Value = ResourceValue<T>;
+    ///
+    /// # Type parameters
+    /// - `B`: Bounds: `Send + 'static`.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `next` (`impl FnOnce(ResourceValue<T>) -> Workflow<B, E, R> + Send + 'static`): Next value or state produced by the transition.
+    ///
+    /// # Returns
+    /// Type: `Workflow<B, E, R>`.
+    /// Returns `Workflow<B, E, R>`.
     fn bind_workflow<B: Send + 'static>(
         self,
         next: impl FnOnce(ResourceValue<T>) -> Workflow<B, E, R> + Send + 'static,
@@ -137,7 +255,21 @@ impl<T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Bind
 impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Bindable<E, R>
     for Workflow<A, E, R>
 {
+    /// Type alias for value in internal workflow.
     type Value = A;
+    ///
+    /// # Type parameters
+    /// - `B`: Bounds: `Send + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `next` (`impl FnOnce(A) -> Workflow<B, E, R> + Send + 'static`): Next value or state produced by the transition.
+    ///
+    /// # Returns
+    /// Type: `Workflow<B, E, R>`.
+    /// Returns `Workflow<B, E, R>`.
     fn bind_workflow<B: Send + 'static>(
         self,
         next: impl FnOnce(A) -> Workflow<B, E, R> + Send + 'static,
@@ -149,6 +281,20 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Bindable<E,
     }
 }
 
+///
+/// # Type parameters
+/// - `A`: Successful application-value type. Additional bound: `Send + 'static`.
+/// - `B`: Transformed success-value type. Additional bound: `Send + 'static`.
+/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type supplying required capabilities. Additional bound: `Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `program` (`Effect<A, E, R>`): Lazy Effect description executed or transformed here.
+/// - `next` (`impl FnOnce(A) -> Workflow<B, E, R> + Send + 'static`): Next value or state produced by the transition.
+///
+/// # Returns
+/// Type: `Workflow<B, E, R>`.
+/// Returns `Workflow<B, E, R>`.
 fn bind_effect<A, B, E, R>(
     program: Effect<A, E, R>,
     next: impl FnOnce(A) -> Workflow<B, E, R> + Send + 'static,
@@ -165,6 +311,20 @@ where
     )
 }
 
+///
+/// # Type parameters
+/// - `A`: Successful application-value type. Additional bound: `Send + 'static`.
+/// - `B`: Transformed success-value type. Additional bound: `Send + 'static`.
+/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type supplying required capabilities. Additional bound: `Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `execute` (`impl FnOnce(Arc<R>, Context, Finish<A, E>) -> Step + Send + 'static`): The execute supplied to this operation.
+/// - `next` (`impl FnOnce(A) -> Workflow<B, E, R> + Send + 'static`): Next value or state produced by the transition.
+///
+/// # Returns
+/// Type: `Workflow<B, E, R>`.
+/// Returns `Workflow<B, E, R>`.
 fn bind_operation<A, B, E, R>(
     execute: impl FnOnce(Arc<R>, Context, Finish<A, E>) -> Step + Send + 'static,
     next: impl FnOnce(A) -> Workflow<B, E, R> + Send + 'static,
@@ -205,6 +365,18 @@ where
 }
 
 /// A fresh workflow factory is invoked lazily on every run.
+///
+/// # Type parameters
+/// - `A`: Application value type. Additional bound: `Send + 'static`.
+/// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type. Additional bound: `Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `factory` (`impl Fn() -> Workflow<A, E, R> + Send + Sync + 'static`): Factory invoked to create fresh data for an execution.
+///
+/// # Returns
+/// Type: `Effect<A, E, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 pub fn reusable<A, E, R>(
     factory: impl Fn() -> Workflow<A, E, R> + Send + Sync + 'static,
 ) -> Effect<A, E, R>

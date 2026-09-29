@@ -1,3 +1,12 @@
+//! Atomic transactions and committed observations.
+//!
+//! [`Transaction`] describes reads and writes against one optimistic journal.
+//! `atomically` validates its read set, commits all writes together, and
+//! publishes changes only after commit. Expected failure abandons the journal;
+//! conflict retry follows the caller's policy. A transactional `retry` waits
+//! for an observed cell to change. This is process-local synchronization, not
+//! a persistent database or a substitute for a workflow engine.
+
 mod internal;
 mod transaction;
 mod tx_chunk;

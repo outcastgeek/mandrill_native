@@ -13,6 +13,18 @@ const pubsub = @import("pub_sub.zig");
 const scopes = @import("scope.zig");
 const Cancellation = @import("internal/runtime.zig").Cancellation;
 
+/// Create a Stream from an existing PubSub subscription.
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `select_bus: comptime fn (*const R) *pubsub.PubSub(A)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `map_bus_error: comptime fn (pubsub.Error) E`: Compile-time typed function selected at comptime; no runtime callback lookup
+///   is required.
+/// - `map_gap: comptime fn (u64) E`: Compile-time typed function selected at comptime; no runtime callback lookup is
+///   required.
+/// Returns (`effects.Stream(A, E, R)`): A lazy typed Stream; the caller consumes it under its scope and handles terminal Exit.
 pub fn fromSubscription(
     comptime A: type,
     comptime E: type,
@@ -71,6 +83,19 @@ pub fn fromSubscription(
 
 /// The producer completes when its source ends; bus shutdown is a separate
 /// caller-owned decision because other producers or subscribers may remain.
+///
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `source: comptime effects.Stream(A, E, R)`: Compile-time typed input value; move or clone owning payloads according to its type
+///   contract.
+/// - `select_bus: comptime fn (*const R) *pubsub.PubSub(A)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `map_bus_error: comptime fn (pubsub.Error) E`: Compile-time typed function selected at comptime; no runtime callback lookup
+///   is required.
+/// - `on_drop: comptime fn () E`: Compile-time typed callback; its signature is checked at comptime where static.
+/// Returns (`effects.Effect(void, E, R)`): producer effect that publishes this stream into the borrowed bus; the caller still owns bus shutdown.
 pub fn publishTo(
     comptime A: type,
     comptime E: type,
@@ -104,6 +129,19 @@ pub fn publishTo(
 /// Publish a single source into an exclusively owned bus, then signal its
 /// subscribers after all retained items have become available to drain.
 /// The publisher's typed failure remains on the returned Effect.
+///
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `source: comptime effects.Stream(A, E, R)`: Compile-time typed input value; move or clone owning payloads according to its type
+///   contract.
+/// - `select_bus: comptime fn (*const R) *pubsub.PubSub(A)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `map_bus_error: comptime fn (pubsub.Error) E`: Compile-time typed function selected at comptime; no runtime callback lookup
+///   is required.
+/// - `on_drop: comptime fn () E`: Compile-time typed callback; its signature is checked at comptime where static.
+/// Returns (`effects.Effect(void, E, R)`): producer effect that publishes this stream and closes its exclusively owned bus afterward.
 pub fn publishToAndClose(
     comptime A: type,
     comptime E: type,
@@ -129,6 +167,19 @@ pub fn publishToAndClose(
 /// Run both producers concurrently into the same bounded bus. Consumers may
 /// subscribe before starting this Effect; the caller shuts the bus down only
 /// after all publishers and observers using it have joined.
+///
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `left: comptime effects.Stream(A, E, R)`: Left-hand typed description in this composition.
+/// - `right: comptime effects.Stream(A, E, R)`: Right-hand typed description in this composition.
+/// - `select_bus: comptime fn (*const R) *pubsub.PubSub(A)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `map_bus_error: comptime fn (pubsub.Error) E`: Compile-time typed function selected at comptime; no runtime callback lookup
+///   is required.
+/// - `on_drop: comptime fn () E`: Compile-time typed callback; its signature is checked at comptime where static.
+/// Returns (`effects.Effect(void, E, R)`): effect running both producers concurrently into the same caller-owned bus.
 pub fn mergeInto(
     comptime A: type,
     comptime E: type,
@@ -167,6 +218,19 @@ pub fn mergeInto(
 /// already attached to the bus drains retained items and then observes `end`.
 /// The returned Effect retains any producer failure; callers must join it.
 /// A shared bus must use `mergeInto` and let its owner decide when to shut down.
+///
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `left: comptime effects.Stream(A, E, R)`: Left-hand typed description in this composition.
+/// - `right: comptime effects.Stream(A, E, R)`: Right-hand typed description in this composition.
+/// - `select_bus: comptime fn (*const R) *pubsub.PubSub(A)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `map_bus_error: comptime fn (pubsub.Error) E`: Compile-time typed function selected at comptime; no runtime callback lookup
+///   is required.
+/// - `on_drop: comptime fn () E`: Compile-time typed callback; its signature is checked at comptime where static.
+/// Returns (`effects.Effect(void, E, R)`): effect running both producers and closing their exclusively owned bus after they settle.
 pub fn mergeIntoAndClose(
     comptime A: type,
     comptime E: type,
@@ -284,6 +348,23 @@ fn runProducer(
 
 /// Run one source through a bounded caller-owned bus, with subscription,
 /// producer lifetime, drain and typed producer completion handled together.
+///
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `source: comptime effects.Stream(A, E, R)`: Compile-time typed input value; move or clone owning payloads according to its type
+///   contract.
+/// - `select_bus: comptime fn (*const R) *pubsub.PubSub(A)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `map_bus_error: comptime fn (pubsub.Error) E`: Compile-time typed function selected at comptime; no runtime callback lookup
+///   is required.
+/// - `map_gap: comptime fn (u64) E`: Compile-time typed function selected at comptime; no runtime callback lookup is
+///   required.
+/// - `on_drop: comptime fn () E`: Compile-time typed callback; its signature is checked at comptime where static.
+/// - `consume: comptime fn (A, *const R) effects.Effect(void, E, R)`: Compile-time typed function selected at comptime; no runtime callback lookup is
+///   required.
+/// Returns (`effects.Effect(void, E, R)`): effect that consumes one source through a bounded bus and joins its producer.
 pub fn runBuffered(
     comptime A: type,
     comptime E: type,
@@ -300,6 +381,23 @@ pub fn runBuffered(
 
 /// Run two source streams concurrently through the same bounded bus. Both
 /// branches share the caller's runtime capabilities and are joined on exit.
+///
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `left: comptime effects.Stream(A, E, R)`: Left-hand typed description in this composition.
+/// - `right: comptime effects.Stream(A, E, R)`: Right-hand typed description in this composition.
+/// - `select_bus: comptime fn (*const R) *pubsub.PubSub(A)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `map_bus_error: comptime fn (pubsub.Error) E`: Compile-time typed function selected at comptime; no runtime callback lookup
+///   is required.
+/// - `map_gap: comptime fn (u64) E`: Compile-time typed function selected at comptime; no runtime callback lookup is
+///   required.
+/// - `on_drop: comptime fn () E`: Compile-time typed callback; its signature is checked at comptime where static.
+/// - `consume: comptime fn (A, *const R) effects.Effect(void, E, R)`: Compile-time typed function selected at comptime; no runtime callback lookup is
+///   required.
+/// Returns (`effects.Effect(void, E, R)`): effect that consumes two merged source streams and joins both producers.
 pub fn runMerged(
     comptime A: type,
     comptime E: type,

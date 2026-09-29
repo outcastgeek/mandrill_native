@@ -1,3 +1,5 @@
+//! Schema-derived binary payload encoding.
+
 use crate::schema::{JsonValue, PureCodec, SchemaAst, SchemaIssue, SchemaResource};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
@@ -15,22 +17,36 @@ use internal::{Cursor, Output};
 pub const SCHEMA_BINARY_FORMAT_VERSION: u8 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Explicit resource bounds for encoding schema binary.
 pub struct BinaryLimits {
+    /// The owned encoded bytes. Type: `NonZeroUsize`.
     pub bytes: NonZeroUsize,
+    /// Maximum permitted nesting depth. Type: `NonZeroUsize`.
     pub depth: NonZeroUsize,
+    /// Maximum permitted schema or parse nodes. Type: `NonZeroUsize`.
     pub nodes: NonZeroUsize,
+    /// Maximum number of items in one collection. Type: `NonZeroUsize`.
     pub collection: NonZeroUsize,
     /// Includes schema redirects and failed union alternatives.
     pub steps: NonZeroUsize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Stable format identity and version used to interpret encoded binary data.
 pub struct BinaryIdentity {
     name: Arc<str>,
     version: NonZeroU64,
 }
 
 impl BinaryIdentity {
+    /// Construct a `BinaryIdentity` from its required inputs and explicit policies.
+    ///
+    /// # Parameters
+    /// - `name` (`impl Into<Arc<str>>`): Stable name used to register or locate this definition.
+    /// - `version` (`NonZeroU64`): Registered schema, event, or workflow compatibility version.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, BinaryError>`.
     pub fn new(name: impl Into<Arc<str>>, version: NonZeroU64) -> Result<Self, BinaryError> {
         let name = name.into();
         if name.is_empty() {
@@ -40,40 +56,86 @@ impl BinaryIdentity {
     }
 
     #[must_use]
+    /// Borrow the stable name used to identify this definition.
+    ///
+    /// # Returns
+    /// Type: `&str`.
     pub fn name(&self) -> &str {
         &self.name
     }
 
     #[must_use]
+    /// # Returns
+    /// Type: `NonZeroU64`.
     pub const fn version(&self) -> NonZeroU64 {
         self.version
     }
 }
 
 #[derive(Debug)]
+/// A typed identity, size, or decoding failure for binary representation.
 pub enum BinaryError {
+    /// The required schema name is empty.
     EmptySchemaName,
+    /// The format is not supported. Carries `u8`.
     UnsupportedFormat(u8),
+    /// The schema name differs from the required or recorded value.
     SchemaNameMismatch,
-    SchemaVersionMismatch { expected: u64, actual: u64 },
+    /// The encoded schema version differs from the expected version.
+    SchemaVersionMismatch {
+        /// Version required by the decoder. Type: `u64`.
+        expected: u64,
+        /// Version found in the payload. Type: `u64`.
+        actual: u64,
+    },
+    /// The codec schema differs from the required or recorded value.
     CodecSchemaMismatch,
+    /// The opaque is not supported.
     UnsupportedOpaque,
+    /// The grapheme length is not supported.
     UnsupportedGraphemeLength,
+    /// A schema reference names no available definition.
     UnresolvedReference,
+    /// The tag failed validation. Carries `u8`.
     InvalidTag(u8),
+    /// The union index failed validation. Carries `u64`.
     InvalidUnionIndex(u64),
+    /// The utf8 failed validation.
     InvalidUtf8,
+    /// The number failed validation.
     InvalidNumber,
+    /// The key already exists or occurred twice. Carries `String`.
     DuplicateKey(String),
-    Truncated { offset: usize, needed: usize },
-    TrailingBytes { offset: usize },
+    /// The binary payload ends before the next value is complete.
+    Truncated {
+        /// Byte position of the incomplete value. Type: `usize`.
+        offset: usize,
+        /// Additional bytes required to complete it. Type: `usize`.
+        needed: usize,
+    },
+    /// Decoded data is followed by unexpected bytes.
+    TrailingBytes {
+        /// Position where trailing bytes begin. Type: `usize`.
+        offset: usize,
+    },
+    /// Computing length exceeded its supported range.
     LengthOverflow,
+    /// The configured resource limit was exceeded. Retains the `SchemaResource` detail.
     LimitExceeded(SchemaResource),
+    /// No union variant is available. Carries `Vec<Self>`.
     NoUnionVariant(Vec<Self>),
+    /// The value failed schema validation. Retains the `SchemaIssue` detail.
     Schema(SchemaIssue),
 }
 
 impl std::fmt::Display for BinaryError {
+    ///
+    /// # Parameters
+    /// - `formatter` (`&mut std::fmt::Formatter<'_>`): Destination formatter used by the Rust formatting trait.
+    ///
+    /// # Returns
+    /// Type: `std::fmt::Result`.
+    /// Returns `std::fmt::Result`.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(self, formatter)
     }
@@ -82,6 +144,12 @@ impl std::fmt::Display for BinaryError {
 impl std::error::Error for BinaryError {}
 
 impl From<SchemaIssue> for BinaryError {
+    ///
+    /// # Parameters
+    /// - `issue` (`SchemaIssue`): The issue supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn from(issue: SchemaIssue) -> Self {
         Self::Schema(issue)
     }
@@ -97,6 +165,15 @@ pub struct SchemaBinary {
 
 impl SchemaBinary {
     #[must_use]
+    /// Construct a `SchemaBinary` from its required inputs and explicit policies.
+    ///
+    /// # Parameters
+    /// - `ast` (`SchemaAst`): Representation tree used for schema inspection or export.
+    /// - `identity` (`BinaryIdentity`): Stable identity used to deduplicate or find this record.
+    /// - `limits` (`BinaryLimits`): Explicit resource bounds enforced while processing this input.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(ast: SchemaAst, identity: BinaryIdentity, limits: BinaryLimits) -> Self {
         Self {
             ast,
@@ -106,17 +183,29 @@ impl SchemaBinary {
     }
 
     #[must_use]
+    /// Borrow the stable binary format identity used by this codec.
+    ///
+    /// # Returns
+    /// Type: `&BinaryIdentity`.
     pub fn identity(&self) -> &BinaryIdentity {
         &self.identity
     }
 
     #[must_use]
+    /// # Returns
+    /// Type: `BinaryLimits`.
     pub const fn limits(&self) -> BinaryLimits {
         self.limits
     }
 
     /// Encode the schema's JSON-facing representation. `Checked` metadata
     /// cannot run application validators; a typed codec must do that first.
+    ///
+    /// # Parameters
+    /// - `value` (`&JsonValue`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Vec<u8>, BinaryError>`.
     pub fn encode_json(&self, value: &JsonValue) -> Result<Vec<u8>, BinaryError> {
         let mut output = Output::new(self.limits);
         output.byte(SCHEMA_BINARY_FORMAT_VERSION)?;
@@ -128,6 +217,12 @@ impl SchemaBinary {
 
     /// Decode into independently owned JSON values. No view into `input` or
     /// a retained arena outlives the call.
+    ///
+    /// # Parameters
+    /// - `input` (`&[u8]`): The input value or factory consumed by this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<JsonValue, BinaryError>`.
     pub fn decode_json(&self, input: &[u8]) -> Result<JsonValue, BinaryError> {
         let mut cursor = Cursor::new(input, self.limits)?;
         let version = cursor.byte()?;
@@ -153,6 +248,17 @@ impl SchemaBinary {
         Ok(value)
     }
 
+    /// Encode a typed value with the declared binary identity and resource bounds.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bounds: `Send + 'static`.
+    ///
+    /// # Parameters
+    /// - `codec` (`&PureCodec<A, JsonValue>`): The codec used to convert and validate values.
+    /// - `value` (`&A`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Vec<u8>, BinaryError>`.
     pub fn encode_typed<A: Send + 'static>(
         &self,
         codec: &PureCodec<A, JsonValue>,
@@ -163,6 +269,17 @@ impl SchemaBinary {
         self.encode_json(&encoded)
     }
 
+    /// Check binary identity and bounds before decoding a typed value.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bounds: `Send + 'static`.
+    ///
+    /// # Parameters
+    /// - `codec` (`&PureCodec<A, JsonValue>`): The codec used to convert and validate values.
+    /// - `input` (`&[u8]`): The input value or factory consumed by this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<A, BinaryError>`.
     pub fn decode_typed<A: Send + 'static>(
         &self,
         codec: &PureCodec<A, JsonValue>,
@@ -174,6 +291,15 @@ impl SchemaBinary {
             .map_err(Into::into)
     }
 
+    ///
+    /// # Type parameters
+    /// - `A`: Bounds: `Send + 'static`.
+    ///
+    /// # Parameters
+    /// - `codec` (`&PureCodec<A, JsonValue>`): The codec supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<(), BinaryError>`.
     fn require_codec<A: Send + 'static>(
         &self,
         codec: &PureCodec<A, JsonValue>,

@@ -1,3 +1,5 @@
+//! Native application entry point.
+
 use clap::{Parser, ValueEnum};
 use effect::{Console, ConsoleChannel, Exit, LogLevel, StandardConsole};
 use effect_app::{AppConfig, Files, LiveApp, application, describe};
@@ -7,6 +9,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 #[derive(Clone, Copy, ValueEnum)]
+/// Command-line choices for the minimum emitted log level.
 enum Verbosity {
     Debug,
     Info,
@@ -14,11 +17,14 @@ enum Verbosity {
     Error,
 }
 #[derive(Clone, Copy, ValueEnum)]
+/// Command-line choices for behavior when diagnostics reach capacity.
 enum Overflow {
     DiscardOldest,
     DiscardNewest,
 }
 #[derive(Parser)]
+/// Required file paths, worker counts, admission bounds, and application
+/// policies. No runtime or retry count is inferred from hidden defaults.
 struct Arguments {
     #[arg(long)]
     input: PathBuf,
@@ -53,6 +59,11 @@ struct Arguments {
     #[arg(long)]
     log_level: Verbosity,
 }
+/// Parse configuration, run the application, request cancellation on Ctrl-C,
+/// drain accepted work, then print the terminal outcome and diagnostics.
+///
+/// # Returns
+/// Type: `Result<ExitCode, effect::Defect>`.
 fn main() -> Result<ExitCode, effect::Defect> {
     let args = Arguments::parse();
     if args.input == args.staging || args.output == args.staging || args.input == args.output {

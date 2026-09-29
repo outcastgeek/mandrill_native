@@ -1,3 +1,5 @@
+//! Claiming and executing accepted Cluster messages.
+
 use super::{
     ClaimOptions, ClaimToken, ClusterExecutor, ClusterMessageStore, ClusterRequestId,
     CompletedReply, DurableClusterMessageStore, HasClusterExecutor, HasClusterMessageStore,
@@ -7,8 +9,21 @@ use crate::{Effect, HasTaskSpawner, HasWallClock, UtcMillis, WallClock};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
+/// Type alias for cluster run result in cluster runner.
+///
+/// # Type parameters
+/// - `Store`: Backing store provider type.
+/// - `Execution`: Execution provider or mode type.
+/// - `Clock`: Clock provider type.
 pub type ClusterRunResult<Store, Execution, Clock> =
     Result<ClusterRunOutcome, ClusterRunnerError<Store, Execution, Clock>>;
+/// Type alias for cluster run effect in cluster runner.
+///
+/// # Type parameters
+/// - `Store`: Backing store provider type.
+/// - `Execution`: Execution provider or mode type.
+/// - `Clock`: Clock provider type.
+/// - `R`: Environment type.
 pub type ClusterRunEffect<Store, Execution, Clock, R> = Effect<
     Vec<ClusterRunResult<Store, Execution, Clock>>,
     ClusterRunnerError<Store, Execution, Clock>,
@@ -16,31 +31,48 @@ pub type ClusterRunEffect<Store, Execution, Clock, R> = Effect<
 >;
 
 #[derive(Debug)]
+/// A failure while claiming, dispatching, or settling accepted cluster messages.
+///
+/// # Type parameters
+/// - `Store`: Backing store provider type.
+/// - `Execution`: Execution provider or mode type.
+/// - `Clock`: Clock provider type.
 pub enum ClusterRunnerError<Store, Execution, Clock> {
+    /// The claim may have committed; ownership could not be confirmed. Retains the `Store` detail.
     UncertainClaim(Store),
     /// Execution failed after a claim; the handler may have performed an
     /// external effect. Inspect the request before deciding to run it again.
     Execution {
+        /// Fencing token used to reject stale owners or claims. Type: `ClaimToken`.
         token: ClaimToken,
+        /// The underlying failure or provider cause. Type: `Execution`.
         source: Execution,
     },
     /// The handler returned a reply, but the completion timestamp could not
     /// be obtained; its external effects may already have occurred.
     UncertainCompletionClock {
+        /// Fencing token used to reject stale owners or claims. Type: `ClaimToken`.
         token: ClaimToken,
+        /// The underlying failure or provider cause. Type: `Clock`.
         source: Clock,
     },
     /// Handler side effects may have occurred before completion was stored.
     /// A later claim may run the body again; inspect by request identity.
     UncertainCompletion {
+        /// Fencing token used to reject stale owners or claims. Type: `ClaimToken`.
         token: ClaimToken,
+        /// The underlying failure or provider cause. Type: `Store`.
         source: Store,
     },
+    /// An owned input was already consumed.
     InputConsumed,
 }
 
+/// The result of one runner attempt, including whether work was claimed or settled.
 pub struct ClusterRunOutcome {
+    /// The request being handled. Type: `ClusterRequestId`.
     pub request: ClusterRequestId,
+    /// Store decision after attempting to settle the claimed message. Type: `StoreCompletion`.
     pub completion: StoreCompletion,
 }
 
@@ -52,6 +84,19 @@ pub struct ClusterRunner;
 impl ClusterRunner {
     /// Run a delivery pass only with a message store that warrants recovery
     /// of accepted and unacknowledged work after its restart boundary.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Additional bound: `HasClusterMessageStore + HasClusterExecutor + HasTaskSpawner + HasWallClock + Send + Sync + 'static`. Additional bound: `:Store: DurableClusterMessageStore<Error = StoreError>`. Additional bound: `:Executor: ClusterExecutor<R, Error = ExecutionError>`. Additional bound: `:Clock: WallClock<Error = ClockError>`.
+    /// - `StoreError`: Error returned by the backing store. Additional bound: `Send + 'static`.
+    /// - `ExecutionError`: Error produced during execution. Additional bound: `Send + 'static`.
+    /// - `ClockError`: Error returned by the clock capability. Additional bound: `Send + 'static`.
+    ///
+    /// # Parameters
+    /// - `options` (`ClaimOptions`): Caller-selected bounds and behavior for this operation.
+    /// - `parallelism` (`NonZeroUsize`): The parallelism supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `ClusterRunEffect<StoreError, ExecutionError, ClockError, R>`.
     pub fn run_once_durable<R, StoreError, ExecutionError, ClockError>(
         options: ClaimOptions,
         parallelism: NonZeroUsize,
@@ -74,6 +119,20 @@ impl ClusterRunner {
         Self::run_once(options, parallelism)
     }
 
+    /// Claim and process one bounded batch of accepted cluster messages.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Additional bound: `HasClusterMessageStore + HasClusterExecutor + HasTaskSpawner + HasWallClock + Send + Sync + 'static`. Additional bound: `:Store: ClusterMessageStore<Error = StoreError>`. Additional bound: `:Executor: ClusterExecutor<R, Error = ExecutionError>`. Additional bound: `:Clock: WallClock<Error = ClockError>`.
+    /// - `StoreError`: Error returned by the backing store. Additional bound: `Send + 'static`.
+    /// - `ExecutionError`: Error produced during execution. Additional bound: `Send + 'static`.
+    /// - `ClockError`: Error returned by the clock capability. Additional bound: `Send + 'static`.
+    ///
+    /// # Parameters
+    /// - `options` (`ClaimOptions`): Caller-selected bounds and behavior for this operation.
+    /// - `parallelism` (`NonZeroUsize`): The parallelism supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `ClusterRunEffect<StoreError, ExecutionError, ClockError, R>`.
     pub fn run_once<R, StoreError, ExecutionError, ClockError>(
         options: ClaimOptions,
         parallelism: NonZeroUsize,
@@ -119,6 +178,19 @@ impl ClusterRunner {
     }
 }
 
+///
+/// # Type parameters
+/// - `R`: Environment type supplying required capabilities. Additional bound: `HasClusterMessageStore + HasClusterExecutor + HasWallClock + Send + Sync + 'static`. Additional bound: `:Store: ClusterMessageStore<Error = StoreError>`. Additional bound: `:Executor: ClusterExecutor<R, Error = ExecutionError>`. Additional bound: `:Clock: WallClock<Error = ClockError>`.
+/// - `StoreError`: Error returned by the backing store. Additional bound: `Send + 'static`.
+/// - `ExecutionError`: Error produced during execution. Additional bound: `Send + 'static`.
+/// - `ClockError`: Error returned by the clock capability. Additional bound: `Send + 'static`.
+///
+/// # Parameters
+/// - `claim` (`MessageClaim`): Fenced ownership token for the selected message.
+///
+/// # Returns
+/// Type: `Effect<ClusterRunOutcome, ClusterRunnerError<StoreError, ExecutionError, ClockError>, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 fn run_claim<R, StoreError, ExecutionError, ClockError>(
     claim: MessageClaim,
 ) -> Effect<ClusterRunOutcome, ClusterRunnerError<StoreError, ExecutionError, ClockError>, R>

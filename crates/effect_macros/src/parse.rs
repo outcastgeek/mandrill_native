@@ -1,7 +1,10 @@
+//! Parsing of Effect macro control flow.
+
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::{Expr, Stmt};
 
+/// Variants of unsupported syntax used by parse.
 enum UnsupportedSyntax {
     BranchAssignment,
     NestedTry,
@@ -11,6 +14,13 @@ enum UnsupportedSyntax {
 
 impl UnsupportedSyntax {
     // AST conditions select these diagnostics; diagnostic text is presentation.
+    ///
+    /// # Parameters
+    /// - `span` (`proc_macro2::Span`): The span supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `syn::Error`.
+    /// Returns `syn::Error`.
     fn at(self, span: proc_macro2::Span) -> syn::Error {
         let message = match self {
             Self::BranchAssignment => {
@@ -28,44 +38,83 @@ impl UnsupportedSyntax {
     }
 }
 
+/// Typed validate used by parse.
 struct Validate {
     error: Option<syn::Error>,
 }
 
 #[derive(Default)]
+/// Typed effect steps used by parse.
 struct EffectSteps {
     found: bool,
 }
 
 impl<'ast> Visit<'ast> for EffectSteps {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn visit_expr_try(&mut self, _: &'ast syn::ExprTry) {
         self.found = true;
     }
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn visit_item(&mut self, _: &'ast syn::Item) {}
 }
 
+/// # Parameters
+/// - `expr` (`&Expr`): Rust syntax expression parsed or expanded by this macro.
+///
+/// # Returns
+/// Type: `bool`.
+/// Returns whether the requested condition holds.
 pub(crate) fn has_effect_steps(expr: &Expr) -> bool {
     let mut visitor = EffectSteps::default();
     visitor.visit_expr(expr);
     visitor.found
 }
 
+/// Typed branch assignments used by parse.
 struct BranchAssignments {
     error: Option<syn::Error>,
 }
 
 impl BranchAssignments {
+    ///
+    /// # Parameters
+    /// - `span` (`proc_macro2::Span`): The span supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn reject(&mut self, span: proc_macro2::Span) {
         self.error = Some(UnsupportedSyntax::BranchAssignment.at(span));
     }
 }
 
 impl<'ast> Visit<'ast> for BranchAssignments {
+    ///
+    /// # Parameters
+    /// - `expr` (`&'ast syn::ExprAssign`): Rust syntax expression parsed or expanded by this macro.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn visit_expr_assign(&mut self, expr: &'ast syn::ExprAssign) {
         self.reject(expr.span());
     }
+    ///
+    /// # Parameters
+    /// - `expr` (`&'ast syn::ExprBinary`): Rust syntax expression parsed or expanded by this macro.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn visit_expr_binary(&mut self, expr: &'ast syn::ExprBinary) {
         if matches!(
             expr.op,
@@ -85,33 +134,79 @@ impl<'ast> Visit<'ast> for BranchAssignments {
             syn::visit::visit_expr_binary(self, expr);
         }
     }
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn visit_item(&mut self, _: &'ast syn::Item) {}
 }
 
 impl<'ast> Visit<'ast> for Validate {
+    ///
+    /// # Parameters
+    /// - `expr` (`&'ast syn::ExprTry`): Rust syntax expression parsed or expanded by this macro.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn visit_expr_try(&mut self, expr: &'ast syn::ExprTry) {
         self.error = Some(UnsupportedSyntax::NestedTry.at(expr.span()));
     }
+    ///
+    /// # Parameters
+    /// - `expr` (`&'ast syn::ExprReturn`): Rust syntax expression parsed or expanded by this macro.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn visit_expr_return(&mut self, expr: &'ast syn::ExprReturn) {
         self.error = Some(UnsupportedSyntax::NestedReturn.at(expr.span()));
     }
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn visit_item(&mut self, _: &'ast syn::Item) {}
 }
 
+/// # Parameters
+/// - `expr` (`&Expr`): Rust syntax expression parsed or expanded by this macro.
+///
+/// # Returns
+/// Type: `syn::Result<()>`.
 pub(crate) fn pure(expr: &Expr) -> syn::Result<()> {
     let mut visitor = Validate { error: None };
     visitor.visit_expr(expr);
     visitor.error.map_or(Ok(()), Err)
 }
 
+/// # Parameters
+/// - `statements` (`&[Stmt]`): Rust statements parsed and lowered by the procedural macro.
+///
+/// # Returns
+/// Type: `syn::Result<()>`.
 pub(crate) fn validate(statements: &[Stmt]) -> syn::Result<()> {
     validate_statements(statements, true)
 }
 
+///
+/// # Parameters
+/// - `expr` (`&Expr`): Rust syntax expression parsed or expanded by this macro.
+///
+/// # Returns
+/// Type: `syn::Result<()>`.
 fn workflow_expression(expr: &Expr) -> syn::Result<()> {
     if has_effect_steps(expr)
         && (matches!(expr, Expr::If(_) | Expr::Match(_))
@@ -152,6 +247,13 @@ fn workflow_expression(expr: &Expr) -> syn::Result<()> {
     pure(expr)
 }
 
+///
+/// # Parameters
+/// - `statements` (`&[Stmt]`): Rust statements parsed and lowered by the procedural macro.
+/// - `allow_return` (`bool`): The allow return supplied to this operation.
+///
+/// # Returns
+/// Type: `syn::Result<()>`.
 fn validate_statements(statements: &[Stmt], allow_return: bool) -> syn::Result<()> {
     for statement in statements {
         match statement {
@@ -177,23 +279,48 @@ fn validate_statements(statements: &[Stmt], allow_return: bool) -> syn::Result<(
 }
 
 #[derive(Default)]
+/// Typed loops used by parse.
 struct Loops {
     found: bool,
 }
 impl<'ast> Visit<'ast> for Loops {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn visit_expr_loop(&mut self, _: &'ast syn::ExprLoop) {
         self.found = true;
     }
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn visit_expr_while(&mut self, _: &'ast syn::ExprWhile) {
         self.found = true;
     }
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn visit_expr_for_loop(&mut self, _: &'ast syn::ExprForLoop) {
         self.found = true;
     }
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn visit_item(&mut self, _: &'ast syn::Item) {}
 }
+/// # Parameters
+/// - `statements` (`&[Stmt]`): Rust statements parsed and lowered by the procedural macro.
+///
+/// # Returns
+/// Type: `bool`.
+/// Returns whether the requested condition holds.
 pub(crate) fn has_loops(statements: &[Stmt]) -> bool {
     let mut loops = Loops::default();
     for statement in statements {

@@ -6,6 +6,10 @@ const journal = @import("event_journal.zig");
 const remote = @import("event_log_remote.zig");
 const keys = @import("../primary_key.zig");
 
+/// Construct an in-memory replica cursor provider with caller-owned runtime resources.
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): in-memory provider for per-replica import cursors.
 pub fn MemoryReplicaCursor(comptime R: type) type {
     return struct {
         const Self = @This();
@@ -20,6 +24,11 @@ pub fn MemoryReplicaCursor(comptime R: type) type {
         cursors: std.StringHashMap(journal.Cursor),
         closed: bool = false,
 
+        /// Create an in-memory replica cursor store using the caller environment.
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Self`): a replica cursor store bound to the supplied environment.
         pub fn init(env: *const R) Self {
             if (R == void or !@hasField(R, "allocator") or @FieldType(R, "allocator") != std.mem.Allocator)
                 @compileError("memory replica cursor requires caller allocator in R");
@@ -28,6 +37,10 @@ pub fn MemoryReplicaCursor(comptime R: type) type {
             return .{ .allocator = env.allocator, .io = env.io, .cursors = std.StringHashMap(journal.Cursor).init(env.allocator) };
         }
 
+        /// Expose this implementation through its capability interface.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`Store`): A capability adapter referencing the selected implementation; keep its backing state alive while in use.
         pub fn capability(self: *Self) Store {
             return Store.fromProvider(self, &.{ .read = readEffect, .compare_and_advance = advanceEffect });
         }
@@ -85,6 +98,10 @@ pub fn MemoryReplicaCursor(comptime R: type) type {
             return .{ .success = .{ .committed = next } };
         }
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             self.mutex.lockUncancelable(self.io);
             self.closed = true;

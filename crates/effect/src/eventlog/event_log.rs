@@ -1,3 +1,5 @@
+//! Event handling and acknowledged journal publication.
+
 use super::{
     AggregateId, AppendDecision, AppendReceipt, EventCodecError, EventDefinition, EventEnvelope,
     EventId, EventInspection, EventJournal, EventJournalId, HasEventJournal, JournalCursor,
@@ -6,65 +8,136 @@ use super::{
 use crate::{Effect, UtcMillis};
 use std::sync::{Arc, Mutex};
 
+/// Type alias for journal error in eventlog event log.
+///
+/// # Type parameters
+/// - `R`: Environment type.
 type JournalError<R> = <<R as HasEventJournal>::Journal as EventJournal>::Error;
+/// Type alias for event run effect in eventlog event log.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
+/// - `HandlerError`: Error produced by the registered handler.
+/// - `R`: Environment type.
 pub type EventRunEffect<A, E, HandlerError, R> =
     Effect<EventRunOutcome<A, E>, EventRunError<JournalError<R>, HandlerError>, R>;
 
+/// A typed event request before encoding and append.
+///
+/// # Type parameters
+/// - `P`: Payload type.
 pub struct EventInvocation<P> {
+    /// Journal that owns the authoritative records. Type: `EventJournalId`.
     pub journal: EventJournalId,
+    /// Aggregate identity or accumulated metric data associated with this record. Type: `AggregateId`.
     pub aggregate: AggregateId,
+    /// Event associated with this record. Type: `EventId`.
     pub event: EventId,
+    /// The value required by the requested condition. Type: `JournalCursor`.
     pub expected: JournalCursor,
+    /// The time at which the occurred occurred. Type: `UtcMillis`.
     pub occurred_at: UtcMillis,
+    /// The payload carried by this request or record. Type: `Arc<P>`.
     pub payload: Arc<P>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The rule for committing an event and interpreting duplicate identity.
 pub enum EventCommitPolicy {
+    /// Only successful outcomes are retained by this policy.
     SuccessOnly,
+    /// Both a successful result and a domain failure were recorded.
     SuccessAndDomainFailure,
 }
 
+/// The committed event identity and typed result of an event invocation.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 pub enum EventRunOutcome<A, E> {
+    /// The state change was committed and is now authoritative.
     Committed {
+        /// The result produced by this operation. Type: `Result<A, E>`.
         result: Result<A, E>,
+        /// The position from which reading or replay resumes. Type: `JournalCursor`.
         cursor: JournalCursor,
     },
+    /// The  already exists or occurred twice.
     Duplicate {
+        /// The result produced by this operation. Type: `Result<A, E>`.
         result: Result<A, E>,
+        /// The position from which reading or replay resumes. Type: `JournalCursor`.
         cursor: JournalCursor,
     },
+    /// The operation was accepted for processing.
     Accepted,
+    /// The operation was rejected before acceptance. Carries `E`.
     Rejected(E),
+    /// The event identity is already bound to different content.
     ConflictingEventId,
+    /// The event identity refers to compacted history.
     CompactedEventId,
+    /// The supplied cursor precedes the current recorded position.
     StaleCursor {
+        /// The value observed when the requested condition failed. Type: `JournalCursor`.
         actual: JournalCursor,
     },
 }
 
 #[derive(Debug)]
+/// A codec, journal, or application failure while invoking an event.
+///
+/// # Type parameters
+/// - `JournalError`: Error returned by the event journal.
+/// - `HandlerError`: Error produced by the registered handler.
 pub enum EventRunError<JournalError, HandlerError> {
+    /// The authoritative event journal rejected or failed the operation. Retains the `JournalError` detail.
     Journal(JournalError),
+    /// The handler ran before the event append was confirmed. Retains the `HandlerError` detail.
     HandlerBeforeAppend(HandlerError),
+    /// Encoding or decoding the typed value failed. Retains the `EventCodecError` detail.
     Codec(EventCodecError),
+    /// A terminal record exists without its required encoded outcome.
     RecordedWithoutOutcome,
+    /// The commit receipt failed validation.
     InvalidCommitReceipt {
+        /// Identity or quantity requested by the caller. Type: `EventId`.
         requested: EventId,
+        /// Event identity already present in the journal. Type: `EventId`.
         recorded: EventId,
     },
+    /// The append may have committed; the journal outcome could not be confirmed.
     UncertainAppend {
+        /// Event associated with this record. Type: `EventId`.
         event: EventId,
+        /// The underlying failure or provider cause. Type: `JournalError`.
         source: JournalError,
     },
+    /// An owned input was already consumed.
     InputConsumed,
 }
 
+/// A typed façade that encodes event invocations and appends them to a journal.
+///
+/// # Type parameters
+/// - `P`: Payload type.
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 pub struct EventLog<P, A, E> {
     definition: EventDefinition<P, A, E>,
     commit: EventCommitPolicy,
 }
 
+///
+/// # Parameters
+/// - `actual` (`&EventEnvelope`): The actual supplied to this operation.
+/// - `expected` (`&EventEnvelope`): Value or revision required for the proposed state transition.
+///
+/// # Returns
+/// Type: `bool`.
+/// Returns whether the requested condition holds.
 fn same_event_intent(actual: &EventEnvelope, expected: &EventEnvelope) -> bool {
     actual.journal == expected.journal
         && actual.aggregate == expected.aggregate
@@ -76,6 +149,17 @@ fn same_event_intent(actual: &EventEnvelope, expected: &EventEnvelope) -> bool {
         && actual.occurred_at == expected.occurred_at
 }
 
+///
+/// # Type parameters
+/// - `JournalError`: Error returned by the event journal.
+/// - `HandlerError`: Error produced by the registered handler.
+///
+/// # Parameters
+/// - `error` (`EventCodecError`): Expected or provider error preserved in the returned outcome.
+///
+/// # Returns
+/// Type: `EventRunError<JournalError, HandlerError>`.
+/// Returns `EventRunError<JournalError, HandlerError>`.
 fn recorded_outcome_error<JournalError, HandlerError>(
     error: EventCodecError,
 ) -> EventRunError<JournalError, HandlerError> {
@@ -89,6 +173,9 @@ fn recorded_outcome_error<JournalError, HandlerError>(
 }
 
 impl<P, A, E> Clone for EventLog<P, A, E> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             definition: self.definition.clone(),
@@ -99,10 +186,38 @@ impl<P, A, E> Clone for EventLog<P, A, E> {
 
 impl<P: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> EventLog<P, A, E> {
     #[must_use]
+    /// Construct a `EventLog` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `P`: Payload type.
+    ///
+    /// # Parameters
+    /// - `definition` (`EventDefinition<P, A, E>`): The typed definition used by this operation.
+    /// - `commit` (`EventCommitPolicy`): The commit supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(definition: EventDefinition<P, A, E>, commit: EventCommitPolicy) -> Self {
         Self { definition, commit }
     }
 
+    /// Execute the selected typed operation using its declared environment capabilities.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Additional bound: `HasEventJournal + Send + Sync + 'static`.
+    /// - `HandlerError`: Error produced by the registered handler. Additional bound: `Send + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `P`: Payload type.
+    ///
+    /// # Parameters
+    /// - `invocation` (`EventInvocation<P>`): The invocation supplied to this operation.
+    /// - `handler` (`impl Fn(Arc<P>) -> Effect<Result<A, E>, HandlerError, R> + Send + Sync + 'static`): The handler invoked for the matching request or event.
+    ///
+    /// # Returns
+    /// Type: `EventRunEffect<A, E, HandlerError, R>`.
     pub fn execute<R, HandlerError>(
         &self,
         invocation: EventInvocation<P>,

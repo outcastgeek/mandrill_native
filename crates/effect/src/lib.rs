@@ -1,3 +1,48 @@
+//! ## Generate the API documentation
+//!
+//! From the workspace root, run:
+//!
+//! ```sh
+//! cargo doc -p effect -p effect-macros -p effect-native-runtime -p effect-rayon -p effect-tokio -p effect-tracing -p effect-app --no-deps
+//! ```
+//!
+//! Open `target/doc/effect/index.html` in a browser. The same directory
+//! contains the companion crate indexes. Add `--document-private-items` to
+//! include internal types and helpers. Generating documentation does not run
+//! tests or start a runtime.
+//!
+//! ## Read the API in this order
+//!
+//! 1. [`Effect`], [`Exit`], and [`Defect`] explain a lazy description, one
+//!    execution's terminal outcome, and the distinction between an expected
+//!    `E` error and a defect.
+//! 2. [`effect!`], [`ResourceBinding`], [`Scope`], and [`Fiber`] explain Rust
+//!    binding syntax, resource lifetime, child ownership, cancellation, and
+//!    joining. The macro expands at compile time; the work runs later.
+//! 3. Capability traits such as [`HasTaskSpawner`], [`HasCpuExecutor`], and
+//!    [`HasClock`] show how one environment `R` supplies all runtime and
+//!    application dependencies. Tokio tasks and Rayon CPU work may coexist
+//!    in the same `R`; no provider is selected by the core.
+//! 4. Feature modules explain their own authorities and guarantees:
+//!    [`Schema`], [`persistence`], [`rpc`], [`reactivity`], [`cluster`],
+//!    [`mod@workflow`], [`eventlog`], and [`transactional`].
+//!
+//! `Effect<A, E, R>` is a reusable recipe: `A` is its success value, `E` its
+//! expected application error, and `R` the environment shared with a run.
+//! Calling [`Effect::run`] creates a future; polling it executes the recipe.
+//! A `Fail(E)` can be handled by expected-error recovery, while defects,
+//! interruption, and cleanup failures retain distinct exit channels.
+//! A method's `R: Has...` bound identifies the capability it requires.
+//! `Arc<R>` shares services without cloning application payloads. `Fn`
+//! callbacks stored in a recipe can run again; `FnOnce` callbacks belong to
+//! one run. Generic capability calls normally use static dispatch; stored
+//! `dyn` callbacks use a local Rust vtable, which is never persisted.
+//!
+//! Rustdoc's `[src]` link on each item opens its implementation. Read a
+//! feature module's contract before reading its individual types: for
+//! example, an invalidation is not evidence of a durable write, and a memory
+//! engine cannot promise recovery after process loss.
+
 #![doc = include_str!("../README.md")]
 
 extern crate self as effect;

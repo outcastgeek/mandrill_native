@@ -1,3 +1,5 @@
+//! Private synchronization gates for Effect state.
+
 use super::notification::notify_all;
 use super::waiting::{Position, Waiting};
 use crate::Cancellation;
@@ -5,39 +7,49 @@ use event_listener::Event;
 use futures_util::future::{Either, select};
 use std::sync::{Arc, Mutex};
 #[derive(Clone, Copy)]
+/// Typed failure cases for internal gate.
 pub(crate) enum GateError {
     Closed,
     Interrupted,
 }
 #[derive(Clone, Copy)]
+/// Variants of status used by internal gate.
 enum Status {
     Queued,
     Granted,
     Closed,
 }
+/// Typed waiter used by internal gate.
 struct Waiter {
     status: Mutex<Status>,
     changed: Event,
 }
+/// Typed state used by internal gate.
 struct State {
     closed: bool,
     busy: bool,
     waiting: Waiting<Arc<Waiter>>,
 }
+/// Typed inner used by internal gate.
 struct Inner {
     state: Mutex<State>,
 }
 #[derive(Clone)]
+/// Typed gate used by internal gate.
 pub(crate) struct Gate(Arc<Inner>);
+/// Typed permit used by internal gate.
 pub(crate) struct Permit {
     gate: Gate,
 }
+/// Typed registration used by internal gate.
 struct Registration {
     gate: Gate,
     waiter: Option<Arc<Waiter>>,
     position: Position,
 }
 impl Gate {
+    /// # Returns
+    /// Type: `Self`.
     pub(crate) fn new() -> Self {
         Self(Arc::new(Inner {
             state: Mutex::new(State {
@@ -47,6 +59,11 @@ impl Gate {
             }),
         }))
     }
+    /// # Parameters
+    /// - `cancellation` (`Cancellation`): The cancellation token for this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Permit, GateError>`.
     pub(crate) async fn enter(&self, cancellation: Cancellation) -> Result<Permit, GateError> {
         if cancellation.is_requested() {
             return Err(GateError::Interrupted);
@@ -103,6 +120,9 @@ impl Gate {
             }
         }
     }
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn release(&self) {
         let next = {
             let mut state = self
@@ -125,6 +145,8 @@ impl Gate {
             notify_all(&next.changed);
         }
     }
+    /// # Returns
+    /// Type: `()`.
     pub(crate) fn close(&self) {
         let waiting = {
             let mut state = self
@@ -147,11 +169,17 @@ impl Gate {
     }
 }
 impl Drop for Permit {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         self.gate.release();
     }
 }
 impl Drop for Registration {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         if let Some(waiter) = self.waiter.take() {
             let granted = {

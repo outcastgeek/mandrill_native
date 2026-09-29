@@ -1,5 +1,10 @@
+//! Build targets for the Effect package, examples, and verification programs.
 const std = @import("std");
 
+/// Register the Effect module, runnable example, and package verification steps.
+/// Parameters:
+/// - `b: *std.Build`: Mutable Zig build graph supplied by the Zig build runner.
+/// Returns (`void`): No value; the build graph receives the declared steps.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -8,6 +13,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const docs_object = b.addObject(.{
+        .name = "effect-docs",
+        .root_module = effect,
+    });
+    const install_docs = b.addInstallDirectory(.{
+        .source_dir = docs_object.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+    b.step("docs", "Generate Effect API documentation in zig-out/docs")
+        .dependOn(&install_docs.step);
     const tests = b.addTest(.{ .root_module = effect });
     const test_step = b.step("test", "Run typed outcome and representation tests");
     test_step.dependOn(boundedTests(b, tests));

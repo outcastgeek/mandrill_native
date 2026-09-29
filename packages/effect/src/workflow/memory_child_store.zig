@@ -5,6 +5,10 @@ const outcomes = @import("../outcome.zig");
 const types = @import("workflow_types.zig");
 const contract = @import("child_store.zig");
 
+/// Construct an in-memory child store provider with caller-owned runtime resources.
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): in-memory provider for durable child execution records.
 pub fn MemoryChildStore(comptime R: type) type {
     return struct {
         const Self = @This();
@@ -34,6 +38,11 @@ pub fn MemoryChildStore(comptime R: type) type {
         items: std.array_list.Managed(Item),
         closed: bool = false,
 
+        /// Create an in-memory durable child store using the caller environment.
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Self`): a child store bound to the supplied allocation and I/O capabilities.
         pub fn init(env: *const R) Self {
             if (R == void or !@hasField(R, "allocator") or
                 @FieldType(R, "allocator") != std.mem.Allocator)
@@ -43,6 +52,10 @@ pub fn MemoryChildStore(comptime R: type) type {
             return .{ .allocator = env.allocator, .io = env.io, .items = std.array_list.Managed(Item).init(env.allocator) };
         }
 
+        /// Expose this implementation through its capability interface.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`Store`): A capability adapter referencing the selected implementation; keep its backing state alive while in use.
         pub fn capability(self: *Self) Store {
             return Store.fromProvider(self, &.{ .register = registerEffect, .complete = completeEffect, .pending = pendingEffect, .acknowledge = acknowledgeEffect });
         }
@@ -196,12 +209,20 @@ pub fn MemoryChildStore(comptime R: type) type {
             return .{ .success = .acknowledged };
         }
 
+        /// Stop the capability and release its retained resources.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn shutdown(self: *Self) void {
             self.mutex.lockUncancelable(self.io);
             self.closed = true;
             self.mutex.unlock(self.io);
         }
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             self.shutdown();
             for (self.items.items) |*item| item.deinit();

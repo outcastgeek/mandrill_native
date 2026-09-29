@@ -1,3 +1,12 @@
+//! Typed event histories, projections, and replication.
+//!
+//! The journal is the authority for appended events. Stable event identities
+//! reject duplicate deliveries, and cursor compare-and-set rejects stale
+//! writers. A projection folds journal entries into a derived state and moves
+//! its checkpoint atomically with that state; it can be rebuilt from retained
+//! history. Reactive invalidation is a downstream notification, not evidence
+//! of an append. In-memory journals do not promise recovery after process loss.
+
 mod event;
 mod event_builder;
 mod event_group;

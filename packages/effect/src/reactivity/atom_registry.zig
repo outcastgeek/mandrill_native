@@ -6,22 +6,35 @@ const outcomes = @import("../outcome.zig");
 const invalidation = @import("invalidation_registry.zig");
 const graph_module = @import("internal/dependency_graph.zig");
 
+/// Typed atom-registry failure during identity, dependency, or subscription operations.
 pub const Error = union(enum) {
     graph: graph_module.Error,
     invalidation: invalidation.Error,
     closed,
 };
 
+/// Change in an atom’s declared dependency relationships.
 pub const DependencyUpdate = struct {
+    /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit` and
+    /// must be released after use.
     pub const effect_owned_payload = true;
     graph_generation: u64,
     invalidation: outcomes.Exit(invalidation.InvalidateResult, Error),
 
+    /// Release resources owned by this value.
+    /// Parameters:
+    /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn deinit(self: *@This()) void {
         self.invalidation.deinit();
         self.* = undefined;
     }
 
+    /// Duplicate this value; marked owning payloads are cloned, while ordinary
+    /// borrowed fields retain their original lifetime.
+    /// Parameters:
+    /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+    /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
     pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
         const copied = self.invalidation.clone();
         if (copied == .die and copied.die.kind == .out_of_memory and
@@ -31,6 +44,7 @@ pub const DependencyUpdate = struct {
     }
 };
 
+/// Typed atom definitions, revisions, and subscriptions owned by the caller.
 pub const Registry = struct {
     const Self = @This();
     allocator: std.mem.Allocator,
@@ -40,6 +54,12 @@ pub const Registry = struct {
     invalidations: invalidation.Registry,
     closed: bool = false,
 
+    /// Construct the selected resource or definition.
+    /// Parameters:
+    /// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected capabilities.
+    /// - `graph_limits: graph_module.Limits`: Caller-supplied graph traversal bounds.
+    /// - `notification_capacity: usize`: Maximum buffered invalidation notices for atom observers.
+    /// Returns (`outcomes.Exit(*Self, Error)`): Carries `*Self` on `.success` or `Error` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
     pub fn create(env: anytype, graph_limits: graph_module.Limits, notification_capacity: usize) outcomes.Exit(*Self, Error) {
         const owner = env.allocator.create(Self) catch return .{ .die = outcomes.Defect.out_of_memory };
         const prepared_invalidation = invalidation.Registry.init(env, notification_capacity);
@@ -109,6 +129,11 @@ pub const Registry = struct {
         };
     }
 
+    /// Invalidate the selected cached or observable value.
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// - `key: []const u8`: Stable identity used for matching, deduplication, or replay.
+    /// Returns (`outcomes.Exit(invalidation.InvalidateResult, Error)`): Carries `invalidation.InvalidateResult` on `.success` or `Error` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
     pub fn invalidate(self: *Self, key: []const u8) outcomes.Exit(invalidation.InvalidateResult, Error) {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -118,6 +143,12 @@ pub const Registry = struct {
 
     /// Collect dependent keys before publishing one versioned notification
     /// batch. The graph and publication boundary are scoped to this registry.
+    ///
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// - `input: []const []const u8`: Borrowed input; keep its owner alive until the operation has copied or joined
+    ///   it.
+    /// Returns (`outcomes.Exit(invalidation.InvalidateResult, Error)`): Carries `invalidation.InvalidateResult` on `.success` or `Error` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
     pub fn invalidateBatch(self: *Self, input: []const []const u8) outcomes.Exit(invalidation.InvalidateResult, Error) {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -159,6 +190,12 @@ pub const Registry = struct {
     /// The graph transition is committed before notification. The nested
     /// invalidation Exit preserves a later notification failure without
     /// pretending that the dependency replacement was rolled back.
+    ///
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// - `key: []const u8`: Stable identity used for matching, deduplication, or replay.
+    /// - `dependencies: []const []const u8`: Dependency definitions required before constructing this component.
+    /// Returns (`outcomes.Exit(DependencyUpdate, Error)`): Carries `DependencyUpdate` on `.success` or `Error` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
     pub fn replaceDependencies(self: *Self, key: []const u8, dependencies: []const []const u8) outcomes.Exit(DependencyUpdate, Error) {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -175,6 +212,11 @@ pub const Registry = struct {
         return .{ .success = .{ .graph_generation = generation, .invalidation = notice } };
     }
 
+    /// Subscribe to invalidation or atom changes.
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// - `key: []const u8`: Stable identity used for matching, deduplication, or replay.
+    /// Returns (`outcomes.Exit(*invalidation.Registry.Watch, Error)`): Carries `*invalidation.Registry.Watch` on `.success` or `Error` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
     pub fn watch(self: *Self, key: []const u8) outcomes.Exit(*invalidation.Registry.Watch, Error) {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -188,10 +230,18 @@ pub const Registry = struct {
         };
     }
 
+    /// Expose the subscription source for atom invalidations.
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`*invalidation.Registry`): A borrowed pointer; keep its owner alive while using it.
     pub fn invalidationSource(self: *Self) *invalidation.Registry {
         return &self.invalidations;
     }
 
+    /// Stop the capability and release its retained resources.
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn shutdown(self: *Self) void {
         self.mutex.lockUncancelable(self.io);
         self.closed = true;
@@ -200,6 +250,10 @@ pub const Registry = struct {
         self.invalidations.shutdown();
     }
 
+    /// Release resources owned by this value.
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn deinit(self: *Self) void {
         self.shutdown();
         self.graph.deinit();

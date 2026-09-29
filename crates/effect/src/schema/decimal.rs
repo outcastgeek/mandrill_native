@@ -1,3 +1,5 @@
+//! Exact decimal syntax and canonical representation.
+
 use std::sync::Arc;
 
 /// An exact, base-ten decimal. The stored text has one canonical spelling:
@@ -8,11 +10,20 @@ use std::sync::Arc;
 pub struct Decimal(Arc<str>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A typed failure to construct or convert an exact decimal value.
 pub enum DecimalError {
+    /// The syntax failed validation.
     InvalidSyntax,
 }
 
 impl std::fmt::Display for DecimalError {
+    ///
+    /// # Parameters
+    /// - `formatter` (`&mut std::fmt::Formatter<'_>`): Destination formatter used by the Rust formatting trait.
+    ///
+    /// # Returns
+    /// Type: `std::fmt::Result`.
+    /// Returns `std::fmt::Result`.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(self, formatter)
     }
@@ -23,6 +34,12 @@ impl std::error::Error for DecimalError {}
 impl Decimal {
     /// Accept ordinary decimal notation exactly; exponent notation and
     /// non-finite values have no representation in this format.
+    ///
+    /// # Parameters
+    /// - `text` (`&str`): Input text parsed or emitted by this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, DecimalError>`.
     pub fn parse(text: &str) -> Result<Self, DecimalError> {
         let (negative, magnitude) = match text.strip_prefix('-') {
             Some(magnitude) => (true, magnitude),
@@ -52,6 +69,10 @@ impl Decimal {
     }
 
     #[must_use]
+    /// Borrow the textual representation without allocating a new string.
+    ///
+    /// # Returns
+    /// Type: `&str`.
     pub fn as_str(&self) -> &str {
         &self.0
     }

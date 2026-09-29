@@ -13,6 +13,19 @@ const defect_wire = @import("internal/defect_wire.zig");
 const wire = @import("wire_codec.zig");
 const Issue = @import("../schema/schema_issue.zig").Issue;
 
+/// Specialize the framed streaming RPC server for a closed protocol.
+/// Parameters:
+/// - `handler: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where static.
+/// - `request_wire: comptime wire.WireCodec(@TypeOf(handler.operation).Request, @TypeOf(handler).Environment)`: Wire codec for the operation’s request type and environment.
+/// - `chunk_wire: comptime wire.WireCodec(@TypeOf(handler.operation).Chunk, @TypeOf(handler).Environment)`: Wire codec for each streaming chunk.
+/// - `terminal_wire: comptime wire.WireCodec(@TypeOf(handler.operation).Terminal, @TypeOf(handler).Environment)`: Wire codec for the stream’s terminal event.
+/// - `failure_wire: comptime wire.WireCodec(@TypeOf(handler.operation).DomainError, @TypeOf(handler).Environment)`: Wire codec for the operation’s typed failure channel.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `select_session: comptime fn (*const @TypeOf(handler).Environment) *const transport.Session(@TypeOf(handler).Environment, ProviderError)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_policy: comptime fn (*const @TypeOf(handler).Environment) transport.Policy`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// Returns (`type`): framed streaming server for a closed protocol and caller-selected admission limits.
 pub fn StreamServer(
     comptime handler: anytype,
     comptime request_wire: wire.WireCodec(@TypeOf(handler.operation).Request, @TypeOf(handler).Environment),
@@ -34,17 +47,29 @@ pub fn StreamServer(
     }
     return struct {
         const Self = @This();
+        /// RPC operation type served by this dispatcher.
         pub const Operation = Op;
+        /// Domain-specific error type carried by the operation.
         pub const DomainError = Op.DomainError;
+        /// Typed session error variant or error channel described by `transport.Error(ProviderError)`.
         pub const SessionError = transport.Error(ProviderError);
+        /// Typed failure channel combining domain and provider errors.
         pub const Failure = errors.Error(DomainError, void, SessionError);
+        /// Lazy Effect for unit; success, error, and environment types are fixed by
+        /// `effects.Effect(void, Failure, R)`.
         pub const Unit = effects.Effect(void, Failure, R);
+        /// Scoped reader for this RPC stream’s event type.
         pub const Reader = effects.StreamReader(Op.Event, DomainError, R);
+        /// `DriveResult` cases: `sent`, `awaiting_acknowledgement`, `idle`, `ended`.
         pub const DriveResult = enum { sent, awaiting_acknowledgement, idle, ended };
+        /// `Control` cases: `acknowledged`, `cancelled`.
         pub const Control = enum { acknowledged, cancelled };
+        /// Lazy Effect for drive; success, error, and environment types are fixed by
+        /// `effects.Effect(DriveResult, Failure, R)`.
         pub const Drive = effects.Effect(DriveResult, Failure, R);
         const Bytes = outcomes.OwnedSlice(u8);
 
+        /// Bounded admission gate for concurrent streaming calls.
         pub const Admission = struct {
             io: std.Io,
             limit: usize,
@@ -52,6 +77,11 @@ pub fn StreamServer(
             mutex: std.Io.Mutex = .init,
             closed: bool = false,
 
+            /// Create a bounded admission gate for concurrent stream calls.
+            /// Parameters:
+            /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+            ///   capabilities.
+            /// Returns (`outcomes.Result(Admission, SessionError)`): An ok/err Result; owned payloads must be released according to their type contract.
             pub fn init(env: *const R) outcomes.Result(Admission, SessionError) {
                 const policy = select_policy(env);
                 if (!policy.valid()) return .{ .err = .invalid_configuration };
@@ -74,12 +104,20 @@ pub fn StreamServer(
                 self.active -= 1;
             }
 
+            /// Stop the capability and release its retained resources.
+            /// Parameters:
+            /// - `self: *Admission`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+            /// Returns (`void`): no value.
             pub fn shutdown(self: *Admission) void {
                 self.mutex.lockUncancelable(self.io);
                 self.closed = true;
                 self.mutex.unlock(self.io);
             }
 
+            /// Release resources owned by this value.
+            /// Parameters:
+            /// - `self: *Admission`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+            /// Returns (`void`): no value.
             pub fn deinit(self: *Admission) void {
                 self.mutex.lockUncancelable(self.io);
                 const drained = self.active == 0;
@@ -89,6 +127,7 @@ pub fn StreamServer(
             }
         };
 
+        /// One admitted stream call with its correlation identity and gate ownership.
         pub const Call = struct {
             correlation: envelope.Correlation,
             admission: *Admission,
@@ -102,6 +141,11 @@ pub fn StreamServer(
             pending_index: usize = 0,
             driving: bool = false,
 
+            /// Attach a correlation identity to an admitted stream call.
+            /// Parameters:
+            /// - `correlation: envelope.Correlation`: Identifier pairing a request with its response.
+            /// - `admission: *Admission`: Borrowed admission state for this call.
+            /// Returns (`outcomes.Result(Call, SessionError)`): An ok/err Result; owned payloads must be released according to their type contract.
             pub fn init(correlation: envelope.Correlation, admission: *Admission) outcomes.Result(Call, SessionError) {
                 return switch (admission.enter()) {
                     .ok => .{ .ok = .{ .correlation = correlation, .admission = admission } },
@@ -109,6 +153,10 @@ pub fn StreamServer(
                 };
             }
 
+            /// Release resources owned by this value.
+            /// Parameters:
+            /// - `self: *Call`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+            /// Returns (`void`): no value.
             pub fn deinit(self: *Call) void {
                 if (self.pending) |*items| items.deinit();
                 if (self.reader) |*value| value.deinit();
@@ -122,6 +170,14 @@ pub fn StreamServer(
             /// Applied by the caller's envelope router after identity checks.
             /// A `cancelled` result tells the owner to interrupt the drive
             /// fiber and close its request scope.
+            ///
+            /// Parameters:
+            /// - `self: *Call`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+            /// - `message: *const envelope.Envelope`: Borrowed input; keep its owner alive until the operation has copied or
+            ///   joined it.
+            /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+            ///   capabilities.
+            /// Returns (`outcomes.Result(Control, errors.Protocol)`): An ok/err Result; owned payloads must be released according to their type contract.
             pub fn control(self: *Call, message: *const envelope.Envelope, env: *const R) outcomes.Result(Control, errors.Protocol) {
                 if (message.correlation != self.correlation or message.version != handler.operation.version or
                     !std.mem.eql(u8, message.operation.items, handler.operation.name) or
@@ -160,16 +216,27 @@ pub fn StreamServer(
         }
 
         const MessageOwner = struct {
+            /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements
+            /// `deinit` and must be released after use.
             pub const effect_owned_payload = true;
             value: *envelope.Envelope,
             allocator: std.mem.Allocator,
 
+            /// Release resources owned by this value.
+            /// Parameters:
+            /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+            /// Returns (`void`): no value.
             pub fn deinit(self: *@This()) void {
                 self.value.deinit();
                 self.allocator.destroy(self.value);
                 self.* = undefined;
             }
 
+            /// Duplicate this value; marked owning payloads are cloned, while ordinary
+            /// borrowed fields retain their original lifetime.
+            /// Parameters:
+            /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+            /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
             pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
                 const copied = try self.allocator.create(envelope.Envelope);
                 errdefer self.allocator.destroy(copied);
@@ -180,6 +247,15 @@ pub fn StreamServer(
 
         /// The request and scope remain owned by the caller until the reader
         /// and its scoped finalizers have joined.
+        ///
+        /// Parameters:
+        /// - `select_request: comptime fn (*const R) *const Op.Request`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// - `select_scope: comptime fn (*const R) *scopes.Scope(DomainError)`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// - `select_context: comptime fn (*const R) protocol.Context`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// Returns (`effects.Effect(Reader, Failure, R)`): stream call state admitted under the server’s configured limit.
         pub fn open(
             comptime select_request: fn (*const R) *const Op.Request,
             comptime select_scope: fn (*const R) *scopes.Scope(DomainError),
@@ -197,6 +273,17 @@ pub fn StreamServer(
 
         /// Opens the typed handler stream in a caller-owned scope and moves
         /// its reader into the call. The request stays alive until call close.
+        ///
+        /// Parameters:
+        /// - `select_call: comptime fn (*const R) *Call`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// - `select_request: comptime fn (*const R) *const Op.Request`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// - `select_scope: comptime fn (*const R) *scopes.Scope(DomainError)`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// - `select_context: comptime fn (*const R) protocol.Context`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn openInto(
             comptime select_call: fn (*const R) *Call,
             comptime select_request: fn (*const R) *const Op.Request,
@@ -222,6 +309,16 @@ pub fn StreamServer(
 
         /// Accepts one complete framed request and retains its decoded
         /// request/metadata for the entire handler stream lifetime.
+        ///
+        /// Parameters:
+        /// - `select_call: comptime fn (*const R) *Call`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// - `select_scope: comptime fn (*const R) *scopes.Scope(DomainError)`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// - `frame: []const u8`: Encoded protocol frame to parse, dispatch, or transmit.
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn acceptFrame(
             comptime select_call: fn (*const R) *Call,
             comptime select_scope: fn (*const R) *scopes.Scope(DomainError),
@@ -342,6 +439,14 @@ pub fn StreamServer(
             }.decodedRequest);
         }
 
+        /// Process an RPC acknowledgement or cancellation frame.
+        /// Parameters:
+        /// - `select_call: comptime fn (*const R) *Call`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// - `frame: []const u8`: Encoded protocol frame to parse, dispatch, or transmit.
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`effects.Effect(Control, Failure, R)`): typed acknowledgement after processing a streaming control frame.
         pub fn acceptControlFrame(
             comptime select_call: fn (*const R) *Call,
             frame: []const u8,
@@ -494,6 +599,11 @@ pub fn StreamServer(
 
         /// Advances one handler event. The caller routes acknowledgement and
         /// cancellation envelopes to `Call.control` between advances.
+        ///
+        /// Parameters:
+        /// - `select_call: comptime fn (*const R) *Call`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// Returns (`Drive`): The typed operation result or description selected by this API.
         pub fn driveOne(comptime select_call: fn (*const R) *Call) Drive {
             const Acquire = effects.Effect(*Call, Failure, R);
             const entered = Acquire.fromOutcome(struct {
@@ -510,17 +620,28 @@ pub fn StreamServer(
         }
 
         const DomainOwner = struct {
+            /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements
+            /// `deinit` and must be released after use.
             pub const effect_owned_payload = true;
             value: *DomainError,
             allocator: std.mem.Allocator,
             call: *Call,
 
+            /// Release resources owned by this value.
+            /// Parameters:
+            /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+            /// Returns (`void`): no value.
             pub fn deinit(self: *@This()) void {
                 outcomes.discardPayload(self.value);
                 self.allocator.destroy(self.value);
                 self.* = undefined;
             }
 
+            /// Duplicate this value; marked owning payloads are cloned, while ordinary
+            /// borrowed fields retain their original lifetime.
+            /// Parameters:
+            /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+            /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
             pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
                 const copied = try self.allocator.create(DomainError);
                 errdefer self.allocator.destroy(copied);
@@ -599,6 +720,13 @@ pub fn StreamServer(
 
         /// Executes one stream step and maps the handler's complete typed Exit
         /// onto the streaming wire protocol before returning to the caller.
+        ///
+        /// Parameters:
+        /// - `select_call: comptime fn (*const R) *Call`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Drive`): The typed operation result or description selected by this API.
         pub fn serveStep(comptime select_call: fn (*const R) *Call, env: *const R) Drive {
             var step = driveOne(select_call);
             var materialized = step.materializeOwned(env);
@@ -611,14 +739,25 @@ pub fn StreamServer(
         }
 
         const SentFrame = struct {
+            /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements
+            /// `deinit` and must be released after use.
             pub const effect_owned_payload = true;
             frame: Bytes,
 
+            /// Release resources owned by this value.
+            /// Parameters:
+            /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+            /// Returns (`void`): no value.
             pub fn deinit(self: *@This()) void {
                 self.frame.deinit();
                 self.* = undefined;
             }
 
+            /// Duplicate this value; marked owning payloads are cloned, while ordinary
+            /// borrowed fields retain their original lifetime.
+            /// Parameters:
+            /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+            /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
             pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
                 return .{ .frame = try self.frame.clone() };
             }
@@ -702,18 +841,46 @@ pub fn StreamServer(
             }.start);
         }
 
+        /// Send one typed streaming RPC chunk.
+        /// Parameters:
+        /// - `select_call: comptime fn (*const R) *Call`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// - `select_chunk: comptime fn (*const R) *const Op.Chunk`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn sendChunk(comptime select_call: fn (*const R) *Call, comptime select_chunk: fn (*const R) *const Op.Chunk) Unit {
             return sendPayload(Op.Chunk, chunk_wire, .stream_chunk, select_call, select_chunk);
         }
 
+        /// Send the terminal streaming RPC value.
+        /// Parameters:
+        /// - `select_call: comptime fn (*const R) *Call`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// - `select_terminal: comptime fn (*const R) *const Op.Terminal`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn sendTerminal(comptime select_call: fn (*const R) *Call, comptime select_terminal: fn (*const R) *const Op.Terminal) Unit {
             return sendPayload(Op.Terminal, terminal_wire, .stream_end, select_call, select_terminal);
         }
 
+        /// Send a typed streaming RPC domain failure.
+        /// Parameters:
+        /// - `select_call: comptime fn (*const R) *Call`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// - `select_failure: comptime fn (*const R) *const DomainError`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn sendFailure(comptime select_call: fn (*const R) *Call, comptime select_failure: fn (*const R) *const DomainError) Unit {
             return sendPayload(DomainError, failure_wire, .response_failure, select_call, select_failure);
         }
 
+        /// Send an unexpected streaming RPC defect.
+        /// Parameters:
+        /// - `select_call: comptime fn (*const R) *Call`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// - `select_defect: comptime fn (*const R) outcomes.Defect`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn sendDefect(comptime select_call: fn (*const R) *Call, comptime select_defect: fn (*const R) outcomes.Defect) Unit {
             return Unit.deferEffect(struct {
                 fn start(env: *const R) Unit {
@@ -737,6 +904,11 @@ pub fn StreamServer(
             }.start);
         }
 
+        /// Send an interrupted streaming RPC outcome.
+        /// Parameters:
+        /// - `select_call: comptime fn (*const R) *Call`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn sendInterrupted(comptime select_call: fn (*const R) *Call) Unit {
             return Unit.deferEffect(struct {
                 fn start(env: *const R) Unit {

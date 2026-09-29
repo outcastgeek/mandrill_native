@@ -1,33 +1,61 @@
+//! Managed HTTP requests over a caller-provided transport and I/O environment.
 const diagnostics = @import("internal/diagnostics.zig");
 const std = @import("std");
 const outcomes = @import("outcome.zig");
 const Cancellation = @import("internal/runtime.zig").Cancellation;
 const native_operation = @import("internal/native_operation.zig");
 
+/// Typed failure channel combining domain and provider errors.
 pub const Failure = union(enum) { transport: outcomes.Defect, http: std.http.Status, decode: outcomes.Defect };
+/// Typed request payload or request record for this operation.
 pub const Request = struct {
     uri: []const u8,
     method: std.http.Method,
     headers: []const std.http.Header,
     body: ?[]const u8,
 };
+/// HTTP transport interface selected by the caller. The callback receives
+/// borrowed provider state, a request, and an optional cancellation token;
+/// it returns a typed `Exit(NativeResponse, Failure)`.
 pub const Transport = struct {
     userdata: *anyopaque,
+    /// Parameters: borrowed provider context, request, and cancellation token.
+    /// Returns a native response on success or a typed transport/HTTP failure.
     send: *const fn (*anyopaque, Request, ?*const Cancellation) outcomes.Exit(NativeResponse, Failure),
 };
+/// Provider-owned response handle. The vtable determines how response bytes
+/// are read, cancellation is forwarded, and the handle is disposed.
 pub const NativeResponse = struct {
     userdata: *anyopaque,
     status: std.http.Status,
     vtable: *const VTable,
+    /// Typed function-pointer interface for this capability. Implement every
+    /// hook with the exact signature below; keep the table valid while the
+    /// capability or pending work can invoke it.
     pub const VTable = struct {
+        /// Read the selected value.
+        /// Parameters (callback order):
+        /// - `1: *anyopaque`: opaque provider or handle context; keep it live until the hook and any retained work complete.
+        /// - `2: ?*const Cancellation`: optional borrowed cancellation token.
+        /// Returns (`outcomes.Exit(outcomes.OwnedSlice(u8), Failure)`): typed terminal Exit, including defect and interruption outcomes.
         read: *const fn (*anyopaque, ?*const Cancellation) outcomes.Exit(outcomes.OwnedSlice(u8), Failure),
         // Cancellation only forwards a request; it never joins or disposes an
         // operation owned by another caller. Disposal follows all active reads.
+        /// Request cancellation.
+        /// Parameters (callback order):
+        /// - `1: *anyopaque`: opaque provider or handle context; keep it live until the hook and any retained work complete.
+        /// Returns (`?outcomes.Defect`): `null` when cancellation was forwarded;
+        /// a defect explains why the provider could not forward it.
         cancel: *const fn (*anyopaque) ?outcomes.Defect,
+        /// Release a native resource.
+        /// Parameters (callback order):
+        /// - `1: *anyopaque`: opaque provider or handle context; keep it live until the hook and any retained work complete.
+        /// Returns (`outcomes.Exit(void, Failure)`): typed terminal Exit, including defect and interruption outcomes.
         dispose: *const fn (*anyopaque) outcomes.Exit(void, Failure),
     };
 };
 
+/// Typed response payload or response record for this operation.
 pub const Response = struct {
     const Self = @This();
     allocator: std.mem.Allocator,
@@ -55,6 +83,15 @@ pub const Response = struct {
         }
     };
 
+    /// Acquire a resource from the selected capability.
+    /// Parameters:
+    /// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected capabilities.
+    /// - `transport: Transport`: Caller-supplied capability or scoped state; no concrete backend is selected
+    ///   here.
+    /// - `request: Request`: HTTP request borrowed through response acquisition and cleanup.
+    /// - `token: ?*const Cancellation`: Cancellation token observed by this operation; its owner must outlive pending
+    ///   work.
+    /// Returns (`outcomes.Exit(*Self, Failure)`): Carries `*Self` on `.success` or `Failure` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
     pub fn acquire(env: anytype, transport: Transport, request: Request, token: ?*const Cancellation) outcomes.Exit(*Self, Failure) {
         const response = env.allocator.create(Self) catch return .{ .die = outcomes.Defect.out_of_memory };
         const metadata = env.allocator.create(Metadata) catch {
@@ -74,6 +111,10 @@ pub const Response = struct {
         response.lifetime.register(&response.registration);
         return .{ .success = response };
     }
+    /// Read the HTTP response status.
+    /// Parameters:
+    /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+    /// Returns (`std.http.Status`): The HTTP status parsed from the response.
     pub fn status(self: *const Self) std.http.Status {
         return self.native.status;
     }
@@ -81,6 +122,12 @@ pub const Response = struct {
         const self: *Self = @ptrCast(@alignCast(data.?));
         self.cancel_failure = self.native.vtable.cancel(self.native.userdata);
     }
+    /// Read response bytes while observing cancellation.
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// - `token: ?*const Cancellation`: Cancellation token observed by this operation; its owner must outlive pending
+    ///   work.
+    /// Returns (`outcomes.Exit(outcomes.OwnedSlice(u8), Failure)`): Carries `outcomes.OwnedSlice(u8)` on `.success` or `Failure` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
     pub fn readToken(self: *Self, token: ?*const Cancellation) outcomes.Exit(outcomes.OwnedSlice(u8), Failure) {
         self.mutex.lockUncancelable(self.io);
         if (self.closed) {
@@ -122,6 +169,10 @@ pub const Response = struct {
         if (local.isRequested()) return .interrupted;
         return self.body.?.clone();
     }
+    /// Close this scoped resource.
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`outcomes.Exit(void, Failure)`): Carries no value on `.success` or `Failure` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
     pub fn close(self: *Self) outcomes.Exit(void, Failure) {
         const protection = self.io.swapCancelProtection(.blocked);
         defer _ = self.io.swapCancelProtection(protection);
@@ -141,6 +192,10 @@ pub const Response = struct {
         self.disposed = true;
         return self.result.clone();
     }
+    /// Release resources owned by this value.
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn deinit(self: *Self) void {
         std.debug.assert(self.disposed and self.active == 0);
         if (self.body) |*body| body.deinit();
@@ -160,6 +215,10 @@ pub const Native = struct {
     transfer_buffer_bytes: usize,
     maximum_body_bytes: usize,
 
+    /// Expose this implementation as an HTTP transport capability.
+    /// Parameters:
+    /// - `self: *Native`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`Transport`): A capability adapter referencing the selected implementation; keep its backing state alive while in use.
     pub fn transport(self: *Native) Transport {
         return .{ .userdata = self, .send = send };
     }

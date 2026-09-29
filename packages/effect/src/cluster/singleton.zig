@@ -5,6 +5,30 @@ const effects = @import("../effect.zig");
 const outcomes = @import("../outcome.zig");
 const ownership = @import("cluster_capabilities.zig");
 
+/// Run work under a fenced singleton lease.
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `guarantee: comptime ownership.Guarantee`: Compile-time volatility or recoverability promised by this provider; durable compositions check it before compiling.
+/// - `select_ownership: comptime fn (*const R) *const ownership.Ownership(R, ProviderError, guarantee)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_address: comptime fn (*const R) ownership.EntityAddress`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_owner_id: comptime fn (*const R) []const u8`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_policy: comptime fn (*const R) ownership.LeasePolicy`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `map_ownership_error: comptime fn (ownership.Ownership(R, ProviderError, guarantee).Failure) E`: Compile-time typed function selected at comptime; no runtime callback
+///   lookup is required.
+/// - `on_unavailable: comptime fn () E`: Compile-time typed callback; its signature is checked at comptime where
+///   static.
+/// - `on_release_problem: comptime fn (ownership.Release) E`: Compile-time typed callback; its signature is checked at comptime where
+///   static.
+/// - `use: comptime fn (ownership.Lease, *const R) effects.Effect(A, E, R)`: Compile-time typed function selected at comptime; no runtime callback lookup is
+///   required.
+/// Returns (`effects.Effect(A, E, R)`): body result while a singleton ownership lease is valid and scoped.
 pub fn withLease(
     comptime R: type,
     comptime E: type,

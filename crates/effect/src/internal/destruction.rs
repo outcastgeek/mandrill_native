@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use std::thread::ThreadId;
 
 #[derive(Default)]
+/// Typed queue used by internal destruction.
 struct Queue {
     draining: bool,
     pending: Vec<Box<dyn Send>>,
@@ -14,11 +15,17 @@ struct Queue {
 static QUEUES: Mutex<Option<HashMap<ThreadId, Queue>>> = Mutex::new(None);
 
 /// Private ownership wrapper. No payload erasure/downcasts occur during interpretation.
+///
+/// # Type parameters
+/// - `T`: Value or item type. Bound or type: `Send + 'static`.
 pub(crate) struct FlatDrop<T: Send + 'static> {
     value: Option<T>,
 }
 
 impl<T: Clone + Send + 'static> Clone for FlatDrop<T> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             value: self.value.clone(),
@@ -27,20 +34,44 @@ impl<T: Clone + Send + 'static> Clone for FlatDrop<T> {
 }
 
 impl<T: Send + 'static> FlatDrop<T> {
+    /// # Type parameters
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `value` (`T`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub(crate) fn new(value: T) -> Self {
         Self { value: Some(value) }
     }
+    /// # Type parameters
+    /// - `T`: Value or item type.
+    ///
+    /// # Returns
+    /// Type: `Option<&T>`.
+    /// Returns the value when present, or `None`.
     pub(crate) fn as_ref(&self) -> Option<&T> {
         self.value.as_ref()
     }
+    /// # Type parameters
+    /// - `T`: Value or item type.
+    ///
+    /// # Returns
+    /// Type: `Option<T>`.
+    /// Returns the value when present, or `None`.
     pub(crate) fn take(mut self) -> Option<T> {
         self.value.take()
     }
 }
 
+/// Typed drain guard used by internal destruction.
 struct DrainGuard(ThreadId);
 
 impl Drop for DrainGuard {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         let pending = {
             let mut queues = QUEUES
@@ -54,6 +85,9 @@ impl Drop for DrainGuard {
 }
 
 impl<T: Send + 'static> Drop for FlatDrop<T> {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         let Some(value) = self.value.take() else {
             return;

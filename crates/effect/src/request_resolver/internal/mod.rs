@@ -1,3 +1,5 @@
+//! Private coordination of shared pending request loads.
+
 use super::{BatchRunner, HasRequestScope, RequestResolverError, RequestScope};
 use crate::internal::notification::notify_all;
 use crate::internal::outcome;
@@ -15,20 +17,46 @@ use std::collections::{BTreeMap, HashMap};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, Weak};
 
+/// Type alias for shared result in request resolver internal mod.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 type SharedResult<A, E> = Exit<SharedValue<A>, RequestResolverError<E>>;
+/// Type alias for grouped requests in request resolver internal mod.
+///
+/// # Type parameters
+/// - `Q`: Request type.
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 type GroupedRequests<Q, A, E> = BTreeMap<RequestGroup, Vec<(Q, Arc<Pending<A, E>>)>>;
 
+/// Typed registry used by request resolver internal mod.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct Registry<A: Send + 'static, E: Send + 'static> {
     closed: bool,
     pending: HashMap<RequestKey, Arc<Pending<A, E>>>,
 }
 
+/// Typed pending state used by request resolver internal mod.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct PendingState<A: Send + 'static, E: Send + 'static> {
     outcome: Option<SharedResult<A, E>>,
     fiber: Option<Fiber<(), RequestResolverError<E>>>,
     admission_done: bool,
 }
 
+/// Typed pending used by request resolver internal mod.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct Pending<A: Send + 'static, E: Send + 'static> {
     key: RequestKey,
     group: RequestGroup,
@@ -37,6 +65,13 @@ struct Pending<A: Send + 'static, E: Send + 'static> {
 }
 
 impl<A: Send + 'static, E: Send + 'static> Pending<A, E> {
+    ///
+    /// # Parameters
+    /// - `key` (`RequestKey`): Stable key used to locate or identify the selected value.
+    /// - `group` (`RequestGroup`): The group supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn new(key: RequestKey, group: RequestGroup) -> Self {
         Self {
             key,
@@ -50,6 +85,16 @@ impl<A: Send + 'static, E: Send + 'static> Pending<A, E> {
         }
     }
 
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `outcome` (`SharedResult<A, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn complete(&self, outcome: SharedResult<A, E>) {
         let discarded = {
             let mut state = self
@@ -70,6 +115,15 @@ impl<A: Send + 'static, E: Send + 'static> Pending<A, E> {
         }
     }
 
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `fiber` (`Fiber<(), RequestResolverError<E>>`): The fiber supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn assign_fiber(&self, fiber: Fiber<(), RequestResolverError<E>>) {
         let mut state = self
             .state
@@ -81,6 +135,16 @@ impl<A: Send + 'static, E: Send + 'static> Pending<A, E> {
         notify_all(&self.changed);
     }
 
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `outcome` (`SharedResult<A, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn reject(&self, outcome: SharedResult<A, E>) {
         self.state
             .lock()
@@ -89,6 +153,10 @@ impl<A: Send + 'static, E: Send + 'static> Pending<A, E> {
         self.complete(outcome);
     }
 
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     fn completed(&self) -> bool {
         self.state
             .lock()
@@ -97,6 +165,19 @@ impl<A: Send + 'static, E: Send + 'static> Pending<A, E> {
             .is_some()
     }
 
+    ///
+    /// # Type parameters
+    /// - `R`: Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `env` (`Arc<R>`): The environment supplying this operation's capabilities.
+    /// - `context` (`&Context`): Execution context carrying cancellation, scope, and trace state.
+    ///
+    /// # Returns
+    /// Type: `SharedResult<A, E>`.
+    /// Returns `SharedResult<A, E>`.
     async fn observe<R: Send + Sync + 'static>(
         &self,
         env: Arc<R>,
@@ -181,6 +262,13 @@ impl<A: Send + 'static, E: Send + 'static> Pending<A, E> {
     }
 }
 
+/// Typed resolver state used by request resolver internal mod.
+///
+/// # Type parameters
+/// - `Q`: Request type. Bound or type: `Send + 'static`.
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
+/// - `R`: Environment type. Bound or type: `HasTaskSpawner + HasRequestScope + Send + Sync + 'static`.
 pub(super) struct ResolverState<
     Q: Send + 'static,
     A: Send + 'static,
@@ -200,6 +288,19 @@ impl<
     R: HasTaskSpawner + HasRequestScope + Send + Sync + 'static,
 > ResolverState<Q, A, E, R>
 {
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `Q`: Request type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `scope` (`Scope<RequestResolverError<E>>`): Owner that joins child work and releases resources at close.
+    /// - `request_scope` (`RequestScope`): The request scope supplied to this operation.
+    /// - `run` (`Arc<BatchRunner<Q, A, E, R>>`): Stable identity of the workflow run being inspected or changed.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub(super) fn new(
         scope: Scope<RequestResolverError<E>>,
         request_scope: RequestScope,
@@ -216,6 +317,14 @@ impl<
         }
     }
 
+    /// # Type parameters
+    /// - `Q`: Request type. Bound: `Send + 'static`.
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bound: `HasTaskSpawner + HasRequestScope + Send + Sync + 'static`.
+    ///
+    /// # Returns
+    /// Type: `()`.
     pub(super) fn close(&self) {
         let pending = {
             let mut registry = self
@@ -230,6 +339,16 @@ impl<
         }
     }
 
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `entry` (`&Arc<Pending<A, E>>`): Stored record or event selected for this transition.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn forget(&self, entry: &Arc<Pending<A, E>>) {
         let removed = {
             let mut registry = self
@@ -249,6 +368,19 @@ impl<
         drop(removed);
     }
 
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `Q`: Request type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `requests` (`Vec<Request<Q, A, E>>`): The requests supplied to this operation.
+    /// - `env` (`Arc<R>`): The environment supplying this operation's capabilities.
+    /// - `context` (`Context`): Execution context carrying cancellation, scope, and trace state.
+    ///
+    /// # Returns
+    /// Type: `Exit<Vec<SharedResult<A, E>>, RequestResolverError<E>>`.
     pub(super) async fn resolve(
         self: Arc<Self>,
         requests: Vec<Request<Q, A, E>>,
@@ -351,6 +483,17 @@ impl<
     }
 }
 
+///
+/// # Type parameters
+/// - `A`: Bounds: `Send + 'static`.
+/// - `E`: Bounds: `Send + 'static`.
+///
+/// # Parameters
+/// - `outcome` (`Exit<A, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+///
+/// # Returns
+/// Type: `SharedResult<A, E>`.
+/// Returns `SharedResult<A, E>`.
 fn share_request<A: Send + 'static, E: Send + 'static>(outcome: Exit<A, E>) -> SharedResult<A, E> {
     match outcome.map_error(|error| RequestResolverError::RequestFailed(SharedValue::new(error))) {
         Exit::Success(value) => Exit::Success(SharedValue::new(value)),
@@ -361,6 +504,18 @@ fn share_request<A: Send + 'static, E: Send + 'static>(outcome: Exit<A, E>) -> S
     }
 }
 
+///
+/// # Type parameters
+/// - `B`: Transformed success-value type.
+/// - `C`: Stream chunk or item type.
+/// - `E`: Expected application-error type.
+///
+/// # Parameters
+/// - `outcome` (`Exit<B, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+///
+/// # Returns
+/// Type: `Exit<C, E>`.
+/// Returns `Exit<C, E>`.
 fn failed<B, C, E>(outcome: Exit<B, E>) -> Exit<C, E> {
     match outcome.into_failure() {
         Ok(_) => Exit::Die(Defect::from(
@@ -370,6 +525,22 @@ fn failed<B, C, E>(outcome: Exit<B, E>) -> Exit<C, E> {
     }
 }
 
+///
+/// # Type parameters
+/// - `Q`: Request payload type. Additional bound: `Send + 'static`.
+/// - `A`: Successful application-value type. Additional bound: `Send + 'static`.
+/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type supplying required capabilities. Additional bound: `HasTaskSpawner + HasRequestScope + Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `group` (`RequestGroup`): The group supplied to this operation.
+/// - `batch` (`Vec<(Q, Arc<Pending<A, E>>)>`): Ordered group of values processed together.
+/// - `run` (`Arc<BatchRunner<Q, A, E, R>>`): Stable identity of the workflow run being inspected or changed.
+/// - `owner` (`Weak<ResolverState<Q, A, E, R>>`): Worker or scope identity used to fence stale operations.
+///
+/// # Returns
+/// Type: `Effect<(), RequestResolverError<E>, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 fn batch_effect<Q, A, E, R>(
     group: RequestGroup,
     batch: Vec<(Q, Arc<Pending<A, E>>)>,

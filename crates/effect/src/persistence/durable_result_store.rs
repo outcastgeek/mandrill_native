@@ -1,3 +1,5 @@
+//! Result storage requiring an explicitly durable provider.
+
 use super::{
     CompareExchange, ConditionalKeyValueStore, DurableKeyValueStore, HasDurableKeyValueStore,
     HasKeyValueStore, KeyValueStore, Persistable, PersistenceError, StoreRevision, StoredLookup,
@@ -9,20 +11,48 @@ use std::sync::Arc;
 /// Select the *same* provider for every operation in a physically durable
 /// result-store path. This private view only shares the provider handle; it
 /// does not copy records or invent a second store.
+///
+/// # Type parameters
+/// - `S`: Service or storage type. Bound or type: `DurableKeyValueStore`.
 struct DurableStoreView<S: DurableKeyValueStore>(Arc<S>);
 
 impl<S: DurableKeyValueStore> HasKeyValueStore for DurableStoreView<S> {
+    /// Type alias for store in persistence durable result store.
     type Store = S;
 
+    ///
+    /// # Returns
+    /// Type: `Arc<Self::Store>`.
+    /// Returns `Arc<Self::Store>`.
     fn key_value_store(&self) -> Arc<Self::Store> {
         Arc::clone(&self.0)
     }
 }
 
+/// Type alias for durable backend in persistence durable result store.
+///
+/// # Type parameters
+/// - `R`: Environment type.
 type DurableBackend<R> = <<R as HasDurableKeyValueStore>::Store as KeyValueStore>::Error;
 
 /// Read through the provider that explicitly warrants acknowledged-state
 /// recovery. A volatile-only environment cannot satisfy this signature.
+///
+/// # Type parameters
+/// - `R`: Environment type. Additional bound: `HasDurableKeyValueStore + Send + Sync + 'static`.
+/// - `I`: Input type. Additional bound: `Send + 'static`.
+/// - `A`: Application value type. Additional bound: `Send + 'static`.
+/// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+/// - `D`: Identity-domain type. Additional bound: `KeyDomain`.
+///
+/// # Parameters
+/// - `definition` (`Persistable<I, A, E, D>`): The typed definition used by this operation.
+/// - `input` (`impl Fn() -> I + Send + Sync + 'static`): The input value or factory consumed by this operation.
+/// - `now` (`UtcMillis`): The caller-supplied current time.
+///
+/// # Returns
+/// Type: `Effect<StoredLookup<A, E>, PersistenceError<DurableBackend<R>>, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 pub fn read_durable<R, I, A, E, D>(
     definition: Persistable<I, A, E, D>,
     input: impl Fn() -> I + Send + Sync + 'static,
@@ -40,6 +70,22 @@ where
 }
 
 /// Batch reads retain the original per-slot result and failure ordering.
+///
+/// # Type parameters
+/// - `R`: Environment type. Additional bound: `HasDurableKeyValueStore + Send + Sync + 'static`.
+/// - `I`: Input type. Additional bound: `Send + 'static`.
+/// - `A`: Application value type. Additional bound: `Send + 'static`.
+/// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+/// - `D`: Identity-domain type. Additional bound: `KeyDomain`.
+///
+/// # Parameters
+/// - `definition` (`Persistable<I, A, E, D>`): The typed definition used by this operation.
+/// - `inputs` (`impl Fn() -> Vec<I> + Send + Sync + 'static`): The inputs supplied to this operation.
+/// - `now` (`UtcMillis`): The caller-supplied current time.
+///
+/// # Returns
+/// Type: `Effect<Vec<Result<StoredLookup<A, E>, PersistenceError<DurableBackend<R>>>>, PersistenceError<DurableBackend<R>>, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 pub fn read_many_durable<R, I, A, E, D>(
     definition: Persistable<I, A, E, D>,
     inputs: impl Fn() -> Vec<I> + Send + Sync + 'static,
@@ -62,6 +108,23 @@ where
 
 /// Provider acknowledgement is still classified as uncertain when a write
 /// error may have occurred after the provider committed it.
+///
+/// # Type parameters
+/// - `R`: Environment type. Additional bound: `HasDurableKeyValueStore + Send + Sync + 'static`.
+/// - `I`: Input type. Additional bound: `Send + 'static`.
+/// - `A`: Application value type. Additional bound: `Send + 'static`.
+/// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+/// - `D`: Identity-domain type. Additional bound: `KeyDomain`.
+///
+/// # Parameters
+/// - `definition` (`Persistable<I, A, E, D>`): The typed definition used by this operation.
+/// - `input` (`impl Fn() -> I + Send + Sync + 'static`): The input value or factory consumed by this operation.
+/// - `outcome` (`impl Fn() -> StoredOutcome<A, E> + Send + Sync + 'static`): Complete terminal outcome, including expected errors and cleanup failures.
+/// - `expires_at` (`Option<UtcMillis>`): The optional expiry instant.
+///
+/// # Returns
+/// Type: `Effect<StoreRevision, PersistenceError<DurableBackend<R>>, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 pub fn write_durable<R, I, A, E, D>(
     definition: Persistable<I, A, E, D>,
     input: impl Fn() -> I + Send + Sync + 'static,
@@ -81,6 +144,22 @@ where
     .provide_some(|environment: &R| DurableStoreView(environment.durable_key_value_store()))
 }
 
+/// Remove a recorded result through the durable store contract.
+///
+/// # Type parameters
+/// - `R`: Environment type. Additional bound: `HasDurableKeyValueStore + Send + Sync + 'static`.
+/// - `I`: Input type. Additional bound: `Send + 'static`.
+/// - `A`: Application value type. Additional bound: `Send + 'static`.
+/// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+/// - `D`: Identity-domain type. Additional bound: `KeyDomain`.
+///
+/// # Parameters
+/// - `definition` (`Persistable<I, A, E, D>`): The typed definition used by this operation.
+/// - `input` (`impl Fn() -> I + Send + Sync + 'static`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `Effect<bool, PersistenceError<DurableBackend<R>>, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 pub fn remove_durable<R, I, A, E, D>(
     definition: Persistable<I, A, E, D>,
     input: impl Fn() -> I + Send + Sync + 'static,
@@ -98,6 +177,18 @@ where
 
 /// Atomic per-key mutation requires the provider to warrant both durability
 /// and conditional writes. Plain durable key/value storage is insufficient.
+///
+/// # Type parameters
+/// - `R`: Environment type. Additional bound: `HasDurableKeyValueStore + Send + Sync + 'static`. Additional bound: `:Store: ConditionalKeyValueStore`.
+///
+/// # Parameters
+/// - `key` (`Arc<[u8]>`): Stable key used to locate or identify the selected value.
+/// - `expected` (`Option<StoreRevision>`): Value or revision required for the proposed state transition.
+/// - `replacement` (`Option<StoredValue>`): The replacement supplied to this operation.
+///
+/// # Returns
+/// Type: `Effect<CompareExchange, PersistenceError<DurableBackend<R>>, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 pub fn compare_exchange_durable<R>(
     key: Arc<[u8]>,
     expected: Option<StoreRevision>,

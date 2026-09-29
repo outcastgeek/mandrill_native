@@ -8,6 +8,11 @@ const keys = @import("../primary_key.zig");
 const queue = @import("persisted_queue.zig");
 const PersistenceError = @import("persistence_error.zig").Error;
 
+/// Construct an in-memory persisted queue provider with caller-owned runtime resources.
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `now: comptime fn (*const R) deadlines.WallInstant`: Compile-time caller-supplied time or cursor boundary used for ordering and retention.
+/// Returns (`type`): in-memory implementation of the persisted-queue contract.
 pub fn MemoryPersistedQueue(
     comptime R: type,
     comptime now: fn (*const R) deadlines.WallInstant,
@@ -63,6 +68,11 @@ pub fn MemoryPersistedQueue(
         next_sequence: u64 = queue.Cursor.before_first.sequence + 1,
         closed: bool = false,
 
+        /// Create an in-memory persisted-queue provider using the caller environment.
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Self`): a queue provider bound to the supplied environment.
         pub fn init(env: *const R) Self {
             if (R == void or !@hasField(R, "allocator") or @FieldType(R, "allocator") != std.mem.Allocator)
                 @compileError("MemoryPersistedQueue requires caller allocator in R");
@@ -75,6 +85,10 @@ pub fn MemoryPersistedQueue(
             };
         }
 
+        /// Expose this implementation through its capability interface.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`Store`): A capability adapter referencing the selected implementation; keep its backing state alive while in use.
         pub fn capability(self: *Self) Store {
             return Store.fromProvider(self, &.{
                 .offer = offerEffect,
@@ -465,12 +479,20 @@ pub fn MemoryPersistedQueue(
             return .{ .success = .{ .removed = removed } };
         }
 
+        /// Stop the capability and release its retained resources.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn shutdown(self: *Self) void {
             self.mutex.lockUncancelable(self.io);
             self.closed = true;
             self.mutex.unlock(self.io);
         }
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             self.shutdown();
             for (self.items.items) |*item| item.deinit();

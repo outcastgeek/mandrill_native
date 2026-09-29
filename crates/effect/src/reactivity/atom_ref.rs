@@ -1,3 +1,5 @@
+//! Observable mutable references for reactive graphs.
+
 use super::{Atom, AtomError, AtomId, AtomKind, AtomRegistry, AtomRegistryError};
 use crate::{
     Defect, Effect, Exit, Finalization, PubSubError, PubSubOverflow, PubSubShutdown, PublishReport,
@@ -8,30 +10,51 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// A registry, publication, or admission failure for a mutable atom reference.
 pub enum AtomRefError {
+    /// The identity or definition registry rejected the operation. Retains the `AtomRegistryError` detail.
     Registry(AtomRegistryError),
+    /// Publishing the committed change failed. Retains the `PubSubError` detail.
     Publication(PubSubError),
     /// The source mutation committed, but dependents may not have received its
     /// invalidation. The caller must reconcile through authoritative state.
     CommittedWithoutInvalidation(AtomRegistryError),
+    /// The atom belongs to a different registry.
     ForeignRegistry,
+    /// The provider rejected work before accepting ownership. Retains the `SemaphoreError` detail.
     Admission(SemaphoreError),
+    /// No further revision can be allocated without exceeding its range.
     RevisionExhausted,
+    /// An owned input was already consumed.
     InputConsumed,
 }
 
+/// A failed or unavailable dependency encountered while evaluating a derived atom.
+///
+/// # Type parameters
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 pub enum AtomDependencyError<E: Send + 'static> {
+    /// Reading the selected source failed. Retains the `AtomError<E>` detail.
     Read(AtomError<E>),
+    /// The atom belongs to a different registry.
     ForeignRegistry,
+    /// The required value or capability is unavailable.
     Unavailable,
+    /// The underlying operation failed. Retains the `SharedValue<AtomError<E>>` detail.
     Failed(SharedValue<AtomError<E>>),
+    /// An unexpected defect occurred. Carries `Defect`.
     Defect(Defect),
+    /// Execution was interrupted.
     Interrupted,
+    /// The finalization operation failed. Retains the `Finalization<SharedValue<AtomError<E>>>` detail.
     FinalizationFailed(Finalization<SharedValue<AtomError<E>>>),
 }
 
 /// A typed source atom. Value snapshots share immutable Arc storage, so
 /// consumers never need A: Clone. Every instance belongs to exactly one graph.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + Sync + 'static`.
 pub struct AtomRef<A: Send + Sync + 'static> {
     pub(super) id: AtomId,
     pub(super) registry: AtomRegistry,
@@ -41,6 +64,9 @@ pub struct AtomRef<A: Send + Sync + 'static> {
 }
 
 impl<A: Send + Sync + 'static> Clone for AtomRef<A> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             id: self.id.clone(),
@@ -53,6 +79,20 @@ impl<A: Send + Sync + 'static> Clone for AtomRef<A> {
 }
 
 impl<A: Send + Sync + 'static> AtomRef<A> {
+    /// Construct a `AtomRef` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `registry` (`AtomRegistry`): Registry that owns definitions and rejects identity conflicts.
+    /// - `id` (`AtomId`): Stable identity of the selected record or operation.
+    /// - `initial` (`A`): Initial value used before any state transition.
+    /// - `capacity` (`NonZeroUsize`): The caller-supplied capacity bound.
+    /// - `overflow` (`PubSubOverflow`): Behavior when the configured buffer capacity is full.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, AtomRegistryError>`.
     pub fn new(
         registry: AtomRegistry,
         id: AtomId,
@@ -71,14 +111,39 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
     }
 
     #[must_use]
+    /// Return the stable identity associated with this value.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + Sync + 'static`.
+    ///
+    /// # Returns
+    /// Type: `&AtomId`.
     pub fn id(&self) -> &AtomId {
         &self.id
     }
 
+    /// Read the selected state without assuming it has been modified.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Returns
+    /// Type: `Effect<Arc<A>, AtomRefError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn read<R: Send + Sync + 'static>(&self) -> Effect<Arc<A>, AtomRefError, R> {
         self.value.read().map_error(AtomRefError::Publication)
     }
 
+    /// Return the revision assigned to the current atom value.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + Sync + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Returns
+    /// Type: `Effect<std::num::NonZeroU64, AtomRefError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn revision<R: Send + Sync + 'static>(
         &self,
     ) -> Effect<std::num::NonZeroU64, AtomRefError, R> {
@@ -90,6 +155,18 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
         })
     }
 
+    /// Replace the current value through the declared state capability.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `next` (`A`): Next value or state produced by the transition.
+    ///
+    /// # Returns
+    /// Type: `Effect<PublishReport, AtomRefError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn set<R: Send + Sync + 'static>(&self, next: A) -> Effect<PublishReport, AtomRefError, R> {
         let source = self.clone();
         let next = Mutex::new(Some(next));
@@ -144,10 +221,30 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
     }
 
     #[must_use]
+    /// Return the stream associated with this value.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Returns
+    /// Type: `crate::Stream<Arc<A>, PubSubError, R>`.
     pub fn stream<R: Send + Sync + 'static>(&self) -> crate::Stream<Arc<A>, PubSubError, R> {
         self.value.stream()
     }
 
+    /// Release owned native state and await its disposal where required.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + Sync + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `mode` (`PubSubShutdown`): Selected behavior for this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), AtomRefError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn dispose<R: Send + Sync + 'static>(
         &self,
         mode: PubSubShutdown,
@@ -185,6 +282,11 @@ pub struct AtomReadContext {
 }
 
 impl AtomReadContext {
+    /// # Parameters
+    /// - `registry` (`AtomRegistry`): Registry that owns definitions and rejects identity conflicts.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub(crate) fn new(registry: AtomRegistry) -> Self {
         Self {
             registry,
@@ -192,6 +294,18 @@ impl AtomReadContext {
         }
     }
 
+    /// Read the selected state without assuming it has been modified.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bounds: `Send + Sync + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `source` (`&AtomRef<A>`): Underlying provider or input from which values are read.
+    ///
+    /// # Returns
+    /// Type: `Effect<Arc<A>, AtomRefError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn read<A: Send + Sync + 'static, R: Send + Sync + 'static>(
         &self,
         source: &AtomRef<A>,
@@ -211,6 +325,8 @@ impl AtomReadContext {
         .flat_map(move |_| source.read())
     }
 
+    /// # Returns
+    /// Type: `BTreeSet<AtomId>`.
     pub(crate) fn collected(&self) -> BTreeSet<AtomId> {
         self.dependencies
             .lock()
@@ -218,6 +334,19 @@ impl AtomReadContext {
             .clone()
     }
 
+    /// Evaluate a derived atom after checking its dependencies.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Additional bound: `Send + 'static`.
+    /// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+    /// - `R`: Environment type. Additional bound: `Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `derived` (`&Atom<A, E, R>`): The derived supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<SharedValue<A>, AtomDependencyError<E>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn read_derived<A, E, R>(
         &self,
         derived: &Atom<A, E, R>,

@@ -1,3 +1,5 @@
+//! Acquisition, use, and awaited release of scoped resources.
+
 use crate::LibraryDefect;
 use crate::internal::destruction::FlatDrop;
 use crate::internal::outcome;
@@ -13,11 +15,26 @@ use std::sync::{Arc, RwLock};
 /// Awaited, single-use cleanup. Its factories can consume an owned resource
 /// without requiring Clone or constructing a reusable future around it.
 #[must_use = "a release must be returned to its resource binding"]
+///
+/// # Type parameters
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
+/// - `R`: Environment type. Bound or type: `Send + Sync + 'static = ()`.
 pub struct Release<E: Send + 'static, R: Send + Sync + 'static = ()> {
     workflow: Workflow<(), E, R>,
 }
 
 impl<E: Send + 'static, R: Send + Sync + 'static> Release<E, R> {
+    /// Describe a single-use synchronous release callback for an owned resource.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bound: `Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `callback` (`impl FnOnce() + Send + 'static`): The callback invoked by this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn sync(callback: impl FnOnce() + Send + 'static) -> Self {
         Self::try_sync(move || {
             callback();
@@ -25,6 +42,17 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Release<E, R> {
         })
     }
 
+    /// Describe a single-use synchronous release that can return an expected error.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bound: `Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `callback` (`impl FnOnce() -> Result<(), E> + Send + 'static`): The callback invoked by this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn try_sync(callback: impl FnOnce() -> Result<(), E> + Send + 'static) -> Self {
         Self {
             workflow: Workflow::new(move |_, _, finish| {
@@ -41,6 +69,18 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Release<E, R> {
         }
     }
 
+    /// Create a single-use release from a future factory, preserving resource ownership.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bound: `Send + Sync + 'static`.
+    /// - `F`: Bounds: `Future<Output = ()> + Send + 'static`.
+    ///
+    /// # Parameters
+    /// - `factory` (`impl FnOnce(Cancellation) -> F + Send + 'static`): Factory invoked to create fresh data for an execution.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn from_future<F: Future<Output = ()> + Send + 'static>(
         factory: impl FnOnce(Cancellation) -> F + Send + 'static,
     ) -> Self {
@@ -50,6 +90,18 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Release<E, R> {
         })
     }
 
+    /// Create a single-use fallible release from a future factory.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bound: `Send + Sync + 'static`.
+    /// - `F`: Bounds: `Future<Output = Result<(), E>> + Send + 'static`.
+    ///
+    /// # Parameters
+    /// - `factory` (`impl FnOnce(Cancellation) -> F + Send + 'static`): Factory invoked to create fresh data for an execution.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn try_future<F: Future<Output = Result<(), E>> + Send + 'static>(
         factory: impl FnOnce(Cancellation) -> F + Send + 'static,
     ) -> Self {
@@ -73,6 +125,17 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Release<E, R> {
         }
     }
 
+    /// Adapt an existing Effect while preserving its typed outcome channels.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `program` (`Effect<(), E, R>`): Lazy Effect description executed or transformed here.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn from_effect(program: Effect<(), E, R>) -> Self {
         Self {
             workflow: Workflow::new(move |env, context, finish| {
@@ -81,6 +144,17 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Release<E, R> {
         }
     }
 
+    /// # Type parameters
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `env` (`Arc<R>`): The environment supplying this operation's capabilities.
+    /// - `context` (`Context`): Execution context carrying cancellation, scope, and trace state.
+    /// - `finish` (`Finish<(), E>`): Continuation receiving the complete terminal outcome.
+    ///
+    /// # Returns
+    /// Type: `Step`.
     pub(crate) fn execute(self, env: Arc<R>, context: Context, finish: Finish<(), E>) -> Step {
         self.workflow.execute(env, context, finish)
     }
@@ -88,11 +162,17 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Release<E, R> {
 
 /// Access handle valid only until the binding's body finishes. Cloning or
 /// returning this handle does not extend the underlying resource lifetime.
+///
+/// # Type parameters
+/// - `T`: Value or item type.
 pub struct ResourceValue<T> {
     value: Arc<RwLock<Option<T>>>,
 }
 
 impl<T> Clone for ResourceValue<T> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             value: Arc::clone(&self.value),
@@ -101,6 +181,15 @@ impl<T> Clone for ResourceValue<T> {
 }
 
 impl<T> ResourceValue<T> {
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `value` (`T`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn new(value: T) -> Self {
         Self {
             value: Arc::new(RwLock::new(Some(value))),
@@ -109,6 +198,16 @@ impl<T> ResourceValue<T> {
 
     /// Synchronous, short access. A borrowed reference cannot escape this call.
     /// Never wait for resource release while inside this callback.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type.
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `access` (`impl FnOnce(&T) -> A`): The access supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<A, Defect>`.
     pub fn with<A>(&self, access: impl FnOnce(&T) -> A) -> Result<A, Defect> {
         let value = self
             .value
@@ -120,6 +219,13 @@ impl<T> ResourceValue<T> {
         }
     }
 
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type.
+    ///
+    /// # Returns
+    /// Type: `Option<T>`.
+    /// Returns the value when present, or `None`.
     fn invalidate(&self) -> Option<T> {
         self.value
             .write()
@@ -131,6 +237,19 @@ impl<T> ResourceValue<T> {
 impl<T: Send + Sync + 'static> ResourceValue<T> {
     /// Effectful access reports a closed handle as a defect. Copy owned data
     /// while inside the callback; references cannot cross an async suspension.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Additional bound: `Send + 'static`.
+    /// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+    /// - `R`: Environment type. Additional bound: `Send + Sync + 'static`.
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `access` (`impl Fn(&T) -> A + Send + Sync + 'static`): The access supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<A, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn access<A, E, R>(
         &self,
         access: impl Fn(&T) -> A + Send + Sync + 'static,
@@ -150,32 +269,66 @@ impl<T: Send + Sync + 'static> ResourceValue<T> {
 
 // Abandonment cannot await release, but must invalidate every escaped handle
 // and relinquish the owned value. Run/scope guards report ownership loss.
+/// Typed resource owner used by resource.
+///
+/// # Type parameters
+/// - `T`: Value or item type.
 struct ResourceOwner<T> {
     handle: ResourceValue<T>,
 }
 
 impl<T> ResourceOwner<T> {
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `handle` (`ResourceValue<T>`): Owned or borrowed capability handle kept live through this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn new(handle: ResourceValue<T>) -> Self {
         Self { handle }
     }
 
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type.
+    ///
+    /// # Returns
+    /// Type: `Option<T>`.
+    /// Returns the value when present, or `None`.
     fn take(&self) -> Option<T> {
         self.handle.invalidate()
     }
 }
 
 impl<T> Drop for ResourceOwner<T> {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         drop(self.take());
     }
 }
 
+/// Type alias for releaser in resource.
+///
+/// # Type parameters
+/// - `T`: Value or item type.
+/// - `E`: Domain-error type.
+/// - `R`: Environment type.
 type Releaser<T, E, R> =
     Arc<dyn for<'outcome> Fn(T, PrimaryOutcomeRef<'outcome, E>) -> Release<E, R> + Send + Sync>;
 
 /// Declares acquisition and release together before work begins.
-/// The body receives an invalidatable handle, not an escaping Arc<T>.
+/// The body receives an invalidatable handle, not an escaping `Arc<T>`.
 #[must_use = "use the resource binding to establish its release obligation"]
+///
+/// # Type parameters
+/// - `T`: Value or item type. Bound or type: `Send + Sync + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
+/// - `R`: Environment type. Bound or type: `Send + Sync + 'static = ()`.
 pub struct ResourceBinding<
     T: Send + Sync + 'static,
     E: Send + 'static,
@@ -188,6 +341,9 @@ pub struct ResourceBinding<
 impl<T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Clone
     for ResourceBinding<T, E, R>
 {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             acquire: self.acquire.clone(),
@@ -199,6 +355,19 @@ impl<T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Clon
 impl<T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
     ResourceBinding<T, E, R>
 {
+    /// Construct a `ResourceBinding` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `acquire` (`Effect<T, E, R>`): Description that obtains the resource before its body runs.
+    /// - `release` (`impl for<'outcome> Fn(T, PrimaryOutcomeRef<'outcome, E>) -> Release<E, R> + Send + Sync + 'static`): The release supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(
         acquire: Effect<T, E, R>,
         release: impl for<'outcome> Fn(T, PrimaryOutcomeRef<'outcome, E>) -> Release<E, R>
@@ -214,6 +383,19 @@ impl<T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
 
     /// Acquire, use, invalidate, and await protected release before publication.
     /// To survive observer loss, execute through a retained owned-run driver.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bounds: `Send + 'static`.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `use_resource` (`impl Fn(ResourceValue<T>) -> Effect<A, E, R> + Send + Sync + 'static`): The use resource supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<A, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn use_with<A: Send + 'static>(
         self,
         use_resource: impl Fn(ResourceValue<T>) -> Effect<A, E, R> + Send + Sync + 'static,
@@ -228,6 +410,17 @@ impl<T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
         })
     }
 
+    /// # Type parameters
+    /// - `A`: Application value type. Bounds: `Send + 'static`.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `use_resource` (`impl FnOnce(ResourceValue<T>) -> Workflow<A, E, R> + Send + 'static`): The use resource supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Workflow<A, E, R>`.
     pub(crate) fn bind_run<A: Send + 'static>(
         self,
         use_resource: impl FnOnce(ResourceValue<T>) -> Workflow<A, E, R> + Send + 'static,
@@ -312,6 +505,17 @@ impl<T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
         })
     }
 
+    /// # Type parameters
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `scope` (`Scope<E>`): Owner that joins child work and releases resources at close.
+    ///
+    /// # Returns
+    /// Type: `Effect<ResourceValue<T>, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub(crate) fn acquire_scoped(self, scope: Scope<E>) -> Effect<ResourceValue<T>, E, R> {
         Effect::new(move |env, context, finish| {
             let scope = scope.clone();
@@ -356,6 +560,17 @@ impl<T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
 impl<E: Send + 'static, R: Send + Sync + 'static> Release<E, R> {
     /// An owned cleanup future that can preserve several failures and all Exit
     /// families. Factory/poll unwinds become release defects under protection.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bound: `Send + Sync + 'static`.
+    /// - `F`: Bounds: `Future<Output = Exit<(), E>> + Send + 'static`.
+    ///
+    /// # Parameters
+    /// - `factory` (`impl FnOnce(Cancellation) -> F + Send + 'static`): Factory invoked to create fresh data for an execution.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn from_exit_future<F: Future<Output = Exit<(), E>> + Send + 'static>(
         factory: impl FnOnce(Cancellation) -> F + Send + 'static,
     ) -> Self {

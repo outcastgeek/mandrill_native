@@ -1,3 +1,5 @@
+//! Injectable monotonic clocks and deterministic test time.
+
 use crate::internal::runtime::{self, Step};
 use crate::internal::waiting::{Position, Waiting};
 use crate::{Cancellation, Defect, Effect, Exit, LibraryDefect};
@@ -13,29 +15,54 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 #[derive(Debug)]
+/// A failure to schedule or observe time through a clock provider.
 pub enum ClockError {
+    /// Execution was interrupted.
     Interrupted,
+    /// A bounded counter or arithmetic operation overflowed.
     Overflow,
+    /// An unexpected defect occurred. Carries `Defect`.
     Defect(Defect),
 }
 
+/// Owned clock wait. Polling uses a boxed future's Rust vtable; the future is
+/// local execution state and is never persisted as a recoverable deadline.
 pub type ClockFuture = Pin<Box<dyn Future<Output = Result<ClockTick, ClockError>> + Send>>;
 
+/// Supplies monotonic time and cancellable waits for local execution.
+/// An environment can use a concrete clock or an object-safe `dyn Clock`;
+/// dynamic dispatch occurs only for the latter.
 pub trait Clock: Send + Sync + 'static {
+    /// # Returns
+    /// Type: `Duration`.
     fn now(&self) -> Duration;
+    /// # Parameters
+    /// - `duration` (`Duration`): The elapsed-time duration to use.
+    /// - `cancellation` (`Cancellation`): The cancellation token for this operation.
+    ///
+    /// # Returns
+    /// Type: `ClockFuture`.
     fn sleep(&self, duration: Duration, cancellation: Cancellation) -> ClockFuture;
 }
+/// Selects a monotonic clock in an application environment.
 pub trait HasClock {
+    /// Clock selected by this environment.
     type Clock: Clock + ?Sized;
+    /// # Returns
+    /// Type: `&Self::Clock`.
     fn clock(&self) -> &Self::Clock;
 }
 
 #[derive(Default)]
+/// Typed acknowledgement used by clock.
 struct Acknowledgement {
     done: AtomicBool,
     waiter: Mutex<Option<Waker>>,
 }
 impl Acknowledgement {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn finish(&self) {
         self.done.store(true, Ordering::Release);
         let waiter = self
@@ -47,6 +74,13 @@ impl Acknowledgement {
             let _ = catch_unwind(AssertUnwindSafe(|| waiter.wake()));
         }
     }
+    ///
+    /// # Parameters
+    /// - `cx` (`&mut Context<'_>`): Rust task context used to register the current waker.
+    ///
+    /// # Returns
+    /// Type: `Poll<()>`.
+    /// Returns `Poll<()>`.
     fn poll(&self, cx: &mut Context<'_>) -> Poll<()> {
         let mut waiter = self
             .waiter
@@ -72,6 +106,8 @@ pub struct ClockTick {
 }
 impl ClockTick {
     #[must_use]
+    /// # Returns
+    /// Type: `Self`.
     pub const fn elapsed() -> Self {
         Self {
             acknowledgement: None,
@@ -79,6 +115,9 @@ impl ClockTick {
     }
 }
 impl Drop for ClockTick {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         if let Some(acknowledgement) = self.acknowledgement.take() {
             acknowledgement.finish();
@@ -87,17 +126,25 @@ impl Drop for ClockTick {
 }
 
 #[derive(Default)]
+/// Typed frontier used by clock.
 pub(crate) struct Frontier {
     present: AtomicBool,
     ticks: Mutex<Vec<ClockTick>>,
 }
 impl Frontier {
+    /// # Returns
+    /// Type: `Self`.
     pub(crate) const fn new() -> Self {
         Self {
             present: AtomicBool::new(false),
             ticks: Mutex::new(Vec::new()),
         }
     }
+    /// # Parameters
+    /// - `tick` (`ClockTick`): The tick supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `()`.
     pub(crate) fn retain(&self, tick: ClockTick) {
         if tick.acknowledgement.is_some() {
             self.ticks
@@ -107,6 +154,8 @@ impl Frontier {
             self.present.store(true, Ordering::Release);
         }
     }
+    /// # Returns
+    /// Type: `()`.
     pub(crate) fn acknowledge(&self) {
         if self.present.swap(false, Ordering::AcqRel) {
             let ticks = std::mem::take(
@@ -121,11 +170,30 @@ impl Frontier {
 }
 
 impl<E: Send + 'static, R: HasClock + Send + Sync + 'static> Effect<Duration, E, R> {
+    /// Read the monotonic clock selected by the Effect environment.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bound: `HasClock + Send + Sync + 'static`.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn clock_now() -> Self {
         Self::ready(|env, _| Exit::Success(env.clock().now()))
     }
 }
 impl<E: Send + 'static, R: HasClock + Send + Sync + 'static> Effect<(), E, R> {
+    /// Wait for the requested duration using the selected clock and cancellation token.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bound: `HasClock + Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `duration` (`Duration`): The elapsed-time duration to use.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn sleep(duration: Duration) -> Self {
         Self::new(move |env, context, finish| {
             let future = match catch_unwind(AssertUnwindSafe(|| {
@@ -155,15 +223,23 @@ impl<E: Send + 'static, R: HasClock + Send + Sync + 'static> Effect<(), E, R> {
     }
 }
 
+/// Typed sleep state used by clock.
 struct SleepState {
     outcome: Option<Result<ClockTick, ClockError>>,
     wake: Option<Waker>,
 }
+/// Typed sleeper used by clock.
 struct Sleeper {
     state: Mutex<SleepState>,
     cancellation: Cancellation,
 }
 impl Sleeper {
+    ///
+    /// # Parameters
+    /// - `outcome` (`Result<ClockTick, ClockError>`): Complete terminal outcome, including expected errors and cleanup failures.
+    ///
+    /// # Returns
+    /// Type: `Result<(), ClockError>`.
     fn complete(&self, outcome: Result<ClockTick, ClockError>) -> Result<(), ClockError> {
         let wake = {
             let mut state = self
@@ -181,10 +257,14 @@ impl Sleeper {
     }
 }
 #[derive(Default)]
+/// Typed advance entry used by clock.
 struct AdvanceEntry {
     wake: Mutex<Option<Waker>>,
 }
 impl AdvanceEntry {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn wake(&self) {
         let wake = self
             .wake
@@ -196,6 +276,7 @@ impl AdvanceEntry {
         }
     }
 }
+/// Typed virtual state used by clock.
 struct VirtualState {
     now: Duration,
     sleepers: BTreeMap<Duration, Waiting<Arc<Sleeper>>>,
@@ -203,16 +284,27 @@ struct VirtualState {
     active: Option<Arc<AdvanceEntry>>,
 }
 #[derive(Clone)]
+/// A manually advanced clock for deterministic scheduling and timeout behavior.
 pub struct TestClock {
     state: Arc<Mutex<VirtualState>>,
 }
 impl Default for TestClock {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn default() -> Self {
         Self::new(Duration::ZERO)
     }
 }
 impl TestClock {
     #[must_use]
+    /// Construct a `TestClock` from its required inputs and explicit policies.
+    ///
+    /// # Parameters
+    /// - `initial` (`Duration`): Initial value used before any state transition.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(initial: Duration) -> Self {
         Self {
             state: Arc::new(Mutex::new(VirtualState {
@@ -224,6 +316,10 @@ impl TestClock {
         }
     }
     #[must_use]
+    /// Count test-clock waits registered but not yet completed.
+    ///
+    /// # Returns
+    /// Type: `usize`.
     pub fn pending(&self) -> usize {
         // The retained entries are actual registrations, not generated sequence IDs.
         self.state
@@ -234,6 +330,13 @@ impl TestClock {
             .map(Waiting::len)
             .sum()
     }
+    /// Move the recorded position forward after validating the intervening state.
+    ///
+    /// # Parameters
+    /// - `duration` (`Duration`): The elapsed-time duration to use.
+    ///
+    /// # Returns
+    /// Type: `TestClockAdvance`.
     pub fn advance(&self, duration: Duration) -> TestClockAdvance {
         let entry = Arc::new(AdvanceEntry::default());
         let mut state = self
@@ -254,6 +357,14 @@ impl TestClock {
             finished: false,
         }
     }
+    ///
+    /// # Parameters
+    /// - `deadline` (`Duration`): The deadline for the pending operation.
+    /// - `position` (`Position`): The position supplied to this operation.
+    /// - `sleeper` (`&Arc<Sleeper>`): The sleeper supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn remove_sleep(&self, deadline: Duration, position: Position, sleeper: &Arc<Sleeper>) {
         let removed = {
             let mut state = self
@@ -272,12 +383,24 @@ impl TestClock {
     }
 }
 impl Clock for TestClock {
+    ///
+    /// # Returns
+    /// Type: `Duration`.
+    /// Returns `Duration`.
     fn now(&self) -> Duration {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .now
     }
+    ///
+    /// # Parameters
+    /// - `duration` (`Duration`): The elapsed-time duration to use.
+    /// - `cancellation` (`Cancellation`): The cancellation token for this operation.
+    ///
+    /// # Returns
+    /// Type: `ClockFuture`.
+    /// Returns `ClockFuture`.
     fn sleep(&self, duration: Duration, cancellation: Cancellation) -> ClockFuture {
         let clock = self.clone();
         Box::pin(async move {
@@ -351,11 +474,16 @@ impl Clock for TestClock {
     }
 }
 impl HasClock for TestClock {
+    /// Type alias for clock in clock.
     type Clock = Self;
+    ///
+    /// # Returns
+    /// Type: `&Self`.
     fn clock(&self) -> &Self {
         self
     }
 }
+/// Typed sleep registration used by clock.
 struct SleepRegistration {
     clock: TestClock,
     sleeper: Arc<Sleeper>,
@@ -363,6 +491,9 @@ struct SleepRegistration {
     position: Position,
 }
 impl Drop for SleepRegistration {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         self.clock
             .remove_sleep(self.deadline, self.position, &self.sleeper);
@@ -370,6 +501,7 @@ impl Drop for SleepRegistration {
 }
 
 #[must_use = "drive virtual advancement through clock-driven continuation settlement"]
+/// The result of moving the test clock through pending deadlines.
 pub struct TestClockAdvance {
     clock: TestClock,
     entry: Arc<AdvanceEntry>,
@@ -380,6 +512,9 @@ pub struct TestClockAdvance {
     finished: bool,
 }
 impl TestClockAdvance {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn finish(&mut self) {
         if self.finished {
             return;
@@ -411,7 +546,15 @@ impl TestClockAdvance {
     }
 }
 impl Future for TestClockAdvance {
+    /// Type alias for output in clock.
     type Output = Result<(), ClockError>;
+    ///
+    /// # Parameters
+    /// - `cx` (`&mut Context<'_>`): Rust task context used to register the current waker.
+    ///
+    /// # Returns
+    /// Type: `Poll<Self::Output>`.
+    /// Returns `Poll<Self::Output>`.
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         if this.finished {
@@ -496,6 +639,9 @@ impl Future for TestClockAdvance {
     }
 }
 impl Drop for TestClockAdvance {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         self.finish();
     }
@@ -509,6 +655,18 @@ impl<
 {
     /// The timeout owns cancellation and joining of its loser, including cleanup.
     /// It does not drop a native future or a running worker callback to detach it.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bound: `HasClock + crate::HasTaskSpawner + Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `duration` (`Duration`): The elapsed-time duration to use.
+    /// - `on_timeout` (`impl Fn() -> E + Send + Sync + 'static`): The on timeout supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn timeout(
         self,
         duration: Duration,

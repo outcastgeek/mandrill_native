@@ -1,3 +1,5 @@
+//! Transport-neutral HTTP requests, responses, and body ownership.
+
 use crate::internal::runtime::{self, Step};
 use crate::internal::workflow::{self, bind, success};
 use crate::{
@@ -12,56 +14,108 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+/// Owned transport future. Polling uses the boxed future's Rust vtable; the
+/// future and its provider remain process-local rather than part of the wire format.
+///
+/// # Type parameters
+/// - `T`: Value or item type.
 pub type TransportFuture<T> = Pin<Box<dyn Future<Output = Result<T, Defect>> + Send>>;
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// The HTTP method selected for a transport request.
 pub enum HttpMethod {
+    /// Read the selected stored value.
     Get,
+    /// Use the current head position of the stream.
     Head,
+    /// Run this middleware stage after the handler response.
     Post,
+    /// Store or replace the selected value.
     Put,
+    /// Delete the selected stored value.
     Delete,
+    /// Apply a partial state update.
     Patch,
+    /// The encoded value is an optional value.
     Options,
+    /// The request uses an extension operation. Contains `Arc<str>`.
     Extension(Arc<str>),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A validated status code returned by an HTTP transport.
 pub struct HttpStatus(pub u16);
+/// Type alias for http headers in http.
 pub type HttpHeaders = BTreeMap<Arc<str>, Arc<str>>;
 #[derive(Clone)]
+/// Caller-supplied timeout, size, and response handling bounds for an HTTP request.
 pub struct RequestOptions {
+    /// HTTP method used by this request. Type: `HttpMethod`.
     pub method: HttpMethod,
+    /// HTTP headers sent or received with this message. Type: `Arc<HttpHeaders>`.
     pub headers: Arc<HttpHeaders>,
+    /// Application body invoked by this definition. Type: `Option<Arc<[u8]>>`.
     pub body: Option<Arc<[u8]>>,
 }
 #[derive(Clone)]
+/// The method, target, headers, and body submitted to an HTTP transport.
 pub struct HttpRequest {
+    /// Target URL supplied to the HTTP transport. Type: `Arc<str>`.
     pub url: Arc<str>,
+    /// Timeout and resource policies for this request. Type: `RequestOptions`.
     pub options: RequestOptions,
 }
 #[derive(Debug)]
+/// A typed failure from status validation, body decoding, or transport execution.
 pub enum FetchFailure {
+    /// The selected transport provider failed. Retains the `Defect` detail.
     Transport(Defect),
+    /// The HTTP transport or response handling failed. Retains the `HttpStatus` detail.
     Http(HttpStatus),
+    /// Decoding the stored or transported value failed. Retains the `Defect` detail.
     Decode(Defect),
 }
 /// Methods return owned futures; implementations retain their reactor/client
 /// and join admitted reads before close completes. No global HTTP client exists.
+/// An `Arc<dyn HttpBody>` dispatches these methods through a Rust vtable;
+/// callers rely on this trait contract, not on a concrete vtable layout.
 pub trait HttpBody: Send + Sync + 'static {
+    /// # Parameters
+    /// - `cancellation` (`Cancellation`): The cancellation token for this operation.
+    ///
+    /// # Returns
+    /// Type: `TransportFuture<Vec<u8>>`.
     fn read(&self, cancellation: Cancellation) -> TransportFuture<Vec<u8>>;
+    /// # Returns
+    /// Type: `Result<(), Defect>`.
     fn abort(&self) -> Result<(), Defect>;
+    /// # Returns
+    /// Type: `TransportFuture<()>`.
     fn close(&self) -> TransportFuture<()>;
 }
+/// Sends requests through a provider-owned HTTP transport.
+/// An environment may expose a concrete implementor or `dyn HttpTransport`;
+/// only the latter uses trait-object vtable dispatch.
 pub trait HttpTransport: Send + Sync + 'static {
+    /// # Parameters
+    /// - `request` (`HttpRequest`): The typed request to process.
+    /// - `cancellation` (`Cancellation`): The cancellation token for this operation.
+    ///
+    /// # Returns
+    /// Type: `TransportFuture<HttpResponse>`.
     fn send(
         &self,
         request: HttpRequest,
         cancellation: Cancellation,
     ) -> TransportFuture<HttpResponse>;
 }
+/// Selects the HTTP transport in an application environment.
 pub trait HasHttpTransport {
+    /// Transport selected by this environment; an unsized trait object is permitted.
     type Transport: HttpTransport + ?Sized;
+    /// # Returns
+    /// Type: `&Self::Transport`.
     fn http_transport(&self) -> &Self::Transport;
 }
+/// A response whose body remains owned until it is consumed or closed.
 pub struct HttpResponse {
     status: HttpStatus,
     headers: Arc<HttpHeaders>,
@@ -72,6 +126,15 @@ pub struct HttpResponse {
 }
 impl HttpResponse {
     #[must_use]
+    /// Construct a `HttpResponse` from its required inputs and explicit policies.
+    ///
+    /// # Parameters
+    /// - `status` (`HttpStatus`): The status supplied to this operation.
+    /// - `headers` (`HttpHeaders`): The headers supplied to this operation.
+    /// - `body` (`Arc<dyn HttpBody>`): Application callback or effect executed inside the owning scope.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(status: HttpStatus, headers: HttpHeaders, body: Arc<dyn HttpBody>) -> Self {
         Self {
             status,
@@ -83,13 +146,26 @@ impl HttpResponse {
         }
     }
     #[must_use]
+    /// # Returns
+    /// Type: `HttpStatus`.
     pub const fn status(&self) -> HttpStatus {
         self.status
     }
     #[must_use]
+    /// Borrow the request or response headers without copying their values.
+    ///
+    /// # Returns
+    /// Type: `&HttpHeaders`.
     pub fn headers(&self) -> &HttpHeaders {
         &self.headers
     }
+    ///
+    /// # Parameters
+    /// - `cancellation` (`Cancellation`): The cancellation token for this operation.
+    ///
+    /// # Returns
+    /// Type: `TransportFuture<Vec<u8>>`.
+    /// Returns `TransportFuture<Vec<u8>>`.
     fn read(&self, cancellation: Cancellation) -> TransportFuture<Vec<u8>> {
         let permit = self.reads.admit();
         let body = Arc::clone(&self.body);
@@ -117,6 +193,13 @@ impl HttpResponse {
             result
         })
     }
+    ///
+    /// # Type parameters
+    /// - `E`: Bounds: `Send + 'static`.
+    ///
+    /// # Returns
+    /// Type: `Pin<Box<dyn Future<Output = Exit<(), E>> + Send>>`.
+    /// Returns `Pin<Box<dyn Future<Output = Exit<(), E>> + Send>>`.
     fn close<E: Send + 'static>(self) -> Pin<Box<dyn Future<Output = Exit<(), E>> + Send>> {
         Box::pin(async move {
             let draining = self.reads.stop();
@@ -147,6 +230,18 @@ impl HttpResponse {
     }
 }
 impl<E: Send + 'static, R: HasHttpTransport + Send + Sync + 'static> Effect<HttpResponse, E, R> {
+    /// Construct a typed HTTP request with caller-supplied method, target, and body.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bound: `HasHttpTransport + Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `request` (`HttpRequest`): The typed request to process.
+    /// - `on_error` (`impl Fn(FetchFailure) -> E + Send + Sync + 'static`): Callback that maps a source error into the declared error type.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn http_request(
         request: HttpRequest,
         on_error: impl Fn(FetchFailure) -> E + Send + Sync + 'static,
@@ -179,6 +274,21 @@ impl<E: Send + 'static, R: HasHttpTransport + Send + Sync + 'static> Effect<Http
         })
     }
 }
+/// Execute a request through the HTTP transport selected by the environment.
+///
+/// # Type parameters
+/// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type. Additional bound: `HasHttpTransport + Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `scope` (`Scope<E>`): Owner that joins child work and releases resources at close.
+/// - `request` (`HttpRequest`): The typed request to process.
+/// - `accept_status` (`impl Fn(HttpStatus) -> bool + Send + Sync + 'static`): The accept status supplied to this operation.
+/// - `on_error` (`impl Fn(FetchFailure) -> E + Send + Sync + 'static`): Callback that maps a source error into the declared error type.
+///
+/// # Returns
+/// Type: `Effect<ResourceValue<HttpResponse>, E, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 pub fn request<E, R>(
     scope: Scope<E>,
     request: HttpRequest,
@@ -204,6 +314,19 @@ where
         Err(defect) => Effect::die(defect),
     })
 }
+/// Decode a response body as UTF-8 after honoring status and size policies.
+///
+/// # Type parameters
+/// - `E`: Domain-error type. Bounds: `Send + 'static`.
+/// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `response` (`ResourceValue<HttpResponse>`): The response supplied to this operation.
+/// - `on_error` (`impl Fn(FetchFailure) -> E + Send + Sync + 'static`): Callback that maps a source error into the declared error type.
+///
+/// # Returns
+/// Type: `Effect<String, E, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 pub fn text<E: Send + 'static, R: Send + Sync + 'static>(
     response: ResourceValue<HttpResponse>,
     on_error: impl Fn(FetchFailure) -> E + Send + Sync + 'static,
@@ -238,6 +361,20 @@ pub fn text<E: Send + 'static, R: Send + Sync + 'static>(
         }))
     })
 }
+/// Fetch a response and decode its body as bounded UTF-8 text.
+///
+/// # Type parameters
+/// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type. Additional bound: `HasHttpTransport + Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `request_value` (`HttpRequest`): The request value supplied to this operation.
+/// - `accept_status` (`impl Fn(HttpStatus) -> bool + Send + Sync + 'static`): The accept status supplied to this operation.
+/// - `on_error` (`impl Fn(FetchFailure) -> E + Send + Sync + 'static`): Callback that maps a source error into the declared error type.
+///
+/// # Returns
+/// Type: `Effect<String, E, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 pub fn fetch_text<E, R>(
     request_value: HttpRequest,
     accept_status: impl Fn(HttpStatus) -> bool + Send + Sync + 'static,

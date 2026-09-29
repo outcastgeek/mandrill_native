@@ -1,10 +1,20 @@
+//! Caller-supplied async, CPU, and blocking execution capabilities.
 const diagnostics = @import("internal/diagnostics.zig");
 const std = @import("std");
 const outcomes = @import("outcome.zig");
 const Cancellation = @import("internal/runtime.zig").Cancellation;
 
+/// Execution lane requested by an Effect. Providers must only accept lanes
+/// covered by their advertised `Capabilities`.
 pub const Kind = enum { async_io, independent, cpu, blocking };
+/// Advertised lanes for one executor. `async_io` is always available through
+/// `Executor.submit`; CPU and blocking work also require `independent` so a
+/// parent worker cannot deadlock waiting on its own lane.
 pub const Capabilities = struct { independent: bool, cpu: bool, blocking: bool };
+/// A callback submitted to an executor. `data` is passed unchanged to `run`;
+/// `cancellation` lets the provider request cooperative stop. All pointers are
+/// borrowed until the accepted handle is joined and destroyed. On rejection,
+/// the callback has not run and the caller keeps the job.
 pub const Job = struct { data: *anyopaque, run: *const fn (*anyopaque) void, cancellation: ?*Cancellation = null };
 
 /// An accepted job runs exactly once and remains owned until join completes.
@@ -13,43 +23,101 @@ pub const Job = struct { data: *anyopaque, run: *const fn (*anyopaque) void, can
 pub const Executor = struct {
     userdata: ?*anyopaque,
     capabilities: Capabilities,
+    /// Submit a job to a provider. The callback receives borrowed `userdata`,
+    /// the requested `Kind`, and the `Job`. Acceptance transfers responsibility
+    /// for running the job exactly once and returns its owned handle. Rejection
+    /// must happen before `Job.run` starts and leaves the job with the caller.
     submit_fn: *const fn (?*anyopaque, Kind, Job) Submission,
 
+    /// Admission result. Rejection leaves the job with the caller.
     pub const Submission = union(enum) { accepted: Handle, rejected: outcomes.Defect };
+    /// Owned provider handle. `request` forwards cancellation; `join` observes
+    /// completion; `deinit` destroys the handle after joining.
     pub const Handle = struct {
+        /// Typed join result channel described by `NativeJoinResult`.
         pub const JoinResult = NativeJoinResult;
         userdata: *anyopaque,
         vtable: *const VTable,
 
+        /// Typed function-pointer interface for this capability. Implement every
+        /// hook with the exact signature below; keep the table valid while the
+        /// capability or pending work can invoke it.
         pub const VTable = struct {
             // Nonblocking and threadsafe. Returns an explicit forwarding defect
             // when the provider cannot request cancellation of owned work.
+            /// Forward cancellation without joining.
+            /// Parameters (callback order):
+            /// - `1: *anyopaque`: the handle's `userdata`; it stays valid until `destroy`.
+            /// Returns (`?outcomes.Defect`): `null` when the request was forwarded;
+            /// otherwise a defect explaining why forwarding failed.
             request: *const fn (*anyopaque) ?outcomes.Defect,
             // The caller serializes joining and destruction. request may run
             // concurrently, but never owns or awaits the underlying handle.
+            /// Join owned work and collect its outcome.
+            /// Parameters (callback order):
+            /// - `1: *anyopaque`: the handle's `userdata`; it stays valid until `destroy`.
+            /// - `2: bool`: whether joining is protected against interruption.
+            /// Returns (`JoinResult`): typed join outcome carrying completion and interruption/defect information.
             join: *const fn (*anyopaque, bool) JoinResult,
+            /// Report whether work has completed.
+            /// Parameters (callback order):
+            /// - `1: *anyopaque`: the handle's `userdata`; it stays valid until `destroy`.
+            /// Returns (`bool`): `true` after the callback has completed.
             is_complete: *const fn (*anyopaque) bool,
+            /// Release the owned handle.
+            /// Parameters (callback order):
+            /// - `1: *anyopaque`: the handle's `userdata`; this call releases it.
+            /// Returns (`void`): no value; the handle is invalid after this call.
             destroy: *const fn (*anyopaque) void,
         };
 
+        /// Check whether the submitted job has completed.
+        /// Parameters:
+        /// - `self: Handle`: borrowed provider handle; retain its `userdata` until destruction.
+        /// Returns (`bool`): `true` when the submitted callback has finished.
         pub fn isComplete(self: Handle) bool {
             return self.vtable.is_complete(self.userdata);
         }
+        /// Ask the provider to cancel this handle's job without waiting for it.
+        /// Parameters:
+        /// - `self: Handle`: borrowed provider handle; retain its `userdata` until destruction.
+        /// Returns (`?outcomes.Defect`): `null` if forwarded, or a provider defect
+        /// when cancellation could not be requested. The owner must still join.
         pub fn request(self: Handle) ?outcomes.Defect {
             return self.vtable.request(self.userdata);
         }
+        /// Wait for the child operation and obtain its result.
+        /// Parameters:
+        /// - `self: Handle`: borrowed provider handle; retain its `userdata` until destruction.
+        /// Returns (`JoinResult`): Completion status, including interruption or provider defects where declared.
         pub fn join(self: Handle) JoinResult {
             return self.joinProtected(false);
         }
+        /// Join a pending operation with the selected interruption protection.
+        /// Parameters:
+        /// - `self: Handle`: borrowed provider handle; retain its `userdata` until destruction.
+        /// - `protected: bool`: Whether joining is protected against interruption.
+        /// Returns (`JoinResult`): Completion status, including interruption or provider defects where declared.
         pub fn joinProtected(self: Handle, protected: bool) JoinResult {
             return self.vtable.join(self.userdata, protected);
         }
+        /// Destroy a handle after its job has been joined; using it afterward is invalid.
+        /// Parameters:
+        /// - `self: *Handle`: unique owned handle to destroy.
+        /// Returns (`void`): no value; the provider releases the handle's storage.
         pub fn deinit(self: *Handle) void {
             self.vtable.destroy(self.userdata);
             self.* = undefined;
         }
     };
 
+    /// Admit work only when the requested lane is supported.
+    /// Parameters:
+    /// - `self: Executor`: Borrowed provider adapter and its advertised capabilities.
+    /// - `kind: Kind`: Requested async, independent, CPU, or blocking lane.
+    /// - `job: Job`: Callback and state transferred to the provider only on acceptance.
+    /// Returns (`Submission`): Accepted work with an owned join handle, or a
+    /// defect explaining rejection before the callback starts.
     pub fn submit(self: Executor, kind: Kind, job: Job) Submission {
         const supported = switch (kind) {
             .async_io => true,
@@ -71,10 +139,20 @@ pub const NativeIo = struct {
     maximum_owned: usize,
     owned: std.atomic.Value(usize) = .init(0),
 
+    /// Expose this NativeIo adapter as an Executor capability.
+    /// Parameters:
+    /// - `self: *NativeIo`: adapter whose address must remain stable while work is pending.
+    /// Returns (`Executor`): a borrowed capability whose `userdata` points to
+    /// this adapter; finish every accepted job before `deinit`.
     pub fn executor(self: *NativeIo) Executor {
         return .{ .userdata = self, .capabilities = self.capabilities, .submit_fn = submit };
     }
 
+    /// Invalidate this adapter after all accepted jobs have been joined and destroyed.
+    /// Parameters:
+    /// - `self: *NativeIo`: adapter with no remaining owned jobs; an assertion
+    /// checks this precondition.
+    /// Returns (`void`): no value; the adapter cannot be used again without initialization.
     pub fn deinit(self: *NativeIo) void {
         std.debug.assert(self.owned.load(.acquire) == 0);
         self.* = undefined;
@@ -173,6 +251,13 @@ pub const Registered = struct {
     failure: ?outcomes.Defect = null,
     gate: std.atomic.Value(bool) = .init(false),
 
+    /// Take ownership of an accepted executor handle and register cancellation forwarding.
+    /// Parameters:
+    /// - `self: *Registered`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// - `handle: Executor.Handle`: Owned executor handle joined and destroyed by this operation.
+    /// - `token: *const Cancellation`: Cancellation token observed by this operation; its owner must outlive pending
+    ///   work.
+    /// Returns (`void`): no value; the registration stays active until join removes it.
     pub fn init(self: *Registered, handle: Executor.Handle, token: *const Cancellation) void {
         self.* = .{ .handle = handle, .registration = .{ .data = self, .forward = forward } };
         token.register(&self.registration);
@@ -185,11 +270,21 @@ pub const Registered = struct {
         if (self.handle.request()) |failure| self.failure = failure;
     }
 
+    /// Typed join result record.
     pub const JoinResult = struct { interrupted: bool, forwarding: ?outcomes.Defect, joining: ?outcomes.Defect };
 
+    /// Wait for the child operation and obtain its result.
+    /// Parameters:
+    /// - `self: *Registered`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`JoinResult`): Completion status, including interruption or provider defects where declared.
     pub fn join(self: *Registered) JoinResult {
         return self.joinProtected(false);
     }
+    /// Join a pending operation with the selected interruption protection.
+    /// Parameters:
+    /// - `self: *Registered`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// - `protected: bool`: Whether joining is protected against interruption.
+    /// Returns (`JoinResult`): Completion status, including interruption or provider defects where declared.
     pub fn joinProtected(self: *Registered, protected: bool) JoinResult {
         const joined = self.handle.joinProtected(protected);
         self.registration.unregister();
@@ -197,4 +292,5 @@ pub const Registered = struct {
         return .{ .interrupted = joined.interrupted, .forwarding = self.failure, .joining = joined.defect };
     }
 };
+/// Typed native join result record.
 pub const NativeJoinResult = struct { interrupted: bool = false, defect: ?outcomes.Defect = null };

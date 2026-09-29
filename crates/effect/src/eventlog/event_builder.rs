@@ -1,3 +1,5 @@
+//! Checked construction of event definitions.
+
 use super::{
     AggregateId, EncodedEventOutcome, EventEnvelope, EventGroupId, EventId, EventJournalId,
     EventOutcomeKind, EventTag, EventVersion,
@@ -7,39 +9,71 @@ use crate::{JsonValue, PureCodec, UtcMillis};
 use std::sync::Arc;
 
 #[derive(Debug)]
+/// A typed failure encoding or decoding an event payload or result.
 pub enum EventCodecError {
+    /// The binary identity, framing, or payload is invalid. Retains the `BinaryError` detail.
     Binary(BinaryError),
+    /// The group differs from the required or recorded value.
     GroupMismatch,
+    /// The tag differs from the required or recorded value.
     TagMismatch,
+    /// The recorded version differs from the declared version.
     VersionMismatch,
+    /// The required outcome is missing.
     MissingOutcome,
 }
 
+/// The stable group, tag, and version that identify a typed event.
 pub struct EventShape {
+    /// Stable event or request group identity. Type: `EventGroupId`.
     pub group: EventGroupId,
+    /// The event or protocol tag. Type: `EventTag`.
     pub tag: EventTag,
+    /// The declared compatibility version. Type: `EventVersion`.
     pub version: EventVersion,
 }
 
+/// The request, success, and domain-error codecs for a typed event.
+///
+/// # Type parameters
+/// - `P`: Payload type.
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 pub struct EventCodecs<P, A, E> {
+    /// The payload carried by this request or record. Type: `PureCodec<P, JsonValue>`.
     pub payload: PureCodec<P, JsonValue>,
+    /// Codec or representation identity for successful results. Type: `PureCodec<A, JsonValue>`.
     pub success: PureCodec<A, JsonValue>,
+    /// The typed error carried by this result. Type: `PureCodec<E, JsonValue>`.
     pub error: PureCodec<E, JsonValue>,
 }
 
+/// The selected binary format identity and limits for event records.
 pub struct EventBinaryFormats {
+    /// The payload carried by this request or record. Type: `BinaryIdentity`.
     pub payload: BinaryIdentity,
+    /// Codec or representation identity for successful results. Type: `BinaryIdentity`.
     pub success: BinaryIdentity,
+    /// The typed error carried by this result. Type: `BinaryIdentity`.
     pub error: BinaryIdentity,
+    /// Explicit resource bounds applied to this operation. Type: `BinaryLimits`.
     pub limits: BinaryLimits,
 }
 
 /// The event payload, successful handler result and domain failure each
 /// retain their own schema and binary identity. A caller chooses those
 /// identities and resource limits; no Rust type name enters stored data.
+///
+/// # Type parameters
+/// - `P`: Payload type.
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 pub struct EventDefinition<P, A, E> {
+    /// Stable event or request group identity. Type: `EventGroupId`.
     pub group: EventGroupId,
+    /// The event or protocol tag. Type: `EventTag`.
     pub tag: EventTag,
+    /// The declared compatibility version. Type: `EventVersion`.
     pub version: EventVersion,
     payload: PureCodec<P, JsonValue>,
     success: PureCodec<A, JsonValue>,
@@ -50,6 +84,9 @@ pub struct EventDefinition<P, A, E> {
 }
 
 impl<P, A, E> Clone for EventDefinition<P, A, E> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             group: self.group.clone(),
@@ -67,6 +104,20 @@ impl<P, A, E> Clone for EventDefinition<P, A, E> {
 
 impl<P: Send + 'static, A: Send + 'static, E: Send + 'static> EventDefinition<P, A, E> {
     #[must_use]
+    /// Construct a `EventDefinition` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `P`: Payload type.
+    ///
+    /// # Parameters
+    /// - `shape` (`EventShape`): Encoded-side structure required by this schema.
+    /// - `codecs` (`EventCodecs<P, A, E>`): The codecs supplied to this operation.
+    /// - `formats` (`EventBinaryFormats`): The formats supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(
         shape: EventShape,
         codecs: EventCodecs<P, A, E>,
@@ -116,6 +167,23 @@ impl<P: Send + 'static, A: Send + 'static, E: Send + 'static> EventDefinition<P,
         }
     }
 
+    /// Encode a typed event into its stable identity, version, and payload envelope.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `P`: Payload type.
+    ///
+    /// # Parameters
+    /// - `journal` (`EventJournalId`): The journal supplied to this operation.
+    /// - `aggregate` (`AggregateId`): The aggregate supplied to this operation.
+    /// - `id` (`EventId`): Stable identity of the selected record or operation.
+    /// - `payload` (`&P`): Application data moved into the message or stored record.
+    /// - `outcome` (`Option<&Result<A, E>>`): Complete terminal outcome, including expected errors and cleanup failures.
+    /// - `occurred_at` (`UtcMillis`): The occurred at supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<EventEnvelope, EventCodecError>`.
     pub fn envelope(
         &self,
         journal: EventJournalId,
@@ -145,6 +213,18 @@ impl<P: Send + 'static, A: Send + 'static, E: Send + 'static> EventDefinition<P,
         })
     }
 
+    /// Validate an event envelope and decode its typed payload.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `P`: Payload type.
+    ///
+    /// # Parameters
+    /// - `envelope` (`&EventEnvelope`): Versioned encoded message crossing the transport boundary.
+    ///
+    /// # Returns
+    /// Type: `Result<P, EventCodecError>`.
     pub fn decode_payload(&self, envelope: &EventEnvelope) -> Result<P, EventCodecError> {
         self.validate(envelope)?;
         self.payload_binary
@@ -152,6 +232,18 @@ impl<P: Send + 'static, A: Send + 'static, E: Send + 'static> EventDefinition<P,
             .map_err(EventCodecError::Binary)
     }
 
+    /// Decode the recorded terminal outcome through its registered codecs.
+    ///
+    /// # Type parameters
+    /// - `P`: Payload type. Bound: `Send + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `envelope` (`&EventEnvelope`): Versioned encoded message crossing the transport boundary.
+    ///
+    /// # Returns
+    /// Type: `Result<Result<A, E>, EventCodecError>`.
     pub fn decode_outcome(
         &self,
         envelope: &EventEnvelope,
@@ -175,6 +267,16 @@ impl<P: Send + 'static, A: Send + 'static, E: Send + 'static> EventDefinition<P,
         }
     }
 
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `outcome` (`&Result<A, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+    ///
+    /// # Returns
+    /// Type: `Result<EncodedEventOutcome, EventCodecError>`.
     fn encode_outcome(
         &self,
         outcome: &Result<A, E>,
@@ -195,6 +297,12 @@ impl<P: Send + 'static, A: Send + 'static, E: Send + 'static> EventDefinition<P,
         })
     }
 
+    ///
+    /// # Parameters
+    /// - `envelope` (`&EventEnvelope`): Versioned encoded message crossing the transport boundary.
+    ///
+    /// # Returns
+    /// Type: `Result<(), EventCodecError>`.
     fn validate(&self, envelope: &EventEnvelope) -> Result<(), EventCodecError> {
         if envelope.group != self.group {
             return Err(EventCodecError::GroupMismatch);

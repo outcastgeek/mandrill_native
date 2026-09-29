@@ -1,14 +1,28 @@
+//! Lowering of restricted durable workflow operations.
+
 use proc_macro2::TokenStream;
 use quote::{quote, quote_spanned};
 use syn::spanned::Spanned;
 use syn::{Expr, Stmt};
 
+/// # Parameters
+/// - `statements` (`Vec<Stmt>`): Rust statements parsed and lowered by the procedural macro.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn expand(statements: Vec<Stmt>) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
     let body = lower(&statements, &path)?;
     Ok(quote!({ #body }))
 }
 
+///
+/// # Parameters
+/// - `statements` (`&[Stmt]`): Rust statements parsed and lowered by the procedural macro.
+/// - `path` (`&TokenStream`): Location of the field, file, or configuration value being processed.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 fn lower(statements: &[Stmt], path: &TokenStream) -> syn::Result<TokenStream> {
     let Some((statement, remaining)) = statements.split_first() else {
         return Ok(quote!(#path::workflow::Durable::succeed_with(|| ())));
@@ -91,12 +105,26 @@ fn lower(statements: &[Stmt], path: &TokenStream) -> syn::Result<TokenStream> {
     }
 }
 
+///
+/// # Parameters
+/// - `expr` (`&Expr`): Rust syntax expression parsed or expanded by this macro.
+///
+/// # Returns
+/// Type: `bool`.
+/// Returns whether the requested condition holds.
 fn is_control_flow(expr: &Expr) -> bool {
     crate::parse::has_effect_steps(expr)
         && (matches!(expr, Expr::If(_) | Expr::Match(_) | Expr::ForLoop(_))
             || matches!(expr, Expr::Block(block) if block.label.is_none()))
 }
 
+///
+/// # Parameters
+/// - `expr` (`&Expr`): Rust syntax expression parsed or expanded by this macro.
+/// - `path` (`&TokenStream`): Location of the field, file, or configuration value being processed.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 fn expression(expr: &Expr, path: &TokenStream) -> syn::Result<TokenStream> {
     if let Expr::If(branch) = expr {
         let attrs = &branch.attrs;

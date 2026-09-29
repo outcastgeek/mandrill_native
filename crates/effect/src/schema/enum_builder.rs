@@ -1,3 +1,5 @@
+//! Typed tagged-enum schema construction.
+
 use super::{
     IssueSegment, JsonValue, ParsePolicy, PureCodec, SchemaAst, SchemaIssue, SchemaIssueKind,
     SchemaProperty, SchemaShape, UnknownFields, ValueKind, value_kind,
@@ -5,9 +7,21 @@ use super::{
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+/// Type alias for variant decode in schema enum builder.
+///
+/// # Type parameters
+/// - `T`: Value or item type.
 type VariantDecode<T> = Arc<dyn Fn(&JsonValue) -> Result<T, SchemaIssue> + Send + Sync>;
+/// Type alias for variant encode in schema enum builder.
+///
+/// # Type parameters
+/// - `T`: Value or item type.
 type VariantEncode<T> = Arc<dyn Fn(&T) -> Option<Result<JsonValue, SchemaIssue>> + Send + Sync>;
 
+/// Typed variant used by schema enum builder.
+///
+/// # Type parameters
+/// - `T`: Value or item type.
 struct Variant<T> {
     tag: Arc<str>,
     schema: SchemaAst,
@@ -16,8 +30,11 @@ struct Variant<T> {
     encode: VariantEncode<T>,
 }
 
-/// Typed registration keeps each payload codec coupled to its own projector
+/// A builder that registers tagged variants and their codecs before producing a checked schema.
 /// and constructor. Only the common JSON envelope is dispatched dynamically.
+///
+/// # Type parameters
+/// - `T`: Value or item type.
 pub struct TaggedEnumBuilder<T> {
     tag_field: Arc<str>,
     content_field: Arc<str>,
@@ -27,6 +44,17 @@ pub struct TaggedEnumBuilder<T> {
 
 impl<T: Send + 'static> TaggedEnumBuilder<T> {
     #[must_use]
+    /// Construct a `TaggedEnumBuilder` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type. Bound: `Send + 'static`.
+    ///
+    /// # Parameters
+    /// - `tag_field` (`impl Into<Arc<str>>`): The tag field supplied to this operation.
+    /// - `content_field` (`impl Into<Arc<str>>`): The content field supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(tag_field: impl Into<Arc<str>>, content_field: impl Into<Arc<str>>) -> Self {
         Self {
             tag_field: tag_field.into(),
@@ -36,6 +64,20 @@ impl<T: Send + 'static> TaggedEnumBuilder<T> {
         }
     }
 
+    /// Register one tagged variant with its discriminator and codec.
+    ///
+    /// # Type parameters
+    /// - `P`: Payload type. Bounds: `Send + 'static`.
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `tag` (`impl Into<Arc<str>>`): The tag supplied to this operation.
+    /// - `codec` (`PureCodec<P, JsonValue>`): The codec used to convert and validate values.
+    /// - `project` (`impl for<'a> Fn(&'a T) -> Option<&'a P> + Send + Sync + 'static`): The project supplied to this operation.
+    /// - `construct` (`impl Fn(P) -> T + Send + Sync + 'static`): The construct supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, SchemaIssue>`.
     pub fn variant<P: Send + 'static>(
         mut self,
         tag: impl Into<Arc<str>>,
@@ -61,6 +103,16 @@ impl<T: Send + 'static> TaggedEnumBuilder<T> {
         Ok(self)
     }
 
+    /// Record the terminal status and release remaining operation ownership.
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `policy` (`ParsePolicy`): The caller-supplied behavior policy.
+    ///
+    /// # Returns
+    /// Type: `Result<PureCodec<T, JsonValue>, SchemaIssue>`.
     pub fn finish(self, policy: ParsePolicy) -> Result<PureCodec<T, JsonValue>, SchemaIssue> {
         if self.tag_field.is_empty()
             || self.content_field.is_empty()

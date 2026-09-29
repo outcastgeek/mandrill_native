@@ -1,3 +1,13 @@
+//! Scoped reactive state, sources, and integration bridges.
+//!
+//! A source provides a snapshot Effect and a stream of later changes. Atoms,
+//! committed transactional state, persisted state, and RPC-backed queries can
+//! share that consumer-facing contract while using different capabilities in
+//! `R`. Invalidation tells consumers to resnapshot; it is not proof of a
+//! durable write. A source must establish its own initial snapshot/subscription
+//! boundary, and a lagging subscriber must resnapshot rather than infer history
+//! from missed notifications.
+
 mod async_result;
 mod atom;
 mod atom_cache;

@@ -1,3 +1,5 @@
+//! Versioned storage of Effect outcomes.
+
 use super::{
     IssueSegment, JsonValue, ParseLimits, PureCodec, SchemaAst, SchemaIssue, SchemaIssueKind,
     ValueKind, value_kind,
@@ -17,6 +19,13 @@ pub struct StoredDefect {
 
 impl StoredDefect {
     #[must_use]
+    /// Encode a defect into the stable stored-outcome representation.
+    ///
+    /// # Parameters
+    /// - `defect` (`&Defect`): The defect supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn from_defect(defect: &Defect) -> Self {
         Self {
             kind: defect.kind(),
@@ -25,51 +34,99 @@ impl StoredDefect {
     }
 
     #[must_use]
+    /// # Returns
+    /// Type: `DefectKind`.
     pub const fn kind(&self) -> DefectKind {
         self.kind
     }
 
     #[must_use]
+    /// Borrow the diagnostic message retained in this stored outcome.
+    ///
+    /// # Returns
+    /// Type: `&str`.
     pub fn message(&self) -> &str {
         &self.message
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
+/// The primary success, expected error, defect, or interruption stored for later decoding.
+///
+/// # Type parameters
+/// - `E`: Domain-error type.
 pub enum StoredPrimary<E> {
+    /// The operation completed successfully.
     Succeeded,
+    /// The operation completed with a failure. Contains `E`.
     Failed(E),
+    /// The operation ended in a defect outside its expected-error channel. Contains `StoredDefect`.
     Defected(StoredDefect),
+    /// The was was interrupted before settlement.
     WasInterrupted,
 }
 
 #[derive(Debug, PartialEq, Eq)]
+/// One encoded cleanup failure retained with a stored outcome.
+///
+/// # Type parameters
+/// - `E`: Domain-error type.
 pub enum StoredCleanup<E> {
+    /// The operation completed with a failure. Contains `E`.
     Failed(E),
+    /// The operation ended in a defect outside its expected-error channel. Contains `StoredDefect`.
     Defected(StoredDefect),
+    /// Execution was interrupted.
     Interrupted,
 }
 
 #[derive(Debug, PartialEq, Eq)]
+/// An encoded primary outcome and ordered cleanup failures.
+///
+/// # Type parameters
+/// - `E`: Domain-error type.
 pub struct StoredFinalization<E> {
+    /// Original outcome before cleanup was attempted. Type: `StoredPrimary<E>`.
     pub primary: StoredPrimary<E>,
+    /// First retained cleanup failure, making the collection nonempty. Type: `StoredCleanup<E>`.
     pub first: StoredCleanup<E>,
+    /// Subsequent cleanup failures in recorded order. Type: `Vec<StoredCleanup<E>>`.
     pub rest: Vec<StoredCleanup<E>>,
 }
 
 /// Serializable *shape* of a full terminal Exit. The A/E fields are still
 /// typed application data; an OutcomeCodec supplies their actual encodings.
 #[derive(Debug, PartialEq, Eq)]
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 pub enum StoredOutcome<A, E> {
+    /// The operation succeeded. Carries `A`.
     Success(A),
+    /// The operation failed with a typed error. Carries `E`.
     Failure(E),
+    /// An unexpected defect occurred. Carries `StoredDefect`.
     Defect(StoredDefect),
+    /// Execution was interrupted.
     Interrupted,
+    /// Cleanup failed after the primary operation settled. Contains `StoredFinalization<E>`.
     FinalizationFailed(StoredFinalization<E>),
 }
 
 impl<A, E> StoredOutcome<A, E> {
     #[must_use]
+    /// Encode all terminal Exit channels for later decoding.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `outcome` (`Exit<A, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn from_exit(outcome: Exit<A, E>) -> Self {
         match outcome {
             Exit::Success(value) => Self::Success(value),
@@ -97,6 +154,15 @@ impl<A, E> StoredOutcome<A, E> {
 }
 
 impl<E> StoredCleanup<E> {
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `failure` (`CleanupFailure<E>`): Expected error or cleanup failure retained in this outcome.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn from_failure(failure: CleanupFailure<E>) -> Self {
         match failure {
             CleanupFailure::ReleaseFailure(error) => Self::Failed(error),
@@ -133,6 +199,14 @@ mod wire {
     pub(super) const FAILED: &str = "failed";
 }
 
+///
+/// # Parameters
+/// - `expected` (`ValueKind`): Value or revision required for the proposed state transition.
+/// - `actual` (`&JsonValue`): The actual supplied to this operation.
+///
+/// # Returns
+/// Type: `SchemaIssue`.
+/// Returns `SchemaIssue`.
 fn wrong_type(expected: ValueKind, actual: &JsonValue) -> SchemaIssue {
     SchemaIssue::new(SchemaIssueKind::TypeMismatch {
         expected,
@@ -140,12 +214,28 @@ fn wrong_type(expected: ValueKind, actual: &JsonValue) -> SchemaIssue {
     })
 }
 
+///
+/// # Parameters
+/// - `value` (`&JsonValue`): Value read, transformed, encoded, or stored by this operation.
+///
+/// # Returns
+/// Type: `Result<&Map<String, JsonValue>, SchemaIssue>`.
 fn object(value: &JsonValue) -> Result<&Map<String, JsonValue>, SchemaIssue> {
     value
         .as_object()
         .ok_or_else(|| wrong_type(ValueKind::Record, value))
 }
 
+///
+/// # Type parameters
+/// - `'a`: Lifetime parameter.
+///
+/// # Parameters
+/// - `object` (`&'a Map<String, JsonValue>`): Encoded object whose fields are validated.
+/// - `name` (`&'static str`): Stable name used to register or locate this definition.
+///
+/// # Returns
+/// Type: `Result<&'a JsonValue, SchemaIssue>`.
 fn field<'a>(
     object: &'a Map<String, JsonValue>,
     name: &'static str,
@@ -156,6 +246,13 @@ fn field<'a>(
     })
 }
 
+///
+/// # Parameters
+/// - `object` (`&Map<String, JsonValue>`): Encoded object whose fields are validated.
+/// - `allowed` (`&[&str]`): The allowed supplied to this operation.
+///
+/// # Returns
+/// Type: `Result<(), SchemaIssue>`.
 fn exact_fields(object: &Map<String, JsonValue>, allowed: &[&str]) -> Result<(), SchemaIssue> {
     for name in object.keys() {
         if !allowed.contains(&name.as_str()) {
@@ -168,6 +265,12 @@ fn exact_fields(object: &Map<String, JsonValue>, allowed: &[&str]) -> Result<(),
     Ok(())
 }
 
+///
+/// # Parameters
+/// - `object` (`&Map<String, JsonValue>`): Encoded object whose fields are validated.
+///
+/// # Returns
+/// Type: `Result<&str, SchemaIssue>`.
 fn tag(object: &Map<String, JsonValue>) -> Result<&str, SchemaIssue> {
     let value = field(object, wire::KIND)?;
     value.as_str().ok_or_else(|| {
@@ -175,6 +278,14 @@ fn tag(object: &Map<String, JsonValue>) -> Result<&str, SchemaIssue> {
     })
 }
 
+///
+/// # Parameters
+/// - `tag` (`&'static str`): The tag supplied to this operation.
+/// - `fields` (`impl IntoIterator<Item = (&'static str, JsonValue)>`): Typed fields composing this record or schema.
+///
+/// # Returns
+/// Type: `JsonValue`.
+/// Returns `JsonValue`.
 fn encoded_object(
     tag: &'static str,
     fields: impl IntoIterator<Item = (&'static str, JsonValue)>,
@@ -187,6 +298,12 @@ fn encoded_object(
     JsonValue::Object(object)
 }
 
+///
+/// # Parameters
+/// - `defect` (`&StoredDefect`): The defect supplied to this operation.
+///
+/// # Returns
+/// Type: `Result<JsonValue, SchemaIssue>`.
 fn defect_to_json(defect: &StoredDefect) -> Result<JsonValue, SchemaIssue> {
     let kind = serde_json::to_value(defect.kind)
         .map_err(|_| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?;
@@ -199,6 +316,12 @@ fn defect_to_json(defect: &StoredDefect) -> Result<JsonValue, SchemaIssue> {
     ])))
 }
 
+///
+/// # Parameters
+/// - `value` (`&JsonValue`): Value read, transformed, encoded, or stored by this operation.
+///
+/// # Returns
+/// Type: `Result<StoredDefect, SchemaIssue>`.
 fn defect_from_json(value: &JsonValue) -> Result<StoredDefect, SchemaIssue> {
     let object = object(value)?;
     exact_fields(object, &[wire::KIND, wire::MESSAGE])?;
@@ -215,6 +338,16 @@ fn defect_from_json(value: &JsonValue) -> Result<StoredDefect, SchemaIssue> {
     })
 }
 
+///
+/// # Type parameters
+/// - `E`: Bounds: `Send + 'static`.
+///
+/// # Parameters
+/// - `value` (`&E`): Value read, transformed, encoded, or stored by this operation.
+/// - `codec` (`&PureCodec<E, JsonValue>`): The codec supplied to this operation.
+///
+/// # Returns
+/// Type: `Result<JsonValue, SchemaIssue>`.
 fn error_to_json<E: Send + 'static>(
     value: &E,
     codec: &PureCodec<E, JsonValue>,
@@ -224,6 +357,16 @@ fn error_to_json<E: Send + 'static>(
         .map_err(|issue| issue.at(IssueSegment::Field(Arc::from(wire::ERROR))))
 }
 
+///
+/// # Type parameters
+/// - `E`: Bounds: `Send + 'static`.
+///
+/// # Parameters
+/// - `object` (`&Map<String, JsonValue>`): Encoded object whose fields are validated.
+/// - `codec` (`&PureCodec<E, JsonValue>`): The codec supplied to this operation.
+///
+/// # Returns
+/// Type: `Result<E, SchemaIssue>`.
 fn error_from_json<E: Send + 'static>(
     object: &Map<String, JsonValue>,
     codec: &PureCodec<E, JsonValue>,
@@ -233,6 +376,16 @@ fn error_from_json<E: Send + 'static>(
         .map_err(|issue| issue.at(IssueSegment::Field(Arc::from(wire::ERROR))))
 }
 
+///
+/// # Type parameters
+/// - `E`: Bounds: `Send + 'static`.
+///
+/// # Parameters
+/// - `value` (`&StoredPrimary<E>`): Value read, transformed, encoded, or stored by this operation.
+/// - `error` (`&PureCodec<E, JsonValue>`): Expected or provider error preserved in the returned outcome.
+///
+/// # Returns
+/// Type: `Result<JsonValue, SchemaIssue>`.
 fn primary_to_json<E: Send + 'static>(
     value: &StoredPrimary<E>,
     error: &PureCodec<E, JsonValue>,
@@ -249,6 +402,16 @@ fn primary_to_json<E: Send + 'static>(
     })
 }
 
+///
+/// # Type parameters
+/// - `E`: Bounds: `Send + 'static`.
+///
+/// # Parameters
+/// - `value` (`&JsonValue`): Value read, transformed, encoded, or stored by this operation.
+/// - `error` (`&PureCodec<E, JsonValue>`): Expected or provider error preserved in the returned outcome.
+///
+/// # Returns
+/// Type: `Result<StoredPrimary<E>, SchemaIssue>`.
 fn primary_from_json<E: Send + 'static>(
     value: &JsonValue,
     error: &PureCodec<E, JsonValue>,
@@ -275,6 +438,16 @@ fn primary_from_json<E: Send + 'static>(
     })
 }
 
+///
+/// # Type parameters
+/// - `E`: Bounds: `Send + 'static`.
+///
+/// # Parameters
+/// - `value` (`&StoredCleanup<E>`): Value read, transformed, encoded, or stored by this operation.
+/// - `error` (`&PureCodec<E, JsonValue>`): Expected or provider error preserved in the returned outcome.
+///
+/// # Returns
+/// Type: `Result<JsonValue, SchemaIssue>`.
 fn cleanup_to_json<E: Send + 'static>(
     value: &StoredCleanup<E>,
     error: &PureCodec<E, JsonValue>,
@@ -290,6 +463,16 @@ fn cleanup_to_json<E: Send + 'static>(
     })
 }
 
+///
+/// # Type parameters
+/// - `E`: Bounds: `Send + 'static`.
+///
+/// # Parameters
+/// - `value` (`&JsonValue`): Value read, transformed, encoded, or stored by this operation.
+/// - `error` (`&PureCodec<E, JsonValue>`): Expected or provider error preserved in the returned outcome.
+///
+/// # Returns
+/// Type: `Result<StoredCleanup<E>, SchemaIssue>`.
 fn cleanup_from_json<E: Send + 'static>(
     value: &JsonValue,
     error: &PureCodec<E, JsonValue>,
@@ -315,6 +498,17 @@ fn cleanup_from_json<E: Send + 'static>(
 /// Build a borrowed-input codec for complete, versioned Exit data. A and E
 /// are encoded through their own typed codecs, without blanket Clone bounds.
 #[must_use]
+/// # Type parameters
+/// - `A`: Application value type. Bounds: `Send + 'static`.
+/// - `E`: Domain-error type. Bounds: `Send + 'static`.
+///
+/// # Parameters
+/// - `success` (`PureCodec<A, JsonValue>`): Successful application value or its codec.
+/// - `error` (`PureCodec<E, JsonValue>`): The error to propagate or record.
+/// - `limits` (`ParseLimits`): Explicit resource bounds enforced while processing this input.
+///
+/// # Returns
+/// Type: `PureCodec<StoredOutcome<A, E>, JsonValue>`.
 pub fn stored_outcome_codec<A: Send + 'static, E: Send + 'static>(
     success: PureCodec<A, JsonValue>,
     error: PureCodec<E, JsonValue>,

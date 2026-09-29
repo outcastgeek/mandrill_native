@@ -8,9 +8,16 @@ const journal = @import("event_journal.zig");
 const message = @import("event_log_message.zig");
 const remote = @import("event_log_remote.zig");
 
+/// Specialize the eventlog failure variants from their typed channels.
+/// Parameters:
+/// - `JournalError: comptime type`: Compile-time typed journal failure.
+/// - `CursorError: comptime type`: Compile-time typed cursor-store failure.
+/// Returns (`type`): typed replica-import failure preserving validation and provider errors.
 pub fn Failure(comptime JournalError: type, comptime CursorError: type) type {
     return union(enum) {
         const Self = @This();
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         journal: JournalError,
         cursor: CursorError,
@@ -18,12 +25,21 @@ pub fn Failure(comptime JournalError: type, comptime CursorError: type) type {
         wrong_destination,
         rejected_append,
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             if (self.* == .journal) outcomes.discardPayload(&self.journal);
             if (self.* == .cursor) outcomes.discardPayload(&self.cursor);
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!Self`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const Self) error{OutOfMemory}!Self {
             return switch (self.*) {
                 .journal => |value| .{ .journal = try outcomes.clonePayload(value) },
@@ -34,6 +50,16 @@ pub fn Failure(comptime JournalError: type, comptime CursorError: type) type {
     };
 }
 
+/// Specialize a replica importer over a typed event group and remote provider.
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `JournalProviderError: comptime type`: Compile-time error type returned by the journal provider.
+/// - `CursorProviderError: comptime type`: Compile-time error type returned by the cursor provider.
+/// - `select_journal: comptime fn (*const R) *const journal.Journal(R, JournalProviderError)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_cursor: comptime fn (*const R) *const remote.CursorStore(R, CursorProviderError)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// Returns (`type`): replica importer over a checked event group and remote transport.
 pub fn Importer(
     comptime R: type,
     comptime JournalProviderError: type,
@@ -59,6 +85,15 @@ pub fn Importer(
             return Out.fromOwnedSuccess(env, value);
         }
 
+        /// Validate and import a batch of replica events.
+        /// Parameters:
+        /// - `select_batch: comptime fn (*const R) *const message.Batch`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// - `select_local: comptime fn (*const R) []const u8`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// - `select_bounds: comptime fn (*const R) message.Bounds`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// Returns (`Out`): The typed operation result or description selected by this API.
         pub fn importBatch(
             comptime select_batch: fn (*const R) *const message.Batch,
             comptime select_local: fn (*const R) []const u8,

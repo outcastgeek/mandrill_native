@@ -60,9 +60,16 @@ fn into(comptime Target: type, comptime tag: []const u8, result: anytype) outcom
     };
 }
 
+/// Specialize decoding of stored Effect terminal outcomes.
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// Returns (`type`): decoded terminal outcome retaining success, typed failure, defect, interruption, and cleanup cases.
 pub fn DecodedExit(comptime A: type, comptime E: type) type {
     return struct {
         const Self = @This();
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         value: outcomes.Exit(A, E),
         encoded: stored.StoredExit,
@@ -90,12 +97,21 @@ pub fn DecodedExit(comptime A: type, comptime E: type) type {
             }
         }
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             self.value.deinit();
             self.encoded.deinit();
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!Self`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const Self) error{OutOfMemory}!Self {
             var copied_encoded = try self.encoded.clone();
             errdefer copied_encoded.deinit();
@@ -110,6 +126,13 @@ pub fn DecodedExit(comptime A: type, comptime E: type) type {
     };
 }
 
+/// Define a typed payload codec with its compile-time value and representation types.
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `DecodeR: comptime type`: Environment type passed to the decoding side of the codec.
+/// - `EncodeR: comptime type`: Environment type passed to the encoding side of the codec.
+/// Returns (`type`): typed success/error payload codec for stored `Exit` values.
 pub fn PayloadCodec(
     comptime A: type,
     comptime E: type,
@@ -120,9 +143,13 @@ pub fn PayloadCodec(
         @compileError("stored outcome payloads containing pointers must declare owned clone/deinit semantics");
     return struct {
         const Self = @This();
+        /// Application value type produced by this codec.
         pub const Decoded = DecodedExit(A, E);
+        /// Encoded stored-outcome representation.
         pub const Encoded = stored.StoredExit;
+        /// Environment required to run decoding effects.
         pub const DecodingEnvironment = DecodeR;
+        /// Environment required to run encoding effects.
         pub const EncodingEnvironment = EncodeR;
 
         encode_success: *const fn (*const A, *const EncodeR) outcomes.Exit(stored.Bytes, Issue),
@@ -130,6 +157,17 @@ pub fn PayloadCodec(
         decode_success: *const fn ([]const u8, *const DecodeR) outcomes.Exit(A, Issue),
         decode_failure: *const fn ([]const u8, *const DecodeR) outcomes.Exit(E, Issue),
 
+        /// Pair success and failure codecs for a persisted typed Exit.
+        /// Parameters:
+        /// - `encode_a: comptime fn (*const A, *const EncodeR) outcomes.Exit(stored.Bytes, Issue)`: Compile-time typed function selected at comptime; no runtime callback
+        ///   lookup is required.
+        /// - `encode_e: comptime fn (*const E, *const EncodeR) outcomes.Exit(stored.Bytes, Issue)`: Compile-time typed function selected at comptime; no runtime callback
+        ///   lookup is required.
+        /// - `decode_a: comptime fn ([]const u8, *const DecodeR) outcomes.Exit(A, Issue)`: Compile-time typed function selected at comptime; no runtime callback
+        ///   lookup is required.
+        /// - `decode_e: comptime fn ([]const u8, *const DecodeR) outcomes.Exit(E, Issue)`: Compile-time typed function selected at comptime; no runtime callback
+        ///   lookup is required.
+        /// Returns (`Self`): an outcome codec whose four callbacks handle each payload direction.
         pub fn init(
             comptime encode_a: fn (*const A, *const EncodeR) outcomes.Exit(stored.Bytes, Issue),
             comptime encode_e: fn (*const E, *const EncodeR) outcomes.Exit(stored.Bytes, Issue),
@@ -167,6 +205,14 @@ pub fn PayloadCodec(
             };
         }
 
+        /// Encode immediately and return a typed outcome.
+        /// Parameters:
+        /// - `self: Self`: Receiver passed by value: the struct itself is copied, while any referenced storage keeps its original ownership and lifetime.
+        /// - `env: *const EncodeR`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `value: *const outcomes.Exit(A, E)`: Borrowed input; keep its owner alive until the operation has copied or
+        ///   joined it.
+        /// Returns (`outcomes.Exit(stored.StoredExit, Issue)`): Carries `stored.StoredExit` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn encodeDirect(self: Self, env: *const EncodeR, value: *const outcomes.Exit(A, E)) outcomes.Exit(stored.StoredExit, Issue) {
             const primary_result = self.encodePrimary(env, value);
             var primary = switch (primary_result) {
@@ -238,6 +284,13 @@ pub fn PayloadCodec(
             };
         }
 
+        /// Decode immediately and return the typed validation outcome.
+        /// Parameters:
+        /// - `self: Self`: Receiver passed by value: the struct itself is copied, while any referenced storage keeps its original ownership and lifetime.
+        /// - `env: *const DecodeR`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `encoded: stored.StoredExit`: stored terminal outcome with its encoded primary and cleanup cases.
+        /// Returns (`outcomes.Exit(Decoded, Issue)`): Carries `Decoded` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn decodeDirect(self: Self, env: *const DecodeR, encoded: stored.StoredExit) outcomes.Exit(Decoded, Issue) {
             var owned = encoded;
             var keep_source = false;
@@ -288,6 +341,11 @@ pub fn PayloadCodec(
             return .{ .success = .{ .value = decoded, .encoded = owned } };
         }
 
+        /// Expose this schema through the Codec interface.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// Returns (`generic_codec.Codec(Decoded, Encoded, DecodeR, EncodeR)`): A typed codec or schema preserving the declared decoded value, representation, and environments.
         pub fn asCodec(comptime self: Self) generic_codec.Codec(Decoded, Encoded, DecodeR, EncodeR) {
             return generic_codec.Codec(Decoded, Encoded, DecodeR, EncodeR).init(struct {
                 fn decode(encoded: *const Encoded) effects.Effect(Decoded, Issue, DecodeR) {
@@ -313,6 +371,13 @@ pub fn PayloadCodec(
         /// separate decode/encode environments select their own allocators
         /// and other capabilities through R; no byte buffer is borrowed past
         /// the returned Effect's lifetime.
+        ///
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `limits: comptime stored.Limits`: Compile-time caller-selected, validated behavior or resource bounds; no
+        ///   hidden default is installed.
+        /// Returns (`generic_codec.Codec(Decoded, stored.Bytes, DecodeR, EncodeR)`): A typed codec or schema preserving the declared decoded value, representation, and environments.
         pub fn asWireCodec(comptime self: Self, comptime limits: stored.Limits) generic_codec.Codec(Decoded, stored.Bytes, DecodeR, EncodeR) {
             if (!limits.valid()) @compileError("stored outcome wire limits must be valid");
             return generic_codec.Codec(Decoded, stored.Bytes, DecodeR, EncodeR).init(struct {

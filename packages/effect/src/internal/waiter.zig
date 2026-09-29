@@ -4,6 +4,7 @@
 const std = @import("std");
 const Cancellation = @import("runtime.zig").Cancellation;
 
+/// Intrusive I/O waiter node; its owner keeps it alive until detached from the queue.
 pub const Waiter = struct {
     previous: ?*Waiter = null,
     next: ?*Waiter = null,
@@ -17,6 +18,13 @@ pub const Waiter = struct {
         waiter.event.set(waiter.io);
     }
 
+    /// Register a definition or subscription with its owner.
+    /// Parameters:
+    /// - `self: *Waiter`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// - `first: *?*Waiter`: First operation in execution order.
+    /// - `token: ?*const Cancellation`: Cancellation token observed by this operation; its owner must outlive pending
+    ///   work.
+    /// Returns (`void`): no value.
     pub fn register(self: *Waiter, first: *?*Waiter, token: ?*const Cancellation) void {
         self.detached = false;
         self.next = first.*;
@@ -26,6 +34,11 @@ pub const Waiter = struct {
         if (token) |cancellation| cancellation.register(&self.registration);
     }
 
+    /// Remove the selected entry.
+    /// Parameters:
+    /// - `self: *Waiter`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// - `first: *?*Waiter`: First operation in execution order.
+    /// Returns (`void`): no value.
     pub fn remove(self: *Waiter, first: *?*Waiter) void {
         if (self.previous) |previous| previous.next = self.next else first.* = self.next;
         if (self.next) |next| next.previous = self.previous;
@@ -33,6 +46,10 @@ pub const Waiter = struct {
         self.next = null;
     }
 
+    /// Wake every waiter registered with this condition.
+    /// Parameters:
+    /// - `first: ?*Waiter`: First operation in execution order.
+    /// Returns (`void`): no value.
     pub fn signalAll(first: ?*Waiter) void {
         var current = first;
         while (current) |waiter| {

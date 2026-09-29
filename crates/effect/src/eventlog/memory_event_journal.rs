@@ -1,3 +1,5 @@
+//! Volatile journal storage and ordered replay.
+
 use super::{
     AppendDecision, AppendReceipt, CompactionOutcome, CompactionPermit, EventEnvelope, EventId,
     EventInspection, EventJournal, JournalCompaction, JournalCursor, JournalEntry, JournalRead,
@@ -9,27 +11,43 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Explicit resource bounds for eventlog memory event journal.
 pub struct MemoryJournalCapacity {
+    /// Maximum distinct journal streams retained in memory. Type: `NonZeroUsize`.
     pub streams: NonZeroUsize,
+    /// Maximum journal entries retained for each stream. Type: `NonZeroUsize`.
     pub entries_per_stream: NonZeroUsize,
+    /// Maximum deduplication tombstones retained for each stream. Type: `NonZeroUsize`.
     pub tombstones_per_stream: NonZeroUsize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A capacity, cursor, or retention failure in the process-local journal.
 pub enum MemoryJournalError {
+    /// The journal reached its configured stream capacity.
     StreamCapacity,
+    /// The journal reached its configured entry capacity.
     EntryCapacity,
+    /// No further sequence can be allocated without exceeding its range.
     SequenceExhausted,
+    /// An owned input was already consumed.
     InputConsumed,
+    /// The requested compaction violates a registered retention policy. Retains the `RetentionError` detail.
     Retention(RetentionError),
+    /// The compaction permit came from a different retention authority.
     WrongRetentionAuthority,
+    /// The journal reached its configured deduplication tombstone capacity.
     TombstoneCapacity,
+    /// The compaction boundary lies beyond the journal head.
     CompactionBeyondHead,
+    /// No later compaction boundary can be represented.
     CompactionBoundaryExhausted,
+    /// The stored index is inconsistent with its records.
     CorruptIndex,
 }
 
 #[derive(Default)]
+/// Typed stream state used by eventlog memory event journal.
 struct StreamState {
     entries: Vec<JournalEntry>,
     by_id: BTreeMap<EventId, EntryLocation>,
@@ -38,12 +56,14 @@ struct StreamState {
     first_available: u64,
 }
 
+/// Variants of entry location used by eventlog memory event journal.
 enum EntryLocation {
     Retained(usize),
     Compacted,
 }
 
 #[derive(Default)]
+/// Typed state used by eventlog memory event journal.
 struct State {
     streams: BTreeMap<JournalStream, StreamState>,
 }
@@ -58,6 +78,13 @@ pub struct MemoryEventJournal {
 
 impl MemoryEventJournal {
     #[must_use]
+    /// Construct a `MemoryEventJournal` from its required inputs and explicit policies.
+    ///
+    /// # Parameters
+    /// - `capacity` (`MemoryJournalCapacity`): The caller-supplied capacity bound.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(capacity: MemoryJournalCapacity) -> Self {
         Self {
             state: Arc::new(Mutex::new(State::default())),
@@ -68,14 +95,25 @@ impl MemoryEventJournal {
 
     /// Return the authority whose permits this journal accepts for compaction.
     #[must_use]
+    /// # Returns
+    /// Type: `MemoryRetentionAuthority`.
     pub fn retention_authority(&self) -> MemoryRetentionAuthority {
         self.retention.clone()
     }
 }
 
 impl EventJournal for MemoryEventJournal {
+    /// Type alias for error in eventlog memory event journal.
     type Error = MemoryJournalError;
 
+    ///
+    /// # Parameters
+    /// - `event` (`EventEnvelope`): Typed event identity and payload submitted to the journal.
+    /// - `expected` (`JournalCursor`): Value or revision required for the proposed state transition.
+    ///
+    /// # Returns
+    /// Type: `Effect<AppendReceipt, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn append(
         &self,
         event: EventEnvelope,
@@ -152,6 +190,14 @@ impl EventJournal for MemoryEventJournal {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `stream` (`JournalStream`): Scoped source of ordered chunks or events.
+    /// - `event` (`EventId`): Typed event identity and payload submitted to the journal.
+    ///
+    /// # Returns
+    /// Type: `Effect<EventInspection, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn inspect(
         &self,
         stream: JournalStream,
@@ -181,6 +227,15 @@ impl EventJournal for MemoryEventJournal {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `stream` (`JournalStream`): Scoped source of ordered chunks or events.
+    /// - `after` (`JournalCursor`): Cursor or instant after which results are selected.
+    /// - `limit` (`NonZeroUsize`): The caller-supplied limit.
+    ///
+    /// # Returns
+    /// Type: `Effect<JournalReadOutcome, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn read(
         &self,
         stream: JournalStream,
@@ -231,6 +286,13 @@ impl EventJournal for MemoryEventJournal {
         })
     }
 
+    ///
+    /// # Parameters
+    /// - `stream` (`JournalStream`): Scoped source of ordered chunks or events.
+    ///
+    /// # Returns
+    /// Type: `Effect<JournalCursor, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn cursor(&self, stream: JournalStream) -> Effect<JournalCursor, Self::Error> {
         let state = Arc::clone(&self.state);
         Effect::sync(move || {
@@ -243,8 +305,16 @@ impl EventJournal for MemoryEventJournal {
 }
 
 impl JournalCompaction for MemoryEventJournal {
+    /// Type alias for permit in eventlog memory event journal.
     type Permit = CompactionPermit;
 
+    ///
+    /// # Parameters
+    /// - `permit` (`CompactionPermit`): The permit supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<CompactionOutcome, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn compact(&self, permit: CompactionPermit) -> Effect<CompactionOutcome, Self::Error> {
         let state = Arc::clone(&self.state);
         let retention_state = Arc::clone(&self.retention.state);

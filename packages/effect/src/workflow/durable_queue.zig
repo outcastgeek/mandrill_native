@@ -7,15 +7,26 @@ const keys = @import("../primary_key.zig");
 const queue = @import("../persistence/persisted_queue.zig");
 const deferred = @import("durable_deferred.zig");
 
+/// Specialize the typed workflow error channel from its compile-time error type.
+/// Parameters:
+/// - `QueueError: comptime type`: Compile-time typed queue failure.
+/// - `DeferredError: comptime type`: Compile-time typed deferred failure.
+/// Returns (`type`): typed durable-queue failure union preserving its provider error.
 pub fn Error(comptime QueueError: type, comptime DeferredError: type) type {
     return union(enum) {
         const Self = @This();
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = outcomes.ownsPayload(QueueError) or
             outcomes.ownsPayload(DeferredError);
         invalid_identity,
         queue: QueueError,
         deferred: DeferredError,
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             switch (self.*) {
                 .queue => outcomes.discardPayload(&self.queue),
@@ -25,6 +36,11 @@ pub fn Error(comptime QueueError: type, comptime DeferredError: type) type {
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!Self`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const Self) error{OutOfMemory}!Self {
             return switch (self.*) {
                 .queue => |value| .{ .queue = try outcomes.clonePayload(value) },
@@ -35,8 +51,11 @@ pub fn Error(comptime QueueError: type, comptime DeferredError: type) type {
     };
 }
 
+/// Queue submission result distinguishing accepted work from a duplicate or refusal.
 pub const Submission = union(enum) {
     const Self = @This();
+    /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit` and
+    /// must be released after use.
     pub const effect_owned_payload = true;
     observed: struct {
         offer: queue.OfferResult,
@@ -44,11 +63,20 @@ pub const Submission = union(enum) {
     },
     possibly_offered,
 
+    /// Release resources owned by this value.
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn deinit(self: *Self) void {
         if (self.* == .observed) self.observed.result.deinit();
         self.* = undefined;
     }
 
+    /// Duplicate this value; marked owning payloads are cloned, while ordinary
+    /// borrowed fields retain their original lifetime.
+    /// Parameters:
+    /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+    /// Returns (`error{OutOfMemory}!Self`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
     pub fn clone(self: *const Self) error{OutOfMemory}!Self {
         return switch (self.*) {
             .observed => |value| .{ .observed = .{ .offer = value.offer, .result = try value.result.clone() } },
@@ -57,6 +85,23 @@ pub const Submission = union(enum) {
     }
 };
 
+/// Offer and observe to the selected queue or store.
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `QueueProviderError: comptime type`: Compile-time error type returned by the queue provider.
+/// - `DeferredProviderError: comptime type`: Compile-time error type returned by the deferred provider.
+/// - `queue_guarantee: comptime queue.Guarantee`: Compile-time recoverability promised by the persisted queue.
+/// - `deferred_guarantee: comptime deferred.Guarantee`: Compile-time the deferred guarantee input required by this typed
+///   operation.
+/// - `select_queue: comptime fn (*const R) *const queue.Store(R, QueueProviderError, queue_guarantee)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_deferred: comptime fn (*const R) *const deferred.Store(R, DeferredProviderError, deferred_guarantee)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_submission: comptime fn (*const R) queue.Submission`: Compile-time typed selector from the current environment; its result
+///   must remain valid through use.
+/// - `select_identity: comptime fn (*const R) deferred.Identity`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// Returns (`effects.Effect(Submission, Error(queue.Store(R, QueueProviderError, queue_guarantee).Failure, deferred.Store(R, DeferredProviderError, deferred_guarantee).Failure), R)`): durable queue submission and its observed outcome under one stable request identity.
 pub fn offerAndObserve(
     comptime R: type,
     comptime QueueProviderError: type,

@@ -1,3 +1,5 @@
+//! Lifetime ownership and ordered asynchronous finalization.
+
 use crate::LibraryDefect;
 use crate::internal::destruction::FlatDrop;
 use crate::internal::notification::notify_all;
@@ -8,13 +10,29 @@ use event_listener::Event;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
+/// Type alias for finalizer in scope.
+///
+/// # Type parameters
+/// - `E`: Domain-error type.
 type Finalizer<E> = Box<dyn FnOnce(Finish<(), E>) -> Step + Send>;
+/// Typed registered used by scope.
+///
+/// # Type parameters
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 pub(crate) struct Registered<E: Send + 'static> {
     operation: Option<FlatDrop<Finalizer<E>>>,
     abandon: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl<E: Send + 'static> Registered<E> {
+    /// # Type parameters
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `callback` (`impl FnOnce(Finish<(), E>) -> Step + Send + 'static`): The callback invoked by this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub(crate) fn new(callback: impl FnOnce(Finish<(), E>) -> Step + Send + 'static) -> Self {
         Self {
             operation: Some(FlatDrop::new(Box::new(callback))),
@@ -22,6 +40,15 @@ impl<E: Send + 'static> Registered<E> {
         }
     }
 
+    /// # Type parameters
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `callback` (`impl FnOnce(Finish<(), E>) -> Step + Send + 'static`): The callback invoked by this operation.
+    /// - `abandon` (`impl FnOnce() + Send + 'static`): The abandon supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub(crate) fn with_abandon(
         callback: impl FnOnce(Finish<(), E>) -> Step + Send + 'static,
         abandon: impl FnOnce() + Send + 'static,
@@ -31,6 +58,14 @@ impl<E: Send + 'static> Registered<E> {
         registered
     }
 
+    /// # Type parameters
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `finish` (`Finish<(), E>`): Continuation receiving the complete terminal outcome.
+    ///
+    /// # Returns
+    /// Type: `Step`.
     pub(crate) fn execute(mut self, finish: Finish<(), E>) -> Step {
         self.abandon = None;
         match self.operation.take().and_then(FlatDrop::take) {
@@ -44,6 +79,9 @@ impl<E: Send + 'static> Registered<E> {
 }
 
 impl<E: Send + 'static> Drop for Registered<E> {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         if let Some(abandon) = self.abandon.take() {
             abandon();
@@ -52,12 +90,17 @@ impl<E: Send + 'static> Drop for Registered<E> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Variants of phase used by scope.
 enum Phase {
     Open,
     Closing,
     Closed,
 }
 
+/// Typed state used by scope.
+///
+/// # Type parameters
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct State<E: Send + 'static> {
     phase: Phase,
     finalizers: Vec<Registered<E>>,
@@ -65,6 +108,10 @@ struct State<E: Send + 'static> {
     status: ScopeCloseStatus,
 }
 
+/// Typed inner used by scope.
+///
+/// # Type parameters
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct Inner<E: Send + 'static> {
     state: Mutex<State<E>>,
     changed: Event,
@@ -74,17 +121,25 @@ struct Inner<E: Send + 'static> {
 /// retains and publishes the owned cleanup errors, including non-Clone errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScopeCloseStatus {
+    /// Cleanup settled without a retained failure.
     Clean,
+    /// The operation completed with a failure.
     Failed,
 }
 
 /// Per-run dynamic finalizers. Construct with `scoped`; the enclosing effect
 /// owns the canonical cleanup outcome. Cloning a handle does not extend scope.
+///
+/// # Type parameters
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 pub struct Scope<E: Send + 'static> {
     inner: Arc<Inner<E>>,
 }
 
 impl<E: Send + 'static> Clone for Scope<E> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -93,6 +148,11 @@ impl<E: Send + 'static> Clone for Scope<E> {
 }
 
 impl<E: Send + 'static> Scope<E> {
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -109,6 +169,18 @@ impl<E: Send + 'static> Scope<E> {
 
     /// Build a fresh scope lazily on each run and await all finalizers before
     /// publishing the body outcome. Cleanup errors remain in the E channel.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Additional bound: `Send + 'static`.
+    /// - `R`: Environment type. Additional bound: `Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `body` (`impl Fn(Self) -> Effect<A, E, R> + Send + Sync + 'static`): Application callback or effect executed inside the owning scope.
+    ///
+    /// # Returns
+    /// Type: `Effect<A, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn scoped<A, R>(
         body: impl Fn(Self) -> Effect<A, E, R> + Send + Sync + 'static,
     ) -> Effect<A, E, R>
@@ -144,6 +216,11 @@ impl<E: Send + 'static> Scope<E> {
         })
     }
 
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    ///
+    /// # Returns
+    /// Type: `usize`.
     pub(crate) fn checkpoint(&self) -> usize {
         self.inner
             .state
@@ -152,6 +229,15 @@ impl<E: Send + 'static> Scope<E> {
             .finalizers
             .len()
     }
+    /// # Type parameters
+    /// - `A`: Application value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `checkpoint` (`usize`): The checkpoint supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Vec<Registered<E>>, Exit<A, E>>`.
     pub(crate) fn take_since<A>(
         &self,
         checkpoint: usize,
@@ -168,6 +254,19 @@ impl<E: Send + 'static> Scope<E> {
         }
         Ok(state.finalizers.split_off(checkpoint))
     }
+    /// # Type parameters
+    /// - `A`: Application value type. Bounds: `Send + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `body` (`crate::internal::workflow::Workflow<A, E, R>`): Application callback or effect executed inside the owning scope.
+    /// - `env` (`Arc<R>`): The environment supplying this operation's capabilities.
+    /// - `context` (`crate::internal::runtime::Context`): Execution context carrying cancellation, scope, and trace state.
+    /// - `finish` (`Finish<A, E>`): Continuation receiving the complete terminal outcome.
+    ///
+    /// # Returns
+    /// Type: `Step`.
     pub(crate) fn execute_workflow<A: Send + 'static, R: Send + Sync + 'static>(
         self,
         body: crate::internal::workflow::Workflow<A, E, R>,
@@ -204,6 +303,17 @@ impl<E: Send + 'static> Scope<E> {
     /// Register a reusable finalizer, retaining the environment at registration.
     /// Registration after closing starts awaits this finalizer immediately and
     /// reports a defect, preserving any additional cleanup failures.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `finalizer` (`Effect<(), E, R>`): Cleanup description awaited after the primary outcome.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn add_finalizer<R: Send + Sync + 'static>(
         &self,
         finalizer: Effect<(), E, R>,
@@ -212,6 +322,17 @@ impl<E: Send + 'static> Scope<E> {
     }
 
     /// Register a fresh single-use release on each execution.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `factory` (`impl Fn() -> Release<E, R> + Send + Sync + 'static`): Factory invoked to create fresh data for an execution.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn add_release<R: Send + Sync + 'static>(
         &self,
         factory: impl Fn() -> Release<E, R> + Send + Sync + 'static,
@@ -233,6 +354,19 @@ impl<E: Send + 'static> Scope<E> {
 
     /// Acquire into this scope with release declared before acquisition starts.
     /// Late success is owned before cancellation or a closing-scope rejection.
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type. Additional bound: `Send + Sync + 'static`.
+    /// - `R`: Environment type. Additional bound: `Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `acquisition` (`Effect<T, E, R>`): The acquisition supplied to this operation.
+    /// - `release` (`impl Fn(T) -> Release<E, R> + Send + Sync + 'static`): The release supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<ResourceValue<T>, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn acquire<T, R>(
         &self,
         acquisition: Effect<T, E, R>,
@@ -250,6 +384,14 @@ impl<E: Send + 'static> Scope<E> {
     /// This returns an acknowledgement; cleanup errors are published by the
     /// enclosing `scoped` effect, rather than cloned into every caller.
     /// Once started, close is protected from cooperative cancellation.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Returns
+    /// Type: `Effect<ScopeCloseStatus, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn close<R: Send + Sync + 'static>(&self) -> Effect<ScopeCloseStatus, E, R> {
         let scope = self.clone();
         Effect::new(move |_, _, finish| {
@@ -264,6 +406,12 @@ impl<E: Send + 'static> Scope<E> {
     }
 
     /// Observe settlement without taking execution ownership or closing it.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    ///
+    /// # Returns
+    /// Type: `ScopeCloseStatus`.
     pub async fn closed(&self) -> ScopeCloseStatus {
         loop {
             let changed = self.inner.changed.listen();
@@ -281,6 +429,10 @@ impl<E: Send + 'static> Scope<E> {
         }
     }
 
+    ///
+    /// # Returns
+    /// Type: `ScopeCloseStatus`.
+    /// Returns `ScopeCloseStatus`.
     fn status(&self) -> ScopeCloseStatus {
         self.inner
             .state
@@ -289,6 +441,17 @@ impl<E: Send + 'static> Scope<E> {
             .status
     }
 
+    /// # Type parameters
+    /// - `A`: Application value type. Bounds: `Send + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `finalizer` (`Registered<E>`): Cleanup description awaited after the primary outcome.
+    /// - `value` (`A`): Value read, transformed, encoded, or stored by this operation.
+    /// - `finish` (`Finish<A, E>`): Continuation receiving the complete terminal outcome.
+    ///
+    /// # Returns
+    /// Type: `Step`.
     pub(crate) fn register_or_release<A: Send + 'static>(
         &self,
         finalizer: Registered<E>,
@@ -310,6 +473,14 @@ impl<E: Send + 'static> Scope<E> {
         }
     }
 
+    /// # Type parameters
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `finalizer` (`Registered<E>`): Cleanup description awaited after the primary outcome.
+    ///
+    /// # Returns
+    /// Type: `Result<(), Registered<E>>`.
     pub(crate) fn try_register(&self, finalizer: Registered<E>) -> Result<(), Registered<E>> {
         {
             let mut state = self
@@ -326,6 +497,18 @@ impl<E: Send + 'static> Scope<E> {
         }
     }
 
+    ///
+    /// # Type parameters
+    /// - `A`: Bounds: `Send + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `primary` (`Exit<A, E>`): The primary supplied to this operation.
+    /// - `finish` (`Finish<A, E>`): Continuation receiving the complete terminal outcome.
+    ///
+    /// # Returns
+    /// Type: `Step`.
+    /// Returns `Step`.
     fn join_close<A: Send + 'static>(self, primary: Exit<A, E>, finish: Finish<A, E>) -> Step {
         let work = {
             let mut state = self
@@ -357,6 +540,15 @@ impl<E: Send + 'static> Scope<E> {
         }
     }
 
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `outcome` (`Exit<(), E>`): Complete terminal outcome, including expected errors and cleanup failures.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn settle(&self, outcome: Exit<(), E>) {
         {
             let mut state = self
@@ -375,6 +567,13 @@ impl<E: Send + 'static> Scope<E> {
         notify_all(&self.inner.changed);
     }
 
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type.
+    ///
+    /// # Returns
+    /// Type: `Exit<(), E>`.
+    /// Returns `Exit<(), E>`.
     fn take_outcome(&self) -> Exit<(), E> {
         self.inner
             .state
@@ -385,6 +584,9 @@ impl<E: Send + 'static> Scope<E> {
             .unwrap_or_else(|| Exit::Die(Defect::from(LibraryDefect::ScopeOutcomeConsumed)))
     }
 
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn abandon_open(&self) {
         let discarded = {
             let mut state = self
@@ -404,12 +606,19 @@ impl<E: Send + 'static> Scope<E> {
     }
 }
 
+/// Typed owner guard used by scope.
+///
+/// # Type parameters
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct OwnerGuard<E: Send + 'static> {
     scope: Scope<E>,
     settled: bool,
 }
 
 impl<E: Send + 'static> Drop for OwnerGuard<E> {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         if !self.settled {
             self.scope.abandon_open();
@@ -417,6 +626,10 @@ impl<E: Send + 'static> Drop for OwnerGuard<E> {
     }
 }
 
+/// Typed drain guard used by scope.
+///
+/// # Type parameters
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct DrainGuard<E: Send + 'static> {
     scope: Scope<E>,
     work: Vec<Registered<E>>,
@@ -424,6 +637,9 @@ struct DrainGuard<E: Send + 'static> {
 }
 
 impl<E: Send + 'static> Drop for DrainGuard<E> {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         if !self.settled {
             // Invalidate resources synchronously before broadcasting loss;
@@ -436,6 +652,20 @@ impl<E: Send + 'static> Drop for DrainGuard<E> {
     }
 }
 
+///
+/// # Type parameters
+/// - `A`: Bounds: `Send + 'static`.
+/// - `E`: Bounds: `Send + 'static`.
+///
+/// # Parameters
+/// - `guard` (`DrainGuard<E>`): The guard supplied to this operation.
+/// - `primary` (`Exit<A, E>`): The primary supplied to this operation.
+/// - `cleanup` (`Exit<(), E>`): The cleanup supplied to this operation.
+/// - `finish` (`Finish<A, E>`): Continuation receiving the complete terminal outcome.
+///
+/// # Returns
+/// Type: `Step`.
+/// Returns `Step`.
 fn drain<A: Send + 'static, E: Send + 'static>(
     mut guard: DrainGuard<E>,
     primary: Exit<A, E>,

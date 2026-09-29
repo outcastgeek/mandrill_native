@@ -5,6 +5,7 @@ const outcomes = @import("../outcome.zig");
 const issue = @import("schema_issue.zig");
 const PureCodec = @import("codec.zig").PureCodec;
 
+/// Pure JSON codec for Zig `bool`.
 pub const boolean = PureCodec(bool, std.json.Value).init(struct {
     fn decode(value: *const std.json.Value) outcomes.Result(bool, issue.Issue) {
         return switch (value.*) {
@@ -18,6 +19,7 @@ pub const boolean = PureCodec(bool, std.json.Value).init(struct {
     }
 }.encode);
 
+/// Pure JSON codec for Zig `i64`.
 pub const signed_integer = PureCodec(i64, std.json.Value).init(struct {
     fn decode(value: *const std.json.Value) outcomes.Result(i64, issue.Issue) {
         return switch (value.*) {
@@ -35,6 +37,7 @@ pub const signed_integer = PureCodec(i64, std.json.Value).init(struct {
     }
 }.encode);
 
+/// Pure JSON codec for finite Zig `f64` values.
 pub const finite_number = PureCodec(f64, std.json.Value).init(struct {
     fn decode(value: *const std.json.Value) outcomes.Result(f64, issue.Issue) {
         const decoded: f64 = switch (value.*) {
@@ -69,6 +72,7 @@ pub const borrowed_string = PureCodec([]const u8, std.json.Value).init(struct {
     }
 }.encode);
 
+/// Pure JSON codec for Zig `void` represented as JSON null.
 pub const null_value = PureCodec(void, std.json.Value).init(struct {
     fn decode(value: *const std.json.Value) outcomes.Result(void, issue.Issue) {
         return switch (value.*) {
@@ -84,6 +88,10 @@ pub const null_value = PureCodec(void, std.json.Value).init(struct {
 
 /// Present JSON null is distinct from an absent record field. Record-field
 /// optionality belongs to SchemaBuilder and never uses this codec implicitly.
+///
+/// Parameters:
+/// - `child: comptime anytype`: Compile-time statically inferred input checked when this operation is instantiated.
+/// Returns (`PureCodec(?@TypeOf(child).Decoded, std.json.Value)`): A typed codec or schema preserving the declared decoded value, representation, and environments.
 pub fn nullable(comptime child: anytype) PureCodec(?@TypeOf(child).Decoded, std.json.Value) {
     const Child = @TypeOf(child);
     if (!@hasDecl(Child, "Decoded") or !@hasDecl(Child, "Representation") or Child.Representation != std.json.Value)
@@ -107,6 +115,12 @@ pub fn nullable(comptime child: anytype) PureCodec(?@TypeOf(child).Decoded, std.
 
 /// A refinement validates both directions. Its stable identifier is schema
 /// metadata supplied by the author, rather than a runtime diagnostic string.
+///
+/// Parameters:
+/// - `child: comptime anytype`: Compile-time statically inferred input checked when this operation is instantiated.
+/// - `identifier: comptime []const u8`: Stable identifier used in a schema or protocol definition.
+/// - `predicate: comptime fn (*const @TypeOf(child).Decoded) bool`: Compile-time typed callback; its signature is checked at comptime where static.
+/// Returns (`PureCodec(@TypeOf(child).Decoded, std.json.Value)`): A typed codec or schema preserving the declared decoded value, representation, and environments.
 pub fn refine(
     comptime child: anytype,
     comptime identifier: []const u8,
@@ -139,6 +153,15 @@ pub fn refine(
 
 /// Bidirectional value mapping keeps the representation codec intact and
 /// requires explicit inverse and failure contracts at definition time.
+///
+/// Parameters:
+/// - `child: comptime anytype`: Compile-time statically inferred input checked when this operation is instantiated.
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `forward: comptime fn (@TypeOf(child).Decoded) outcomes.Result(A, issue.Issue)`: Compile-time typed function selected at comptime; no runtime callback lookup is
+///   required.
+/// - `backward: comptime fn (*const A) outcomes.Result(@TypeOf(child).Decoded, issue.Issue)`: Compile-time typed function selected at comptime; no runtime callback lookup is
+///   required.
+/// Returns (`PureCodec(A, std.json.Value)`): A typed codec or schema preserving the declared decoded value, representation, and environments.
 pub fn transform(
     comptime child: anytype,
     comptime A: type,

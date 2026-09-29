@@ -1,3 +1,5 @@
+//! Tracing, logging, and diagnostic capability contracts.
+
 use crate::internal::runtime::{self};
 use crate::{Clock, Defect, Effect, Exit, HasClock, PrimaryOutcomeRef};
 use std::collections::{BTreeMap, VecDeque};
@@ -6,16 +8,27 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Type alias for annotations in telemetry.
 pub type Annotations = BTreeMap<Arc<str>, Arc<str>>;
 static EMPTY_ANNOTATIONS: Annotations = Annotations::new();
 #[derive(Clone, Default)]
+/// An immutable, shared set of annotations that can cross execution boundaries without copying each entry.
 pub enum SharedAnnotations {
     #[default]
+    /// No value is present.
     Empty,
+    /// Other observers still retain a shared view of the outcome. Contains `Arc<Annotations>`.
     Shared(Arc<Annotations>),
 }
 impl SharedAnnotations {
     #[must_use]
+    /// Construct a `SharedAnnotations` from its required inputs and explicit policies.
+    ///
+    /// # Parameters
+    /// - `annotations` (`Annotations`): The annotations supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(annotations: Annotations) -> Self {
         if annotations.is_empty() {
             Self::Empty
@@ -25,6 +38,9 @@ impl SharedAnnotations {
     }
 }
 impl AsRef<Annotations> for SharedAnnotations {
+    ///
+    /// # Returns
+    /// Type: `&Annotations`.
     fn as_ref(&self) -> &Annotations {
         match self {
             Self::Empty => &EMPTY_ANNOTATIONS,
@@ -33,61 +49,104 @@ impl AsRef<Annotations> for SharedAnnotations {
     }
 }
 impl std::ops::Deref for SharedAnnotations {
+    /// Type alias for target in telemetry.
     type Target = Annotations;
+    ///
+    /// # Returns
+    /// Type: `&Annotations`.
     fn deref(&self) -> &Annotations {
         self.as_ref()
     }
 }
 impl std::fmt::Debug for SharedAnnotations {
+    ///
+    /// # Parameters
+    /// - `f` (`&mut std::fmt::Formatter<'_>`): The f supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `std::fmt::Result`.
+    /// Returns `std::fmt::Result`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(self.as_ref(), f)
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// Stable identity used by telemetry operations.
 pub struct SpanId(Arc<str>);
 impl SpanId {
     #[must_use]
+    /// Construct a `SpanId` from its required inputs and explicit policies.
+    ///
+    /// # Parameters
+    /// - `id` (`impl Into<Arc<str>>`): Stable identity of the selected record or operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(id: impl Into<Arc<str>>) -> Self {
         Self(id.into())
     }
     #[must_use]
+    /// Borrow the textual representation without allocating a new string.
+    ///
+    /// # Returns
+    /// Type: `&str`.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 #[derive(Clone, Default, Debug)]
+/// The active span identity and annotations carried with a running Effect and its children.
 pub struct TraceContext {
+    /// Immutable metadata propagated with this operation. Type: `SharedAnnotations`.
     pub annotations: SharedAnnotations,
+    /// Active parent span, if one exists. Type: `Option<SpanId>`.
     pub span: Option<SpanId>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// Severity used to filter application log events before they reach a backend.
 pub enum LogLevel {
+    /// Debug-level diagnostic detail.
     Debug,
+    /// Informational application event.
     Info,
+    /// Warning that may need operator attention.
     Warn,
+    /// The value is an expected application error.
     Error,
 }
+/// A message, level, and captured trace context passed to the configured logger.
 pub struct LogEvent {
+    /// Severity used to filter and emit this log event. Type: `LogLevel`.
     pub level: LogLevel,
+    /// Text emitted by the logger. Type: `Arc<str>`.
     pub message: Arc<str>,
+    /// Captured span and annotation context. Type: `TraceContext`.
     pub context: TraceContext,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Explicit resource bounds for telemetry.
 pub enum DiagnosticCapacity {
+    /// No explicit capacity bound is imposed.
     Unbounded,
+    /// The supplied positive capacity bound is enforced. Contains `NonZeroUsize`.
     Bounded(NonZeroUsize),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The policy for retaining diagnostics when a bounded diagnostic buffer is full.
 pub enum DiagnosticOverflow {
+    /// Discard the oldest buffered diagnostic to retain the new one.
     DiscardOldest,
+    /// Discard the incoming diagnostic and retain older entries.
     DiscardNewest,
 }
+/// Typed diagnostic state used by telemetry.
 struct DiagnosticState {
     entries: VecDeque<Defect>,
     discarded: usize,
 }
 #[derive(Clone)]
+/// A separately retained channel for instrumentation defects that must not replace an application outcome.
 pub struct Diagnostics {
     state: Arc<Mutex<DiagnosticState>>,
     capacity: DiagnosticCapacity,
@@ -95,6 +154,14 @@ pub struct Diagnostics {
 }
 impl Diagnostics {
     #[must_use]
+    /// Construct a `Diagnostics` from its required inputs and explicit policies.
+    ///
+    /// # Parameters
+    /// - `capacity` (`DiagnosticCapacity`): The caller-supplied capacity bound.
+    /// - `overflow` (`DiagnosticOverflow`): Behavior when the configured buffer capacity is full.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(capacity: DiagnosticCapacity, overflow: DiagnosticOverflow) -> Self {
         Self {
             state: Arc::new(Mutex::new(DiagnosticState {
@@ -105,6 +172,13 @@ impl Diagnostics {
             overflow,
         }
     }
+    /// Retain a diagnostic defect under this buffer’s capacity and overflow policy.
+    ///
+    /// # Parameters
+    /// - `defect` (`Defect`): The defect supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `()`.
     pub fn record(&self, defect: Defect) {
         let mut state = self
             .state
@@ -124,6 +198,10 @@ impl Diagnostics {
         state.entries.push_back(defect);
     }
     #[must_use]
+    /// Wait for accepted work to settle and collect retained outcomes.
+    ///
+    /// # Returns
+    /// Type: `Vec<Defect>`.
     pub fn drain(&self) -> Vec<Defect> {
         self.state
             .lock()
@@ -133,12 +211,26 @@ impl Diagnostics {
             .collect()
     }
     #[must_use]
+    /// Count diagnostic events discarded after the buffer reached capacity.
+    ///
+    /// # Returns
+    /// Type: `usize`.
     pub fn discarded(&self) -> usize {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .discarded
     }
+    ///
+    /// # Type parameters
+    /// - `T`: Stored or transferred value type.
+    ///
+    /// # Parameters
+    /// - `callback` (`impl FnOnce() -> Result<T, Defect>`): The callback invoked by this operation.
+    ///
+    /// # Returns
+    /// Type: `Option<T>`.
+    /// Returns the value when present, or `None`.
     fn isolate<T>(&self, callback: impl FnOnce() -> Result<T, Defect>) -> Option<T> {
         match catch_unwind(AssertUnwindSafe(callback)) {
             Ok(Ok(value)) => Some(value),
@@ -153,11 +245,16 @@ impl Diagnostics {
         }
     }
 }
+/// Type alias for redact in telemetry.
 type Redact = Arc<dyn Fn(&Annotations) -> Result<Annotations, Defect> + Send + Sync>;
+/// Type alias for write log in telemetry.
 type WriteLog = Arc<dyn Fn(&LogEvent) -> Result<(), Defect> + Send + Sync>;
+/// Type alias for start span in telemetry.
 type StartSpan = Arc<dyn Fn(&SpanStart) -> Result<Option<SpanId>, Defect> + Send + Sync>;
+/// Type alias for finish span in telemetry.
 type FinishSpan = Arc<dyn Fn(&SpanFinish) -> Result<(), Defect> + Send + Sync>;
 #[derive(Clone)]
+/// An environment-supplied logger that filters, redacts, and forwards events to its backend.
 pub struct Logger {
     minimum: LogLevel,
     redact: Redact,
@@ -166,6 +263,16 @@ pub struct Logger {
 }
 impl Logger {
     #[must_use]
+    /// Construct a `Logger` from its required inputs and explicit policies.
+    ///
+    /// # Parameters
+    /// - `minimum` (`LogLevel`): Lower bound enforced by this policy.
+    /// - `diagnostics` (`Diagnostics`): Separate sink for instrumentation or provider failures.
+    /// - `redact` (`impl Fn(&Annotations) -> Result<Annotations, Defect> + Send + Sync + 'static`): The redact supplied to this operation.
+    /// - `write` (`impl Fn(&LogEvent) -> Result<(), Defect> + Send + Sync + 'static`): The write supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(
         minimum: LogLevel,
         diagnostics: Diagnostics,
@@ -180,9 +287,18 @@ impl Logger {
         }
     }
     #[must_use]
+    /// # Returns
+    /// Type: `&Diagnostics`.
     pub const fn diagnostics(&self) -> &Diagnostics {
         &self.diagnostics
     }
+    /// Filter and forward a log event while retaining backend defects as diagnostics.
+    ///
+    /// # Parameters
+    /// - `event` (`LogEvent`): Typed event identity and payload submitted to the journal.
+    ///
+    /// # Returns
+    /// Type: `()`.
     pub fn emit(&self, mut event: LogEvent) {
         if event.level < self.minimum {
             return;
@@ -196,30 +312,50 @@ impl Logger {
         }
     }
 }
+/// Selects the logging capability supplied by an application environment.
 pub trait HasLogger {
+    /// # Returns
+    /// Type: `&Logger`.
     fn logger(&self) -> &Logger;
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The terminal status recorded when a tracing span finishes.
 pub enum SpanOutcome {
+    /// The operation completed successfully.
     Succeeded,
+    /// The operation completed with a failure.
     Failed,
+    /// The operation ended in a defect outside its expected-error channel.
     Defected,
+    /// Execution was interrupted.
     Interrupted,
+    /// The owner was lost before the operation settled.
     Abandoned,
 }
+/// The name, parent, and context needed to begin a span.
 pub struct SpanStart {
+    /// The stable name identifying this value. Type: `Arc<str>`.
     pub name: Arc<str>,
+    /// Identity of the parent operation or span. Type: `Option<SpanId>`.
     pub parent: Option<SpanId>,
+    /// Immutable metadata propagated with this operation. Type: `SharedAnnotations`.
     pub annotations: SharedAnnotations,
+    /// Time associated with this transition. Type: `Duration`.
     pub time: Duration,
 }
+/// The span identity and terminal status delivered to a tracing backend.
 pub struct SpanFinish {
+    /// Stable identity of this record. Type: `SpanId`.
     pub id: SpanId,
+    /// The recorded outcome of this operation. Type: `SpanOutcome`.
     pub outcome: SpanOutcome,
+    /// Whether protected cleanup reported a failure. Type: `bool`.
     pub cleanup_failed: bool,
+    /// Time associated with this transition. Type: `Duration`.
     pub time: Duration,
 }
 #[derive(Clone)]
+/// An environment-supplied span service that records begin and end events.
 pub struct Tracer {
     redact: Redact,
     start: StartSpan,
@@ -228,6 +364,16 @@ pub struct Tracer {
 }
 impl Tracer {
     #[must_use]
+    /// Construct a `Tracer` from its required inputs and explicit policies.
+    ///
+    /// # Parameters
+    /// - `diagnostics` (`Diagnostics`): Separate sink for instrumentation or provider failures.
+    /// - `redact` (`impl Fn(&Annotations) -> Result<Annotations, Defect> + Send + Sync + 'static`): The redact supplied to this operation.
+    /// - `start` (`impl Fn(&SpanStart) -> Result<Option<SpanId>, Defect> + Send + Sync + 'static`): The start supplied to this operation.
+    /// - `finish` (`impl Fn(&SpanFinish) -> Result<(), Defect> + Send + Sync + 'static`): Continuation receiving the complete terminal outcome.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(
         diagnostics: Diagnostics,
         redact: impl Fn(&Annotations) -> Result<Annotations, Defect> + Send + Sync + 'static,
@@ -242,9 +388,18 @@ impl Tracer {
         }
     }
     #[must_use]
+    /// # Returns
+    /// Type: `&Diagnostics`.
     pub const fn diagnostics(&self) -> &Diagnostics {
         &self.diagnostics
     }
+    ///
+    /// # Parameters
+    /// - `start` (`SpanStart`): The start supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Option<SpanId>`.
+    /// Returns the value when present, or `None`.
     fn begin(&self, mut start: SpanStart) -> Option<SpanId> {
         start.annotations = SharedAnnotations::new(
             self.diagnostics
@@ -252,14 +407,35 @@ impl Tracer {
         );
         self.diagnostics.isolate(|| (self.start)(&start)).flatten()
     }
+    ///
+    /// # Parameters
+    /// - `finish` (`SpanFinish`): Continuation receiving the complete terminal outcome.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn end(&self, finish: SpanFinish) {
         let _ = self.diagnostics.isolate(|| (self.finish)(&finish));
     }
 }
+/// Selects the tracing capability supplied by an application environment.
 pub trait HasTracer {
+    /// # Returns
+    /// Type: `&Tracer`.
     fn tracer(&self) -> &Tracer;
 }
 impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E, R> {
+    /// Return a value with the supplied annotations added to its context.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bound: `Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `annotations` (`Annotations`): The annotations supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn annotate(self, annotations: Annotations) -> Self {
         let annotations = SharedAnnotations::new(annotations);
         Self::new(move |env, context, finish| {
@@ -276,11 +452,31 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
     }
 }
 impl<E: Send + 'static, R: Send + Sync + 'static> Effect<TraceContext, E, R> {
+    /// Capture the current span and annotations for propagation to later work.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bound: `Send + Sync + 'static`.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn trace_context() -> Self {
         Effect::ready(|_, context| Exit::Success(context.trace.clone()))
     }
 }
 impl<E: Send + 'static, R: HasLogger + Send + Sync + 'static> Effect<(), E, R> {
+    /// Describe one log event with its level and message.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bound: `HasLogger + Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `level` (`LogLevel`): The level supplied to this operation.
+    /// - `message` (`impl Into<Arc<str>>`): Text or payload transferred to the selected consumer.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn log(level: LogLevel, message: impl Into<Arc<str>>) -> Self {
         let message = message.into();
         Self::ready(move |env, context| {
@@ -296,11 +492,22 @@ impl<E: Send + 'static, R: HasLogger + Send + Sync + 'static> Effect<(), E, R> {
         })
     }
 }
+/// Typed span guard used by telemetry.
+///
+/// # Type parameters
+/// - `R`: Environment type. Bound or type: `HasTracer + HasClock + Send + Sync + 'static`.
 struct SpanGuard<R: HasTracer + HasClock + Send + Sync + 'static> {
     env: Arc<R>,
     id: Option<SpanId>,
 }
 impl<R: HasTracer + HasClock + Send + Sync + 'static> SpanGuard<R> {
+    ///
+    /// # Parameters
+    /// - `outcome` (`SpanOutcome`): Complete terminal outcome, including expected errors and cleanup failures.
+    /// - `cleanup_failed` (`bool`): The cleanup failed supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn finish(&mut self, outcome: SpanOutcome, cleanup_failed: bool) {
         if let Some(id) = self.id.take() {
             let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -318,6 +525,9 @@ impl<R: HasTracer + HasClock + Send + Sync + 'static> SpanGuard<R> {
     }
 }
 impl<R: HasTracer + HasClock + Send + Sync + 'static> Drop for SpanGuard<R> {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         self.finish(SpanOutcome::Abandoned, false);
     }
@@ -325,6 +535,18 @@ impl<R: HasTracer + HasClock + Send + Sync + 'static> Drop for SpanGuard<R> {
 impl<A: Send + 'static, E: Send + 'static, R: HasTracer + HasClock + Send + Sync + 'static>
     Effect<A, E, R>
 {
+    /// Run this work inside a named tracing span and record its outcome.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bound: `HasTracer + HasClock + Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `name` (`impl Into<Arc<str>>`): Stable name used to register or locate this definition.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn with_span(self, name: impl Into<Arc<str>>) -> Self {
         let name = name.into();
         Self::new(move |env, mut context, finish| {

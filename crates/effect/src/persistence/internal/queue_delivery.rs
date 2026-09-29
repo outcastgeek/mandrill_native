@@ -1,3 +1,5 @@
+//! Atomic in-memory queue claims and settlement.
+
 use super::super::persisted_queue::{
     HasPersistedQueueStore, MemoryQueueStoreError, PersistedQueueName, PersistedQueueStore,
     QueueClaim, QueueClaimOptions, QueueClaimToken, QueueDeadLetterReason, QueueMessageId,
@@ -10,8 +12,10 @@ use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::{Arc, Mutex};
 
+/// Type alias for address in persistence internal queue delivery.
 type Address = (PersistedQueueName, QueueMessageId);
 
+/// Typed state used by persistence internal queue delivery.
 struct State {
     records: BTreeMap<Address, QueueRecord>,
     next_sequence: u64,
@@ -26,6 +30,9 @@ pub struct MemoryPersistedQueueStore {
 }
 
 impl Clone for MemoryPersistedQueueStore {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             state: Arc::clone(&self.state),
@@ -34,8 +41,13 @@ impl Clone for MemoryPersistedQueueStore {
 }
 
 impl HasPersistedQueueStore for Arc<MemoryPersistedQueueStore> {
+    /// Type alias for store in persistence internal queue delivery.
     type Store = MemoryPersistedQueueStore;
 
+    ///
+    /// # Returns
+    /// Type: `Arc<Self::Store>`.
+    /// Returns `Arc<Self::Store>`.
     fn persisted_queue_store(&self) -> Arc<Self::Store> {
         Arc::clone(self)
     }
@@ -43,6 +55,13 @@ impl HasPersistedQueueStore for Arc<MemoryPersistedQueueStore> {
 
 impl MemoryPersistedQueueStore {
     #[must_use]
+    /// Construct a `MemoryPersistedQueueStore` from its required inputs and explicit policies.
+    ///
+    /// # Parameters
+    /// - `capacity` (`QueueStoreCapacity`): The caller-supplied capacity bound.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(capacity: QueueStoreCapacity) -> Self {
         Self {
             state: Arc::new(Mutex::new(State {
@@ -55,10 +74,24 @@ impl MemoryPersistedQueueStore {
     }
 
     #[must_use]
+    /// Build a scoped dependency layer for this service.
+    ///
+    /// # Parameters
+    /// - `capacity` (`QueueStoreCapacity`): The caller-supplied capacity bound.
+    ///
+    /// # Returns
+    /// Type: `Layer<(), MemoryQueueStoreError, Arc<Self>>`.
     pub fn layer(capacity: QueueStoreCapacity) -> Layer<(), MemoryQueueStoreError, Arc<Self>> {
         Layer::make_with(move || Arc::new(Self::new(capacity)))
     }
 
+    ///
+    /// # Parameters
+    /// - `state` (`&State`): Current or replacement state owned by this operation.
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     fn fits(state: &State) -> bool {
         match state.capacity {
             QueueStoreCapacity::Unbounded => true,
@@ -67,6 +100,7 @@ impl MemoryPersistedQueueStore {
     }
 }
 
+/// Typed candidate used by persistence internal queue delivery.
 struct Candidate {
     address: Address,
     available_at: UtcMillis,
@@ -75,8 +109,16 @@ struct Candidate {
 }
 
 impl PersistedQueueStore for MemoryPersistedQueueStore {
+    /// Type alias for error in persistence internal queue delivery.
     type Error = MemoryQueueStoreError;
 
+    ///
+    /// # Parameters
+    /// - `offer` (`QueueOffer`): The offer supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<QueueOfferOutcome, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn offer(&self, offer: QueueOffer) -> Effect<QueueOfferOutcome, Self::Error> {
         let state = Arc::clone(&self.state);
         Effect::try_sync_once(
@@ -134,6 +176,14 @@ impl PersistedQueueStore for MemoryPersistedQueueStore {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `queue` (`PersistedQueueName`): Queue definition or store that owns the selected messages.
+    /// - `options` (`QueueClaimOptions`): Caller-selected bounds and behavior for this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<Vec<QueueClaim>, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn claim(
         &self,
         queue: PersistedQueueName,
@@ -248,6 +298,14 @@ impl PersistedQueueStore for MemoryPersistedQueueStore {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `token` (`QueueClaimToken`): Fencing token that identifies the current claim or owner.
+    /// - `action` (`QueueSettlementAction`): State transition selected for this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<QueueSettlement, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn settle(
         &self,
         token: QueueClaimToken,
@@ -303,6 +361,14 @@ impl PersistedQueueStore for MemoryPersistedQueueStore {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `queue` (`PersistedQueueName`): Queue definition or store that owns the selected messages.
+    /// - `id` (`QueueMessageId`): Stable identity of the selected record or operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<Option<QueueRecord>, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn inspect(
         &self,
         queue: PersistedQueueName,
@@ -319,6 +385,14 @@ impl PersistedQueueStore for MemoryPersistedQueueStore {
         })
     }
 
+    ///
+    /// # Parameters
+    /// - `queue` (`PersistedQueueName`): Queue definition or store that owns the selected messages.
+    /// - `scan` (`QueueScan`): Bounded request for records in a selected state.
+    ///
+    /// # Returns
+    /// Type: `Effect<Vec<QueueRecord>, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn dead_letters(
         &self,
         queue: PersistedQueueName,
@@ -347,6 +421,15 @@ impl PersistedQueueStore for MemoryPersistedQueueStore {
         })
     }
 
+    ///
+    /// # Parameters
+    /// - `queue` (`PersistedQueueName`): Queue definition or store that owns the selected messages.
+    /// - `id` (`QueueMessageId`): Stable identity of the selected record or operation.
+    /// - `request` (`QueueRequeue`): Typed request submitted to a handler or transport.
+    ///
+    /// # Returns
+    /// Type: `Effect<QueueRequeueOutcome, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn requeue(
         &self,
         queue: PersistedQueueName,
@@ -381,6 +464,14 @@ impl PersistedQueueStore for MemoryPersistedQueueStore {
         })
     }
 
+    ///
+    /// # Parameters
+    /// - `queue` (`PersistedQueueName`): Queue definition or store that owns the selected messages.
+    /// - `now` (`UtcMillis`): The caller-supplied current time.
+    ///
+    /// # Returns
+    /// Type: `Effect<usize, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn cleanup(&self, queue: PersistedQueueName, now: UtcMillis) -> Effect<usize, Self::Error> {
         let state = Arc::clone(&self.state);
         Effect::sync_once(move || {

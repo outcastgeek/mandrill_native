@@ -1,3 +1,5 @@
+//! Expansion of tagged-enum schema declarations.
+
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote, quote_spanned};
 use syn::parse::{Parse, ParseStream};
@@ -5,12 +7,19 @@ use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{Expr, Path, Token, braced, parenthesized};
 
+/// Typed named field used by schema enum expand.
 struct NamedField {
     name: Ident,
     codec: Expr,
 }
 
 impl Parse for NamedField {
+    ///
+    /// # Parameters
+    /// - `input` (`ParseStream<'_>`): Owned input decoded or consumed by this operation.
+    ///
+    /// # Returns
+    /// Type: `syn::Result<Self>`.
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let name = input.parse()?;
         input.parse::<Token![:]>()?;
@@ -21,12 +30,14 @@ impl Parse for NamedField {
     }
 }
 
+/// Variants of payload used by schema enum expand.
 enum Payload {
     Unit,
     Tuple(Expr),
     Named(Vec<NamedField>),
 }
 
+/// Typed variant used by schema enum expand.
 struct Variant {
     name: Ident,
     payload: Payload,
@@ -34,6 +45,12 @@ struct Variant {
 }
 
 impl Parse for Variant {
+    ///
+    /// # Parameters
+    /// - `input` (`ParseStream<'_>`): Owned input decoded or consumed by this operation.
+    ///
+    /// # Returns
+    /// Type: `syn::Result<Self>`.
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let name = input.parse()?;
         let payload = if input.peek(syn::token::Paren) {
@@ -61,6 +78,7 @@ impl Parse for Variant {
     }
 }
 
+/// Typed schema enum input used by schema enum expand.
 pub(crate) struct SchemaEnumInput {
     enum_path: Path,
     variants: Vec<Variant>,
@@ -70,6 +88,12 @@ pub(crate) struct SchemaEnumInput {
 }
 
 impl Parse for SchemaEnumInput {
+    ///
+    /// # Parameters
+    /// - `input` (`ParseStream<'_>`): Owned input decoded or consumed by this operation.
+    ///
+    /// # Returns
+    /// Type: `syn::Result<Self>`.
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         input.parse::<Token![enum]>()?;
         let enum_path = input.parse()?;
@@ -92,6 +116,13 @@ impl Parse for SchemaEnumInput {
     }
 }
 
+///
+/// # Parameters
+/// - `input` (`ParseStream<'_>`): Owned input decoded or consumed by this operation.
+/// - `expected` (`&str`): Value or revision required for the proposed state transition.
+///
+/// # Returns
+/// Type: `syn::Result<Expr>`.
 fn named_expr(input: ParseStream<'_>, expected: &str) -> syn::Result<Expr> {
     let name: Ident = input.parse()?;
     if name != expected {
@@ -108,6 +139,11 @@ fn named_expr(input: ParseStream<'_>, expected: &str) -> syn::Result<Expr> {
     Ok(value)
 }
 
+/// # Parameters
+/// - `input` (`SchemaEnumInput`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn expand(input: SchemaEnumInput) -> syn::Result<TokenStream> {
     let effect = crate::expand::effect_crate_path()?;
     let enum_path = &input.enum_path;

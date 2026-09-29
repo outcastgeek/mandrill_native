@@ -1,14 +1,18 @@
+//! Lowering of asynchronous Effect control flow.
+
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{quote, quote_spanned};
 use syn::fold::Fold;
 use syn::spanned::Spanned;
 use syn::{Expr, Stmt};
 
+/// Typed target used by async expand.
 struct Target {
     label: Option<syn::Lifetime>,
     checkpoint: Ident,
     continuing: bool,
 }
+/// Typed lower used by async expand.
 struct Lower {
     path: TokenStream,
     context: Ident,
@@ -16,6 +20,10 @@ struct Lower {
     checkpoints: usize,
 }
 impl Lower {
+    ///
+    /// # Returns
+    /// Type: `Ident`.
+    /// Returns `Ident`.
     fn checkpoint(&mut self) -> Ident {
         let ordinal = self.checkpoints;
         self.checkpoints += std::num::NonZeroUsize::MIN.get();
@@ -24,10 +32,26 @@ impl Lower {
             Span::mixed_site(),
         )
     }
+    ///
+    /// # Parameters
+    /// - `checkpoint` (`&Ident`): The checkpoint supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `TokenStream`.
+    /// Returns the expanded Rust tokens.
     fn close(&self, checkpoint: &Ident) -> TokenStream {
         let context = &self.context;
         quote!(if let Err(__effect_failure) = #context.release(#checkpoint).await { return __effect_failure; })
     }
+    ///
+    /// # Parameters
+    /// - `block` (`syn::Block`): The block supplied to this operation.
+    /// - `checkpoint` (`Option<Ident>`): The checkpoint supplied to this operation.
+    /// - `cooperate` (`bool`): The cooperate supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `syn::Block`.
+    /// Returns `syn::Block`.
     fn block(
         &mut self,
         block: syn::Block,
@@ -58,6 +82,14 @@ impl Lower {
             None => syn::parse_quote!({ #yielding #(#statements)* }),
         }
     }
+    ///
+    /// # Parameters
+    /// - `label` (`&Option<syn::Lifetime>`): The label supplied to this operation.
+    /// - `continuing` (`bool`): The continuing supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Option<&Ident>`.
+    /// Returns the value when present, or `None`.
     fn target(&self, label: &Option<syn::Lifetime>, continuing: bool) -> Option<&Ident> {
         self.targets
             .iter()
@@ -73,6 +105,13 @@ impl Lower {
     }
 }
 impl Fold for Lower {
+    ///
+    /// # Parameters
+    /// - `item` (`syn::Item`): The item supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `syn::Item`.
+    /// Returns `syn::Item`.
     fn fold_item(&mut self, item: syn::Item) -> syn::Item {
         item
     }
@@ -80,6 +119,13 @@ impl Fold for Lower {
         clippy::wildcard_enum_match_arm,
         reason = "Delegate ordinary and future non-exhaustive syn syntax to syn folding"
     )]
+    ///
+    /// # Parameters
+    /// - `expr` (`Expr`): Rust syntax expression parsed or expanded by this macro.
+    ///
+    /// # Returns
+    /// Type: `Expr`.
+    /// Returns `Expr`.
     fn fold_expr(&mut self, expr: Expr) -> Expr {
         match expr {
             Expr::Closure(expr) => Expr::Closure(expr),
@@ -173,10 +219,24 @@ impl Fold for Lower {
             other => syn::fold::fold_expr(self, other),
         }
     }
+    ///
+    /// # Parameters
+    /// - `block` (`syn::Block`): The block supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `syn::Block`.
+    /// Returns `syn::Block`.
     fn fold_block(&mut self, block: syn::Block) -> syn::Block {
         self.block(block, None, false)
     }
 }
+/// # Parameters
+/// - `statements` (`Vec<Stmt>`): Rust statements parsed and lowered by the procedural macro.
+/// - `path` (`&TokenStream`): Location of the field, file, or configuration value being processed.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 pub(crate) fn expand(statements: Vec<Stmt>, path: &TokenStream) -> TokenStream {
     let context = Ident::new(stringify!(__effect_context), Span::mixed_site());
     let prefix_length = statements

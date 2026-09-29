@@ -4,16 +4,22 @@ const std = @import("std");
 const outcomes = @import("../../outcome.zig");
 const ast = @import("../schema_ast.zig");
 
+/// Bounds on schema definition preparation and recursive expansion.
 pub const Limits = struct {
     max_nodes: usize,
     max_edges: usize,
     max_depth: usize,
 
+    /// Check whether this value satisfies its structural invariants.
+    /// Parameters:
+    /// - `self: Limits`: Receiver passed by value: the struct itself is copied, while any referenced storage keeps its original ownership and lifetime.
+    /// Returns (`bool`): `true` when node, edge, and depth limits are positive.
     pub fn valid(self: Limits) bool {
         return self.max_nodes > 0 and self.max_edges > 0 and self.max_depth > 0;
     }
 };
 
+/// Schema-preparation failure for invalid definitions or exceeded bounds.
 pub const Error = union(enum) {
     invalid_limits,
     duplicate_definition: usize,
@@ -25,6 +31,7 @@ pub const Error = union(enum) {
     depth_limit,
 };
 
+/// Counts gathered while preparing a schema definition.
 pub const Stats = struct { definitions: usize, nodes: usize, edges: usize };
 const Verdict = outcomes.Exit(Stats, Error);
 const Frame = struct { node: *const ast.Node, depth: usize };
@@ -39,10 +46,21 @@ pub const Definitions = struct {
     ready: std.atomic.Value(bool) = .init(false),
     cached: Verdict = undefined,
 
+    /// Validate and index schema definitions under explicit resource limits.
+    /// Parameters:
+    /// - `definitions: []const ast.Definition`: Static definitions to register or validate.
+    /// - `limits: Limits`: Caller-selected, validated behavior or resource bounds; no hidden default is
+    ///   installed.
+    /// Returns (`Definitions`): Prepared structural schema definitions under the selected limits.
     pub fn init(definitions: []const ast.Definition, limits: Limits) Definitions {
         return .{ .definitions = definitions, .limits = limits };
     }
 
+    /// Prepare and validate structural schema definitions.
+    /// Parameters:
+    /// - `self: *Definitions`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected capabilities.
+    /// Returns (`Verdict`): Schema preparation success or typed validation issue.
     pub fn prepare(self: *Definitions, env: anytype) Verdict {
         if (self.ready.load(.acquire)) return self.cached;
         while (self.gate.swap(true, .acquire)) std.atomic.spinLoopHint();

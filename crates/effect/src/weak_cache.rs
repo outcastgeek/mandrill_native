@@ -1,3 +1,5 @@
+//! Weakly held cached values and partitioned identities.
+
 use crate::cache::Entry;
 use crate::internal::runtime::{self, Step};
 use crate::{
@@ -10,25 +12,55 @@ use std::sync::{
 };
 
 #[derive(Clone, PartialEq, Eq)]
+/// A key partition and its weakly associated cached values.
 pub enum CachePartition {
+    /// Use the unnamed default partition.
     Default,
+    /// Use a caller-supplied named partition. Contains `Arc<str>`.
     Named(Arc<str>),
 }
+/// Stable identity used by weak cache operations.
+///
+/// # Type parameters
+/// - `K`: Key type used for identity or lookup. Bound or type: `Send + Sync + 'static`.
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct Key<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
     identity: Weak<K>,
     partition: CachePartition,
     load: Mutex<Option<Effect<A, E, ()>>>,
 }
+/// Type alias for associations in weak cache.
+///
+/// # Type parameters
+/// - `K`: Key type used for identity or lookup.
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 type Associations<K, A, E> = Mutex<Vec<Weak<Entry<Key<K, A, E>, A, E>>>>;
+/// Typed inner used by weak cache.
+///
+/// # Type parameters
+/// - `K`: Key type used for identity or lookup. Bound or type: `Send + Sync + 'static`.
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct Inner<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
     cache: Cache<Key<K, A, E>, A, E>,
     entries: Associations<K, A, E>,
     closed: AtomicBool,
 }
+/// A cache whose key and association ownership can disappear when consumers release them.
+///
+/// # Type parameters
+/// - `K`: Key type used for identity or lookup. Bound or type: `Send + Sync + 'static`.
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 pub struct WeakCache<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
     inner: Arc<Inner<K, A, E>>,
 }
 impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Clone for WeakCache<K, A, E> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -40,6 +72,11 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Clone for W
 /// retention than a tracing-GC ephemeron: dropping the last consumer handle may
 /// cause a miss even while the key lives. A value-to-key reference cannot make
 /// a successful settled association keep itself alive through the cache.
+///
+/// # Type parameters
+/// - `K`: Key type used for identity or lookup. Bound or type: `Send + Sync + 'static`.
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 pub struct WeakCacheValue<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
     entry: Arc<Entry<Key<K, A, E>, A, E>>,
     value: SharedValue<A>,
@@ -47,6 +84,9 @@ pub struct WeakCacheValue<K: Send + Sync + 'static, A: Send + 'static, E: Send +
 impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Clone
     for WeakCacheValue<K, A, E>
 {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             entry: Arc::clone(&self.entry),
@@ -55,11 +95,38 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Clone
     }
 }
 impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> WeakCacheValue<K, A, E> {
+    /// Borrow the contained value only for the duration of the supplied callback.
+    ///
+    /// # Type parameters
+    /// - `K`: Key type used for identity or lookup. Bound: `Send + Sync + 'static`.
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `B`: Transformed value type.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `inspect` (`impl FnOnce(&A) -> B`): The inspect supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<B, Defect>`.
     pub fn with<B>(&self, inspect: impl FnOnce(&A) -> B) -> Result<B, Defect> {
         self.value.with(inspect)
     }
 }
 impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> WeakCache<K, A, E> {
+    /// Create a `WeakCache` through the declared Effect and environment capabilities.
+    ///
+    /// # Type parameters
+    /// - `K`: Key type used for identity or lookup. Bound: `Send + Sync + 'static`.
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bounds: `HasClock + HasTaskSpawner + Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `scope` (`Scope<SharedValue<E>>`): Owner that joins child work and releases resources at close.
+    ///
+    /// # Returns
+    /// Type: `Effect<Self, SharedValue<E>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn make<R: HasClock + HasTaskSpawner + Send + Sync + 'static>(
         scope: Scope<SharedValue<E>>,
     ) -> Effect<Self, SharedValue<E>, R> {
@@ -98,6 +165,9 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> WeakCache<K
             registered.map(move |()| cache.clone())
         })
     }
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn close_index(&self) {
         self.inner.closed.store(true, Ordering::Release);
         let entries = std::mem::take(
@@ -111,6 +181,21 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> WeakCache<K
             entry.invalidate_association();
         }
     }
+    /// Read the current value through the declared storage or state capability.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `K`: Type supplied by the enclosing impl or trait.
+    ///
+    /// # Parameters
+    /// - `key` (`&Arc<K>`): Stable key used to locate or identify the selected value.
+    /// - `load` (`impl Fn() -> Effect<A, E, R> + Send + Sync + 'static`): The load supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<WeakCacheValue<K, A, E>, SharedValue<E>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn get<R: Send + Sync + 'static>(
         &self,
         key: &Arc<K>,
@@ -118,6 +203,22 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> WeakCache<K
     ) -> Effect<WeakCacheValue<K, A, E>, SharedValue<E>, R> {
         self.get_partition(CachePartition::Default, key, load)
     }
+    /// Locate or create the weak association for the selected cache partition.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `K`: Type supplied by the enclosing impl or trait.
+    ///
+    /// # Parameters
+    /// - `partition` (`CachePartition`): The partition supplied to this operation.
+    /// - `key` (`&Arc<K>`): Stable key used to locate or identify the selected value.
+    /// - `load` (`impl Fn() -> Effect<A, E, R> + Send + Sync + 'static`): The load supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<WeakCacheValue<K, A, E>, SharedValue<E>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn get_partition<R: Send + Sync + 'static>(
         &self,
         partition: CachePartition,
@@ -199,6 +300,20 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> WeakCache<K
             }))
         })
     }
+    /// Mark the selected cached or reactive state stale for its consumers.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    /// - `K`: Type supplied by the enclosing impl or trait.
+    ///
+    /// # Parameters
+    /// - `key` (`&Arc<K>`): Stable key used to locate or identify the selected value.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), SharedValue<E>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn invalidate<R: Send + Sync + 'static>(
         &self,
         key: &Arc<K>,
@@ -237,6 +352,17 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> WeakCache<K
         })
         .uninterruptible()
     }
+    /// Stop accepting new work and describe the settlement of owned work.
+    ///
+    /// # Type parameters
+    /// - `K`: Key type used for identity or lookup. Bound: `Send + Sync + 'static`.
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Returns
+    /// Type: `Effect<crate::PoolEndStatus, SharedValue<E>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn shutdown<R: Send + Sync + 'static>(
         &self,
     ) -> Effect<crate::PoolEndStatus, SharedValue<E>, R> {

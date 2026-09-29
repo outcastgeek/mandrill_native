@@ -1,3 +1,12 @@
+//! Tracing-backed logging and span adapters.
+//!
+//! [`TracingBackend`] uses a caller-supplied `tracing::Dispatch`, active-span
+//! capacity, and `Diagnostics` service. Construct its logger and tracer, then
+//! expose them through the application's `HasLogger` and `HasTracer`
+//! capabilities. Effect carries span context through execution; this adapter
+//! sends events to the selected dispatcher without installing a global
+//! subscriber. Redaction runs before events reach the backend.
+
 use effect::{
     Annotations, Defect, Diagnostics, LogLevel, Logger, SpanFinish, SpanId, SpanStart, Tracer,
 };
@@ -5,6 +14,7 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 #[derive(Clone)]
+/// Adapter that emits Effect telemetry through the `tracing` subscriber.
 pub struct TracingBackend {
     spans: Arc<Mutex<HashMap<SpanId, tracing::Span>>>,
     dispatch: tracing::Dispatch,
@@ -13,6 +23,14 @@ pub struct TracingBackend {
 }
 impl TracingBackend {
     #[must_use]
+    /// Retain the selected dispatcher and bound the number of tracked spans.
+    /// # Parameters
+    /// - `dispatch` (`tracing::Dispatch`): The dispatch supplied to this operation.
+    /// - `capacity` (`NonZeroUsize`): The caller-supplied capacity bound.
+    /// - `diagnostics` (`Diagnostics`): Separate sink for instrumentation or provider failures.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(
         dispatch: tracing::Dispatch,
         capacity: NonZeroUsize,
@@ -26,6 +44,9 @@ impl TracingBackend {
         }
     }
     #[must_use]
+    /// Count spans currently retained by this backend.
+    /// # Returns
+    /// Type: `usize`.
     pub fn active(&self) -> usize {
         self.spans
             .lock()
@@ -33,6 +54,12 @@ impl TracingBackend {
             .len()
     }
     #[must_use]
+    /// Build a tracer that redacts annotations before emitting spans.
+    /// # Parameters
+    /// - `redact` (`impl Fn(&Annotations) -> Result<Annotations, Defect> + Send + Sync + 'static`): The redact supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Tracer`.
     pub fn tracer(
         &self,
         redact: impl Fn(&Annotations) -> Result<Annotations, Defect> + Send + Sync + 'static,
@@ -50,6 +77,13 @@ impl TracingBackend {
         )
     }
     #[must_use]
+    /// Build a level-filtered logger that redacts annotations before emission.
+    /// # Parameters
+    /// - `minimum` (`LogLevel`): Lower bound enforced by this policy.
+    /// - `redact` (`impl Fn(&Annotations) -> Result<Annotations, Defect> + Send + Sync + 'static`): The redact supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Logger`.
     pub fn logger(
         &self,
         minimum: LogLevel,
@@ -82,6 +116,12 @@ impl TracingBackend {
             Ok(())
         })
     }
+    ///
+    /// # Parameters
+    /// - `info` (`&SpanStart`): The info supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Option<SpanId>, Defect>`.
     fn start(&self, info: &SpanStart) -> Result<Option<SpanId>, Defect> {
         let parent = info.parent.as_ref().and_then(|id| {
             self.spans
@@ -109,6 +149,12 @@ impl TracingBackend {
         drop(previous);
         Ok(Some(id))
     }
+    ///
+    /// # Parameters
+    /// - `info` (`&SpanFinish`): The info supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn finish(&self, info: &SpanFinish) {
         let span = self
             .spans

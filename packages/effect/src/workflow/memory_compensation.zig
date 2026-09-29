@@ -6,6 +6,10 @@ const outcomes = @import("../outcome.zig");
 const types = @import("workflow_types.zig");
 const compensation = @import("compensation.zig");
 
+/// Construct an in-memory compensation provider with caller-owned runtime resources.
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): in-memory provider for recorded compensation steps and their resolution.
 pub fn MemoryCompensation(comptime R: type) type {
     return struct {
         const Self = @This();
@@ -38,6 +42,11 @@ pub fn MemoryCompensation(comptime R: type) type {
         items: std.array_list.Managed(Item),
         closed: bool = false,
 
+        /// Create an in-memory compensation journal using the caller environment.
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Self`): a compensation journal bound to the supplied environment.
         pub fn init(env: *const R) Self {
             if (R == void or !@hasField(R, "allocator") or @FieldType(R, "allocator") != std.mem.Allocator)
                 @compileError("memory compensation requires caller allocator in R");
@@ -46,6 +55,10 @@ pub fn MemoryCompensation(comptime R: type) type {
             return .{ .allocator = env.allocator, .io = env.io, .items = std.array_list.Managed(Item).init(env.allocator) };
         }
 
+        /// Expose this implementation through its capability interface.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`Journal`): A capability adapter referencing the selected implementation; keep its backing state alive while in use.
         pub fn capability(self: *Self) Journal {
             return Journal.fromProvider(self, &.{ .register = registerEffect, .lookup = lookupEffect, .record = recordEffect, .pending_reverse = pendingEffect });
         }
@@ -216,12 +229,20 @@ pub fn MemoryCompensation(comptime R: type) type {
             }, .allocator = allocator }, .more = more } };
         }
 
+        /// Stop the capability and release its retained resources.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn shutdown(self: *Self) void {
             self.mutex.lockUncancelable(self.io);
             self.closed = true;
             self.mutex.unlock(self.io);
         }
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             self.shutdown();
             for (self.items.items) |*item| item.deinit();

@@ -1,3 +1,5 @@
+//! Private Effect runtime coordination.
+
 use super::destruction::FlatDrop;
 use crate::LibraryDefect;
 use crate::{Cancellation, Defect, Effect, Exit};
@@ -7,8 +9,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
+/// Type alias for finish in internal runtime.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 pub(crate) type Finish<A, E> = FlatDrop<Box<dyn FnOnce(Exit<A, E>) -> Step + Send>>;
 
+/// Variants of step used by internal runtime.
 pub(crate) enum Step {
     Done,
     More(FlatDrop<Box<dyn FnOnce() -> Step + Send>>),
@@ -17,6 +25,7 @@ pub(crate) enum Step {
 }
 
 #[derive(Clone)]
+/// Typed context used by internal runtime.
 pub(crate) struct Context {
     pub(crate) cancellation: Cancellation,
     origin: Arc<FailureOrigin>,
@@ -24,6 +33,7 @@ pub(crate) struct Context {
     clock_frontier: ClockFrontier,
 }
 
+/// Typed failure origin used by internal runtime.
 struct FailureOrigin {
     protected: AtomicBool,
     fiber: bool,
@@ -31,6 +41,9 @@ struct FailureOrigin {
 }
 
 impl FailureOrigin {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     const fn root() -> Self {
         Self {
             protected: AtomicBool::new(false),
@@ -41,20 +54,28 @@ impl FailureOrigin {
 }
 
 #[derive(Clone)]
+/// Variants of clock frontier used by internal runtime.
 enum ClockFrontier {
     Own,
     Parent(Arc<FailureOrigin>),
 }
 
 impl Context {
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     pub(crate) fn cancelled(&self) -> bool {
         self.cancellation.is_requested()
     }
 
+    /// # Returns
+    /// Type: `()`.
     pub(crate) fn begin_operation(&self) {
         self.origin.protected.store(false, Ordering::Relaxed);
     }
 
+    /// # Returns
+    /// Type: `Self`.
     pub(crate) fn protected(&self) -> Self {
         Self {
             cancellation: Cancellation::new(),
@@ -64,6 +85,8 @@ impl Context {
         }
     }
 
+    /// # Returns
+    /// Type: `Self`.
     pub(crate) fn child(&self) -> Self {
         Self {
             cancellation: self.cancellation.child(),
@@ -79,6 +102,12 @@ impl Context {
 
     /// Parallel branches inherit whether their caller is itself a fiber; unlike
     /// a scoped fork they do not create a new fiber failure-publication boundary.
+    ///
+    /// # Parameters
+    /// - `cancellation` (`Cancellation`): The cancellation token for this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub(crate) fn parallel(&self, cancellation: Cancellation) -> Self {
         Self {
             cancellation,
@@ -92,27 +121,55 @@ impl Context {
         }
     }
 
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     pub(crate) fn was_protected(&self) -> bool {
         self.origin.protected.load(Ordering::Relaxed)
     }
 
+    ///
+    /// # Returns
+    /// Type: `&Arc<FailureOrigin>`.
     fn clock_origin(&self) -> &Arc<FailureOrigin> {
         match &self.clock_frontier {
             ClockFrontier::Own => &self.origin,
             ClockFrontier::Parent(origin) => origin,
         }
     }
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn acknowledge_clock(&self) {
         self.clock_origin().frontier.acknowledge();
     }
+    /// # Parameters
+    /// - `tick` (`crate::ClockTick`): The tick supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `()`.
     pub(crate) fn clock_tick(&self, tick: crate::ClockTick) {
         self.clock_origin().frontier.retain(tick);
     }
 
+    /// # Parameters
+    /// - `protected` (`bool`): The protected supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `()`.
     pub(crate) fn inherit_protection(&self, protected: bool) {
         self.origin.protected.store(protected, Ordering::Relaxed);
     }
 
+    /// # Type parameters
+    /// - `A`: Application value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `outcome` (`&Exit<A, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+    ///
+    /// # Returns
+    /// Type: `()`.
     pub(crate) fn record_protected_failure<A, E>(&self, outcome: &Exit<A, E>) {
         self.origin
             .protected
@@ -120,10 +177,25 @@ impl Context {
     }
 }
 
+/// # Parameters
+/// - `next` (`impl FnOnce() -> Step + Send + 'static`): Next value or state produced by the transition.
+///
+/// # Returns
+/// Type: `Step`.
 pub(crate) fn more(next: impl FnOnce() -> Step + Send + 'static) -> Step {
     Step::More(FlatDrop::new(Box::new(next)))
 }
 
+/// # Type parameters
+/// - `A`: Application value type. Bounds: `Send + 'static`.
+/// - `E`: Domain-error type. Bounds: `Send + 'static`.
+///
+/// # Parameters
+/// - `callback` (`Finish<A, E>`): The callback invoked by this operation.
+/// - `outcome` (`Exit<A, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+///
+/// # Returns
+/// Type: `Step`.
 pub(crate) fn finish<A: Send + 'static, E: Send + 'static>(
     callback: Finish<A, E>,
     outcome: Exit<A, E>,
@@ -134,12 +206,31 @@ pub(crate) fn finish<A: Send + 'static, E: Send + 'static>(
     })
 }
 
+/// # Type parameters
+/// - `A`: Application value type. Bounds: `Send + 'static`.
+/// - `E`: Domain-error type. Bounds: `Send + 'static`.
+///
+/// # Parameters
+/// - `callback` (`impl FnOnce(Exit<A, E>) -> Step + Send + 'static`): The callback invoked by this operation.
+///
+/// # Returns
+/// Type: `Finish<A, E>`.
 pub(crate) fn continuation<A: Send + 'static, E: Send + 'static>(
     callback: impl FnOnce(Exit<A, E>) -> Step + Send + 'static,
 ) -> Finish<A, E> {
     FlatDrop::new(Box::new(callback))
 }
 
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
+///
+/// # Parameters
+/// - `outcome` (`Exit<A, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+/// - `context` (`&Context`): Execution context carrying cancellation, scope, and trace state.
+///
+/// # Returns
+/// Type: `Exit<A, E>`.
 pub(crate) fn publish<A, E>(outcome: Exit<A, E>, context: &Context) -> Exit<A, E> {
     if !context.cancelled() {
         return outcome;
@@ -158,6 +249,18 @@ pub(crate) fn publish<A, E>(outcome: Exit<A, E>, context: &Context) -> Exit<A, E
     }
 }
 
+/// # Type parameters
+/// - `A`: Application value type. Additional bound: `Send + 'static`.
+/// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type. Additional bound: `Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `program` (`Effect<A, E, R>`): Lazy Effect description executed or transformed here.
+/// - `env` (`Arc<R>`): The environment supplying this operation's capabilities.
+/// - `cancellation` (`Cancellation`): The cancellation token for this operation.
+///
+/// # Returns
+/// Type: `Exit<A, E>`.
 pub(crate) async fn evaluate<A, E, R>(
     program: Effect<A, E, R>,
     env: Arc<R>,
@@ -177,6 +280,18 @@ where
     evaluate_context(program, env, &context).await
 }
 
+/// # Type parameters
+/// - `A`: Application value type. Additional bound: `Send + 'static`.
+/// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type. Additional bound: `Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `program` (`Effect<A, E, R>`): Lazy Effect description executed or transformed here.
+/// - `env` (`Arc<R>`): The environment supplying this operation's capabilities.
+/// - `context` (`&Context`): Execution context carrying cancellation, scope, and trace state.
+///
+/// # Returns
+/// Type: `Exit<A, E>`.
 pub(crate) async fn evaluate_context<A, E, R>(
     program: Effect<A, E, R>,
     env: Arc<R>,
@@ -190,6 +305,18 @@ where
     evaluate_inner(program, env, context, Publication::Publish).await
 }
 
+/// # Type parameters
+/// - `A`: Application value type. Bounds: `Send + 'static`.
+/// - `E`: Domain-error type. Bounds: `Send + 'static`.
+/// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `program` (`Effect<A, E, R>`): Lazy Effect description executed or transformed here.
+/// - `env` (`Arc<R>`): The environment supplying this operation's capabilities.
+/// - `context` (`&Context`): Execution context carrying cancellation, scope, and trace state.
+///
+/// # Returns
+/// Type: `Exit<A, E>`.
 pub(crate) async fn evaluate_raw<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static>(
     program: Effect<A, E, R>,
     env: Arc<R>,
@@ -199,6 +326,18 @@ pub(crate) async fn evaluate_raw<A: Send + 'static, E: Send + 'static, R: Send +
 }
 // A composed workflow owns the continuation after this sub-interpreter's Done.
 // Native waits still acknowledge virtual time; a local bind completion does not.
+/// # Type parameters
+/// - `A`: Application value type. Bounds: `Send + 'static`.
+/// - `E`: Domain-error type. Bounds: `Send + 'static`.
+/// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `program` (`Effect<A, E, R>`): Lazy Effect description executed or transformed here.
+/// - `env` (`Arc<R>`): The environment supplying this operation's capabilities.
+/// - `context` (`&Context`): Execution context carrying cancellation, scope, and trace state.
+///
+/// # Returns
+/// Type: `Exit<A, E>`.
 pub(crate) async fn evaluate_composed<
     A: Send + 'static,
     E: Send + 'static,
@@ -210,11 +349,27 @@ pub(crate) async fn evaluate_composed<
 ) -> Exit<A, E> {
     evaluate_inner(program, env, context, Publication::Continue).await
 }
+/// Variants of publication used by internal runtime.
 enum Publication {
     Publish,
     Raw,
     Continue,
 }
+///
+/// # Type parameters
+/// - `A`: Bounds: `Send + 'static`.
+/// - `E`: Bounds: `Send + 'static`.
+/// - `R`: Bounds: `Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `program` (`Effect<A, E, R>`): Lazy Effect description executed or transformed here.
+/// - `env` (`Arc<R>`): The environment supplying this operation's capabilities.
+/// - `context` (`&Context`): Execution context carrying cancellation, scope, and trace state.
+/// - `publication` (`Publication`): The publication supplied to this operation.
+///
+/// # Returns
+/// Type: `Exit<A, E>`.
+/// Returns `Exit<A, E>`.
 async fn evaluate_inner<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static>(
     program: Effect<A, E, R>,
     env: Arc<R>,

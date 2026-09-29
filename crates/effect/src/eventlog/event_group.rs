@@ -1,11 +1,18 @@
+//! Registration of distinct event tags and versions.
+
 use super::{EventDefinition, EventGroupId, EventTag, EventVersion};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// An invalid stable group identity or incompatible group definition.
 pub enum EventGroupError {
+    /// The group differs from the required or recorded value.
     GroupMismatch,
+    /// The tag already exists or occurred twice.
     DuplicateTag {
+        /// The event or protocol tag. Type: `EventTag`.
         tag: EventTag,
+        /// The declared compatibility version. Type: `EventVersion`.
         version: EventVersion,
     },
 }
@@ -17,6 +24,12 @@ pub struct EventGroup {
 }
 
 impl EventGroup {
+    ///
+    /// # Parameters
+    /// - `id` (`EventGroupId`): Stable identity of the selected record or operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn empty(id: EventGroupId) -> Self {
         Self {
             id,
@@ -24,6 +37,19 @@ impl EventGroup {
         }
     }
 
+    /// Derive the stable group identity from a registered event definition.
+    ///
+    /// # Type parameters
+    /// - `P`: Payload type.
+    /// - `A`: Application value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `id` (`EventGroupId`): Stable identity of the selected record or operation.
+    /// - `first` (`&EventDefinition<P, A, E>`): First value or branch in the ordered composition.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, EventGroupError>`.
     pub fn from_event<P, A, E>(
         id: EventGroupId,
         first: &EventDefinition<P, A, E>,
@@ -33,6 +59,18 @@ impl EventGroup {
         Ok(group)
     }
 
+    /// Register the supplied definition, rejecting an identity or compatibility conflict.
+    ///
+    /// # Type parameters
+    /// - `P`: Payload type.
+    /// - `A`: Application value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `definition` (`&EventDefinition<P, A, E>`): The typed definition used by this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<(), EventGroupError>`.
     pub fn register<P, A, E>(
         &mut self,
         definition: &EventDefinition<P, A, E>,
@@ -51,11 +89,24 @@ impl EventGroup {
     }
 
     #[must_use]
+    /// Return the stable identity associated with this value.
+    ///
+    /// # Returns
+    /// Type: `&EventGroupId`.
     pub fn id(&self) -> &EventGroupId {
         &self.id
     }
 
     #[must_use]
+    /// Check whether the selected identity or value is present.
+    ///
+    /// # Parameters
+    /// - `tag` (`&EventTag`): The tag supplied to this operation.
+    /// - `version` (`EventVersion`): Registered schema, event, or workflow compatibility version.
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     pub fn contains(&self, tag: &EventTag, version: EventVersion) -> bool {
         self.events.contains_key(&(tag.clone(), version))
     }

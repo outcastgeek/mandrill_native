@@ -5,6 +5,11 @@ const deadlines = @import("../deadline.zig");
 const clock = @import("durable_clock.zig");
 const workflow = @import("workflow_types.zig");
 
+/// Construct an in-memory durable clock provider with caller-owned runtime resources.
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `now: comptime fn (*const R) deadlines.WallInstant`: Compile-time caller-supplied time or cursor boundary used for ordering and retention.
+/// Returns (`type`): in-memory provider for durable workflow clock state.
 pub fn MemoryDurableClock(comptime R: type, comptime now: fn (*const R) deadlines.WallInstant) type {
     return struct {
         const Self = @This();
@@ -40,6 +45,11 @@ pub fn MemoryDurableClock(comptime R: type, comptime now: fn (*const R) deadline
         items: std.array_list.Managed(Item),
         closed: bool = false,
 
+        /// Create an in-memory workflow clock provider using the caller environment.
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Self`): a clock provider bound to the supplied environment.
         pub fn init(env: *const R) Self {
             if (R == void or !@hasField(R, "allocator") or @FieldType(R, "allocator") != std.mem.Allocator)
                 @compileError("memory durable clock requires caller allocator in R");
@@ -48,6 +58,10 @@ pub fn MemoryDurableClock(comptime R: type, comptime now: fn (*const R) deadline
             return .{ .allocator = env.allocator, .io = env.io, .items = std.array_list.Managed(Item).init(env.allocator) };
         }
 
+        /// Expose this implementation through its capability interface.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`Store`): A capability adapter referencing the selected implementation; keep its backing state alive while in use.
         pub fn capability(self: *Self) Store {
             return Store.fromProvider(self, &.{ .schedule = scheduleEffect, .cancel = cancelEffect, .claim_due = claimEffect, .acknowledge = ackEffect });
         }
@@ -226,6 +240,10 @@ pub fn MemoryDurableClock(comptime R: type, comptime now: fn (*const R) deadline
             return .{ .success = .acknowledged };
         }
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             self.mutex.lockUncancelable(self.io);
             self.closed = true;

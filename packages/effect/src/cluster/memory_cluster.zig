@@ -6,6 +6,11 @@ const deadlines = @import("../deadline.zig");
 const capabilities = @import("cluster_capabilities.zig");
 const messages = @import("message_store.zig");
 
+/// Construct an in-memory ownership provider with caller-owned runtime resources.
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `now: comptime fn (*const R) deadlines.WallInstant`: Compile-time caller-supplied time or cursor boundary used for ordering and retention.
+/// Returns (`type`): in-memory ownership provider used to acquire, renew, and release entity leases.
 pub fn MemoryOwnership(comptime R: type, comptime now: fn (*const R) deadlines.WallInstant) type {
     return struct {
         const Self = @This();
@@ -43,6 +48,11 @@ pub fn MemoryOwnership(comptime R: type, comptime now: fn (*const R) deadlines.W
         items: std.array_list.Managed(Item),
         closed: bool = false,
 
+        /// Create an in-memory cluster provider using the caller environment.
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Self`): a cluster provider whose state is owned by this instance.
         pub fn init(env: *const R) Self {
             if (R == void or !@hasField(R, "allocator") or @FieldType(R, "allocator") != std.mem.Allocator)
                 @compileError("memory cluster ownership requires caller allocator in R");
@@ -51,12 +61,20 @@ pub fn MemoryOwnership(comptime R: type, comptime now: fn (*const R) deadlines.W
             return .{ .allocator = env.allocator, .io = env.io, .items = std.array_list.Managed(Item).init(env.allocator) };
         }
 
+        /// Expose this implementation through its capability interface.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`Service`): A capability adapter referencing the selected implementation; keep its backing state alive while in use.
         pub fn capability(self: *Self) Service {
             return Service.fromProvider(self, &.{ .acquire = acquireEffect, .renew = renewEffect, .release = releaseEffect, .read = readEffect });
         }
 
         /// Borrowed by a message store. This owner must outlive that store;
         /// every held guard is released before either provider is destroyed.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`capabilities.Fence`): The ownership fence to validate before a transition.
         pub fn fence(self: *Self) capabilities.Fence {
             return .{ .userdata = self, .enter = enterFence };
         }
@@ -252,12 +270,20 @@ pub fn MemoryOwnership(comptime R: type, comptime now: fn (*const R) deadlines.W
                 return .{ .die = outcomes.Defect.out_of_memory } };
         }
 
+        /// Stop the capability and release its retained resources.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn shutdown(self: *Self) void {
             self.mutex.lockUncancelable(self.io);
             self.closed = true;
             self.mutex.unlock(self.io);
         }
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             self.shutdown();
             for (self.items.items) |*item| item.deinit();

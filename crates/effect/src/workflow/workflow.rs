@@ -1,3 +1,5 @@
+//! Workflow registration, replay, and typed handles.
+
 use super::{
     Durable, HasWorkflowEngine, WorkflowCodecError, WorkflowDefinition, WorkflowEngine,
     WorkflowHandle, WorkflowRunId, WorkflowStatus,
@@ -5,28 +7,67 @@ use super::{
 use crate::{Effect, PrimaryOutcomeRef, Release};
 use std::sync::{Arc, Mutex};
 
+/// The selected engine's error type remains part of the environment contract.
+///
+/// # Type parameters
+/// - `R`: Environment type.
 type EngineError<R> = <<R as HasWorkflowEngine>::Engine as WorkflowEngine>::Error;
 
+/// The typed status or terminal value returned when executing a workflow definition.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 pub enum WorkflowRunResult<A, E> {
+    /// The operation completed and its outcome is available. Carries `Result<A, E>`.
     Completed(Result<A, E>),
+    /// The requested work is already in progress.
     Busy,
+    /// The operation is ready to continue.
     Ready,
+    /// Execution is suspended until a durable wakeup.
     Suspended,
+    /// Execution was cancelled.
     Cancelled,
+    /// The owner was lost before the operation settled.
     Abandoned,
 }
 
+/// One replayable coordination operation in a durable workflow.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 pub enum WorkflowStep<A, E> {
+    /// The operation completed and its outcome is available. Carries `Result<A, E>`.
     Completed(Result<A, E>),
+    /// Execution is suspended until a durable wakeup.
     Suspended,
 }
 
 /// A registered definition together with its durable coordination body.
 /// The input is moved into execution; replay decodes a fresh value from the
 /// engine's recorded bytes, so callers never need to clone application data.
+/// The body is dispatched through a local Rust vtable. Replay restores data
+/// and re-enters registered code; it never persists the closure or vtable.
+///
+/// # Type parameters
+/// - `I`: Input type.
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
+/// - `BodyError`: Error produced by the registered workflow body.
+/// - `R`: Environment type.
 type TypedWorkflowBody<I, A, E, BodyError, R> =
     dyn Fn(I) -> Durable<Result<A, E>, BodyError, R> + Send + Sync;
 
+/// Binds a typed workflow definition to its durable execution body.
+///
+/// # Type parameters
+/// - `I`: Input type.
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
+/// - `BodyError`: Error type produced by the workflow body.
+/// - `R`: Environment type.
 pub struct TypedWorkflowDefinition<I, A, E, BodyError, R>
 where
     I: Send + 'static,
@@ -35,6 +76,7 @@ where
     BodyError: Send + 'static,
     R: HasWorkflowEngine + Send + Sync + 'static,
 {
+    /// Registered workflow identity and input/output codecs. Type: `WorkflowDefinition<I, A, E>`.
     pub definition: WorkflowDefinition<I, A, E>,
     body: Arc<TypedWorkflowBody<I, A, E, BodyError, R>>,
 }
@@ -47,6 +89,21 @@ where
     BodyError: Send + 'static,
     R: HasWorkflowEngine + Send + Sync + 'static,
 {
+    /// Construct a `TypedWorkflowDefinition` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `BodyError`: Error produced by the registered workflow body.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `I`: Input type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `definition` (`WorkflowDefinition<I, A, E>`): The typed definition used by this operation.
+    /// - `body` (`impl Fn(I) -> Durable<Result<A, E>, BodyError, R> + Send + Sync + 'static`): Application callback or effect executed inside the owning scope.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(
         definition: WorkflowDefinition<I, A, E>,
         body: impl Fn(I) -> Durable<Result<A, E>, BodyError, R> + Send + Sync + 'static,
@@ -57,6 +114,22 @@ where
         }
     }
 
+    /// Execute or describe one run using the supplied environment and inputs.
+    ///
+    /// # Type parameters
+    /// - `BodyError`: Error produced by the registered workflow body.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `I`: Input type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `input` (`I`): The input value or factory consumed by this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<WorkflowRunResult<A, E>, WorkflowRunError<EngineError<R>, BodyError>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn run(
         &self,
         run: WorkflowRunId,
@@ -69,25 +142,46 @@ where
 }
 
 #[derive(Debug)]
+/// An engine, body, codec, or replay mismatch failure for a workflow run.
+///
+/// # Type parameters
+/// - `EngineError`: Error returned by the workflow engine.
+/// - `BodyError`: Error produced by the registered workflow body.
 pub enum WorkflowRunError<EngineError, BodyError> {
+    /// The workflow engine failed while recording or replaying the run.
     Engine(EngineError),
+    /// The registered workflow body failed.
     Body(BodyError),
+    /// Encoding or decoding workflow data failed.
     Codec(WorkflowCodecError),
+    /// Reconstructing or resuming recorded workflow state failed.
     Recovery {
+        /// Application body invoked by this definition. Type: `Option<BodyError>`.
         body: Option<BodyError>,
+        /// The underlying failure or provider cause. Type: `EngineError`.
         source: EngineError,
     },
+    /// The recovery transition differs from the required or recorded value.
     RecoveryTransitionMismatch {
+        /// Application body invoked by this definition. Type: `Option<BodyError>`.
         body: Option<BodyError>,
     },
+    /// Completion may have committed; the recorded outcome could not be confirmed.
     UncertainCompletion {
+        /// Stable identity of the workflow run. Type: `WorkflowRunId`.
         run: WorkflowRunId,
+        /// The underlying failure or provider cause. Type: `EngineError`.
         source: EngineError,
     },
+    /// The started run differs from the required or recorded value.
     StartedRunMismatch,
+    /// The running transition differs from the required or recorded value.
     RunningTransitionMismatch,
+    /// The recorded completion differs from the value produced during replay.
     RecordedCompletionMismatch,
+    /// An owned input was already consumed.
     InputConsumed,
+    /// A workflow suspended on a step absent from its registered definition.
     UnregisteredSuspension,
 }
 
@@ -95,6 +189,22 @@ impl<I: Send + 'static, A: Send + 'static, E: Send + 'static> WorkflowDefinition
     /// Register, start or resume, and execute this definition without a
     /// Cluster dependency. The engine is the sole execution-record authority.
     /// Activities invoked by `body` consult that same engine for replay.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Additional bound: `HasWorkflowEngine + Send + Sync + 'static`.
+    /// - `BodyError`: Error produced by the registered workflow body. Additional bound: `Send + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `I`: Input type.
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `input` (`I`): The input value or factory consumed by this operation.
+    /// - `body` (`impl Fn(I) -> Durable<Result<A, E>, BodyError, R> + Send + Sync + 'static`): Application callback or effect executed inside the owning scope.
+    ///
+    /// # Returns
+    /// Type: `Effect<WorkflowRunResult<A, E>, WorkflowRunError<EngineError<R>, BodyError>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn execute<R, BodyError>(
         &self,
         run: WorkflowRunId,
@@ -113,6 +223,22 @@ impl<I: Send + 'static, A: Send + 'static, E: Send + 'static> WorkflowDefinition
     /// A suspended step leaves its activities and signals recorded without
     /// writing a terminal result. A later signal or deadline can mark it
     /// ready for deterministic coordination replay.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Additional bound: `HasWorkflowEngine + Send + Sync + 'static`.
+    /// - `BodyError`: Error produced by the registered workflow body. Additional bound: `Send + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `I`: Input type.
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `input` (`I`): The input value or factory consumed by this operation.
+    /// - `body` (`impl Fn(I) -> Durable<WorkflowStep<A, E>, BodyError, R> + Send + Sync + 'static`): Application callback or effect executed inside the owning scope.
+    ///
+    /// # Returns
+    /// Type: `Effect<WorkflowRunResult<A, E>, WorkflowRunError<EngineError<R>, BodyError>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn execute_resumable<R, BodyError>(
         &self,
         run: WorkflowRunId,

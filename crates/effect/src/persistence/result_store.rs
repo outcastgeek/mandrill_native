@@ -1,3 +1,5 @@
+//! Typed stored outcomes over encoded key-value operations.
+
 use super::{
     CompareExchange, ConditionalKeyValueStore, HasKeyValueStore, KeyValueStore, Persistable,
     PersistedRecordError, PersistenceError, PersistenceMutation, StoreRead, StoreRevision,
@@ -6,7 +8,17 @@ use super::{
 use crate::{Effect, KeyDomain, StoredOutcome, UtcMillis};
 use std::sync::Arc;
 
+/// Type alias for backend error in persistence result store.
+///
+/// # Type parameters
+/// - `R`: Environment type.
 type BackendError<R> = <<R as HasKeyValueStore>::Store as KeyValueStore>::Error;
+/// Type alias for stored read many effect in persistence result store.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
+/// - `R`: Environment type.
 pub type StoredReadManyEffect<A, E, R> = Effect<
     Vec<Result<StoredLookup<A, E>, PersistenceError<BackendError<R>>>>,
     PersistenceError<BackendError<R>>,
@@ -16,18 +28,43 @@ pub type StoredReadManyEffect<A, E, R> = Effect<
 /// A read does not collapse absence, expiry, corruption, and provider failure.
 /// Corruption and provider failure use the Effect error channel.
 #[derive(Debug)]
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 pub enum StoredLookup<A, E> {
+    /// No matching value exists.
     Missing,
+    /// The value exists but has passed its expiry instant.
     Expired {
+        /// The recorded storage revision. Type: `StoreRevision`.
         revision: StoreRevision,
+        /// The time at which the expires occurred. Type: `UtcMillis`.
         expires_at: UtcMillis,
     },
+    /// A matching value was found.
     Found {
+        /// The recorded storage revision. Type: `StoreRevision`.
         revision: StoreRevision,
+        /// The recorded outcome of this operation. Type: `StoredOutcome<A, E>`.
         outcome: StoredOutcome<A, E>,
     },
 }
 
+///
+/// # Type parameters
+/// - `I`: Workflow or codec input type.
+/// - `A`: Bounds: `Send + 'static`.
+/// - `E`: Bounds: `Send + 'static`.
+/// - `D`: Bounds: `KeyDomain`.
+/// - `Backend`: Backend-specific error or provider type.
+///
+/// # Parameters
+/// - `definition` (`&Persistable<I, A, E, D>`): The definition supplied to this operation.
+/// - `read` (`StoreRead`): The read supplied to this operation.
+///
+/// # Returns
+/// Type: `Result<StoredLookup<A, E>, PersistenceError<Backend>>`.
 fn decode_entry<I, A: Send + 'static, E: Send + 'static, D: KeyDomain, Backend>(
     definition: &Persistable<I, A, E, D>,
     read: StoreRead,
@@ -72,6 +109,22 @@ fn decode_entry<I, A: Send + 'static, E: Send + 'static, D: KeyDomain, Backend>(
 
 /// Read a typed record using only the store supplied by R. The input factory
 /// supplies an owned request for each run; no request or outcome Clone is needed.
+///
+/// # Type parameters
+/// - `R`: Environment type. Additional bound: `HasKeyValueStore + Send + Sync + 'static`.
+/// - `I`: Input type. Additional bound: `Send + 'static`.
+/// - `A`: Application value type. Additional bound: `Send + 'static`.
+/// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+/// - `D`: Identity-domain type. Additional bound: `KeyDomain`.
+///
+/// # Parameters
+/// - `definition` (`Persistable<I, A, E, D>`): The typed definition used by this operation.
+/// - `input` (`impl Fn() -> I + Send + Sync + 'static`): The input value or factory consumed by this operation.
+/// - `now` (`UtcMillis`): The caller-supplied current time.
+///
+/// # Returns
+/// Type: `Effect<StoredLookup<A, E>, PersistenceError<<<R as HasKeyValueStore>::Store as KeyValueStore>::Error>, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 pub fn read<R, I, A, E, D>(
     definition: Persistable<I, A, E, D>,
     input: impl Fn() -> I + Send + Sync + 'static,
@@ -113,6 +166,21 @@ where
 /// Batch reads preserve request order and key association. Identity, backend
 /// and decode failures remain at their respective result slots; a malformed
 /// batch response or unavailable batch is an outer failure.
+///
+/// # Type parameters
+/// - `R`: Environment type. Additional bound: `HasKeyValueStore + Send + Sync + 'static`.
+/// - `I`: Input type. Additional bound: `Send + 'static`.
+/// - `A`: Application value type. Additional bound: `Send + 'static`.
+/// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+/// - `D`: Identity-domain type. Additional bound: `KeyDomain`.
+///
+/// # Parameters
+/// - `definition` (`Persistable<I, A, E, D>`): The typed definition used by this operation.
+/// - `inputs` (`impl Fn() -> Vec<I> + Send + Sync + 'static`): The inputs supplied to this operation.
+/// - `now` (`UtcMillis`): The caller-supplied current time.
+///
+/// # Returns
+/// Type: `StoredReadManyEffect<A, E, R>`.
 pub fn read_many<R, I, A, E, D>(
     definition: Persistable<I, A, E, D>,
     inputs: impl Fn() -> Vec<I> + Send + Sync + 'static,
@@ -190,6 +258,23 @@ where
 /// A write error from the provider is uncertain because the provider may have
 /// committed before its acknowledgement was lost. Identity/codec errors occur
 /// before submission and remain distinguishable.
+///
+/// # Type parameters
+/// - `R`: Environment type. Additional bound: `HasKeyValueStore + Send + Sync + 'static`.
+/// - `I`: Input type. Additional bound: `Send + 'static`.
+/// - `A`: Application value type. Additional bound: `Send + 'static`.
+/// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+/// - `D`: Identity-domain type. Additional bound: `KeyDomain`.
+///
+/// # Parameters
+/// - `definition` (`Persistable<I, A, E, D>`): The typed definition used by this operation.
+/// - `input` (`impl Fn() -> I + Send + Sync + 'static`): The input value or factory consumed by this operation.
+/// - `outcome` (`impl Fn() -> StoredOutcome<A, E> + Send + Sync + 'static`): Complete terminal outcome, including expected errors and cleanup failures.
+/// - `expires_at` (`Option<UtcMillis>`): The optional expiry instant.
+///
+/// # Returns
+/// Type: `Effect<StoreRevision, PersistenceError<<<R as HasKeyValueStore>::Store as KeyValueStore>::Error>, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 pub fn write<R, I, A, E, D>(
     definition: Persistable<I, A, E, D>,
     input: impl Fn() -> I + Send + Sync + 'static,
@@ -268,6 +353,22 @@ where
     })
 }
 
+/// Remove the selected entry through this collection or store contract.
+///
+/// # Type parameters
+/// - `R`: Environment type. Additional bound: `HasKeyValueStore + Send + Sync + 'static`.
+/// - `I`: Input type. Additional bound: `Send + 'static`.
+/// - `A`: Application value type. Additional bound: `Send + 'static`.
+/// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+/// - `D`: Identity-domain type. Additional bound: `KeyDomain`.
+///
+/// # Parameters
+/// - `definition` (`Persistable<I, A, E, D>`): The typed definition used by this operation.
+/// - `input` (`impl Fn() -> I + Send + Sync + 'static`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `Effect<bool, PersistenceError<<<R as HasKeyValueStore>::Store as KeyValueStore>::Error>, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 pub fn remove<R, I, A, E, D>(
     definition: Persistable<I, A, E, D>,
     input: impl Fn() -> I + Send + Sync + 'static,
@@ -307,6 +408,18 @@ where
 /// Conditional mutation is available only when R's store supplies the
 /// stronger per-key compare-and-exchange guarantee. A plain key/value store
 /// cannot acquire it through a callback or name alone.
+///
+/// # Type parameters
+/// - `R`: Environment type. Additional bound: `HasKeyValueStore + Send + Sync + 'static`. Additional bound: `:Store: ConditionalKeyValueStore`.
+///
+/// # Parameters
+/// - `key` (`Arc<[u8]>`): Stable key used to locate or identify the selected value.
+/// - `expected` (`Option<StoreRevision>`): Value or revision required for the proposed state transition.
+/// - `replacement` (`Option<StoredValue>`): The replacement supplied to this operation.
+///
+/// # Returns
+/// Type: `Effect<CompareExchange, PersistenceError<<<R as HasKeyValueStore>::Store as KeyValueStore>::Error>, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 pub fn compare_exchange<R>(
     key: Arc<[u8]>,
     expected: Option<StoreRevision>,

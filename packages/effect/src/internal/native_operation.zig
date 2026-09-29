@@ -1,3 +1,4 @@
+//! Internal bridge from a cancellation token to one native I/O operation.
 const diagnostics = @import("diagnostics.zig");
 const std = @import("std");
 const outcomes = @import("../outcome.zig");
@@ -5,6 +6,13 @@ const Cancellation = @import("runtime.zig").Cancellation;
 
 /// Bridge a logical token to a native I/O operation without sharing Future
 /// ownership. Only this invocation awaits/cancels its own Future.
+///
+/// Parameters:
+/// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected capabilities.
+/// - `capture: anytype`: Statically inferred input checked when this operation is instantiated.
+/// - `token: ?*const Cancellation`: Cancellation token observed by this operation; its owner must outlive pending work.
+/// - `callback: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where static.
+/// Returns (`@typeInfo(@TypeOf(callback)).@"fn".return_type.?`): The exact result type inferred from the supplied typed callback.
 pub fn run(env: anytype, capture: anytype, token: ?*const Cancellation, comptime callback: anytype) @typeInfo(@TypeOf(callback)).@"fn".return_type.? {
     const Exit = @typeInfo(@TypeOf(callback)).@"fn".return_type.?;
     const Task = struct {

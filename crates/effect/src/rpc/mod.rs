@@ -1,3 +1,13 @@
+//! Typed unary and streaming RPC protocols.
+//!
+//! [`RpcOperation`] pairs a stable operation identity and version with separate
+//! request, success, and domain-error codecs. Protocols register typed handlers;
+//! framing and envelopes turn those calls into bounded encoded messages.
+//! Malformed input, unknown operations, domain failures, and backend failures
+//! remain distinguishable. Streaming requires acknowledgement before pulling
+//! the next item. The transport and any runtime remain capabilities supplied
+//! by the caller's environment.
+
 mod client;
 mod definition;
 mod envelope;

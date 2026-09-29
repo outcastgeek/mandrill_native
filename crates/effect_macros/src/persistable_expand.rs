@@ -1,8 +1,17 @@
+//! Expansion of typed persistable record declarations.
+
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
 use syn::{Expr, Ident, Token, Type};
 
+///
+/// # Parameters
+/// - `input` (`ParseStream<'_>`): Owned input decoded or consumed by this operation.
+/// - `expected` (`&str`): Value or revision required for the proposed state transition.
+///
+/// # Returns
+/// Type: `syn::Result<()>`.
 fn label(input: ParseStream<'_>, expected: &str) -> syn::Result<()> {
     let name: Ident = input.parse()?;
     if name != expected {
@@ -15,6 +24,7 @@ fn label(input: ParseStream<'_>, expected: &str) -> syn::Result<()> {
     Ok(())
 }
 
+/// Typed persistable input used by persistable expand.
 pub(crate) struct PersistableInput {
     namespace: Expr,
     request: Type,
@@ -25,6 +35,12 @@ pub(crate) struct PersistableInput {
 }
 
 impl Parse for PersistableInput {
+    ///
+    /// # Parameters
+    /// - `input` (`ParseStream<'_>`): Owned input decoded or consumed by this operation.
+    ///
+    /// # Returns
+    /// Type: `syn::Result<Self>`.
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         label(input, "namespace")?;
         let namespace = input.parse()?;
@@ -60,6 +76,11 @@ impl Parse for PersistableInput {
     }
 }
 
+/// # Parameters
+/// - `input` (`PersistableInput`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn expand(input: PersistableInput) -> syn::Result<TokenStream> {
     let effect = crate::expand::effect_crate_path()?;
     let PersistableInput {

@@ -1,3 +1,5 @@
+//! Volatile key-value store operations.
+
 use super::super::{
     BatchReadItem, CompareExchange, ConditionalKeyValueStore, KeyValueStore, MemoryStoreError,
     StoreCapacity, StoreEntry, StoreRead, StoreRevision, StoredValue, UtcMillis,
@@ -6,6 +8,7 @@ use crate::{Effect, Exit};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+/// Typed state used by persistence internal memory store.
 struct State {
     entries: BTreeMap<Arc<[u8]>, StoreEntry>,
     next_revision: u64,
@@ -20,6 +23,9 @@ pub struct MemoryKeyValueStore {
 }
 
 impl Clone for MemoryKeyValueStore {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             state: Arc::clone(&self.state),
@@ -29,6 +35,13 @@ impl Clone for MemoryKeyValueStore {
 
 impl MemoryKeyValueStore {
     #[must_use]
+    /// Construct a `MemoryKeyValueStore` from its required inputs and explicit policies.
+    ///
+    /// # Parameters
+    /// - `capacity` (`StoreCapacity`): The caller-supplied capacity bound.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(capacity: StoreCapacity) -> Self {
         Self {
             state: Arc::new(Mutex::new(State {
@@ -39,6 +52,14 @@ impl MemoryKeyValueStore {
         }
     }
 
+    ///
+    /// # Parameters
+    /// - `entry` (`&StoreEntry`): Stored record or event selected for this transition.
+    /// - `now` (`UtcMillis`): The caller-supplied current time.
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     fn expired(entry: &StoreEntry, now: UtcMillis) -> bool {
         entry
             .value
@@ -46,6 +67,14 @@ impl MemoryKeyValueStore {
             .is_some_and(|deadline| now >= deadline)
     }
 
+    ///
+    /// # Parameters
+    /// - `state` (`&mut State`): Current or replacement state owned by this operation.
+    /// - `now` (`UtcMillis`): The caller-supplied current time.
+    ///
+    /// # Returns
+    /// Type: `Vec<StoreEntry>`.
+    /// Returns `Vec<StoreEntry>`.
     fn remove_expired(state: &mut State, now: UtcMillis) -> Vec<StoreEntry> {
         let expired: Vec<_> = state
             .entries
@@ -59,6 +88,12 @@ impl MemoryKeyValueStore {
             .collect()
     }
 
+    ///
+    /// # Parameters
+    /// - `state` (`&mut State`): Current or replacement state owned by this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<StoreRevision, MemoryStoreError>`.
     fn next_revision(state: &mut State) -> Result<StoreRevision, MemoryStoreError> {
         let next = state
             .next_revision
@@ -68,6 +103,14 @@ impl MemoryKeyValueStore {
         Ok(StoreRevision(next))
     }
 
+    ///
+    /// # Parameters
+    /// - `state` (`&State`): Current or replacement state owned by this operation.
+    /// - `key` (`&[u8]`): Stable key used to locate or identify the selected value.
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     fn fits(state: &State, key: &[u8]) -> bool {
         state.entries.contains_key(key)
             || match state.capacity {
@@ -78,8 +121,17 @@ impl MemoryKeyValueStore {
 }
 
 impl KeyValueStore for MemoryKeyValueStore {
+    /// Type alias for error in persistence internal memory store.
     type Error = MemoryStoreError;
 
+    ///
+    /// # Parameters
+    /// - `key` (`Arc<[u8]>`): Stable key used to locate or identify the selected value.
+    /// - `now` (`UtcMillis`): The caller-supplied current time.
+    ///
+    /// # Returns
+    /// Type: `Effect<StoreRead, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn get(&self, key: Arc<[u8]>, now: UtcMillis) -> Effect<StoreRead, Self::Error> {
         let store = self.clone();
         Effect::sync(move || {
@@ -95,6 +147,14 @@ impl KeyValueStore for MemoryKeyValueStore {
         })
     }
 
+    ///
+    /// # Parameters
+    /// - `keys` (`Vec<Arc<[u8]>>`): The keys supplied to this operation.
+    /// - `now` (`UtcMillis`): The caller-supplied current time.
+    ///
+    /// # Returns
+    /// Type: `Effect<Vec<BatchReadItem<Self::Error>>, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn get_many(
         &self,
         keys: Vec<Arc<[u8]>>,
@@ -124,6 +184,14 @@ impl KeyValueStore for MemoryKeyValueStore {
         })
     }
 
+    ///
+    /// # Parameters
+    /// - `key` (`Arc<[u8]>`): Stable key used to locate or identify the selected value.
+    /// - `value` (`StoredValue`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<StoreRevision, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn put(&self, key: Arc<[u8]>, value: StoredValue) -> Effect<StoreRevision, Self::Error> {
         let store = self.clone();
         let value = Mutex::new(Some(value));
@@ -164,6 +232,13 @@ impl KeyValueStore for MemoryKeyValueStore {
         })
     }
 
+    ///
+    /// # Parameters
+    /// - `key` (`Arc<[u8]>`): Stable key used to locate or identify the selected value.
+    ///
+    /// # Returns
+    /// Type: `Effect<Option<StoreEntry>, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn remove(&self, key: Arc<[u8]>) -> Effect<Option<StoreEntry>, Self::Error> {
         let store = self.clone();
         Effect::sync(move || {
@@ -176,6 +251,13 @@ impl KeyValueStore for MemoryKeyValueStore {
         })
     }
 
+    ///
+    /// # Parameters
+    /// - `now` (`UtcMillis`): The caller-supplied current time.
+    ///
+    /// # Returns
+    /// Type: `Effect<usize, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn cleanup_expired(&self, now: UtcMillis) -> Effect<usize, Self::Error> {
         let store = self.clone();
         Effect::sync(move || {
@@ -194,6 +276,15 @@ impl KeyValueStore for MemoryKeyValueStore {
 }
 
 impl ConditionalKeyValueStore for MemoryKeyValueStore {
+    ///
+    /// # Parameters
+    /// - `key` (`Arc<[u8]>`): Stable key used to locate or identify the selected value.
+    /// - `expected` (`Option<StoreRevision>`): Value or revision required for the proposed state transition.
+    /// - `replacement` (`Option<StoredValue>`): The replacement supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<CompareExchange, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn compare_exchange(
         &self,
         key: Arc<[u8]>,

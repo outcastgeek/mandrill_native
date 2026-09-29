@@ -8,18 +8,33 @@ const cache = @import("../cache.zig");
 const storage = @import("key_value_store.zig");
 const Cancellation = @import("../internal/runtime.zig").Cancellation;
 
+/// Specialize the typed read outcome for persistence operations.
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// Returns (`type`): typed cache read outcome, including stored-value status.
 pub fn Read(comptime A: type) type {
     return union(enum) {
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         found: A,
         missing,
         expired,
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *@This()) void {
             if (self.* == .found) outcomes.discardPayload(&self.found);
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
             return switch (self.*) {
                 .found => |value| .{ .found = try outcomes.clonePayload(value) },
@@ -29,12 +44,23 @@ pub fn Read(comptime A: type) type {
     };
 }
 
+/// Specialize the persistence failure variants from their typed channels.
+/// Parameters:
+/// - `StoreError: comptime type`: Compile-time typed store failure.
+/// - `LookupError: comptime type`: Compile-time typed lookup failure.
+/// Returns (`type`): typed cache failure union preserving persistence and decode errors.
 pub fn Failure(comptime StoreError: type, comptime LookupError: type) type {
     return union(enum) {
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         storage: StoreError,
         lookup: LookupError,
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *@This()) void {
             switch (self.*) {
                 .storage => outcomes.discardPayload(&self.storage),
@@ -43,6 +69,11 @@ pub fn Failure(comptime StoreError: type, comptime LookupError: type) type {
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
             return switch (self.*) {
                 .storage => |value| .{ .storage = try outcomes.clonePayload(value) },
@@ -52,36 +83,66 @@ pub fn Failure(comptime StoreError: type, comptime LookupError: type) type {
     };
 }
 
+/// Specialize the typed value outcome for persistence operations.
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// Returns (`type`): decoded cached value with its persistence metadata.
 pub fn Value(comptime A: type) type {
     return struct {
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         data: A,
         source: enum { persisted, computed },
         /// Present for a computed value, including ambiguous persistence.
         write: ?storage.WriteAcknowledgement,
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *@This()) void {
             outcomes.discardPayload(&self.data);
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
             return .{ .data = try outcomes.clonePayload(self.data), .source = self.source, .write = self.write };
         }
     };
 }
 
+/// Specialize the typed invalidation report outcome for persistence operations.
+/// Parameters:
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// Returns (`type`): typed report of persisted-cache invalidation progress.
 pub fn InvalidationReport(comptime E: type) type {
     return struct {
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         acknowledgement: storage.WriteAcknowledgement,
         local: outcomes.Exit(void, E),
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *@This()) void {
             self.local.deinit();
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
             const copied = self.local.clone();
             if (copied == .die and copied.die.kind == .out_of_memory and
@@ -92,6 +153,22 @@ pub fn InvalidationReport(comptime E: type) type {
     };
 }
 
+/// Specialize a cache backed by persisted values and their typed codecs.
+/// Parameters:
+/// - `Key: comptime type`: Key type used to identify or look up entries in this component.
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `StoreError: comptime type`: Compile-time typed store failure.
+/// - `LookupError: comptime type`: Compile-time typed lookup failure.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `read_store: comptime fn (Key, *const R) effects.Effect(Read(A), StoreError, R)`: Compile-time typed function selected at comptime; no runtime callback lookup is
+///   required.
+/// - `lookup: comptime fn (Key, *const R) effects.Effect(A, LookupError, R)`: Compile-time typed function selected at comptime; no runtime callback lookup is
+///   required.
+/// - `write_store: comptime fn (Key, *const A, *const R) effects.Effect(storage.WriteAcknowledgement, StoreError, R)`: Compile-time typed function selected at comptime; no runtime callback lookup
+///   is required.
+/// - `remove_store: comptime fn (Key, *const R) effects.Effect(storage.WriteAcknowledgement, StoreError, R)`: Compile-time typed function selected at comptime; no runtime callback lookup
+///   is required.
+/// Returns (`type`): schema-backed cache using stable keys, expiry, and a caller-selected store.
 pub fn PersistedCache(
     comptime Key: type,
     comptime A: type,
@@ -114,7 +191,9 @@ pub fn PersistedCache(
     }
     return struct {
         const Self = @This();
+        /// Expected application failure type `E` carried by this persisted cache.
         pub const Error = E;
+        /// Typed result channel described by `Loaded`.
         pub const Result = Loaded;
         const Context = struct {
             allocator: std.mem.Allocator,
@@ -179,6 +258,13 @@ pub fn PersistedCache(
 
         /// R remains alive until the cache is shut down and joined. The
         /// caller chooses memory TTL, capacity, failure caching and admission.
+        ///
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `config: cache.Config(Key, E)`: Caller-selected, validated behavior or resource bounds; no hidden default
+        ///   is installed.
+        /// Returns (`outcomes.Exit(Self, E)`): Carries `Self` on `.success` or `E` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn create(env: *const R, config: cache.Config(Key, E)) outcomes.Exit(Self, E) {
             const context = env.allocator.create(Context) catch return .{ .die = outcomes.Defect.out_of_memory };
             context.* = .{ .allocator = env.allocator, .env = env };
@@ -204,16 +290,33 @@ pub fn PersistedCache(
             };
         }
 
+        /// Look up the selected value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `key: Key`: Stable identity used for matching, deduplication, or replay.
+        /// - `token: ?*const Cancellation`: Cancellation token observed by this operation; its owner must outlive
+        ///   pending work.
+        /// Returns (`outcomes.Exit(Loaded, E)`): Carries `Loaded` on `.success` or `E` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn get(self: *Self, key: Key, token: ?*const Cancellation) outcomes.Exit(Loaded, E) {
             return self.memory.getToken(key, token);
         }
 
+        /// Invalidate a locally cached persisted value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `key: Key`: Stable identity used for matching, deduplication, or replay.
+        /// Returns (`outcomes.Exit(void, E)`): Carries no value on `.success` or `E` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn invalidateLocal(self: *Self, key: Key) outcomes.Exit(void, E) {
             return self.memory.invalidate(key);
         }
 
         /// Remove persistent data first, then invalidate local memory. An
         /// ambiguous removal still invalidates locally and remains explicit.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `key: Key`: Stable identity used for matching, deduplication, or replay.
+        /// Returns (`outcomes.Exit(InvalidationReport(E), E)`): Carries `InvalidationReport(E)` on `.success` or `E` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn invalidate(self: *Self, key: Key) outcomes.Exit(InvalidationReport(E), E) {
             var removing = remove_store(key, self.context.env);
             var mapped = removing.mapErrorOwned(self.context.env, Context.storeError);
@@ -225,10 +328,18 @@ pub fn PersistedCache(
             };
         }
 
+        /// Stop the capability and release its retained resources.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`outcomes.Exit(void, E)`): Carries no value on `.success` or `E` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn shutdown(self: *Self) outcomes.Exit(void, E) {
             return self.memory.shutdown();
         }
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             self.memory.deinit();
             self.* = undefined;

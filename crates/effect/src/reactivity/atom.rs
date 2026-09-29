@@ -1,3 +1,5 @@
+//! Typed reactive atom descriptions and dependencies.
+
 use super::{AsyncResult, AtomId, AtomKind, AtomReadContext, AtomRegistry, AtomRegistryError};
 use super::{InvalidationBatch, InvalidationError};
 use crate::pub_sub::{Subscription, SubscriptionEvent};
@@ -8,23 +10,50 @@ use crate::{
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
+/// Live evaluators use Rust trait-object dispatch. Hydration transfers only
+/// encoded state, never this callback or its process-local vtable.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
+/// - `R`: Environment type.
 type AtomEvaluator<A, E, R> = dyn Fn(AtomReadContext) -> Effect<A, E, R> + Send + Sync;
+/// Type alias for atom read effect in reactivity atom.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
+/// - `R`: Environment type.
 pub type AtomReadEffect<A, E, R> = Effect<Arc<AsyncResult<A, AtomError<E>>>, AtomError<E>, R>;
 
 #[derive(Debug)]
+/// A typed read, write, or publication failure for an atom.
+///
+/// # Type parameters
+/// - `E`: Domain-error type.
 pub enum AtomError<E> {
+    /// Evaluating the reactive definition failed. Retains the `E` detail.
     Evaluation(E),
+    /// The identity or definition registry rejected the operation. Retains the `AtomRegistryError` detail.
     Registry(AtomRegistryError),
+    /// Publishing the committed change failed. Retains the `PubSubError` detail.
     Publication(PubSubError),
+    /// The provider rejected work before accepting ownership. Retains the `SemaphoreError` detail.
     Admission(SemaphoreError),
     /// The status publication committed, but dependent invalidation failed.
     CommittedWithoutInvalidation(AtomRegistryError),
+    /// An owned input was already consumed.
     InputConsumed,
 }
 
 /// A typed derived atom. The evaluator reads sources through AtomReadContext,
 /// so the graph records only dependencies used by that evaluation. Each atom
 /// owns its status and commit gate; registries share neither values nor R.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
+/// - `R`: Environment type.
 pub struct Atom<A, E, R>
 where
     A: Send + 'static,
@@ -44,6 +73,9 @@ where
     E: Send + 'static,
     R: Send + Sync + 'static,
 {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             id: self.id.clone(),
@@ -61,6 +93,22 @@ where
     E: Send + 'static,
     R: Send + Sync + 'static,
 {
+    /// Construct a `Atom` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `registry` (`AtomRegistry`): Registry that owns definitions and rejects identity conflicts.
+    /// - `id` (`AtomId`): Stable identity of the selected record or operation.
+    /// - `capacity` (`NonZeroUsize`): The caller-supplied capacity bound.
+    /// - `overflow` (`PubSubOverflow`): Behavior when the configured buffer capacity is full.
+    /// - `evaluate` (`impl Fn(AtomReadContext) -> Effect<A, E, R> + Send + Sync + 'static`): The evaluate supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, AtomRegistryError>`.
     pub fn new(
         registry: AtomRegistry,
         id: AtomId,
@@ -79,24 +127,68 @@ where
     }
 
     #[must_use]
+    /// Return the stable identity associated with this value.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Returns
+    /// Type: `&AtomId`.
     pub fn id(&self) -> &AtomId {
         &self.id
     }
 
     #[must_use]
+    /// # Type parameters
+    /// - `A`: Application value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Returns
+    /// Type: `&AtomRegistry`.
     pub(crate) fn registry(&self) -> &AtomRegistry {
         &self.registry
     }
 
+    /// Read the selected state without assuming it has been modified.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Returns
+    /// Type: `AtomReadEffect<A, E, R>`.
     pub fn read(&self) -> AtomReadEffect<A, E, R> {
         self.status.read().map_error(AtomError::Publication)
     }
 
     #[must_use]
+    /// Return the stream associated with this value.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Returns
+    /// Type: `crate::Stream<Arc<AsyncResult<A, AtomError<E>>>, PubSubError, R>`.
     pub fn stream(&self) -> crate::Stream<Arc<AsyncResult<A, AtomError<E>>>, PubSubError, R> {
         self.status.stream()
     }
 
+    /// Re-evaluate this atom and publish the resulting revision.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), AtomError<E>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn refresh(&self) -> Effect<(), AtomError<E>, R> {
         let atom = self.clone();
         self.commit
@@ -198,6 +290,19 @@ where
             })
     }
 
+    /// Release owned native state and await its disposal where required.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `mode` (`PubSubShutdown`): Selected behavior for this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), AtomError<E>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn dispose(&self, mode: PubSubShutdown) -> Effect<(), AtomError<E>, R> {
         let atom = self.clone();
         self.commit
@@ -224,6 +329,18 @@ where
     /// Register observation before the first refresh. The scope owns the
     /// subscription and the driver fiber; closing it cancels and joins the
     /// driver through the TaskSpawner supplied by R.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `scope` (`&Scope<AtomError<E>>`): Owner that joins child work and releases resources at close.
+    ///
+    /// # Returns
+    /// Type: `Effect<Fiber<(), AtomError<E>>, AtomError<E>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn observe(
         &self,
         scope: &Scope<AtomError<E>>,
@@ -255,6 +372,19 @@ where
     }
 }
 
+///
+/// # Type parameters
+/// - `A`: Successful application-value type. Additional bound: `Send + 'static`.
+/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type supplying required capabilities. Additional bound: `HasTaskSpawner + Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `atom` (`Atom<A, E, R>`): The atom supplied to this operation.
+/// - `subscription` (`ResourceValue<Subscription<InvalidationBatch>>`): The subscription supplied to this operation.
+///
+/// # Returns
+/// Type: `Effect<(), AtomError<E>, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 fn drive_atom<A, E, R>(
     atom: Atom<A, E, R>,
     subscription: ResourceValue<Subscription<InvalidationBatch>>,

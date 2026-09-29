@@ -11,19 +11,35 @@ const input_group_bytes: usize = 3;
 const output_group_bytes: usize = 4;
 const sextet_bits: u4 = 6;
 
+/// Owned validated Base64 text; release its byte storage with `deinit`.
 pub const Base64Text = struct {
+    /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit` and
+    /// must be released after use.
     pub const effect_owned_payload = true;
     bytes: outcomes.OwnedSlice(u8),
 
+    /// Borrow the represented byte slice.
+    /// Parameters:
+    /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+    /// Returns (`[]const u8`): A borrowed slice; keep the owner alive while using it.
     pub fn slice(self: *const @This()) []const u8 {
         return self.bytes.items;
     }
 
+    /// Release resources owned by this value.
+    /// Parameters:
+    /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn deinit(self: *@This()) void {
         self.bytes.deinit();
         self.* = undefined;
     }
 
+    /// Duplicate this value; marked owning payloads are cloned, while ordinary
+    /// borrowed fields retain their original lifetime.
+    /// Parameters:
+    /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+    /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
     pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
         return .{ .bytes = try self.bytes.clone() };
     }
@@ -95,6 +111,11 @@ fn decode(allocator: std.mem.Allocator, input: []const u8) outcomes.Exit(outcome
     return .{ .success = .{ .items = output, .allocator = allocator } };
 }
 
+/// Expose this base64 representation as a typed Codec.
+/// Parameters:
+/// - `DecodeR: comptime type`: Environment type passed to the decoding side of the codec.
+/// - `EncodeR: comptime type`: Environment type passed to the encoding side of the codec.
+/// Returns (`Codec(outcomes.OwnedSlice(u8), Base64Text, DecodeR, EncodeR)`): A typed codec or schema preserving the declared decoded value, representation, and environments.
 pub fn codec(comptime DecodeR: type, comptime EncodeR: type) Codec(outcomes.OwnedSlice(u8), Base64Text, DecodeR, EncodeR) {
     const Bytes = outcomes.OwnedSlice(u8);
     return Codec(Bytes, Base64Text, DecodeR, EncodeR).init(struct {

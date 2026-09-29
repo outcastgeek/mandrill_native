@@ -1,3 +1,5 @@
+//! Bounded buffering for scoped streams.
+
 use crate::internal::notification::notify_all;
 use crate::internal::runtime::{self, Step};
 use crate::{
@@ -18,15 +20,24 @@ use std::sync::{Arc, Mutex};
 /// admitted, so the capacity bounds the added queue, not upstream chunk size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamBufferOptions {
+    /// The maximum admitted capacity. Type: `NonZeroUsize`.
     pub capacity: NonZeroUsize,
+    /// Maximum items requested in one stream pull. Type: `NonZeroUsize`.
     pub pull_batch: NonZeroUsize,
 }
 
+/// Typed buffered used by stream internal buffer.
+///
+/// # Type parameters
+/// - `A`: Application value type.
 struct Buffered<A> {
     inner: Arc<Inner<A>>,
 }
 
 impl<A> Clone for Buffered<A> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -34,6 +45,10 @@ impl<A> Clone for Buffered<A> {
     }
 }
 
+/// Typed inner used by stream internal buffer.
+///
+/// # Type parameters
+/// - `A`: Application value type.
 struct Inner<A> {
     capacity: NonZeroUsize,
     state: Mutex<State<A>>,
@@ -41,12 +56,22 @@ struct Inner<A> {
     pull_gate: AsyncMutex<()>,
 }
 
+/// Typed state used by stream internal buffer.
+///
+/// # Type parameters
+/// - `A`: Application value type.
 struct State<A> {
     values: VecDeque<A>,
     terminal_observed: bool,
 }
 
 impl<A: Send + 'static> Buffered<A> {
+    ///
+    /// # Parameters
+    /// - `capacity` (`NonZeroUsize`): The caller-supplied capacity bound.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn new(capacity: NonZeroUsize) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -61,6 +86,16 @@ impl<A: Send + 'static> Buffered<A> {
         }
     }
 
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `value` (`A`): Value read, transformed, encoded, or stored by this operation.
+    /// - `cancellation` (`&Cancellation`): The cancellation token for this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<bool, LibraryDefect>`.
     async fn offer(&self, value: A, cancellation: &Cancellation) -> Result<bool, LibraryDefect> {
         let mut value = Some(value);
         loop {
@@ -92,6 +127,16 @@ impl<A: Send + 'static> Buffered<A> {
         }
     }
 
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `batch` (`NonZeroUsize`): Ordered group of values processed together.
+    ///
+    /// # Returns
+    /// Type: `Option<Chunk<A>>`.
+    /// Returns the value when present, or `None`.
     fn take(&self, batch: NonZeroUsize) -> Option<Chunk<A>> {
         let mut state = self
             .inner
@@ -119,6 +164,9 @@ impl<A: Send + 'static> Buffered<A> {
         Some(Chunk::Values(values))
     }
 
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn mark_terminal(&self) {
         self.inner
             .state
@@ -127,6 +175,18 @@ impl<A: Send + 'static> Buffered<A> {
             .terminal_observed = true;
     }
 
+    ///
+    /// # Type parameters
+    /// - `E`: Bounds: `Send + 'static`.
+    /// - `R`: Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `reader` (`StreamReader<A, E, R>`): Scoped handle used to pull further items.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn producer<E: Send + 'static, R: Send + Sync + 'static>(
         &self,
         reader: StreamReader<A, E, R>,
@@ -165,6 +225,19 @@ impl<A: Send + 'static> Buffered<A> {
         })
     }
 
+    ///
+    /// # Type parameters
+    /// - `E`: Bounds: `Send + 'static`.
+    /// - `R`: Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `producers` (`Vec<Fiber<(), E>>`): The producers supplied to this operation.
+    /// - `batch` (`NonZeroUsize`): Ordered group of values processed together.
+    ///
+    /// # Returns
+    /// Type: `StreamReader<A, E, R>`.
+    /// Returns `StreamReader<A, E, R>`.
     fn reader<E: Send + 'static, R: Send + Sync + 'static>(
         &self,
         producers: Vec<Fiber<(), E>>,
@@ -282,12 +355,26 @@ impl<A: Send + 'static> Buffered<A> {
     }
 }
 
+/// Variants of wake used by stream internal buffer.
 enum Wake {
     Data,
     Finished,
     Cancelled,
 }
 
+///
+/// # Type parameters
+/// - `E`: Bounds: `Send + 'static`.
+///
+/// # Parameters
+/// - `changed` (`EventListener`): The changed supplied to this operation.
+/// - `cancellation` (`&Cancellation`): The cancellation token for this operation.
+/// - `left` (`Option<Fiber<(), E>>`): The left supplied to this operation.
+/// - `right` (`Option<Fiber<(), E>>`): Right-hand operation composed with this one.
+///
+/// # Returns
+/// Type: `Wake`.
+/// Returns `Wake`.
 async fn wait_for_change<E: Send + 'static>(
     changed: EventListener,
     cancellation: &Cancellation,
@@ -321,6 +408,18 @@ async fn wait_for_change<E: Send + 'static>(
     }
 }
 
+/// # Type parameters
+/// - `A`: Application value type. Additional bound: `Send + 'static`.
+/// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type. Additional bound: `HasTaskSpawner + Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `upstream` (`Stream<A, E, R>`): The upstream supplied to this operation.
+/// - `options` (`StreamBufferOptions`): Caller-selected bounds and behavior for this operation.
+///
+/// # Returns
+/// Type: `Stream<A, E, R>`.
+/// Returns a scoped stream with the declared item, error, and environment types.
 pub(crate) fn buffered<A, E, R>(
     upstream: Stream<A, E, R>,
     options: StreamBufferOptions,
@@ -343,6 +442,19 @@ where
     })
 }
 
+/// # Type parameters
+/// - `A`: Application value type. Additional bound: `Send + 'static`.
+/// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type. Additional bound: `HasTaskSpawner + Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `left` (`Stream<A, E, R>`): The left supplied to this operation.
+/// - `right` (`Stream<A, E, R>`): Right-hand operation composed with this one.
+/// - `options` (`StreamBufferOptions`): Caller-selected bounds and behavior for this operation.
+///
+/// # Returns
+/// Type: `Stream<A, E, R>`.
+/// Returns a scoped stream with the declared item, error, and environment types.
 pub(crate) fn merged<A, E, R>(
     left: Stream<A, E, R>,
     right: Stream<A, E, R>,

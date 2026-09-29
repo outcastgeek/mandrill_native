@@ -1,3 +1,5 @@
+//! Asynchronous queue transfer and shutdown behavior.
+
 use crate::internal::notification::notify_all;
 use crate::internal::runtime::{self, Step};
 use crate::internal::waiting::{Position, Waiting};
@@ -14,8 +16,11 @@ use std::sync::{Arc, Mutex};
 /// Explicit admission policy, with no default capacity or hidden worker pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueueCapacity {
+    /// No explicit capacity bound is imposed.
     Unbounded,
+    /// The supplied positive capacity bound is enforced. Contains `NonZeroUsize`.
     Bounded(NonZeroUsize),
+    /// Producer and consumer meet directly without a buffered slot.
     Rendezvous,
 }
 
@@ -23,6 +28,11 @@ impl QueueCapacity {
     /// Adapt the source's optional nonnegative capacity. Zero means rendezvous;
     /// Rust's unsigned input excludes negative capacities before execution.
     #[must_use]
+    /// # Parameters
+    /// - `limit` (`Option<usize>`): The caller-supplied limit.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub const fn from_limit(limit: Option<usize>) -> Self {
         match limit {
             None => Self::Unbounded,
@@ -33,6 +43,13 @@ impl QueueCapacity {
         }
     }
 
+    ///
+    /// # Parameters
+    /// - `buffered` (`usize`): The buffered supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     const fn permits_buffer(self, buffered: usize) -> bool {
         match self {
             Self::Unbounded => true,
@@ -45,10 +62,18 @@ impl QueueCapacity {
 /// Expected queue failure, as in the reference implementation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueueError {
+    /// The provider is shutting down and cannot accept this work.
     Shutdown,
 }
 
 impl std::fmt::Display for QueueError {
+    ///
+    /// # Parameters
+    /// - `formatter` (`&mut std::fmt::Formatter<'_>`): Destination formatter used by the Rust formatting trait.
+    ///
+    /// # Returns
+    /// Type: `std::fmt::Result`.
+    /// Returns `std::fmt::Result`.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(self, formatter)
     }
@@ -60,16 +85,26 @@ impl std::error::Error for QueueError {}
 /// those values too. Both reject every pending offer/take and future offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueueShutdown {
+    /// Stop admission and wait for already accepted work.
     Drain,
+    /// Drop the selected value under the configured overflow policy.
     Discard,
 }
 
+/// Typed waiter used by queue.
+///
+/// # Type parameters
+/// - `B`: Transformed value type.
 struct Waiter<B> {
     outcome: Mutex<Option<Exit<B, QueueError>>>,
     changed: Event,
 }
 
 impl<B> Waiter<B> {
+    ///
+    /// # Returns
+    /// Type: `Arc<Self>`.
+    /// Returns `Arc<Self>`.
     fn new() -> Arc<Self> {
         Arc::new(Self {
             outcome: Mutex::new(None),
@@ -77,6 +112,15 @@ impl<B> Waiter<B> {
         })
     }
 
+    ///
+    /// # Type parameters
+    /// - `B`: Transformed output type.
+    ///
+    /// # Parameters
+    /// - `outcome` (`Exit<B, QueueError>`): Complete terminal outcome, including expected errors and cleanup failures.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn complete(&self, outcome: Exit<B, QueueError>) {
         *self
             .outcome
@@ -84,6 +128,13 @@ impl<B> Waiter<B> {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
     }
 
+    ///
+    /// # Type parameters
+    /// - `B`: Transformed output type.
+    ///
+    /// # Returns
+    /// Type: `Option<Exit<B, QueueError>>`.
+    /// Returns the value when present, or `None`.
     fn take(&self) -> Option<Exit<B, QueueError>> {
         self.outcome
             .lock()
@@ -92,17 +143,29 @@ impl<B> Waiter<B> {
     }
 }
 
+/// Typed offer used by queue.
+///
+/// # Type parameters
+/// - `A`: Application value type.
 struct Offer<A> {
     value: A,
     waiter: Arc<Waiter<()>>,
     cancellation: Cancellation,
 }
 
+/// Typed taker used by queue.
+///
+/// # Type parameters
+/// - `A`: Application value type.
 struct Taker<A> {
     waiter: Arc<Waiter<A>>,
     cancellation: Cancellation,
 }
 
+/// Typed state used by queue.
+///
+/// # Type parameters
+/// - `A`: Application value type.
 struct State<A> {
     capacity: QueueCapacity,
     buffer: VecDeque<A>,
@@ -115,11 +178,17 @@ struct State<A> {
 /// Operations commit under one admission gate. Waiting nodes have targeted
 /// completion events; cancellation/abandonment removes only uncommitted nodes.
 /// Transfers already committed to a buffer/taker are never rolled back.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
 pub struct AsyncQueue<A: Send + 'static> {
     state: Arc<Mutex<State<A>>>,
 }
 
 impl<A: Send + 'static> Clone for AsyncQueue<A> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             state: Arc::clone(&self.state),
@@ -127,17 +196,28 @@ impl<A: Send + 'static> Clone for AsyncQueue<A> {
     }
 }
 
+/// Variants of notify used by queue.
+///
+/// # Type parameters
+/// - `A`: Application value type.
 enum Notify<A> {
     Offer(Arc<Waiter<()>>),
     Take(Arc<Waiter<A>>),
 }
 
+/// Typed changes used by queue.
+///
+/// # Type parameters
+/// - `A`: Application value type.
 struct Changes<A> {
     notify: Vec<Notify<A>>,
     discard: Vec<A>,
 }
 
 impl<A> Default for Changes<A> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn default() -> Self {
         Self {
             notify: Vec::new(),
@@ -147,16 +227,43 @@ impl<A> Default for Changes<A> {
 }
 
 impl<A> Changes<A> {
+    ///
+    /// # Parameters
+    /// - `waiter` (`Arc<Waiter<()>>`): The waiter supplied to this operation.
+    /// - `outcome` (`Exit<(), QueueError>`): Complete terminal outcome, including expected errors and cleanup failures.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn offered(&mut self, waiter: Arc<Waiter<()>>, outcome: Exit<(), QueueError>) {
         waiter.complete(outcome);
         self.notify.push(Notify::Offer(waiter));
     }
 
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `waiter` (`Arc<Waiter<A>>`): The waiter supplied to this operation.
+    /// - `outcome` (`Exit<A, QueueError>`): Complete terminal outcome, including expected errors and cleanup failures.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn taken(&mut self, waiter: Arc<Waiter<A>>, outcome: Exit<A, QueueError>) {
         waiter.complete(outcome);
         self.notify.push(Notify::Take(waiter));
     }
 
+    ///
+    /// # Type parameters
+    /// - `B`: Transformed success-value type.
+    ///
+    /// # Parameters
+    /// - `outcome` (`Exit<B, QueueError>`): Complete terminal outcome, including expected errors and cleanup failures.
+    ///
+    /// # Returns
+    /// Type: `Exit<B, QueueError>`.
+    /// Returns `Exit<B, QueueError>`.
     fn finish<B>(self, outcome: Exit<B, QueueError>) -> Exit<B, QueueError> {
         let mut failures = Vec::new();
         // Complete every node before invoking callbacks. Broadcast and all
@@ -204,47 +311,110 @@ impl<A> Changes<A> {
     }
 }
 
+/// Variants of admission used by queue.
+///
+/// # Type parameters
+/// - `B`: Transformed value type.
 enum Admission<B> {
     Ready(Exit<B, QueueError>),
     Pending(Position, Arc<Waiter<B>>),
 }
 
+/// Removes a pending queue offer or take when its registration is withdrawn.
 trait Registration<A: Send + 'static>: Send + 'static {
+    /// Type alias for value in queue.
     type Value: Send + 'static;
 
+    ///
+    /// # Returns
+    /// Type: `&Waiter<Self::Value>`.
     fn waiter(&self) -> &Waiter<Self::Value>;
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `queue` (`&AsyncQueue<A>`): Queue definition or store that owns the selected messages.
+    ///
+    /// # Returns
+    /// Type: `Changes<A>`.
+    /// Returns `Changes<A>`.
     fn withdraw(&self, queue: &AsyncQueue<A>) -> Changes<A>;
 }
 
+/// Typed offered used by queue.
 struct Offered(Position, Arc<Waiter<()>>);
+/// Typed taken used by queue.
+///
+/// # Type parameters
+/// - `A`: Application value type.
 struct Taken<A>(Position, Arc<Waiter<A>>);
 
 impl<A: Send + 'static> Registration<A> for Offered {
+    /// Type alias for value in queue.
     type Value = ();
+    ///
+    /// # Returns
+    /// Type: `&Waiter<()>`.
     fn waiter(&self) -> &Waiter<()> {
         &self.1
     }
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `queue` (`&AsyncQueue<A>`): Queue definition or store that owns the selected messages.
+    ///
+    /// # Returns
+    /// Type: `Changes<A>`.
+    /// Returns `Changes<A>`.
     fn withdraw(&self, queue: &AsyncQueue<A>) -> Changes<A> {
         queue.withdraw_offer(self.0, &self.1)
     }
 }
 
 impl<A: Send + 'static> Registration<A> for Taken<A> {
+    /// Type alias for value in queue.
     type Value = A;
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Returns
+    /// Type: `&Waiter<A>`.
     fn waiter(&self) -> &Waiter<A> {
         &self.1
     }
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `queue` (`&AsyncQueue<A>`): Queue definition or store that owns the selected messages.
+    ///
+    /// # Returns
+    /// Type: `Changes<A>`.
+    /// Returns `Changes<A>`.
     fn withdraw(&self, queue: &AsyncQueue<A>) -> Changes<A> {
         queue.withdraw_take(self.0, &self.1)
     }
 }
 
+/// Typed registered used by queue.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `K`: Key type used for identity or lookup. Bound or type: `Registration<A>`.
 struct Registered<A: Send + 'static, K: Registration<A>> {
     queue: AsyncQueue<A>,
     registration: K,
 }
 
 impl<A: Send + 'static, K: Registration<A>> Drop for Registered<A, K> {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         let _ = self
             .registration
@@ -261,6 +431,16 @@ impl<A: Send + 'static, K: Registration<A>> Drop for Registered<A, K> {
 
 impl<A: Send + 'static> AsyncQueue<A> {
     #[must_use]
+    /// Construct a `AsyncQueue` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    ///
+    /// # Parameters
+    /// - `capacity` (`QueueCapacity`): The caller-supplied capacity bound.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(capacity: QueueCapacity) -> Self {
         Self {
             state: Arc::new(Mutex::new(State {
@@ -273,6 +453,18 @@ impl<A: Send + 'static> AsyncQueue<A> {
         }
     }
 
+    /// Create a `AsyncQueue` through the declared Effect and environment capabilities.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `capacity` (`QueueCapacity`): The caller-supplied capacity bound.
+    ///
+    /// # Returns
+    /// Type: `Effect<Self, QueueError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn make<R: Send + Sync + 'static>(capacity: QueueCapacity) -> Effect<Self, QueueError, R> {
         Effect::sync(move || Self::new(capacity))
     }
@@ -280,6 +472,17 @@ impl<A: Send + 'static> AsyncQueue<A> {
     /// Move one owned candidate on the first started execution. Reuse reports
     /// QueueOfferConsumed; `offer_with` produces fresh candidates without Clone.
     /// A pre-cancelled execution leaves this candidate available.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `value` (`A`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), QueueError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn offer<R: Send + Sync + 'static>(&self, value: A) -> Effect<(), QueueError, R> {
         let value = Mutex::new(Some(value));
         self.offer_candidate(move || {
@@ -291,6 +494,18 @@ impl<A: Send + 'static> AsyncQueue<A> {
         })
     }
 
+    /// Offer a value and use the caller’s callback for the queue’s completion result.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `factory` (`impl Fn() -> A + Send + Sync + 'static`): Factory invoked to create fresh data for an execution.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), QueueError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn offer_with<R: Send + Sync + 'static>(
         &self,
         factory: impl Fn() -> A + Send + Sync + 'static,
@@ -299,6 +514,17 @@ impl<A: Send + 'static> AsyncQueue<A> {
     }
 
     /// Explicit stored-payload copying for consumers who intend that ownership.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `value` (`A`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), QueueError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn offer_cloned<R: Send + Sync + 'static>(&self, value: A) -> Effect<(), QueueError, R>
     where
         A: Clone + Sync,
@@ -306,6 +532,17 @@ impl<A: Send + 'static> AsyncQueue<A> {
         self.offer_with(move || value.clone())
     }
 
+    ///
+    /// # Type parameters
+    /// - `R`: Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `factory` (`impl Fn() -> Result<A, Defect> + Send + Sync + 'static`): Factory invoked to create fresh data for an execution.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), QueueError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn offer_candidate<R: Send + Sync + 'static>(
         &self,
         factory: impl Fn() -> Result<A, Defect> + Send + Sync + 'static,
@@ -341,6 +578,15 @@ impl<A: Send + 'static> AsyncQueue<A> {
         })
     }
 
+    /// Transfer the owned value out when the current state permits it.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Returns
+    /// Type: `Effect<A, QueueError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn take<R: Send + Sync + 'static>(&self) -> Effect<A, QueueError, R> {
         let queue = self.clone();
         Effect::new(move |_, context, finish| {
@@ -368,6 +614,15 @@ impl<A: Send + 'static> AsyncQueue<A> {
         })
     }
 
+    /// Return the number of values currently buffered by the queue.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Returns
+    /// Type: `Effect<usize, QueueError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn size<R: Send + Sync + 'static>(&self) -> Effect<usize, QueueError, R> {
         let queue = self.clone();
         Effect::sync(move || {
@@ -380,6 +635,18 @@ impl<A: Send + 'static> AsyncQueue<A> {
         })
     }
 
+    /// Stop accepting new work and describe the settlement of owned work.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `mode` (`QueueShutdown`): Selected behavior for this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), QueueError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn shutdown<R: Send + Sync + 'static>(
         &self,
         mode: QueueShutdown,
@@ -429,6 +696,17 @@ impl<A: Send + 'static> AsyncQueue<A> {
         })
     }
 
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `value` (`A`): Value read, transformed, encoded, or stored by this operation.
+    /// - `cancellation` (`&Cancellation`): The cancellation token for this operation.
+    ///
+    /// # Returns
+    /// Type: `(Admission<()>, Changes<A>)`.
+    /// Returns `(Admission<()>, Changes<A>)`.
     fn admit_offer(&self, value: A, cancellation: &Cancellation) -> (Admission<()>, Changes<A>) {
         let mut changes = Changes::default();
         let mut state = self
@@ -474,6 +752,16 @@ impl<A: Send + 'static> AsyncQueue<A> {
         (admission, changes)
     }
 
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `cancellation` (`&Cancellation`): The cancellation token for this operation.
+    ///
+    /// # Returns
+    /// Type: `(Admission<A>, Changes<A>)`.
+    /// Returns `(Admission<A>, Changes<A>)`.
     fn admit_take(&self, cancellation: &Cancellation) -> (Admission<A>, Changes<A>) {
         let mut changes = Changes::default();
         let mut state = self
@@ -511,6 +799,17 @@ impl<A: Send + 'static> AsyncQueue<A> {
         (admission, changes)
     }
 
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `position` (`Position`): The position supplied to this operation.
+    /// - `waiter` (`&Arc<Waiter<()>>`): The waiter supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Changes<A>`.
+    /// Returns `Changes<A>`.
     fn withdraw_offer(&self, position: Position, waiter: &Arc<Waiter<()>>) -> Changes<A> {
         let mut changes = Changes::default();
         let mut state = self
@@ -527,6 +826,17 @@ impl<A: Send + 'static> AsyncQueue<A> {
         changes
     }
 
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `position` (`Position`): The position supplied to this operation.
+    /// - `waiter` (`&Arc<Waiter<A>>`): The waiter supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Changes<A>`.
+    /// Returns `Changes<A>`.
     fn withdraw_take(&self, position: Position, waiter: &Arc<Waiter<A>>) -> Changes<A> {
         let mut changes = Changes::default();
         let mut state = self
@@ -543,6 +853,17 @@ impl<A: Send + 'static> AsyncQueue<A> {
     }
 }
 
+///
+/// # Type parameters
+/// - `A`: Successful application-value type.
+///
+/// # Parameters
+/// - `offers` (`&mut Waiting<Offer<A>>`): The offers supplied to this operation.
+/// - `changes` (`&mut Changes<A>`): The changes supplied to this operation.
+///
+/// # Returns
+/// Type: `Option<Offer<A>>`.
+/// Returns the value when present, or `None`.
 fn live_offer<A>(offers: &mut Waiting<Offer<A>>, changes: &mut Changes<A>) -> Option<Offer<A>> {
     while let Some(offer) = offers.pop_front() {
         if offer.cancellation.is_requested() {
@@ -556,6 +877,16 @@ fn live_offer<A>(offers: &mut Waiting<Offer<A>>, changes: &mut Changes<A>) -> Op
 }
 
 impl<A: Send + 'static, K: Registration<A>> Registered<A, K> {
+    ///
+    /// # Type parameters
+    /// - `K`: Type supplied by the enclosing impl or trait.
+    ///
+    /// # Parameters
+    /// - `cancellation` (`Cancellation`): The cancellation token for this operation.
+    ///
+    /// # Returns
+    /// Type: `Exit<K::Value, QueueError>`.
+    /// Returns `Exit<K::Value, QueueError>`.
     async fn wait(self, cancellation: Cancellation) -> Exit<K::Value, QueueError> {
         loop {
             let waiter = self.registration.waiter();

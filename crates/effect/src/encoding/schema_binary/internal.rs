@@ -1,3 +1,5 @@
+//! Private binary tags, widths, and parser mechanics.
+
 use super::{BinaryError, BinaryLimits};
 use crate::schema::{
     IssueSegment, JsonValue, PrimitiveShape, SchemaAst, SchemaIssue, SchemaIssueKind,
@@ -23,10 +25,25 @@ const ANY_STRING: u8 = 6;
 const ANY_ARRAY: u8 = 7;
 const ANY_OBJECT: u8 = 8;
 
+///
+/// # Parameters
+/// - `kind` (`SchemaIssueKind`): The kind supplied to this operation.
+///
+/// # Returns
+/// Type: `BinaryError`.
+/// Returns `BinaryError`.
 fn issue(kind: SchemaIssueKind) -> BinaryError {
     BinaryError::Schema(SchemaIssue::new(kind))
 }
 
+///
+/// # Parameters
+/// - `expected` (`ValueKind`): Value or revision required for the proposed state transition.
+/// - `actual` (`&JsonValue`): The actual supplied to this operation.
+///
+/// # Returns
+/// Type: `BinaryError`.
+/// Returns `BinaryError`.
 fn mismatch(expected: ValueKind, actual: &JsonValue) -> BinaryError {
     issue(SchemaIssueKind::TypeMismatch {
         expected,
@@ -34,6 +51,14 @@ fn mismatch(expected: ValueKind, actual: &JsonValue) -> BinaryError {
     })
 }
 
+///
+/// # Parameters
+/// - `error` (`BinaryError`): Expected or provider error preserved in the returned outcome.
+/// - `segment` (`IssueSegment`): The segment supplied to this operation.
+///
+/// # Returns
+/// Type: `BinaryError`.
+/// Returns `BinaryError`.
 fn at(error: BinaryError, segment: IssueSegment) -> BinaryError {
     if let BinaryError::Schema(issue) = error {
         BinaryError::Schema(issue.at(segment))
@@ -42,12 +67,25 @@ fn at(error: BinaryError, segment: IssueSegment) -> BinaryError {
     }
 }
 
+///
+/// # Parameters
+/// - `depth` (`usize`): Nesting depth used to enforce a parser or schema bound.
+///
+/// # Returns
+/// Type: `Result<usize, BinaryError>`.
 fn child_depth(depth: usize) -> Result<usize, BinaryError> {
     depth
         .checked_add(1)
         .ok_or(BinaryError::LimitExceeded(SchemaResource::Depth))
 }
 
+///
+/// # Parameters
+/// - `value` (`&JsonValue`): Value read, transformed, encoded, or stored by this operation.
+/// - `expected` (`ValueKind`): Value or revision required for the proposed state transition.
+///
+/// # Returns
+/// Type: `Result<(u8, [u8; 8]), BinaryError>`.
 fn number_parts(value: &JsonValue, expected: ValueKind) -> Result<(u8, [u8; 8]), BinaryError> {
     let JsonValue::Number(number) = value else {
         return Err(mismatch(expected, value));
@@ -67,6 +105,7 @@ fn number_parts(value: &JsonValue, expected: ValueKind) -> Result<(u8, [u8; 8]),
 }
 
 #[derive(Clone, Copy)]
+/// Explicit resource bounds for encoding schema binary internal.
 struct Budget {
     limits: BinaryLimits,
     nodes: usize,
@@ -74,6 +113,12 @@ struct Budget {
 }
 
 impl Budget {
+    ///
+    /// # Parameters
+    /// - `depth` (`usize`): Nesting depth used to enforce a parser or schema bound.
+    ///
+    /// # Returns
+    /// Type: `Result<(), BinaryError>`.
     fn value(&mut self, depth: usize) -> Result<(), BinaryError> {
         if depth > self.limits.depth.get() {
             return Err(BinaryError::LimitExceeded(SchemaResource::Depth));
@@ -88,6 +133,9 @@ impl Budget {
         Ok(())
     }
 
+    ///
+    /// # Returns
+    /// Type: `Result<(), BinaryError>`.
     fn step(&mut self) -> Result<(), BinaryError> {
         self.steps = self
             .steps
@@ -99,6 +147,12 @@ impl Budget {
         Ok(())
     }
 
+    ///
+    /// # Parameters
+    /// - `count` (`usize`): Caller-selected number of iterations, values, or permits.
+    ///
+    /// # Returns
+    /// Type: `Result<(), BinaryError>`.
     fn collection(&self, count: usize) -> Result<(), BinaryError> {
         if count > self.limits.collection.get() {
             Err(BinaryError::LimitExceeded(SchemaResource::Width))
@@ -108,12 +162,18 @@ impl Budget {
     }
 }
 
+/// Typed output used by encoding schema binary internal.
 pub(super) struct Output {
     pub(super) bytes: Vec<u8>,
     budget: Budget,
 }
 
 impl Output {
+    /// # Parameters
+    /// - `limits` (`BinaryLimits`): Explicit resource bounds enforced while processing this input.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub(super) fn new(limits: BinaryLimits) -> Self {
         Self {
             bytes: Vec::new(),
@@ -125,6 +185,12 @@ impl Output {
         }
     }
 
+    ///
+    /// # Parameters
+    /// - `bytes` (`&[u8]`): Encoded bytes to validate, decode, write, or transfer.
+    ///
+    /// # Returns
+    /// Type: `Result<(), BinaryError>`.
     fn raw(&mut self, bytes: &[u8]) -> Result<(), BinaryError> {
         let next = self
             .bytes
@@ -138,23 +204,51 @@ impl Output {
         Ok(())
     }
 
+    /// # Parameters
+    /// - `byte` (`u8`): The byte supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<(), BinaryError>`.
     pub(super) fn byte(&mut self, byte: u8) -> Result<(), BinaryError> {
         self.raw(&[byte])
     }
 
+    /// # Parameters
+    /// - `value` (`u64`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<(), BinaryError>`.
     pub(super) fn u64(&mut self, value: u64) -> Result<(), BinaryError> {
         self.raw(&value.to_be_bytes())
     }
 
+    ///
+    /// # Parameters
+    /// - `length` (`usize`): The length supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<(), BinaryError>`.
     fn length(&mut self, length: usize) -> Result<(), BinaryError> {
         self.u64(u64::try_from(length).map_err(|_| BinaryError::LengthOverflow)?)
     }
 
+    /// # Parameters
+    /// - `text` (`&str`): Input text parsed or emitted by this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<(), BinaryError>`.
     pub(super) fn text(&mut self, text: &str) -> Result<(), BinaryError> {
         self.length(text.len())?;
         self.raw(text.as_bytes())
     }
 
+    /// # Parameters
+    /// - `ast` (`&SchemaAst`): Representation tree used for schema inspection or export.
+    /// - `value` (`&JsonValue`): Value read, transformed, encoded, or stored by this operation.
+    /// - `depth` (`usize`): Nesting depth used to enforce a parser or schema bound.
+    ///
+    /// # Returns
+    /// Type: `Result<(), BinaryError>`.
     pub(super) fn value(
         &mut self,
         ast: &SchemaAst,
@@ -165,6 +259,14 @@ impl Output {
         self.shape(ast, value, depth)
     }
 
+    ///
+    /// # Parameters
+    /// - `ast` (`&SchemaAst`): Representation tree used for schema inspection or export.
+    /// - `value` (`&JsonValue`): Value read, transformed, encoded, or stored by this operation.
+    /// - `depth` (`usize`): Nesting depth used to enforce a parser or schema bound.
+    ///
+    /// # Returns
+    /// Type: `Result<(), BinaryError>`.
     fn shape(
         &mut self,
         ast: &SchemaAst,
@@ -328,6 +430,14 @@ impl Output {
         }
     }
 
+    ///
+    /// # Parameters
+    /// - `shape` (`PrimitiveShape`): Encoded-side structure required by this schema.
+    /// - `value` (`&JsonValue`): Value read, transformed, encoded, or stored by this operation.
+    /// - `depth` (`usize`): Nesting depth used to enforce a parser or schema bound.
+    ///
+    /// # Returns
+    /// Type: `Result<(), BinaryError>`.
     fn primitive(
         &mut self,
         shape: PrimitiveShape,
@@ -388,6 +498,13 @@ impl Output {
         }
     }
 
+    ///
+    /// # Parameters
+    /// - `value` (`&JsonValue`): Value read, transformed, encoded, or stored by this operation.
+    /// - `depth` (`usize`): Nesting depth used to enforce a parser or schema bound.
+    ///
+    /// # Returns
+    /// Type: `Result<(), BinaryError>`.
     fn any(&mut self, value: &JsonValue, depth: usize) -> Result<(), BinaryError> {
         self.budget.step()?;
         match value {
@@ -436,6 +553,10 @@ impl Output {
     }
 }
 
+/// Typed cursor used by encoding schema binary internal.
+///
+/// # Type parameters
+/// - `'a`: Lifetime parameter.
 pub(super) struct Cursor<'a> {
     input: &'a [u8],
     pub(super) offset: usize,
@@ -443,6 +564,15 @@ pub(super) struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
+    /// # Type parameters
+    /// - `'a`: Lifetime parameter.
+    ///
+    /// # Parameters
+    /// - `input` (`&'a [u8]`): The input value or factory consumed by this operation.
+    /// - `limits` (`BinaryLimits`): Explicit resource bounds enforced while processing this input.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, BinaryError>`.
     pub(super) fn new(input: &'a [u8], limits: BinaryLimits) -> Result<Self, BinaryError> {
         if input.len() > limits.bytes.get() {
             return Err(BinaryError::LimitExceeded(SchemaResource::Bytes));
@@ -458,6 +588,12 @@ impl<'a> Cursor<'a> {
         })
     }
 
+    ///
+    /// # Parameters
+    /// - `count` (`usize`): Caller-selected number of iterations, values, or permits.
+    ///
+    /// # Returns
+    /// Type: `Result<&'a [u8], BinaryError>`.
     fn raw(&mut self, count: usize) -> Result<&'a [u8], BinaryError> {
         let end = self
             .offset
@@ -474,6 +610,11 @@ impl<'a> Cursor<'a> {
         Ok(bytes)
     }
 
+    /// # Type parameters
+    /// - `'a`: Lifetime parameter.
+    ///
+    /// # Returns
+    /// Type: `Result<u8, BinaryError>`.
     pub(super) fn byte(&mut self) -> Result<u8, BinaryError> {
         let offset = self.offset;
         self.raw(1)?
@@ -482,6 +623,11 @@ impl<'a> Cursor<'a> {
             .ok_or(BinaryError::Truncated { offset, needed: 1 })
     }
 
+    /// # Type parameters
+    /// - `'a`: Lifetime parameter.
+    ///
+    /// # Returns
+    /// Type: `Result<u64, BinaryError>`.
     pub(super) fn u64(&mut self) -> Result<u64, BinaryError> {
         let mut bytes = [0; size_of::<u64>()];
         let length = bytes.len();
@@ -489,15 +635,32 @@ impl<'a> Cursor<'a> {
         Ok(u64::from_be_bytes(bytes))
     }
 
+    ///
+    /// # Returns
+    /// Type: `Result<usize, BinaryError>`.
     fn length(&mut self) -> Result<usize, BinaryError> {
         usize::try_from(self.u64()?).map_err(|_| BinaryError::LengthOverflow)
     }
 
+    /// # Type parameters
+    /// - `'a`: Lifetime parameter.
+    ///
+    /// # Returns
+    /// Type: `Result<&'a str, BinaryError>`.
     pub(super) fn text(&mut self) -> Result<&'a str, BinaryError> {
         let count = self.length()?;
         std::str::from_utf8(self.raw(count)?).map_err(|_| BinaryError::InvalidUtf8)
     }
 
+    /// # Type parameters
+    /// - `'a`: Lifetime parameter.
+    ///
+    /// # Parameters
+    /// - `ast` (`&SchemaAst`): Representation tree used for schema inspection or export.
+    /// - `depth` (`usize`): Nesting depth used to enforce a parser or schema bound.
+    ///
+    /// # Returns
+    /// Type: `Result<JsonValue, BinaryError>`.
     pub(super) fn value(
         &mut self,
         ast: &SchemaAst,
@@ -507,6 +670,13 @@ impl<'a> Cursor<'a> {
         self.shape(ast, depth)
     }
 
+    ///
+    /// # Parameters
+    /// - `ast` (`&SchemaAst`): Representation tree used for schema inspection or export.
+    /// - `depth` (`usize`): Nesting depth used to enforce a parser or schema bound.
+    ///
+    /// # Returns
+    /// Type: `Result<JsonValue, BinaryError>`.
     fn shape(&mut self, ast: &SchemaAst, depth: usize) -> Result<JsonValue, BinaryError> {
         self.budget.step()?;
         match ast.shape() {
@@ -641,6 +811,13 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    ///
+    /// # Parameters
+    /// - `shape` (`PrimitiveShape`): Encoded-side structure required by this schema.
+    /// - `depth` (`usize`): Nesting depth used to enforce a parser or schema bound.
+    ///
+    /// # Returns
+    /// Type: `Result<JsonValue, BinaryError>`.
     fn primitive(&mut self, shape: PrimitiveShape, depth: usize) -> Result<JsonValue, BinaryError> {
         match shape {
             PrimitiveShape::Any => self.any(depth),
@@ -667,11 +844,24 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    ///
+    /// # Parameters
+    /// - `allow_float` (`bool`): The allow float supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<JsonValue, BinaryError>`.
     fn number(&mut self, allow_float: bool) -> Result<JsonValue, BinaryError> {
         let tag = self.byte()?;
         self.number_payload(tag, allow_float)
     }
 
+    ///
+    /// # Parameters
+    /// - `tag` (`u8`): The tag supplied to this operation.
+    /// - `allow_float` (`bool`): The allow float supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<JsonValue, BinaryError>`.
     fn number_payload(&mut self, tag: u8, allow_float: bool) -> Result<JsonValue, BinaryError> {
         if tag > FLOAT || (tag == FLOAT && !allow_float) {
             return Err(BinaryError::InvalidTag(tag));
@@ -689,6 +879,12 @@ impl<'a> Cursor<'a> {
         Ok(JsonValue::Number(number))
     }
 
+    ///
+    /// # Parameters
+    /// - `depth` (`usize`): Nesting depth used to enforce a parser or schema bound.
+    ///
+    /// # Returns
+    /// Type: `Result<JsonValue, BinaryError>`.
     fn any(&mut self, depth: usize) -> Result<JsonValue, BinaryError> {
         self.budget.step()?;
         match self.byte()? {
@@ -731,6 +927,15 @@ impl<'a> Cursor<'a> {
     }
 }
 
+///
+/// # Parameters
+/// - `value` (`&JsonValue`): Value read, transformed, encoded, or stored by this operation.
+/// - `minimum` (`usize`): Lower bound enforced by this policy.
+/// - `maximum` (`usize`): Upper bound enforced by this policy.
+/// - `unit` (`StringLengthUnit`): The unit supplied to this operation.
+///
+/// # Returns
+/// Type: `Result<(), BinaryError>`.
 fn check_string_length(
     value: &JsonValue,
     minimum: usize,

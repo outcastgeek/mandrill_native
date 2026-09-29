@@ -6,9 +6,15 @@ const events = @import("event.zig");
 const journal = @import("event_journal.zig");
 const Issue = @import("../schema/schema_issue.zig").Issue;
 
+/// Specialize the typed eventlog error channel from its compile-time error type.
+/// Parameters:
+/// - `FoldError: comptime type`: Compile-time typed projection-fold failure.
+/// Returns (`type`): typed projection failure union retaining reducer and checkpoint errors.
 pub fn Error(comptime FoldError: type) type {
     return union(enum) {
         const Self = @This();
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         fold: FoldError,
         schema: Issue,
@@ -17,12 +23,21 @@ pub fn Error(comptime FoldError: type) type {
         history_gap,
         malformed_page,
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             if (self.* == .fold) outcomes.discardPayload(&self.fold);
             if (self.* == .schema) self.schema.deinit();
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!Self`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const Self) error{OutOfMemory}!Self {
             return switch (self.*) {
                 .fold => |value| .{ .fold = try outcomes.clonePayload(value) },
@@ -33,18 +48,33 @@ pub fn Error(comptime FoldError: type) type {
     };
 }
 
+/// Specialize projection state together with its replay cursor.
+/// Parameters:
+/// - `State: comptime type`: State value type retained between operations.
+/// Returns (`type`): projection state paired with the cursor reached by replay.
 pub fn Replayed(comptime State: type) type {
     return struct {
         const Self = @This();
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         state: State,
         cursor: journal.Cursor,
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             outcomes.discardPayload(&self.state);
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!Self`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const Self) error{OutOfMemory}!Self {
             return .{ .state = try outcomes.clonePayload(self.state), .cursor = self.cursor };
         }
@@ -55,6 +85,20 @@ pub fn Replayed(comptime State: type) type {
 /// `fold` receives that same handler, a private mutable state and a borrowed
 /// payload, returning Result(void, FoldError). A failed fold discards the
 /// private clone; the caller's prior projection state is untouched.
+///
+/// Parameters:
+/// - `State: comptime type`: State value type retained between operations.
+/// - `FoldError: comptime type`: Compile-time typed projection-fold failure.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `handlers: comptime anytype`: Compile-time statically inferred input checked when this operation is
+///   instantiated.
+/// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected capabilities.
+/// - `initial: *const State`: Borrowed initial projection state; it remains owned by the caller.
+/// - `after: journal.Cursor`: Caller-supplied time or cursor boundary used for ordering and retention.
+/// - `page: *const journal.ReadPage`: Borrowed journal page processed by this operation.
+/// - `decode: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where static.
+/// - `fold: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where static.
+/// Returns (`outcomes.Exit(Replayed(State), Error(FoldError))`): Carries `Replayed(State)` on `.success` or `Error(FoldError)` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
 pub fn replayPage(
     comptime State: type,
     comptime FoldError: type,

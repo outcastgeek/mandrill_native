@@ -1,3 +1,5 @@
+//! Cache-backed atom refresh and invalidation.
+
 use super::{Atom, AtomError};
 use crate::{Effect, Exit, HasWallClock, Semaphore, SemaphoreError, UtcMillis, WallClock};
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -5,14 +7,27 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[derive(Debug)]
+/// A cache or atom-evaluation failure while refreshing reactive state.
+///
+/// # Type parameters
+/// - `E`: Domain-error type.
+/// - `ClockError`: Error returned by the clock capability.
 pub enum AtomCacheError<E, ClockError> {
+    /// The selected reactive atom could not be evaluated or updated. Retains the `AtomError<E>` detail.
     Atom(AtomError<E>),
+    /// The selected clock could not schedule or observe the requested time. Retains the `ClockError` detail.
     Clock(ClockError),
+    /// The provider rejected work before accepting ownership. Retains the `SemaphoreError` detail.
     Admission(SemaphoreError),
 }
 
 /// TTL is a policy of this handle, not a process-global timer. Expiry is
 /// checked against the clock in R and never publishes by itself.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
+/// - `R`: Environment type.
 pub struct AtomCache<A, E, R>
 where
     A: Send + 'static,
@@ -31,6 +46,9 @@ where
     E: Send + 'static,
     R: HasWallClock + Send + Sync + 'static,
 {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             atom: self.atom.clone(),
@@ -48,6 +66,19 @@ where
     R: HasWallClock + Send + Sync + 'static,
 {
     #[must_use]
+    /// Construct a `AtomCache` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `atom` (`Atom<A, E, R>`): The atom supplied to this operation.
+    /// - `ttl` (`Duration`): The ttl supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(atom: Atom<A, E, R>, ttl: Duration) -> Self {
         Self {
             atom,
@@ -58,12 +89,33 @@ where
     }
 
     #[must_use]
+    /// Select the registered atom identified by this value.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Returns
+    /// Type: `&Atom<A, E, R>`.
     pub fn atom(&self) -> &Atom<A, E, R> {
         &self.atom
     }
 
     /// Forced refresh bypasses TTL. Concurrent cache requests queue behind
     /// one gate; cancellation of a waiter is handled by the semaphore.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `force` (`bool`): The force supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<bool, AtomCacheError<E, <R::Clock as WallClock>::Error>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn refresh(
         &self,
         force: bool,

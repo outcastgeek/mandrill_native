@@ -1,46 +1,85 @@
+//! Scoped atom evaluation, dependency tracking, and disposal.
+
 use super::{InvalidationError, InvalidationKey, InvalidationRegistry};
 use crate::{Effect, KeyDomain, PubSubOptions, PubSubShutdown, StableKey};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Stable identity used by reactivity atom registry operations.
 pub struct AtomId(InvalidationKey);
 
 impl AtomId {
     #[must_use]
+    /// Wrap a typed stable key while preserving its identity bytes.
+    ///
+    /// # Type parameters
+    /// - `D`: Identity-domain type. Bounds: `KeyDomain`.
+    ///
+    /// # Parameters
+    /// - `key` (`StableKey<D>`): Stable key used to locate or identify the selected value.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn from_stable<D: KeyDomain>(key: StableKey<D>) -> Self {
         Self(InvalidationKey::from_stable(key))
     }
 
     #[must_use]
+    /// Return the stable key used to publish invalidations for this atom.
+    ///
+    /// # Returns
+    /// Type: `InvalidationKey`.
     pub fn invalidation_key(&self) -> InvalidationKey {
         self.0.clone()
     }
 
     #[must_use]
+    /// Borrow the stable encoded bytes without transferring ownership.
+    ///
+    /// # Returns
+    /// Type: `&[u8]`.
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The source or derived role assigned to an atom in a registry.
 pub enum AtomKind {
+    /// The error originated in the underlying source.
     Source,
+    /// This atom computes its value from registered dependencies.
     Derived,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// An identity conflict or lifecycle failure while registering atoms.
 pub enum AtomRegistryError {
+    /// The ation failed validation. Carries `InvalidationError`.
     Invalidation(InvalidationError),
+    /// The removal committed, but publishing its invalidation failed. Retains the `InvalidationError` detail.
     RemovalCommittedWithoutInvalidation(InvalidationError),
+    /// The  already exists or occurred twice. Carries `AtomId`.
     Duplicate(AtomId),
+    /// No matching value exists. Carries `AtomId`.
     Missing(AtomId),
+    /// The referenced atom is not registered as a derived atom.
     NotDerived(AtomId),
+    /// No further generation can be allocated without exceeding its range. Retains the `AtomId` detail.
     GenerationExhausted(AtomId),
-    DependencyCycle { atom: AtomId, through: AtomId },
+    /// The requested dependency would create a reactive graph cycle.
+    DependencyCycle {
+        /// Atom whose dependency cannot be added. Type: `AtomId`.
+        atom: AtomId,
+        /// Atom that closes the cycle. Type: `AtomId`.
+        through: AtomId,
+    },
+    /// The resource has already been disposed.
     Disposed,
 }
 
+/// Typed node used by reactivity atom registry.
 struct Node {
     kind: AtomKind,
     dependencies: BTreeSet<AtomId>,
@@ -48,6 +87,7 @@ struct Node {
     invalidated: bool,
 }
 
+/// Typed graph used by reactivity atom registry.
 struct Graph {
     disposed: bool,
     nodes: BTreeMap<AtomId, Node>,
@@ -63,6 +103,9 @@ pub struct AtomRegistry {
 }
 
 impl Clone for AtomRegistry {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             graph: Arc::clone(&self.graph),
@@ -72,6 +115,13 @@ impl Clone for AtomRegistry {
 }
 
 impl AtomRegistry {
+    /// Construct a `AtomRegistry` from its required inputs and explicit policies.
+    ///
+    /// # Parameters
+    /// - `options` (`PubSubOptions`): Caller-selected bounds and behavior for this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, AtomRegistryError>`.
     pub fn new(options: PubSubOptions) -> Result<Self, AtomRegistryError> {
         Ok(Self {
             graph: Arc::new(Mutex::new(Graph {
@@ -85,15 +135,33 @@ impl AtomRegistry {
     }
 
     #[must_use]
+    /// Borrow the invalidation publisher associated with this registry.
+    ///
+    /// # Returns
+    /// Type: `InvalidationRegistry`.
     pub fn invalidations(&self) -> InvalidationRegistry {
         self.invalidations.clone()
     }
 
     #[must_use]
+    /// # Parameters
+    /// - `other` (`&Self`): Second value used for comparison or composition.
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     pub(crate) fn same_instance(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.graph, &other.graph)
     }
 
+    /// Register the supplied definition, rejecting an identity or compatibility conflict.
+    ///
+    /// # Parameters
+    /// - `id` (`AtomId`): Stable identity of the selected record or operation.
+    /// - `kind` (`AtomKind`): The kind supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<(), AtomRegistryError>`.
     pub fn register(&self, id: AtomId, kind: AtomKind) -> Result<(), AtomRegistryError> {
         let mut graph = self
             .graph
@@ -121,6 +189,13 @@ impl AtomRegistry {
     /// Dynamic dependencies replace the previous set only after all targets
     /// exist and the resulting graph is proven acyclic. The failed update
     /// leaves the original edges intact.
+    ///
+    /// # Parameters
+    /// - `id` (`&AtomId`): Stable identity of the selected record or operation.
+    /// - `dependencies` (`impl IntoIterator<Item = AtomId>`): The dependencies supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<(), AtomRegistryError>`.
     pub fn replace_dependencies(
         &self,
         id: &AtomId,
@@ -172,6 +247,12 @@ impl AtomRegistry {
 
     /// Bump a node generation before starting a refresh. Completion must
     /// compare this token; disposal or a later refresh makes it obsolete.
+    ///
+    /// # Parameters
+    /// - `id` (`&AtomId`): Stable identity of the selected record or operation.
+    ///
+    /// # Returns
+    /// Type: `Result<std::num::NonZeroU64, AtomRegistryError>`.
     pub fn begin_evaluation(&self, id: &AtomId) -> Result<std::num::NonZeroU64, AtomRegistryError> {
         let mut graph = self
             .graph
@@ -200,6 +281,13 @@ impl AtomRegistry {
         Ok(generation)
     }
 
+    /// Read the registered dependencies of one derived atom.
+    ///
+    /// # Parameters
+    /// - `id` (`&AtomId`): Stable identity of the selected record or operation.
+    ///
+    /// # Returns
+    /// Type: `Result<BTreeSet<AtomId>, AtomRegistryError>`.
     pub fn dependencies_of(&self, id: &AtomId) -> Result<BTreeSet<AtomId>, AtomRegistryError> {
         let graph = self
             .graph
@@ -216,6 +304,15 @@ impl AtomRegistry {
     }
 
     #[must_use]
+    /// Check whether the recorded revision is still current.
+    ///
+    /// # Parameters
+    /// - `id` (`&AtomId`): Stable identity of the selected record or operation.
+    /// - `generation` (`std::num::NonZeroU64`): The generation supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     pub fn is_current(&self, id: &AtomId, generation: std::num::NonZeroU64) -> bool {
         let graph = self
             .graph
@@ -232,6 +329,16 @@ impl AtomRegistry {
     /// one batch. Publication happens after releasing the graph lock. Once
     /// mutation starts, cancellation cannot split it from publication;
     /// caller-selected backpressure can still delay completion.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `id` (`AtomId`): Stable identity of the selected record or operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), AtomRegistryError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn changed<R: Send + Sync + 'static>(
         &self,
         id: AtomId,
@@ -284,6 +391,16 @@ impl AtomRegistry {
 
     /// Remove the node and all graph edges. Handles become stale; an obsolete
     /// evaluation can no longer pass its generation check.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `id` (`AtomId`): Stable identity of the selected record or operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<bool, AtomRegistryError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn remove<R: Send + Sync + 'static>(
         &self,
         id: AtomId,
@@ -349,6 +466,17 @@ impl AtomRegistry {
         .uninterruptible()
     }
 
+    /// Release owned native state and await its disposal where required.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `mode` (`PubSubShutdown`): Selected behavior for this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<bool, AtomRegistryError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn dispose<R: Send + Sync + 'static>(
         &self,
         mode: PubSubShutdown,
@@ -384,6 +512,15 @@ impl AtomRegistry {
     }
 }
 
+///
+/// # Parameters
+/// - `graph` (`&Graph`): The graph supplied to this operation.
+/// - `from` (`&AtomId`): The from supplied to this operation.
+/// - `target` (`&AtomId`): The target supplied to this operation.
+///
+/// # Returns
+/// Type: `bool`.
+/// Returns whether the requested condition holds.
 fn reaches(graph: &Graph, from: &AtomId, target: &AtomId) -> bool {
     let mut visited = BTreeSet::new();
     let mut pending = vec![from.clone()];

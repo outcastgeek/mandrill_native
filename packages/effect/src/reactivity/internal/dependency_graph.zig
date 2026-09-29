@@ -5,15 +5,21 @@ const std = @import("std");
 const outcomes = @import("../../outcome.zig");
 const keys = @import("../../primary_key.zig");
 
+/// Explicit maximum graph nodes and dependencies per node.
 pub const Limits = struct {
     max_nodes: usize,
     max_dependencies_per_node: usize,
 
+    /// Check whether this value satisfies its structural invariants.
+    /// Parameters:
+    /// - `self: Limits`: Receiver passed by value: the struct itself is copied, while any referenced storage keeps its original ownership and lifetime.
+    /// Returns (`bool`): `true` when node and per-node dependency limits are positive.
     pub fn valid(self: Limits) bool {
         return self.max_nodes > 0 and self.max_dependencies_per_node > 0;
     }
 };
 
+/// Dependency-graph failure for invalid limits, identities, or updates.
 pub const Error = enum {
     invalid_policy,
     invalid_key,
@@ -25,6 +31,7 @@ pub const Error = enum {
     closed,
 };
 
+/// Synchronized dependency graph used for reactive invalidation.
 pub const Graph = struct {
     const Self = @This();
     const Bytes = outcomes.OwnedSlice(u8);
@@ -49,6 +56,12 @@ pub const Graph = struct {
     generation: u64 = 0,
     closed: bool = false,
 
+    /// Create a bounded dependency graph using the caller environment.
+    /// Parameters:
+    /// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected capabilities.
+    /// - `limits: Limits`: Caller-selected, validated behavior or resource bounds; no hidden default is
+    ///   installed.
+    /// Returns (`outcomes.Exit(Self, Error)`): Carries `Self` on `.success` or `Error` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
     pub fn init(env: anytype, limits: Limits) outcomes.Exit(Self, Error) {
         const R = @typeInfo(@TypeOf(env)).pointer.child;
         if (R == void or !@hasField(R, "allocator") or @FieldType(R, "allocator") != std.mem.Allocator)
@@ -105,6 +118,12 @@ pub const Graph = struct {
 
     /// A derived node may change dependencies after evaluation. Copies and
     /// capacity reservation complete before the old edge set is released.
+    ///
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// - `key: []const u8`: Stable identity used for matching, deduplication, or replay.
+    /// - `dependencies: []const []const u8`: Dependency definitions required before constructing this component.
+    /// Returns (`outcomes.Exit(u64, Error)`): Carries `u64` on `.success` or `Error` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
     pub fn replace(self: *Self, key: []const u8, dependencies: []const []const u8) outcomes.Exit(u64, Error) {
         if (keys.inspectEncoded(key) == .err) return .{ .fail = .invalid_key };
         if (dependencies.len > self.limits.max_dependencies_per_node)
@@ -157,6 +176,11 @@ pub const Graph = struct {
 
     /// Computes transitive dependents without running callbacks under the
     /// graph gate. The returned keys are owned by the caller's allocator.
+    ///
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// - `key: []const u8`: Stable identity used for matching, deduplication, or replay.
+    /// Returns (`outcomes.Exit(outcomes.OwnedSlice(Bytes), Error)`): Carries `outcomes.OwnedSlice(Bytes)` on `.success` or `Error` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
     pub fn dependents(self: *Self, key: []const u8) outcomes.Exit(outcomes.OwnedSlice(Bytes), Error) {
         if (keys.inspectEncoded(key) == .err) return .{ .fail = .invalid_key };
         self.mutex.lockUncancelable(self.io);
@@ -194,12 +218,20 @@ pub const Graph = struct {
         return .{ .success = .{ .items = copied, .allocator = self.allocator } };
     }
 
+    /// Stop the capability and release its retained resources.
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn shutdown(self: *Self) void {
         self.mutex.lockUncancelable(self.io);
         self.closed = true;
         self.mutex.unlock(self.io);
     }
 
+    /// Release resources owned by this value.
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn deinit(self: *Self) void {
         self.shutdown();
         for (self.entries.items) |*entry| entry.deinit();

@@ -10,21 +10,38 @@ const transport = @import("../session.zig");
 const Protocol = @import("../rpc_error.zig").Protocol;
 const Cancellation = @import("../../internal/runtime.zig").Cancellation;
 
+/// Session failure for closure, exhausted capacity, correlation conflict, or unexpected reply.
 pub const Error = enum { closed, capacity_exhausted, correlation_conflict, unexpected_response };
+/// `Delivery` cases: `accepted`, `orphaned`, `duplicate`, `conflict`.
 pub const Delivery = enum { accepted, orphaned, duplicate, conflict };
 
+/// Specialize the rpc failure variants from their typed channels.
+/// Parameters:
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// Returns (`type`): typed receive failure union for a session.
 pub fn ReceiveError(comptime ProviderError: type) type {
     return union(enum) {
         const Self = @This();
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         session: transport.Error(ProviderError),
         protocol: Protocol,
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             if (self.* == .session) outcomes.discardPayload(&self.session);
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!Self`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const Self) error{OutOfMemory}!Self {
             return switch (self.*) {
                 .session => |value| .{ .session = try outcomes.clonePayload(value) },
@@ -34,9 +51,14 @@ pub fn ReceiveError(comptime ProviderError: type) type {
     };
 }
 
+/// Build a closed registry of completed rpc definitions.
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): bounded ownership registry for pending unary responses.
 pub fn Registry(comptime R: type) type {
     return struct {
         const Self = @This();
+        /// Owned record of a unary response awaiting its correlation ID.
         pub const Pending = struct {
             correlation: envelope.Correlation,
             operation: []u8,
@@ -44,6 +66,10 @@ pub fn Registry(comptime R: type) type {
             allocator: std.mem.Allocator,
             response: primitives.Deferred(envelope.Envelope, Error),
 
+            /// Wait for the response paired with this RPC correlation.
+            /// Parameters:
+            /// - `self: *Pending`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+            /// Returns (`effects.Effect(envelope.Envelope, Error, R)`): typed response correlated to one pending unary call.
             pub fn awaitResponse(self: *Pending) effects.Effect(envelope.Envelope, Error, R) {
                 return effects.Effect(envelope.Envelope, Error, R).awaitDeferred(&self.response);
             }
@@ -62,6 +88,12 @@ pub fn Registry(comptime R: type) type {
         pending: std.AutoHashMap(envelope.Correlation, *Pending),
         closed: bool = false,
 
+        /// Create a unary RPC session with an explicit in-flight call bound.
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `max_inflight: usize`: maximum simultaneously pending calls.
+        /// Returns (`outcomes.Exit(Self, Error)`): Carries `Self` on `.success` or `Error` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn init(env: *const R, max_inflight: usize) outcomes.Exit(Self, Error) {
             if (!@hasField(R, "allocator") or @FieldType(R, "allocator") != std.mem.Allocator or
                 !@hasField(R, "io") or @FieldType(R, "io") != std.Io)
@@ -75,6 +107,13 @@ pub fn Registry(comptime R: type) type {
             } };
         }
 
+        /// Register a definition or subscription with its owner.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `correlation: envelope.Correlation`: Identifier pairing a request with its response.
+        /// - `operation: []const u8`: Typed operation definition selected for this call.
+        /// - `version: envelope.Version`: Stable version used to reject incompatible encoded or replayed data.
+        /// Returns (`outcomes.Exit(*Pending, Error)`): Carries `*Pending` on `.success` or `Error` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn register(self: *Self, correlation: envelope.Correlation, operation: []const u8, version: envelope.Version) outcomes.Exit(*Pending, Error) {
             if (operation.len == 0 or !std.unicode.utf8ValidateSlice(operation)) return .{ .fail = .unexpected_response };
             const name = self.allocator.dupe(u8, operation) catch return .{ .die = outcomes.Defect.out_of_memory };
@@ -98,6 +137,11 @@ pub fn Registry(comptime R: type) type {
 
         /// Takes ownership of `response` in every case. An orphan is reported
         /// so the receiver can record a late response without retaining it.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `response: envelope.Envelope`: Typed or encoded response being delivered.
+        /// Returns (`Delivery`): The publication or delivery status for this message.
         pub fn deliver(self: *Self, response: envelope.Envelope) Delivery {
             var owned = response;
             self.mutex.lockUncancelable(self.io);
@@ -130,6 +174,11 @@ pub fn Registry(comptime R: type) type {
 
         /// Called only after the owner has stopped awaiting this slot. A late
         /// response is then orphaned rather than delivered into freed storage.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `slot: *Pending`: Borrowed pending-operation slot used to track completion.
+        /// Returns (`void`): no value.
         pub fn unregister(self: *Self, slot: *Pending) void {
             self.mutex.lockUncancelable(self.io);
             const removed = self.pending.fetchRemove(slot.correlation);
@@ -138,12 +187,21 @@ pub fn Registry(comptime R: type) type {
             slot.deinit();
         }
 
+        /// Check whether this registry owns the selected correlation.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `correlation: envelope.Correlation`: Identifier pairing a request with its response.
+        /// Returns (`bool`): `true` when this registry currently contains the correlation ID.
         pub fn owns(self: *Self, correlation: envelope.Correlation) bool {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             return self.pending.contains(correlation);
         }
 
+        /// Close this scoped resource.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn close(self: *Self) void {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
@@ -153,6 +211,10 @@ pub fn Registry(comptime R: type) type {
             while (iterator.next()) |slot| _ = slot.*.response.complete(.{ .fail = .closed });
         }
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             self.mutex.lockUncancelable(self.io);
             const empty = self.pending.count() == 0;
@@ -166,6 +228,17 @@ pub fn Registry(comptime R: type) type {
 
 /// One suspended provider receive, then bounded frame/envelope decoding and
 /// delivery. A caller-owned registry remains alive until this Effect joins.
+///
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `select_session: comptime fn (*const R) *const transport.Session(R, ProviderError)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_registry: comptime fn (*const R) *Registry(R)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_policy: comptime fn (*const R) transport.Policy`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// Returns (`effects.Effect(Delivery, ReceiveError(ProviderError), R)`): one framed response dispatched to its pending unary owner.
 pub fn receiveOne(
     comptime R: type,
     comptime ProviderError: type,
@@ -222,9 +295,15 @@ pub fn receiveOne(
 
 /// A separate bounded registry keeps streaming responses distinct from unary
 /// Deferred values. One pending call owns a bounded frame queue and sequence.
+///
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): bounded registry for pending streaming responses and their frames.
 pub fn StreamRegistry(comptime R: type) type {
     return struct {
         const Self = @This();
+        /// `StreamError` cases: `closed`, `capacity_exhausted`, `correlation_conflict`,
+        /// `unexpected_response`, `stream_sequence`, `pending_full`, `concurrent_pull`.
         pub const StreamError = enum {
             closed,
             capacity_exhausted,
@@ -234,6 +313,7 @@ pub fn StreamRegistry(comptime R: type) type {
             pending_full,
             concurrent_pull,
         };
+        /// Owned record of a streaming response awaiting frames.
         pub const Pending = struct {
             correlation: envelope.Correlation,
             operation: []u8,
@@ -248,6 +328,10 @@ pub fn StreamRegistry(comptime R: type) type {
                 return .closed;
             }
 
+            /// Take one item or permit from the selected capability.
+            /// Parameters:
+            /// - `self: *Pending`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+            /// Returns (`effects.Effect(envelope.Envelope, StreamError, R)`): next pending streaming response frame.
             pub fn take(self: *Pending) effects.Effect(envelope.Envelope, StreamError, R) {
                 return effects.Effect(envelope.Envelope, StreamError, R).fromNativeCancellableBorrowed(Pending, self, struct {
                     fn run(borrowed: *const Pending, _: *const R, token: ?*const Cancellation) outcomes.Exit(envelope.Envelope, StreamError) {
@@ -277,6 +361,13 @@ pub fn StreamRegistry(comptime R: type) type {
         pending: std.AutoHashMap(envelope.Correlation, *Pending),
         closed: bool = false,
 
+        /// Create a stream RPC session with in-flight and pending bounds.
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `max_inflight: usize`: maximum simultaneously pending calls.
+        /// - `pending_capacity: usize`: maximum buffered frames for pending stream calls.
+        /// Returns (`outcomes.Exit(Self, StreamError)`): Carries `Self` on `.success` or `StreamError` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn init(env: *const R, max_inflight: usize, pending_capacity: usize) outcomes.Exit(Self, StreamError) {
             if (!@hasField(R, "allocator") or @FieldType(R, "allocator") != std.mem.Allocator or
                 !@hasField(R, "io") or @FieldType(R, "io") != std.Io)
@@ -285,6 +376,13 @@ pub fn StreamRegistry(comptime R: type) type {
             return .{ .success = .{ .allocator = env.allocator, .io = env.io, .max_inflight = max_inflight, .pending_capacity = pending_capacity, .pending = std.AutoHashMap(envelope.Correlation, *Pending).init(env.allocator) } };
         }
 
+        /// Register a definition or subscription with its owner.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `correlation: envelope.Correlation`: Identifier pairing a request with its response.
+        /// - `operation: []const u8`: Typed operation definition selected for this call.
+        /// - `version: envelope.Version`: Stable version used to reject incompatible encoded or replayed data.
+        /// Returns (`outcomes.Exit(*Pending, StreamError)`): Carries `*Pending` on `.success` or `StreamError` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn register(self: *Self, correlation: envelope.Correlation, operation: []const u8, version: envelope.Version) outcomes.Exit(*Pending, StreamError) {
             if (operation.len == 0 or !std.unicode.utf8ValidateSlice(operation))
                 return .{ .fail = .unexpected_response };
@@ -322,6 +420,11 @@ pub fn StreamRegistry(comptime R: type) type {
 
         /// Takes every envelope. A full pending queue is a protocol failure;
         /// it cannot silently drop a chunk or advance the sequence.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `response: envelope.Envelope`: Typed or encoded response being delivered.
+        /// Returns (`outcomes.Exit(Delivery, StreamError)`): Carries `Delivery` on `.success` or `StreamError` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn deliver(self: *Self, response: envelope.Envelope) outcomes.Exit(Delivery, StreamError) {
             var owned = response;
             self.mutex.lockUncancelable(self.io);
@@ -386,6 +489,11 @@ pub fn StreamRegistry(comptime R: type) type {
             return .{ .success = .accepted };
         }
 
+        /// Detach this registration from its owner.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `slot: *Pending`: Borrowed pending-operation slot used to track completion.
+        /// Returns (`void`): no value.
         pub fn unregister(self: *Self, slot: *Pending) void {
             self.mutex.lockUncancelable(self.io);
             const removed = self.pending.fetchRemove(slot.correlation);
@@ -394,12 +502,21 @@ pub fn StreamRegistry(comptime R: type) type {
             slot.deinit();
         }
 
+        /// Check whether this registry owns the selected correlation.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `correlation: envelope.Correlation`: Identifier pairing a request with its response.
+        /// Returns (`bool`): `true` when this stream registry currently contains the correlation ID.
         pub fn owns(self: *Self, correlation: envelope.Correlation) bool {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             return self.pending.contains(correlation);
         }
 
+        /// Close this scoped resource.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn close(self: *Self) void {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
@@ -409,6 +526,10 @@ pub fn StreamRegistry(comptime R: type) type {
             while (iterator.next()) |slot| slot.*.queue.shutdown(false);
         }
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             self.mutex.lockUncancelable(self.io);
             const empty = self.pending.count() == 0;
@@ -420,6 +541,17 @@ pub fn StreamRegistry(comptime R: type) type {
     };
 }
 
+/// Receive stream one through the selected provider.
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `select_session: comptime fn (*const R) *const transport.Session(R, ProviderError)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_registry: comptime fn (*const R) *StreamRegistry(R)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_policy: comptime fn (*const R) transport.Policy`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// Returns (`effects.Effect(Delivery, ReceiveError(ProviderError), R)`): one framed response dispatched to its pending stream owner.
 pub fn receiveStreamOne(
     comptime R: type,
     comptime ProviderError: type,
@@ -489,6 +621,19 @@ pub fn receiveStreamOne(
 
 /// A single receiver dispatches both unary and streaming replies. Separate
 /// receive loops on the same provider could steal one another's frames.
+///
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `select_session: comptime fn (*const R) *const transport.Session(R, ProviderError)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_unary: comptime fn (*const R) *Registry(R)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_stream: comptime fn (*const R) *StreamRegistry(R)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_policy: comptime fn (*const R) transport.Policy`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// Returns (`effects.Effect(Delivery, ReceiveError(ProviderError), R)`): one incoming frame dispatched to its matching unary or streaming owner.
 pub fn receiveAnyOne(
     comptime R: type,
     comptime ProviderError: type,

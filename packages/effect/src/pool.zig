@@ -1,3 +1,4 @@
+//! Scoped resource pooling with bounded capacity, lease ownership, and shutdown.
 const diagnostics = @import("internal/diagnostics.zig");
 const std = @import("std");
 const outcomes = @import("outcome.zig");
@@ -6,14 +7,24 @@ const execution = @import("executor.zig");
 const primitives = @import("primitives.zig");
 const Cancellation = @import("internal/runtime.zig").Cancellation;
 
+/// Typed config record; release owned state with `deinit`.
 pub const Config = struct { capacity: ?usize, idle_time_to_live: ?std.Io.Duration };
 
 /// The pool owns resources. Leases borrow them exclusively until their first
 /// disposition completes. Scope finalization also destroys lease bookkeeping.
+///
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// Returns (`type`): a bounded resource pool with exclusive leases, caller-selected factory, and typed acquisition failures.
 pub fn Pool(comptime A: type, comptime E: type) type {
     return struct {
         const Self = @This();
         const UnitExit = outcomes.Exit(void, E);
+        /// `Factory` is a callback interface with `userdata: *anyopaque`, `create: *const fn
+        /// (*anyopaque, *const Cancellation) outcomes.Exit(A, E)`, `validate: *const fn (*anyopaque, A,
+        /// *const Cancellation) outcomes.Exit(bool, E)`, `dispose: *const fn (*anyopaque, A) UnitExit`
+        /// and further declared fields.
         pub const Factory = struct {
             userdata: *anyopaque,
             create: *const fn (*anyopaque, *const Cancellation) outcomes.Exit(A, E),
@@ -48,6 +59,7 @@ pub fn Pool(comptime A: type, comptime E: type) type {
                 self.wake.set(self.io);
             }
         };
+        /// Exclusive, scope-bound loan of one pooled resource. Release or discard it before pool shutdown; never use its resource afterward.
         pub const Lease = struct {
             pool: *Self,
             allocator: std.mem.Allocator,
@@ -57,9 +69,18 @@ pub fn Pool(comptime A: type, comptime E: type) type {
             started: bool = false,
             metadata: ?*Metadata,
 
+            /// Access the value held by this wrapper or lease.
+            /// Parameters:
+            /// - `self: *const Lease`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+            /// Returns (`A`): The typed stored or computed value; ownership follows the enclosing type contract.
             pub fn value(self: *const Lease) A {
                 return self.resource.value;
             }
+            /// Finish the current operation and release its active state.
+            /// Parameters:
+            /// - `self: *Lease`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+            /// - `should_retire: bool`: Whether this lease must be retired instead of returned to the pool.
+            /// Returns (`UnitExit`): A terminal Exit with no success payload and a typed failure channel.
             pub fn end(self: *Lease, should_retire: bool) UnitExit {
                 const io = self.completion.io;
                 const protection = io.swapCancelProtection(.blocked);
@@ -93,6 +114,10 @@ pub fn Pool(comptime A: type, comptime E: type) type {
                 _ = self.completion.complete(result);
                 return self.completion.waitToken(null);
             }
+            /// Release resources owned by this value.
+            /// Parameters:
+            /// - `self: *Lease`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+            /// Returns (`void`): no value.
             pub fn deinit(self: *Lease) void {
                 std.debug.assert(self.started);
                 self.completion.deinit();
@@ -202,6 +227,14 @@ pub fn Pool(comptime A: type, comptime E: type) type {
         manager_metadata: *Metadata,
         closing: UnitExit = .{ .success = {} },
 
+        /// Construct the selected resource or definition.
+        /// Parameters:
+        /// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `config: Config`: Caller-selected, validated behavior or resource bounds; no hidden default
+        ///   is installed.
+        /// - `factory: Factory`: Typed callback; its signature is checked at comptime where static.
+        /// Returns (`outcomes.Exit(*Self, E)`): Carries `*Self` on `.success` or `E` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn create(env: anytype, config: Config, factory: Factory) outcomes.Exit(*Self, E) {
             if (config.capacity) |capacity| if (capacity == 0) return invalid(diagnostics.pool_capacity_must_be_positive);
             if (config.idle_time_to_live) |ttl| if (ttl.nanoseconds < 0) return invalid(diagnostics.pool_idle_lifetime_must_be_non_negative);
@@ -300,6 +333,12 @@ pub fn Pool(comptime A: type, comptime E: type) type {
             return result;
         }
 
+        /// Acquire a pool value while observing cancellation.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `parent: ?*const Cancellation`: Cancellation token observed by this operation; its owner must outlive
+        ///   pending work.
+        /// Returns (`outcomes.Exit(*Lease, E)`): Carries `*Lease` on `.success` or `E` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn acquireToken(self: *Self, parent: ?*const Cancellation) outcomes.Exit(*Lease, E) {
             const lease = self.allocator.create(Lease) catch return .{ .die = outcomes.Defect.out_of_memory };
             const metadata = Metadata.make(self.allocator) orelse {
@@ -472,6 +511,11 @@ pub fn Pool(comptime A: type, comptime E: type) type {
             }
         }
 
+        /// Set the maximum number of pool resources.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `capacity: usize`: new maximum number of pooled resources.
+        /// Returns (`UnitExit`): A terminal Exit with no success payload and a typed failure channel.
         pub fn setCapacity(self: *Self, capacity: usize) UnitExit {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
@@ -481,6 +525,14 @@ pub fn Pool(comptime A: type, comptime E: type) type {
             self.notify();
             return .{ .success = {} };
         }
+        /// Inspect idle pool resources with the supplied predicate.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `token: ?*const Cancellation`: Cancellation token observed by this operation; its owner must outlive
+        ///   pending work.
+        /// - `predicate: comptime fn (A) bool`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`outcomes.Exit(bool, E)`): Carries `bool` on `.success` or `E` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn existsIdle(self: *Self, token: ?*const Cancellation, comptime predicate: fn (A) bool) outcomes.Exit(bool, E) {
             self.mutex.lockUncancelable(self.io);
             if (self.closed) {
@@ -527,6 +579,13 @@ pub fn Pool(comptime A: type, comptime E: type) type {
             return if (closed) closedExit(bool) else .{ .success = found };
         }
 
+        /// Populate the pool toward a requested target size.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `target: usize`: minimum pool population to create under the configured maximum.
+        /// - `token: ?*const Cancellation`: Cancellation token observed by this operation; its owner must outlive
+        ///   pending work.
+        /// Returns (`UnitExit`): A terminal Exit with no success payload and a typed failure channel.
         pub fn ensureSize(self: *Self, target: usize, token: ?*const Cancellation) UnitExit {
             self.mutex.lockUncancelable(self.io);
             if (self.closed or (self.config.capacity != null and target > self.config.capacity.?)) {
@@ -881,6 +940,10 @@ pub fn Pool(comptime A: type, comptime E: type) type {
                 self.wake.waitUncancelable(self.io);
             }
         }
+        /// Stop the capability and release its retained resources.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`UnitExit`): A terminal Exit with no success payload and a typed failure channel.
         pub fn shutdown(self: *Self) UnitExit {
             const protection = self.io.swapCancelProtection(.blocked);
             defer _ = self.io.swapCancelProtection(protection);
@@ -916,6 +979,10 @@ pub fn Pool(comptime A: type, comptime E: type) type {
             }
             return self.closing.clone();
         }
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             std.debug.assert(self.manager_joined and self.operations == 0 and self.leases == 0 and self.idle == null);
             var current = self.populations;

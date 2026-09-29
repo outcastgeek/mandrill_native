@@ -1,3 +1,5 @@
+//! Separation of an execution owner from result observers.
+
 use crate::LibraryDefect;
 use crate::internal::notification::notify_all;
 use crate::{Defect, Exit};
@@ -7,14 +9,34 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
+/// Type alias for run future in owned run.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 type RunFuture<A, E> = Pin<Box<dyn Future<Output = Exit<A, E>> + Send>>;
 
+/// Typed completion used by owned run.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 struct Completion<A, E> {
     outcome: Mutex<Option<Exit<A, E>>>,
     changed: Event,
 }
 
 impl<A, E> Completion<A, E> {
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `outcome` (`Exit<A, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn publish(&self, outcome: Exit<A, E>) {
         *self
             .outcome
@@ -23,6 +45,14 @@ impl<A, E> Completion<A, E> {
         notify_all(&self.changed);
     }
 
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Returns
+    /// Type: `Option<Exit<A, E>>`.
+    /// Returns the value when present, or `None`.
     fn take(&self) -> Option<Exit<A, E>> {
         self.outcome
             .lock()
@@ -37,6 +67,10 @@ impl<A, E> Completion<A, E> {
 /// observer does not abandon execution. Dropping the driver before settlement
 /// reports a defect to its observer and cannot promise asynchronous cleanup.
 #[must_use = "keep driving the owned run through settlement"]
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 pub struct RunDriver<A, E> {
     pending: Option<RunFuture<A, E>>,
     completion: Arc<Completion<A, E>>,
@@ -46,12 +80,25 @@ pub struct RunDriver<A, E> {
 /// Single-consumer observation of a run's complete outcome, without a Clone
 /// or Sync requirement on success/error values. The host retains its driver.
 #[must_use = "await the observer to handle the complete run outcome"]
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 pub struct RunObserver<A, E> {
     completion: Arc<Completion<A, E>>,
     listener: Option<Pin<Box<EventListener>>>,
     consumed: bool,
 }
 
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
+///
+/// # Parameters
+/// - `pending` (`impl Future<Output = Exit<A, E>> + Send + 'static`): The pending supplied to this operation.
+///
+/// # Returns
+/// Type: `(RunDriver<A, E>, RunObserver<A, E>)`.
 pub(crate) fn owned<A, E>(
     pending: impl Future<Output = Exit<A, E>> + Send + 'static,
 ) -> (RunDriver<A, E>, RunObserver<A, E>) {
@@ -74,8 +121,16 @@ pub(crate) fn owned<A, E>(
 }
 
 impl<A, E> Future for RunDriver<A, E> {
+    /// Type alias for output in owned run.
     type Output = ();
 
+    ///
+    /// # Parameters
+    /// - `cx` (`&mut Context<'_>`): Rust task context used to register the current waker.
+    ///
+    /// # Returns
+    /// Type: `Poll<()>`.
+    /// Returns `Poll<()>`.
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
         let Some(pending) = &mut this.pending else {
@@ -94,6 +149,9 @@ impl<A, E> Future for RunDriver<A, E> {
 }
 
 impl<A, E> Drop for RunDriver<A, E> {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         if !self.settled {
             drop(self.pending.take());
@@ -104,8 +162,16 @@ impl<A, E> Drop for RunDriver<A, E> {
 }
 
 impl<A, E> Future for RunObserver<A, E> {
+    /// Type alias for output in owned run.
     type Output = Exit<A, E>;
 
+    ///
+    /// # Parameters
+    /// - `cx` (`&mut Context<'_>`): Rust task context used to register the current waker.
+    ///
+    /// # Returns
+    /// Type: `Poll<Self::Output>`.
+    /// Returns `Poll<Self::Output>`.
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         if this.consumed {

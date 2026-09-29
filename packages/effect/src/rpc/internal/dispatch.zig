@@ -14,6 +14,8 @@ const Issue = @import("../../schema/schema_issue.zig").Issue;
 
 fn Box(comptime T: type) type {
     return struct {
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         allocator: std.mem.Allocator,
         value: *T,
@@ -28,12 +30,21 @@ fn Box(comptime T: type) type {
             return .{ .allocator = allocator, .value = pointer };
         }
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *@This()) void {
             outcomes.discardPayload(self.value);
             self.allocator.destroy(self.value);
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
             return init(self.allocator, try outcomes.clonePayload(self.value.*));
         }
@@ -44,6 +55,8 @@ fn Box(comptime T: type) type {
 /// until its Effect joins. The stable heap address survives suspended work.
 fn Invocation(comptime Request: type) type {
     return struct {
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         const Self = @This();
         const Inner = struct {
@@ -71,6 +84,10 @@ fn Invocation(comptime Request: type) type {
             return .{ .allocator = allocator, .inner = inner };
         }
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             outcomes.discardPayload(&self.inner.request);
             self.inner.message.deinit();
@@ -79,6 +96,11 @@ fn Invocation(comptime Request: type) type {
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!Self`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const Self) error{OutOfMemory}!Self {
             return init(self.allocator, try outcomes.clonePayload(self.inner.request), &self.inner.message);
         }
@@ -87,6 +109,8 @@ fn Invocation(comptime Request: type) type {
 
 fn ResponseValue(comptime T: type) type {
     return struct {
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         const Self = @This();
         allocator: std.mem.Allocator,
@@ -98,12 +122,21 @@ fn ResponseValue(comptime T: type) type {
             return .{ .allocator = boxed.allocator, .correlation = correlation, .value = boxed.value };
         }
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             outcomes.discardPayload(self.value);
             self.allocator.destroy(self.value);
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!Self`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const Self) error{OutOfMemory}!Self {
             return init(self.allocator, self.correlation, try outcomes.clonePayload(self.value.*));
         }
@@ -113,6 +146,16 @@ fn ResponseValue(comptime T: type) type {
 /// A single typed unary registration. A closed server protocol selects one
 /// such route by its checked operation identity; no erased business value is
 /// exposed to the consumer.
+///
+/// Parameters:
+/// - `handler: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where static.
+/// - `request_wire: comptime wire.WireCodec(@TypeOf(handler.operation).Request, @TypeOf(handler).Environment)`: Wire codec for the operation’s request type and environment.
+/// - `success_wire: comptime wire.WireCodec(@TypeOf(handler.operation).Success, @TypeOf(handler).Environment)`: Wire codec for the operation’s success channel.
+/// - `failure_wire: comptime wire.WireCodec(@TypeOf(handler.operation).DomainError, @TypeOf(handler).Environment)`: Wire codec for the operation’s typed failure channel.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `select_policy: comptime fn (*const @TypeOf(handler).Environment) transport.Policy`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// Returns (`type`): one checked encoded unary registration.
 pub fn UnaryRoute(
     comptime handler: anytype,
     comptime request_wire: wire.WireCodec(@TypeOf(handler.operation).Request, @TypeOf(handler).Environment),
@@ -134,9 +177,14 @@ pub fn UnaryRoute(
     }
     return struct {
         const Self = @This();
+        /// Operation descriptor attached to this dispatcher.
         pub const operation = handler.operation;
+        /// Exact caller environment type required when the description runs.
         pub const Environment = R;
+        /// Typed failure channel combining domain and provider errors.
         pub const Failure = errors.Error(void, void, transport.Error(ProviderError));
+        /// Lazy Effect for result; success, error, and environment types are fixed by
+        /// `effects.Effect(outcomes.OwnedSlice(u8), Failure, R)`.
         pub const Result = effects.Effect(outcomes.OwnedSlice(u8), Failure, R);
         const Bytes = outcomes.OwnedSlice(u8);
         const MessageOwner = Box(envelope.Envelope);
@@ -247,6 +295,12 @@ pub fn UnaryRoute(
 
         /// Takes ownership of a decoded request envelope. The caller's R
         /// supplies allocation, I/O and the selected runtime policy.
+        ///
+        /// Parameters:
+        /// - `message: envelope.Envelope`: decoded envelope whose operation identity selects the typed route.
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Result`): The typed operation result or description selected by this API.
         pub fn serve(message: envelope.Envelope, env: *const R) Result {
             var owned = message;
             const policy = select_policy(env);
@@ -262,6 +316,12 @@ pub fn UnaryRoute(
             return mapped.flatMapCapturedOwned(env, Bytes, capture, afterDecode);
         }
 
+        /// Decode and dispatch one encoded RPC frame.
+        /// Parameters:
+        /// - `frame: []const u8`: Encoded protocol frame to parse, dispatch, or transmit.
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Result`): The typed operation result or description selected by this API.
         pub fn serveFrame(frame: []const u8, env: *const R) Result {
             const policy = select_policy(env);
             if (!policy.valid()) return Result.fromOwnedOutcome(env, .{ .fail = .{ .protocol = .malformed_envelope } });
@@ -281,6 +341,13 @@ pub fn UnaryRoute(
 
 /// A closed tuple of typed encoded registrations. Selection is by checked
 /// operation identity; every branch returns the same framed-byte Effect.
+///
+/// Parameters:
+/// - `routes: comptime anytype`: Compile-time statically inferred input checked when this operation is instantiated.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `select_policy: comptime anytype`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// Returns (`type`): closed tuple of encoded routes selected by checked operation identity.
 pub fn EncodedProtocol(
     comptime routes: anytype,
     comptime ProviderError: type,
@@ -306,8 +373,12 @@ pub fn EncodedProtocol(
         }
     }
     return struct {
+        /// Exact caller environment type required when the description runs.
         pub const Environment = R;
+        /// Typed failure channel combining domain and provider errors.
         pub const Failure = errors.Error(void, void, transport.Error(ProviderError));
+        /// Lazy Effect for result; success, error, and environment types are fixed by
+        /// `effects.Effect(outcomes.OwnedSlice(u8), Failure, R)`.
         pub const Result = effects.Effect(outcomes.OwnedSlice(u8), Failure, R);
         const Bytes = outcomes.OwnedSlice(u8);
 
@@ -315,6 +386,12 @@ pub fn EncodedProtocol(
             return .{ .protocol = problem };
         }
 
+        /// Dispatch one decoded RPC envelope to its handler.
+        /// Parameters:
+        /// - `message: envelope.Envelope`: decoded envelope whose operation identity selects the typed route.
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Result`): The typed operation result or description selected by this API.
         pub fn serve(message: envelope.Envelope, env: *const R) Result {
             var owned = message;
             if (owned.kind != .request) {
@@ -334,6 +411,12 @@ pub fn EncodedProtocol(
             return Result.fromOwnedOutcome(env, .{ .fail = .{ .protocol = .unknown_operation } });
         }
 
+        /// Decode and dispatch one encoded RPC frame.
+        /// Parameters:
+        /// - `frame: []const u8`: Encoded protocol frame to parse, dispatch, or transmit.
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Result`): The typed operation result or description selected by this API.
         pub fn serveFrame(frame: []const u8, env: *const R) Result {
             const policy = select_policy(env);
             if (!policy.valid()) return Result.fromOwnedOutcome(env, .{ .fail = .{ .session = .invalid_configuration } });

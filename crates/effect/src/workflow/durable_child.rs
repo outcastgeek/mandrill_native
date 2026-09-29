@@ -1,3 +1,5 @@
+//! Parent-child workflow identities and propagation.
+
 use super::{
     ChildWait, Durable, HasWorkflowEngine, RecordedChild, WorkflowCodecError, WorkflowDefinition,
     WorkflowEngine, WorkflowHandle, WorkflowRunError, WorkflowRunId, WorkflowRunResult,
@@ -5,16 +7,37 @@ use super::{
 use crate::Effect;
 use std::sync::{Arc, Mutex};
 
+/// Type alias for engine error in workflow durable child.
+///
+/// # Type parameters
+/// - `R`: Environment type.
 type EngineError<R> = <<R as HasWorkflowEngine>::Engine as WorkflowEngine>::Error;
+/// Type alias for durable child run in workflow durable child.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
+/// - `BodyError`: Error produced by the registered workflow body.
+/// - `R`: Environment type.
 pub type DurableChildRun<A, E, BodyError, R> =
     Durable<WorkflowRunResult<A, E>, DurableChildError<EngineError<R>, BodyError>, R>;
 
 #[derive(Debug)]
+/// A typed failure while starting or joining a durable child workflow.
+///
+/// # Type parameters
+/// - `EngineError`: Error returned by the workflow engine.
+/// - `BodyError`: Error produced by the registered workflow body.
 pub enum DurableChildError<EngineError, BodyError> {
+    /// Encoding or decoding the typed value failed. Retains the `WorkflowCodecError` detail.
     Codec(WorkflowCodecError),
+    /// The workflow engine rejected or could not complete the operation. Retains the `EngineError` detail.
     Engine(EngineError),
+    /// Executing or recording the workflow run failed. Retains the `WorkflowRunError<EngineError, BodyError>` detail.
     Run(WorkflowRunError<EngineError, BodyError>),
+    /// The recorded child differs from the value produced during replay.
     RecordedChildMismatch,
+    /// An owned input was already consumed.
     InputConsumed,
 }
 
@@ -24,6 +47,17 @@ pub struct DurableChild;
 
 impl DurableChild {
     #[must_use]
+    /// Wait for the represented condition or owned work to settle.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Additional bound: `HasWorkflowEngine + Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `parent` (`WorkflowRunId`): Parent scope, span, or workflow identity.
+    /// - `child` (`WorkflowRunId`): Child workflow or scope-owned task being observed.
+    ///
+    /// # Returns
+    /// Type: `Durable<ChildWait, <R::Engine as WorkflowEngine>::Error, R>`.
     pub fn wait<R>(
         parent: WorkflowRunId,
         child: WorkflowRunId,
@@ -40,6 +74,24 @@ impl DurableChild {
         ))
     }
 
+    /// Execute or describe one run using the supplied environment and inputs.
+    ///
+    /// # Type parameters
+    /// - `I`: Input type. Additional bound: `Send + 'static`.
+    /// - `A`: Application value type. Additional bound: `Send + 'static`.
+    /// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+    /// - `BodyError`: Error produced by the registered workflow body. Additional bound: `Send + 'static`.
+    /// - `R`: Environment type. Additional bound: `HasWorkflowEngine + Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `parent` (`WorkflowRunId`): Parent scope, span, or workflow identity.
+    /// - `child_run` (`WorkflowRunId`): The child run supplied to this operation.
+    /// - `definition` (`WorkflowDefinition<I, A, E>`): The typed definition used by this operation.
+    /// - `input` (`I`): The input value or factory consumed by this operation.
+    /// - `body` (`impl Fn(I) -> Durable<Result<A, E>, BodyError, R> + Send + Sync + 'static`): Application callback or effect executed inside the owning scope.
+    ///
+    /// # Returns
+    /// Type: `DurableChildRun<A, E, BodyError, R>`.
     pub fn run<I, A, E, BodyError, R>(
         parent: WorkflowRunId,
         child_run: WorkflowRunId,

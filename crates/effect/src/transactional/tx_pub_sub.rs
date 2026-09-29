@@ -1,3 +1,5 @@
+//! Publish-subscribe delivery after transaction commit.
+
 use super::internal::journal::JournalError;
 use super::{Transaction, TransactionDomain, TransactionDomainError, TxRef, TxValue};
 use crate::{Chunk, Effect, Release, Stream};
@@ -11,33 +13,56 @@ use std::sync::{
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The policy applied when a transactional subscriber’s buffer is full.
 pub enum TxPubSubOverflow {
+    /// Reject the conflicting input without applying its proposed state change.
     Reject,
+    /// Evict the oldest buffered value to admit the new value.
     DropOldest,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A publication, capacity, or lifecycle failure in transactional PubSub.
 pub enum TxPubSubError {
+    /// The configured capacity has been reached.
     Full,
+    /// No further sequence can be allocated without exceeding its range.
     SequenceExhausted,
-    Lagged { first_available: NonZeroU64 },
+    /// A transactional subscriber missed entries beyond retention.
+    Lagged {
+        /// First retained sequence available for resumption. Type: `NonZeroU64`.
+        first_available: NonZeroU64,
+    },
+    /// The required cell is missing.
     MissingCell,
+    /// Execution was cancelled.
     Cancelled,
+    /// The resource has already been disposed.
     Disposed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The committed subscriber-delivery accounting for one publication.
 pub struct TxPublishReceipt {
+    /// The ordered sequence position. Type: `NonZeroU64`.
     pub sequence: NonZeroU64,
+    /// Whether overflow evicted the oldest buffered publication. Type: `bool`.
     pub dropped_oldest: bool,
 }
 
+/// Typed pub sub state used by transactional tx pub sub.
+///
+/// # Type parameters
+/// - `T`: Value or item type. Bound or type: `TxValue`.
 struct PubSubState<T: TxValue> {
     last_sequence: u64,
     retained: VecDeque<(NonZeroU64, Arc<T>)>,
 }
 
 impl<T: TxValue> Clone for PubSubState<T> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             last_sequence: self.last_sequence,
@@ -48,6 +73,10 @@ impl<T: TxValue> Clone for PubSubState<T> {
 
 impl<T: TxValue> TxValue for PubSubState<T> {}
 
+/// A publication channel whose messages become visible only after commit.
+///
+/// # Type parameters
+/// - `T`: Value or item type. Bound or type: `TxValue`.
 pub struct TxPubSub<T: TxValue> {
     cell: TxRef<PubSubState<T>>,
     capacity: NonZeroUsize,
@@ -55,6 +84,9 @@ pub struct TxPubSub<T: TxValue> {
 }
 
 impl<T: TxValue> Clone for TxPubSub<T> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             cell: self.cell.clone(),
@@ -65,6 +97,18 @@ impl<T: TxValue> Clone for TxPubSub<T> {
 }
 
 impl<T: TxValue> TxPubSub<T> {
+    /// Construct a `TxPubSub` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type. Bound: `TxValue`.
+    ///
+    /// # Parameters
+    /// - `domain` (`&TransactionDomain`): Stable identity or provider of the operation’s transaction domain.
+    /// - `capacity` (`NonZeroUsize`): The caller-supplied capacity bound.
+    /// - `overflow` (`TxPubSubOverflow`): Behavior when the configured buffer capacity is full.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, TransactionDomainError>`.
     pub fn new(
         domain: &TransactionDomain,
         capacity: NonZeroUsize,
@@ -81,6 +125,16 @@ impl<T: TxValue> TxPubSub<T> {
         })
     }
 
+    /// Add a publication to the journal so subscribers see it only after commit.
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `value` (`Arc<T>`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Transaction<TxPublishReceipt, TxPubSubError>`.
     pub fn publish(&self, value: Arc<T>) -> Transaction<TxPublishReceipt, TxPubSubError> {
         let capacity = self.capacity;
         let overflow = self.overflow;
@@ -114,6 +168,15 @@ impl<T: TxValue> TxPubSub<T> {
         })
     }
 
+    /// Register an observer for future committed changes.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `T`: Value or item type.
+    ///
+    /// # Returns
+    /// Type: `Effect<TxPubSubSubscription<T>, TxPubSubError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn subscribe<R: Send + Sync + 'static>(
         &self,
     ) -> Effect<TxPubSubSubscription<T>, TxPubSubError, R> {
@@ -131,6 +194,16 @@ impl<T: TxValue> TxPubSub<T> {
     }
 
     #[must_use]
+    /// Register a subscriber beginning after the supplied committed position.
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `after` (`u64`): Cursor or instant after which results are selected.
+    ///
+    /// # Returns
+    /// Type: `TxPubSubSubscription<T>`.
     pub fn subscription_after(&self, after: u64) -> TxPubSubSubscription<T> {
         TxPubSubSubscription {
             inner: Arc::new(PubSubSubscriptionInner {
@@ -143,6 +216,15 @@ impl<T: TxValue> TxPubSub<T> {
     }
 
     #[must_use]
+    /// Return the stream associated with this value.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `T`: Value or item type.
+    ///
+    /// # Returns
+    /// Type: `Stream<(NonZeroU64, Arc<T>), TxPubSubError, R>`.
+    /// Returns a scoped stream with the declared item, error, and environment types.
     pub fn stream<R: Send + Sync + 'static>(
         &self,
     ) -> Stream<(NonZeroU64, Arc<T>), TxPubSubError, R> {
@@ -164,6 +246,10 @@ impl<T: TxValue> TxPubSub<T> {
     }
 }
 
+/// Typed pub sub subscription inner used by transactional tx pub sub.
+///
+/// # Type parameters
+/// - `T`: Value or item type. Bound or type: `TxValue`.
 struct PubSubSubscriptionInner<T: TxValue> {
     cell: TxRef<PubSubState<T>>,
     cursor: Mutex<u64>,
@@ -171,11 +257,18 @@ struct PubSubSubscriptionInner<T: TxValue> {
     closed: Event,
 }
 
+/// A subscriber that observes messages committed by its transaction domain.
+///
+/// # Type parameters
+/// - `T`: Value or item type. Bound or type: `TxValue`.
 pub struct TxPubSubSubscription<T: TxValue> {
     inner: Arc<PubSubSubscriptionInner<T>>,
 }
 
 impl<T: TxValue> Clone for TxPubSubSubscription<T> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -185,6 +278,14 @@ impl<T: TxValue> Clone for TxPubSubSubscription<T> {
 
 impl<T: TxValue> TxPubSubSubscription<T> {
     #[must_use]
+    /// Release owned native state and await its disposal where required.
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type. Bound: `TxValue`.
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     pub fn dispose(&self) -> bool {
         let first = !self.inner.disposed.swap(true, Ordering::AcqRel);
         if first {
@@ -193,6 +294,15 @@ impl<T: TxValue> TxPubSubSubscription<T> {
         first
     }
 
+    /// Advance to the next value or recorded step when one exists.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `T`: Value or item type.
+    ///
+    /// # Returns
+    /// Type: `Effect<(NonZeroU64, Arc<T>), TxPubSubError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn next<R: Send + Sync + 'static>(&self) -> Effect<(NonZeroU64, Arc<T>), TxPubSubError, R> {
         let subscription = self.clone();
         Effect::try_future(

@@ -1,3 +1,5 @@
+//! Scoped batching and sharing of request loads.
+
 use crate::internal::runtime::{self, Step};
 use crate::{
     Defect, Effect, Exit, HasTaskSpawner, Release, Request, RequestKey, Scope, SharedValue,
@@ -6,6 +8,12 @@ use futures_util::FutureExt;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 
+/// Type alias for resolve many effect in request resolver.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
+/// - `R`: Environment type.
 pub type ResolveManyEffect<A, E, R> =
     Effect<Vec<Exit<SharedValue<A>, RequestResolverError<E>>>, RequestResolverError<E>, R>;
 
@@ -19,11 +27,23 @@ pub struct RequestScope(Arc<()>);
 
 impl RequestScope {
     #[must_use]
+    /// Construct a `RequestScope` from its required inputs and explicit policies.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new() -> Self {
         Self(Arc::new(()))
     }
 
     #[must_use]
+    /// Check whether two resolver requests share the same stable identity.
+    ///
+    /// # Parameters
+    /// - `other` (`&Self`): Second value used for comparison or composition.
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     pub fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -31,23 +51,44 @@ impl RequestScope {
 
 /// Only request-resolution operations require this environment projection.
 pub trait HasRequestScope {
+    /// # Returns
+    /// Type: `&RequestScope`.
     fn request_scope(&self) -> &RequestScope;
 }
 
 /// Expected request, batch and construction failures remain distinct. Error
 /// payloads are shared handles, so concurrent observers need no E: Clone.
+///
+/// # Type parameters
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 pub enum RequestResolverError<E: Send + 'static> {
+    /// The request operation failed. Retains the `SharedValue<E>` detail.
     RequestFailed(SharedValue<E>),
+    /// The batch operation failed. Retains the `SharedValue<E>` detail.
     BatchFailed(SharedValue<E>),
+    /// The same request key was assigned to another group. Retains the `RequestKey` detail.
     ConflictingGroup(RequestKey),
-    CardinalityMismatch { expected: usize, actual: usize },
+    /// A batch resolver returned a different number of results than requests.
+    CardinalityMismatch {
+        /// Number of submitted requests. Type: `usize`.
+        expected: usize,
+        /// Number of returned results. Type: `usize`.
+        actual: usize,
+    },
+    /// The supplied environment does not match the required or recorded value.
     WrongEnvironment,
+    /// The provider has closed admission for new work.
     Closed,
+    /// An owned input was already consumed.
     InputConsumed,
+    /// The operation ended without recording a terminal result.
     Uncompleted,
 }
 
 impl<E: Send + 'static> Clone for RequestResolverError<E> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         match self {
             Self::RequestFailed(error) => Self::RequestFailed(error.clone()),
@@ -66,6 +107,13 @@ impl<E: Send + 'static> Clone for RequestResolverError<E> {
 }
 
 impl<E: Send + 'static> std::fmt::Debug for RequestResolverError<E> {
+    ///
+    /// # Parameters
+    /// - `formatter` (`&mut std::fmt::Formatter<'_>`): Destination formatter used by the Rust formatting trait.
+    ///
+    /// # Returns
+    /// Type: `std::fmt::Result`.
+    /// Returns `std::fmt::Result`.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RequestFailed(_) => formatter.write_str("RequestFailed"),
@@ -85,6 +133,13 @@ impl<E: Send + 'static> std::fmt::Debug for RequestResolverError<E> {
 }
 
 impl<E: Send + 'static> std::fmt::Display for RequestResolverError<E> {
+    ///
+    /// # Parameters
+    /// - `formatter` (`&mut std::fmt::Formatter<'_>`): Destination formatter used by the Rust formatting trait.
+    ///
+    /// # Returns
+    /// Type: `std::fmt::Result`.
+    /// Returns `std::fmt::Result`.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(self, formatter)
     }
@@ -92,6 +147,13 @@ impl<E: Send + 'static> std::fmt::Display for RequestResolverError<E> {
 
 impl<E: Send + 'static> std::error::Error for RequestResolverError<E> {}
 
+/// Type alias for batch runner in request resolver.
+///
+/// # Type parameters
+/// - `Q`: Request type.
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
+/// - `R`: Environment type.
 type BatchRunner<Q, A, E, R> =
     dyn Fn(crate::RequestGroup, Vec<Q>) -> Effect<Vec<Exit<A, E>>, E, R> + Send + Sync;
 
@@ -101,6 +163,12 @@ type BatchRunner<Q, A, E, R> =
 /// A batch is explicit: no implicit tick, debounce, worker count or executor
 /// chooses when requests leave the pending registry. Identical pending keys
 /// within this instance share one load; completed entries are not retained.
+///
+/// # Type parameters
+/// - `Q`: Request type. Bound or type: `Send + 'static`.
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
+/// - `R`: Environment type. Bound or type: `HasTaskSpawner + HasRequestScope + Send + Sync + 'static`.
 pub struct RequestResolver<
     Q: Send + 'static,
     A: Send + 'static,
@@ -117,6 +185,9 @@ impl<
     R: HasTaskSpawner + HasRequestScope + Send + Sync + 'static,
 > Clone for RequestResolver<Q, A, E, R>
 {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -136,6 +207,20 @@ impl<
     /// `run` receives a nonempty same-group batch and returns exactly one
     /// outcome per input, in the same order. A whole-batch E is separate from
     /// the per-request E values carried by its successful result vector.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `Q`: Request type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `scope` (`Scope<RequestResolverError<E>>`): Owner that joins child work and releases resources at close.
+    /// - `run` (`impl Fn(crate::RequestGroup, Vec<Q>) -> Effect<Vec<Exit<A, E>>, E, R> + Send + Sync + 'static`): Stable identity of the workflow run being inspected or changed.
+    ///
+    /// # Returns
+    /// Type: `Effect<Self, RequestResolverError<E>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn make(
         scope: Scope<RequestResolverError<E>>,
         run: impl Fn(crate::RequestGroup, Vec<Q>) -> Effect<Vec<Exit<A, E>>, E, R>
@@ -176,6 +261,18 @@ impl<
     /// Resolve an explicit batch. Construction/scope conflicts use the outer
     /// error; each position retains its typed request, batch or admission Exit
     /// in input order.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `Q`: Request type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `requests` (`Vec<Request<Q, A, E>>`): The requests supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `ResolveManyEffect<A, E, R>`.
     pub fn resolve_many(&self, requests: Vec<Request<Q, A, E>>) -> ResolveManyEffect<A, E, R> {
         let resolver = Arc::clone(&self.inner);
         let requests = Mutex::new(Some(requests));
@@ -200,6 +297,19 @@ impl<
 
     /// Resolve one request and expose its expected failure in the Effect E
     /// channel while retaining shared, non-Clone result ownership.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `Q`: Request type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `request` (`Request<Q, A, E>`): The typed request to process.
+    ///
+    /// # Returns
+    /// Type: `Effect<SharedValue<A>, RequestResolverError<E>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn resolve(
         &self,
         request: Request<Q, A, E>,

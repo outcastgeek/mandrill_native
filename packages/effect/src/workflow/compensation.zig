@@ -6,75 +6,122 @@ const effects = @import("../effect.zig");
 const outcomes = @import("../outcome.zig");
 const types = @import("workflow_types.zig");
 
+/// Stable identity for one workflow compensation sequence.
 pub const Identity = struct {
     execution: types.ExecutionId,
     name: []const u8,
     version: u32,
 
+    /// Check whether this value satisfies its structural invariants.
+    /// Parameters:
+    /// - `self: Identity`: Receiver passed by value: the struct itself is copied, while any referenced storage keeps its original ownership and lifetime.
+    /// Returns (`bool`): `true` for valid execution, nonempty UTF-8 name, and positive version.
     pub fn valid(self: Identity) bool {
         return self.execution.validate() == .ok and self.name.len > 0 and
             std.unicode.utf8ValidateSlice(self.name) and self.version > 0;
     }
 };
 
+/// One recorded attempt to execute a compensation step.
 pub const Attempt = struct {
     identity: Identity,
     ordinal: u64,
     attempt: u64,
 
+    /// Check whether this value satisfies its structural invariants.
+    /// Parameters:
+    /// - `self: Attempt`: Receiver passed by value: the struct itself is copied, while any referenced storage keeps its original ownership and lifetime.
+    /// Returns (`bool`): `true` for valid identity and positive ordinal and attempt.
     pub fn valid(self: Attempt) bool {
         return self.identity.valid() and self.ordinal > 0 and self.attempt > 0;
     }
 };
 
+/// Stored compensation definition and its progress.
 pub const Recorded = struct {
+    /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit` and
+    /// must be released after use.
     pub const effect_owned_payload = true;
     ordinal: u64,
     attempt: u64,
     encoded_exit: types.Bytes,
 
+    /// Release resources owned by this value.
+    /// Parameters:
+    /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn deinit(self: *@This()) void {
         self.encoded_exit.deinit();
         self.* = undefined;
     }
 
+    /// Duplicate this value; marked owning payloads are cloned, while ordinary
+    /// borrowed fields retain their original lifetime.
+    /// Parameters:
+    /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+    /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
     pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
         return .{ .ordinal = self.ordinal, .attempt = self.attempt, .encoded_exit = try self.encoded_exit.clone() };
     }
 };
 
+/// Compensation step awaiting execution or resolution.
 pub const Pending = struct {
+    /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit` and
+    /// must be released after use.
     pub const effect_owned_payload = true;
     name: types.Bytes,
     version: u32,
     ordinal: u64,
     attempt: u64,
 
+    /// Release resources owned by this value.
+    /// Parameters:
+    /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn deinit(self: *@This()) void {
         self.name.deinit();
         self.* = undefined;
     }
 
+    /// Duplicate this value; marked owning payloads are cloned, while ordinary
+    /// borrowed fields retain their original lifetime.
+    /// Parameters:
+    /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+    /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
     pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
         return .{ .name = try self.name.clone(), .version = self.version, .ordinal = self.ordinal, .attempt = self.attempt };
     }
 };
 
+/// Bounded ordered page of pending compensations.
 pub const Page = struct {
+    /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit` and
+    /// must be released after use.
     pub const effect_owned_payload = true;
     items: outcomes.OwnedSlice(Pending),
     more: bool,
 
+    /// Release resources owned by this value.
+    /// Parameters:
+    /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn deinit(self: *@This()) void {
         self.items.deinit();
         self.* = undefined;
     }
 
+    /// Duplicate this value; marked owning payloads are cloned, while ordinary
+    /// borrowed fields retain their original lifetime.
+    /// Parameters:
+    /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+    /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
     pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
         return .{ .items = try self.items.clone(), .more = self.more };
     }
 };
 
+/// Result of registering or deduplicating a compensation step.
 pub const Registration = union(enum) {
     registered: u64,
     already_registered: u64,
@@ -82,6 +129,8 @@ pub const Registration = union(enum) {
     possibly_registered,
 };
 
+/// `Recording` cases: `recorded`, `already_recorded`, `conflicting_outcome`, `stale_attempt`,
+/// `possibly_recorded`.
 pub const Recording = enum {
     recorded,
     already_recorded,
@@ -90,6 +139,7 @@ pub const Recording = enum {
     possibly_recorded,
 };
 
+/// Typed compensation registration, execution, or resolution failure.
 pub const Error = union(enum) {
     invalid_identity,
     malformed_record,
@@ -98,27 +148,48 @@ pub const Error = union(enum) {
     stale_attempt,
 };
 
+/// Storage or provider durability promised by this capability. `recoverable`
+/// permits compositions that must survive process restart; `volatile` does not.
 pub const Guarantee = enum { @"volatile", recoverable };
 
 /// `register` atomically allocates a per-execution ordinal, deduplicated by
 /// identity. `pendingReverse` returns highest ordinals first; its cursor is
 /// exclusive. `record` fences the attempt and stores a complete encoded Exit.
 /// A provider must never report success after an uncertain write.
+///
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `guarantee: comptime Guarantee`: Compile-time volatility or recoverability promised by this provider; durable compositions check it before compiling.
+/// Returns (`type`): provider contract for registering, claiming, and resolving durable compensation steps.
 pub fn Journal(comptime R: type, comptime ProviderError: type, comptime guarantee: Guarantee) type {
     return struct {
         const Self = @This();
+        /// Compile-time volatility or recoverability promised by this provider.
         pub const storage_guarantee = guarantee;
+        /// Typed failure channel combining domain and provider errors.
         pub const Failure = union(enum) {
             const Own = @This();
+            /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements
+            /// `deinit` and must be released after use.
             pub const effect_owned_payload = outcomes.ownsPayload(ProviderError);
             operation: Error,
             provider: ProviderError,
 
+            /// Release resources owned by this value.
+            /// Parameters:
+            /// - `self: *Own`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+            /// Returns (`void`): no value.
             pub fn deinit(self: *Own) void {
                 if (self.* == .provider) outcomes.discardPayload(&self.provider);
                 self.* = undefined;
             }
 
+            /// Duplicate this value; marked owning payloads are cloned, while ordinary
+            /// borrowed fields retain their original lifetime.
+            /// Parameters:
+            /// - `self: *const Own`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+            /// Returns (`error{OutOfMemory}!Own`): A `Own` on success; `OutOfMemory` if required allocation fails.
             pub fn clone(self: *const Own) error{OutOfMemory}!Own {
                 return switch (self.*) {
                     .provider => |value| .{ .provider = try outcomes.clonePayload(value) },
@@ -126,21 +197,67 @@ pub fn Journal(comptime R: type, comptime ProviderError: type, comptime guarante
                 };
             }
         };
+        /// Lazy Effect for register effect; success, error, and environment types are fixed by
+        /// `effects.Effect(Registration, Failure, R)`.
         pub const RegisterEffect = effects.Effect(Registration, Failure, R);
+        /// Lazy Effect for lookup effect; success, error, and environment types are fixed by
+        /// `effects.Effect(?Recorded, Failure, R)`.
         pub const LookupEffect = effects.Effect(?Recorded, Failure, R);
+        /// Lazy Effect for record effect; success, error, and environment types are fixed by
+        /// `effects.Effect(Recording, Failure, R)`.
         pub const RecordEffect = effects.Effect(Recording, Failure, R);
+        /// Lazy Effect for pending effect; success, error, and environment types are fixed by
+        /// `effects.Effect(Page, Failure, R)`.
         pub const PendingEffect = effects.Effect(Page, Failure, R);
 
         userdata: ?*anyopaque,
         vtable: *const VTable,
 
+        /// Typed function-pointer interface for this capability. Implement every
+        /// hook with the exact signature below; keep the table valid while the
+        /// capability or pending work can invoke it.
         pub const VTable = struct {
+            /// Register through this provider.
+            /// Parameters (callback order):
+            /// - `1: ?*anyopaque`: opaque provider or handle context; keep it live until the hook and any retained work complete.
+            /// - `2: *const R`: borrowed generic environment `R`, including caller-supplied runtime services.
+            /// - `3: Identity`: stable typed identity for the selected operation.
+            /// Returns (`RegisterEffect`): lazy typed Effect; run it with its declared environment to obtain Exit.
             register: *const fn (?*anyopaque, *const R, Identity) RegisterEffect,
+            /// Lookup through this provider.
+            /// Parameters (callback order):
+            /// - `1: ?*anyopaque`: opaque provider or handle context; keep it live until the hook and any retained work complete.
+            /// - `2: *const R`: borrowed generic environment `R`, including caller-supplied runtime services.
+            /// - `3: Attempt`: typed domain value consumed by this hook.
+            /// Returns (`LookupEffect`): lazy typed Effect; run it with its declared environment to obtain Exit.
             lookup: *const fn (?*anyopaque, *const R, Attempt) LookupEffect,
+            /// Record the supplied measurement.
+            /// Parameters (callback order):
+            /// - `1: ?*anyopaque`: opaque provider or handle context; keep it live until the hook and any retained work complete.
+            /// - `2: *const R`: borrowed generic environment `R`, including caller-supplied runtime services.
+            /// - `3: Attempt`: typed domain value consumed by this hook.
+            /// - `4: []const u8`: borrowed input slice; keep it valid through deferred use or copy before retaining it.
+            /// Returns (`RecordEffect`): lazy typed Effect; run it with its declared environment to obtain Exit.
             record: *const fn (?*anyopaque, *const R, Attempt, []const u8) RecordEffect,
+            /// Pending reverse through this provider.
+            /// Parameters (callback order):
+            /// - `1: ?*anyopaque`: opaque provider or handle context; keep it live until the hook and any retained work complete.
+            /// - `2: *const R`: borrowed generic environment `R`, including caller-supplied runtime services.
+            /// - `3: types.ExecutionId`: stable typed identity for the selected operation.
+            /// - `4: ?u64`: typed counter or optional sequence value.
+            /// - `5: usize`: caller-selected count or bound.
+            /// Returns (`PendingEffect`): lazy typed Effect; run it with its declared environment to obtain Exit.
             pending_reverse: *const fn (?*anyopaque, *const R, types.ExecutionId, ?u64, usize) PendingEffect,
         };
 
+        /// Wrap a caller-supplied provider implementation.
+        /// Parameters:
+        /// - `data: ?*anyopaque`: Borrowed provider context passed unchanged to every hook.
+        ///   Its owner keeps it alive through any pending effect or operation.
+        /// - `vtable: *const VTable`: Borrowed table of exactly typed callbacks; keep it
+        ///   alive for every use of this capability, including deferred execution.
+        /// Returns (`Self`): A non-owning adapter referencing `data` and `vtable`; no
+        ///   provider state is allocated or transferred by this constructor.
         pub fn fromProvider(data: ?*anyopaque, vtable: *const VTable) Self {
             return .{ .userdata = data, .vtable = vtable };
         }
@@ -153,6 +270,13 @@ pub fn Journal(comptime R: type, comptime ProviderError: type, comptime guarante
             }.result);
         }
 
+        /// Register a definition or subscription with its owner.
+        /// Parameters:
+        /// - `select_journal: comptime fn (*const R) *const Self`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// - `select_identity: comptime fn (*const R) Identity`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// Returns (`RegisterEffect`): durable compensation registration or matching previously registered step.
         pub fn register(
             comptime select_journal: fn (*const R) *const Self,
             comptime select_identity: fn (*const R) Identity,
@@ -168,6 +292,13 @@ pub fn Journal(comptime R: type, comptime ProviderError: type, comptime guarante
             }.start);
         }
 
+        /// Look up a stored value using its stable identity.
+        /// Parameters:
+        /// - `select_journal: comptime fn (*const R) *const Self`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// - `select_attempt: comptime fn (*const R) Attempt`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// Returns (`LookupEffect`): recorded compensation step for the supplied execution and ordinal.
         pub fn lookup(
             comptime select_journal: fn (*const R) *const Self,
             comptime select_attempt: fn (*const R) Attempt,
@@ -182,6 +313,15 @@ pub fn Journal(comptime R: type, comptime ProviderError: type, comptime guarante
             }.start);
         }
 
+        /// Record the selected metric or durable result.
+        /// Parameters:
+        /// - `select_journal: comptime fn (*const R) *const Self`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// - `select_attempt: comptime fn (*const R) Attempt`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// - `select_encoded_exit: comptime fn (*const R) []const u8`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// Returns (`RecordEffect`): typed acknowledgement after recording a compensation result.
         pub fn record(
             comptime select_journal: fn (*const R) *const Self,
             comptime select_attempt: fn (*const R) Attempt,
@@ -198,6 +338,17 @@ pub fn Journal(comptime R: type, comptime ProviderError: type, comptime guarante
             }.start);
         }
 
+        /// Read pending compensations in reverse execution order.
+        /// Parameters:
+        /// - `select_journal: comptime fn (*const R) *const Self`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// - `select_execution: comptime fn (*const R) types.ExecutionId`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// - `select_before: comptime fn (*const R) ?u64`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// - `select_limit: comptime fn (*const R) usize`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// Returns (`PendingEffect`): bounded page of pending compensations in reverse execution order.
         pub fn pendingReverse(
             comptime select_journal: fn (*const R) *const Self,
             comptime select_execution: fn (*const R) types.ExecutionId,
@@ -219,18 +370,35 @@ pub fn Journal(comptime R: type, comptime ProviderError: type, comptime guarante
 
 /// Both exits remain visible; a failed compensation must not replace the
 /// original failure. The error types may differ and preserve their own tags.
+///
+/// Parameters:
+/// - `OriginalSuccess: comptime type`: Compile-time success type before the transformation.
+/// - `OriginalError: comptime type`: Compile-time error type before the transformation.
+/// - `CompensationError: comptime type`: Compile-time typed compensation failure.
+/// Returns (`type`): record of an application-defined compensation outcome.
 pub fn Resolution(comptime OriginalSuccess: type, comptime OriginalError: type, comptime CompensationError: type) type {
     return struct {
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         original: outcomes.Exit(OriginalSuccess, OriginalError),
         compensation: outcomes.Exit(void, CompensationError),
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *@This()) void {
             self.original.deinit();
             self.compensation.deinit();
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
             var original = self.original.clone();
             if (original == .die and original.die.kind == .out_of_memory and
@@ -246,9 +414,16 @@ pub fn Resolution(comptime OriginalSuccess: type, comptime OriginalError: type, 
     };
 }
 
+/// Specialize the workflow failure variants from their typed channels.
+/// Parameters:
+/// - `JournalError: comptime type`: Compile-time typed journal failure.
+/// - `CodecError: comptime type`: Failure type returned by the selected encoder or decoder.
+/// Returns (`type`): typed failure when running a compensation step.
 pub fn RunError(comptime JournalError: type, comptime CodecError: type) type {
     return union(enum) {
         const Self = @This();
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = outcomes.ownsPayload(JournalError) or outcomes.ownsPayload(CodecError);
         journal: JournalError,
         codec: CodecError,
@@ -257,6 +432,10 @@ pub fn RunError(comptime JournalError: type, comptime CodecError: type) type {
         stale_attempt,
         uncertain_record,
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             switch (self.*) {
                 .journal => outcomes.discardPayload(&self.journal),
@@ -266,6 +445,11 @@ pub fn RunError(comptime JournalError: type, comptime CodecError: type) type {
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!Self`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const Self) error{OutOfMemory}!Self {
             return switch (self.*) {
                 .journal => |value| .{ .journal = try outcomes.clonePayload(value) },
@@ -276,17 +460,32 @@ pub fn RunError(comptime JournalError: type, comptime CodecError: type) type {
     };
 }
 
+/// Specialize the typed completed outcome for workflow operations.
+/// Parameters:
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// Returns (`type`): completed compensation outcome retaining its typed result.
 pub fn Completed(comptime E: type) type {
     return struct {
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         source: enum { executed, replayed },
         exit: outcomes.Exit(void, E),
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *@This()) void {
             self.exit.deinit();
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
             const copy = self.exit.clone();
             if (copy == .die and copy.die.kind == .out_of_memory and
@@ -297,18 +496,33 @@ pub fn Completed(comptime E: type) type {
     };
 }
 
+/// Specialize a recorded compensation step for reverse replay.
+/// Parameters:
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// Returns (`type`): recorded compensation waiting for reverse-order replay.
 pub fn PendingStep(comptime E: type) type {
     return union(enum) {
         const Self = @This();
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         none,
         completed: struct { ordinal: u64, outcome: Completed(E) },
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             if (self.* == .completed) self.completed.outcome.deinit();
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!Self`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const Self) error{OutOfMemory}!Self {
             return switch (self.*) {
                 .none => .none,
@@ -324,6 +538,20 @@ pub fn PendingStep(comptime E: type) type {
 /// failed compensation stays in the returned completed Exit for the caller
 /// to combine with the original workflow failure; dispatch must record before
 /// this step can report completion.
+///
+/// Parameters:
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `CodecError: comptime type`: Failure type returned by the selected encoder or decoder.
+/// - `guarantee: comptime Guarantee`: Compile-time volatility or recoverability promised by this provider; durable compositions check it before compiling.
+/// - `select_journal: comptime fn (*const R) *const Journal(R, ProviderError, guarantee)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_execution: comptime fn (*const R) types.ExecutionId`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `dispatch: comptime fn (*const Pending, *const R) effects.Effect(Completed(E), RunError(Journal(R, ProviderError, guarantee).Failure, CodecError), R)`: Compile-time typed function selected at comptime; no runtime callback lookup is
+///   required.
+/// Returns (`effects.Effect(PendingStep(E), RunError(Journal(R, ProviderError, guarantee).Failure, CodecError), R)`): result of executing the next pending compensation step.
 pub fn runNextPending(
     comptime E: type,
     comptime R: type,
@@ -376,6 +604,20 @@ pub fn runNextPending(
 /// defected compensation is returned as an owned Exit so the original workflow
 /// Exit can remain visible in `Resolution`. A dispatcher that reports success
 /// without making journal progress is rejected instead of looping forever.
+///
+/// Parameters:
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `CodecError: comptime type`: Failure type returned by the selected encoder or decoder.
+/// - `guarantee: comptime Guarantee`: Compile-time volatility or recoverability promised by this provider; durable compositions check it before compiling.
+/// - `select_journal: comptime fn (*const R) *const Journal(R, ProviderError, guarantee)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_execution: comptime fn (*const R) types.ExecutionId`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `dispatch: comptime fn (*const Pending, *const R) effects.Effect(Completed(E), RunError(Journal(R, ProviderError, guarantee).Failure, CodecError), R)`: Compile-time typed function selected at comptime; no runtime callback lookup is
+///   required.
+/// Returns (`effects.Effect(outcomes.Exit(void, E), RunError(Journal(R, ProviderError, guarantee).Failure, CodecError), R)`): A lazy Effect; running it with its declared environment yields a typed Exit.
 pub fn runAllPending(
     comptime E: type,
     comptime R: type,
@@ -426,6 +668,23 @@ pub fn runAllPending(
 /// The supplied program must use a stable external idempotency key derived
 /// from the attempt identity whenever it performs an external side effect;
 /// recording the Exit cannot make that side effect exactly once.
+///
+/// Parameters:
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `CodecError: comptime type`: Failure type returned by the selected encoder or decoder.
+/// - `guarantee: comptime Guarantee`: Compile-time volatility or recoverability promised by this provider; durable compositions check it before compiling.
+/// - `program: comptime effects.Effect(void, E, R)`: Lazy typed program to sequence, run, or transform.
+/// - `select_journal: comptime fn (*const R) *const Journal(R, ProviderError, guarantee)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_attempt: comptime fn (*const R) Attempt`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `encode_exit: comptime fn (*const outcomes.Exit(void, E), *const R) outcomes.Exit(outcomes.OwnedSlice(u8), CodecError)`: Compile-time typed function selected at comptime; no runtime callback lookup
+///   is required.
+/// - `decode_exit: comptime fn ([]const u8, *const R) outcomes.Exit(outcomes.Exit(void, E), CodecError)`: Compile-time typed function selected at comptime; no runtime callback lookup
+///   is required.
+/// Returns (`effects.Effect(Completed(E), RunError(Journal(R, ProviderError, guarantee).Failure, CodecError), R)`): recorded or newly executed compensation outcome.
 pub fn runRecorded(
     comptime E: type,
     comptime R: type,
@@ -443,16 +702,27 @@ pub fn runRecorded(
     const Out = effects.Effect(Completed(E), Failure, R);
     const Encoded = outcomes.OwnedSlice(u8);
     const Capture = struct {
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         exit: outcomes.Exit(void, E),
         encoded: Encoded,
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *@This()) void {
             self.exit.deinit();
             self.encoded.deinit();
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
             const exit = self.exit.clone();
             if (exit == .die and exit.die.kind == .out_of_memory and

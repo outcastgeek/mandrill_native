@@ -7,16 +7,25 @@ const std = @import("std");
 const outcomes = @import("../outcome.zig");
 const Issue = @import("../schema/schema_issue.zig").Issue;
 
+/// `Version` cases: `v1`.
 pub const Version = enum(u8) { v1 = 1 };
+/// Length uses `u32` as its stable representation in this module.
 pub const Length = u32;
+/// Width in bytes of an encoded schema length field.
 pub const length_bytes = @sizeOf(Length);
+/// Fixed byte width of a schema-binary header.
 pub const header_bytes = @sizeOf(Version) + 2 * length_bytes;
 
+/// Explicit bounds on schema-name and encoded payload bytes.
 pub const Limits = struct {
     max_schema_name_bytes: usize,
     max_payload_bytes: usize,
     max_frame_bytes: usize,
 
+    /// Check whether this value satisfies its structural invariants.
+    /// Parameters:
+    /// - `self: Limits`: Receiver passed by value: the struct itself is copied, while any referenced storage keeps its original ownership and lifetime.
+    /// Returns (`bool`): `true` when name/payload limits are positive and header plus payload cannot overflow.
     pub fn valid(self: Limits) bool {
         const parts = std.math.add(usize, self.max_schema_name_bytes, self.max_payload_bytes) catch return false;
         const total = std.math.add(usize, header_bytes, parts) catch return false;
@@ -27,6 +36,7 @@ pub const Limits = struct {
     }
 };
 
+/// Typed view record.
 pub const View = struct { version: Version, schema_name: []const u8, payload: []const u8 };
 
 fn writeLength(target: []u8, value: Length) void {
@@ -45,6 +55,12 @@ fn readLength(source: []const u8) Length {
     return value;
 }
 
+/// Validate a key or encoded value without taking ownership.
+/// Parameters:
+/// - `frame: []const u8`: Encoded protocol frame to parse, dispatch, or transmit.
+/// - `limits: Limits`: Caller-selected, validated behavior or resource bounds; no hidden default is
+///   installed.
+/// Returns (`outcomes.Result(View, Issue)`): An ok/err Result; owned payloads must be released according to their type contract.
 pub fn inspect(frame: []const u8, limits: Limits) outcomes.Result(View, Issue) {
     if (!limits.valid() or frame.len > limits.max_frame_bytes)
         return .{ .err = Issue.pure(.decode, .size_limit) };
@@ -70,6 +86,15 @@ pub fn inspect(frame: []const u8, limits: Limits) outcomes.Result(View, Issue) {
     return .{ .ok = .{ .version = version, .schema_name = name, .payload = frame[header_bytes + schema_length ..] } };
 }
 
+/// Encode a value into its wire representation.
+/// Parameters:
+/// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected capabilities.
+/// - `schema_name: comptime []const u8`: Compile-time typed codec/schema fixing the corresponding decoded and encoded
+///   value types.
+/// - `payload: []const u8`: Borrowed input; keep its owner alive until the operation has copied or joined it.
+/// - `limits: Limits`: Caller-selected, validated behavior or resource bounds; no hidden default is
+///   installed.
+/// Returns (`outcomes.Exit(outcomes.OwnedSlice(u8), Issue)`): Carries `outcomes.OwnedSlice(u8)` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
 pub fn encode(env: anytype, comptime schema_name: []const u8, payload: []const u8, limits: Limits) outcomes.Exit(outcomes.OwnedSlice(u8), Issue) {
     comptime {
         if (schema_name.len == 0 or !std.unicode.utf8ValidateSlice(schema_name))
@@ -93,6 +118,15 @@ pub fn encode(env: anytype, comptime schema_name: []const u8, payload: []const u
     return .{ .success = .{ .items = frame, .allocator = env.allocator } };
 }
 
+/// Decode a value from its wire representation.
+/// Parameters:
+/// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected capabilities.
+/// - `schema_name: comptime []const u8`: Compile-time typed codec/schema fixing the corresponding decoded and encoded
+///   value types.
+/// - `frame: []const u8`: Encoded protocol frame to parse, dispatch, or transmit.
+/// - `limits: Limits`: Caller-selected, validated behavior or resource bounds; no hidden default is
+///   installed.
+/// Returns (`outcomes.Exit(outcomes.OwnedSlice(u8), Issue)`): Carries `outcomes.OwnedSlice(u8)` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
 pub fn decode(env: anytype, comptime schema_name: []const u8, frame: []const u8, limits: Limits) outcomes.Exit(outcomes.OwnedSlice(u8), Issue) {
     const view = switch (inspect(frame, limits)) {
         .ok => |value| value,

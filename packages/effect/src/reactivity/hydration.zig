@@ -6,19 +6,31 @@ const atom_ref = @import("atom_ref.zig");
 const registry = @import("atom_registry.zig");
 const Issue = @import("../schema/schema_issue.zig").Issue;
 
+/// Stored atom key, schema version, revision, and encoded state.
 pub const Snapshot = struct {
+    /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit` and
+    /// must be released after use.
     pub const effect_owned_payload = true;
     key: outcomes.OwnedSlice(u8),
     schema_version: u32,
     revision: u64,
     bytes: outcomes.OwnedSlice(u8),
 
+    /// Release resources owned by this value.
+    /// Parameters:
+    /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn deinit(self: *@This()) void {
         self.key.deinit();
         self.bytes.deinit();
         self.* = undefined;
     }
 
+    /// Duplicate this value; marked owning payloads are cloned, while ordinary
+    /// borrowed fields retain their original lifetime.
+    /// Parameters:
+    /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+    /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
     pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
         var key = try self.key.clone();
         errdefer key.deinit();
@@ -26,10 +38,16 @@ pub const Snapshot = struct {
     }
 };
 
+/// Specialize the typed reactivity error channel from its compile-time error type.
+/// Parameters:
+/// - `T: comptime type`: Value type stored or transported by the returned component.
+/// Returns (`type`): typed hydration failure union retaining source and validation errors.
 pub fn Error(comptime T: type) type {
     _ = T;
     return union(enum) {
         const Self = @This();
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         atom: atom_ref.Error,
         codec: Issue,
@@ -39,11 +57,20 @@ pub fn Error(comptime T: type) type {
         conflicting_revision,
         revision_exhausted,
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             if (self.* == .codec) self.codec.deinit();
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!Self`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const Self) error{OutOfMemory}!Self {
             return switch (self.*) {
                 .codec => |issue| .{ .codec = try issue.clone() },
@@ -53,6 +80,7 @@ pub fn Error(comptime T: type) type {
     };
 }
 
+/// Result of importing a snapshot into a hydrated atom.
 pub const ImportResult = union(enum) {
     applied: atom_ref.Write,
     unchanged,
@@ -62,6 +90,13 @@ pub const ImportResult = union(enum) {
 /// and publication share one serialized boundary. `Codec.encode` returns
 /// owned bytes; `Codec.decode` returns an owned value. The codec must represent
 /// data only and reject nontransferable/pending runtime objects.
+///
+/// Parameters:
+/// - `T: comptime type`: Value type stored or transported by the returned component.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `version: comptime u32`: Compile-time stable version used to reject incompatible encoded or replayed data.
+/// - `Codec: comptime type`: Compile-time codec type with a decoded value and encoded representation.
+/// Returns (`type`): hydrated observable value with revision and source identity.
 pub fn State(comptime T: type, comptime R: type, comptime version: u32, comptime Codec: type) type {
     comptime {
         if (version == 0) @compileError("hydration schema version must be nonzero");
@@ -73,12 +108,24 @@ pub fn State(comptime T: type, comptime R: type, comptime version: u32, comptime
     }
     return struct {
         const Self = @This();
+        /// Typed failure channel combining domain and provider errors.
         pub const Failure = Error(T);
         io: std.Io,
         mutex: std.Io.Mutex = .init,
         atom: atom_ref.AtomRef(T),
         revision: u64,
 
+        /// Create a hydrated observable value from its source, key, and initial revision.
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `source: *registry.Registry`: Mutable input or buffer; ownership transfer is specified by the returned
+        ///   type.
+        /// - `key: []const u8`: Stable identity used for matching, deduplication, or replay.
+        /// - `initial: T`: Value restored from the serialized state into the hydrated reference.
+        /// - `capacity: usize`: buffer capacity for this hydrated value’s change notices.
+        /// - `initial_revision: u64`: Starting revision for optimistic concurrency checks.
+        /// Returns (`outcomes.Exit(Self, Failure)`): Carries `Self` on `.success` or `Failure` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn init(env: *const R, source: *registry.Registry, key: []const u8, initial: T, capacity: usize, initial_revision: u64) outcomes.Exit(Self, Failure) {
             return switch (atom_ref.AtomRef(T).init(env, source, key, initial, capacity)) {
                 .success => |atom| .{ .success = .{ .io = env.io, .atom = atom, .revision = initial_revision } },
@@ -89,6 +136,10 @@ pub fn State(comptime T: type, comptime R: type, comptime version: u32, comptime
             };
         }
 
+        /// Read the current observable state.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`outcomes.Exit(*atom_ref.AtomRef(T).Observation, Failure)`): Carries `*atom_ref.AtomRef(T).Observation` on `.success` or `Failure` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn observe(self: *Self) outcomes.Exit(*atom_ref.AtomRef(T).Observation, Failure) {
             return switch (self.atom.observe()) {
                 .success => |value| .{ .success = value },
@@ -111,6 +162,11 @@ pub fn State(comptime T: type, comptime R: type, comptime version: u32, comptime
             };
         }
 
+        /// Replace the current value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `value: T`: replacement value associated with the next committed revision.
+        /// Returns (`outcomes.Exit(atom_ref.Write, Failure)`): Carries `atom_ref.Write` on `.success` or `Failure` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn set(self: *Self, value: T) outcomes.Exit(atom_ref.Write, Failure) {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
@@ -120,6 +176,12 @@ pub fn State(comptime T: type, comptime R: type, comptime version: u32, comptime
             return result;
         }
 
+        /// Capture the current observable state.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`outcomes.Exit(Snapshot, Failure)`): Carries `Snapshot` on `.success` or `Failure` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn snapshot(self: *Self, env: *const R) outcomes.Exit(Snapshot, Failure) {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
@@ -147,6 +209,14 @@ pub fn State(comptime T: type, comptime R: type, comptime version: u32, comptime
             return .{ .success = .{ .key = .{ .items = key, .allocator = env.allocator }, .schema_version = version, .revision = self.revision, .bytes = bytes } };
         }
 
+        /// Restore state from the supplied snapshot or checkpoint.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `source: *const Snapshot`: Borrowed input; keep its owner alive until the operation has copied or
+        ///   joined it.
+        /// Returns (`outcomes.Exit(ImportResult, Failure)`): Carries `ImportResult` on `.success` or `Failure` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn restore(self: *Self, env: *const R, source: *const Snapshot) outcomes.Exit(ImportResult, Failure) {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
@@ -198,6 +268,10 @@ pub fn State(comptime T: type, comptime R: type, comptime version: u32, comptime
             };
         }
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             self.atom.deinit();
             self.* = undefined;

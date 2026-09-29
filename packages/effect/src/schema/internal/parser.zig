@@ -5,6 +5,7 @@ const legacy = @import("../../schema.zig");
 const ast = @import("../schema_ast.zig");
 const Issue = @import("../schema_issue.zig").Issue;
 
+/// Explicit parser bounds used before JSON input is allocated or decoded.
 pub const Limits = struct {
     max_document_bytes: usize,
     max_depth: usize,
@@ -13,6 +14,17 @@ pub const Limits = struct {
 
 /// Duplicate policy is applied before field construction. The scanner pass
 /// bounds nesting before a document tree can allocate at an excessive depth.
+///
+/// Parameters:
+/// - `T: comptime type`: Value type stored or transported by the returned component.
+/// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected capabilities.
+/// - `bytes: []const u8`: Borrowed input; keep its owner alive until the operation has copied or joined it.
+/// - `duplicates: comptime ast.DuplicateFields`: Compile-time policy for duplicate record fields.
+/// - `limits: Limits`: Caller-selected, validated behavior or resource bounds; no hidden default is
+///   installed.
+/// - `decode_value: comptime anytype`: Compile-time statically inferred input checked when this operation is
+///   instantiated.
+/// Returns (`outcomes.Exit(legacy.Parsed(T), Issue)`): Carries `legacy.Parsed(T)` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
 pub fn parseWith(
     comptime T: type,
     env: anytype,

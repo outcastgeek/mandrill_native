@@ -1,3 +1,5 @@
+//! Versioned transactional references.
+
 use super::TxValue;
 use super::internal::journal::{Cell, DomainInner, JournalError, TxJournal};
 use super::{Transaction, TransactionError, TxStep};
@@ -5,8 +7,11 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A capacity or identity failure in the process-local transaction domain.
 pub enum TransactionDomainError {
+    /// The configured capacity cannot admit this operation.
     Capacity,
+    /// No further identity can be allocated without exceeding its range.
     IdentityExhausted,
 }
 
@@ -19,6 +24,13 @@ pub struct TransactionDomain {
 
 impl TransactionDomain {
     #[must_use]
+    /// Construct a `TransactionDomain` from its required inputs and explicit policies.
+    ///
+    /// # Parameters
+    /// - `capacity` (`NonZeroUsize`): The caller-supplied capacity bound.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(capacity: NonZeroUsize) -> Self {
         Self {
             inner: Arc::new(DomainInner::default()),
@@ -26,6 +38,16 @@ impl TransactionDomain {
         }
     }
 
+    /// Borrow the transactional reference underlying this handle.
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type. Bounds: `TxValue`.
+    ///
+    /// # Parameters
+    /// - `initial` (`T`): Initial value used before any state transition.
+    ///
+    /// # Returns
+    /// Type: `Result<TxRef<T>, TransactionDomainError>`.
     pub fn reference<T: TxValue>(&self, initial: T) -> Result<TxRef<T>, TransactionDomainError> {
         let mut state = self
             .inner
@@ -58,23 +80,33 @@ impl TransactionDomain {
     }
 }
 
+/// Selects the atomic transaction domain in an application environment.
 pub trait HasTransactionDomain {
+    /// # Returns
+    /// Type: `Arc<TransactionDomain>`.
     fn transaction_domain(&self) -> Arc<TransactionDomain>;
 }
 
 /// Immutable values are shared by Arc. A transaction replaces a whole value;
 /// it cannot mutate a cell through an aliased interior-mutable reference.
+///
+/// # Type parameters
+/// - `T`: Value or item type. Bound or type: `TxValue`.
 pub struct TxRef<T: TxValue> {
     handle: Arc<ReferenceHandle>,
     marker: std::marker::PhantomData<fn() -> T>,
 }
 
+/// Typed reference handle used by transactional tx ref.
 pub(crate) struct ReferenceHandle {
     pub domain: Arc<DomainInner>,
     pub id: NonZeroU64,
 }
 
 impl Drop for ReferenceHandle {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         let removed = self
             .domain
@@ -89,6 +121,9 @@ impl Drop for ReferenceHandle {
 }
 
 impl<T: TxValue> Clone for TxRef<T> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             handle: Arc::clone(&self.handle),
@@ -99,10 +134,22 @@ impl<T: TxValue> Clone for TxRef<T> {
 
 impl<T: TxValue> TxRef<T> {
     #[must_use]
+    /// Return the stable identity associated with this value.
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type. Bound: `TxValue`.
+    ///
+    /// # Returns
+    /// Type: `NonZeroU64`.
     pub fn id(&self) -> NonZeroU64 {
         self.handle.id
     }
 
+    /// # Type parameters
+    /// - `T`: Value or item type.
+    ///
+    /// # Returns
+    /// Type: `Result<(u64, Arc<T>), JournalError>`.
     pub(crate) fn inspect_committed(&self) -> Result<(u64, Arc<T>), JournalError> {
         let state = self
             .handle
@@ -119,11 +166,24 @@ impl<T: TxValue> TxRef<T> {
         Ok((cell.version, value))
     }
 
+    /// # Type parameters
+    /// - `T`: Value or item type. Bound: `TxValue`.
+    ///
+    /// # Returns
+    /// Type: `&event_listener::Event`.
     pub(crate) fn changed(&self) -> &event_listener::Event {
         &self.handle.domain.changed
     }
 
     #[must_use]
+    /// Read the selected state without assuming it has been modified.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bounds: `Send + 'static`.
+    /// - `T`: Value or item type.
+    ///
+    /// # Returns
+    /// Type: `Transaction<Arc<T>, E>`.
     pub fn read<E: Send + 'static>(&self) -> Transaction<Arc<T>, E> {
         let reference = self.clone();
         Transaction::new(move |journal: &mut TxJournal| {
@@ -135,6 +195,17 @@ impl<T: TxValue> TxRef<T> {
         })
     }
 
+    /// Record the supplied value through the selected state or transport capability.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bounds: `Send + 'static`.
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `value` (`Arc<T>`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Transaction<(), E>`.
     pub fn write<E: Send + 'static>(&self, value: Arc<T>) -> Transaction<(), E> {
         let reference = self.clone();
         Transaction::new(move |journal: &mut TxJournal| {
@@ -149,6 +220,17 @@ impl<T: TxValue> TxRef<T> {
     /// Replace a value from a borrowed immutable snapshot and return an
     /// operation result. Only the returned replacement is journaled; a typed
     /// failure leaves the cell untouched.
+    ///
+    /// # Type parameters
+    /// - `B`: Transformed value type. Bounds: `Send + 'static`.
+    /// - `E`: Domain-error type. Bounds: `Send + 'static`.
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `update` (`impl Fn(&T) -> Result<(T, B), E> + Send + Sync + 'static`): The update supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Transaction<B, E>`.
     pub fn update<B: Send + 'static, E: Send + 'static>(
         &self,
         update: impl Fn(&T) -> Result<(T, B), E> + Send + Sync + 'static,

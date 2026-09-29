@@ -1,3 +1,5 @@
+//! Scoped in-memory cache lookup, ownership, and invalidation.
+
 use crate::execution::TaskEvent;
 use crate::internal::notification::notify_all;
 use crate::internal::outcome;
@@ -20,10 +22,16 @@ use std::time::Duration;
 
 /// A shared payload, including non-Sync data, without cloning that payload.
 /// Inspection is synchronous and must not reenter this same data gate.
+///
+/// # Type parameters
+/// - `T`: Value or item type. Bound or type: `Send + 'static`.
 pub struct SharedValue<T: Send + 'static> {
     value: Arc<Mutex<T>>,
 }
 impl<T: Send + 'static> Clone for SharedValue<T> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             value: Arc::clone(&self.value),
@@ -32,11 +40,32 @@ impl<T: Send + 'static> Clone for SharedValue<T> {
 }
 impl<T: Send + 'static> SharedValue<T> {
     #[must_use]
+    /// Construct a `SharedValue` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `value` (`T`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(value: T) -> Self {
         Self {
             value: Arc::new(Mutex::new(value)),
         }
     }
+    /// Borrow the contained value only for the duration of the supplied callback.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type.
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `inspect` (`impl FnOnce(&T) -> A`): The inspect supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<A, Defect>`.
     pub fn with<A>(&self, inspect: impl FnOnce(&T) -> A) -> Result<A, Defect> {
         let value = self
             .value
@@ -44,6 +73,13 @@ impl<T: Send + 'static> SharedValue<T> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         catch_unwind(AssertUnwindSafe(|| inspect(&value))).map_err(Defect::from_panic)
     }
+    /// Take the guarded value when no other shared views retain it.
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type.
+    ///
+    /// # Returns
+    /// Type: `Result<T, Self>`.
     pub fn try_into_owned(self) -> Result<T, Self> {
         match Arc::try_unwrap(self.value) {
             Ok(value) => Ok(value
@@ -54,19 +90,39 @@ impl<T: Send + 'static> SharedValue<T> {
     }
 }
 #[derive(Clone, Copy)]
+/// Explicit resource bounds for cache.
 pub enum CacheCapacity {
+    /// No explicit capacity bound is imposed.
     Unbounded,
+    /// The supplied positive capacity bound is enforced. Contains `NonZeroUsize`.
     Bounded(NonZeroUsize),
+    /// No retention is available.
     NoRetention,
 }
+/// Type alias for equality in cache.
+///
+/// # Type parameters
+/// - `K`: Key type used for identity or lookup.
 type Equality<K> = Arc<dyn Fn(&K, &K) -> bool + Send + Sync>;
+/// The equality, expiry, capacity, and failure-retention policies for a cache.
+///
+/// # Type parameters
+/// - `K`: Key type used for identity or lookup.
+/// - `E`: Domain-error type.
 pub struct CacheConfig<K, E> {
+    /// Key equality function used to identify cache entries. Type: `Equality<K>`.
     pub equal: Equality<K>,
+    /// Time for which the stored value remains valid. Type: `Option<Duration>`.
     pub ttl: Option<Duration>,
+    /// The maximum admitted capacity. Type: `CacheCapacity`.
     pub capacity: CacheCapacity,
+    /// Predicate selecting expected errors that remain cached. Type: `Arc<dyn Fn(&E) -> bool + Send + Sync>`.
     pub cache_failure: Arc<dyn Fn(&E) -> bool + Send + Sync>,
 }
 impl<K, E> Clone for CacheConfig<K, E> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             equal: Arc::clone(&self.equal),
@@ -76,7 +132,17 @@ impl<K, E> Clone for CacheConfig<K, E> {
         }
     }
 }
+/// Type alias for shared outcome in cache.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 type SharedOutcome<A, E> = Exit<SharedValue<A>, SharedValue<E>>;
+/// Typed entry state used by cache.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct EntryState<A: Send + 'static, E: Send + 'static> {
     outcome: Option<SharedOutcome<A, E>>,
     expires: Option<Duration>,
@@ -84,20 +150,45 @@ struct EntryState<A: Send + 'static, E: Send + 'static> {
     retiring: bool,
     observed: bool,
 }
+/// Typed entry used by cache.
+///
+/// # Type parameters
+/// - `K`: Key type used for identity or lookup. Bound or type: `Send + Sync + 'static`.
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 pub(crate) struct Entry<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
     pub(crate) key: Arc<K>,
     state: Mutex<EntryState<A, E>>,
     changed: Event,
     cancellation: Cancellation,
 }
+/// Type alias for diagnostic in cache.
+///
+/// # Type parameters
+/// - `K`: Key type used for identity or lookup.
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 type Diagnostic<K, A, E> = (Arc<Entry<K, A, E>>, SharedOutcome<A, E>);
+/// Variants of submission used by cache.
 enum Submission {
     Pending(Option<Defect>),
     Accepted,
     Finished,
 }
+/// Type alias for start load in cache.
+///
+/// # Type parameters
+/// - `K`: Key type used for identity or lookup.
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 type StartLoad<K, A, E> =
     Arc<dyn Fn(Arc<Entry<K, A, E>>, Weak<Inner<K, A, E>>, Context) + Send + Sync>;
+/// Typed cache state used by cache.
+///
+/// # Type parameters
+/// - `K`: Key type used for identity or lookup. Bound or type: `Send + Sync + 'static`.
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct CacheState<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
     closed: bool,
     revision: Arc<()>,
@@ -107,11 +198,21 @@ struct CacheState<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static
     shutdown: CacheShutdown<E>,
     owner_loss: Option<Defect>,
 }
+/// Variants of cache shutdown used by cache.
+///
+/// # Type parameters
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 enum CacheShutdown<E: Send + 'static> {
     Open,
     Closing,
     Closed(Option<Exit<(), SharedValue<E>>>),
 }
+/// Typed inner used by cache.
+///
+/// # Type parameters
+/// - `K`: Key type used for identity or lookup. Bound or type: `Send + Sync + 'static`.
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct Inner<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
     state: Mutex<CacheState<K, A, E>>,
     changed: Event,
@@ -120,16 +221,36 @@ struct Inner<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
     now: Arc<dyn Fn() -> Duration + Send + Sync>,
     start: StartLoad<K, A, E>,
 }
+/// A scoped cache that shares in-flight loads and retains their outcomes under an explicit policy.
+///
+/// # Type parameters
+/// - `K`: Key type used for identity or lookup. Bound or type: `Send + Sync + 'static`.
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 pub struct Cache<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
     inner: Arc<Inner<K, A, E>>,
 }
 impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Clone for Cache<K, A, E> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
         }
     }
 }
+///
+/// # Type parameters
+/// - `A`: Bounds: `Send + 'static`.
+/// - `E`: Bounds: `Send + 'static`.
+///
+/// # Parameters
+/// - `outcome` (`Exit<A, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+///
+/// # Returns
+/// Type: `SharedOutcome<A, E>`.
+/// Returns `SharedOutcome<A, E>`.
 fn share<A: Send + 'static, E: Send + 'static>(outcome: Exit<A, E>) -> SharedOutcome<A, E> {
     let outcome = outcome.map_error(SharedValue::new);
     match outcome {
@@ -140,6 +261,19 @@ fn share<A: Send + 'static, E: Send + 'static>(outcome: Exit<A, E>) -> SharedOut
         Exit::FinalizationFailed(details) => Exit::FinalizationFailed(details),
     }
 }
+///
+/// # Type parameters
+/// - `K`: Bounds: `Send + Sync + 'static`.
+/// - `A`: Bounds: `Send + 'static`.
+/// - `E`: Bounds: `Send + 'static`.
+///
+/// # Parameters
+/// - `entry` (`&Arc<Entry<K, A, E>>`): Stored record or event selected for this transition.
+/// - `owner` (`&Weak<Inner<K, A, E>>`): Worker or scope identity used to fence stale operations.
+/// - `original` (`Exit<A, E>`): The original supplied to this operation.
+///
+/// # Returns
+/// Type: `()`.
 fn settle<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static>(
     entry: &Arc<Entry<K, A, E>>,
     owner: &Weak<Inner<K, A, E>>,
@@ -265,6 +399,21 @@ fn settle<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static>(
 impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A, E> {
     /// Error payloads are shared handles so all waiters and cleanup owners retain
     /// typed errors without requiring E: Clone or copying application memory.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `HasClock + HasTaskSpawner + Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `K`: Type supplied by the enclosing impl or trait.
+    ///
+    /// # Parameters
+    /// - `scope` (`Scope<SharedValue<E>>`): Owner that joins child work and releases resources at close.
+    /// - `config` (`CacheConfig<K, E>`): The config supplied to this operation.
+    /// - `load` (`impl Fn(&K) -> Effect<A, E, R> + Send + Sync + 'static`): The load supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<Self, SharedValue<E>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn make<R: HasClock + HasTaskSpawner + Send + Sync + 'static>(
         scope: Scope<SharedValue<E>>,
         config: CacheConfig<K, E>,
@@ -383,6 +532,14 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
             scope.register_or_release(finalizer, cache, finish)
         })
     }
+    /// # Type parameters
+    /// - `K`: Key type used for identity or lookup. Bound: `Send + Sync + 'static`.
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     pub(crate) fn is_closed(&self) -> bool {
         self.inner
             .state
@@ -390,6 +547,9 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .closed
     }
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn abandon(&self) {
         {
             let mut state = self
@@ -411,6 +571,17 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
         let _ = self.inner.parent.request();
         notify_all(&self.inner.changed);
     }
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `K`: Type supplied by the enclosing impl or trait.
+    ///
+    /// # Parameters
+    /// - `key` (`Arc<K>`): Stable key used to locate or identify the selected value.
+    /// - `context` (`&Context`): Execution context carrying cancellation, scope, and trace state.
+    ///
+    /// # Returns
+    /// Type: `Result<Option<Arc<Entry<K, A, E>>>, Defect>`.
     pub(crate) async fn select_entry(
         &self,
         key: Arc<K>,
@@ -508,6 +679,17 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
             cooperative_retry().await;
         }
     }
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `K`: Type supplied by the enclosing impl or trait.
+    ///
+    /// # Parameters
+    /// - `entry` (`&Arc<Entry<K, A, E>>`): Stored record or event selected for this transition.
+    /// - `cancellation` (`Cancellation`): The cancellation token for this operation.
+    ///
+    /// # Returns
+    /// Type: `SharedOutcome<A, E>`.
     pub(crate) async fn observe(
         entry: &Arc<Entry<K, A, E>>,
         cancellation: Cancellation,
@@ -542,6 +724,17 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
             }
         }
     }
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `K`: Type supplied by the enclosing impl or trait.
+    ///
+    /// # Parameters
+    /// - `entry` (`&Arc<Entry<K, A, E>>`): Stored record or event selected for this transition.
+    /// - `cancellation` (`Cancellation`): The cancellation token for this operation.
+    ///
+    /// # Returns
+    /// Type: `SharedOutcome<A, E>`.
     pub(crate) async fn observe_value(
         &self,
         entry: &Arc<Entry<K, A, E>>,
@@ -578,6 +771,20 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
         }
         result
     }
+    /// Read the current value through the declared storage or state capability.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `K`: Type supplied by the enclosing impl or trait.
+    ///
+    /// # Parameters
+    /// - `key` (`K`): Stable key used to locate or identify the selected value.
+    ///
+    /// # Returns
+    /// Type: `Effect<SharedValue<A>, SharedValue<E>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn get<R: Send + Sync + 'static>(
         &self,
         key: K,
@@ -585,6 +792,18 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
         self.get_shared(Arc::new(key))
     }
 
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `K`: Type supplied by the enclosing impl or trait.
+    ///
+    /// # Parameters
+    /// - `key` (`Arc<K>`): Stable key used to locate or identify the selected value.
+    ///
+    /// # Returns
+    /// Type: `Effect<SharedValue<A>, SharedValue<E>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub(crate) fn get_shared<R: Send + Sync + 'static>(
         &self,
         key: Arc<K>,
@@ -613,6 +832,19 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
             }))
         })
     }
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `K`: Type supplied by the enclosing impl or trait.
+    ///
+    /// # Parameters
+    /// - `selected` (`Vec<Arc<Entry<K, A, E>>>`): The selected supplied to this operation.
+    /// - `earlier` (`Vec<SharedOutcome<A, E>>`): The earlier supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Exit<(), SharedValue<E>>`.
+    /// Returns `Exit<(), SharedValue<E>>`.
     async fn retire(
         &self,
         selected: Vec<Arc<Entry<K, A, E>>>,
@@ -643,10 +875,36 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
         }
         cleanup
     }
+    /// Mark the selected cached or reactive state stale for its consumers.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    /// - `K`: Type supplied by the enclosing impl or trait.
+    ///
+    /// # Parameters
+    /// - `key` (`K`): Stable key used to locate or identify the selected value.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), SharedValue<E>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn invalidate<R: Send + Sync + 'static>(&self, key: K) -> Effect<(), SharedValue<E>, R> {
         self.invalidate_shared(Arc::new(key))
     }
 
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    /// - `K`: Type supplied by the enclosing impl or trait.
+    ///
+    /// # Parameters
+    /// - `key` (`Arc<K>`): Stable key used to locate or identify the selected value.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), SharedValue<E>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub(crate) fn invalidate_shared<R: Send + Sync + 'static>(
         &self,
         key: Arc<K>,
@@ -741,6 +999,9 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
         })
         .uninterruptible()
     }
+    ///
+    /// # Returns
+    /// Type: `()`.
     async fn shutdown_start(&self) {
         let selected = {
             let mut state = self
@@ -821,6 +1082,13 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
             }
         }
     }
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type.
+    ///
+    /// # Returns
+    /// Type: `Exit<(), SharedValue<E>>`.
+    /// Returns `Exit<(), SharedValue<E>>`.
     async fn shutdown_owned(&self, _: Context) -> Exit<(), SharedValue<E>> {
         self.shutdown_start().await;
         let mut state = self
@@ -835,6 +1103,17 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
             }
         }
     }
+    /// Stop accepting new work and describe the settlement of owned work.
+    ///
+    /// # Type parameters
+    /// - `K`: Key type used for identity or lookup. Bound: `Send + Sync + 'static`.
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Returns
+    /// Type: `Effect<crate::PoolEndStatus, SharedValue<E>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn shutdown<R: Send + Sync + 'static>(
         &self,
     ) -> Effect<crate::PoolEndStatus, SharedValue<E>, R> {
@@ -868,6 +1147,12 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
         .uninterruptible()
     }
 }
+/// Typed cache shutdown driver used by cache.
+///
+/// # Type parameters
+/// - `K`: Key type used for identity or lookup. Bound or type: `Send + Sync + 'static`.
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct CacheShutdownDriver<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
     cache: Cache<K, A, E>,
     settled: bool,
@@ -875,6 +1160,9 @@ struct CacheShutdownDriver<K: Send + Sync + 'static, A: Send + 'static, E: Send 
 impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Drop
     for CacheShutdownDriver<K, A, E>
 {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         if !self.settled {
             self.cache
@@ -891,12 +1179,27 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Drop
 }
 
 impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Entry<K, A, E> {
+    /// # Type parameters
+    /// - `K`: Key type used for identity or lookup. Bound: `Send + Sync + 'static`.
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    ///
+    /// # Returns
+    /// Type: `()`.
     pub(crate) fn invalidate_association(&self) {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .invalidated = true;
     }
+    /// # Type parameters
+    /// - `K`: Key type used for identity or lookup. Bound: `Send + Sync + 'static`.
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     pub(crate) fn is_invalidated(&self) -> bool {
         self.state
             .lock()
@@ -906,6 +1209,9 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Entry<K, A,
 }
 
 // One handoff per failed optimistic selection; no arbitrary retry batch.
+///
+/// # Returns
+/// Type: `()`.
 async fn cooperative_retry() {
     let mut yielded = false;
     std::future::poll_fn(|cx| {

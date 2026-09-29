@@ -10,15 +10,23 @@ const parser = @import("internal/parser.zig");
 const structural = @import("internal/structural.zig");
 const representation = @import("internal/representation.zig");
 
+/// Resource bounds accepted by the schema parser.
 pub const ParseLimits = parser.Limits;
+/// Parse a schema representation with caller-selected limits.
 pub const parseWith = parser.parseWith;
 
+/// Policy for unknown fields, duplicate fields, issue collection, and issue count.
 pub const RecordPolicy = struct {
     unknown_fields: ast.UnknownFields,
     duplicate_fields: ast.DuplicateFields,
     issues: ast.Issues,
     max_issues: ?usize = null,
 
+    /// Check whether this schema record policy is internally consistent.
+    ///
+    /// Parameters:
+    /// - `self: RecordPolicy`: Receiver passed by value: the struct itself is copied, while any referenced storage keeps its original ownership and lifetime.
+    /// Returns (`bool`): `true` when first-issue mode has no count or accumulation has a positive count.
     pub fn valid(self: RecordPolicy) bool {
         return switch (self.issues) {
             .first => self.max_issues == null,
@@ -30,15 +38,26 @@ pub const RecordPolicy = struct {
 /// Owns the map allocation. Keys and JSON values borrow the parsed document;
 /// `Parsed(T)` keeps that document alive for decoded records.
 pub const UnknownFields = struct {
+    /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit` and
+    /// must be released after use.
     pub const effect_owned_payload = true;
     values: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 
+    /// Release resources owned by this value.
+    /// Parameters:
+    /// - `self: *UnknownFields`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn deinit(self: *UnknownFields) void {
         self.values.deinit(self.allocator);
         self.* = undefined;
     }
 
+    /// Duplicate this value; marked owning payloads are cloned, while ordinary
+    /// borrowed fields retain their original lifetime.
+    /// Parameters:
+    /// - `self: *const UnknownFields`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+    /// Returns (`error{OutOfMemory}!UnknownFields`): A `UnknownFields` on success; `OutOfMemory` if required allocation fails.
     pub fn clone(self: *const UnknownFields) error{OutOfMemory}!UnknownFields {
         var values: std.json.ObjectMap = .{};
         errdefer values.deinit(self.allocator);
@@ -47,26 +66,69 @@ pub const UnknownFields = struct {
     }
 };
 
+/// Declares a required JSON field and its pure codec; absence fails decoding.
+///
+/// Parameters:
+/// - `name: comptime []const u8`: Compile-time stable, nonempty identity component validated at definition time.
+/// - `codec: comptime anytype`: Compile-time typed codec/schema fixing the corresponding decoded and encoded value
+///   types.
+/// Returns (`@TypeOf(.{ .name = name, .codec = codec, .presence = ast.Presence.required, .default_value = {}, .extension = false, .nested = false })`): A compile-time descriptor containing the declared field or case metadata.
 pub fn required(comptime name: []const u8, comptime codec: anytype) @TypeOf(.{ .name = name, .codec = codec, .presence = ast.Presence.required, .default_value = {}, .extension = false, .nested = false }) {
     return .{ .name = name, .codec = codec, .presence = ast.Presence.required, .default_value = {}, .extension = false, .nested = false };
 }
 
+/// Declares an optional JSON field whose decoded Zig type is optional.
+///
+/// Parameters:
+/// - `name: comptime []const u8`: Compile-time stable, nonempty identity component validated at definition time.
+/// - `codec: comptime anytype`: Compile-time typed codec/schema fixing the corresponding decoded and encoded value
+///   types.
+/// Returns (`@TypeOf(.{ .name = name, .codec = codec, .presence = ast.Presence.optional, .default_value = {}, .extension = false, .nested = false })`): A compile-time descriptor containing the declared field or case metadata.
 pub fn optional(comptime name: []const u8, comptime codec: anytype) @TypeOf(.{ .name = name, .codec = codec, .presence = ast.Presence.optional, .default_value = {}, .extension = false, .nested = false }) {
     return .{ .name = name, .codec = codec, .presence = ast.Presence.optional, .default_value = {}, .extension = false, .nested = false };
 }
 
+/// Declares a field whose typed constructor runs only when input omits it.
+///
+/// Parameters:
+/// - `name: comptime []const u8`: Compile-time stable, nonempty identity component validated at definition time.
+/// - `codec: comptime anytype`: Compile-time typed codec/schema fixing the corresponding decoded and encoded value
+///   types.
+/// - `constructor: comptime anytype`: Compile-time statically inferred input checked when this operation is
+///   instantiated.
+/// Returns (`@TypeOf(.{ .name = name, .codec = codec, .presence = ast.Presence.defaulted, .default_value = constructor, .extension = false, .nested = false })`): A compile-time descriptor containing the declared field or case metadata.
 pub fn defaulted(comptime name: []const u8, comptime codec: anytype, comptime constructor: anytype) @TypeOf(.{ .name = name, .codec = codec, .presence = ast.Presence.defaulted, .default_value = constructor, .extension = false, .nested = false }) {
     return .{ .name = name, .codec = codec, .presence = ast.Presence.defaulted, .default_value = constructor, .extension = false, .nested = false };
 }
 
+/// Declares a required field backed by a structural child schema.
+///
+/// Parameters:
+/// - `name: comptime []const u8`: Compile-time stable, nonempty identity component validated at definition time.
+/// - `Child: comptime type`: Compile-time child schema or value type.
+/// Returns (`@TypeOf(.{ .name = name, .codec = Child, .presence = ast.Presence.required, .default_value = {}, .extension = false, .nested = true })`): A compile-time descriptor containing the declared field or case metadata.
 pub fn nestedRequired(comptime name: []const u8, comptime Child: type) @TypeOf(.{ .name = name, .codec = Child, .presence = ast.Presence.required, .default_value = {}, .extension = false, .nested = true }) {
     return .{ .name = name, .codec = Child, .presence = ast.Presence.required, .default_value = {}, .extension = false, .nested = true };
 }
 
+/// Declares an optional field backed by a structural child schema.
+///
+/// Parameters:
+/// - `name: comptime []const u8`: Compile-time stable, nonempty identity component validated at definition time.
+/// - `Child: comptime type`: Compile-time child schema or value type.
+/// Returns (`@TypeOf(.{ .name = name, .codec = Child, .presence = ast.Presence.optional, .default_value = {}, .extension = false, .nested = true })`): A compile-time descriptor containing the declared field or case metadata.
 pub fn nestedOptional(comptime name: []const u8, comptime Child: type) @TypeOf(.{ .name = name, .codec = Child, .presence = ast.Presence.optional, .default_value = {}, .extension = false, .nested = true }) {
     return .{ .name = name, .codec = Child, .presence = ast.Presence.optional, .default_value = {}, .extension = false, .nested = true };
 }
 
+/// Declares a nested field with a typed default constructor.
+///
+/// Parameters:
+/// - `name: comptime []const u8`: Compile-time stable, nonempty identity component validated at definition time.
+/// - `Child: comptime type`: Compile-time child schema or value type.
+/// - `constructor: comptime anytype`: Compile-time statically inferred input checked when this operation is
+///   instantiated.
+/// Returns (`@TypeOf(.{ .name = name, .codec = Child, .presence = ast.Presence.defaulted, .default_value = constructor, .extension = false, .nested = true })`): A compile-time descriptor containing the declared field or case metadata.
 pub fn nestedDefaulted(comptime name: []const u8, comptime Child: type, comptime constructor: anytype) @TypeOf(.{ .name = name, .codec = Child, .presence = ast.Presence.defaulted, .default_value = constructor, .extension = false, .nested = true }) {
     return .{ .name = name, .codec = Child, .presence = ast.Presence.defaulted, .default_value = constructor, .extension = false, .nested = true };
 }
@@ -74,17 +136,44 @@ pub fn nestedDefaulted(comptime name: []const u8, comptime Child: type, comptime
 /// A record is unavailable until its fields and policy are supplied. Every
 /// field constructor itself requires the matching codec and, for defaults,
 /// the typed default callback before this stage can finish.
+/// Staged record builder. `fields` must pair every Zig field with a typed
+/// codec, and `policy` must be supplied before `build` exposes the schema.
+/// Allocating decode/encode operations take their allocator from `R`.
+///
+/// Parameters:
+/// - `T: comptime type`: Value type stored or transported by the returned component.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): staged record builder requiring field definitions and a parsing policy before `build` is available.
 pub fn Builder(comptime T: type, comptime R: type) type {
     return struct {
+        /// Starts record construction; the result has no build operation yet.
+        ///
+        /// Returns (`type`): first stage; only `fields` is available until every Zig field has a codec.
         pub fn begin() type {
             return struct {
+                /// Pairs the Zig record fields with typed codecs, presence, and defaults.
+                ///
+                /// Parameters:
+                /// - `definitions: comptime anytype`: Compile-time statically inferred input checked when this
+                ///   operation is instantiated.
+                /// Returns (`type`): stage retaining the field tuple; `policy` must be selected next.
                 pub fn fields(comptime definitions: anytype) type {
                     return struct {
+                        /// Selects unknown-field, duplicate-field, and issue collection behavior.
+                        ///
+                        /// Parameters:
+                        /// - `selected: comptime RecordPolicy`: Compile-time the selected input required by this typed
+                        ///   operation.
+                        /// Returns (`type`): completed stage exposing `Definition` and `build` for the checked record schema.
                         pub fn policy(comptime selected: RecordPolicy) type {
                             const Schema = Record(T, R, definitions, selected);
                             return struct {
+                                /// Completed schema or protocol definition type selected by this builder.
                                 pub const Definition = Schema;
 
+                                /// Completes the checked record schema after fields and policy are supplied.
+                                ///
+                                /// Returns (`type`): the checked record schema type, ready for typed encode and decode.
                                 pub fn build() type {
                                     return Schema;
                                 }
@@ -97,6 +186,11 @@ pub fn Builder(comptime T: type, comptime R: type) type {
     };
 }
 
+/// Reserves one field for owned unknown JSON properties when preservation is selected.
+///
+/// Parameters:
+/// - `field_name: comptime []const u8`: Compile-time field name used as the stable schema key.
+/// Returns (`@TypeOf(.{ .name = field_name, .codec = {}, .presence = ast.Presence.required, .default_value = {}, .extension = true, .nested = false })`): A compile-time descriptor containing the declared field or case metadata.
 pub fn extensions(comptime field_name: []const u8) @TypeOf(.{ .name = field_name, .codec = {}, .presence = ast.Presence.required, .default_value = {}, .extension = true, .nested = false }) {
     return .{ .name = field_name, .codec = {}, .presence = ast.Presence.required, .default_value = {}, .extension = true, .nested = false };
 }
@@ -107,6 +201,18 @@ fn codecType(comptime field: anytype) type {
 
 /// A record codec must be specialized on the environment that owns errors and
 /// encoded bytes. Decoded borrowed strings remain tied to their JSON input.
+/// Comptime-checked bidirectional JSON record schema. It rejects missing,
+/// duplicate, or mismatched fields at compilation; runtime input errors are
+/// returned as typed `Issue` values. Document-backed decoded views remain
+/// owned by their `Parsed(T)` result.
+///
+/// Parameters:
+/// - `T: comptime type`: Value type stored or transported by the returned component.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `fields: comptime anytype`: Compile-time statically inferred input checked when this operation is instantiated.
+/// - `policy: comptime RecordPolicy`: Compile-time caller-selected, validated behavior or resource bounds; no hidden
+///   default is installed.
+/// Returns (`type`): bidirectional schema for `T` with the supplied field codecs, environment, and parse policy.
 pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comptime policy: RecordPolicy) type {
     comptime {
         if (!policy.valid()) @compileError("record issue policy requires an explicit positive bound only when accumulating");
@@ -161,7 +267,9 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
     }
     return struct {
         const Self = @This();
+        /// Application value type produced by this codec.
         pub const Decoded = T;
+        /// Exact caller environment type required when the description runs.
         pub const Environment = R;
 
         fn encodedFields() [fields.len - (if (policy.unknown_fields == .preserve) @as(usize, 1) else 0)]ast.Field {
@@ -179,6 +287,9 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
             return result;
         }
 
+        /// Return the structural representation node for this schema.
+        ///
+        /// Returns (`*const ast.Node`): A borrowed read-only pointer; keep its owner alive while using it.
         pub fn encodedNode() *const ast.Node {
             const Metadata = struct {
                 const field_nodes = encodedFields();
@@ -192,6 +303,14 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
             return &Metadata.node;
         }
 
+        /// Retrieve  from the current typed state.
+        ///
+        /// Parameters:
+        /// - `name: comptime []const u8`: Compile-time stable, nonempty identity component validated at definition
+        ///   time.
+        /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
+        ///   joined it.
+        /// Returns (`*const @FieldType(T, name)`): A borrowed read-only pointer; keep its owner alive while using it.
         pub fn get(comptime name: []const u8, value: *const T) *const @FieldType(T, name) {
             if (!@hasField(T, name)) @compileError("unknown schema record field");
             inline for (fields) |field| {
@@ -276,11 +395,25 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
 
         /// The caller retains `json` for the lifetime of borrowed decoded
         /// fields. A failed partial construction releases each owned field.
+        ///
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `json: *const std.json.Value`: JSON value or document to decode, encode, or validate.
+        /// Returns (`outcomes.Exit(T, Issue)`): Carries `T` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn decodeDirect(env: *const R, json: *const std.json.Value) outcomes.Exit(T, Issue) {
             var state: structural.DecodeState = .{};
             return decodeWithin(env, json, &state);
         }
 
+        /// Decodes a child value in an existing parsed-document ownership scope.
+        ///
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `json: *const std.json.Value`: JSON value or document to decode, encode, or validate.
+        /// - `state: *structural.DecodeState`: Mutable operation state, retained for the duration of this call.
+        /// Returns (`outcomes.Exit(T, Issue)`): Carries `T` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn decodeWithin(env: *const R, json: *const std.json.Value, state: *structural.DecodeState) outcomes.Exit(T, Issue) {
             if (json.* != .object) return .{ .fail = Issue.init(env, .decode, .{ .expected = .object }) };
             var collector = Collector.init(env.allocator);
@@ -380,6 +513,11 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
             }
         }
 
+        /// Describes decoding as an Effect using the allocator and services in R.
+        ///
+        /// Parameters:
+        /// - `json: *const std.json.Value`: JSON value or document to decode, encode, or validate.
+        /// Returns (`effects.Effect(T, Issue, R)`): decoded record `T` or a bounded list of typed field issues.
         pub fn decode(json: *const std.json.Value) effects.Effect(T, Issue, R) {
             return effects.Effect(T, Issue, R).fromBorrowed(std.json.Value, json, struct {
                 fn run(input: *const std.json.Value, env: *const R) outcomes.Exit(T, Issue) {
@@ -390,6 +528,15 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
 
         /// Scans before allocating a JSON tree so the caller's explicit
         /// document and nesting limits apply even to malformed input.
+        ///
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `bytes: []const u8`: Borrowed input; keep its owner alive until the operation has copied or
+        ///   joined it.
+        /// - `limits: ParseLimits`: Caller-selected, validated behavior or resource bounds; no hidden default
+        ///   is installed.
+        /// Returns (`outcomes.Exit(legacy.Parsed(T), Issue)`): Carries `legacy.Parsed(T)` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn parseBytesDirect(
             env: *const R,
             bytes: []const u8,
@@ -408,11 +555,28 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
 
         /// Structural composition shares the temporary representation arena;
         /// no nested serialization/parsing or extra per-field allocation.
+        ///
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
+        ///   joined it.
+        /// - `temporary: std.mem.Allocator`: Temporary state retained only for the duration of this operation.
+        /// Returns (`outcomes.Exit(std.json.Value, Issue)`): Carries `std.json.Value` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn encodeValueDirect(env: *const R, value: *const T, temporary: std.mem.Allocator) outcomes.Exit(std.json.Value, Issue) {
             var state: structural.EncodeState = .{ .scratch = temporary };
             return encodeWithin(env, value, &state);
         }
 
+        /// Encodes a child record within an existing JSON ownership scope.
+        ///
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
+        ///   joined it.
+        /// - `state: *structural.EncodeState`: Mutable operation state, retained for the duration of this call.
+        /// Returns (`outcomes.Exit(std.json.Value, Issue)`): Carries `std.json.Value` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn encodeWithin(env: *const R, value: *const T, state: *structural.EncodeState) outcomes.Exit(std.json.Value, Issue) {
             var object: std.json.ObjectMap = .{};
             inline for (fields) |field| {
@@ -446,6 +610,13 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
 
         /// Encodes into caller-owned bytes. The temporary JSON object and any
         /// nested representation storage are freed before this returns.
+        ///
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
+        ///   joined it.
+        /// Returns (`outcomes.Exit(outcomes.OwnedSlice(u8), Issue)`): Carries `outcomes.OwnedSlice(u8)` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn encodeBytesDirect(env: *const R, value: *const T) outcomes.Exit(outcomes.OwnedSlice(u8), Issue) {
             var arena = std.heap.ArenaAllocator.init(env.allocator);
             defer arena.deinit();
@@ -462,6 +633,13 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
 
         /// Checks the application-side value through every field encoder,
         /// without decoding input or executing default constructors.
+        ///
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
+        ///   joined it.
+        /// Returns (`outcomes.Exit(void, Issue)`): Carries no value on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn validateDirect(env: *const R, value: *const T) outcomes.Exit(void, Issue) {
             var arena = std.heap.ArenaAllocator.init(env.allocator);
             defer arena.deinit();
@@ -473,6 +651,12 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
             };
         }
 
+        /// Describes typed record validation as an Effect in R.
+        ///
+        /// Parameters:
+        /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
+        ///   joined it.
+        /// Returns (`effects.Effect(void, Issue, R)`): unit success when the JSON record satisfies every declared field policy, otherwise typed issues.
         pub fn validate(value: *const T) effects.Effect(void, Issue, R) {
             return effects.Effect(void, Issue, R).fromBorrowed(T, value, struct {
                 fn run(input: *const T, env: *const R) outcomes.Exit(void, Issue) {
@@ -481,6 +665,12 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
             }.run);
         }
 
+        /// Describes JSON byte encoding as an Effect; the result owns its buffer.
+        ///
+        /// Parameters:
+        /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
+        ///   joined it.
+        /// Returns (`effects.Effect(outcomes.OwnedSlice(u8), Issue, R)`): owned JSON bytes encoded from `T` under the declared record policy.
         pub fn encodeBytes(value: *const T) effects.Effect(outcomes.OwnedSlice(u8), Issue, R) {
             return effects.Effect(outcomes.OwnedSlice(u8), Issue, R).fromBorrowed(T, value, struct {
                 fn run(input: *const T, env: *const R) outcomes.Exit(outcomes.OwnedSlice(u8), Issue) {

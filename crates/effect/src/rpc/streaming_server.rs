@@ -1,3 +1,5 @@
+//! Acknowledged RPC stream server execution.
+
 use super::{
     RpcCallId, RpcEnvelope, RpcEnvelopeKind, RpcEnvelopePolicy, RpcStreamOperation,
     RpcStreamSession, RpcWireError,
@@ -9,17 +11,45 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+/// Type alias for stream pull in rpc streaming server.
+///
+/// # Type parameters
+/// - `C`: Stream chunk or item type.
+/// - `T`: Value or item type.
+/// - `E`: Domain-error type.
+/// - `R`: Environment type.
 type StreamPull<C, T, E, R> = dyn Fn() -> Effect<RpcProduced<C, T>, E, R> + Send + Sync;
+/// Type alias for stream invoke in rpc streaming server.
+///
+/// # Type parameters
+/// - `Q`: Request type.
+/// - `C`: Stream chunk or item type.
+/// - `T`: Value or item type.
+/// - `E`: Domain-error type.
+/// - `R`: Environment type.
 type StreamInvoke<Q, C, T, E, R> =
     dyn Fn(Q, RpcStreamContext) -> Effect<RpcStreamProducer<C, T, E, R>, E, R> + Send + Sync;
 
+/// The next encoded stream item or terminal reply produced by a handler.
+///
+/// # Type parameters
+/// - `C`: Stream chunk or item type.
+/// - `T`: Value or item type.
 pub enum RpcProduced<C, T> {
+    /// Deliver one ordered chunk of stream data. Contains `C`.
     Chunk(C),
+    /// The stream or operation has reached its terminal state. Contains `T`.
     Terminal(T),
 }
 
 /// Pull is application-defined and may use any services in R. The server
 /// invokes it again only after the preceding chunk is acknowledged.
+///
+/// # Type parameters
+/// - `C`: Stream chunk or item type.
+/// - `T`: Value or item type.
+/// - `E`: Domain-error type.
+/// - `R`: Environment type.
 pub struct RpcStreamProducer<C, T, E, R>
 where
     C: Send + 'static,
@@ -37,6 +67,9 @@ where
     E: Send + 'static,
     R: Send + Sync + 'static,
 {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             pull: Arc::clone(&self.pull),
@@ -52,23 +85,58 @@ where
     R: Send + Sync + 'static,
 {
     #[must_use]
+    /// Construct a `RpcStreamProducer` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `C`: Type supplied by the enclosing impl or trait.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `pull` (`impl Fn() -> Effect<RpcProduced<C, T>, E, R> + Send + Sync + 'static`): The pull supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(pull: impl Fn() -> Effect<RpcProduced<C, T>, E, R> + Send + Sync + 'static) -> Self {
         Self {
             pull: Arc::new(pull),
         }
     }
 
+    /// Request the next stream chunk within the reader’s scope.
+    ///
+    /// # Type parameters
+    /// - `C`: Type supplied by the enclosing impl or trait.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    /// - `T`: Value or item type.
+    ///
+    /// # Returns
+    /// Type: `Effect<RpcProduced<C, T>, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn pull(&self) -> Effect<RpcProduced<C, T>, E, R> {
         (self.pull)()
     }
 }
 
 #[derive(Clone)]
+/// Call identity and cancellation context supplied to a streaming handler.
 pub struct RpcStreamContext {
+    /// Identity of the RPC call. Type: `RpcCallId`.
     pub call: RpcCallId,
+    /// Application or protocol metadata attached to this value. Type: `BTreeMap<Arc<str>, Arc<str>>`.
     pub metadata: BTreeMap<Arc<str>, Arc<str>>,
 }
 
+/// A registered typed handler that creates one scoped RPC stream.
+///
+/// # Type parameters
+/// - `Q`: Request type.
+/// - `C`: Stream chunk or item type.
+/// - `T`: Value or item type.
+/// - `E`: Domain-error type.
+/// - `R`: Environment type.
 pub struct RpcStreamHandler<Q, C, T, E, R>
 where
     Q: Send + 'static,
@@ -89,6 +157,9 @@ where
     E: Send + 'static,
     R: Send + Sync + 'static,
 {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             operation: self.operation.clone(),
@@ -106,6 +177,21 @@ where
     R: Send + Sync + 'static,
 {
     #[must_use]
+    /// Construct a `RpcStreamHandler` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `C`: Type supplied by the enclosing impl or trait.
+    /// - `E`: Domain-error type.
+    /// - `Q`: Request type.
+    /// - `R`: Environment type.
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `operation` (`RpcStreamOperation<Q, C, T, E>`): Typed operation definition or callback selected for execution.
+    /// - `invoke` (`impl Fn(Q, RpcStreamContext) -> Effect<RpcStreamProducer<C, T, E, R>, E, R> + Send + Sync + 'static`): The invoke supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(
         operation: RpcStreamOperation<Q, C, T, E>,
         invoke: impl Fn(Q, RpcStreamContext) -> Effect<RpcStreamProducer<C, T, E, R>, E, R>
@@ -120,10 +206,37 @@ where
     }
 
     #[must_use]
+    /// Borrow the typed operation definition associated with this value.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type.
+    /// - `C`: Type supplied by the enclosing impl or trait.
+    /// - `E`: Domain-error type.
+    /// - `Q`: Request type.
+    /// - `T`: Value or item type.
+    ///
+    /// # Returns
+    /// Type: `&RpcStreamOperation<Q, C, T, E>`.
     pub fn operation(&self) -> &RpcStreamOperation<Q, C, T, E> {
         &self.operation
     }
 
+    /// Invoke the typed operation through its selected channel or handler.
+    ///
+    /// # Type parameters
+    /// - `C`: Type supplied by the enclosing impl or trait.
+    /// - `E`: Domain-error type.
+    /// - `Q`: Request type.
+    /// - `R`: Environment type.
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `request` (`Q`): The typed request to process.
+    /// - `context` (`RpcStreamContext`): Execution context carrying cancellation, scope, and trace state.
+    ///
+    /// # Returns
+    /// Type: `Effect<RpcStreamProducer<C, T, E, R>, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn call(
         &self,
         request: Q,
@@ -134,30 +247,63 @@ where
 }
 
 #[derive(Debug)]
+/// A registration, handler, framing, or stream lifecycle failure.
+///
+/// # Type parameters
+/// - `E`: Domain-error type.
+/// - `Backend`: Backend-specific error or provider type.
 pub enum RpcStreamServerError<E, Backend> {
+    /// The registered typed handler failed. Retains the `E` detail.
     Handler(E),
+    /// The request failed its declared schema validation. Retains the `SchemaIssue` detail.
     RequestSchema(SchemaIssue),
+    /// A stream chunk failed its declared schema validation. Retains the `SchemaIssue` detail.
     ChunkSchema(SchemaIssue),
+    /// The stream’s terminal value failed schema validation. Retains the `SchemaIssue` detail.
     TerminalSchema(SchemaIssue),
+    /// An expected-error payload failed schema validation. Retains the `SchemaIssue` detail.
     ErrorSchema(SchemaIssue),
+    /// RPC framing or envelope validation failed. Retains the `RpcWireError` detail.
     Wire(RpcWireError),
+    /// The selected transport provider failed. Retains the `Backend` detail.
     Transport(Backend),
+    /// The remote connection ended before settlement.
     Disconnected,
+    /// The operation differs from the required or recorded value.
     OperationMismatch,
+    /// The received request kind is invalid in the current protocol state. Retains the `RpcEnvelopeKind` detail.
     UnexpectedRequestKind(RpcEnvelopeKind),
+    /// The received acknowledgement kind is invalid in the current protocol state. Retains the `RpcEnvelopeKind` detail.
     UnexpectedAcknowledgementKind(RpcEnvelopeKind),
+    /// The correlation differs from the required or recorded value.
     CorrelationMismatch,
+    /// The required sequence is missing.
     MissingSequence,
+    /// The control payload failed validation.
     InvalidControlPayload,
+    /// The sequence differs from the required or recorded value.
     SequenceMismatch {
+        /// The value required by the requested condition. Type: `NonZeroU64`.
         expected: NonZeroU64,
+        /// The value observed when the requested condition failed. Type: `NonZeroU64`.
         actual: NonZeroU64,
     },
+    /// No further sequence can be allocated without exceeding its range.
     SequenceExhausted,
+    /// Execution was cancelled.
     Cancelled,
+    /// An owned input was already consumed.
     InputConsumed,
 }
 
+/// Dispatches registered streaming operations and enforces acknowledgement order.
+///
+/// # Type parameters
+/// - `Q`: Request type.
+/// - `C`: Stream chunk or item type.
+/// - `T`: Value or item type.
+/// - `E`: Domain-error type.
+/// - `R`: Environment type.
 pub struct RpcStreamServer<Q, C, T, E, R>
 where
     Q: Send + 'static,
@@ -178,6 +324,9 @@ where
     E: Send + 'static,
     R: Send + Sync + 'static,
 {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             handler: self.handler.clone(),
@@ -195,12 +344,42 @@ where
     R: Send + Sync + 'static,
 {
     #[must_use]
+    /// Construct a `RpcStreamServer` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `C`: Type supplied by the enclosing impl or trait.
+    /// - `E`: Domain-error type.
+    /// - `Q`: Request type.
+    /// - `R`: Environment type.
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `handler` (`RpcStreamHandler<Q, C, T, E, R>`): The handler invoked for the matching request or event.
+    /// - `policy` (`RpcEnvelopePolicy`): The caller-supplied behavior policy.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(handler: RpcStreamHandler<Q, C, T, E, R>, policy: RpcEnvelopePolicy) -> Self {
         Self { handler, policy }
     }
 
     /// Own one accepted session until terminal completion, cancellation or
     /// failure. The scope awaits the provider's close effect on every exit.
+    ///
+    /// # Type parameters
+    /// - `Q`: Request type.
+    /// - `C`: Stream chunk or item type.
+    /// - `T`: Value or item type.
+    /// - `Session`: Active stream-session provider type. Additional bound: `RpcStreamSession`.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `accepted` (`Arc<Session>`): The accepted supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), RpcStreamServerError<E, Session::Error>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn serve<Session>(
         &self,
         accepted: Arc<Session>,
@@ -213,6 +392,22 @@ where
 
     /// The protocol dispatcher has already read this frame to select the
     /// operation. It must be decoded again against the selected typed codec.
+    ///
+    /// # Type parameters
+    /// - `Q`: Request type.
+    /// - `C`: Stream chunk or item type.
+    /// - `T`: Value or item type.
+    /// - `Session`: Active stream-session provider type. Additional bound: `RpcStreamSession`.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `accepted` (`Arc<Session>`): The accepted supplied to this operation.
+    /// - `first` (`Vec<u8>`): First value or branch in the ordered composition.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), RpcStreamServerError<E, Session::Error>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn serve_prefetched<Session>(
         &self,
         accepted: Arc<Session>,
@@ -224,6 +419,19 @@ where
         self.serve_with_first(accepted, Some(first))
     }
 
+    ///
+    /// # Type parameters
+    /// - `Session`: Active stream-session provider type. Additional bound: `RpcStreamSession`.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `accepted` (`Arc<Session>`): The accepted supplied to this operation.
+    /// - `first` (`Option<Vec<u8>>`): First value or branch in the ordered composition.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), RpcStreamServerError<E, Session::Error>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn serve_with_first<Session>(
         &self,
         accepted: Arc<Session>,
@@ -320,6 +528,17 @@ where
     }
 }
 
+///
+/// # Type parameters
+/// - `E`: Expected application-error type.
+/// - `B`: Transformed success-value type.
+///
+/// # Parameters
+/// - `bytes` (`&[u8]`): Encoded bytes to validate, decode, write, or transfer.
+/// - `policy` (`RpcEnvelopePolicy`): The caller-supplied behavior policy.
+///
+/// # Returns
+/// Type: `Result<RpcEnvelope, RpcStreamServerError<E, B>>`.
 fn decode_frame<E, B>(
     bytes: &[u8],
     policy: RpcEnvelopePolicy,
@@ -343,6 +562,21 @@ fn decode_frame<E, B>(
     RpcEnvelope::decode(&first, policy).map_err(RpcStreamServerError::Wire)
 }
 
+///
+/// # Type parameters
+/// - `Q`: Request payload type. Additional bound: `Send + 'static`.
+/// - `C`: Stream chunk or item type. Additional bound: `Send + 'static`.
+/// - `T`: Stored or transferred value type. Additional bound: `Send + 'static`.
+/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
+/// - `B`: Transformed success-value type.
+///
+/// # Parameters
+/// - `operation` (`&RpcStreamOperation<Q, C, T, E>`): Typed operation definition or callback selected for execution.
+/// - `bytes` (`&[u8]`): Encoded bytes to validate, decode, write, or transfer.
+/// - `policy` (`RpcEnvelopePolicy`): The caller-supplied behavior policy.
+///
+/// # Returns
+/// Type: `Result<(Q, RpcStreamContext), RpcStreamServerError<E, B>>`.
 fn decode_request<Q, C, T, E, B>(
     operation: &RpcStreamOperation<Q, C, T, E>,
     bytes: &[u8],
@@ -376,6 +610,25 @@ where
     ))
 }
 
+///
+/// # Type parameters
+/// - `Q`: Request payload type. Additional bound: `Send + 'static`.
+/// - `C`: Stream chunk or item type. Additional bound: `Send + 'static`.
+/// - `T`: Stored or transferred value type. Additional bound: `Send + 'static`.
+/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type supplying required capabilities. Additional bound: `Send + Sync + 'static`.
+/// - `Session`: Active stream-session provider type. Additional bound: `RpcStreamSession`.
+///
+/// # Parameters
+/// - `session` (`Arc<Session>`): Scoped connection or stream session retained until settlement.
+/// - `operation` (`RpcStreamOperation<Q, C, T, E>`): Typed operation definition or callback selected for execution.
+/// - `call` (`RpcCallId`): Identity and contents of the selected RPC call.
+/// - `error` (`E`): Expected or provider error preserved in the returned outcome.
+/// - `policy` (`RpcEnvelopePolicy`): The caller-supplied behavior policy.
+///
+/// # Returns
+/// Type: `Effect<(), RpcStreamServerError<E, Session::Error>, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 fn send_error<Q, C, T, E, R, Session>(
     session: Arc<Session>,
     operation: RpcStreamOperation<Q, C, T, E>,
@@ -416,6 +669,20 @@ where
     )
 }
 
+///
+/// # Type parameters
+/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type supplying required capabilities. Additional bound: `Send + Sync + 'static`.
+/// - `Session`: Active stream-session provider type. Additional bound: `RpcStreamSession`.
+///
+/// # Parameters
+/// - `session` (`Arc<Session>`): Scoped connection or stream session retained until settlement.
+/// - `envelope` (`RpcEnvelope`): Versioned encoded message crossing the transport boundary.
+/// - `policy` (`RpcEnvelopePolicy`): The caller-supplied behavior policy.
+///
+/// # Returns
+/// Type: `Effect<(), RpcStreamServerError<E, Session::Error>, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 fn send_envelope<E, R, Session>(
     session: Arc<Session>,
     envelope: RpcEnvelope,
@@ -436,6 +703,26 @@ where
         .provide_some(|_: &R| ())
 }
 
+///
+/// # Type parameters
+/// - `Q`: Request payload type. Additional bound: `Send + 'static`.
+/// - `C`: Stream chunk or item type. Additional bound: `Send + 'static`.
+/// - `T`: Stored or transferred value type. Additional bound: `Send + 'static`.
+/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type supplying required capabilities. Additional bound: `Send + Sync + 'static`.
+/// - `Session`: Active stream-session provider type. Additional bound: `RpcStreamSession`.
+///
+/// # Parameters
+/// - `session` (`Arc<Session>`): Scoped connection or stream session retained until settlement.
+/// - `operation` (`RpcStreamOperation<Q, C, T, E>`): Typed operation definition or callback selected for execution.
+/// - `producer` (`RpcStreamProducer<C, T, E, R>`): The producer supplied to this operation.
+/// - `call` (`RpcCallId`): Identity and contents of the selected RPC call.
+/// - `sequence` (`Option<NonZeroU64>`): Ordered stream position used to reject gaps or duplicates.
+/// - `policy` (`RpcEnvelopePolicy`): The caller-supplied behavior policy.
+///
+/// # Returns
+/// Type: `Effect<(), RpcStreamServerError<E, Session::Error>, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 fn serve_pulls<Q, C, T, E, R, Session>(
     session: Arc<Session>,
     operation: RpcStreamOperation<Q, C, T, E>,
@@ -570,6 +857,23 @@ where
     })
 }
 
+///
+/// # Type parameters
+/// - `Q`: Request payload type. Additional bound: `Send + 'static`.
+/// - `C`: Stream chunk or item type. Additional bound: `Send + 'static`.
+/// - `T`: Stored or transferred value type. Additional bound: `Send + 'static`.
+/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
+/// - `B`: Transformed success-value type.
+///
+/// # Parameters
+/// - `operation` (`&RpcStreamOperation<Q, C, T, E>`): Typed operation definition or callback selected for execution.
+/// - `call` (`&RpcCallId`): Identity and contents of the selected RPC call.
+/// - `expected` (`NonZeroU64`): Value or revision required for the proposed state transition.
+/// - `bytes` (`&[u8]`): Encoded bytes to validate, decode, write, or transfer.
+/// - `policy` (`RpcEnvelopePolicy`): The caller-supplied behavior policy.
+///
+/// # Returns
+/// Type: `Result<(), RpcStreamServerError<E, B>>`.
 fn decode_ack<Q, C, T, E, B>(
     operation: &RpcStreamOperation<Q, C, T, E>,
     call: &RpcCallId,

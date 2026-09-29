@@ -1,3 +1,5 @@
+//! Pure recurring-calendar evaluation and occurrence policies.
+
 use crate::UtcMillis;
 use chrono::{
     DateTime, Datelike, FixedOffset, LocalResult, NaiveDate, NaiveDateTime, TimeDelta, TimeZone,
@@ -22,13 +24,24 @@ const MAX_WEEKDAY: u32 = 7;
 const SUNDAY_ALIAS: u32 = 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A calendar or time-zone conversion failure with a typed cause.
 pub enum CalendarTimeError {
+    /// The local date time failed validation.
     InvalidLocalDateTime,
+    /// The offset failed validation.
     InvalidOffset,
+    /// The supplied value lies outside the supported range.
     OutOfRange,
 }
 
 impl std::fmt::Display for CalendarTimeError {
+    ///
+    /// # Parameters
+    /// - `formatter` (`&mut std::fmt::Formatter<'_>`): Destination formatter used by the Rust formatting trait.
+    ///
+    /// # Returns
+    /// Type: `std::fmt::Result`.
+    /// Returns `std::fmt::Result`.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(self, formatter)
     }
@@ -49,6 +62,18 @@ pub struct CivilDateTime {
 }
 
 impl CivilDateTime {
+    /// Construct a `CivilDateTime` from its required inputs and explicit policies.
+    ///
+    /// # Parameters
+    /// - `year` (`i32`): The year supplied to this operation.
+    /// - `month` (`u32`): The month supplied to this operation.
+    /// - `day` (`u32`): The day supplied to this operation.
+    /// - `hour` (`u32`): The hour supplied to this operation.
+    /// - `minute` (`u32`): The minute supplied to this operation.
+    /// - `second` (`u32`): The second supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, CalendarTimeError>`.
     pub fn new(
         year: i32,
         month: u32,
@@ -63,6 +88,12 @@ impl CivilDateTime {
         Ok(Self::from_naive(local))
     }
 
+    ///
+    /// # Parameters
+    /// - `local` (`NaiveDateTime`): Local civil-time representation to resolve.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn from_naive(local: NaiveDateTime) -> Self {
         Self {
             year: local.year(),
@@ -74,6 +105,9 @@ impl CivilDateTime {
         }
     }
 
+    ///
+    /// # Returns
+    /// Type: `Result<NaiveDateTime, CalendarTimeError>`.
     fn to_naive(self) -> Result<NaiveDateTime, CalendarTimeError> {
         NaiveDate::from_ymd_opt(self.year, self.month, self.day)
             .and_then(|date| date.and_hms_opt(self.hour, self.minute, self.second))
@@ -81,6 +115,8 @@ impl CivilDateTime {
     }
 
     #[must_use]
+    /// # Returns
+    /// Type: `(i32, u32, u32, u32, u32, u32)`.
     pub const fn components(self) -> (i32, u32, u32, u32, u32, u32) {
         (
             self.year,
@@ -94,11 +130,17 @@ impl CivilDateTime {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The possible UTC resolutions of one local civil time, including gaps and overlaps.
 pub enum LocalResolution {
+    /// The local time does not exist because the clock moved forward.
     Gap,
+    /// The identity was accepted as a new record. Contains `UtcMillis`.
     Unique(UtcMillis),
+    /// The local time occurs twice because the clock moved backward.
     Overlap {
+        /// Earlier UTC realization of an overlapped local time. Type: `UtcMillis`.
         earlier: UtcMillis,
+        /// Later UTC realization of an overlapped local time. Type: `UtcMillis`.
         later: UtcMillis,
     },
 }
@@ -107,15 +149,29 @@ pub enum LocalResolution {
 /// be strictly less than one day in magnitude. The same logical zone/version
 /// must be supplied during replay; no process-local timezone is consulted.
 pub trait CalendarZone: Send + Sync {
+    /// Provider-specific failure type returned by this capability.
     type Error;
 
+    /// # Parameters
+    /// - `local` (`CivilDateTime`): Local civil-time representation to resolve.
+    ///
+    /// # Returns
+    /// Type: `Result<LocalResolution, Self::Error>`.
     fn resolve(&self, local: CivilDateTime) -> Result<LocalResolution, Self::Error>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A calendar zone with one constant UTC offset.
 pub struct FixedOffsetZone(FixedOffset);
 
 impl FixedOffsetZone {
+    /// Return the fixed offset in seconds east of UTC.
+    ///
+    /// # Parameters
+    /// - `seconds` (`i32`): The seconds supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, CalendarTimeError>`.
     pub fn east_seconds(seconds: i32) -> Result<Self, CalendarTimeError> {
         FixedOffset::east_opt(seconds)
             .map(Self)
@@ -123,14 +179,23 @@ impl FixedOffsetZone {
     }
 
     #[must_use]
+    /// # Returns
+    /// Type: `i32`.
     pub const fn seconds_east(self) -> i32 {
         self.0.local_minus_utc()
     }
 }
 
 impl CalendarZone for FixedOffsetZone {
+    /// Type alias for error in cron.
     type Error = CalendarTimeError;
 
+    ///
+    /// # Parameters
+    /// - `local` (`CivilDateTime`): Local civil-time representation to resolve.
+    ///
+    /// # Returns
+    /// Type: `Result<LocalResolution, Self::Error>`.
     fn resolve(&self, local: CivilDateTime) -> Result<LocalResolution, Self::Error> {
         let local = local.to_naive()?;
         Ok(match self.0.from_local_datetime(&local) {
@@ -151,76 +216,123 @@ impl CalendarZone for FixedOffsetZone {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The rule for combining day-of-month and day-of-week constraints.
 pub enum DayMatch {
+    /// A match in either configured day field is sufficient.
     Either,
+    /// Both compared conditions hold.
     Both,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The choice applied when a local time does not exist after a clock transition.
 pub enum GapPolicy {
+    /// Leave the occurrence or value unchanged and continue.
     Skip,
+    /// Reject the conflicting input without applying its proposed state change.
     Reject,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The choice applied when a local time occurs twice after a clock transition.
 pub enum OverlapPolicy {
+    /// Select the earlier UTC realization of an overlapped time.
     Earlier,
+    /// Select the later UTC realization of an overlapped time.
     Later,
+    /// Both compared conditions hold.
     Both,
+    /// Reject the conflicting input without applying its proposed state change.
     Reject,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Caller-selected handling of daylight-saving gaps and overlaps.
 pub struct CalendarTransitionPolicy {
+    /// Behavior for a local time skipped by a clock transition. Type: `GapPolicy`.
     pub gap: GapPolicy,
+    /// Behavior for a local time repeated by a clock transition. Type: `OverlapPolicy`.
     pub overlap: OverlapPolicy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The decision for a scheduled occurrence missed while execution was unavailable.
 pub enum MissedOccurrencePolicy {
+    /// Leave the occurrence or value unchanged and continue.
     Skip,
+    /// Select the later realization of an overlapped local time.
     Latest,
+    /// Include every matching candidate.
     All,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Explicit resource bounds for cron.
 pub struct CronSearchBudget {
+    /// Maximum calendar days examined during occurrence search. Type: `NonZeroUsize`.
     pub days: NonZeroUsize,
+    /// Maximum candidate instants examined during occurrence search. Type: `NonZeroUsize`.
     pub candidates: NonZeroUsize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The resource dimension that exhausted a cron search budget.
 pub enum CronBudgetKind {
+    /// The day-count search budget was exhausted.
     Days,
+    /// The candidate-count search budget was exhausted.
     Candidates,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The calendar field named by a cron parse or validation issue.
 pub enum CronFieldKind {
+    /// The second branch or value was selected.
     Second,
+    /// The minute field caused this calendar decision.
     Minute,
+    /// The hour field caused this calendar decision.
     Hour,
+    /// The day field caused this calendar decision.
     Day,
+    /// The month field caused this calendar decision.
     Month,
+    /// The weekday field caused this calendar decision.
     Weekday,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A typed reason why a cron expression cannot be parsed.
 pub enum CronParseErrorKind {
+    /// The calendar expression contains the wrong number of fields.
     FieldCount,
+    /// A required calendar field has no value.
     EmptyField,
+    /// The number failed validation.
     InvalidNumber,
+    /// The range failed validation.
     InvalidRange,
+    /// The step failed validation.
     InvalidStep,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The position, field, and typed cause of an invalid cron expression.
 pub struct CronParseError {
+    /// Calendar field associated with the parse failure. Type: `Option<CronFieldKind>`.
     pub field: Option<CronFieldKind>,
+    /// Typed discriminator for this state. Type: `CronParseErrorKind`.
     pub kind: CronParseErrorKind,
 }
 
 impl std::fmt::Display for CronParseError {
+    ///
+    /// # Parameters
+    /// - `formatter` (`&mut std::fmt::Formatter<'_>`): Destination formatter used by the Rust formatting trait.
+    ///
+    /// # Returns
+    /// Type: `std::fmt::Result`.
+    /// Returns `std::fmt::Result`.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(self, formatter)
     }
@@ -229,29 +341,53 @@ impl std::fmt::Display for CronParseError {
 impl std::error::Error for CronParseError {}
 
 #[derive(Debug)]
+/// A typed failure while resolving future occurrences under the selected calendar policy.
+///
+/// # Type parameters
+/// - `ZoneError`: Error returned by the calendar-zone provider.
 pub enum CronEvalError<ZoneError> {
+    /// The requested time window ends before it begins.
     ReversedWindow,
+    /// The requested instant lies outside the supported range.
     TimeOutOfRange,
+    /// The configured search budget was exhausted. Retains the `CronBudgetKind` detail.
     BudgetExceeded(CronBudgetKind),
+    /// The local time falls in a clock-transition gap. Retains the `CivilDateTime` detail.
     Gap(CivilDateTime),
+    /// The local time has two valid realizations. Retains the `CivilDateTime` detail.
     Overlap(CivilDateTime),
+    /// The zone resolution failed validation.
     InvalidZoneResolution,
+    /// The time-zone provider could not resolve the local time. Retains the `ZoneError` detail.
     Zone(ZoneError),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The specific calendar or budget condition that stopped occurrence search.
 pub enum CronEvalErrorKind {
+    /// The end of the requested time window precedes its start.
     ReversedWindow,
+    /// The requested instant lies outside the supported range.
     TimeOutOfRange,
+    /// The configured search budget was exhausted.
     BudgetExceeded,
+    /// The local time does not exist because the clock moved forward.
     Gap,
+    /// The local time occurs twice because the clock moved backward.
     Overlap,
+    /// The zone resolution failed validation.
     InvalidZoneResolution,
+    /// The time-zone provider failed to resolve this occurrence.
     Zone,
 }
 
 impl<ZoneError> CronEvalError<ZoneError> {
     #[must_use]
+    /// # Type parameters
+    /// - `ZoneError`: Error returned by the calendar-zone provider.
+    ///
+    /// # Returns
+    /// Type: `CronEvalErrorKind`.
     pub const fn kind(&self) -> CronEvalErrorKind {
         match self {
             Self::ReversedWindow => CronEvalErrorKind::ReversedWindow,
@@ -266,6 +402,13 @@ impl<ZoneError> CronEvalError<ZoneError> {
 }
 
 impl<ZoneError> std::fmt::Display for CronEvalError<ZoneError> {
+    ///
+    /// # Parameters
+    /// - `formatter` (`&mut std::fmt::Formatter<'_>`): Destination formatter used by the Rust formatting trait.
+    ///
+    /// # Returns
+    /// Type: `std::fmt::Result`.
+    /// Returns `std::fmt::Result`.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(&self.kind(), formatter)
     }
@@ -274,26 +417,41 @@ impl<ZoneError> std::fmt::Display for CronEvalError<ZoneError> {
 impl<ZoneError: std::fmt::Debug> std::error::Error for CronEvalError<ZoneError> {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Whether an occurrence is the earlier or later realization of an overlapped local time.
 pub enum OccurrencePhase {
+    /// The identity was accepted as a new record.
     Unique,
+    /// Select the earlier UTC realization of an overlapped time.
     Earlier,
+    /// Select the later UTC realization of an overlapped time.
     Later,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A resolved occurrence with both its UTC instant and local calendar representation.
 pub struct CalendarOccurrence {
+    /// Resolved absolute instant. Type: `UtcMillis`.
     pub instant: UtcMillis,
+    /// Local civil-time representation of the occurrence. Type: `CivilDateTime`.
     pub local: CivilDateTime,
+    /// Current phase of this lifecycle. Type: `OccurrencePhase`.
     pub phase: OccurrencePhase,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Typed field set used by cron.
 struct FieldSet {
     mask: u64,
     wildcard: bool,
 }
 
 impl FieldSet {
+    ///
+    /// # Parameters
+    /// - `value` (`u32`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     const fn single(value: u32) -> Self {
         Self {
             mask: 1_u64 << value,
@@ -301,10 +459,26 @@ impl FieldSet {
         }
     }
 
+    ///
+    /// # Parameters
+    /// - `value` (`u32`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     const fn contains(self, value: u32) -> bool {
         self.mask & (1_u64 << value) != 0
     }
 
+    ///
+    /// # Parameters
+    /// - `raw` (`&str`): The raw supplied to this operation.
+    /// - `field` (`CronFieldKind`): The field supplied to this operation.
+    /// - `minimum` (`u32`): Lower bound enforced by this policy.
+    /// - `maximum` (`u32`): Upper bound enforced by this policy.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, CronParseError>`.
     fn parse(
         raw: &str,
         field: CronFieldKind,
@@ -398,6 +572,14 @@ pub struct Cron {
 }
 
 impl Cron {
+    /// Parse and validate the input under this schema or syntax policy.
+    ///
+    /// # Parameters
+    /// - `expression` (`&str`): The expression supplied to this operation.
+    /// - `day_match` (`DayMatch`): The day match supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, CronParseError>`.
     pub fn parse(expression: &str, day_match: DayMatch) -> Result<Self, CronParseError> {
         let fields: Vec<_> = expression.split_whitespace().collect();
         let (seconds, [minute, hour, day, month, weekday]) = match fields.as_slice() {
@@ -427,6 +609,13 @@ impl Cron {
         })
     }
 
+    ///
+    /// # Parameters
+    /// - `date` (`NaiveDate`): The date supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     fn matches_date(&self, date: NaiveDate) -> bool {
         if !self.months.contains(date.month()) {
             return false;
@@ -449,6 +638,19 @@ impl Cron {
     /// Enumerate all occurrences after `after` and through `through`, both UTC.
     /// Budgets are caller supplied; exceeding one is a typed incomplete search,
     /// never a silent claim that no occurrence exists. No clock is read here.
+    ///
+    /// # Type parameters
+    /// - `Zone`: Bounds: `CalendarZone`.
+    ///
+    /// # Parameters
+    /// - `after` (`UtcMillis`): Cursor or instant after which results are selected.
+    /// - `through` (`UtcMillis`): Last cursor or sequence included in this bounded operation.
+    /// - `zone` (`&Zone`): The zone supplied to this operation.
+    /// - `transitions` (`CalendarTransitionPolicy`): The transitions supplied to this operation.
+    /// - `budget` (`CronSearchBudget`): The budget supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Vec<CalendarOccurrence>, CronEvalError<Zone::Error>>`.
     pub fn occurrences_between<Zone: CalendarZone>(
         &self,
         after: UtcMillis,
@@ -548,6 +750,20 @@ impl Cron {
     /// `Skip` returns only an occurrence due exactly at `now`, without
     /// backfill; `Latest` reports the most recent due occurrence, while `All`
     /// reports every due occurrence within the budget.
+    ///
+    /// # Type parameters
+    /// - `Zone`: Bounds: `CalendarZone`.
+    ///
+    /// # Parameters
+    /// - `after` (`UtcMillis`): Cursor or instant after which results are selected.
+    /// - `now` (`UtcMillis`): The caller-supplied current time.
+    /// - `zone` (`&Zone`): The zone supplied to this operation.
+    /// - `transitions` (`CalendarTransitionPolicy`): The transitions supplied to this operation.
+    /// - `missed` (`MissedOccurrencePolicy`): The missed supplied to this operation.
+    /// - `budget` (`CronSearchBudget`): The budget supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Vec<CalendarOccurrence>, CronEvalError<Zone::Error>>`.
     pub fn due<Zone: CalendarZone>(
         &self,
         after: UtcMillis,
@@ -569,10 +785,29 @@ impl Cron {
     }
 }
 
+///
+/// # Parameters
+/// - `instant` (`UtcMillis`): The instant supplied to this operation.
+/// - `after` (`UtcMillis`): Cursor or instant after which results are selected.
+/// - `through` (`UtcMillis`): Last cursor or sequence included in this bounded operation.
+///
+/// # Returns
+/// Type: `bool`.
+/// Returns whether the requested condition holds.
 fn in_window(instant: UtcMillis, after: UtcMillis, through: UtcMillis) -> bool {
     instant > after && instant <= through
 }
 
+///
+/// # Type parameters
+/// - `ZoneError`: Error returned by the calendar-zone provider.
+///
+/// # Parameters
+/// - `local` (`NaiveDateTime`): Local civil-time representation to resolve.
+/// - `instant` (`UtcMillis`): The instant supplied to this operation.
+///
+/// # Returns
+/// Type: `Result<(), CronEvalError<ZoneError>>`.
 fn validate_resolution<ZoneError>(
     local: NaiveDateTime,
     instant: UtcMillis,
@@ -587,6 +822,20 @@ fn validate_resolution<ZoneError>(
     Ok(())
 }
 
+///
+/// # Type parameters
+/// - `ZoneError`: Error returned by the calendar-zone provider.
+///
+/// # Parameters
+/// - `occurrences` (`&mut Vec<CalendarOccurrence>`): The occurrences supplied to this operation.
+/// - `local` (`NaiveDateTime`): Local civil-time representation to resolve.
+/// - `resolution` (`LocalResolution`): The resolution supplied to this operation.
+/// - `after` (`UtcMillis`): Cursor or instant after which results are selected.
+/// - `through` (`UtcMillis`): Last cursor or sequence included in this bounded operation.
+/// - `transitions` (`CalendarTransitionPolicy`): The transitions supplied to this operation.
+///
+/// # Returns
+/// Type: `Result<(), CronEvalError<ZoneError>>`.
 fn collect_resolution<ZoneError>(
     occurrences: &mut Vec<CalendarOccurrence>,
     local: NaiveDateTime,
@@ -638,6 +887,17 @@ fn collect_resolution<ZoneError>(
     Ok(())
 }
 
+///
+/// # Parameters
+/// - `occurrences` (`&mut Vec<CalendarOccurrence>`): The occurrences supplied to this operation.
+/// - `after` (`UtcMillis`): Cursor or instant after which results are selected.
+/// - `through` (`UtcMillis`): Last cursor or sequence included in this bounded operation.
+/// - `instant` (`UtcMillis`): The instant supplied to this operation.
+/// - `local` (`CivilDateTime`): Local civil-time representation to resolve.
+/// - `phase` (`OccurrencePhase`): The phase supplied to this operation.
+///
+/// # Returns
+/// Type: `()`.
 fn push_occurrence(
     occurrences: &mut Vec<CalendarOccurrence>,
     after: UtcMillis,

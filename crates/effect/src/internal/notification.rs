@@ -1,6 +1,14 @@
+//! Wakeup delivery outside synchronization boundaries.
+
 use event_listener::Event;
 
 /// Broadcast a persisted state change to every currently registered listener.
+///
+/// # Parameters
+/// - `event` (`&Event`): Typed event identity and payload submitted to the journal.
+///
+/// # Returns
+/// Type: `()`.
 pub(crate) fn notify_all(event: &Event) {
     // Event::notify(n) ensures at least n registered listeners are notified.
     // usize::MAX covers every representable listener count: this is the

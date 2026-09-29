@@ -1,20 +1,37 @@
+//! Registration and cleanup of pending observers.
+
 /// The actual slot of one queued entry, not a counter or runtime-provider ID.
 /// A caller must check its retained entry identity before removing a reused slot.
 #[derive(Clone, Copy)]
 pub(crate) struct Position(usize);
 
+/// Typed entry used by internal waiting.
+///
+/// # Type parameters
+/// - `T`: Value or item type.
 struct Entry<T> {
     previous: Option<Position>,
     next: Option<Position>,
     value: T,
 }
 
+/// Variants of slot used by internal waiting.
+///
+/// # Type parameters
+/// - `T`: Value or item type.
 enum Slot<T> {
     Occupied(Entry<T>),
     Vacant(Option<Position>),
 }
 
 impl<T> Slot<T> {
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type.
+    ///
+    /// # Returns
+    /// Type: `Option<&Entry<T>>`.
+    /// Returns the value when present, or `None`.
     const fn entry(&self) -> Option<&Entry<T>> {
         match self {
             Self::Occupied(entry) => Some(entry),
@@ -22,6 +39,13 @@ impl<T> Slot<T> {
         }
     }
 
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type.
+    ///
+    /// # Returns
+    /// Type: `Option<&mut Entry<T>>`.
+    /// Returns the value when present, or `None`.
     const fn entry_mut(&mut self) -> Option<&mut Entry<T>> {
         match self {
             Self::Occupied(entry) => Some(entry),
@@ -36,6 +60,9 @@ impl<T> Slot<T> {
 /// of other waiters. Insertion is amortized constant-time because it can grow
 /// the slot vector. Storage retains its observed high-water capacity until this
 /// list is dropped, including terminal queue shutdown.
+///
+/// # Type parameters
+/// - `T`: Value or item type.
 pub(crate) struct Waiting<T> {
     entries: Vec<Slot<T>>,
     free: Option<Position>,
@@ -45,6 +72,9 @@ pub(crate) struct Waiting<T> {
 }
 
 impl<T> Default for Waiting<T> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn default() -> Self {
         Self {
             entries: Vec::new(),
@@ -57,12 +87,31 @@ impl<T> Default for Waiting<T> {
 }
 
 impl<T> Waiting<T> {
+    /// # Type parameters
+    /// - `T`: Value or item type.
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     pub(crate) const fn is_empty(&self) -> bool {
         self.first.is_none()
     }
+    /// # Type parameters
+    /// - `T`: Value or item type.
+    ///
+    /// # Returns
+    /// Type: `usize`.
     pub(crate) const fn len(&self) -> usize {
         self.len
     }
+    /// # Type parameters
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `value` (`T`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Position`.
     pub(crate) fn push_back(&mut self, value: T) -> Position {
         let position = match self.free.take() {
             Some(position) => {
@@ -99,11 +148,27 @@ impl<T> Waiting<T> {
         position
     }
 
+    /// # Type parameters
+    /// - `T`: Value or item type.
+    ///
+    /// # Returns
+    /// Type: `Option<T>`.
+    /// Returns the value when present, or `None`.
     pub(crate) fn pop_front(&mut self) -> Option<T> {
         let position = self.first?;
         self.remove_where(position, |_| true)
     }
 
+    /// # Type parameters
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `position` (`Position`): The position supplied to this operation.
+    /// - `matches` (`impl FnOnce(&T) -> bool`): The matches supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Option<T>`.
+    /// Returns the value when present, or `None`.
     pub(crate) fn remove_where(
         &mut self,
         position: Position,

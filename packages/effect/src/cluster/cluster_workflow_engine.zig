@@ -12,6 +12,7 @@ const workflow_engine = @import("../workflow/workflow_engine.zig");
 const durable_deferred = @import("../workflow/durable_deferred.zig");
 const durable_clock = @import("../workflow/durable_clock.zig");
 
+/// Cluster message selecting a workflow run or progress query.
 pub const Command = union(enum) {
     run: workflow_types.Submission,
     poll: workflow_types.ExecutionId,
@@ -33,6 +34,10 @@ pub const Command = union(enum) {
     schedule_deadline: durable_clock.Schedule,
     cancel_deadline: durable_clock.Identity,
 
+    /// Return the workflow execution identity.
+    /// Parameters:
+    /// - `self: @This()`: Receiver passed by value: the struct itself is copied, while any referenced storage keeps its original ownership and lifetime.
+    /// Returns (`workflow_types.ExecutionId`): The workflow execution identity.
     pub fn execution(self: @This()) workflow_types.ExecutionId {
         return switch (self) {
             .run => |value| value.execution,
@@ -50,7 +55,10 @@ pub const Command = union(enum) {
     }
 };
 
+/// Typed answer to the selected workflow command.
 pub const Reply = union(enum) {
+    /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit` and
+    /// must be released after use.
     pub const effect_owned_payload = true;
     run: workflow_types.SubmitResult,
     poll: workflow_types.ExecutionState,
@@ -67,6 +75,10 @@ pub const Reply = union(enum) {
     schedule_deadline: durable_clock.ScheduleResult,
     cancel_deadline: durable_clock.CancelResult,
 
+    /// Release resources owned by this value.
+    /// Parameters:
+    /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn deinit(self: *@This()) void {
         switch (self.*) {
             .poll => outcomes.discardPayload(&self.poll),
@@ -77,6 +89,11 @@ pub const Reply = union(enum) {
         self.* = undefined;
     }
 
+    /// Duplicate this value; marked owning payloads are cloned, while ordinary
+    /// borrowed fields retain their original lifetime.
+    /// Parameters:
+    /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+    /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
     pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
         return switch (self.*) {
             .poll => |value| .{ .poll = try outcomes.clonePayload(value) },
@@ -87,8 +104,14 @@ pub const Reply = union(enum) {
     }
 };
 
+/// Specialize the typed exchange result outcome for cluster operations.
+/// Parameters:
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// Returns (`type`): typed response to a cluster/workflow command exchange.
 pub fn ExchangeResult(comptime E: type) type {
     return union(enum) {
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         completed: outcomes.Exit(Reply, E),
         accepted,
@@ -96,11 +119,20 @@ pub fn ExchangeResult(comptime E: type) type {
         missing,
         expired,
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *@This()) void {
             if (self.* == .completed) self.completed.deinit();
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
             return switch (self.*) {
                 .completed => |value| blk: {
@@ -116,6 +148,34 @@ pub fn ExchangeResult(comptime E: type) type {
     };
 }
 
+/// Compose cluster messaging with a workflow engine and explicit durability guarantees.
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `StoreProviderError: comptime type`: Compile-time error type returned by the store provider.
+/// - `EngineProviderError: comptime type`: Compile-time error type returned by the selected engine provider.
+/// - `SignalProviderError: comptime type`: Compile-time error type returned by the signal provider.
+/// - `ClockProviderError: comptime type`: Compile-time error type returned by the clock provider.
+/// - `CodecError: comptime type`: Failure type returned by the selected encoder or decoder.
+/// - `store_guarantee: comptime message_store.Guarantee`: Compile-time recoverability promised by the message store.
+/// - `engine_guarantee: comptime workflow_engine.Guarantee`: Compile-time recoverability promised by the selected engine.
+/// - `signal_guarantee: comptime durable_deferred.Guarantee`: Compile-time recoverability promised by the signal store.
+/// - `clock_guarantee: comptime durable_clock.Guarantee`: Compile-time recoverability promised by the durable clock.
+/// - `select_store: comptime fn (*const R) *const message_store.MessageStore(R, StoreProviderError, store_guarantee)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_engine: comptime fn (*const R) *const workflow_engine.WorkflowEngine(R, EngineProviderError, engine_guarantee)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_signal: comptime fn (*const R) *const durable_deferred.Store(R, SignalProviderError, signal_guarantee)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_clock: comptime fn (*const R) *const durable_clock.Store(R, ClockProviderError, clock_guarantee)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_retention: comptime fn (*const R) deadlines.Deadline`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `group: comptime []const u8`: Compile-time stable, nonempty identity component validated at definition time.
+/// - `version: comptime u32`: Compile-time stable version used to reject incompatible encoded or replayed data.
+/// - `request_key: comptime fn (*const Command) []const u8`: Compile-time typed function selected at comptime; no runtime callback lookup
+///   is required.
+/// - `Codec: comptime type`: Compile-time codec type with a decoded value and encoded representation.
+/// Returns (`type`): workflow engine adapter that routes through cluster messaging while preserving durability requirements.
 pub fn ClusterWorkflowEngine(
     comptime R: type,
     comptime StoreProviderError: type,
@@ -153,11 +213,15 @@ pub fn ClusterWorkflowEngine(
     }
     return struct {
         const Self = @This();
+        /// Recoverable only when store, engine, signal, and clock providers all promise recoverability.
         pub const storage_guarantee: workflow_engine.Guarantee = if (store_guarantee == .recoverable and
             engine_guarantee == .recoverable and signal_guarantee == .recoverable and
             clock_guarantee == .recoverable) .recoverable else .@"volatile";
+        /// Typed failure of a cluster-backed workflow command exchange.
         pub const Error = union(enum) {
             const Own = @This();
+            /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements
+            /// `deinit` and must be released after use.
             pub const effect_owned_payload = true;
             cluster: Store.Failure,
             workflow: Engine.Failure,
@@ -166,6 +230,10 @@ pub fn ClusterWorkflowEngine(
             codec: CodecError,
             invalid_identity,
 
+            /// Release resources owned by this value.
+            /// Parameters:
+            /// - `self: *Own`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+            /// Returns (`void`): no value.
             pub fn deinit(self: *Own) void {
                 switch (self.*) {
                     .cluster => outcomes.discardPayload(&self.cluster),
@@ -178,6 +246,11 @@ pub fn ClusterWorkflowEngine(
                 self.* = undefined;
             }
 
+            /// Duplicate this value; marked owning payloads are cloned, while ordinary
+            /// borrowed fields retain their original lifetime.
+            /// Parameters:
+            /// - `self: *const Own`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+            /// Returns (`error{OutOfMemory}!Own`): A `Own` on success; `OutOfMemory` if required allocation fails.
             pub fn clone(self: *const Own) error{OutOfMemory}!Own {
                 return switch (self.*) {
                     .cluster => |value| .{ .cluster = try outcomes.clonePayload(value) },
@@ -189,10 +262,19 @@ pub fn ClusterWorkflowEngine(
                 };
             }
         };
+        /// Typed command-exchange outcome for a cluster-backed workflow.
         pub const Exchange = ExchangeResult(Error);
+        /// Lazy Effect for send; success, error, and environment types are fixed by
+        /// `effects.Effect(Exchange, Error, R)`.
         pub const Send = effects.Effect(Exchange, Error, R);
+        /// Lazy Effect for execute; success, error, and environment types are fixed by
+        /// `effects.Effect(Reply, Error, R)`.
         pub const Execute = effects.Effect(Reply, Error, R);
+        /// Typed terminal outcome for recorded; its success and failure types are fixed by
+        /// `outcomes.Exit(Reply, Error)`.
         pub const Recorded = outcomes.Exit(Reply, Error);
+        /// Lazy Effect for complete; success, error, and environment types are fixed by
+        /// `effects.Effect(message_store.Completion, Error, R)`.
         pub const Complete = effects.Effect(message_store.Completion, Error, R);
 
         fn clusterError(value: Store.Failure) Error {
@@ -222,15 +304,26 @@ pub fn ClusterWorkflowEngine(
         }
 
         const SubmissionOwner = struct {
+            /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements
+            /// `deinit` and must be released after use.
             pub const effect_owned_payload = true;
             bytes: workflow_types.Bytes,
             located: cluster_types.Address,
 
+            /// Release resources owned by this value.
+            /// Parameters:
+            /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+            /// Returns (`void`): no value.
             pub fn deinit(self: *@This()) void {
                 self.bytes.deinit();
                 self.* = undefined;
             }
 
+            /// Duplicate this value; marked owning payloads are cloned, while ordinary
+            /// borrowed fields retain their original lifetime.
+            /// Parameters:
+            /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+            /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
             pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
                 return .{ .bytes = try self.bytes.clone(), .located = self.located };
             }
@@ -266,6 +359,11 @@ pub fn ClusterWorkflowEngine(
 
         /// Acceptance is deduplicated by the caller's stable request key;
         /// completion reads Cluster's saved reply rather than another cache.
+        ///
+        /// Parameters:
+        /// - `select_command: comptime fn (*const R) *const Command`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// Returns (`Send`): The typed operation result or description selected by this API.
         pub fn send(comptime select_command: fn (*const R) *const Command) Send {
             return Send.deferEffect(struct {
                 fn start(env: *const R) Send {
@@ -276,6 +374,12 @@ pub fn ClusterWorkflowEngine(
 
         /// The caller keeps borrowed command fields valid through execution.
         /// The codec returns independent owned bytes before Cluster accepts it.
+        ///
+        /// Parameters:
+        /// - `command: Command`: Typed command submitted to the engine.
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Send`): The typed operation result or description selected by this API.
         pub fn sendCommand(command: Command, env: *const R) Send {
             const located = switch (address(&command)) {
                 .ok => |value| value,
@@ -295,15 +399,26 @@ pub fn ClusterWorkflowEngine(
         }
 
         const CompletionOwner = struct {
+            /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements
+            /// `deinit` and must be released after use.
             pub const effect_owned_payload = true;
             bytes: workflow_types.Bytes,
             claim: *const message_store.ClaimedMessage,
 
+            /// Release resources owned by this value.
+            /// Parameters:
+            /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+            /// Returns (`void`): no value.
             pub fn deinit(self: *@This()) void {
                 self.bytes.deinit();
                 self.* = undefined;
             }
 
+            /// Duplicate this value; marked owning payloads are cloned, while ordinary
+            /// borrowed fields retain their original lifetime.
+            /// Parameters:
+            /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+            /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
             pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
                 return .{ .bytes = try self.bytes.clone(), .claim = self.claim };
             }
@@ -332,6 +447,11 @@ pub fn ClusterWorkflowEngine(
         /// Effect. Decoding borrows from its request bytes. The codec encodes
         /// the full typed Exit into independent owned reply bytes; decoding a
         /// saved reply likewise returns an independent owned Exit.
+        ///
+        /// Parameters:
+        /// - `select_claim: comptime fn (*const R) *const message_store.ClaimedMessage`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// Returns (`Complete`): The typed operation result or description selected by this API.
         pub fn serveClaim(comptime select_claim: fn (*const R) *const message_store.ClaimedMessage) Complete {
             return Complete.deferEffect(struct {
                 fn start(env: *const R) Complete {
@@ -362,6 +482,12 @@ pub fn ClusterWorkflowEngine(
             }.start);
         }
 
+        /// Execute a cluster-backed workflow command.
+        /// Parameters:
+        /// - `command: Command`: Typed command submitted to the engine.
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Execute`): The typed operation result or description selected by this API.
         pub fn execute(command: Command, env: *const R) Execute {
             const engine = select_engine(env);
             return switch (command) {

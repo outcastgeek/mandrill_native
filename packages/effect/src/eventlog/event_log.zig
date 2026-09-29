@@ -9,14 +9,25 @@ const journal = @import("event_journal.zig");
 const journal_error = @import("event_log_error.zig");
 const Issue = @import("../schema/schema_issue.zig").Issue;
 
+/// Specialize the eventlog failure variants from their typed channels.
+/// Parameters:
+/// - `DomainError: comptime type`: Application failure type produced by domain-level operations.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// Returns (`type`): typed append failure distinguishing handler and journal errors.
 pub fn AppendError(comptime DomainError: type, comptime ProviderError: type) type {
     return union(enum) {
         const Self = @This();
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         encoding: Issue,
         handler: DomainError,
         journal: journal_error.Error(ProviderError),
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             switch (self.*) {
                 .encoding => self.encoding.deinit(),
@@ -26,6 +37,11 @@ pub fn AppendError(comptime DomainError: type, comptime ProviderError: type) typ
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!Self`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const Self) error{OutOfMemory}!Self {
             return switch (self.*) {
                 .encoding => |value| .{ .encoding = try value.clone() },
@@ -36,15 +52,25 @@ pub fn AppendError(comptime DomainError: type, comptime ProviderError: type) typ
     };
 }
 
+/// Specialize the typed append result outcome for eventlog operations.
+/// Parameters:
+/// - `Success: comptime type`: Success payload type represented by the returned component.
+/// Returns (`type`): typed append outcome with its committed event identity.
 pub fn AppendResult(comptime Success: type) type {
     return union(enum) {
         const Self = @This();
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = outcomes.ownsPayload(Success);
         committed: struct { cursor: journal.Cursor, result: Success },
         accepted: Success,
         rejected: Success,
         uncertain: Success,
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             switch (self.*) {
                 .committed => outcomes.discardPayload(&self.committed.result),
@@ -55,6 +81,11 @@ pub fn AppendResult(comptime Success: type) type {
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!Self`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const Self) error{OutOfMemory}!Self {
             return switch (self.*) {
                 .committed => |value| .{ .committed = .{ .cursor = value.cursor, .result = try outcomes.clonePayload(value.result) } },
@@ -100,6 +131,18 @@ fn appendSuccessful(
     }.finish);
 }
 
+/// Handle an event, append its result, and invalidate observers.
+/// Parameters:
+/// - `handler: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where static.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `select_payload: comptime fn (*const R) *const @TypeOf(handler).EventDefinition.Payload`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_journal: comptime fn (*const R) *const journal.Journal(R, ProviderError)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_proposal: comptime fn (*const R) journal.Proposal`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// Returns (`effects.Effect(AppendResult(@TypeOf(handler).EventDefinition.Success), AppendError(@TypeOf(handler).EventDefinition.DomainError, ProviderError), R)`): handler result appended under the event’s stable identity.
 pub fn handleAndAppend(
     comptime handler: anytype,
     comptime R: type,
@@ -157,6 +200,20 @@ pub fn handleAndAppend(
 /// owned bytes through the journal acknowledgement. The adapter receives the
 /// definition's checked payload codec and can serialize its representation
 /// using the caller's R; no codec or I/O implementation is fixed by core.
+///
+/// Parameters:
+/// - `handler: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where static.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `select_payload: comptime fn (*const R) *const @TypeOf(handler).EventDefinition.Payload`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_journal: comptime fn (*const R) *const journal.Journal(R, ProviderError)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_event_id: comptime fn (*const R) []const u8`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `encode_payload: comptime fn (*const @TypeOf(handler).EventDefinition.PayloadSchema, *const @TypeOf(handler).EventDefinition.Payload, *const R) effects.Effect(outcomes.OwnedSlice(u8), Issue, R)`: Compile-time typed function selected at comptime; no runtime callback
+///   lookup is required.
+/// Returns (`effects.Effect(AppendResult(@TypeOf(handler).EventDefinition.Success), AppendError(@TypeOf(handler).EventDefinition.DomainError, ProviderError), R)`): encoded handler result appended under the event’s stable identity.
 pub fn handleAndAppendEncoded(
     comptime handler: anytype,
     comptime R: type,

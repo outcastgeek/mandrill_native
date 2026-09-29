@@ -1,3 +1,5 @@
+//! Lazy `Effect(A, E, R)` descriptions and their typed execution kernel.
+//! `R` supplies runtime capabilities; execution returns `Exit(A, E)` directly.
 const std = @import("std");
 const outcomes = @import("outcome.zig");
 const rt = @import("internal/runtime.zig");
@@ -64,11 +66,24 @@ fn requireEffect(comptime T: type, comptime E: type, comptime R: type, comptime 
         @compileError(operation.label() ++ diagnostics.expected_effect_contract);
 }
 
+/// Lazy program producing `Exit(A, E)` when run with `R`. The environment
+/// supplies application services and runtime capabilities such as allocator,
+/// I/O, and execution engines; operations do not take a second runtime context.
+/// Construction performs no work, and owning descriptions need `deinit`.
+///
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): a lazy program type with constructors, combinators, and execution contracts fixed to `A`, `E`, and `R`.
 pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
     return struct {
         const Self = @This();
+        /// Value type carried by the successful channel.
         pub const Success = A;
+        /// Expected application failure type `E` carried by this Effect; defects and interruption remain separate.
         pub const Error = E;
+        /// Exact caller environment type required when the description runs.
         pub const Environment = R;
 
         const Sequence = struct { items: *const anyopaque, len: usize, concurrency: ?usize = null };
@@ -161,6 +176,12 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return described;
         }
 
+        /// Describe a success without executing work. The value is reused on
+        /// every run, so owning payload types are rejected at comptime; use a
+        /// lazy factory or `fromOwnedSuccess` for a fresh owned value.
+        /// Parameters:
+        /// - `value: A`: reusable success value; it must not declare owned payload storage.
+        /// Returns (`Self`): lazy effect whose execution yields `.success = value`.
         pub fn succeed(value: A) Self {
             if (comptime outcomes.ownsPayload(A)) @compileError(diagnostics.reusable_owned_success_requires_a_lazy_sync_fromoutcome_factory_or_a_scoped);
             return succeedMoved(value);
@@ -172,6 +193,11 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return described;
         }
 
+        /// Describe an expected application failure. The error value is reused
+        /// on every run, so owning error payloads require a lazy factory.
+        /// Parameters:
+        /// - `err: E`: reusable typed failure value; it must not own payload storage.
+        /// Returns (`Self`): lazy effect whose execution yields `.fail = err`.
         pub fn fail(err: E) Self {
             if (comptime outcomes.ownsPayload(E)) @compileError(diagnostics.reusable_owned_failure_requires_a_lazy_fromoutcome_factory);
             var described = terminalExit(.{ .fail = err });
@@ -179,18 +205,28 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return described;
         }
 
+        /// Describe an immediate defect, distinct from the typed `E` channel.
+        /// Parameters:
+        /// - `defect: outcomes.Defect`: Unexpected failure represented separately from typed errors.
+        /// Returns (`Self`): lazy effect whose execution yields `.die = defect`.
         pub fn die(defect: outcomes.Defect) Self {
             var described = terminalExit(.{ .die = defect });
             described.delivery = .ordinary;
             return described;
         }
 
+        /// Describe an immediate interruption.
+        /// Returns (`Self`): lazy effect whose execution yields `.interrupted`.
         pub fn interrupted() Self {
             var described = terminalExit(.interrupted);
             described.delivery = .ordinary;
             return described;
         }
 
+        /// Read a service from the environment when this Effect runs.
+        /// Parameters:
+        /// - `project: comptime anytype`: Typed selector from `*const R` to the service value.
+        /// Returns (`Self`): A lazy Effect producing the selected service.
         pub inline fn service(comptime project: anytype) Self {
             if (unaryResult(project, *const R, .service) != A)
                 @compileError(diagnostics.service_result ++ @typeName(A));
@@ -205,12 +241,23 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         }
 
         /// The callback runs inline when reached, and anew on each run.
+        /// Describe a synchronous computation over the environment.
+        /// Parameters:
+        /// - `callback: comptime anytype`: Typed callback checked against this Effect’s `A`, `E`, and `R`.
+        /// Returns (`Self`): A lazy Effect; the callback runs only during execution.
         pub inline fn sync(comptime callback: anytype) Self {
             if (unaryResult(callback, *const R, .sync) != A)
                 @compileError(diagnostics.sync_result ++ @typeName(A));
             return comptime service(callback);
         }
 
+        /// Build a lazy Effect from a borrowed value without taking ownership.
+        /// Parameters:
+        /// - `Capture: comptime type`: type of the borrowed capture; fixes the
+        ///   callback signature without a runtime type check.
+        /// - `capture: *const Capture`: caller-owned state that must outlive execution.
+        /// - `callback: comptime fn (*const Capture, *const R) outcomes.Exit(A, E)`: operation invoked with the capture and environment when reached.
+        /// Returns (`Self`): lazy effect borrowing `capture`; it owns no capture storage.
         pub fn fromBorrowed(comptime Capture: type, capture: *const Capture, comptime callback: fn (*const Capture, *const R) outcomes.Exit(A, E)) Self {
             return .{ .value = .{ .borrowed = capture }, .ready = struct {
                 fn ready(env: *const R, stored: Value, _: *rt.State) outcomes.Exit(A, E) {
@@ -222,6 +269,13 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
 
         /// Supplies the active logical token without introducing an execution
         /// context or duplicating allocator/I/O arguments outside R.
+        ///
+        /// Parameters:
+        /// - `Capture: comptime type`: type of the borrowed callback state.
+        /// - `capture: *const Capture`: caller-owned state kept alive through execution.
+        /// - `callback: comptime fn (*const Capture, *const R, ?*const rt.Cancellation) outcomes.Exit(A, E)`: operation receiving the active token, or `null` inside protected execution.
+        /// Returns (`Self`): lazy effect borrowing `capture` and propagating
+        /// cancellation through its callback's optional token.
         pub fn fromCancellableBorrowed(comptime Capture: type, capture: *const Capture, comptime callback: fn (*const Capture, *const R, ?*const rt.Cancellation) outcomes.Exit(A, E)) Self {
             return .{ .value = .{ .borrowed = capture }, .ready = struct {
                 fn ready(env: *const R, stored: Value, state: *rt.State) outcomes.Exit(A, E) {
@@ -231,6 +285,13 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.ready };
         }
 
+        /// Adapt a borrowed native operation into a lazy Effect.
+        /// Parameters:
+        /// - `Capture: comptime type`: type of the borrowed native-operation state.
+        /// - `capture: *const Capture`: caller-owned state kept alive until native work joins.
+        /// - `callback: comptime fn (*const Capture, *const R) outcomes.Exit(A, E)`: native operation started only when this effect is reached.
+        /// Returns (`Self`): lazy native effect; its environment must provide
+        /// both `allocator` and `io` with the declared Zig types.
         pub fn fromNativeBorrowed(comptime Capture: type, capture: *const Capture, comptime callback: fn (*const Capture, *const R) outcomes.Exit(A, E)) Self {
             comptime requireNativeEnvironment();
             return fromAsyncBorrowed(Capture, capture, struct {
@@ -240,6 +301,13 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.start);
         }
 
+        /// Adapt a borrowed, cancellable native operation into an Effect.
+        /// Parameters:
+        /// - `Capture: comptime type`: type of the borrowed native-operation state.
+        /// - `capture: *const Capture`: caller-owned state kept alive until native work joins.
+        /// - `callback: comptime fn (*const Capture, *const R, ?*const rt.Cancellation) outcomes.Exit(A, E)`: native operation receiving the logical cancellation token.
+        /// Returns (`Self`): lazy native effect with typed cancellation and an
+        /// environment requirement for `allocator` and `io`.
         pub fn fromNativeCancellableBorrowed(comptime Capture: type, capture: *const Capture, comptime callback: fn (*const Capture, *const R, ?*const rt.Cancellation) outcomes.Exit(A, E)) Self {
             comptime requireNativeEnvironment();
             return fromAsyncBorrowed(Capture, capture, struct {
@@ -314,6 +382,14 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         /// Copies capture storage into an owning, reusable description. Pointer
         /// fields remain borrowed; this operation does not invent a destructor
         /// for application data. Move/deinit the description exactly once.
+        ///
+        /// Parameters:
+        /// - `env: *const R`: supplies the allocator used for the capture node;
+        ///   the environment itself stays borrowed.
+        /// - `capture: anytype`: value moved into the description's allocated node.
+        /// - `callback: comptime fn (*const @TypeOf(capture), *const R) outcomes.Exit(A, E)`: operation invoked with the stored capture when run.
+        /// Returns (`Self`): owning lazy effect. Call `deinit` exactly once;
+        /// allocation failure instead produces a defect description.
         pub fn fromOwned(env: *const R, capture: anytype, comptime callback: fn (*const @TypeOf(capture), *const R) outcomes.Exit(A, E)) Self {
             const Capture = @TypeOf(capture);
             const Node = struct {
@@ -354,6 +430,13 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
 
         /// Owns a runtime capture while exposing the active branch token to
         /// a cancellation-aware synchronous provider operation.
+        ///
+        /// Parameters:
+        /// - `env: *const R`: supplies the allocator for the owning capture node.
+        /// - `capture: anytype`: value moved into that node.
+        /// - `callback: comptime fn (*const @TypeOf(capture), *const R, ?*const rt.Cancellation) outcomes.Exit(A, E)`: operation receiving the stored capture, environment, and active cancellation token.
+        /// Returns (`Self`): owning lazy effect. Call `deinit` exactly once;
+        /// a missing allocator or allocation failure becomes a defect.
         pub fn fromOwnedCancellable(
             env: *const R,
             capture: anytype,
@@ -372,6 +455,13 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         /// If cancellation or disposal prevents execution, its owner is
         /// released with the description. No allocator or I/O argument is
         /// duplicated outside the caller's R.
+        ///
+        /// Parameters:
+        /// - `env: *const R`: supplies the allocator for the owning outcome node.
+        /// - `supplied: outcomes.Exit(A, E)`: completed outcome moved into this
+        ///   description; the caller must not deinitialize its old copy.
+        /// Returns (`Self`): single-use owning effect. A second run produces
+        /// an invalid-configuration defect; deinitialize the description once.
         pub fn fromOwnedOutcome(env: *const R, supplied: outcomes.Exit(A, E)) Self {
             const Node = struct {
                 header: rt.DescriptionNode,
@@ -416,6 +506,13 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return .{ .value = .{ .borrowed = node }, .ready = Node.ready, .ownership = &node.header };
         }
 
+        /// Build an Effect that owns its successful payload.
+        /// Parameters:
+        /// - `env: *const R`: supplies the allocator for the owning outcome node.
+        /// - `value: A`: success payload moved into that node; do not deinitialize
+        ///   another copy after transfer.
+        /// Returns (`Self`): single-use effect yielding the owned success once;
+        /// deinitialize the description if it is never run.
         pub fn fromOwnedSuccess(env: *const R, value: A) Self {
             return fromOwnedOutcome(env, .{ .success = value });
         }
@@ -472,6 +569,12 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return .{ .value = .{ .borrowed = holder }, .ownership = &holder.header, .resolve = Holder.resolve, .start = Holder.start };
         }
 
+        /// Lift a pure `Result(A, E)` into an Effect.
+        /// Parameters:
+        /// - `value: outcomes.Result(A, E)`: pure result whose `.ok` or `.err`
+        ///   case becomes the corresponding `Exit` case on every run.
+        /// Returns (`Self`): lazy success or failure description. Owning
+        ///   payloads must instead be produced afresh by a factory.
         pub fn fromResult(value: outcomes.Result(A, E)) Self {
             return switch (value) {
                 .ok => |a| succeed(a),
@@ -479,6 +582,12 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             };
         }
 
+        /// Lift an optional value into success or a typed failure.
+        /// Parameters:
+        /// - `value: ?A`: present success value, or `null` for failure.
+        /// - `on_none: comptime fn () E`: callback invoked on each run only
+        ///   when `value` is absent, producing a fresh typed failure.
+        /// Returns (`Self`): lazy effect yielding the value or the mapped failure.
         pub fn fromOption(value: ?A, comptime on_none: fn () E) Self {
             if (value) |a| return succeed(a);
             return fromOutcome(struct {
@@ -489,6 +598,12 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         }
 
         /// A fresh typed outcome is produced at execution, never construction.
+        ///
+        /// Parameters:
+        /// - `callback: comptime fn (*const R) outcomes.Exit(A, E)`: factory
+        ///   called once per execution with the current environment.
+        /// Returns (`Self`): reusable description of a fresh typed outcome;
+        ///   ownership of each returned `Exit` belongs to that run.
         pub fn fromOutcome(comptime callback: fn (*const R) outcomes.Exit(A, E)) Self {
             return .{ .ready = struct {
                 fn ready(env: *const R, _: Value, _: *rt.State) outcomes.Exit(A, E) {
@@ -499,6 +614,14 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
 
         /// A native error union is mapped inside the Effect boundary. Native
         /// cancellation remains logical interruption after acknowledgement.
+        ///
+        /// Parameters:
+        /// - `callback: comptime anytype`: `fn (*const R) NativeError!A`
+        ///   operation called when this effect executes.
+        /// - `on_error: comptime anytype`: `fn (NativeError) E` mapping for
+        ///   native errors other than `error.Canceled`.
+        /// Returns (`Self`): lazy effect that yields success, typed failure,
+        ///   or interruption for `error.Canceled`; native errors do not escape.
         pub fn trySync(comptime callback: anytype, comptime on_error: anytype) Self {
             const Return = unaryResult(callback, *const R, .tryIo);
             if (@typeInfo(Return) != .error_union) @compileError(diagnostics.native_error_union);
@@ -515,6 +638,14 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.invoke);
         }
 
+        /// Map a native Zig error union into the Effect’s typed error channel.
+        /// Parameters:
+        /// - `callback: comptime anytype`: `fn (*const R) NativeError!A`
+        ///   operation using the `std.Io` supplied by `R`.
+        /// - `on_error: comptime anytype`: `fn (NativeError) E` mapping for
+        ///   native errors other than `error.Canceled`.
+        /// Returns (`Self`): lazy effect that contains native errors in `Exit`;
+        ///   `error.Canceled` becomes interruption.
         pub fn tryIo(comptime callback: anytype, comptime on_error: anytype) Self {
             const Return = unaryResult(callback, *const R, .tryIo);
             if (@typeInfo(Return) != .error_union)
@@ -540,6 +671,14 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.ready };
         }
 
+        /// Adapt a native operation and map its Zig errors to typed failures.
+        /// Parameters:
+        /// - `callback: comptime anytype`: `fn (*const R) NativeError!A`
+        ///   operation started through the native async adapter.
+        /// - `on_error: comptime anytype`: `fn (NativeError) E` mapping for
+        ///   native errors other than `error.Canceled`.
+        /// Returns (`Self`): lazy native effect whose result is an `Exit`,
+        ///   never a native error union at the run boundary.
         pub fn tryNative(comptime callback: anytype, comptime on_error: anytype) Self {
             const Return = unaryResult(callback, *const R, .tryIo);
             if (@typeInfo(Return) != .error_union) @compileError(diagnostics.native_error_union);
@@ -556,6 +695,12 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.invoke);
         }
 
+        /// Defer constructing a dependent Effect until execution.
+        /// Parameters:
+        /// - `callback: comptime anytype`: `fn (*const R) Self` factory checked
+        ///   at compilation and called for each execution.
+        /// Returns (`Self`): lazy description; each run constructs and then
+        ///   executes its own inner effect.
         pub fn deferEffect(comptime callback: anytype) Self {
             if (unaryResult(callback, *const R, .deferEffect) != Self)
                 @compileError(diagnostics.defer_result);
@@ -567,6 +712,13 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.start };
         }
 
+        /// Defer an Effect-producing callback over borrowed input.
+        /// Parameters:
+        /// - `Capture: comptime type`: type of the borrowed factory state.
+        /// - `capture: *const Capture`: caller-owned state kept alive through every run.
+        /// - `factory: comptime fn (*const Capture, *const R) Self`: callback
+        ///   that builds the inner effect from borrowed state at execution.
+        /// Returns (`Self`): lazy, reusable description borrowing `capture`.
         pub fn deferBorrowed(comptime Capture: type, capture: *const Capture, comptime factory: fn (*const Capture, *const R) Self) Self {
             return .{ .value = .{ .borrowed = capture }, .start = struct {
                 fn start(_: *rt.State, parent: *Job) rt.Step {
@@ -577,6 +729,12 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.start };
         }
 
+        /// Adapt an asynchronous operation with owned state into an Effect.
+        /// Parameters:
+        /// - `factory: comptime fn (*const R) asynchronous.Async(A, E).Start`: starts
+        ///   a fresh async operation from the current environment when reached.
+        /// Returns (`Self`): lazy effect that joins the operation and publishes
+        ///   its typed result, including cancellation and cleanup.
         pub fn fromAsync(comptime factory: fn (*const R) asynchronous.Async(A, E).Start) Self {
             return fromAsyncBorrowed(void, &{}, struct {
                 fn start(_: *const void, env: *const R) asynchronous.Async(A, E).Start {
@@ -585,6 +743,14 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.start);
         }
 
+        /// Adapt an asynchronous operation over borrowed state.
+        /// Parameters:
+        /// - `Capture: comptime type`: type of the borrowed operation state.
+        /// - `capture: *const Capture`: caller-owned state kept alive until the
+        ///   async operation has been joined and cleaned up.
+        /// - `factory: comptime fn (*const Capture, *const R) asynchronous.Async(A, E).Start`: starts a fresh operation using the capture and environment.
+        /// Returns (`Self`): lazy async effect that owns each started operation's
+        ///   join and cleanup, while only borrowing `capture`.
         pub fn fromAsyncBorrowed(comptime Capture: type, capture: *const Capture, comptime factory: fn (*const Capture, *const R) asynchronous.Async(A, E).Start) Self {
             const Async = asynchronous.Async(A, E);
             const Adapter = struct {
@@ -646,6 +812,12 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return .{ .value = .{ .borrowed = @ptrCast(capture) }, .start = Adapter.start };
         }
 
+        /// Wait for a typed Deferred to complete.
+        /// Parameters:
+        /// - `deferred: *primitives.Deferred(A, E)`: caller-owned one-shot result
+        ///   source that must outlive the wait.
+        /// Returns (`Self`): effect waiting for the deferred value or failure;
+        ///   cancellation interrupts the wait without consuming its owner.
         pub fn awaitDeferred(deferred: *primitives.Deferred(A, E)) Self {
             return fromNativeCancellableBorrowed(primitives.Deferred(A, E), deferred, struct {
                 fn wait(value: *const primitives.Deferred(A, E), _: *const R, token: ?*const rt.Cancellation) outcomes.Exit(A, E) {
@@ -654,6 +826,10 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.wait);
         }
 
+        /// Wait for and take a value from a typed Queue.
+        /// Parameters:
+        /// - `queue: *primitives.Queue(A)`: Queue capability used for this operation.
+        /// Returns (`Effect(A, primitives.QueueError, R)`): a cancellable queue wait yielding one `A`, or a typed queue shutdown failure.
         pub fn takeQueue(queue: *primitives.Queue(A)) Effect(A, primitives.QueueError, R) {
             return Effect(A, primitives.QueueError, R).fromNativeCancellableBorrowed(primitives.Queue(A), queue, struct {
                 fn take(value: *const primitives.Queue(A), _: *const R, token: ?*const rt.Cancellation) outcomes.Exit(A, primitives.QueueError) {
@@ -662,6 +838,12 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.take);
         }
 
+        /// Start a structured child Fiber within the current scope.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `scope: *scopes.Scope(E)`: Scope that owns the operation and its registered finalizers.
+        /// Returns (`Effect(*Fiber(A, E), E, R)`): a scoped child fiber pointer; the scope owns and drains that child.
         pub fn fork(comptime self: Self, scope: *scopes.Scope(E)) Effect(*Fiber(A, E), E, R) {
             const Acquire = Effect(*Fiber(A, E), E, R);
             const Adapter = struct {
@@ -681,6 +863,11 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return acquisition.scopeAcquire(scope, Adapter.release);
         }
 
+        /// Join a Fiber and propagate its typed outcome.
+        /// Parameters:
+        /// - `fiber: *Fiber(A, E)`: scope-owned child kept alive through the join.
+        /// Returns (`Self`): effect that waits for a separate observation of the
+        ///   child's `Exit` and propagates it through this effect's channels.
         pub fn joinFiber(fiber: *Fiber(A, E)) Self {
             return fromNativeCancellableBorrowed(Fiber(A, E), fiber, struct {
                 fn wait(value: *const Fiber(A, E), _: *const R, token: ?*const rt.Cancellation) outcomes.Exit(A, E) {
@@ -692,6 +879,10 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.wait);
         }
 
+        /// Observe a Fiber’s full Exit without collapsing its channels.
+        /// Parameters:
+        /// - `fiber: *Fiber(A, E)`: Running child fiber whose lifecycle is controlled here.
+        /// Returns (`Effect(outcomes.Exit(A, E), E, R)`): A lazy Effect; running it with its declared environment yields a typed Exit.
         pub fn awaitFiberExit(fiber: *Fiber(A, E)) Effect(outcomes.Exit(A, E), E, R) {
             return Effect(outcomes.Exit(A, E), E, R).fromNativeCancellableBorrowed(Fiber(A, E), fiber, struct {
                 fn wait(value: *const Fiber(A, E), _: *const R, token: ?*const rt.Cancellation) outcomes.Exit(outcomes.Exit(A, E), E) {
@@ -708,6 +899,10 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.wait);
         }
 
+        /// Request interruption of a Fiber and wait for cleanup.
+        /// Parameters:
+        /// - `fiber: *Fiber(A, E)`: Running child fiber whose lifecycle is controlled here.
+        /// Returns (`Effect(outcomes.Exit(A, E), E, R)`): A lazy Effect; running it with its declared environment yields a typed Exit.
         pub fn interruptFiber(fiber: *Fiber(A, E)) Effect(outcomes.Exit(A, E), E, R) {
             const Out = Effect(outcomes.Exit(A, E), E, R);
             return Out.fromNativeCancellableBorrowed(Fiber(A, E), fiber, struct {
@@ -869,6 +1064,13 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return frame.child.step();
         }
 
+        /// Sequence a dependent description produced from the previous success.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `next: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`continuationResult(next, A, R, .flatMap)`): A composed description whose evaluation remains deferred.
         pub fn flatMap(comptime self: Self, comptime next: anytype) continuationResult(next, A, R, .flatMap) {
             const Out = continuationResult(next, A, R, .flatMap);
             comptime requireEffect(Out, E, R, .flatMap);
@@ -890,6 +1092,14 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         /// through the supplied R. On construction failure it still consumes
         /// and releases the source, and returns a lazy defect description.
         /// The returned owning description must be moved and deinitialized once.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `next: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`continuationResult(next, A, R, .flatMapOwned)`): The typed Effect returned by the compile-time continuation or binding.
         pub fn flatMapOwned(self: *Self, env: *const R, comptime next: anytype) continuationResult(next, A, R, .flatMapOwned) {
             const Out = continuationResult(next, A, R, .flatMapOwned);
             comptime requireEffect(Out, E, R, .flatMapOwned);
@@ -911,6 +1121,16 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         /// `next` may inspect the capture while constructing its returned
         /// Effect; any data needed after that return must be copied into the
         /// new description. The capture is released exactly once.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `B: comptime type`: Success value type after this operation transforms the original value.
+        /// - `capture: anytype`: Statically inferred input checked when this operation is instantiated.
+        /// - `next: comptime fn (*const @TypeOf(capture), A, *const R) Effect(B, E, R)`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Effect(B, E, R)`): a dependent effect that owns its runtime capture until the continuation completes.
         pub fn flatMapCapturedOwned(
             self: *Self,
             env: *const R,
@@ -1092,6 +1312,10 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
 
         /// Frees owned description storage, not application success/error data.
         /// Borrowed/static descriptions require no allocation cleanup.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             rt.DescriptionNode.deinit(self.ownership);
             self.* = undefined;
@@ -1099,6 +1323,10 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
 
         /// Borrows an existing description without transferring its storage.
         /// The owner must outlive execution and joined cleanup of this value.
+        ///
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`Self`): a non-owning view of this description; keep the original owner alive through execution.
         pub fn borrow(self: *const Self) Self {
             var borrowed = self.*;
             borrowed.ownership = null;
@@ -1111,6 +1339,13 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return terminalExit(outcomes.castFailure(A, value));
         }
 
+        /// Transform the success value while preserving the surrounding contract.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `transform: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Effect(unaryResult(transform, A, .map), E, R)`): an effect whose successful `A` is transformed while `E` and `R` stay unchanged.
         pub fn map(comptime self: Self, comptime transform: anytype) Effect(unaryResult(transform, A, .map), E, R) {
             const B = unaryResult(transform, A, .map);
             const Out = Effect(B, E, R);
@@ -1141,6 +1376,14 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         /// Consumes a runtime-built description while retaining the same
         /// typed environment and error. The mapped value is transferred to
         /// an owning continuation only when execution reaches this step.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `transform: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Effect(unaryResult(transform, A, .map), E, R)`): an effect that moves this owning description and transforms its success without losing cleanup.
         pub fn mapOwned(self: *Self, env: *const R, comptime transform: anytype) Effect(unaryResult(transform, A, .map), E, R) {
             const B = unaryResult(transform, A, .map);
             const Out = Effect(B, E, R);
@@ -1151,6 +1394,13 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.next);
         }
 
+        /// Transform the typed error channel.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `transform: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Effect(A, unaryResult(transform, E, .mapError), R)`): an effect with transformed typed failures; defects and interruption pass through.
         pub fn mapError(comptime self: Self, comptime transform: anytype) Effect(A, unaryResult(transform, E, .mapError), R) {
             const F = unaryResult(transform, E, .mapError);
             const Out = Effect(A, F, R);
@@ -1163,6 +1413,14 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
 
         /// Maps a runtime-built owning description without discarding its
         /// capture or requiring that its value be known at comptime.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `transform: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Effect(A, unaryResult(transform, E, .mapError), R)`): an effect that moves this owning description and transforms `E` without losing cleanup.
         pub fn mapErrorOwned(self: *Self, env: *const R, comptime transform: anytype) Effect(A, unaryResult(transform, E, .mapError), R) {
             const F = unaryResult(transform, E, .mapError);
             const Out = Effect(A, F, R);
@@ -1181,6 +1439,11 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return stored.terminal;
         }
 
+        /// Represent typed success and failure as a value in the success channel.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// Returns (`Effect(outcomes.Result(A, E), E, R)`): A lazy Effect; running it with its declared environment yields a typed Exit.
         pub fn either(comptime self: Self) Effect(outcomes.Result(A, E), E, R) {
             const Out = Effect(outcomes.Result(A, E), E, R);
             return self.bindExit(Out, struct {
@@ -1194,6 +1457,11 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.handle);
         }
 
+        /// Represent the typed success/failure Result as a successful Effect value.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// Returns (`Effect(outcomes.Result(A, E), E, R)`): A lazy Effect; running it with its declared environment yields a typed Exit.
         pub fn result(comptime self: Self) Effect(outcomes.Result(A, E), E, R) {
             return self.either();
         }
@@ -1201,6 +1469,11 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         /// Reify the entire terminal outcome as an owning success value.
         /// Domain failure, interruption, defect and failed cleanup remain
         /// distinct; callers can observe them without an error-union catch.
+        ///
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// Returns (`Effect(outcomes.Exit(A, E), E, R)`): A lazy Effect; running it with its declared environment yields a typed Exit.
         pub fn exit(comptime self: Self) Effect(outcomes.Exit(A, E), E, R) {
             const Out = Effect(outcomes.Exit(A, E), E, R);
             return self.bindExit(Out, struct {
@@ -1213,6 +1486,12 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         /// Reifies a runtime-built description's full Exit. This consumes
         /// the description exactly once; its owner remains with the returned
         /// Effect until execution or disposal.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Effect(outcomes.Exit(A, E), E, R)`): A lazy Effect; running it with its declared environment yields a typed Exit.
         pub fn exitOwned(self: *Self, env: *const R) Effect(outcomes.Exit(A, E), E, R) {
             const Out = Effect(outcomes.Exit(A, E), E, R);
             return self.bindExitOwned(env, Out, struct {
@@ -1225,6 +1504,12 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         /// Reifies every terminal path, including typed failure and cleanup,
         /// into an owned Exit value. The resulting Effect has no domain-error
         /// value because the original error is inside that Exit.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Effect(outcomes.Exit(A, E), void, R)`): A lazy Effect; running it with its declared environment yields a typed Exit.
         pub fn materializeOwned(self: *Self, env: *const R) Effect(outcomes.Exit(A, E), void, R) {
             const Out = Effect(outcomes.Exit(A, E), void, R);
             return self.bindExitOwned(env, Out, struct {
@@ -1234,6 +1519,11 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.handle, null);
         }
 
+        /// Turn a typed failure into absence while preserving defects and interruption.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// Returns (`Effect(?A, E, R)`): an effect yielding `?A`, with typed failure mapped to `null` and other terminal channels preserved.
         pub fn option(comptime self: Self) Effect(?A, E, R) {
             const Out = Effect(?A, E, R);
             return self.bindExit(Out, struct {
@@ -1251,6 +1541,13 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.handle);
         }
 
+        /// Expose terminal failure information for explicit recovery.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `on_defect: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Self`): an effect that exposes defect information to the supplied recovery callback while preserving the typed channels.
         pub fn sandbox(comptime self: Self, comptime on_defect: anytype) Self {
             if (unaryResult(on_defect, outcomes.Defect, .sandbox) != E)
                 @compileError(diagnostics.sandbox_mapper_must_return_the_declared_effect_error_type);
@@ -1264,6 +1561,13 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.handle);
         }
 
+        /// Combine independent descriptions into a typed pair.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `right: comptime anytype`: Compile-time statically inferred input checked when this operation is
+        ///   instantiated.
+        /// Returns (`Effect(outcomes.Pair(A, @TypeOf(right).Success), E, R)`): a pair of successful results after both descriptions run under the same `E` and `R`.
         pub fn zip(comptime self: Self, comptime right: anytype) Effect(outcomes.Pair(A, @TypeOf(right).Success), E, R) {
             const Right = @TypeOf(right);
             comptime requireEffect(Right, E, R, .zip);
@@ -1344,6 +1648,11 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return .{ .resolve = Adapter.resolve, .ready = if (self.ready != null and right.ready != null) Adapter.ready else null, .start = Adapter.start };
         }
 
+        /// Protect this Effect’s execution from interruption.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// Returns (`Self`): this effect with interruption masked for its execution; cleanup and outside cancellation still follow scope rules.
         pub fn uninterruptible(comptime self: Self) Self {
             const Adapter = struct {
                 fn resolve(env: *const R, _: Value) rt.Services {
@@ -1396,6 +1705,12 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return .{ .resolve = Adapter.resolve, .ready = if (self.ready != null) Adapter.ready else null, .start = Adapter.start };
         }
 
+        /// Run the supplied finalizer when this Effect is interrupted.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `finalizer: comptime Effect(void, E, R)`: Typed cleanup Effect run when the scope closes.
+        /// Returns (`Self`): this effect with the finalizer registered for its interruption path.
         pub fn onInterrupt(comptime self: Self, comptime finalizer: Effect(void, E, R)) Self {
             const Unit = Effect(void, E, R);
             return (comptime Unit.succeed({})).acquireRelease(struct {
@@ -1412,6 +1727,10 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         /// Borrows the descriptions until execution and cleanup have finished.
         /// Returned array storage is owned; elements keep their declared
         /// ownership. Use scoped acquisitions for resources in a traversal.
+        ///
+        /// Parameters:
+        /// - `effects: []const Self`: Effect descriptions to compose in order.
+        /// Returns (`Effect(outcomes.OwnedSlice(A), E, R)`): ordered owned array of successful `A` values; the borrowed input descriptions outlive execution.
         pub fn all(effects: []const Self) Effect(outcomes.OwnedSlice(A), E, R) {
             return traverse(Self, effects, struct {
                 fn identity(program: Self) Self {
@@ -1420,10 +1739,24 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.identity);
         }
 
+        /// Traverse inputs in order, collecting typed successful values.
+        /// Parameters:
+        /// - `Input: comptime type`: Input environment or value type consumed by this composition.
+        /// - `values: []const Input`: Input collection; its elements are processed in the documented order.
+        /// - `transform: comptime fn (Input) Self`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Effect(outcomes.OwnedSlice(A), E, R)`): ordered owned array of results produced by traversing `values` sequentially.
         pub fn forEach(comptime Input: type, values: []const Input, comptime transform: fn (Input) Self) Effect(outcomes.OwnedSlice(A), E, R) {
             return traverse(Input, values, transform);
         }
 
+        /// Traverse inputs in order while discarding successful values.
+        /// Parameters:
+        /// - `Input: comptime type`: Input environment or value type consumed by this composition.
+        /// - `values: []const Input`: Input collection; its elements are processed in the documented order.
+        /// - `transform: comptime fn (Input) Effect(void, E, R)`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Effect(void, E, R)`): unit-valued traversal that runs every input effect in order and preserves failures.
         pub fn forEachDiscard(comptime Input: type, values: []const Input, comptime transform: fn (Input) Effect(void, E, R)) Effect(void, E, R) {
             const Unit = Effect(void, E, R);
             const Adapter = struct {
@@ -1469,6 +1802,11 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return .{ .value = .{ .sequence = .{ .items = @ptrCast(values.ptr), .len = values.len } }, .start = Adapter.start };
         }
 
+        /// Schedule the operation on the caller’s CPU-capable executor.
+        /// Parameters:
+        /// - `callback: comptime fn (*const R, *const rt.Cancellation) outcomes.Exit(A, E)`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Self`): lazy work submitted to the CPU-capable provider selected by `R`.
         pub fn onCpu(comptime callback: fn (*const R, *const rt.Cancellation) outcomes.Exit(A, E)) Self {
             const program: Self = .{ .ready = struct {
                 fn ready(env: *const R, _: Value, state: *rt.State) outcomes.Exit(A, E) {
@@ -1478,6 +1816,11 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return program.dispatch(.cpu);
         }
 
+        /// Schedule the operation on the caller’s blocking-capable executor.
+        /// Parameters:
+        /// - `callback: comptime fn (*const R, *const rt.Cancellation) outcomes.Exit(A, E)`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Self`): lazy work submitted to the blocking-capable provider selected by `R`.
         pub fn onBlocking(comptime callback: fn (*const R, *const rt.Cancellation) outcomes.Exit(A, E)) Self {
             const program: Self = .{ .ready = struct {
                 fn ready(env: *const R, _: Value, state: *rt.State) outcomes.Exit(A, E) {
@@ -1489,10 +1832,24 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
 
         /// Runtime captures stay borrowed until the selected engine's work has
         /// joined. Only callback/type metadata is part of specialization.
+        ///
+        /// Parameters:
+        /// - `Capture: comptime type`: Compile-time captured state type retained by the composed operation.
+        /// - `capture: *const Capture`: Operation-specific state retained until the callback completes.
+        /// - `callback: comptime fn (*const Capture, *const R, *const rt.Cancellation) outcomes.Exit(A, E)`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Self`): CPU-dispatched work borrowing `capture` until its provider job joins.
         pub fn onCpuBorrowed(comptime Capture: type, capture: *const Capture, comptime callback: fn (*const Capture, *const R, *const rt.Cancellation) outcomes.Exit(A, E)) Self {
             return onEngineBorrowed(Capture, capture, callback, .cpu);
         }
 
+        /// Schedule borrowed work on the caller’s blocking executor.
+        /// Parameters:
+        /// - `Capture: comptime type`: Compile-time captured state type retained by the composed operation.
+        /// - `capture: *const Capture`: Operation-specific state retained until the callback completes.
+        /// - `callback: comptime fn (*const Capture, *const R, *const rt.Cancellation) outcomes.Exit(A, E)`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Self`): blocking-dispatched work borrowing `capture` until its provider job joins.
         pub fn onBlockingBorrowed(comptime Capture: type, capture: *const Capture, comptime callback: fn (*const Capture, *const R, *const rt.Cancellation) outcomes.Exit(A, E)) Self {
             return onEngineBorrowed(Capture, capture, callback, .blocking);
         }
@@ -1519,6 +1876,12 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return @field(env, @tagName(field));
         }
 
+        /// Route an incoming request to its typed handler.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `kind: comptime execution.Kind`: Typed operation or execution kind selecting behavior.
+        /// Returns (`Self`): this effect routed to the selected execution lane when run.
         pub fn dispatch(comptime self: Self, comptime kind: execution.Kind) Self {
             return self.dispatchValue(self.value, kind);
         }
@@ -1595,6 +1958,12 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return .{ .value = value, .resolve = Adapter.resolve, .start = Adapter.start };
         }
 
+        /// Run alternatives concurrently and use the first completed outcome.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `right: comptime Self`: Right-hand typed description in this composition.
+        /// Returns (`Self`): A composed description of the same specialized API; evaluation remains deferred.
         pub fn race(comptime self: Self, comptime right: Self) Self {
             const Adapter = struct {
                 const Side = enum { left, right };
@@ -1736,6 +2105,14 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return .{ .resolve = Adapter.resolve, .start = Adapter.start };
         }
 
+        /// Bound this Effect by a caller-selected duration.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `delay: comptime std.Io.Duration`: Duration selected for the deferred operation.
+        /// - `on_timeout: comptime fn () E`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Self`): an effect whose overdue branch produces `on_timeout()` as typed failure after losing work is cancelled and joined.
         pub fn timeout(comptime self: Self, comptime delay: std.Io.Duration, comptime on_timeout: fn () E) Self {
             const Unit = Effect(void, E, R);
             if (delay.nanoseconds < 0) return die(.{ .kind = .invalid_configuration, .message = diagnostics.timeout_duration_must_be_non_negative });
@@ -1752,6 +2129,15 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return self.race(timer);
         }
 
+        /// Bound this Effect by a duration selected from `R`.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `select_delay: comptime fn (*const R) std.Io.Duration`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// - `on_timeout: comptime fn () E`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Self`): an effect using the environment-selected duration; overdue work is cancelled and joined before publication.
         pub fn timeoutFrom(comptime self: Self, comptime select_delay: fn (*const R) std.Io.Duration, comptime on_timeout: fn () E) Self {
             const Adapter = struct {
                 fn expired(_: *const void, env: *const R) outcomes.Exit(A, E) {
@@ -1775,6 +2161,11 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return deferEffect(Adapter.factory);
         }
 
+        /// Run a collection of Effects with the selected concurrency limit.
+        /// Parameters:
+        /// - `concurrency: usize`: Maximum number of operations permitted to run at once.
+        /// - `effects: []const Self`: Effect descriptions to compose in order.
+        /// Returns (`Effect(outcomes.OwnedSlice(A), E, R)`): ordered owned array after at most `concurrency` effects run at once; admitted work is drained on failure.
         pub fn allConcurrent(concurrency: usize, effects: []const Self) Effect(outcomes.OwnedSlice(A), E, R) {
             return traverseConcurrent(Self, effects, concurrency, struct {
                 fn identity(program: Self) Self {
@@ -1783,6 +2174,14 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.identity);
         }
 
+        /// Traverse inputs concurrently with a caller-selected limit.
+        /// Parameters:
+        /// - `Input: comptime type`: Input environment or value type consumed by this composition.
+        /// - `concurrency: usize`: Maximum number of operations permitted to run at once.
+        /// - `values: []const Input`: Input collection; its elements are processed in the documented order.
+        /// - `transform: comptime fn (Input) Self`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Effect(outcomes.OwnedSlice(A), E, R)`): ordered owned array after bounded concurrent traversal; admitted work is drained on failure.
         pub fn forEachConcurrent(comptime Input: type, concurrency: usize, values: []const Input, comptime transform: fn (Input) Self) Effect(outcomes.OwnedSlice(A), E, R) {
             return traverseConcurrent(Input, values, concurrency, transform);
         }
@@ -2036,6 +2435,13 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return .{ .value = .{ .sequence = .{ .items = @ptrCast(values.ptr), .len = values.len } }, .start = Adapter.start };
         }
 
+        /// Recover from typed `E` failures using another Effect.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `recover: comptime anytype`: Compile-time statically inferred input checked when this operation is
+        ///   instantiated.
+        /// Returns (`Self`): an effect that runs `recover` for `.fail` outcomes and leaves other channels separate.
         pub fn catchAll(comptime self: Self, comptime recover: anytype) Self {
             if (unaryResult(recover, E, .catchAll) != Self)
                 @compileError(diagnostics.recovery_result);
@@ -2054,6 +2460,14 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.handle);
         }
 
+        /// Acquire and register a resource in the current scope.
+        /// Parameters:
+        /// - `acquisition_description: comptime Self`: Compile-time the acquisition description input required by
+        ///   this typed operation.
+        /// - `scope: *scopes.Scope(E)`: Scope that owns the operation and its registered finalizers.
+        /// - `release: comptime fn (A) Effect(void, E, R)`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Self`): an effect that registers a successful acquisition with `scope` and releases it at scope close.
         pub fn scopeAcquire(comptime acquisition_description: Self, scope: *scopes.Scope(E), comptime release: fn (A) Effect(void, E, R)) Self {
             return scopeAcquisition(struct {
                 const description: Self = acquisition_description;
@@ -2209,6 +2623,10 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return .{ .value = stored, .resolve = Adapter.resolve, .start = Adapter.start };
         }
 
+        /// Close a scope and observe its finalizer outcomes.
+        /// Parameters:
+        /// - `scope: *scopes.Scope(E)`: Scope that owns the operation and its registered finalizers.
+        /// Returns (`Effect(void, E, R)`): unit-valued effect that closes `scope` and publishes finalizer failures.
         pub fn closeScope(scope: *scopes.Scope(E)) Effect(void, E, R) {
             return scopeCloser(scope, false);
         }
@@ -2244,6 +2662,11 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return .{ .value = .{ .borrowed = scope }, .start = Adapter.start };
         }
 
+        /// Run an Effect within a scope that closes when work completes.
+        /// Parameters:
+        /// - `use_scope: comptime fn (*scopes.Scope(E)) Self`: Compile-time typed function selected at comptime; no runtime callback
+        ///   lookup is required.
+        /// Returns (`Self`): a scoped effect that closes the supplied scope after execution.
         pub fn scoped(comptime use_scope: fn (*scopes.Scope(E)) Self) Self {
             const Acquire = Effect(*scopes.Scope(E), E, R);
             const Factory = struct {
@@ -2261,6 +2684,10 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return (comptime Acquire.fromOutcome(Factory.create)).acquireRelease(use_scope, Factory.release);
         }
 
+        /// Describe a cancellable delay through the environment’s I/O capability.
+        /// Parameters:
+        /// - `delay: std.Io.Duration`: Requested duration before the next scheduled action.
+        /// Returns (`Effect(void, E, R)`): unit-valued delay using `R.io`; cancellation interrupts the wait.
         pub fn sleep(delay: std.Io.Duration) Effect(void, E, R) {
             const Unit = Effect(void, E, R);
             const Adapter = struct {
@@ -2338,6 +2765,12 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return .{ .value = .{ .duration = delay }, .start = Adapter.start };
         }
 
+        /// Emit a log record through the environment’s Logger.
+        /// Parameters:
+        /// - `level: comptime providers.LogLevel`: Log severity used to filter this record.
+        /// - `message: comptime []const u8`: Compile-time borrowed input; keep its owner alive until the operation has
+        ///   copied or joined it.
+        /// Returns (`Effect(void, E, R)`): unit-valued logging effect using the logger selected from `R`.
         pub fn log(comptime level: providers.LogLevel, comptime message: []const u8) Effect(void, E, R) {
             const Unit = Effect(void, E, R);
             if (R == void or !@hasField(R, "logger") or @FieldType(R, "logger") != providers.Logger)
@@ -2350,6 +2783,12 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.ready };
         }
 
+        /// Emit a log record selected from the current environment.
+        /// Parameters:
+        /// - `level: comptime providers.LogLevel`: Log severity used to filter this record.
+        /// - `message: comptime fn (*const R) []const u8`: Compile-time typed input value; move or clone owning payloads according to
+        ///   its type contract.
+        /// Returns (`Effect(void, E, R)`): unit-valued logging effect whose message is selected from `R` at execution.
         pub fn logFrom(comptime level: providers.LogLevel, comptime message: fn (*const R) []const u8) Effect(void, E, R) {
             const Unit = Effect(void, E, R);
             if (@FieldType(R, "logger") != providers.Logger) @compileError(diagnostics.r_logger_must_be_effect_logger);
@@ -2367,6 +2806,13 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return null;
         }
 
+        /// Run the Effect inside a traced span.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `name: comptime []const u8`: Compile-time stable, nonempty identity component validated at definition
+        ///   time.
+        /// Returns (`Self`): this effect executed within a span named `name`, with span closure on every outcome.
         pub fn withSpan(comptime self: Self, comptime name: []const u8) Self {
             return self.withSpanFrom(struct {
                 fn select(_: *const R) []const u8 {
@@ -2375,6 +2821,13 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.select);
         }
 
+        /// Run the Effect inside a span selected from the environment.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `select_name: comptime fn (*const R) []const u8`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// Returns (`Self`): this effect executed within an environment-selected span, closed on every outcome.
         pub fn withSpanFrom(comptime self: Self, comptime select_name: fn (*const R) []const u8) Self {
             if (R == void or !@hasField(R, "tracer") or @FieldType(R, "tracer") != providers.Tracer)
                 @compileError(diagnostics.tracing_requires_environment_tracer_effect_tracer);
@@ -2435,6 +2888,12 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return .{ .resolve = Adapter.resolve, .ready = if (self.ready != null) Adapter.ready else null, .start = Adapter.start };
         }
 
+        /// Attach typed annotations to this Effect’s diagnostics or trace.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `annotations: []const providers.Annotation`: Metadata attached to the operation or diagnostic.
+        /// Returns (`Self`): A composed description of the same specialized API; evaluation remains deferred.
         pub fn annotate(comptime self: Self, annotations: []const providers.Annotation) Self {
             const Adapter = struct {
                 const Frame = struct {
@@ -2504,6 +2963,13 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             };
         }
 
+        /// Retry according to the declared policy.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `policy: comptime anytype`: Compile-time caller-selected, validated behavior or resource bounds; no
+        ///   hidden default is installed.
+        /// Returns (`Self`): this effect repeated after typed failures according to `policy`.
         pub fn retry(comptime self: Self, comptime policy: anytype) Self {
             return self.iterate(false, struct {
                 fn select(_: *const R) @TypeOf(policy) {
@@ -2512,6 +2978,13 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.select);
         }
 
+        /// Repeat successful execution according to a Schedule.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `policy: comptime anytype`: Compile-time caller-selected, validated behavior or resource bounds; no
+        ///   hidden default is installed.
+        /// Returns (`Self`): A composed description of the same specialized API; evaluation remains deferred.
         pub fn repeat(comptime self: Self, comptime policy: anytype) Self {
             return self.iterate(true, struct {
                 fn select(_: *const R) @TypeOf(policy) {
@@ -2520,9 +2993,23 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.select);
         }
 
+        /// Retry typed failure using a Schedule selected from `R`.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `policy: comptime anytype`: Compile-time caller-selected, validated behavior or resource bounds; no
+        ///   hidden default is installed.
+        /// Returns (`Self`): this effect retried after typed failures using a schedule selected from `R`.
         pub fn retryFrom(comptime self: Self, comptime policy: anytype) Self {
             return self.iterate(false, policy);
         }
+        /// Repeat using a Schedule selected from `R`.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `policy: comptime anytype`: Compile-time caller-selected, validated behavior or resource bounds; no
+        ///   hidden default is installed.
+        /// Returns (`Self`): this effect repeated after successful results using a schedule selected from `R`.
         pub fn repeatFrom(comptime self: Self, comptime policy: anytype) Self {
             return self.iterate(true, policy);
         }
@@ -2618,6 +3105,15 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return .{ .resolve = Adapter.resolve, .start = Adapter.start };
         }
 
+        /// Compose acquisition, use, and release under a scope.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `use: comptime anytype`: Compile-time statically inferred input checked when this operation is
+        ///   instantiated.
+        /// - `release: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`continuationResult(use, A, R, .acquireRelease_body)`): The typed Effect returned by the compile-time continuation or binding.
         pub fn acquireRelease(comptime self: Self, comptime use: anytype, comptime release: anytype) continuationResult(use, A, R, .acquireRelease_body) {
             const Out = continuationResult(use, A, R, .acquireRelease_body);
             if (self.resolve == null and (R == void or !@hasField(R, @tagName(rt.EnvironmentField.allocator))))
@@ -2631,6 +3127,16 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
 
         /// Consumes a runtime-owned acquisition while retaining the same
         /// bracket semantics and cleanup ordering as `acquireRelease`.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `use: comptime anytype`: Compile-time statically inferred input checked when this operation is
+        ///   instantiated.
+        /// - `release: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`continuationResult(use, A, R, .acquireRelease_body)`): The typed Effect returned by the compile-time continuation or binding.
         pub fn acquireReleaseOwned(self: *Self, env: *const R, comptime use: anytype, comptime release: anytype) continuationResult(use, A, R, .acquireRelease_body) {
             const Out = continuationResult(use, A, R, .acquireRelease_body);
             if (R == void or !@hasField(R, @tagName(rt.EnvironmentField.allocator)))
@@ -2834,6 +3340,13 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             };
         }
 
+        /// Supply the Effect’s required environment through a Layer.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Effect(A, E, void)`): effect with its `R` supplied, leaving no environment requirement at its run boundary.
         pub fn provide(comptime self: Self, env: *const R) Effect(A, E, void) {
             const Out = Effect(A, E, void);
             const Adapter = struct {
@@ -2846,6 +3359,14 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return provided;
         }
 
+        /// Project the required environment from a larger one.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `Large: comptime type`: Compile-time outer environment from which a smaller service view is projected.
+        /// - `project: comptime anytype`: Compile-time statically inferred input checked when this operation is
+        ///   instantiated.
+        /// Returns (`Effect(A, E, Large)`): effect requiring `Large`, projected to the original `R` at execution.
         pub fn provideSome(comptime self: Self, comptime Large: type, comptime project: anytype) Effect(A, E, Large) {
             if (unaryResult(project, *const Large, .provideSome) != *const R)
                 @compileError(diagnostics.projection_contract);
@@ -2861,6 +3382,13 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         /// supplied source environment must remain alive until the returned
         /// Effect has joined or been disposed; callers can retain it in an
         /// owning continuation capture.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `source_env: *const R`: Borrowed source environment supplying the projected service.
+        /// - `Large: comptime type`: Compile-time outer environment from which a smaller service view is projected.
+        /// - `outer_env: *const Large`: Borrowed outer environment from which services are projected.
+        /// Returns (`Effect(A, E, Large)`): effect that moves this owning description into a larger caller environment.
         pub fn provideOwned(self: *Self, source_env: *const R, comptime Large: type, outer_env: *const Large) Effect(A, E, Large) {
             const Out = Effect(A, E, Large);
             const Node = struct {
@@ -2972,17 +3500,41 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
     };
 }
 
+/// Typed sequencing syntax for Effects with one expected-error and environment
+/// type. Its comptime continuations preserve both channels without dynamic
+/// registration or a second interpreter.
+///
+/// Parameters:
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): a comptime sequencing API whose bindings keep one `E` and `R` while success types change.
 pub fn EffectBuilder(comptime E: type, comptime R: type) type {
     return struct {
         const Unit = Effect(void, E, R);
+        /// Construct a successful description.
+        /// Parameters:
+        /// - `value: anytype`: success value captured in a reusable lazy description.
+        /// Returns (`Effect(@TypeOf(value), E, R)`): effect yielding the supplied success value with error `E` and environment `R`.
         pub fn succeed(value: anytype) Effect(@TypeOf(value), E, R) {
             return Effect(@TypeOf(value), E, R).succeed(value);
         }
 
+        /// Construct a typed failure description.
+        /// Parameters:
+        /// - `A: comptime type`: Value type produced by a successful computation.
+        /// - `err: E`: Failure to propagate or transform.
+        /// Returns (`Effect(A, E, R)`): effect yielding typed failure `E` with the selected success type `A`.
         pub fn fail(comptime A: type, err: E) Effect(A, E, R) {
             return Effect(A, E, R).fail(err);
         }
 
+        /// Sequence a continuation in the effect builder.
+        /// Parameters:
+        /// - `program: comptime anytype`: Compile-time statically inferred input checked when this operation is
+        ///   instantiated.
+        /// - `next: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`BindingResult(@TypeOf(program), next)`): The typed Effect returned by the compile-time continuation or binding.
         pub fn bind(comptime program: anytype, comptime next: anytype) BindingResult(@TypeOf(program), next) {
             if (comptime @hasDecl(@TypeOf(program), "Resource")) {
                 const A = @TypeOf(program).Resource;
@@ -3010,21 +3562,38 @@ pub fn EffectBuilder(comptime E: type, comptime R: type) type {
             return continuationResult(next, Binding.Success, R, .EffectBuilder_bind);
         }
 
+        /// Describe a successful no-op Effect.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn zero() Unit {
             return Unit.succeed({});
         }
 
+        /// Lift an existing description into the builder.
+        /// Parameters:
+        /// - `program: anytype`: Statically inferred input checked when this operation is instantiated.
+        /// Returns (`@TypeOf(program)`): The value or description with the exact type inferred from the supplied input.
         pub fn returnFrom(program: anytype) @TypeOf(program) {
             comptime requireEffect(@TypeOf(program), E, R, .EffectBuilder_bind);
             return program;
         }
 
+        /// Defer construction until execution.
+        /// Parameters:
+        /// - `factory: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`unaryResult(factory, *const R, .deferEffect)`): The typed Effect returned by the compile-time continuation or binding.
         pub fn delay(comptime factory: anytype) unaryResult(factory, *const R, .deferEffect) {
             const Out = unaryResult(factory, *const R, .deferEffect);
             comptime requireEffect(Out, E, R, .deferEffect);
             return Out.deferEffect(factory);
         }
 
+        /// Sequence two descriptions in order.
+        /// Parameters:
+        /// - `first: comptime Unit`: First typed description, executed or evaluated before the next.
+        /// - `second: comptime anytype`: Compile-time statically inferred input checked when this operation is
+        ///   instantiated.
+        /// Returns (`@TypeOf(second)`): The value or description with the exact type inferred from the supplied input.
         pub fn combine(comptime first: Unit, comptime second: anytype) @TypeOf(second) {
             comptime requireEffect(@TypeOf(second), E, R, .EffectBuilder_bind);
             return first.flatMap(struct {
@@ -3034,6 +3603,13 @@ pub fn EffectBuilder(comptime E: type, comptime R: type) type {
             }.next);
         }
 
+        /// Compose a typed loop from a condition and body.
+        /// Parameters:
+        /// - `guard: comptime fn (*const R) bool`: Compile-time typed function selected at comptime; no runtime callback lookup
+        ///   is required.
+        /// - `body: comptime Unit`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn whileLoop(comptime guard: fn (*const R) bool, comptime body: Unit) Unit {
             const Loop = struct {
                 fn factory(env: *const R) Unit {
@@ -3051,13 +3627,31 @@ pub fn EffectBuilder(comptime E: type, comptime R: type) type {
             return Unit.deferEffect(Loop.factory);
         }
 
+        /// Pass an Effect through builder sequencing.
+        /// Parameters:
+        /// - `program: comptime Unit`: Lazy typed program to sequence, run, or transform.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn yieldEffect(comptime program: Unit) Unit {
             return program;
         }
+        /// Sequence a body Effect for each input value.
+        /// Parameters:
+        /// - `Input: comptime type`: Input environment or value type consumed by this composition.
+        /// - `values: []const Input`: Input collection; its elements are processed in the documented order.
+        /// - `body: comptime fn (Input) Unit`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn forLoop(comptime Input: type, values: []const Input, comptime body: fn (Input) Unit) Unit {
             return Unit.forEachDiscard(Input, values, body);
         }
 
+        /// Run a finalizer after a builder body.
+        /// Parameters:
+        /// - `body: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// - `finalizer: comptime fn (*const R) void`: Compile-time typed function selected at comptime; no runtime callback
+        ///   lookup is required.
+        /// Returns (`@TypeOf(body)`): The value or description with the exact type inferred from the supplied input.
         pub fn tryFinally(comptime body: anytype, comptime finalizer: fn (*const R) void) @TypeOf(body) {
             const Out = @TypeOf(body);
             comptime requireEffect(Out, E, R, .EffectBuilder_bind);
@@ -3072,6 +3666,11 @@ pub fn EffectBuilder(comptime E: type, comptime R: type) type {
             }.release);
         }
 
+        /// Run a body with a scoped resource binding.
+        /// Parameters:
+        /// - `binding: anytype`: Typed acquisition and release definition.
+        /// - `body: comptime anytype`: Typed continuation consuming the acquired resource.
+        /// Returns (`BindingResult(@TypeOf(binding), body)`): The composed scoped Effect.
         pub inline fn using(binding: anytype, comptime body: anytype) BindingResult(@TypeOf(binding), body) {
             if (comptime @hasDecl(@TypeOf(binding), "AlreadyOwnedResource")) {
                 const Out = BindingResult(@TypeOf(binding), body);
@@ -3083,40 +3682,80 @@ pub fn EffectBuilder(comptime E: type, comptime R: type) type {
     };
 }
 
+/// Specialize a resource value with its release callback.
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// Returns (`type`): a scoped resource wrapper pairing an acquired `A` with the release action that owns it.
 pub fn ResourceValue(comptime A: type) type {
     return struct {
+        /// Marker and type alias for an acquisition whose resource is already owned.
         pub const AlreadyOwnedResource = A;
         value: A,
     };
 }
 
+/// Specialize a typed acquisition/release binding.
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): a typed acquisition and release binding accepted by `EffectBuilder.using`.
 pub fn ResourceBinding(comptime A: type, comptime E: type, comptime R: type) type {
     return struct {
+        /// Type of the resource acquired by this binding.
         pub const Resource = A;
         acquire: Effect(A, E, R),
         release: *const fn (A, outcomes.PrimaryOutcome(E)) Effect(void, E, R),
     };
 }
 
+/// Pair a typed acquisition with its release operation.
+/// Parameters:
+/// - `acquisition: comptime anytype`: Compile-time statically inferred input checked when this operation is
+///   instantiated.
+/// - `release: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where static.
+/// Returns (`ResourceBinding(@TypeOf(acquisition).Success, @TypeOf(acquisition).Error, @TypeOf(acquisition).Environment)`): A lazy scoped service or resource description; acquisition and release occur during execution.
 pub fn resource(comptime acquisition: anytype, comptime release: anytype) ResourceBinding(@TypeOf(acquisition).Success, @TypeOf(acquisition).Error, @TypeOf(acquisition).Environment) {
     return .{ .acquire = acquisition, .release = release };
 }
 
+/// Scoped dependency construction from `Input` to `Output`. A successful
+/// acquisition owns its output until the matching scope runs its finalizer.
+///
+/// Parameters:
+/// - `Input: comptime type`: Input environment or value type consumed by this composition.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `Output: comptime type`: Service or value type produced by this composition.
+/// Returns (`type`): a dependency layer that builds `Output` from `Input`, reports `E`, and releases scoped services.
 pub fn Layer(comptime Input: type, comptime E: type, comptime Output: type) type {
     if (outcomes.ownsPayload(Output)) @compileError(diagnostics.layer_services_must_be_borrowed_dependency_records_or_handles_install_owning_resources);
     return struct {
         const Self = @This();
+        /// Exact caller environment type required when the description runs.
         pub const Environment = Input;
+        /// Expected application failure type `E` carried by this Layer.
         pub const Error = E;
+        /// Service value type produced by this Layer.
         pub const Service = Output;
         const Scope = scopes.Scope(E);
         const Build = Effect(Output, E, Input);
         build_fn: *const fn (*Scope) Build,
 
+        /// Finish construction of the typed definition.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `scope: *Scope`: Scope that owns the operation and its registered finalizers.
+        /// Returns (`Build`): The typed operation result or description selected by this API.
         pub fn build(comptime self: Self, scope: *Scope) Build {
             return self.build_fn(scope);
         }
 
+        /// Construct a successful description.
+        /// Parameters:
+        /// - `value: comptime Output`: Compile-time typed input value; move or clone owning payloads according to
+        ///   its type contract.
+        /// Returns (`Self`): a layer that supplies the given service value without acquisition.
         pub fn succeed(comptime value: Output) Self {
             return .{ .build_fn = struct {
                 fn build(_: *Scope) Build {
@@ -3125,6 +3764,10 @@ pub fn Layer(comptime Input: type, comptime E: type, comptime Output: type) type
             }.build };
         }
 
+        /// Adapt a lazy Effect to this operation.
+        /// Parameters:
+        /// - `program: comptime Build`: Lazy typed program to sequence, run, or transform.
+        /// Returns (`Self`): a layer built by executing the supplied effect at provision time.
         pub fn fromEffect(comptime program: Build) Self {
             return .{ .build_fn = struct {
                 fn build(_: *Scope) Build {
@@ -3133,6 +3776,12 @@ pub fn Layer(comptime Input: type, comptime E: type, comptime Output: type) type
             }.build };
         }
 
+        /// Run an Effect within a scope that closes when work completes.
+        /// Parameters:
+        /// - `acquire: comptime Build`: Resource acquisition description.
+        /// - `release: comptime fn (Output) Effect(void, E, Input)`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Self`): a layer that acquires the service and releases it with its scope.
         pub fn scoped(comptime acquire: Build, comptime release: fn (Output) Effect(void, E, Input)) Self {
             return .{ .build_fn = struct {
                 fn build(scope: *Scope) Build {
@@ -3141,6 +3790,15 @@ pub fn Layer(comptime Input: type, comptime E: type, comptime Output: type) type
             }.build };
         }
 
+        /// Combine independent service Layers.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `right: comptime anytype`: Compile-time statically inferred input checked when this operation is
+        ///   instantiated.
+        /// - `combine: comptime anytype`: Compile-time statically inferred input checked when this operation is
+        ///   instantiated.
+        /// Returns (`Layer(Input, E, @typeInfo(@TypeOf(combine)).@"fn".return_type.?)`): A lazy scoped service or resource description; acquisition and release occur during execution.
         pub fn merge(comptime self: Self, comptime right: anytype, comptime combine: anytype) Layer(Input, E, @typeInfo(@TypeOf(combine)).@"fn".return_type.?) {
             const Right = @TypeOf(right);
             if (Right.Environment != Input or Right.Error != E) @compileError(diagnostics.merged_layers_must_share_environment_and_error_types);
@@ -3195,6 +3853,13 @@ pub fn Layer(comptime Input: type, comptime E: type, comptime Output: type) type
             }.build };
         }
 
+        /// Supply the Effect’s required environment through a Layer.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `second: comptime anytype`: Compile-time statically inferred input checked when this operation is
+        ///   instantiated.
+        /// Returns (`Layer(Input, E, @TypeOf(second).Service)`): A lazy scoped service or resource description; acquisition and release occur during execution.
         pub fn provide(comptime self: Self, comptime second: anytype) Layer(Input, E, @TypeOf(second).Service) {
             const Second = @TypeOf(second);
             if (Second.Environment != Output or Second.Error != E) @compileError(diagnostics.provided_layer_input_must_match_the_first_layer_s_output_and_error);
@@ -3247,6 +3912,13 @@ pub fn Layer(comptime Input: type, comptime E: type, comptime Output: type) type
             }.build };
         }
 
+        /// Use this Layer to provide services to an Effect.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `program: comptime anytype`: Compile-time statically inferred input checked when this operation is
+        ///   instantiated.
+        /// Returns (`Effect(@TypeOf(program).Success, E, Input)`): program whose input dependencies are acquired and supplied by this layer.
         pub fn provideTo(comptime self: Self, comptime program: anytype) Effect(@TypeOf(program).Success, E, Input) {
             const Body = @TypeOf(program);
             comptime requireEffect(Body, E, Output, .provideSome);
@@ -3299,19 +3971,37 @@ pub fn Layer(comptime Input: type, comptime E: type, comptime Output: type) type
     };
 }
 
+/// Specialize a typed stream chunk and its ownership.
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// Returns (`type`): a group of `A` elements with explicit borrowed or owned storage.
 pub fn Chunk(comptime A: type) type {
     return union(enum) {
         const Self = @This();
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         end,
         items: struct { values: []const A, allocator: ?std.mem.Allocator },
 
+        /// Wrap borrowed stream data without transferring ownership.
+        /// Parameters:
+        /// - `values: []const A`: Input collection; its elements are processed in the documented order.
+        /// Returns (`Self`): a chunk that refers to caller-owned elements; the caller keeps them alive through consumption.
         pub fn borrowed(values: []const A) Self {
             return .{ .items = .{ .values = values, .allocator = null } };
         }
+        /// Wrap stream data whose allocated payload is owned.
+        /// Parameters:
+        /// - `values: outcomes.OwnedSlice(A)`: Input collection; its elements are processed in the documented order.
+        /// Returns (`Self`): a chunk that takes ownership of the supplied slice storage.
         pub fn owned(values: outcomes.OwnedSlice(A)) Self {
             return .{ .items = .{ .values = values.items, .allocator = values.allocator } };
         }
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             self.deinitFrom(0);
         }
@@ -3322,6 +4012,11 @@ pub fn Chunk(comptime A: type) type {
             };
             self.* = .end;
         }
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!Self`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const Self) error{OutOfMemory}!Self {
             if (self.* == .end or self.items.allocator == null) return self.*;
             const values: outcomes.OwnedSlice(A) = .{ .items = @constCast(self.items.values), .allocator = self.items.allocator.? };
@@ -3330,8 +4025,16 @@ pub fn Chunk(comptime A: type) type {
     };
 }
 
+/// Specialize a scoped pull reader for stream elements.
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): a scoped pull reader yielding `A` values or typed `E` failures.
 pub fn StreamReader(comptime A: type, comptime E: type, comptime R: type) type {
     return struct {
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         const Description = struct {
             allocator: std.mem.Allocator,
@@ -3340,6 +4043,10 @@ pub fn StreamReader(comptime A: type, comptime E: type, comptime R: type) type {
         };
         pull: Effect(Chunk(A), E, R),
         description: *Description,
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *@This()) void {
             if (self.description.references.fetchSub(1, .acq_rel) == 1) {
                 self.description.program.deinit();
@@ -3347,6 +4054,11 @@ pub fn StreamReader(comptime A: type, comptime E: type, comptime R: type) type {
             }
             self.* = undefined;
         }
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
             _ = self.description.references.fetchAdd(1, .monotonic);
             return self.*;
@@ -3354,6 +4066,14 @@ pub fn StreamReader(comptime A: type, comptime E: type, comptime R: type) type {
     };
 }
 
+/// Lazy typed stream. Opening creates an owned reader; callers must consume or
+/// close it so pending work and retained chunks are released.
+///
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): a lazy stream type whose reader is acquired for each execution and closed by its scope.
 pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
     return struct {
         const Self = @This();
@@ -3366,6 +4086,11 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
         captured: ?*const anyopaque = null,
         captured_open_fn: ?*const fn (*const anyopaque, *Scope) Open = null,
 
+        /// Open the selected scoped resource or stream.
+        /// Parameters:
+        /// - `self: Self`: Receiver passed by value: the struct itself is copied, while any referenced storage keeps its original ownership and lifetime.
+        /// - `scope: *Scope`: Scope that owns the operation and its registered finalizers.
+        /// Returns (`Open`): The typed operation result or description selected by this API.
         pub fn open(self: Self, scope: *Scope) Open {
             if (self.captured_open_fn) |open_captured| return open_captured(self.captured.?, scope);
             return self.open_fn.?(scope);
@@ -3373,6 +4098,13 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
 
         /// Borrow request-specific construction state without a heap node.
         /// The capture must outlive the opened reader and its scope.
+        ///
+        /// Parameters:
+        /// - `Capture: comptime type`: Compile-time captured state type retained by the composed operation.
+        /// - `capture: *const Capture`: Operation-specific state retained until the callback completes.
+        /// - `build: comptime fn (*const Capture, *Scope) Open`: Compile-time typed function selected at comptime; no runtime callback lookup
+        ///   is required.
+        /// Returns (`Self`): a stream description borrowing the capture rather than allocating a capture node.
         pub fn fromCaptured(
             comptime Capture: type,
             capture: *const Capture,
@@ -3387,6 +4119,13 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
 
         /// Reinterprets expected stream failures while preserving the source
         /// scope, pull state, cancellation and finalizer outcomes.
+        ///
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `transform: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Stream(A, unaryResult(transform, E, .mapError), R)`): A lazy typed Stream; the caller consumes it under its scope and handles terminal Exit.
         pub fn mapError(comptime self: Self, comptime transform: anytype) Stream(A, unaryResult(transform, E, .mapError), R) {
             const F = unaryResult(transform, E, .mapError);
             const Mapped = Stream(A, F, R);
@@ -3457,6 +4196,15 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
             return Mapped.fromPull(acquired, Adapter.pull, Adapter.close);
         }
 
+        /// Build a Stream from acquisition, pull, and release operations.
+        /// Parameters:
+        /// - `acquisition: comptime anytype`: Compile-time statically inferred input checked when this operation is
+        ///   instantiated.
+        /// - `pull: comptime fn (@TypeOf(acquisition).Success) Pull`: Compile-time typed function selected at comptime; no runtime callback lookup
+        ///   is required.
+        /// - `release: comptime fn (@TypeOf(acquisition).Success) Unit`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Self`): a stream that acquires a resource, pulls elements, and runs release when its scope closes.
         pub fn fromPull(comptime acquisition: anytype, comptime pull: fn (@TypeOf(acquisition).Success) Pull, comptime release: fn (@TypeOf(acquisition).Success) Unit) Self {
             const Acquire = @TypeOf(acquisition);
             comptime requireEffect(Acquire, E, R, .acquireRelease_body);
@@ -3506,6 +4254,16 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
             }.open };
         }
 
+        /// Build a Stream from a caller-provided iterable.
+        /// Parameters:
+        /// - `Iterator: comptime type`: Compile-time iterator type traversed by this operation.
+        /// - `factory: comptime fn (*const R) outcomes.Exit(*Iterator, E)`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// - `next: comptime fn (*Iterator, *const R) outcomes.Exit(?A, E)`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// - `release: comptime fn (*Iterator) Unit`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Self`): a stream that constructs a fresh iterator for each run and releases it after consumption.
         pub fn fromIterable(comptime Iterator: type, comptime factory: fn (*const R) outcomes.Exit(*Iterator, E), comptime next: fn (*Iterator, *const R) outcomes.Exit(?A, E), comptime release: fn (*Iterator) Unit) Self {
             const Acquire = Effect(*Iterator, E, R);
             return fromPull(comptime Acquire.fromOutcome(factory), struct {
@@ -3531,6 +4289,16 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
             }.pull, release);
         }
 
+        /// Build a Stream from an asynchronous iterable.
+        /// Parameters:
+        /// - `Iterator: comptime type`: Compile-time iterator type traversed by this operation.
+        /// - `factory: comptime fn (*const R) outcomes.Exit(*Iterator, E)`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// - `next: comptime fn (*const Iterator, *const R) asynchronous.Async(?A, E).Start`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// - `release: comptime fn (*Iterator) Unit`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Self`): a stream that joins asynchronous iterator operations before releasing the iterator.
         pub fn fromAsyncIterable(comptime Iterator: type, comptime factory: fn (*const R) outcomes.Exit(*Iterator, E), comptime next: fn (*const Iterator, *const R) asynchronous.Async(?A, E).Start, comptime release: fn (*Iterator) Unit) Self {
             const Next = Effect(?A, E, R);
             return fromPull(comptime Effect(*Iterator, E, R).fromOutcome(factory), struct {
@@ -3575,6 +4343,13 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
             }.pull, release);
         }
 
+        /// Transform stream elements with a typed Effect.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `transform: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Stream(unaryResult(transform, A, .flatMap).Success, E, R)`): A lazy typed Stream; the caller consumes it under its scope and handles terminal Exit.
         pub fn mapEffect(comptime self: Self, comptime transform: anytype) Stream(unaryResult(transform, A, .flatMap).Success, E, R) {
             const Transform = unaryResult(transform, A, .flatMap);
             comptime requireEffect(Transform, E, R, .flatMap);
@@ -3702,6 +4477,13 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
             return .{ .open_fn = Adapter.open };
         }
 
+        /// Consume the Stream and collect values within a caller-selected bound.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `limit: comptime ?usize`: Compile-time caller-selected bound or count; zero/overflow handling follows
+        ///   this API’s validation.
+        /// Returns (`Effect(outcomes.OwnedSlice(A), E, R)`): owned result slice, limited by `limit`; partial results are released on failure.
         pub fn runCollect(comptime self: Self, comptime limit: ?usize) Effect(outcomes.OwnedSlice(A), E, R) {
             const Out = Effect(outcomes.OwnedSlice(A), E, R);
             const Adapter = struct {
@@ -3786,6 +4568,13 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
             return Out.scoped(Adapter.useScope);
         }
 
+        /// Consume the Stream with a typed effectful callback.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `consume: comptime anytype`: Compile-time statically inferred input checked when this operation is
+        ///   instantiated.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn runForEach(comptime self: Self, comptime consume: anytype) Unit {
             const Parameters = @typeInfo(@TypeOf(consume)).@"fn".params;
             comptime {
@@ -3881,11 +4670,30 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
 
 /// Execute a description and return its full typed Exit.
 /// Runtime services come from the caller's environment.
+///
+/// Parameters:
+/// - `env: anytype`: Borrowed `*const R` environment containing the program's
+///   required services, allocator, I/O, and execution engines. It must stay
+///   valid until execution finishes.
+/// - `program: anytype`: An `Effect(A, E, R)` description. Its `Success`,
+///   `Error`, and `Environment` types determine the generic result and required
+///   environment at comptime.
+/// Returns (`outcomes.Exit(@TypeOf(program).Success, @TypeOf(program).Error)`):
+/// The complete terminal outcome. Switch on every variant; no `try` or `catch`
+/// is required to handle the effect's typed error channel.
 pub inline fn run(env: anytype, program: anytype) outcomes.Exit(@TypeOf(program).Success, @TypeOf(program).Error) {
     if (program.entry) |entry| return entry(env, program.value);
     return runDriver(false, env, program);
 }
 
+/// Owner of an immediate Exit or an in-flight Effect run. `join` observes the
+/// outcome; `deinit` cancels and drains work that remains pending.
+///
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): an owner of either an immediate `Exit(A, E)` or a pending run that must be joined or deinitialized.
 pub fn AsyncRun(comptime A: type, comptime E: type, comptime R: type) type {
     return union(enum) {
         const Self = @This();
@@ -3965,6 +4773,10 @@ pub fn AsyncRun(comptime A: type, comptime E: type, comptime R: type) type {
 
         /// The handle is owned and must be moved/deinitialized once. Borrowed
         /// environment and description captures must outlive its joined work.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`outcomes.Exit(A, E)`): Carries `A` on `.success` or `E` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn join(self: *Self) outcomes.Exit(A, E) {
             switch (self.*) {
                 .immediate => |value| return value.clone(),
@@ -3977,12 +4789,20 @@ pub fn AsyncRun(comptime A: type, comptime E: type, comptime R: type) type {
             }
         }
 
+        /// Describe a typed request.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`void`): no value.
         pub fn request(self: *const Self) void {
             if (self.* == .pending) self.pending.cancellation.request();
         }
 
         /// Cancellation requests ownership-preserving shutdown, then joins it.
         /// Copies borrowed by observers must no longer be in use at destruction.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             switch (self.*) {
                 .immediate => |*value| value.deinit(),
@@ -4001,6 +4821,19 @@ pub fn AsyncRun(comptime A: type, comptime E: type, comptime R: type) type {
     };
 }
 
+/// Starts `program` with the caller's `R`, executing its immediate prefix.
+/// Keep `env` and its providers alive until the returned handle is joined or
+/// deinitialized; the handle owns pending work and cleanup.
+///
+/// Parameters:
+/// - `env: anytype`: Borrowed `*const R` environment containing the allocator,
+///   I/O, and selected async/parallel engines. Keep it and its providers alive
+///   until the returned handle is joined or deinitialized.
+/// - `program: anytype`: An `Effect(A, E, R)` whose `Success`, `Error`, and
+///   `Environment` declarations determine the handle type at comptime.
+/// Returns (`AsyncRun(@TypeOf(program).Success, @TypeOf(program).Error, @TypeOf(program).Environment)`):
+///   An immediate typed Exit or an owned pending handle. Join it to observe
+///   completion or deinitialize it to cancel and drain remaining work.
 pub fn runAsync(env: anytype, program: anytype) AsyncRun(@TypeOf(program).Success, @TypeOf(program).Error, @TypeOf(program).Environment) {
     const Program = @TypeOf(program);
     const Handle = AsyncRun(Program.Success, Program.Error, Program.Environment);
@@ -4060,6 +4893,13 @@ fn evaluateBorrowed(env: anytype, program: anytype, state: *rt.State) outcomes.E
     return state.publish(result);
 }
 
+/// Scoped child execution handle. Joining observes its typed Exit; the owning
+/// scope cancels and drains unjoined children during closure.
+///
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// Returns (`type`): a scope-owned child handle that can be awaited, joined, or interrupted.
 pub fn Fiber(comptime A: type, comptime E: type) type {
     return struct {
         const Self = @This();
@@ -4077,6 +4917,10 @@ pub fn Fiber(comptime A: type, comptime E: type) type {
         fn wait(self: *Self, token: ?*const rt.Cancellation) primitives.Deferred(A, E).WaitResult {
             return self.vtable.wait(self.userdata, token);
         }
+        /// Describe a typed request.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn request(self: *Self) void {
             self.vtable.request(self.userdata);
         }
@@ -4347,12 +5191,27 @@ fn ManagedEnvironment(comptime R: type) type {
     };
 }
 
+/// Specialize an Effect-backed cache with typed keys and values.
+/// Parameters:
+/// - `Key: comptime type`: Key type used to identify or look up entries in this component.
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): cache operations expressed as `Effect` values over keys, values, errors, and the caller environment.
 pub fn EffectCache(comptime Key: type, comptime A: type, comptime E: type, comptime R: type) type {
     return struct {
         const Core = @import("cache.zig").Cache(Key, A, E);
         const Config = @import("cache.zig").Config(Key, E);
         const Out = Effect(*Core, E, R);
         const Unit = Effect(void, E, R);
+        /// Construct a typed value from the supplied parts.
+        /// Parameters:
+        /// - `scope: *scopes.Scope(E)`: Scope that owns the operation and its registered finalizers.
+        /// - `select_config: comptime fn (*const R) Config`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// - `load: comptime fn (Key) Effect(A, E, R)`: Compile-time typed function selected at comptime; no runtime callback lookup
+        ///   is required.
+        /// Returns (`Out`): The typed operation result or description selected by this API.
         pub fn make(scope: *scopes.Scope(E), comptime select_config: fn (*const R) Config, comptime load: fn (Key) Effect(A, E, R)) Out {
             const Adapter = struct {
                 fn ready(env: *const R, _: Out.Value, state: *rt.State) outcomes.Exit(*Core, E) {
@@ -4386,6 +5245,11 @@ pub fn EffectCache(comptime Key: type, comptime A: type, comptime E: type, compt
             const acquire: Out = .{ .ready = Adapter.ready };
             return acquire.scopeAcquire(scope, Adapter.release);
         }
+        /// Look up the selected value.
+        /// Parameters:
+        /// - `cache: *Core`: Cache capability used for lookup or invalidation.
+        /// - `key: Key`: Stable identity used for matching, deduplication, or replay.
+        /// Returns (`Effect(A, E, R)`): cached value associated with `key`, or the cache’s typed failure.
         pub fn get(cache: *Core, key: Key) Effect(A, E, R) {
             const Capture = struct { cache: *Core, key: Key };
             return Effect(A, E, R).captureOwned(cache.allocator, Capture{ .cache = cache, .key = key }, true, struct {
@@ -4394,6 +5258,11 @@ pub fn EffectCache(comptime Key: type, comptime A: type, comptime E: type, compt
                 }
             }.get);
         }
+        /// Invalidate the selected cached or observable value.
+        /// Parameters:
+        /// - `cache: *Core`: Cache capability used for lookup or invalidation.
+        /// - `key: Key`: Stable identity used for matching, deduplication, or replay.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn invalidate(cache: *Core, key: Key) Unit {
             const Capture = struct { cache: *Core, key: Key };
             const program = Unit.captureOwned(cache.allocator, Capture{ .cache = cache, .key = key }, true, struct {
@@ -4403,6 +5272,10 @@ pub fn EffectCache(comptime Key: type, comptime A: type, comptime E: type, compt
             }.invalidate);
             return program;
         }
+        /// Stop the capability and release its retained resources.
+        /// Parameters:
+        /// - `cache: *Core`: Cache capability used for lookup or invalidation.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn shutdown(cache: *Core) Unit {
             return Unit.cleanupBorrowed(Core, cache, struct {
                 fn close(value: *const Core, _: *const R) outcomes.Exit(void, E) {
@@ -4413,6 +5286,12 @@ pub fn EffectCache(comptime Key: type, comptime A: type, comptime E: type, compt
     };
 }
 
+/// Specialize scoped pool operations as Effects.
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): typed pool acquisition and lease operations expressed as `Effect` values.
 pub fn EffectPool(comptime A: type, comptime E: type, comptime R: type) type {
     return struct {
         const Core = @import("pool.zig").Pool(A, E);
@@ -4421,6 +5300,17 @@ pub fn EffectPool(comptime A: type, comptime E: type, comptime R: type) type {
         const Lease = Core.Lease;
         const Acquire = Effect(*Lease, E, R);
         const Unit = Effect(void, E, R);
+        /// Construct a typed value from the supplied parts.
+        /// Parameters:
+        /// - `scope: *scopes.Scope(E)`: Scope that owns the operation and its registered finalizers.
+        /// - `select_config: comptime fn (*const R) Config`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// - `create: comptime Effect(A, E, R)`: Typed Effect that constructs the requested value.
+        /// - `validate: comptime fn (A) Effect(bool, E, R)`: Compile-time typed function selected at comptime; no runtime callback
+        ///   lookup is required.
+        /// - `dispose: comptime fn (A) Unit`: Compile-time typed function selected at comptime; no runtime callback
+        ///   lookup is required.
+        /// Returns (`Out`): The typed operation result or description selected by this API.
         pub fn make(scope: *scopes.Scope(E), comptime select_config: fn (*const R) Config, comptime create: Effect(A, E, R), comptime validate: fn (A) Effect(bool, E, R), comptime dispose: fn (A) Unit) Out {
             const Adapter = struct {
                 fn ready(env: *const R, _: Out.Value, state: *rt.State) outcomes.Exit(*Core, E) {
@@ -4470,6 +5360,11 @@ pub fn EffectPool(comptime A: type, comptime E: type, comptime R: type) type {
             const program: Out = .{ .ready = Adapter.ready };
             return program.scopeAcquire(scope, Adapter.release);
         }
+        /// Acquire a resource from the selected capability.
+        /// Parameters:
+        /// - `scope: *scopes.Scope(E)`: Scope that owns the operation and its registered finalizers.
+        /// - `pool: *Core`: Pool providing or reclaiming this lease.
+        /// Returns (`Acquire`): The typed operation result or description selected by this API.
         pub fn acquire(scope: *scopes.Scope(E), pool: *Core) Acquire {
             var program = Acquire.fromNativeCancellableBorrowed(Core, pool, struct {
                 fn acquire(captured_value: *const Core, _: *const R, token: ?*const rt.Cancellation) outcomes.Exit(*Lease, E) {
@@ -4504,12 +5399,24 @@ pub fn EffectPool(comptime A: type, comptime E: type, comptime R: type) type {
                 }
             }.complete);
         }
+        /// Access the value held by this wrapper or lease.
+        /// Parameters:
+        /// - `lease: *const Lease`: Owned pool lease, returned or retired by this operation.
+        /// Returns (`A`): The typed stored or computed value; ownership follows the enclosing type contract.
         pub fn value(lease: *const Lease) A {
             return lease.value();
         }
+        /// Return or release the owned resource.
+        /// Parameters:
+        /// - `lease: *Lease`: Owned pool lease, returned or retired by this operation.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn release(lease: *Lease) Unit {
             return disposition(lease, false);
         }
+        /// Discard a pool lease through its typed release operation.
+        /// Parameters:
+        /// - `lease: *Lease`: Owned pool lease, returned or retired by this operation.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn discard(lease: *Lease) Unit {
             return disposition(lease, true);
         }
@@ -4520,6 +5427,11 @@ pub fn EffectPool(comptime A: type, comptime E: type, comptime R: type) type {
                 }
             }.run);
         }
+        /// Change the pool’s configured maximum capacity.
+        /// Parameters:
+        /// - `pool: *Core`: Pool providing or reclaiming this lease.
+        /// - `capacity: usize`: new maximum size requested for the underlying pool.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn setCapacity(pool: *Core, capacity: usize) Unit {
             const Capture = struct { pool: *Core, capacity: usize };
             return Unit.captureOwned(pool.allocator, Capture{ .pool = pool, .capacity = capacity }, false, struct {
@@ -4528,6 +5440,12 @@ pub fn EffectPool(comptime A: type, comptime E: type, comptime R: type) type {
                 }
             }.run);
         }
+        /// Check whether an idle pool value matches a predicate.
+        /// Parameters:
+        /// - `pool: *Core`: Pool providing or reclaiming this lease.
+        /// - `predicate: comptime fn (A) bool`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Effect(bool, E, R)`): boolean result indicating whether an idle pool resource satisfies `predicate`.
         pub fn existsIdle(pool: *Core, comptime predicate: fn (A) bool) Effect(bool, E, R) {
             return Effect(bool, E, R).fromCancellableBorrowed(Core, pool, struct {
                 fn run(captured_value: *const Core, _: *const R, token: ?*const rt.Cancellation) outcomes.Exit(bool, E) {
@@ -4535,6 +5453,11 @@ pub fn EffectPool(comptime A: type, comptime E: type, comptime R: type) type {
                 }
             }.run);
         }
+        /// Populate the pool toward a caller-selected target size.
+        /// Parameters:
+        /// - `pool: *Core`: Pool providing or reclaiming this lease.
+        /// - `target: usize`: pool population target under the configured capacity.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn ensureSize(pool: *Core, target: usize) Unit {
             const Capture = struct { pool: *Core, target: usize };
             return Unit.captureOwned(pool.allocator, Capture{ .pool = pool, .target = target }, true, struct {
@@ -4543,6 +5466,10 @@ pub fn EffectPool(comptime A: type, comptime E: type, comptime R: type) type {
                 }
             }.run);
         }
+        /// Stop the capability and release its retained resources.
+        /// Parameters:
+        /// - `pool: *Core`: Pool providing or reclaiming this lease.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn shutdown(pool: *Core) Unit {
             return Unit.cleanupBorrowed(Core, pool, struct {
                 fn close(captured_value: *const Core, _: *const R) outcomes.Exit(void, E) {
@@ -4553,6 +5480,10 @@ pub fn EffectPool(comptime A: type, comptime E: type, comptime R: type) type {
     };
 }
 
+/// Specialize managed HTTP fetching through the environment transport.
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): managed HTTP request operations using the transport and runtime capabilities projected from `R`.
 pub fn Fetch(comptime R: type) type {
     return struct {
         const http = @import("http.zig");
@@ -4560,6 +5491,14 @@ pub fn Fetch(comptime R: type) type {
         const Acquire = Effect(*http.Response, E, R);
         const Text = Effect(outcomes.OwnedSlice(u8), E, R);
         const Unit = Effect(void, E, R);
+        /// Describe a typed request.
+        /// Parameters:
+        /// - `scope: *scopes.Scope(E)`: Scope that owns the operation and its registered finalizers.
+        /// - `select_request: comptime fn (*const R) http.Request`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// - `accept: comptime fn (std.http.Status) bool`: Compile-time typed function selected at comptime; no runtime callback
+        ///   lookup is required.
+        /// Returns (`Acquire`): The typed operation result or description selected by this API.
         pub fn request(scope: *scopes.Scope(E), comptime select_request: fn (*const R) http.Request, comptime accept: fn (std.http.Status) bool) Acquire {
             const Adapter = struct {
                 const Frame = struct {
@@ -4606,6 +5545,10 @@ pub fn Fetch(comptime R: type) type {
             };
             return .{ .value = .{ .borrowed = scope }, .start = Adapter.start };
         }
+        /// Read a managed HTTP response body as text.
+        /// Parameters:
+        /// - `response: *http.Response`: Typed or encoded response being delivered.
+        /// Returns (`Text`): Owned or borrowed text according to the returned response type.
         pub fn text(response: *http.Response) Text {
             return Text.fromNativeCancellableBorrowed(http.Response, response, struct {
                 fn read(value: *const http.Response, _: *const R, token: ?*const rt.Cancellation) outcomes.Exit(outcomes.OwnedSlice(u8), E) {
@@ -4613,6 +5556,13 @@ pub fn Fetch(comptime R: type) type {
                 }
             }.read);
         }
+        /// Fetch and decode an HTTP response body as text.
+        /// Parameters:
+        /// - `select_request: comptime fn (*const R) http.Request`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// - `accept: comptime fn (std.http.Status) bool`: Compile-time typed function selected at comptime; no runtime callback
+        ///   lookup is required.
+        /// Returns (`Text`): Owned or borrowed text according to the returned response type.
         pub fn fetchText(comptime select_request: fn (*const R) http.Request, comptime accept: fn (std.http.Status) bool) Text {
             const Adapter = struct {
                 const Frame = struct {
@@ -4661,11 +5611,20 @@ pub fn Fetch(comptime R: type) type {
     };
 }
 
+/// Specialize managed WebSocket operations over a caller transport.
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): managed WebSocket connect, send, receive, and close operations using `R`.
 pub fn EffectWebSocket(comptime R: type) type {
     return struct {
         const sockets = @import("websocket.zig");
         const NativeEffect = Effect(sockets.NativeSocket, sockets.Error, R);
         const Unit = Effect(void, sockets.Error, R);
+        /// Send the typed or encoded message.
+        /// Parameters:
+        /// - `connection: *sockets.Connection`: Connection operated within its owning scope.
+        /// - `message: sockets.Message`: borrowed text or binary WebSocket bytes kept alive through the send.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn send(connection: *sockets.Connection, message: sockets.Message) Unit {
             const Capture = struct { connection: *sockets.Connection, message: sockets.Message };
             return Unit.captureOwned(connection.allocator, Capture{ .connection = connection, .message = message }, true, struct {
@@ -4674,6 +5633,10 @@ pub fn EffectWebSocket(comptime R: type) type {
                 }
             }.run);
         }
+        /// Receive a WebSocket message through the native socket.
+        /// Parameters:
+        /// - `connection: *sockets.Connection`: Connection operated within its owning scope.
+        /// Returns (`Effect(sockets.Receive, sockets.Error, R)`): typed WebSocket receive result with owned message or close information.
         pub fn receive(connection: *sockets.Connection) Effect(sockets.Receive, sockets.Error, R) {
             return Effect(sockets.Receive, sockets.Error, R).fromNativeCancellableBorrowed(sockets.Connection, connection, struct {
                 fn run(value: *const sockets.Connection, _: *const R, token: ?*const rt.Cancellation) outcomes.Exit(sockets.Receive, sockets.Error) {
@@ -4681,6 +5644,10 @@ pub fn EffectWebSocket(comptime R: type) type {
                 }
             }.run);
         }
+        /// Close this scoped resource.
+        /// Parameters:
+        /// - `connection: *sockets.Connection`: Connection operated within its owning scope.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn close(connection: *sockets.Connection) Unit {
             return Unit.fromNativeBorrowed(sockets.Connection, connection, struct {
                 fn run(value: *const sockets.Connection, _: *const R) outcomes.Exit(void, sockets.Error) {
@@ -4688,6 +5655,10 @@ pub fn EffectWebSocket(comptime R: type) type {
                 }
             }.run);
         }
+        /// Abort a WebSocket operation or connection.
+        /// Parameters:
+        /// - `connection: *sockets.Connection`: Connection operated within its owning scope.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn abort(connection: *sockets.Connection) Unit {
             return Unit.fromNativeBorrowed(sockets.Connection, connection, struct {
                 fn run(value: *const sockets.Connection, _: *const R) outcomes.Exit(void, sockets.Error) {
@@ -4695,6 +5666,10 @@ pub fn EffectWebSocket(comptime R: type) type {
                 }
             }.run);
         }
+        /// Read the negotiated WebSocket subprotocol.
+        /// Parameters:
+        /// - `connection: *sockets.Connection`: Connection operated within its owning scope.
+        /// Returns (`Effect(?[]const u8, sockets.Error, R)`): borrowed negotiated subprotocol, or `null` if none was selected.
         pub fn subProtocol(connection: *sockets.Connection) Effect(?[]const u8, sockets.Error, R) {
             return Effect(?[]const u8, sockets.Error, R).fromBorrowed(sockets.Connection, connection, struct {
                 fn run(value: *const sockets.Connection, _: *const R) outcomes.Exit(?[]const u8, sockets.Error) {
@@ -4705,9 +5680,27 @@ pub fn EffectWebSocket(comptime R: type) type {
         fn identity(error_value: sockets.Error) sockets.Error {
             return error_value;
         }
+        /// Run a body with a scoped native WebSocket.
+        /// Parameters:
+        /// - `select_limits: comptime fn (*const R) sockets.Limits`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// - `acquisition: comptime NativeEffect`: Typed Effect that acquires the resource before the body runs.
+        /// - `use_connection: comptime anytype`: Compile-time statically inferred input checked when this operation
+        ///   is instantiated.
+        /// Returns (`@typeInfo(@TypeOf(use_connection)).@"fn".return_type.?`): The exact result type inferred from the supplied typed callback.
         pub fn withSocket(comptime select_limits: fn (*const R) sockets.Limits, comptime acquisition: NativeEffect, comptime use_connection: anytype) @typeInfo(@TypeOf(use_connection)).@"fn".return_type.? {
             return withSocketMapError(identity, select_limits, acquisition, use_connection);
         }
+        /// Run a scoped native socket body with mapped typed errors.
+        /// Parameters:
+        /// - `map_error: comptime anytype`: Compile-time statically inferred input checked when this operation is
+        ///   instantiated.
+        /// - `select_limits: comptime fn (*const R) sockets.Limits`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// - `acquisition: comptime NativeEffect`: Typed Effect that acquires the resource before the body runs.
+        /// - `use_connection: comptime anytype`: Compile-time statically inferred input checked when this operation
+        ///   is instantiated.
+        /// Returns (`@typeInfo(@TypeOf(use_connection)).@"fn".return_type.?`): The exact result type inferred from the supplied typed callback.
         pub fn withSocketMapError(comptime map_error: anytype, comptime select_limits: fn (*const R) sockets.Limits, comptime acquisition: NativeEffect, comptime use_connection: anytype) @typeInfo(@TypeOf(use_connection)).@"fn".return_type.? {
             return withNative(map_error, struct {
                 fn limits(env: *const R) sockets.Limits {
@@ -4718,9 +5711,25 @@ pub fn EffectWebSocket(comptime R: type) type {
                 }
             }, use_connection);
         }
+        /// Run a body with a scoped managed WebSocket connection.
+        /// Parameters:
+        /// - `select_options: comptime fn (*const R) sockets.ConnectOptions`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// - `use_connection: comptime anytype`: Compile-time statically inferred input checked when this operation
+        ///   is instantiated.
+        /// Returns (`@typeInfo(@TypeOf(use_connection)).@"fn".return_type.?`): The exact result type inferred from the supplied typed callback.
         pub fn withConnection(comptime select_options: fn (*const R) sockets.ConnectOptions, comptime use_connection: anytype) @typeInfo(@TypeOf(use_connection)).@"fn".return_type.? {
             return withConnectionMapError(identity, select_options, use_connection);
         }
+        /// Run a scoped connection body with mapped typed errors.
+        /// Parameters:
+        /// - `map_error: comptime anytype`: Compile-time statically inferred input checked when this operation is
+        ///   instantiated.
+        /// - `select_options: comptime fn (*const R) sockets.ConnectOptions`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// - `use_connection: comptime anytype`: Compile-time statically inferred input checked when this operation
+        ///   is instantiated.
+        /// Returns (`@typeInfo(@TypeOf(use_connection)).@"fn".return_type.?`): The exact result type inferred from the supplied typed callback.
         pub fn withConnectionMapError(comptime map_error: anytype, comptime select_options: fn (*const R) sockets.ConnectOptions, comptime use_connection: anytype) @typeInfo(@TypeOf(use_connection)).@"fn".return_type.? {
             return withNative(map_error, struct {
                 fn limits(env: *const R) sockets.Limits {
@@ -4833,11 +5842,21 @@ pub fn EffectWebSocket(comptime R: type) type {
     };
 }
 
+/// Specialize Effect operations for a typed Deferred.
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): typed Effect operations for completing and awaiting a deferred result.
 pub fn EffectDeferred(comptime A: type, comptime E: type, comptime R: type) type {
     return struct {
         const Core = primitives.Deferred(A, E);
         const Acquire = Effect(*Core, E, R);
         const Unit = Effect(void, E, R);
+        /// Construct a typed value from the supplied parts.
+        /// Parameters:
+        /// - `scope: *scopes.Scope(E)`: Scope that owns the operation and its registered finalizers.
+        /// Returns (`Acquire`): The typed operation result or description selected by this API.
         pub fn make(scope: *scopes.Scope(E)) Acquire {
             return (comptime Acquire.fromOutcome(struct {
                 fn create(env: *const R) outcomes.Exit(*Core, E) {
@@ -4858,9 +5877,17 @@ pub fn EffectDeferred(comptime A: type, comptime E: type, comptime R: type) type
                 }
             }.release);
         }
+        /// Wait for a Deferred and obtain its typed value.
+        /// Parameters:
+        /// - `deferred: *Core`: Deferred state used to synchronize completion.
+        /// Returns (`Effect(A, E, R)`): typed value or failure obtained by a cancellable Deferred wait.
         pub fn awaitValue(deferred: *Core) Effect(A, E, R) {
             return Effect(A, E, R).awaitDeferred(deferred);
         }
+        /// Observe the current completion state.
+        /// Parameters:
+        /// - `deferred: *Core`: Deferred state used to synchronize completion.
+        /// Returns (`Effect(?outcomes.Exit(A, E), E, R)`): A lazy Effect; running it with its declared environment yields a typed Exit.
         pub fn poll(deferred: *Core) Effect(?outcomes.Exit(A, E), E, R) {
             return Effect(?outcomes.Exit(A, E), E, R).fromBorrowed(Core, deferred, struct {
                 fn read(value: *const Core, _: *const R) outcomes.Exit(?outcomes.Exit(A, E), E) {
@@ -4868,6 +5895,12 @@ pub fn EffectDeferred(comptime A: type, comptime E: type, comptime R: type) type
                 }
             }.read);
         }
+        /// Record successful completion of the operation.
+        /// Parameters:
+        /// - `deferred: *Core`: Deferred state used to synchronize completion.
+        /// - `select_value: comptime fn (*const R) outcomes.Exit(A, E)`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// Returns (`Effect(bool, E, R)`): boolean indicating whether this call won the Deferred one-shot completion.
         pub fn complete(deferred: *Core, comptime select_value: fn (*const R) outcomes.Exit(A, E)) Effect(bool, E, R) {
             return Effect(bool, E, R).fromBorrowed(Core, deferred, struct {
                 fn complete(value: *const Core, env: *const R) outcomes.Exit(bool, E) {
@@ -4881,11 +5914,22 @@ pub fn EffectDeferred(comptime A: type, comptime E: type, comptime R: type) type
     };
 }
 
+/// Specialize Effect operations for a Latch.
+/// Parameters:
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): typed Effect operations for opening and awaiting a one-shot latch.
 pub fn EffectLatch(comptime E: type, comptime R: type) type {
     return struct {
         const Deferred = EffectDeferred(void, E, R);
+        /// Deferred constructor exposed through the Effect adapter.
         pub const make = Deferred.make;
+        /// Deferred wait operation exposed through the Effect adapter.
         pub const awaitValue = Deferred.awaitValue;
+        /// Open the selected scoped resource or stream.
+        /// Parameters:
+        /// - `latch: *primitives.Latch(E)`: Synchronization latch awaited by this operation.
+        /// Returns (`Effect(bool, E, R)`): boolean indicating whether this call opened the one-shot latch.
         pub fn open(latch: *primitives.Latch(E)) Effect(bool, E, R) {
             return Deferred.complete(latch, struct {
                 fn success(_: *const R) outcomes.Exit(void, E) {
@@ -4896,11 +5940,23 @@ pub fn EffectLatch(comptime E: type, comptime R: type) type {
     };
 }
 
+/// Specialize Effect operations for a concurrent Ref.
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): typed Effect operations for reading and updating a concurrent reference.
 pub fn EffectRef(comptime A: type, comptime E: type, comptime R: type) type {
     return struct {
         const Core = primitives.Ref(A);
         const Acquire = Effect(*Core, E, R);
         const Unit = Effect(void, E, R);
+        /// Construct a typed value from the supplied parts.
+        /// Parameters:
+        /// - `scope: *scopes.Scope(E)`: Scope that owns the operation and its registered finalizers.
+        /// - `initial: comptime fn (*const R) A`: Compile-time typed function selected at comptime; no runtime callback
+        ///   lookup is required.
+        /// Returns (`Acquire`): The typed operation result or description selected by this API.
         pub fn make(scope: *scopes.Scope(E), comptime initial: fn (*const R) A) Acquire {
             return (comptime Acquire.fromOutcome(struct {
                 fn create(env: *const R) outcomes.Exit(*Core, E) {
@@ -4919,6 +5975,10 @@ pub fn EffectRef(comptime A: type, comptime E: type, comptime R: type) type {
                 }
             }.release);
         }
+        /// Look up the selected value.
+        /// Parameters:
+        /// - `ref: *Core`: Reference whose value is read or modified.
+        /// Returns (`Effect(A, E, R)`): current copyable reference value read under synchronization.
         pub fn get(ref: *Core) Effect(A, E, R) {
             return Effect(A, E, R).fromBorrowed(Core, ref, struct {
                 fn read(value: *const Core, _: *const R) outcomes.Exit(A, E) {
@@ -4926,6 +5986,12 @@ pub fn EffectRef(comptime A: type, comptime E: type, comptime R: type) type {
                 }
             }.read);
         }
+        /// Replace the current value.
+        /// Parameters:
+        /// - `ref: *Core`: Reference whose value is read or modified.
+        /// - `select_value: comptime fn (*const R) A`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn set(ref: *Core, comptime select_value: fn (*const R) A) Unit {
             return Unit.fromBorrowed(Core, ref, struct {
                 fn write(value: *const Core, env: *const R) outcomes.Exit(void, E) {
@@ -4934,6 +6000,12 @@ pub fn EffectRef(comptime A: type, comptime E: type, comptime R: type) type {
                 }
             }.write);
         }
+        /// Update a concurrent Ref through a typed callback.
+        /// Parameters:
+        /// - `ref: *Core`: Reference whose value is read or modified.
+        /// - `transform: comptime fn (A) A`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn update(ref: *Core, comptime transform: fn (A) A) Unit {
             return Unit.fromBorrowed(Core, ref, struct {
                 fn change(value: *const Core, _: *const R) outcomes.Exit(void, E) {
@@ -4942,6 +6014,12 @@ pub fn EffectRef(comptime A: type, comptime E: type, comptime R: type) type {
                 }
             }.change);
         }
+        /// Update the current state with the supplied callback.
+        /// Parameters:
+        /// - `ref: *Core`: Reference whose value is read or modified.
+        /// - `transform: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`Effect(primitives.modificationResult(A, transform), E, R)`): callback result paired with an atomic replacement of the reference value.
         pub fn modify(ref: *Core, comptime transform: anytype) Effect(primitives.modificationResult(A, transform), E, R) {
             const Output = primitives.modificationResult(A, transform);
             return Effect(Output, E, R).fromBorrowed(Core, ref, struct {
@@ -4953,12 +6031,24 @@ pub fn EffectRef(comptime A: type, comptime E: type, comptime R: type) type {
     };
 }
 
+/// Specialize Effect operations for a Queue.
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): typed Effect operations for offering, taking, and shutting down a queue.
 pub fn EffectQueue(comptime A: type, comptime E: type, comptime R: type) type {
     return struct {
         const Core = primitives.Queue(A);
         const Acquire = Effect(*Core, E, R);
         const Unit = Effect(void, E, R);
         const NativeUnit = Effect(void, primitives.QueueError, R);
+        /// Construct a typed value from the supplied parts.
+        /// Parameters:
+        /// - `scope: *scopes.Scope(E)`: Scope that owns the operation and its registered finalizers.
+        /// - `select_capacity: comptime fn (*const R) ?usize`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// Returns (`Acquire`): The typed operation result or description selected by this API.
         pub fn make(scope: *scopes.Scope(E), comptime select_capacity: fn (*const R) ?usize) Acquire {
             return (comptime Acquire.fromOutcome(struct {
                 fn create(env: *const R) outcomes.Exit(*Core, E) {
@@ -4985,9 +6075,19 @@ pub fn EffectQueue(comptime A: type, comptime E: type, comptime R: type) type {
                 }
             }.release);
         }
+        /// Take one item or permit from the selected capability.
+        /// Parameters:
+        /// - `queue: *Core`: Queue capability used for this operation.
+        /// Returns (`Effect(A, primitives.QueueError, R)`): one queue item, or a typed queue shutdown failure.
         pub fn take(queue: *Core) Effect(A, primitives.QueueError, R) {
             return Effect(A, E, R).takeQueue(queue);
         }
+        /// Offer the value to the selected queue or store.
+        /// Parameters:
+        /// - `queue: *Core`: Queue capability used for this operation.
+        /// - `select_value: comptime fn (*const R) A`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// Returns (`NativeUnit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn offer(queue: *Core, comptime select_value: fn (*const R) A) NativeUnit {
             return NativeUnit.fromNativeCancellableBorrowed(Core, queue, struct {
                 fn offer(value: *const Core, env: *const R, token: ?*const rt.Cancellation) outcomes.Exit(void, primitives.QueueError) {
@@ -4998,6 +6098,11 @@ pub fn EffectQueue(comptime A: type, comptime E: type, comptime R: type) type {
                 }
             }.offer);
         }
+        /// Offer a typed value to the selected Queue.
+        /// Parameters:
+        /// - `queue: *Core`: Queue capability used for this operation.
+        /// - `value: A`: queue item produced for this offer; ownership transfers only on acceptance.
+        /// Returns (`NativeUnit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn offerValue(queue: *Core, value: A) NativeUnit {
             if (comptime outcomes.ownsPayload(A)) @compileError(diagnostics.a_reusable_queue_offer_must_produce_a_fresh_owning_value_through_offer);
             const Capture = struct { queue: *Core, value: A };
@@ -5007,6 +6112,11 @@ pub fn EffectQueue(comptime A: type, comptime E: type, comptime R: type) type {
                 }
             }.offer);
         }
+        /// Stop the capability and release its retained resources.
+        /// Parameters:
+        /// - `queue: *Core`: Queue capability used for this operation.
+        /// - `drain: comptime bool`: Whether pending work must finish before shutdown.
+        /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn shutdown(queue: *Core, comptime drain: bool) Unit {
             return Unit.fromBorrowed(Core, queue, struct {
                 fn shutdown(value: *const Core, _: *const R) outcomes.Exit(void, E) {
@@ -5015,6 +6125,10 @@ pub fn EffectQueue(comptime A: type, comptime E: type, comptime R: type) type {
                 }
             }.shutdown);
         }
+        /// Read the current number of elements.
+        /// Parameters:
+        /// - `queue: *Core`: Queue capability used for this operation.
+        /// Returns (`Effect(usize, E, R)`): current queue length observed through its synchronized state.
         pub fn size(queue: *Core) Effect(usize, E, R) {
             return Effect(usize, E, R).fromBorrowed(Core, queue, struct {
                 fn read(value: *const Core, _: *const R) outcomes.Exit(usize, E) {
@@ -5025,9 +6139,18 @@ pub fn EffectQueue(comptime A: type, comptime E: type, comptime R: type) type {
     };
 }
 
+/// Specialize Effect-backed console output through `R`.
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): console write operations that use the caller-provided output capability in `R`.
 pub fn EffectConsole(comptime R: type) type {
     return struct {
         const Out = Effect(void, outcomes.Defect, R);
+        /// Write through the selected capability.
+        /// Parameters:
+        /// - `message: comptime fn (*const R) []const u8`: Compile-time typed input value; move or clone owning payloads according to
+        ///   its type contract.
+        /// Returns (`Out`): The typed operation result or description selected by this API.
         pub fn write(comptime message: fn (*const R) []const u8) Out {
             return Out.fromOutcome(struct {
                 fn run(env: *const R) outcomes.Exit(void, outcomes.Defect) {
@@ -5035,6 +6158,11 @@ pub fn EffectConsole(comptime R: type) type {
                 }
             }.run);
         }
+        /// Write a message to the console’s error channel.
+        /// Parameters:
+        /// - `message: comptime fn (*const R) []const u8`: Compile-time typed input value; move or clone owning payloads according to
+        ///   its type contract.
+        /// Returns (`Out`): The typed operation result or description selected by this API.
         pub fn err(comptime message: fn (*const R) []const u8) Out {
             return Out.fromOutcome(struct {
                 fn run(env: *const R) outcomes.Exit(void, outcomes.Defect) {

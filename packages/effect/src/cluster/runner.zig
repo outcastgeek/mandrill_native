@@ -6,14 +6,25 @@ const effects = @import("../effect.zig");
 const store_module = @import("message_store.zig");
 const types = @import("cluster_types.zig");
 
+/// Specialize the typed cluster error channel from its compile-time error type.
+/// Parameters:
+/// - `StoreError: comptime type`: Compile-time typed store failure.
+/// - `CodecError: comptime type`: Failure type returned by the selected encoder or decoder.
+/// Returns (`type`): typed cluster-runner failure union retaining its domain error channel.
 pub fn Error(comptime StoreError: type, comptime CodecError: type) type {
     return union(enum) {
         const Self = @This();
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = outcomes.ownsPayload(StoreError) or outcomes.ownsPayload(CodecError);
         store: StoreError,
         codec: CodecError,
         invalid_claim,
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             switch (self.*) {
                 .store => outcomes.discardPayload(&self.store),
@@ -23,6 +34,11 @@ pub fn Error(comptime StoreError: type, comptime CodecError: type) type {
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!Self`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const Self) error{OutOfMemory}!Self {
             return switch (self.*) {
                 .store => |value| .{ .store = try outcomes.clonePayload(value) },
@@ -33,6 +49,7 @@ pub fn Error(comptime StoreError: type, comptime CodecError: type) type {
     };
 }
 
+/// Number of processed messages and reason a bounded processing batch stopped.
 pub const BatchProgress = struct {
     completed: usize,
     stopped: enum { drained, ownership_lost, stale_claim, uncertain },
@@ -42,6 +59,26 @@ pub const BatchProgress = struct {
 /// stop at a fenced or uncertain completion. The claimed page is retained by
 /// structured acquisition until every handler and store operation has joined.
 /// Use `serveClaims` when a caller wants bounded parallel execution of a page.
+///
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `CodecError: comptime type`: Failure type returned by the selected encoder or decoder.
+/// - `guarantee: comptime store_module.Guarantee`: Compile-time volatility or recoverability promised by this provider; durable compositions check it before compiling.
+/// - `select_store: comptime fn (*const R) *const store_module.MessageStore(R, ProviderError, guarantee)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_address: comptime fn (*const R) types.EntityAddress`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_owner: comptime fn (*const R) types.Ownership`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_policy: comptime fn (*const R) store_module.ClaimPolicy`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `handler: comptime fn (*const store_module.ClaimedMessage, *const R) effects.Effect(A, E, R)`: Compile-time typed callback; its signature is checked at comptime where static.
+/// - `encode_exit: comptime fn (*const outcomes.Exit(A, E), *const R) outcomes.Exit(outcomes.OwnedSlice(u8), CodecError)`: Compile-time typed function selected at comptime; no runtime callback lookup
+///   is required.
+/// Returns (`effects.Effect(BatchProgress, Error(store_module.MessageStore(R, ProviderError, guarantee).Failure, CodecError), R)`): progress after claiming and processing a bounded batch under a valid ownership lease.
 pub fn claimAndServe(
     comptime A: type,
     comptime E: type,
@@ -101,6 +138,22 @@ pub fn claimAndServe(
 /// Run a typed handler and save its full Exit under the claim's ownership
 /// fence. A stale or uncertain completion remains an explicit store result.
 /// The claim selected from R must remain alive until this Effect completes.
+///
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `CodecError: comptime type`: Failure type returned by the selected encoder or decoder.
+/// - `guarantee: comptime store_module.Guarantee`: Compile-time volatility or recoverability promised by this provider; durable compositions check it before compiling.
+/// - `select_store: comptime fn (*const R) *const store_module.MessageStore(R, ProviderError, guarantee)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_claim: comptime fn (*const R) *const store_module.ClaimedMessage`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `handler: comptime fn (*const store_module.ClaimedMessage, *const R) effects.Effect(A, E, R)`: Compile-time typed callback; its signature is checked at comptime where static.
+/// - `encode_exit: comptime fn (*const outcomes.Exit(A, E), *const R) outcomes.Exit(outcomes.OwnedSlice(u8), CodecError)`: Compile-time typed function selected at comptime; no runtime callback lookup
+///   is required.
+/// Returns (`effects.Effect(store_module.Completion, Error(store_module.MessageStore(R, ProviderError, guarantee).Failure, CodecError), R)`): result of handling one claimed message and committing its reply under the claim fence.
 pub fn serveClaim(
     comptime A: type,
     comptime E: type,
@@ -126,6 +179,22 @@ pub fn serveClaim(
 /// caller and admitted through Effect's selected execution capabilities.
 /// Each output corresponds to the same input position, including stale and
 /// uncertain fenced completions.
+///
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `CodecError: comptime type`: Failure type returned by the selected encoder or decoder.
+/// - `guarantee: comptime store_module.Guarantee`: Compile-time volatility or recoverability promised by this provider; durable compositions check it before compiling.
+/// - `concurrency: usize`: Maximum number of operations permitted to run at once.
+/// - `claims: []const *const store_module.ClaimedMessage`: Borrowed claims processed together in this batch.
+/// - `select_store: comptime fn (*const R) *const store_module.MessageStore(R, ProviderError, guarantee)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `handler: comptime fn (*const store_module.ClaimedMessage, *const R) effects.Effect(A, E, R)`: Compile-time typed callback; its signature is checked at comptime where static.
+/// - `encode_exit: comptime fn (*const outcomes.Exit(A, E), *const R) outcomes.Exit(outcomes.OwnedSlice(u8), CodecError)`: Compile-time typed function selected at comptime; no runtime callback lookup
+///   is required.
+/// Returns (`effects.Effect(outcomes.OwnedSlice(store_module.Completion), Error(store_module.MessageStore(R, ProviderError, guarantee).Failure, CodecError), R)`): progress after serving the supplied claimed messages in order.
 pub fn serveClaims(
     comptime A: type,
     comptime E: type,
@@ -170,15 +239,26 @@ fn serveAt(
     const Out = effects.Effect(store_module.Completion, Failure, R);
     const Encoded = outcomes.OwnedSlice(u8);
     const Owner = struct {
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         claim: *const store_module.ClaimedMessage,
         bytes: Encoded,
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *@This()) void {
             self.bytes.deinit();
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
             return .{ .claim = self.claim, .bytes = try self.bytes.clone() };
         }

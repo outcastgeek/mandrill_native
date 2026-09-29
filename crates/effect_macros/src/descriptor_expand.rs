@@ -1,3 +1,5 @@
+//! Expansion of typed feature descriptors and registrations.
+
 use proc_macro2::TokenStream;
 use quote::quote;
 use std::collections::BTreeMap;
@@ -5,6 +7,7 @@ use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::{Expr, Ident, Token};
 
+/// Typed field used by descriptor expand.
 struct Field {
     name: Ident,
     _colon: Option<Token![:]>,
@@ -12,6 +15,12 @@ struct Field {
 }
 
 impl Parse for Field {
+    ///
+    /// # Parameters
+    /// - `input` (`ParseStream<'_>`): Owned input decoded or consumed by this operation.
+    ///
+    /// # Returns
+    /// Type: `syn::Result<Self>`.
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let name: Ident = input.parse()?;
         let colon = if input.peek(Token![:]) {
@@ -29,11 +38,18 @@ impl Parse for Field {
     }
 }
 
+/// Typed named fields used by descriptor expand.
 pub(crate) struct NamedFields {
     values: BTreeMap<String, Expr>,
 }
 
 impl Parse for NamedFields {
+    ///
+    /// # Parameters
+    /// - `input` (`ParseStream<'_>`): Owned input decoded or consumed by this operation.
+    ///
+    /// # Returns
+    /// Type: `syn::Result<Self>`.
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let fields = Punctuated::<Field, Token![,]>::parse_terminated(input)?;
         let mut values = BTreeMap::new();
@@ -51,10 +67,22 @@ impl Parse for NamedFields {
 }
 
 impl NamedFields {
+    /// # Parameters
+    /// - `name` (`&str`): Stable name used to register or locate this definition.
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     pub(crate) fn contains(&self, name: &str) -> bool {
         self.values.contains_key(name)
     }
 
+    ///
+    /// # Parameters
+    /// - `name` (`&str`): Stable name used to register or locate this definition.
+    ///
+    /// # Returns
+    /// Type: `syn::Result<Expr>`.
     fn take(&mut self, name: &str) -> syn::Result<Expr> {
         self.values.remove(name).ok_or_else(|| {
             syn::Error::new(
@@ -64,6 +92,13 @@ impl NamedFields {
         })
     }
 
+    ///
+    /// # Parameters
+    /// - `first` (`&str`): First value or branch in the ordered composition.
+    /// - `second` (`&str`): The second supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `syn::Result<Expr>`.
     fn take_one_of(&mut self, first: &str, second: &str) -> syn::Result<Expr> {
         match (self.values.remove(first), self.values.remove(second)) {
             (Some(value), None) | (None, Some(value)) => Ok(value),
@@ -78,6 +113,9 @@ impl NamedFields {
         }
     }
 
+    ///
+    /// # Returns
+    /// Type: `syn::Result<()>`.
     fn finish(self) -> syn::Result<()> {
         if let Some((name, _)) = self.values.into_iter().next() {
             Err(syn::Error::new(
@@ -89,11 +127,26 @@ impl NamedFields {
         }
     }
 
+    ///
+    /// # Parameters
+    /// - `name` (`&str`): Stable name used to register or locate this definition.
+    ///
+    /// # Returns
+    /// Type: `Option<Expr>`.
+    /// Returns the value when present, or `None`.
     fn optional(&mut self, name: &str) -> Option<Expr> {
         self.values.remove(name)
     }
 }
 
+///
+/// # Parameters
+/// - `expression` (`Expr`): The expression supplied to this operation.
+/// - `parameters` (`usize`): The parameters supplied to this operation.
+/// - `path` (`&TokenStream`): Location of the field, file, or configuration value being processed.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 fn effect_evaluator(
     expression: Expr,
     parameters: usize,
@@ -137,6 +190,11 @@ fn effect_evaluator(
     ))
 }
 
+/// # Parameters
+/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn reactive_source(mut fields: NamedFields) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
     let registry = fields.take("registry")?;
@@ -150,6 +208,11 @@ pub(crate) fn reactive_source(mut fields: NamedFields) -> syn::Result<TokenStrea
     )))
 }
 
+/// # Parameters
+/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn reactive_derived(mut fields: NamedFields) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
     let registry = fields.take("registry")?;
@@ -163,6 +226,11 @@ pub(crate) fn reactive_derived(mut fields: NamedFields) -> syn::Result<TokenStre
     )))
 }
 
+/// # Parameters
+/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn reactive_query(mut fields: NamedFields) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
     let registry = fields.take("registry")?;
@@ -174,6 +242,11 @@ pub(crate) fn reactive_query(mut fields: NamedFields) -> syn::Result<TokenStream
     )))
 }
 
+/// # Parameters
+/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn reactive_bridge(mut fields: NamedFields) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
     let read = effect_evaluator(fields.take("read")?, 0, &path)?;
@@ -184,6 +257,11 @@ pub(crate) fn reactive_bridge(mut fields: NamedFields) -> syn::Result<TokenStrea
     )))
 }
 
+/// # Parameters
+/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn rpc_operation(mut fields: NamedFields) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
     let id = fields.take("id")?;
@@ -203,6 +281,11 @@ pub(crate) fn rpc_operation(mut fields: NamedFields) -> syn::Result<TokenStream>
     })
 }
 
+/// # Parameters
+/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn rpc_stream_operation(mut fields: NamedFields) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
     let id = fields.take("id")?;
@@ -218,6 +301,11 @@ pub(crate) fn rpc_stream_operation(mut fields: NamedFields) -> syn::Result<Token
     )))
 }
 
+/// # Parameters
+/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn rpc_protocol(mut fields: NamedFields) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
     let policy = fields.take("policy")?;
@@ -246,6 +334,11 @@ pub(crate) fn rpc_protocol(mut fields: NamedFields) -> syn::Result<TokenStream> 
     )
 }
 
+/// # Parameters
+/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn rpc_stream_protocol(mut fields: NamedFields) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
     let policy = fields.take("policy")?;
@@ -274,6 +367,11 @@ pub(crate) fn rpc_stream_protocol(mut fields: NamedFields) -> syn::Result<TokenS
     )
 }
 
+/// # Parameters
+/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn rpc_middleware(mut fields: NamedFields) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
     let handler = fields.take("handler")?;
@@ -286,6 +384,11 @@ pub(crate) fn rpc_middleware(mut fields: NamedFields) -> syn::Result<TokenStream
     )))
 }
 
+/// # Parameters
+/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn rpc_stream_middleware(mut fields: NamedFields) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
     let handler = fields.take("handler")?;
@@ -299,6 +402,11 @@ pub(crate) fn rpc_stream_middleware(mut fields: NamedFields) -> syn::Result<Toke
     )))
 }
 
+/// # Parameters
+/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn entity(mut fields: NamedFields) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
     let dispatcher = fields.optional("dispatcher");
@@ -333,6 +441,11 @@ pub(crate) fn entity(mut fields: NamedFields) -> syn::Result<TokenStream> {
     })
 }
 
+/// # Parameters
+/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn event(mut fields: NamedFields) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
     let group = fields.take("group")?;
@@ -360,6 +473,11 @@ pub(crate) fn event(mut fields: NamedFields) -> syn::Result<TokenStream> {
     )))
 }
 
+/// # Parameters
+/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn event_group(mut fields: NamedFields) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
     let group = fields.take("group")?;
@@ -387,6 +505,11 @@ pub(crate) fn event_group(mut fields: NamedFields) -> syn::Result<TokenStream> {
     )
 }
 
+/// # Parameters
+/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn projection(mut fields: NamedFields) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
     let key = fields.take("key")?;
@@ -400,6 +523,11 @@ pub(crate) fn projection(mut fields: NamedFields) -> syn::Result<TokenStream> {
     )))
 }
 
+/// # Parameters
+/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn workflow_definition(mut fields: NamedFields) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
     let id = fields.take("id")?;
@@ -416,6 +544,11 @@ pub(crate) fn workflow_definition(mut fields: NamedFields) -> syn::Result<TokenS
     }))
 }
 
+/// # Parameters
+/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn workflow(mut fields: NamedFields) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
     let id = fields.take_one_of("id", "name")?;
@@ -436,6 +569,12 @@ pub(crate) fn workflow(mut fields: NamedFields) -> syn::Result<TokenStream> {
     )))
 }
 
+///
+/// # Parameters
+/// - `expression` (`Expr`): The expression supplied to this operation.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 fn durable_evaluator(expression: Expr) -> syn::Result<TokenStream> {
     let Expr::Closure(closure) = expression else {
         return Err(syn::Error::new_spanned(
@@ -476,6 +615,11 @@ fn durable_evaluator(expression: Expr) -> syn::Result<TokenStream> {
     Ok(quote!(move |#inputs| #body))
 }
 
+/// # Parameters
+/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn activity_definition(mut fields: NamedFields) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
     let id = fields.take("id")?;
@@ -488,6 +632,11 @@ pub(crate) fn activity_definition(mut fields: NamedFields) -> syn::Result<TokenS
     }))
 }
 
+/// # Parameters
+/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn activity(mut fields: NamedFields) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
     if let Some(description) = fields.optional("description") {

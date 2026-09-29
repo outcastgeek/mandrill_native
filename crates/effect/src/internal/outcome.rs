@@ -1,6 +1,16 @@
 //! Source Outcome.fs semantics without cloning owned application errors.
 use crate::{CleanupFailure, Exit, Finalization, PrimaryOutcome};
 
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
+///
+/// # Parameters
+/// - `outcome` (`&Exit<A, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+///
+/// # Returns
+/// Type: `bool`.
+/// Returns whether the requested condition holds.
 pub(crate) fn interrupted<A, E>(outcome: &Exit<A, E>) -> bool {
     matches!(
         outcome,
@@ -12,6 +22,15 @@ pub(crate) fn interrupted<A, E>(outcome: &Exit<A, E>) -> bool {
     )
 }
 
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
+///
+/// # Parameters
+/// - `outcome` (`Exit<A, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+///
+/// # Returns
+/// Type: `Vec<CleanupFailure<E>>`.
 pub(crate) fn cleanup_failures<A, E>(outcome: Exit<A, E>) -> Vec<CleanupFailure<E>> {
     match outcome {
         Exit::Success(_) => Vec::new(),
@@ -32,12 +51,32 @@ pub(crate) fn cleanup_failures<A, E>(outcome: Exit<A, E>) -> Vec<CleanupFailure<
     }
 }
 
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
+///
+/// # Parameters
+/// - `outcome` (`Exit<A, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+/// - `cleanup` (`Exit<(), E>`): The cleanup supplied to this operation.
+///
+/// # Returns
+/// Type: `Exit<A, E>`.
 pub(crate) fn append_cleanup<A, E>(outcome: Exit<A, E>, cleanup: Exit<(), E>) -> Exit<A, E> {
     append_failures(outcome, cleanup_failures(cleanup))
 }
 
 /// Parallel losers retain their cleanup failures, not their discarded primary.
 /// The caller owns destruction and must invoke this outside bookkeeping gates.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
+///
+/// # Parameters
+/// - `outcome` (`Exit<A, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+///
+/// # Returns
+/// Type: `Vec<CleanupFailure<E>>`.
 pub(crate) fn failures<A, E>(outcome: Exit<A, E>) -> Vec<CleanupFailure<E>> {
     match outcome {
         Exit::FinalizationFailed(details) => {
@@ -47,6 +86,16 @@ pub(crate) fn failures<A, E>(outcome: Exit<A, E>) -> Vec<CleanupFailure<E>> {
     }
 }
 
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
+///
+/// # Parameters
+/// - `outcome` (`Exit<A, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+/// - `additional` (`impl IntoIterator<Item = CleanupFailure<E>>`): The additional supplied to this operation.
+///
+/// # Returns
+/// Type: `Exit<A, E>`.
 pub(crate) fn append_failures<A, E>(
     outcome: Exit<A, E>,
     additional: impl IntoIterator<Item = CleanupFailure<E>>,

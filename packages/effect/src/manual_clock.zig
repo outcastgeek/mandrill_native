@@ -1,3 +1,4 @@
+//! Deterministic, caller-advanced clock for scheduling and cancellation.
 const diagnostics = @import("internal/diagnostics.zig");
 const std = @import("std");
 const providers = @import("services.zig");
@@ -13,9 +14,18 @@ pub const ManualClock = struct {
     changed: std.Io.Condition = .init,
     time: std.Io.Timestamp,
     waiters: ?*Waiter = null,
+    /// Start a controllable clock at the supplied timestamp using the environment I/O.
+    /// Parameters:
+    /// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected capabilities.
+    /// - `initial: std.Io.Timestamp`: Starting timestamp reported by the manual clock.
+    /// Returns (`Self`): a clock whose time advances only when its owner advances it.
     pub fn init(env: anytype, initial: std.Io.Timestamp) Self {
         return .{ .io = env.io, .time = initial };
     }
+    /// Expose this implementation through its service interface.
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`providers.Clock`): A clock capability borrowing this manual clock’s state.
     pub fn service(self: *Self) providers.Clock {
         return .{ .userdata = self, .vtable = &.{ .now = now, .sleep = sleep } };
     }
@@ -58,6 +68,11 @@ pub const ManualClock = struct {
         self.mutex.unlock(self.io);
         return if (interrupted) .interrupted else .done;
     }
+    /// Advance the manual clock and wake due sleepers.
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// - `duration: std.Io.Duration`: Caller-supplied time or cursor boundary used for ordering and retention.
+    /// Returns (`outcomes.Exit(void, outcomes.Defect)`): Carries no value on `.success` or `outcomes.Defect` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
     pub fn advance(self: *Self, duration: std.Io.Duration) outcomes.Exit(void, outcomes.Defect) {
         if (duration.nanoseconds < 0) return .{ .die = .{ .kind = .invalid_configuration, .message = diagnostics.manual_clock_cannot_move_backwards } };
         self.mutex.lockUncancelable(self.io);
@@ -70,6 +85,10 @@ pub const ManualClock = struct {
         }
         return .{ .success = {} };
     }
+    /// Read the count of currently pending operations.
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`usize`): The current size or count reported by this operation.
     pub fn pending(self: *Self) usize {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -81,6 +100,11 @@ pub const ManualClock = struct {
         }
         return count;
     }
+    /// Wait until the requested number of sleepers is pending.
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// - `count: usize`: number of pending sleepers to wait for before returning.
+    /// Returns (`outcomes.Exit(void, outcomes.Defect)`): Carries no value on `.success` or `outcomes.Defect` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
     pub fn awaitPending(self: *Self, count: usize) outcomes.Exit(void, outcomes.Defect) {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -95,6 +119,10 @@ pub const ManualClock = struct {
             self.changed.wait(self.io, &self.mutex) catch return .interrupted;
         }
     }
+    /// Release resources owned by this value.
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn deinit(self: *Self) void {
         std.debug.assert(self.waiters == null);
         self.* = undefined;

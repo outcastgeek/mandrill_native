@@ -1,3 +1,5 @@
+//! Encoded-side JSON Schema representation export.
+
 use super::{
     JsonValue, PrimitiveShape, SchemaAst, SchemaShape, StringLengthUnit, StringPattern,
     UnknownFields,
@@ -11,25 +13,39 @@ use std::sync::Arc;
 /// exempt each traversal occurrence from the node/depth budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RepresentationLimits {
+    /// Maximum permitted nesting depth. Type: `NonZeroUsize`.
     pub depth: NonZeroUsize,
+    /// Maximum permitted schema or parse nodes. Type: `NonZeroUsize`.
     pub nodes: NonZeroUsize,
+    /// Maximum number of schema definitions in exported output. Type: `NonZeroUsize`.
     pub definitions: NonZeroUsize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Whether an exported representation preserves the source schema exactly or approximately.
 pub enum RepresentationPrecision {
+    /// The exported representation preserves the source constraint exactly.
     Exact,
+    /// The exported representation may lose source-schema constraints.
     Approximate,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// A typed reason a schema cannot be exported under the requested representation limits.
 pub enum RepresentationError {
+    /// The configured depth limit was reached.
     DepthLimit,
+    /// No de limit is available.
     NodeLimit,
+    /// The configured definition limit was reached.
     DefinitionLimit,
+    /// A schema reference names no available definition. Retains the `Arc<str>` detail.
     UnresolvedReference(Arc<str>),
+    /// The schema reference name was bound to a different definition. Retains the `Arc<str>` detail.
     ConflictingReference(Arc<str>),
+    /// The range failed validation.
     InvalidRange,
+    /// The definition violates required construction rules.
     InvalidDefinition,
 }
 
@@ -42,21 +58,32 @@ pub struct JsonSchemaDocument {
 
 impl JsonSchemaDocument {
     #[must_use]
+    /// Borrow the JSON value held by this representation.
+    ///
+    /// # Returns
+    /// Type: `&JsonValue`.
     pub fn value(&self) -> &JsonValue {
         &self.value
     }
 
     #[must_use]
+    /// Transfer the owned JSON value to the caller.
+    ///
+    /// # Returns
+    /// Type: `JsonValue`.
     pub fn into_value(self) -> JsonValue {
         self.value
     }
 
     #[must_use]
+    /// # Returns
+    /// Type: `RepresentationPrecision`.
     pub const fn precision(&self) -> RepresentationPrecision {
         self.precision
     }
 }
 
+/// Typed exporter used by schema json schema.
 struct Exporter {
     limits: RepresentationLimits,
     visited: usize,
@@ -66,6 +93,12 @@ struct Exporter {
 }
 
 impl Exporter {
+    ///
+    /// # Parameters
+    /// - `depth` (`usize`): Nesting depth used to enforce a parser or schema bound.
+    ///
+    /// # Returns
+    /// Type: `Result<(), RepresentationError>`.
     fn visit(&mut self, depth: usize) -> Result<(), RepresentationError> {
         if depth > self.limits.depth.get() {
             return Err(RepresentationError::DepthLimit);
@@ -80,14 +113,30 @@ impl Exporter {
         Ok(())
     }
 
+    ///
+    /// # Parameters
+    /// - `depth` (`usize`): Nesting depth used to enforce a parser or schema bound.
+    ///
+    /// # Returns
+    /// Type: `Result<usize, RepresentationError>`.
     fn child_depth(depth: usize) -> Result<usize, RepresentationError> {
         depth.checked_add(1).ok_or(RepresentationError::DepthLimit)
     }
 
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn approximate(&mut self) {
         self.precision = RepresentationPrecision::Approximate;
     }
 
+    ///
+    /// # Parameters
+    /// - `schema` (`&SchemaAst`): Codec and validation rules for the application value.
+    /// - `depth` (`usize`): Nesting depth used to enforce a parser or schema bound.
+    ///
+    /// # Returns
+    /// Type: `Result<JsonValue, RepresentationError>`.
     fn shape(
         &mut self,
         schema: &SchemaAst,
@@ -323,6 +372,13 @@ impl Exporter {
 
 /// Only printable ASCII literals have an unambiguous direct translation
 /// between Rust substring matching and the supported ECMA regex subset.
+///
+/// # Parameters
+/// - `value` (`&str`): Value read, transformed, encoded, or stored by this operation.
+///
+/// # Returns
+/// Type: `Option<String>`.
+/// Returns the value when present, or `None`.
 fn ecma_literal(value: &str) -> Option<String> {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
@@ -353,6 +409,13 @@ fn ecma_literal(value: &str) -> Option<String> {
     Some(escaped)
 }
 
+///
+/// # Parameters
+/// - `value` (`JsonValue`): Value read, transformed, encoded, or stored by this operation.
+///
+/// # Returns
+/// Type: `Map<String, JsonValue>`.
+/// Returns `Map<String, JsonValue>`.
 fn into_object(value: JsonValue) -> Map<String, JsonValue> {
     if let JsonValue::Object(object) = value {
         object
@@ -363,6 +426,13 @@ fn into_object(value: JsonValue) -> Map<String, JsonValue> {
 
 /// Export a Draft 2020-12 document from the encoded-side AST. Unsupported
 /// checks are omitted conservatively and mark the result approximate.
+///
+/// # Parameters
+/// - `schema` (`&SchemaAst`): Codec and validation rules for the application value.
+/// - `limits` (`RepresentationLimits`): Explicit resource bounds enforced while processing this input.
+///
+/// # Returns
+/// Type: `Result<JsonSchemaDocument, RepresentationError>`.
 pub fn export_json_schema(
     schema: &SchemaAst,
     limits: RepresentationLimits,

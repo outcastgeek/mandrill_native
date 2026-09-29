@@ -1,26 +1,54 @@
+//! Bounded incremental envelope framing.
+
 use std::num::NonZeroUsize;
 
 /// Format 1: one version octet, one unsigned 64-bit big-endian payload length,
 /// then exactly that many payload octets. Versioning belongs to this format,
 /// not to an application's schema, request identity or domain revision.
 const VERSION: u8 = 1;
+/// Number of bytes in the fixed frame header.
 pub const FRAME_HEADER_LENGTH: usize = size_of::<u8>() + size_of::<u64>();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Caller-selected maximum frame size and framing behavior.
 pub struct FramePolicy {
+    /// The payload for maximum. Type: `NonZeroUsize`.
     pub maximum_payload: NonZeroUsize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A typed rejection of malformed or oversized framed input.
 pub enum FrameError {
+    /// The version is not supported. Carries `u8`.
     UnsupportedVersion(u8),
+    /// Computing length exceeded its supported range.
     LengthOverflow,
-    PayloadTooLarge { maximum: usize, actual: usize },
-    Truncated { received: usize, expected: usize },
+    /// The frame payload exceeds the configured byte limit.
+    PayloadTooLarge {
+        /// Maximum permitted payload length. Type: `usize`.
+        maximum: usize,
+        /// Observed payload length. Type: `usize`.
+        actual: usize,
+    },
+    /// The frame ended before all declared bytes arrived.
+    Truncated {
+        /// Bytes received so far. Type: `usize`.
+        received: usize,
+        /// Bytes required by the frame header. Type: `usize`.
+        expected: usize,
+    },
+    /// The encoded length exceeded a checked internal bound.
     InternalBounds,
 }
 
 impl std::fmt::Display for FrameError {
+    ///
+    /// # Parameters
+    /// - `formatter` (`&mut std::fmt::Formatter<'_>`): Destination formatter used by the Rust formatting trait.
+    ///
+    /// # Returns
+    /// Type: `std::fmt::Result`.
+    /// Returns `std::fmt::Result`.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(self, formatter)
     }
@@ -32,7 +60,9 @@ impl std::error::Error for FrameError {}
 /// the same input chunk is invalid. The decoder is poisoned after `error`.
 #[derive(Debug)]
 pub struct FrameDecodeFailure {
+    /// Results that have already reached a terminal state. Type: `Vec<Vec<u8>>`.
     pub completed: Vec<Vec<u8>>,
+    /// The typed error carried by this result. Type: `FrameError`.
     pub error: FrameError,
 }
 
@@ -44,6 +74,14 @@ pub struct FrameParts {
 }
 
 impl FrameParts {
+    /// Construct a `FrameParts` from its required inputs and explicit policies.
+    ///
+    /// # Parameters
+    /// - `payload` (`Vec<u8>`): Application data moved into the message or stored record.
+    /// - `policy` (`FramePolicy`): The caller-supplied behavior policy.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, FrameError>`.
     pub fn new(payload: Vec<u8>, policy: FramePolicy) -> Result<Self, FrameError> {
         if payload.len() > policy.maximum_payload.get() {
             return Err(FrameError::PayloadTooLarge {
@@ -62,10 +100,18 @@ impl FrameParts {
     }
 
     #[must_use]
+    /// Borrow the ordered segments of this path or identity.
+    ///
+    /// # Returns
+    /// Type: `(&[u8], &[u8])`.
     pub fn segments(&self) -> (&[u8], &[u8]) {
         (&self.header, &self.payload)
     }
 
+    /// Transfer the owned encoded bytes to the caller.
+    ///
+    /// # Returns
+    /// Type: `Result<Vec<u8>, FrameError>`.
     pub fn into_bytes(mut self) -> Result<Vec<u8>, FrameError> {
         let total = FRAME_HEADER_LENGTH
             .checked_add(self.payload.len())
@@ -77,6 +123,7 @@ impl FrameParts {
     }
 }
 
+/// Variants of decode state used by encoding frame.
 enum DecodeState {
     Header {
         bytes: [u8; FRAME_HEADER_LENGTH],
@@ -98,6 +145,11 @@ pub struct FrameDecoder {
 
 impl FrameDecoder {
     #[must_use]
+    /// # Parameters
+    /// - `policy` (`FramePolicy`): The caller-supplied behavior policy.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub const fn new(policy: FramePolicy) -> Self {
         Self {
             policy,
@@ -110,6 +162,12 @@ impl FrameDecoder {
 
     /// Input may split a header or payload at any octet. Complete payloads
     /// move into output in wire order, with no Clone of application values.
+    ///
+    /// # Parameters
+    /// - `input` (`&[u8]`): The input value or factory consumed by this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Vec<Vec<u8>>, FrameDecodeFailure>`.
     pub fn push(&mut self, mut input: &[u8]) -> Result<Vec<Vec<u8>>, FrameDecodeFailure> {
         if let DecodeState::Poisoned(error) = &self.state {
             return Err(FrameDecodeFailure {
@@ -201,6 +259,10 @@ impl FrameDecoder {
         Ok(complete)
     }
 
+    /// Record the terminal status and release remaining operation ownership.
+    ///
+    /// # Returns
+    /// Type: `Result<(), FrameError>`.
     pub fn finish(&self) -> Result<(), FrameError> {
         match &self.state {
             DecodeState::Header { used: 0, .. } => Ok(()),
@@ -216,6 +278,13 @@ impl FrameDecoder {
         }
     }
 
+    ///
+    /// # Parameters
+    /// - `error` (`FrameError`): Expected or provider error preserved in the returned outcome.
+    /// - `completed` (`Vec<Vec<u8>>`): The completed supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Vec<Vec<u8>>, FrameDecodeFailure>`.
     fn poison(
         &mut self,
         error: FrameError,

@@ -7,16 +7,28 @@ const outcomes = @import("outcome.zig");
 const schema_issue = @import("schema/schema_issue.zig");
 const schemas = @import("schema.zig");
 
+/// Configuration lookup result: present owned bytes or an absent value. Release present bytes after use.
 pub const Read = union(enum) {
+    /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit` and
+    /// must be released after use.
     pub const effect_owned_payload = true;
     present: outcomes.OwnedSlice(u8),
     missing,
 
+    /// Release resources owned by this value.
+    /// Parameters:
+    /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn deinit(self: *@This()) void {
         if (self.* == .present) self.present.deinit();
         self.* = undefined;
     }
 
+    /// Duplicate this value; marked owning payloads are cloned, while ordinary
+    /// borrowed fields retain their original lifetime.
+    /// Parameters:
+    /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+    /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
     pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
         return switch (self.*) {
             .present => |bytes| .{ .present = try bytes.clone() },
@@ -25,9 +37,15 @@ pub const Read = union(enum) {
     }
 };
 
+/// Specialize the typed config error channel from its compile-time error type.
+/// Parameters:
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// Returns (`type`): tagged configuration failure union distinguishing provider, missing, invalid, and unavailable cases.
 pub fn Error(comptime ProviderError: type) type {
     return union(enum) {
         const Self = @This();
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         provider: ProviderError,
         missing,
@@ -35,6 +53,10 @@ pub fn Error(comptime ProviderError: type) type {
         invalid_key,
         unavailable,
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             switch (self.*) {
                 .provider => outcomes.discardPayload(&self.provider),
@@ -44,6 +66,11 @@ pub fn Error(comptime ProviderError: type) type {
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!Self`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const Self) error{OutOfMemory}!Self {
             return switch (self.*) {
                 .provider => |value| .{ .provider = try outcomes.clonePayload(value) },
@@ -54,22 +81,54 @@ pub fn Error(comptime ProviderError: type) type {
     };
 }
 
+/// Specialize a configuration-source provider and its typed read error.
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// Returns (`type`): provider contract for reading configuration values with typed failures.
 pub fn Source(comptime R: type, comptime ProviderError: type) type {
     return struct {
         const Self = @This();
+        /// Typed failure channel combining domain and provider errors.
         pub const Failure = Error(ProviderError);
+        /// Lazy Effect for read effect; success, error, and environment types are fixed by
+        /// `effects.Effect(Read, Failure, R)`.
         pub const ReadEffect = effects.Effect(Read, Failure, R);
         userdata: ?*anyopaque,
         vtable: *const VTable,
 
+        /// Typed function-pointer interface for this capability. Implement every
+        /// hook with the exact signature below; keep the table valid while the
+        /// capability or pending work can invoke it.
         pub const VTable = struct {
+            /// Read the selected value.
+            /// Parameters (callback order):
+            /// - `1: ?*anyopaque`: opaque provider or handle context; keep it live until the hook and any retained work complete.
+            /// - `2: *const R`: borrowed generic environment `R`, including caller-supplied runtime services.
+            /// - `3: []const u8`: borrowed input slice; keep it valid through deferred use or copy before retaining it.
+            /// Returns (`ReadEffect`): lazy typed Effect; run it with its declared environment to obtain Exit.
             read: *const fn (?*anyopaque, *const R, []const u8) ReadEffect,
         };
 
+        /// Wrap a caller-supplied provider implementation.
+        /// Parameters:
+        /// - `data: ?*anyopaque`: Borrowed provider context passed unchanged to every hook.
+        ///   Its owner keeps it alive through any pending effect or operation.
+        /// - `vtable: *const VTable`: Borrowed table of exactly typed callbacks; keep it
+        ///   alive for every use of this capability, including deferred execution.
+        /// Returns (`Self`): A non-owning adapter referencing `data` and `vtable`; no
+        ///   provider state is allocated or transferred by this constructor.
         pub fn fromProvider(data: ?*anyopaque, vtable: *const VTable) Self {
             return .{ .userdata = data, .vtable = vtable };
         }
 
+        /// Read through the selected capability.
+        /// Parameters:
+        /// - `name: comptime []const u8`: Compile-time stable, nonempty identity component validated at definition
+        ///   time.
+        /// - `select: comptime fn (*const R) *const Self`: Compile-time typed function selected at comptime; no runtime callback
+        ///   lookup is required.
+        /// Returns (`ReadEffect`): typed lookup from the selected configuration source.
         pub fn read(comptime name: []const u8, comptime select: fn (*const R) *const Self) ReadEffect {
             if (name.len == 0 or !std.unicode.utf8ValidateSlice(name)) @compileError("configuration keys must be nonempty UTF-8");
             return ReadEffect.deferEffect(struct {
@@ -87,6 +146,17 @@ pub fn Source(comptime R: type, comptime ProviderError: type) type {
 /// its independent JSON document alive for any borrowed decoded fields.
 /// The key, source projection and schema are definition-time values, so this
 /// adds no runtime registry, lookup table or erased codec dispatch.
+///
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `name: comptime []const u8`: Compile-time stable, nonempty identity component validated at definition time.
+/// - `select: comptime fn (*const R) *const Source(R, ProviderError)`: Compile-time typed function selected at comptime; no runtime callback lookup is
+///   required.
+/// - `schema: comptime schemas.Schema(A, schema_issue.Issue)`: Compile-time typed codec/schema fixing the corresponding decoded and encoded value
+///   types.
+/// Returns (`effects.Effect(schemas.Parsed(A), Error(ProviderError), R)`): decoded required setting or a typed missing/invalid failure.
 pub fn required(
     comptime A: type,
     comptime R: type,
@@ -134,6 +204,17 @@ fn decodeBytes(
 
 /// Missing is a successful optional result. A present but invalid setting
 /// remains a typed failure and never silently selects the missing branch.
+///
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `name: comptime []const u8`: Compile-time stable, nonempty identity component validated at definition time.
+/// - `select: comptime fn (*const R) *const Source(R, ProviderError)`: Compile-time typed function selected at comptime; no runtime callback lookup is
+///   required.
+/// - `schema: comptime schemas.Schema(A, schema_issue.Issue)`: Compile-time typed codec/schema fixing the corresponding decoded and encoded value
+///   types.
+/// Returns (`effects.Effect(?schemas.Parsed(A), Error(ProviderError), R)`): optional decoded setting; absence succeeds, invalid content fails.
 pub fn optional(
     comptime A: type,
     comptime R: type,
@@ -165,6 +246,19 @@ pub fn optional(
 
 /// The fallback is an ordinary Effect, so its dependencies and failures stay
 /// visible in R/E. It runs only when the key is absent, not on invalid input.
+///
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `name: comptime []const u8`: Compile-time stable, nonempty identity component validated at definition time.
+/// - `select: comptime fn (*const R) *const Source(R, ProviderError)`: Compile-time typed function selected at comptime; no runtime callback lookup is
+///   required.
+/// - `schema: comptime schemas.Schema(A, schema_issue.Issue)`: Compile-time typed codec/schema fixing the corresponding decoded and encoded value
+///   types.
+/// - `fallback: comptime fn (*const R) effects.Effect(schemas.Parsed(A), Error(ProviderError), R)`: Compile-time typed function selected at comptime; no runtime callback lookup is
+///   required.
+/// Returns (`effects.Effect(schemas.Parsed(A), Error(ProviderError), R)`): decoded setting or the caller-supplied fallback Effect when absent.
 pub fn withDefault(
     comptime A: type,
     comptime R: type,
@@ -192,6 +286,10 @@ pub fn withDefault(
 /// A volatile source for explicit application settings and contract tests.
 /// Values are copied on write and read; no environment variable, file system
 /// or service provider is built into the core package.
+///
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): in-memory configuration source type with caller-owned runtime state.
 pub fn MemorySource(comptime R: type) type {
     return struct {
         const Self = @This();
@@ -205,6 +303,11 @@ pub fn MemorySource(comptime R: type) type {
         mutex: std.Io.Mutex = .init,
         values: std.StringHashMap(Entry),
 
+        /// Create the in-memory configuration source using the caller environment.
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Self`): a source whose storage and synchronization use the supplied environment.
         pub fn init(env: *const R) Self {
             if (R == void or !@hasField(R, "allocator") or @FieldType(R, "allocator") != std.mem.Allocator)
                 @compileError("MemorySource requires caller allocator in R");
@@ -213,6 +316,10 @@ pub fn MemorySource(comptime R: type) type {
             return .{ .allocator = env.allocator, .io = env.io, .values = std.StringHashMap(Entry).init(env.allocator) };
         }
 
+        /// Expose this implementation through its capability interface.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`Provider`): A capability adapter referencing the selected implementation; keep its backing state alive while in use.
         pub fn capability(self: *Self) Provider {
             return Provider.fromProvider(self, &.{ .read = readEffect });
         }
@@ -253,6 +360,13 @@ pub fn MemorySource(comptime R: type) type {
             }
         }
 
+        /// Store the supplied value under its typed key.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `name: []const u8`: Stable, nonempty identity component validated at definition time.
+        /// - `value: []const u8`: Borrowed input; keep its owner alive until the operation has copied or
+        ///   joined it.
+        /// Returns (`outcomes.Exit(void, Failure)`): Carries no value on `.success` or `Failure` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn put(self: *Self, name: []const u8, value: []const u8) outcomes.Exit(void, Failure) {
             if (name.len == 0 or !std.unicode.utf8ValidateSlice(name)) return .{ .fail = .invalid_key };
             const owned_name = self.allocator.dupe(u8, name) catch return .{ .die = outcomes.Defect.out_of_memory };
@@ -275,6 +389,11 @@ pub fn MemorySource(comptime R: type) type {
             return .{ .success = {} };
         }
 
+        /// Remove the selected entry.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `name: []const u8`: Stable, nonempty identity component validated at definition time.
+        /// Returns (`outcomes.Exit(void, Failure)`): Carries no value on `.success` or `Failure` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn remove(self: *Self, name: []const u8) outcomes.Exit(void, Failure) {
             if (name.len == 0 or !std.unicode.utf8ValidateSlice(name)) return .{ .fail = .invalid_key };
             self.mutex.lockUncancelable(self.io);
@@ -287,6 +406,10 @@ pub fn MemorySource(comptime R: type) type {
             return .{ .success = {} };
         }
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             self.mutex.lockUncancelable(self.io);
             var iterator = self.values.iterator();

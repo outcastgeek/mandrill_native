@@ -1,3 +1,5 @@
+//! Pure and effectful bidirectional codecs.
+
 use super::{
     IssueSegment, JsonValue, ParsePolicy, Schema, SchemaAst, SchemaIssue, SchemaIssueKind,
     SchemaReference, SchemaShape,
@@ -5,17 +7,54 @@ use super::{
 use crate::Effect;
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// Codec callbacks are shared trait objects: Rust dispatches each callback
+/// through its local vtable, while `A`, `Encoded`, and the environments stay
+/// statically typed. Only encoded values and schema metadata cross boundaries.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `Encoded`: Encoded representation type.
 type Decoder<A, Encoded> = Arc<dyn Fn(&Encoded) -> Result<A, SchemaIssue> + Send + Sync>;
+/// Type alias for encoder in schema codec.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `Encoded`: Encoded representation type.
 type Encoder<A, Encoded> = Arc<dyn Fn(&A) -> Result<Encoded, SchemaIssue> + Send + Sync>;
+/// Type alias for type validator in schema codec.
+///
+/// # Type parameters
+/// - `A`: Application value type.
 type TypeValidator<A> = Arc<dyn Fn(&A) -> Result<(), SchemaIssue> + Send + Sync>;
+/// Type alias for effect decoder in schema codec.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `Encoded`: Encoded representation type.
+/// - `Env`: Environment type supplying required capabilities.
 type EffectDecoder<A, Encoded, Env> =
     Arc<dyn Fn(Encoded) -> Effect<A, SchemaIssue, Env> + Send + Sync>;
+/// Type alias for effect encoder in schema codec.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `Encoded`: Encoded representation type.
+/// - `Env`: Environment type supplying required capabilities.
 type EffectEncoder<A, Encoded, Env> =
     Arc<dyn Fn(A) -> Effect<Encoded, SchemaIssue, Env> + Send + Sync>;
+/// Type alias for once operation in schema codec.
+///
+/// # Type parameters
+/// - `Input`: Input value type.
+/// - `Output`: Output value type.
 type OnceOperation<Input, Output> = dyn Fn(&Input) -> Result<Output, SchemaIssue> + Send + Sync;
 
 /// Pure bidirectional conversion with independently owned results.
 /// The callbacks inspect borrowed inputs; no payload Clone is implied.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `Encoded`: Encoded representation type.
 pub struct PureCodec<A, Encoded> {
     ast: SchemaAst,
     decode: Decoder<A, Encoded>,
@@ -24,6 +63,9 @@ pub struct PureCodec<A, Encoded> {
 }
 
 impl<A, Encoded> Clone for PureCodec<A, Encoded> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             ast: self.ast.clone(),
@@ -36,6 +78,18 @@ impl<A, Encoded> Clone for PureCodec<A, Encoded> {
 
 impl<A: Send + 'static, Encoded: Send + 'static> PureCodec<A, Encoded> {
     #[must_use]
+    /// Construct a `PureCodec` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `decode` (`impl Fn(&Encoded) -> Result<A, SchemaIssue> + Send + Sync + 'static`): Callback that validates and reconstructs a typed value.
+    /// - `encode` (`impl Fn(&A) -> Result<Encoded, SchemaIssue> + Send + Sync + 'static`): The encode supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(
         decode: impl Fn(&Encoded) -> Result<A, SchemaIssue> + Send + Sync + 'static,
         encode: impl Fn(&A) -> Result<Encoded, SchemaIssue> + Send + Sync + 'static,
@@ -45,6 +99,18 @@ impl<A: Send + 'static, Encoded: Send + 'static> PureCodec<A, Encoded> {
 
     /// Construct a codec with an explicit encoded-side description. The
     /// caller must keep that description consistent with both callbacks.
+    ///
+    /// # Type parameters
+    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `ast` (`SchemaAst`): Representation tree used for schema inspection or export.
+    /// - `decode` (`impl Fn(&Encoded) -> Result<A, SchemaIssue> + Send + Sync + 'static`): Callback that validates and reconstructs a typed value.
+    /// - `encode` (`impl Fn(&A) -> Result<Encoded, SchemaIssue> + Send + Sync + 'static`): The encode supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn with_ast(
         ast: SchemaAst,
         decode: impl Fn(&Encoded) -> Result<A, SchemaIssue> + Send + Sync + 'static,
@@ -62,6 +128,15 @@ impl<A: Send + 'static, Encoded: Send + 'static> PureCodec<A, Encoded> {
     /// solely for validation would be unnecessary. Encoding remains checked
     /// independently; this callback does not bypass the encoder.
     #[must_use]
+    /// # Type parameters
+    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `validate` (`impl Fn(&A) -> Result<(), SchemaIssue> + Send + Sync + 'static`): The validate supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn with_type_validator(
         mut self,
         validate: impl Fn(&A) -> Result<(), SchemaIssue> + Send + Sync + 'static,
@@ -74,6 +149,16 @@ impl<A: Send + 'static, Encoded: Send + 'static> PureCodec<A, Encoded> {
     /// validator does not assert that encoding succeeds; callers storing a
     /// value still use the checked encoder. Without a custom validator this
     /// method validates through encoding and discards that encoded value.
+    ///
+    /// # Type parameters
+    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `value` (`&A`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<(), SchemaIssue>`.
     pub fn validate_ref(&self, value: &A) -> Result<(), SchemaIssue> {
         match &self.validate_type {
             Some(validate) => validate(value),
@@ -81,21 +166,59 @@ impl<A: Send + 'static, Encoded: Send + 'static> PureCodec<A, Encoded> {
         }
     }
 
+    /// Decode from a borrowed representation without taking its ownership.
+    ///
+    /// # Type parameters
+    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `encoded` (`&Encoded`): The encoded supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<A, SchemaIssue>`.
     pub fn decode_ref(&self, encoded: &Encoded) -> Result<A, SchemaIssue> {
         (self.decode)(encoded)
     }
 
+    /// Encode a borrowed application value under this codec’s rules.
+    ///
+    /// # Type parameters
+    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `value` (`&A`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Encoded, SchemaIssue>`.
     pub fn encode_ref(&self, value: &A) -> Result<Encoded, SchemaIssue> {
         (self.encode)(value)
     }
 
     #[must_use]
+    /// Borrow the representation tree used for schema inspection or export.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
+    ///
+    /// # Returns
+    /// Type: `&SchemaAst`.
     pub fn ast(&self) -> &SchemaAst {
         &self.ast
     }
 
     /// Lift pure directions into independent Effect environments.
     #[must_use]
+    /// # Type parameters
+    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
+    /// - `DecodeEnv`: Capabilities required while decoding. Additional bound: `Send + Sync + 'static`.
+    /// - `EncodeEnv`: Capabilities required while encoding. Additional bound: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Returns
+    /// Type: `Codec<A, Encoded, DecodeEnv, EncodeEnv>`.
     pub fn into_effect<DecodeEnv, EncodeEnv>(&self) -> Codec<A, Encoded, DecodeEnv, EncodeEnv>
     where
         DecodeEnv: Send + Sync + 'static,
@@ -112,6 +235,17 @@ impl<A: Send + 'static, Encoded: Send + 'static> PureCodec<A, Encoded> {
 }
 
 impl<A: Send + 'static> PureCodec<A, JsonValue> {
+    /// Parse JSON text under the declared limits, then decode its typed value.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `text` (`&str`): Input text parsed or emitted by this operation.
+    /// - `policy` (`ParsePolicy`): The caller-supplied behavior policy.
+    ///
+    /// # Returns
+    /// Type: `Result<A, SchemaIssue>`.
     pub fn parse_str(&self, text: &str, policy: ParsePolicy) -> Result<A, SchemaIssue> {
         self.ast.prepare(policy.limits)?;
         let encoded = super::internal::parser::parse_json(text, policy)?;
@@ -120,6 +254,17 @@ impl<A: Send + 'static> PureCodec<A, JsonValue> {
 
     /// Tie a recursive codec without an owning reference cycle. The body sees
     /// a typed self-reference, while AST references remain weak and exportable.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    ///
+    /// # Parameters
+    /// - `name` (`impl Into<Arc<str>>`): Stable name used to register or locate this definition.
+    /// - `shape` (`impl FnOnce(SchemaReference) -> SchemaShape`): Encoded-side structure required by this schema.
+    /// - `build` (`impl FnOnce(Self) -> Result<Self, SchemaIssue>`): The build supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, SchemaIssue>`.
     pub fn recursive(
         name: impl Into<Arc<str>>,
         shape: impl FnOnce(SchemaReference) -> SchemaShape,
@@ -166,6 +311,16 @@ impl<A: Send + 'static> PureCodec<A, JsonValue> {
 
     /// A caller-named refinement validates both directions. A failed encode
     /// cannot silently emit a value the decoder would reject.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `name` (`impl Into<Arc<str>>`): Stable name used to register or locate this definition.
+    /// - `predicate` (`impl Fn(&A) -> bool + Send + Sync + 'static`): The condition used to select or validate values.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn refine(
         self,
         name: impl Into<Arc<str>>,
@@ -204,6 +359,18 @@ impl<A: Send + 'static> PureCodec<A, JsonValue> {
         )
     }
 
+    /// Map a codec to a different application type while preserving its encoded representation.
+    ///
+    /// # Type parameters
+    /// - `B`: Transformed value type. Bounds: `Send + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `decode` (`impl Fn(A) -> Result<B, SchemaIssue> + Send + Sync + 'static`): Callback that validates and reconstructs a typed value.
+    /// - `encode` (`impl Fn(&B) -> Result<A, SchemaIssue> + Send + Sync + 'static`): The encode supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `PureCodec<B, JsonValue>`.
     pub fn transform<B: Send + 'static>(
         self,
         decode: impl Fn(A) -> Result<B, SchemaIssue> + Send + Sync + 'static,
@@ -222,6 +389,16 @@ impl<A: Send + 'static> PureCodec<A, JsonValue> {
 
     /// Preserve the existing decoder surface. An encoder is already present in
     /// this PureCodec; adapting an old one-way Schema in reverse is not inferred.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bounds: `Send + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `issue` (`impl Fn(SchemaIssue) -> E + Send + Sync + 'static`): The issue supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Schema<A, E>`.
     pub fn to_schema<E: Send + 'static>(
         &self,
         issue: impl Fn(SchemaIssue) -> E + Send + Sync + 'static,
@@ -231,6 +408,19 @@ impl<A: Send + 'static> PureCodec<A, JsonValue> {
     }
 }
 
+///
+/// # Type parameters
+/// - `Input`: Bounds: `Send + 'static`.
+/// - `Output`: Bounds: `Send + 'static`.
+/// - `Env`: Bounds: `Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `input` (`Input`): Owned input decoded or consumed by this operation.
+/// - `operation` (`Arc<OnceOperation<Input, Output>>`): Typed operation definition or callback selected for execution.
+///
+/// # Returns
+/// Type: `Effect<Output, SchemaIssue, Env>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 fn evaluate_once<Input: Send + 'static, Output: Send + 'static, Env: Send + Sync + 'static>(
     input: Input,
     operation: Arc<OnceOperation<Input, Output>>,
@@ -251,6 +441,12 @@ fn evaluate_once<Input: Send + 'static, Output: Send + 'static, Env: Send + Sync
 
 /// Effectful codec with independent decode and encode environments.
 /// Directions own their inputs; effectful transformations may suspend safely.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `Encoded`: Encoded representation type. Bound or type: `Send + 'static`.
+/// - `DecodeEnv`: Decoding environment type. Bound or type: `Send + Sync + 'static`.
+/// - `EncodeEnv`: Encoding environment type. Bound or type: `Send + Sync + 'static`.
 pub struct Codec<
     A: Send + 'static,
     Encoded: Send + 'static,
@@ -269,6 +465,9 @@ impl<
     EncodeEnv: Send + Sync + 'static,
 > Clone for Codec<A, Encoded, DecodeEnv, EncodeEnv>
 {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             ast: self.ast.clone(),
@@ -286,6 +485,20 @@ impl<
 > Codec<A, Encoded, DecodeEnv, EncodeEnv>
 {
     #[must_use]
+    /// Construct a `Codec` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
+    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `decode` (`impl Fn(Encoded) -> Effect<A, SchemaIssue, DecodeEnv> + Send + Sync + 'static`): Callback that validates and reconstructs a typed value.
+    /// - `encode` (`impl Fn(A) -> Effect<Encoded, SchemaIssue, EncodeEnv> + Send + Sync + 'static`): The encode supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(
         decode: impl Fn(Encoded) -> Effect<A, SchemaIssue, DecodeEnv> + Send + Sync + 'static,
         encode: impl Fn(A) -> Effect<Encoded, SchemaIssue, EncodeEnv> + Send + Sync + 'static,
@@ -293,6 +506,19 @@ impl<
         Self::with_ast(SchemaAst::opaque(), decode, encode)
     }
 
+    /// # Type parameters
+    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
+    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `ast` (`SchemaAst`): Representation tree used for schema inspection or export.
+    /// - `decode` (`impl Fn(Encoded) -> Effect<A, SchemaIssue, DecodeEnv> + Send + Sync + 'static`): Callback that validates and reconstructs a typed value.
+    /// - `encode` (`impl Fn(A) -> Effect<Encoded, SchemaIssue, EncodeEnv> + Send + Sync + 'static`): The encode supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub(crate) fn with_ast(
         ast: SchemaAst,
         decode: impl Fn(Encoded) -> Effect<A, SchemaIssue, DecodeEnv> + Send + Sync + 'static,
@@ -306,6 +532,19 @@ impl<
     }
 
     /// Each evaluation receives a fresh owned input without requiring Clone.
+    ///
+    /// # Type parameters
+    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
+    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `input` (`impl Fn() -> Encoded + Send + Sync + 'static`): The input value or factory consumed by this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<A, SchemaIssue, DecodeEnv>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn decode_with(
         &self,
         input: impl Fn() -> Encoded + Send + Sync + 'static,
@@ -314,6 +553,20 @@ impl<
         Effect::defer(move || decode(input()))
     }
 
+    /// Supply an effectful encoder while retaining this schema’s decode contract.
+    ///
+    /// # Type parameters
+    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
+    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `input` (`impl Fn() -> A + Send + Sync + 'static`): The input value or factory consumed by this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<Encoded, SchemaIssue, EncodeEnv>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn encode_with(
         &self,
         input: impl Fn() -> A + Send + Sync + 'static,
@@ -323,6 +576,16 @@ impl<
     }
 
     #[must_use]
+    /// Borrow the representation tree used for schema inspection or export.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
+    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
+    ///
+    /// # Returns
+    /// Type: `&SchemaAst`.
     pub fn ast(&self) -> &SchemaAst {
         &self.ast
     }
@@ -330,6 +593,18 @@ impl<
     /// Adapt only decoding to a larger environment. The original encode
     /// environment remains unchanged and visible in the returned type.
     #[must_use]
+    /// # Type parameters
+    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
+    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `Outer`: Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `project` (`impl Fn(&Outer) -> DecodeEnv + Send + Sync + 'static`): The project supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Codec<A, Encoded, Outer, EncodeEnv>`.
     pub fn provide_decode<Outer: Send + Sync + 'static>(
         &self,
         project: impl Fn(&Outer) -> DecodeEnv + Send + Sync + 'static,
@@ -349,6 +624,18 @@ impl<
 
     /// Adapt only encoding without changing decoding's requirements.
     #[must_use]
+    /// # Type parameters
+    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
+    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `Outer`: Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `project` (`impl Fn(&Outer) -> EncodeEnv + Send + Sync + 'static`): The project supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Codec<A, Encoded, DecodeEnv, Outer>`.
     pub fn provide_encode<Outer: Send + Sync + 'static>(
         &self,
         project: impl Fn(&Outer) -> EncodeEnv + Send + Sync + 'static,
@@ -370,6 +657,19 @@ impl<
     /// its value, so suspension does not borrow a temporary or require Clone.
     /// Decode and encode keep their independently selected environments.
     #[must_use]
+    /// # Type parameters
+    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
+    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `B`: Transformed value type. Bounds: `Send + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `after_decode` (`impl Fn(A) -> Effect<B, SchemaIssue, DecodeEnv> + Send + Sync + 'static`): The after decode supplied to this operation.
+    /// - `before_encode` (`impl Fn(B) -> Effect<A, SchemaIssue, EncodeEnv> + Send + Sync + 'static`): The before encode supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Codec<B, Encoded, DecodeEnv, EncodeEnv>`.
     pub fn transform_effectful<B: Send + 'static>(
         self,
         after_decode: impl Fn(A) -> Effect<B, SchemaIssue, DecodeEnv> + Send + Sync + 'static,
@@ -395,6 +695,19 @@ impl<
 
     /// A refinement is a transformation whose application-side type stays A.
     #[must_use]
+    /// # Type parameters
+    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
+    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `name` (`impl Into<Arc<str>>`): Stable name used to register or locate this definition.
+    /// - `after_decode` (`impl Fn(A) -> Effect<A, SchemaIssue, DecodeEnv> + Send + Sync + 'static`): The after decode supplied to this operation.
+    /// - `before_encode` (`impl Fn(A) -> Effect<A, SchemaIssue, EncodeEnv> + Send + Sync + 'static`): The before encode supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn refine_effectful(
         self,
         name: impl Into<Arc<str>>,
@@ -411,6 +724,19 @@ impl<
 
     /// A single owned input can be evaluated once. Further runs fail as data
     /// with InputConsumed rather than silently duplicating the original input.
+    ///
+    /// # Type parameters
+    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
+    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `input` (`Encoded`): The input value or factory consumed by this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<A, SchemaIssue, DecodeEnv>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn decode_once(&self, input: Encoded) -> Effect<A, SchemaIssue, DecodeEnv> {
         let decode = Arc::clone(&self.decode);
         let input = Mutex::new(Some(input));
@@ -426,6 +752,20 @@ impl<
         })
     }
 
+    /// Consume one owned value during a single encoding run.
+    ///
+    /// # Type parameters
+    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
+    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `input` (`A`): The input value or factory consumed by this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<Encoded, SchemaIssue, EncodeEnv>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn encode_once(&self, input: A) -> Effect<Encoded, SchemaIssue, EncodeEnv> {
         let encode = Arc::clone(&self.encode);
         let input = Mutex::new(Some(input));
@@ -444,12 +784,19 @@ impl<
 
 /// An Effect-returning compatibility view for general JSON codecs. It retains
 /// the decode environment; no blocking conversion to the old pure Schema occurs.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `DecodeEnv`: Decoding environment type. Bound or type: `Send + Sync + 'static`.
 pub struct EffectSchema<A: Send + 'static, DecodeEnv: Send + Sync + 'static> {
     ast: SchemaAst,
     decode: EffectDecoder<A, JsonValue, DecodeEnv>,
 }
 
 impl<A: Send + 'static, DecodeEnv: Send + Sync + 'static> Clone for EffectSchema<A, DecodeEnv> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             ast: self.ast.clone(),
@@ -460,10 +807,30 @@ impl<A: Send + 'static, DecodeEnv: Send + Sync + 'static> Clone for EffectSchema
 
 impl<A: Send + 'static, DecodeEnv: Send + Sync + 'static> EffectSchema<A, DecodeEnv> {
     #[must_use]
+    /// Borrow the representation tree used for schema inspection or export.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
+    ///
+    /// # Returns
+    /// Type: `&SchemaAst`.
     pub fn ast(&self) -> &SchemaAst {
         &self.ast
     }
 
+    /// Consume one encoded value during a single decoding run.
+    ///
+    /// # Type parameters
+    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `input` (`JsonValue`): The input value or factory consumed by this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<A, SchemaIssue, DecodeEnv>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn decode_once(&self, input: JsonValue) -> Effect<A, SchemaIssue, DecodeEnv> {
         let decode = Arc::clone(&self.decode);
         let input = Mutex::new(Some(input));
@@ -481,6 +848,18 @@ impl<A: Send + 'static, DecodeEnv: Send + Sync + 'static> EffectSchema<A, Decode
 
     /// JSON parsing repeats from immutable text; decoding retains DecodeEnv.
     /// The caller supplies the byte and structural budgets explicitly.
+    ///
+    /// # Type parameters
+    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `text` (`impl Into<Arc<str>>`): Input text parsed or emitted by this operation.
+    /// - `policy` (`ParsePolicy`): The caller-supplied behavior policy.
+    ///
+    /// # Returns
+    /// Type: `Effect<A, SchemaIssue, DecodeEnv>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn parse(
         &self,
         text: impl Into<Arc<str>>,
@@ -508,6 +887,20 @@ impl<A: Send + 'static, DecodeEnv: Send + Sync + 'static, EncodeEnv: Send + Sync
     /// The field codec must be the one used by the record declaration; the
     /// constructor checks their shared schema identity before returning.
     /// Chained defaults run in reverse adapter order, once each when absent.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `F`: Bounds: `Send + 'static`.
+    ///
+    /// # Parameters
+    /// - `name` (`impl Into<Arc<str>>`): Stable name used to register or locate this definition.
+    /// - `field_codec` (`PureCodec<F, JsonValue>`): The field codec supplied to this operation.
+    /// - `default` (`impl Fn() -> Effect<F, SchemaIssue, DecodeEnv> + Send + Sync + 'static`): The default supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, SchemaIssue>`.
     pub fn with_effectful_field_default<F: Send + 'static>(
         self,
         name: impl Into<Arc<str>>,
@@ -589,6 +982,15 @@ impl<A: Send + 'static, DecodeEnv: Send + Sync + 'static, EncodeEnv: Send + Sync
     }
 
     #[must_use]
+    /// Lift this pure codec into an Effect-compatible schema.
+    ///
+    /// # Type parameters
+    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Returns
+    /// Type: `EffectSchema<A, DecodeEnv>`.
     pub fn as_effect_schema(&self) -> EffectSchema<A, DecodeEnv> {
         EffectSchema {
             ast: self.ast.clone(),

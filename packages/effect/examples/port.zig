@@ -1,3 +1,4 @@
+//! Standalone consumer showing typed Effect composition and all Exit channels.
 const std = @import("std");
 const fx = @import("effect");
 
@@ -16,6 +17,11 @@ fn validatePort(port: u16) Port {
     return if (port == 0) Build.fail(u16, .{ .invalid_port = port }) else Build.succeed(port);
 }
 
+/// Run the example with an application environment carrying its allocator,
+/// I/O implementation, and configured port; inspect every `Exit` variant.
+/// Parameters:
+/// - `init: std.process.Init`: Process-provided allocator and I/O capabilities.
+/// Returns (`void`): No value; the example handles its typed Exit directly.
 pub fn main(init: std.process.Init) void {
     const env: Env = .{ .allocator = init.gpa, .io = init.io, .port = configured_port };
     const program = comptime Build.bind(Port.service(readPort), validatePort);

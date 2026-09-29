@@ -1,3 +1,5 @@
+//! Bounded parallel traversal and race coordination.
+
 use crate::fiber::JoinedOrigin;
 use crate::internal::notification::notify_all;
 use crate::internal::outcome;
@@ -15,18 +17,26 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy)]
+/// Variants of side used by parallel.
 enum Side {
     Left,
     Right,
 }
 
 #[derive(Default)]
+/// Typed selection used by parallel.
 struct Selection {
     winner: Mutex<Option<Side>>,
     changed: Event,
 }
 
 impl Selection {
+    ///
+    /// # Parameters
+    /// - `side` (`Side`): The side supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn choose(&self, side: Side) {
         let first = {
             let mut winner = self
@@ -45,6 +55,10 @@ impl Selection {
         }
     }
 
+    ///
+    /// # Returns
+    /// Type: `Side`.
+    /// Returns `Side`.
     async fn winner(&self) -> Side {
         loop {
             let changed = self.changed.listen();
@@ -60,6 +74,20 @@ impl Selection {
     }
 }
 
+///
+/// # Type parameters
+/// - `A`: Successful application-value type. Additional bound: `Send + 'static`.
+/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type supplying required capabilities. Additional bound: `Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `program` (`Effect<A, E, R>`): Lazy Effect description executed or transformed here.
+/// - `selection` (`Arc<Selection>`): The selection supplied to this operation.
+/// - `side` (`Side`): The side supplied to this operation.
+///
+/// # Returns
+/// Type: `Effect<A, E, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 fn contender<A, E, R>(
     program: Effect<A, E, R>,
     selection: Arc<Selection>,
@@ -96,6 +124,17 @@ where
     /// Like the reference, retain loser cleanup failures, not its ordinary
     /// primary failure. Driver loss is additionally retained as an ownership
     /// defect. Submission errors abort admission and still join admitted work.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `right` (`Self`): Right-hand operation composed with this one.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn race(self, right: Self) -> Self {
         Scope::scoped(move |scope| {
             let left = self.clone();
@@ -148,6 +187,19 @@ where
     /// workers. Results retain input order and move without A/E Clone bounds.
     /// A terminal failure stops reservations and cancels/joins all workers;
     /// subsequent child cleanup failures are retained in completion order.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `concurrency` (`NonZeroUsize`): Positive bound on independently admitted work.
+    /// - `programs` (`Vec<Self>`): The programs supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<Vec<A>, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn all_concurrent(concurrency: NonZeroUsize, programs: Vec<Self>) -> Effect<Vec<A>, E, R> {
         let programs: Arc<[Self]> = programs.into();
         Self::all_concurrent_shared(concurrency, programs)
@@ -155,6 +207,19 @@ where
 
     /// Reuse an already shared immutable description collection without copying
     /// its elements or converting another Vec into shared storage.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `concurrency` (`NonZeroUsize`): Positive bound on independently admitted work.
+    /// - `programs` (`Arc<[Self]>`): The programs supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<Vec<A>, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn all_concurrent_shared(
         concurrency: NonZeroUsize,
         programs: Arc<[Self]>,
@@ -166,6 +231,22 @@ where
     /// are shared once; neither input nor result/error payloads are cloned.
     /// The callback runs lazily on a worker outside bookkeeping locks. Any data
     /// captured by its returned reusable Effect must have its own valid ownership.
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type. Additional bound: `Send + Sync + 'static`.
+    /// - `F`: Callback or field-definition type. Additional bound: `Fn(&T) -> Self + Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `concurrency` (`NonZeroUsize`): Positive bound on independently admitted work.
+    /// - `values` (`Vec<T>`): Owned values processed in their declared order.
+    /// - `transform` (`F`): Callback applied to the selected value or error.
+    ///
+    /// # Returns
+    /// Type: `Effect<Vec<A>, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn for_each_concurrent<T, F>(
         concurrency: NonZeroUsize,
         values: Vec<T>,
@@ -181,6 +262,22 @@ where
 
     /// Borrow inputs that are already shared, retaining their existing allocation.
     /// This also avoids the initial owned Vec-to-Arc collection conversion.
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type. Additional bound: `Send + Sync + 'static`.
+    /// - `F`: Callback or field-definition type. Additional bound: `Fn(&T) -> Self + Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `concurrency` (`NonZeroUsize`): Positive bound on independently admitted work.
+    /// - `values` (`Arc<[T]>`): Owned values processed in their declared order.
+    /// - `transform` (`F`): Callback applied to the selected value or error.
+    ///
+    /// # Returns
+    /// Type: `Effect<Vec<A>, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn for_each_concurrent_shared<T, F>(
         concurrency: NonZeroUsize,
         values: Arc<[T]>,
@@ -198,6 +295,20 @@ where
     }
 }
 
+///
+/// # Type parameters
+/// - `A`: Bounds: `Send + 'static`.
+/// - `E`: Bounds: `Send + 'static`.
+///
+/// # Parameters
+/// - `left` (`Fiber<A, E>`): The left supplied to this operation.
+/// - `right` (`Fiber<A, E>`): Right-hand operation composed with this one.
+/// - `selection` (`Arc<Selection>`): The selection supplied to this operation.
+/// - `context` (`Context`): Execution context carrying cancellation, scope, and trace state.
+///
+/// # Returns
+/// Type: `Exit<A, E>`.
+/// Returns `Exit<A, E>`.
 async fn settle_race<A: Send + 'static, E: Send + 'static>(
     left: Fiber<A, E>,
     right: Fiber<A, E>,
@@ -244,31 +355,81 @@ async fn settle_race<A: Send + 'static, E: Send + 'static>(
     }
 }
 
+/// Provides indexed effect jobs to the parallel coordinator.
 trait Source<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static>:
     Send + Sync + 'static
 {
+    ///
+    /// # Returns
+    /// Type: `usize`.
     fn count(&self) -> usize;
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     fn is_empty(&self) -> bool;
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `index` (`usize`): Position of the selected item in its ordered collection.
+    ///
+    /// # Returns
+    /// Type: `Option<Effect<A, E, R>>`.
+    /// Returns the value when present, or `None`.
     fn job(&self, index: usize) -> Option<Effect<A, E, R>>;
 }
 
+/// Typed programs used by parallel.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
+/// - `R`: Environment type. Bound or type: `Send + Sync + 'static`.
 struct Programs<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static>(
     Arc<[Effect<A, E, R>]>,
 );
 impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Source<A, E, R>
     for Programs<A, E, R>
 {
+    ///
+    /// # Returns
+    /// Type: `usize`.
     fn count(&self) -> usize {
         self.0.len()
     }
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `index` (`usize`): Position of the selected item in its ordered collection.
+    ///
+    /// # Returns
+    /// Type: `Option<Effect<A, E, R>>`.
+    /// Returns the value when present, or `None`.
     fn job(&self, index: usize) -> Option<Effect<A, E, R>> {
         self.0.get(index).cloned()
     }
 }
 
+/// Typed values used by parallel.
+///
+/// # Type parameters
+/// - `T`: Value or item type.
+/// - `F`: Callback or field-definition type.
 struct Values<T, F> {
     values: Arc<[T]>,
     transform: Arc<F>,
@@ -281,12 +442,31 @@ where
     T: Send + Sync + 'static,
     F: Fn(&T) -> Effect<A, E, R> + Send + Sync + 'static,
 {
+    ///
+    /// # Returns
+    /// Type: `usize`.
     fn count(&self) -> usize {
         self.values.len()
     }
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     fn is_empty(&self) -> bool {
         self.values.is_empty()
     }
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `index` (`usize`): Position of the selected item in its ordered collection.
+    ///
+    /// # Returns
+    /// Type: `Option<Effect<A, E, R>>`.
+    /// Returns the value when present, or `None`.
     fn job(&self, index: usize) -> Option<Effect<A, E, R>> {
         self.values.get(index).map(|value| (self.transform)(value))
     }
@@ -294,9 +474,16 @@ where
 
 // enumerate supplies identities; the finite take length derives from input.
 // There is no numeric sentinel, scheduler quantum, or allocation cutoff.
+/// Type alias for reservations in parallel.
 type Reservations = Enumerate<RepeatN<()>>;
+/// Type alias for workers in parallel.
 type Workers = RepeatN<()>;
 
+/// Typed collection used by parallel.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 struct Collection<A, E> {
     reservations: Reservations,
     values: Vec<Option<A>>,
@@ -304,12 +491,24 @@ struct Collection<A, E> {
     cleanup: Vec<CleanupFailure<E>>,
 }
 
+/// Variants of recorded used by parallel.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 enum Recorded<A, E> {
     First,
     AdditionalPrimary(PrimaryOutcome<E>),
     AdditionalOutcome(Exit<Vec<A>, E>),
 }
 
+/// Typed batch used by parallel.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
+/// - `R`: Environment type. Bound or type: `Send + Sync + 'static`.
+/// - `S`: Service or storage type.
 struct Batch<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static, S> {
     source: S,
     cancellation: Cancellation,
@@ -324,6 +523,10 @@ where
     R: Send + Sync + 'static,
     S: Source<A, E, R>,
 {
+    ///
+    /// # Returns
+    /// Type: `Option<usize>`.
+    /// Returns the value when present, or `None`.
     fn reserve(&self) -> Option<usize> {
         let mut state = self
             .state
@@ -336,6 +539,17 @@ where
         }
     }
 
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `index` (`usize`): Position of the selected item in its ordered collection.
+    /// - `outcome` (`Exit<A, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn record(&self, index: usize, outcome: Exit<A, E>) {
         match outcome.into_failure() {
             Ok(value) => {
@@ -362,6 +576,16 @@ where
         }
     }
 
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `failure` (`Exit<Vec<A>, E>`): Expected error or cleanup failure retained in this outcome.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn record_failure(&self, failure: Exit<Vec<A>, E>) {
         let recorded = {
             let mut state = self
@@ -400,6 +624,16 @@ where
         }
     }
 
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `failure` (`Exit<Vec<A>, E>`): Expected error or cleanup failure retained in this outcome.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn record_worker_failure(&self, failure: Exit<Vec<A>, E>) {
         let secondary = {
             let mut state = self
@@ -430,6 +664,14 @@ where
         }
     }
 
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Returns
+    /// Type: `Exit<Vec<A>, E>`.
+    /// Returns `Exit<Vec<A>, E>`.
     fn finish(&self) -> Exit<Vec<A>, E> {
         let (terminal, values, cleanup) = {
             let mut state = self
@@ -457,6 +699,18 @@ where
     }
 }
 
+///
+/// # Type parameters
+/// - `A`: Successful application-value type.
+/// - `E`: Expected application-error type.
+///
+/// # Parameters
+/// - `terminal` (`Exit<Vec<A>, E>`): The terminal supplied to this operation.
+/// - `values` (`Vec<Option<A>>`): Owned values processed in their declared order.
+///
+/// # Returns
+/// Type: `Exit<Vec<A>, E>`.
+/// Returns `Exit<Vec<A>, E>`.
 fn discard_partial<A, E>(terminal: Exit<Vec<A>, E>, values: Vec<Option<A>>) -> Exit<Vec<A>, E> {
     match catch_unwind(AssertUnwindSafe(|| drop(values))) {
         Ok(()) => terminal,
@@ -464,6 +718,20 @@ fn discard_partial<A, E>(terminal: Exit<Vec<A>, E>, values: Vec<Option<A>>) -> E
     }
 }
 
+///
+/// # Type parameters
+/// - `A`: Successful application-value type. Additional bound: `Send + 'static`.
+/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type supplying required capabilities. Additional bound: `HasTaskSpawner + Send + Sync + 'static`.
+/// - `S`: State or store value type. Additional bound: `Source<A, E, R>`.
+///
+/// # Parameters
+/// - `concurrency` (`NonZeroUsize`): Positive bound on independently admitted work.
+/// - `factory` (`impl Fn() -> S + Send + Sync + 'static`): Factory invoked to create fresh data for an execution.
+///
+/// # Returns
+/// Type: `Effect<Vec<A>, E, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 fn concurrent<A, E, R, S>(
     concurrency: NonZeroUsize,
     factory: impl Fn() -> S + Send + Sync + 'static,
@@ -511,6 +779,19 @@ where
     })
 }
 
+///
+/// # Type parameters
+/// - `A`: Successful application-value type. Additional bound: `Send + 'static`.
+/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type supplying required capabilities. Additional bound: `Send + Sync + 'static`.
+/// - `S`: State or store value type. Additional bound: `Source<A, E, R>`.
+///
+/// # Parameters
+/// - `batch` (`Arc<Batch<A, E, R, S>>`): Ordered group of values processed together.
+///
+/// # Returns
+/// Type: `Effect<(), E, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 fn worker<A, E, R, S>(batch: Arc<Batch<A, E, R, S>>) -> Effect<(), E, R>
 where
     A: Send + 'static,
@@ -537,6 +818,25 @@ where
     })
 }
 
+///
+/// # Type parameters
+/// - `A`: Successful application-value type. Additional bound: `Send + 'static`.
+/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type supplying required capabilities. Additional bound: `HasTaskSpawner + Send + Sync + 'static`.
+/// - `S`: State or store value type. Additional bound: `Source<A, E, R>`.
+///
+/// # Parameters
+/// - `scope` (`Scope<E>`): Owner that joins child work and releases resources at close.
+/// - `batch` (`Arc<Batch<A, E, R, S>>`): Ordered group of values processed together.
+/// - `remaining` (`Workers`): The remaining supplied to this operation.
+/// - `fibers` (`Vec<Fiber<(), E>>`): The fibers supplied to this operation.
+/// - `env` (`Arc<R>`): The environment supplying this operation's capabilities.
+/// - `context` (`Context`): Execution context carrying cancellation, scope, and trace state.
+/// - `finish` (`Finish<Vec<A>, E>`): Continuation receiving the complete terminal outcome.
+///
+/// # Returns
+/// Type: `Step`.
+/// Returns `Step`.
 fn submit_workers<A, E, R, S>(
     scope: Scope<E>,
     batch: Arc<Batch<A, E, R, S>>,

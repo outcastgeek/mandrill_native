@@ -6,13 +6,20 @@ const std = @import("std");
 const outcomes = @import("../outcome.zig");
 const Issue = @import("schema_issue.zig").Issue;
 
+/// Owned bytes buffer paired with its allocator; release it with `deinit`.
 pub const Bytes = outcomes.OwnedSlice(u8);
+/// `Version` cases: `first`.
 pub const Version = enum(u16) { first = 1 };
+/// Bounds on encoded outcome payload and cleanup records.
 pub const Limits = struct {
     max_payload_bytes: usize,
     max_cleanup_records: usize,
     max_total_bytes: usize,
 
+    /// Check whether this value satisfies its structural invariants.
+    /// Parameters:
+    /// - `self: Limits`: Receiver passed by value: the struct itself is copied, while any referenced storage keeps its original ownership and lifetime.
+    /// Returns (`bool`): `true` when encoded capacity exceeds the mandatory envelope header.
     pub fn valid(self: Limits) bool {
         return self.max_total_bytes > @sizeOf(u16) + @sizeOf(u8) + @sizeOf(u32);
     }
@@ -34,22 +41,37 @@ const DefectTag = enum(u8) {
     invalid_configuration = 5,
 };
 
+/// Serializable defect kind and message preserved across outcome encoding.
 pub const DefectData = struct {
+    /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit` and
+    /// must be released after use.
     pub const effect_owned_payload = true;
     kind: outcomes.Defect.Kind,
     diagnostic: Bytes,
 
+    /// Release resources owned by this value.
+    /// Parameters:
+    /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn deinit(self: *@This()) void {
         self.diagnostic.deinit();
         self.* = undefined;
     }
 
+    /// Duplicate this value; marked owning payloads are cloned, while ordinary
+    /// borrowed fields retain their original lifetime.
+    /// Parameters:
+    /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+    /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
     pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
         return .{ .kind = self.kind, .diagnostic = try self.diagnostic.clone() };
     }
 };
 
+/// Stored primary success, failure, defect, or interruption before cleanup.
 pub const Primary = union(enum) {
+    /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit` and
+    /// must be released after use.
     pub const effect_owned_payload = true;
     success: Bytes,
     failure: Bytes,
@@ -57,6 +79,10 @@ pub const Primary = union(enum) {
     interrupted,
     succeeded_before_cleanup_failure,
 
+    /// Release resources owned by this value.
+    /// Parameters:
+    /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn deinit(self: *@This()) void {
         switch (self.*) {
             .success => self.success.deinit(),
@@ -67,6 +93,11 @@ pub const Primary = union(enum) {
         self.* = undefined;
     }
 
+    /// Duplicate this value; marked owning payloads are cloned, while ordinary
+    /// borrowed fields retain their original lifetime.
+    /// Parameters:
+    /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+    /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
     pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
         return switch (self.*) {
             .success => |value| .{ .success = try value.clone() },
@@ -77,12 +108,19 @@ pub const Primary = union(enum) {
     }
 };
 
+/// Stored release-time typed failure, defect, or interruption.
 pub const Cleanup = union(enum) {
+    /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit` and
+    /// must be released after use.
     pub const effect_owned_payload = true;
     failure: Bytes,
     defect: DefectData,
     interrupted,
 
+    /// Release resources owned by this value.
+    /// Parameters:
+    /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn deinit(self: *@This()) void {
         switch (self.*) {
             .failure => self.failure.deinit(),
@@ -92,6 +130,11 @@ pub const Cleanup = union(enum) {
         self.* = undefined;
     }
 
+    /// Duplicate this value; marked owning payloads are cloned, while ordinary
+    /// borrowed fields retain their original lifetime.
+    /// Parameters:
+    /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+    /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
     pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
         return switch (self.*) {
             .failure => |value| .{ .failure = try value.clone() },
@@ -101,23 +144,39 @@ pub const Cleanup = union(enum) {
     }
 };
 
+/// Encoded terminal outcome retaining primary and ordered cleanup information.
 pub const StoredExit = struct {
+    /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit` and
+    /// must be released after use.
     pub const effect_owned_payload = true;
     primary: Primary,
     cleanup: outcomes.OwnedSlice(Cleanup),
 
+    /// Release resources owned by this value.
+    /// Parameters:
+    /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn deinit(self: *@This()) void {
         self.primary.deinit();
         self.cleanup.deinit();
         self.* = undefined;
     }
 
+    /// Duplicate this value; marked owning payloads are cloned, while ordinary
+    /// borrowed fields retain their original lifetime.
+    /// Parameters:
+    /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+    /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
     pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
         var primary = try self.primary.clone();
         errdefer primary.deinit();
         return .{ .primary = primary, .cleanup = try self.cleanup.clone() };
     }
 
+    /// Check whether this value satisfies its structural invariants.
+    /// Parameters:
+    /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+    /// Returns (`bool`): `true` when a successful primary has no cleanup failures and a cleanup-failed primary has at least one.
     pub fn valid(self: *const @This()) bool {
         if (self.primary == .success and self.cleanup.items.len != 0) return false;
         if (self.primary == .succeeded_before_cleanup_failure and self.cleanup.items.len == 0) return false;
@@ -289,6 +348,13 @@ fn formatFailure(env: anytype, problem: FormatError, direction: @import("schema_
     };
 }
 
+/// Encode a value into its wire representation.
+/// Parameters:
+/// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected capabilities.
+/// - `stored: *const StoredExit`: Borrowed stored Exit consulted during replay.
+/// - `limits: Limits`: Caller-selected, validated behavior or resource bounds; no hidden default is
+///   installed.
+/// Returns (`outcomes.Exit(Bytes, Issue)`): Carries `Bytes` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
 pub fn encode(env: anytype, stored: *const StoredExit, limits: Limits) outcomes.Exit(Bytes, Issue) {
     if (!limits.valid() or !stored.valid() or stored.cleanup.items.len > limits.max_cleanup_records or
         stored.cleanup.items.len > std.math.maxInt(u32))
@@ -311,6 +377,13 @@ pub fn encode(env: anytype, stored: *const StoredExit, limits: Limits) outcomes.
     return .{ .success = .{ .items = owned, .allocator = env.allocator } };
 }
 
+/// Decode a value from its wire representation.
+/// Parameters:
+/// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected capabilities.
+/// - `encoded: []const u8`: Borrowed input; keep its owner alive until the operation has copied or joined it.
+/// - `limits: Limits`: Caller-selected, validated behavior or resource bounds; no hidden default is
+///   installed.
+/// Returns (`outcomes.Exit(StoredExit, Issue)`): Carries `StoredExit` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
 pub fn decode(env: anytype, encoded: []const u8, limits: Limits) outcomes.Exit(StoredExit, Issue) {
     if (!limits.valid()) return .{ .fail = Issue.init(env, .decode, .invalid_value) };
     if (encoded.len > limits.max_total_bytes) return .{ .fail = Issue.init(env, .decode, .size_limit) };

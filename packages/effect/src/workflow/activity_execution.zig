@@ -5,9 +5,16 @@ const effects = @import("../effect.zig");
 const engine_module = @import("workflow_engine.zig");
 const types = @import("workflow_types.zig");
 
+/// Specialize the workflow failure variants from their typed channels.
+/// Parameters:
+/// - `EngineError: comptime type`: Compile-time typed engine failure.
+/// - `CodecError: comptime type`: Failure type returned by the selected encoder or decoder.
+/// Returns (`type`): typed activity execution failure distinguishing domain and recorded-work errors.
 pub fn RunError(comptime EngineError: type, comptime CodecError: type) type {
     return union(enum) {
         const Self = @This();
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = outcomes.ownsPayload(EngineError) or outcomes.ownsPayload(CodecError);
         engine: EngineError,
         codec: CodecError,
@@ -17,6 +24,10 @@ pub fn RunError(comptime EngineError: type, comptime CodecError: type) type {
         stale_activation,
         uncertain_record,
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             switch (self.*) {
                 .engine => outcomes.discardPayload(&self.engine),
@@ -26,6 +37,11 @@ pub fn RunError(comptime EngineError: type, comptime CodecError: type) type {
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!Self`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const Self) error{OutOfMemory}!Self {
             return switch (self.*) {
                 .engine => |value| .{ .engine = try outcomes.clonePayload(value) },
@@ -36,18 +52,34 @@ pub fn RunError(comptime EngineError: type, comptime CodecError: type) type {
     };
 }
 
+/// Specialize the typed recorded outcome for workflow operations.
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// Returns (`type`): activity result together with its durable execution record.
 pub fn Recorded(comptime A: type, comptime E: type) type {
     return struct {
         const Self = @This();
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         source: enum { executed, replayed },
         exit: outcomes.Exit(A, E),
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             self.exit.deinit();
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!Self`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const Self) error{OutOfMemory}!Self {
             const copy = self.exit.clone();
             if (copy == .die and copy.die.kind == .out_of_memory and
@@ -61,6 +93,26 @@ pub fn Recorded(comptime A: type, comptime E: type) type {
 /// A completed record is decoded instead of rerunning its body. An absent
 /// record permits execution; only an acknowledged record is replayable.
 /// `possibly_recorded` remains explicit uncertainty for caller read-back.
+///
+/// Parameters:
+/// - `handler: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where static.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `CodecError: comptime type`: Failure type returned by the selected encoder or decoder.
+/// - `guarantee: comptime engine_module.Guarantee`: Compile-time volatility or recoverability promised by this provider; durable compositions check it before compiling.
+/// - `select_engine: comptime fn (*const R) *const engine_module.WorkflowEngine(R, ProviderError, guarantee)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_activation: comptime fn (*const R) types.Activation`: Compile-time typed selector from the current environment; its result
+///   must remain valid through use.
+/// - `select_activity: comptime fn (*const R) types.ActivityId`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_payload: comptime fn (*const R) *const @TypeOf(handler).ActivityDefinition.Payload`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `encode_exit: comptime fn (*const outcomes.Exit(@TypeOf(handler).ActivityDefinition.Success, @TypeOf(handler).ActivityDefinition.DomainError), *const R) outcomes.Exit(outcomes.OwnedSlice(u8), CodecError)`: Compile-time typed function selected at comptime; no runtime callback lookup
+///   is required.
+/// - `decode_exit: comptime fn ([]const u8, *const R) outcomes.Exit(outcomes.Exit(@TypeOf(handler).ActivityDefinition.Success, @TypeOf(handler).ActivityDefinition.DomainError), CodecError)`: Compile-time typed function selected at comptime; no runtime callback lookup
+///   is required.
+/// Returns (`effects.Effect(Recorded(@TypeOf(handler).ActivityDefinition.Success, @TypeOf(handler).ActivityDefinition.DomainError), RunError(engine_module.WorkflowEngine(R, ProviderError, guarantee).Failure, CodecError), R)`): activity outcome obtained from a recorded result or a newly committed run.
 pub fn runRecorded(
     comptime handler: anytype,
     comptime R: type,
@@ -83,16 +135,27 @@ pub fn runRecorded(
     const Out = effects.Effect(Output, Failure, R);
     const Encoded = outcomes.OwnedSlice(u8);
     const Capture = struct {
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         outcome: outcomes.Exit(A, E),
         encoded: Encoded,
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *@This()) void {
             self.outcome.deinit();
             self.encoded.deinit();
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
             const copy = self.outcome.clone();
             if (copy == .die and copy.die.kind == .out_of_memory and

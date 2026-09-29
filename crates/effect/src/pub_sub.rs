@@ -1,3 +1,5 @@
+//! Bounded publish-subscribe streams and overload policies.
+
 use crate::internal::notification::notify_all;
 use crate::internal::runtime::{self, Step};
 use crate::{
@@ -13,26 +15,39 @@ use std::sync::{Arc, Mutex};
 /// A bounded subscriber's response to a full buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PubSubOverflow {
+    /// Wait for consumer capacity before admitting another value.
     Backpressure,
+    /// Discard the incoming value when the buffer is full.
     DropNewest,
+    /// Evict the oldest buffered value to admit the new value.
     DropOldest,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The amount of earlier publication history offered to a new subscriber.
 pub enum ReplayPolicy {
+    /// No value is present.
     None,
+    /// Select the last matching candidate. Contains `NonZeroUsize`.
     Last(NonZeroUsize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Capacity, replay, and overflow behavior for a publication channel.
 pub struct PubSubOptions {
+    /// The maximum admitted capacity. Type: `NonZeroUsize`.
     pub capacity: NonZeroUsize,
+    /// Policy applied when the subscriber buffer is full. Type: `PubSubOverflow`.
     pub overflow: PubSubOverflow,
+    /// History offered to a newly registered subscriber. Type: `ReplayPolicy`.
     pub replay: ReplayPolicy,
 }
 
 impl PubSubOptions {
     /// This pure policy check also runs during compilation in a const context.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, PubSubError>`.
     pub const fn validate(self) -> Result<Self, PubSubError> {
         match self.replay {
             ReplayPolicy::Last(count) if count.get() > self.capacity.get() => {
@@ -44,16 +59,33 @@ impl PubSubOptions {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A typed publication or subscription lifecycle failure.
 pub enum PubSubError {
+    /// The provider is shutting down and cannot accept this work.
     Shutdown,
+    /// The replay failed validation.
     InvalidReplay,
+    /// No further subscription id can be allocated without exceeding its range.
     SubscriptionIdExhausted,
+    /// The publication payload was already consumed by an earlier run.
     PublishValueConsumed,
+    /// Computing lag count exceeded its supported range.
     LagCountOverflow,
-    Lagged { dropped: NonZeroUsize },
+    /// A subscriber fell behind the bounded replay buffer.
+    Lagged {
+        /// Number of values no longer available. Type: `NonZeroUsize`.
+        dropped: NonZeroUsize,
+    },
 }
 
 impl std::fmt::Display for PubSubError {
+    ///
+    /// # Parameters
+    /// - `formatter` (`&mut std::fmt::Formatter<'_>`): Destination formatter used by the Rust formatting trait.
+    ///
+    /// # Returns
+    /// Type: `std::fmt::Result`.
+    /// Returns `std::fmt::Result`.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(self, formatter)
     }
@@ -62,17 +94,28 @@ impl std::fmt::Display for PubSubError {
 impl std::error::Error for PubSubError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Counts of subscribers reached, lagged, or otherwise affected by a publication.
 pub struct PublishReport {
+    /// Number of subscribers that received this publication. Type: `usize`.
     pub delivered: usize,
+    /// Number of values discarded under the overflow policy. Type: `usize`.
     pub dropped: usize,
 }
 
+/// Typed subscriber used by pub sub.
+///
+/// # Type parameters
+/// - `A`: Application value type.
 struct Subscriber<A> {
     buffered: VecDeque<Arc<A>>,
     dropped: usize,
     changed: Arc<Event>,
 }
 
+/// Typed state used by pub sub.
+///
+/// # Type parameters
+/// - `A`: Application value type.
 struct State<A> {
     closed: bool,
     next_id: Option<u64>,
@@ -81,6 +124,10 @@ struct State<A> {
     current: Option<Arc<A>>,
 }
 
+/// Typed inner used by pub sub.
+///
+/// # Type parameters
+/// - `A`: Application value type.
 struct Inner<A> {
     state: Mutex<State<A>>,
     space_changed: Event,
@@ -88,17 +135,27 @@ struct Inner<A> {
     retain_current: bool,
 }
 
+/// Type alias for commit hook in pub sub.
+///
+/// # Type parameters
+/// - `A`: Application value type.
 type CommitHook<A> = Arc<dyn Fn(&A) + Send + Sync>;
 
 /// A bounded, executor-independent broadcast hub. Payloads are shared through
 /// Arc; publishing never requires `A: Clone`. Backpressure checks all current
 /// subscribers before committing one publication. Drop policies report loss to
 /// both the publisher and each affected subscriber.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + Sync + 'static`.
 pub struct PubSub<A: Send + Sync + 'static> {
     inner: Arc<Inner<A>>,
 }
 
 impl<A: Send + Sync + 'static> Clone for PubSub<A> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -107,10 +164,30 @@ impl<A: Send + Sync + 'static> Clone for PubSub<A> {
 }
 
 impl<A: Send + Sync + 'static> PubSub<A> {
+    /// Construct a `PubSub` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `options` (`PubSubOptions`): Caller-selected bounds and behavior for this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, PubSubError>`.
     pub fn new(options: PubSubOptions) -> Result<Self, PubSubError> {
         Ok(Self::with_state(options.validate()?, None, false))
     }
 
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `capacity` (`NonZeroUsize`): The caller-supplied capacity bound.
+    /// - `overflow` (`PubSubOverflow`): Behavior when the configured buffer capacity is full.
+    /// - `initial` (`A`): Initial value used before any state transition.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub(crate) fn with_current(
         capacity: NonZeroUsize,
         overflow: PubSubOverflow,
@@ -127,6 +204,17 @@ impl<A: Send + Sync + 'static> PubSub<A> {
         )
     }
 
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `options` (`PubSubOptions`): Caller-selected bounds and behavior for this operation.
+    /// - `current` (`Option<Arc<A>>`): The current supplied to this operation.
+    /// - `retain_current` (`bool`): The retain current supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn with_state(options: PubSubOptions, current: Option<Arc<A>>, retain_current: bool) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -144,12 +232,32 @@ impl<A: Send + Sync + 'static> PubSub<A> {
         }
     }
 
+    /// Create a `PubSub` through the declared Effect and environment capabilities.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + Sync + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `options` (`PubSubOptions`): Caller-selected bounds and behavior for this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<Self, PubSubError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn make<R: Send + Sync + 'static>(options: PubSubOptions) -> Effect<Self, PubSubError, R> {
         Effect::try_sync(move || Self::new(options), |error| error)
     }
 
     /// A fresh subscription is registered on each execution. Replay history
     /// and registration are read under the same gate as publication.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Returns
+    /// Type: `Effect<Subscription<A>, PubSubError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn subscribe<R: Send + Sync + 'static>(&self) -> Effect<Subscription<A>, PubSubError, R> {
         let hub = self.clone();
         Effect::ready(move |_, _| match hub.subscribe_now() {
@@ -158,6 +266,18 @@ impl<A: Send + Sync + 'static> PubSub<A> {
         })
     }
 
+    /// Register a subscriber owned by the supplied scope.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `scope` (`&Scope<PubSubError>`): Owner that joins child work and releases resources at close.
+    ///
+    /// # Returns
+    /// Type: `Effect<ResourceValue<Subscription<A>>, PubSubError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn subscribe_scoped<R: Send + Sync + 'static>(
         &self,
         scope: &Scope<PubSubError>,
@@ -173,6 +293,13 @@ impl<A: Send + Sync + 'static> PubSub<A> {
     /// Convert one scoped subscription into a stream. A loss notification is
     /// a typed stream failure rather than a silently skipped element.
     #[must_use]
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Returns
+    /// Type: `Stream<Arc<A>, PubSubError, R>`.
+    /// Returns a scoped stream with the declared item, error, and environment types.
     pub fn stream<R: Send + Sync + 'static>(&self) -> Stream<Arc<A>, PubSubError, R> {
         let hub = self.clone();
         Stream::new(move |scope| {
@@ -187,6 +314,11 @@ impl<A: Send + Sync + 'static> PubSub<A> {
         })
     }
 
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Returns
+    /// Type: `Result<Subscription<A>, PubSubError>`.
     pub(crate) fn subscribe_now(&self) -> Result<Subscription<A>, PubSubError> {
         let mut state = self
             .inner
@@ -217,6 +349,11 @@ impl<A: Send + Sync + 'static> PubSub<A> {
         })
     }
 
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Returns
+    /// Type: `Result<(Arc<A>, Subscription<A>), PubSubError>`.
     pub(crate) fn subscribe_current_now(&self) -> Result<(Arc<A>, Subscription<A>), PubSubError> {
         let mut state = self
             .inner
@@ -254,6 +391,11 @@ impl<A: Send + Sync + 'static> PubSub<A> {
         ))
     }
 
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Returns
+    /// Type: `Result<Arc<A>, PubSubError>`.
     pub(crate) fn current(&self) -> Result<Arc<A>, PubSubError> {
         let state = self
             .inner
@@ -272,6 +414,17 @@ impl<A: Send + Sync + 'static> PubSub<A> {
 
     /// Consume one owned value on the first started execution. Re-running the
     /// recipe reports a typed consumed-value error instead of cloning payloads.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `value` (`A`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<PublishReport, PubSubError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn publish<R: Send + Sync + 'static>(
         &self,
         value: A,
@@ -291,6 +444,17 @@ impl<A: Send + Sync + 'static> PubSub<A> {
 
     /// Create one fresh owned value per execution, including after a prior run
     /// was cancelled or rejected. The factory runs once per started execution.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `factory` (`impl Fn() -> A + Send + Sync + 'static`): Factory invoked to create fresh data for an execution.
+    ///
+    /// # Returns
+    /// Type: `Effect<PublishReport, PubSubError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn publish_with<R: Send + Sync + 'static>(
         &self,
         factory: impl Fn() -> A + Send + Sync + 'static,
@@ -300,6 +464,18 @@ impl<A: Send + Sync + 'static> PubSub<A> {
 
     /// Commit related state while publication is admitted and before any
     /// subscriber can observe the value. The callback must not reenter this hub.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `value` (`A`): Value read, transformed, encoded, or stored by this operation.
+    /// - `commit` (`impl Fn(&A) + Send + Sync + 'static`): The commit supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<PublishReport, PubSubError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub(crate) fn publish_with_commit<R: Send + Sync + 'static>(
         &self,
         value: A,
@@ -318,6 +494,18 @@ impl<A: Send + Sync + 'static> PubSub<A> {
         )
     }
 
+    ///
+    /// # Type parameters
+    /// - `R`: Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `factory` (`impl Fn() -> Result<A, PubSubError> + Send + Sync + 'static`): Factory invoked to create fresh data for an execution.
+    /// - `commit` (`Option<CommitHook<A>>`): The commit supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<PublishReport, PubSubError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn publish_candidate<R: Send + Sync + 'static>(
         &self,
         factory: impl Fn() -> Result<A, PubSubError> + Send + Sync + 'static,
@@ -346,6 +534,17 @@ impl<A: Send + Sync + 'static> PubSub<A> {
     /// Drain allows existing subscriber buffers to be read; discard removes
     /// them. Both reject new publications/subscriptions and wake pending work.
     /// The first shutdown policy wins; later calls return false.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + Sync + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `mode` (`PubSubShutdown`): Selected behavior for this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<bool, PubSubError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn shutdown<R: Send + Sync + 'static>(
         &self,
         mode: PubSubShutdown,
@@ -388,11 +587,18 @@ impl<A: Send + Sync + 'static> PubSub<A> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The state reported when publication closes and subscribers settle.
 pub enum PubSubShutdown {
+    /// Stop admission and wait for already accepted work.
     Drain,
+    /// Drop the selected value under the configured overflow policy.
     Discard,
 }
 
+/// Variants of publish attempt used by pub sub.
+///
+/// # Type parameters
+/// - `A`: Application value type.
 enum PublishAttempt<A> {
     Wait,
     Complete(PublishReport, Vec<Arc<A>>, Vec<Arc<Event>>),
@@ -400,6 +606,18 @@ enum PublishAttempt<A> {
 }
 
 impl<A: Send + Sync + 'static> Inner<A> {
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `value` (`Arc<A>`): Value read, transformed, encoded, or stored by this operation.
+    /// - `cancellation` (`Cancellation`): The cancellation token for this operation.
+    /// - `commit` (`Option<CommitHook<A>>`): The commit supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Exit<PublishReport, PubSubError>`.
+    /// Returns `Exit<PublishReport, PubSubError>`.
     async fn publish(
         &self,
         value: Arc<A>,
@@ -499,6 +717,10 @@ impl<A: Send + Sync + 'static> Inner<A> {
     }
 }
 
+/// Typed subscription inner used by pub sub.
+///
+/// # Type parameters
+/// - `A`: Application value type.
 struct SubscriptionInner<A> {
     hub: Arc<Inner<A>>,
     id: u64,
@@ -507,21 +729,46 @@ struct SubscriptionInner<A> {
 
 /// Unique subscription ownership. Dropping the handle unregisters it and
 /// wakes pending takers and backpressured publishers; no payload is copied.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + Sync + 'static`.
 pub struct Subscription<A: Send + Sync + 'static> {
     inner: Arc<SubscriptionInner<A>>,
 }
 
+/// A delivered value or lifecycle event observed by a subscriber.
+///
+/// # Type parameters
+/// - `A`: Application value type.
 pub enum SubscriptionEvent<A> {
+    /// Deliver one application item. Contains `Arc<A>`.
     Item(Arc<A>),
+    /// The subscriber missed values and must resnapshot. Contains `NonZeroUsize`.
     Lagged(NonZeroUsize),
+    /// The stream has no further items.
     End,
 }
 
 impl<A: Send + Sync + 'static> Subscription<A> {
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + Sync + 'static`.
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     pub(crate) fn close_now(&self) -> bool {
         self.inner.close()
     }
 
+    /// Transfer the owned value out when the current state permits it.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Returns
+    /// Type: `Effect<SubscriptionEvent<A>, PubSubError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn take<R: Send + Sync + 'static>(&self) -> Effect<SubscriptionEvent<A>, PubSubError, R> {
         let subscription = Arc::clone(&self.inner);
         Effect::new(move |_, context, finish| {
@@ -536,6 +783,15 @@ impl<A: Send + Sync + 'static> Subscription<A> {
         })
     }
 
+    /// Receive the next bounded batch of published values.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Returns
+    /// Type: `Effect<Chunk<Arc<A>>, PubSubError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn pull_chunk<R: Send + Sync + 'static>(&self) -> Effect<Chunk<Arc<A>>, PubSubError, R> {
         self.take().flat_map(|event| match event {
             SubscriptionEvent::Item(value) => Effect::sync_once(move || Chunk::Values(vec![value])),
@@ -546,6 +802,15 @@ impl<A: Send + Sync + 'static> Subscription<A> {
         })
     }
 
+    /// Remove this subscriber and release its retained delivery state.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + Sync + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Returns
+    /// Type: `Effect<bool, PubSubError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn unsubscribe<R: Send + Sync + 'static>(&self) -> Effect<bool, PubSubError, R> {
         let subscription = Arc::clone(&self.inner);
         Effect::sync(move || subscription.close())
@@ -553,12 +818,19 @@ impl<A: Send + Sync + 'static> Subscription<A> {
 }
 
 impl<A: Send + Sync + 'static> Drop for Subscription<A> {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         let _ = catch_unwind(AssertUnwindSafe(|| self.inner.close()));
     }
 }
 
 impl<A: Send + Sync + 'static> SubscriptionInner<A> {
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     fn close(&self) -> bool {
         let removed = self
             .hub
@@ -576,6 +848,16 @@ impl<A: Send + Sync + 'static> SubscriptionInner<A> {
         first
     }
 
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `cancellation` (`Cancellation`): The cancellation token for this operation.
+    ///
+    /// # Returns
+    /// Type: `Exit<SubscriptionEvent<A>, PubSubError>`.
+    /// Returns `Exit<SubscriptionEvent<A>, PubSubError>`.
     async fn take(&self, cancellation: Cancellation) -> Exit<SubscriptionEvent<A>, PubSubError> {
         loop {
             let changed = self.changed.listen();

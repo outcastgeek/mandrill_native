@@ -1,3 +1,5 @@
+//! Committed-event integration with reactive observation.
+
 use super::event_journal::validate_journal_read;
 use super::{
     EventJournal, HasEventJournal, JournalCursor, JournalEntry, JournalReadOutcome,
@@ -8,33 +10,56 @@ use crate::{Effect, PublishReport};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+/// Type alias for observation keys in eventlog event observation.
 type ObservationKeys = dyn Fn(&JournalEntry) -> Vec<InvalidationKey> + Send + Sync;
 
+/// The cursor and invalidations accounted for during event observation.
 pub struct EventObservationReport {
+    /// Next position after the current record. Type: `JournalCursor`.
     pub next: JournalCursor,
+    /// Whether more entries remain after this batch. Type: `bool`.
     pub has_more: bool,
+    /// Publication report when invalidation was emitted. Type: `Option<PublishReport>`.
     pub notification: Option<PublishReport>,
 }
 
 #[derive(Debug)]
+/// An observation failure carrying the cursor from which reconciliation can resume.
+///
+/// # Type parameters
+/// - `JournalError`: Error returned by the event journal.
 pub enum EventObservationError<JournalError> {
+    /// The authoritative event journal rejected or failed the operation. Retains the `JournalError` detail.
     Journal(JournalError),
+    /// Required history was compacted before this replay cursor.
     HistoryTruncated {
+        /// Earliest position still retained for replay. Type: `JournalCursor`.
         first_available: JournalCursor,
     },
+    /// The supplied cursor is ahead of the journal’s current head.
     CursorAhead {
+        /// Current head position of the ordered stream. Type: `JournalCursor`.
         head: JournalCursor,
     },
+    /// The journal read failed validation.
     InvalidJournalRead {
+        /// Cursor from which reconciliation can safely resume. Type: `JournalCursor`.
         replay_after: JournalCursor,
+        /// Structured validation issue explaining this failure. Type: `JournalReadViolation`.
         issue: JournalReadViolation,
     },
+    /// No tification is available.
     Notification {
+        /// Cursor from which reconciliation can safely resume. Type: `JournalCursor`.
         replay_after: JournalCursor,
+        /// The underlying failure or provider cause. Type: `InvalidationError`.
         source: InvalidationError,
     },
+    /// No tification dropped is available.
     NotificationDropped {
+        /// Cursor from which reconciliation can safely resume. Type: `JournalCursor`.
         replay_after: JournalCursor,
+        /// Number of values discarded under the overflow policy. Type: `NonZeroUsize`.
         dropped: NonZeroUsize,
     },
 }
@@ -50,6 +75,14 @@ pub struct EventObservation {
 
 impl EventObservation {
     #[must_use]
+    /// Construct a `EventObservation` from its required inputs and explicit policies.
+    ///
+    /// # Parameters
+    /// - `registry` (`InvalidationRegistry`): Registry that owns definitions and rejects identity conflicts.
+    /// - `keys` (`impl Fn(&JournalEntry) -> Vec<InvalidationKey> + Send + Sync + 'static`): The keys supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(
         registry: InvalidationRegistry,
         keys: impl Fn(&JournalEntry) -> Vec<InvalidationKey> + Send + Sync + 'static,
@@ -60,6 +93,19 @@ impl EventObservation {
         }
     }
 
+    /// Publish invalidations for committed events and return a replay-safe cursor.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Additional bound: `HasEventJournal + Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `stream` (`JournalStream`): Scoped source of ordered chunks or events.
+    /// - `after` (`JournalCursor`): Cursor or instant after which results are selected.
+    /// - `limit` (`NonZeroUsize`): The caller-supplied limit.
+    ///
+    /// # Returns
+    /// Type: `Effect<EventObservationReport, EventObservationError<<R::Journal as EventJournal>::Error>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn reconcile<R>(
         &self,
         stream: JournalStream,

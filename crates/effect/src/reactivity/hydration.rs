@@ -1,3 +1,5 @@
+//! Versioned encoded export and import of registry state.
+
 use super::{AtomId, AtomRef, AtomRefError, AtomRegistry};
 use crate::persistence::RecordVersion;
 use crate::{
@@ -8,7 +10,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 
+/// Type alias for hydration export in reactivity hydration.
+///
+/// # Type parameters
+/// - `R`: Environment type.
 type HydrationExport<R> = dyn Fn() -> Effect<Arc<[u8]>, HydrationError, R> + Send + Sync;
+/// Type alias for hydration import in reactivity hydration.
+///
+/// # Type parameters
+/// - `R`: Environment type.
 type HydrationImport<R> = dyn Fn(Arc<[u8]>, HydrationConflictPolicy) -> Effect<HydrationImportOutcome, HydrationError, R>
     + Send
     + Sync;
@@ -24,6 +34,7 @@ mod wire {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The decision when imported state conflicts with a newer local revision.
 pub enum HydrationConflictPolicy {
     /// Apply only if the incoming revision is strictly newer.
     OnlyIfNewer,
@@ -33,34 +44,56 @@ pub enum HydrationConflictPolicy {
 }
 
 #[derive(Debug)]
+/// A codec, source, or revision failure while exporting or importing reactive state.
 pub enum HydrationError {
+    /// The underlying source failed before the operation could settle. Retains the `AtomRefError` detail.
     Source(AtomRefError),
+    /// The value failed schema validation. Retains the `SchemaIssue` detail.
     Schema(SchemaIssue),
+    /// The record failed validation.
     InvalidRecord,
+    /// The supplied atom does not match the required or recorded value.
     WrongAtom,
+    /// The recorded version differs from the declared version.
     VersionMismatch,
+    /// The supplied revision is older than current state.
     Stale {
+        /// Current recorded value or position. Type: `NonZeroU64`.
         current: NonZeroU64,
+        /// Revision supplied by the imported record. Type: `NonZeroU64`.
         incoming: NonZeroU64,
     },
+    /// No further revision can be allocated without exceeding its range.
     RevisionExhausted,
+    /// An owned input was already consumed.
     InputConsumed,
+    /// The atom belongs to a different registry.
     ForeignRegistry,
+    /// The atom already exists or occurred twice.
     DuplicateAtom,
+    /// The record already exists or occurred twice.
     DuplicateRecord,
+    /// The atom is not recognized.
     UnknownAtom,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The state and publication decision after importing a hydration record.
 pub struct HydrationImportOutcome {
+    /// The recorded storage revision. Type: `NonZeroU64`.
     pub revision: NonZeroU64,
+    /// Whether conflict policy forced replacement of newer local state. Type: `bool`.
     pub forced: bool,
+    /// Accounting for invalidations published after import. Type: `PublishReport`.
     pub publication: PublishReport,
 }
 
 /// A typed export description; the codec is application-supplied and pure.
 /// This record's compatibility version is separate from the atom key and the
 /// codec's schema metadata.
+///
+/// # Type parameters
+/// - `A`: Application value type.
 pub struct HydrationSchema<A> {
     atom: AtomId,
     version: RecordVersion,
@@ -69,6 +102,9 @@ pub struct HydrationSchema<A> {
 }
 
 impl<A> Clone for HydrationSchema<A> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             atom: self.atom.clone(),
@@ -81,6 +117,19 @@ impl<A> Clone for HydrationSchema<A> {
 
 impl<A: Send + 'static> HydrationSchema<A> {
     #[must_use]
+    /// Construct a `HydrationSchema` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `atom` (`AtomId`): The atom supplied to this operation.
+    /// - `version` (`RecordVersion`): Registered schema, event, or workflow compatibility version.
+    /// - `codec` (`PureCodec<A, JsonValue>`): The codec used to convert and validate values.
+    /// - `limits` (`ParseLimits`): Explicit resource bounds enforced while processing this input.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(
         atom: AtomId,
         version: RecordVersion,
@@ -96,10 +145,28 @@ impl<A: Send + 'static> HydrationSchema<A> {
     }
 
     #[must_use]
+    /// Select the registered atom identified by this value.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    ///
+    /// # Returns
+    /// Type: `&AtomId`.
     pub fn atom(&self) -> &AtomId {
         &self.atom
     }
 
+    /// Encode the typed value using this definition’s declared representation.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `value` (`&A`): Value read, transformed, encoded, or stored by this operation.
+    /// - `revision` (`NonZeroU64`): The revision supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Arc<[u8]>, HydrationError>`.
     pub fn encode(&self, value: &A, revision: NonZeroU64) -> Result<Arc<[u8]>, HydrationError> {
         let encoded = self
             .codec
@@ -130,6 +197,16 @@ impl<A: Send + 'static> HydrationSchema<A> {
         Ok(Arc::from(bytes))
     }
 
+    /// Validate the encoded input and reconstruct its typed value.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `bytes` (`&[u8]`): Encoded bytes to validate, decode, write, or transfer.
+    ///
+    /// # Returns
+    /// Type: `Result<(A, NonZeroU64), HydrationError>`.
     pub fn decode(&self, bytes: &[u8]) -> Result<(A, NonZeroU64), HydrationError> {
         if bytes.len() > self.limits.bytes.get() {
             return Err(HydrationError::Schema(SchemaIssue::new(
@@ -190,11 +267,18 @@ impl<A: Send + 'static> HydrationSchema<A> {
     }
 }
 
+/// The result of processing one atom record in a hydration batch.
 pub struct HydrationRecordResult {
+    /// Stable identity of the atom involved in this record. Type: `AtomId`.
     pub atom: AtomId,
+    /// The recorded outcome of this operation. Type: `Result<HydrationImportOutcome, HydrationError>`.
     pub outcome: Result<HydrationImportOutcome, HydrationError>,
 }
 
+/// Typed binding used by reactivity hydration.
+///
+/// # Type parameters
+/// - `R`: Environment type. Bound or type: `Send + Sync + 'static`.
 struct Binding<R: Send + Sync + 'static> {
     atom: AtomId,
     export: Arc<HydrationExport<R>>,
@@ -202,6 +286,9 @@ struct Binding<R: Send + Sync + 'static> {
 }
 
 impl<R: Send + Sync + 'static> Clone for Binding<R> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             atom: self.atom.clone(),
@@ -212,7 +299,10 @@ impl<R: Send + Sync + 'static> Clone for Binding<R> {
 }
 
 /// Heterogeneous registration erases only the already-typed Effect factories.
-/// Values are never downcast; each binding retains its own PureCodec<A>.
+/// Values are never downcast; each binding retains its own `PureCodec<A>`.
+///
+/// # Type parameters
+/// - `R`: Environment type. Bound or type: `Send + Sync + 'static`.
 pub struct HydrationSet<R: Send + Sync + 'static> {
     registry: AtomRegistry,
     routing_limits: ParseLimits,
@@ -221,6 +311,17 @@ pub struct HydrationSet<R: Send + Sync + 'static> {
 
 impl<R: Send + Sync + 'static> HydrationSet<R> {
     #[must_use]
+    /// Construct a `HydrationSet` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bound: `Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `registry` (`AtomRegistry`): Registry that owns definitions and rejects identity conflicts.
+    /// - `routing_limits` (`ParseLimits`): The routing limits supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(registry: AtomRegistry, routing_limits: ParseLimits) -> Self {
         Self {
             registry,
@@ -229,6 +330,18 @@ impl<R: Send + Sync + 'static> HydrationSet<R> {
         }
     }
 
+    /// Register the supplied definition, rejecting an identity or compatibility conflict.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bound: `Send + Sync + 'static`.
+    /// - `A`: Application value type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `source` (`AtomRef<A>`): Underlying provider or input from which values are read.
+    /// - `schema` (`HydrationSchema<A>`): Codec and validation rules for the application value.
+    ///
+    /// # Returns
+    /// Type: `Result<(), HydrationError>`.
     pub fn register<A: Send + Sync + 'static>(
         &mut self,
         source: AtomRef<A>,
@@ -261,6 +374,14 @@ impl<R: Send + Sync + 'static> HydrationSet<R> {
         Ok(())
     }
 
+    /// Encode a consistent set of registered atom values for hydration.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type.
+    ///
+    /// # Returns
+    /// Type: `Effect<Vec<Arc<[u8]>>, HydrationError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn export_all(&self) -> Effect<Vec<Arc<[u8]>>, HydrationError, R> {
         let programs = self
             .bindings
@@ -273,6 +394,17 @@ impl<R: Send + Sync + 'static> HydrationSet<R> {
     /// Validate routing identities and duplicates for the entire batch before
     /// issuing any mutation. After that boundary each record has its own
     /// outcome; there is no invented multi-atom transaction guarantee.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `records` (`Vec<Arc<[u8]>>`): The records supplied to this operation.
+    /// - `policy` (`HydrationConflictPolicy`): The caller-supplied behavior policy.
+    ///
+    /// # Returns
+    /// Type: `Effect<Vec<HydrationRecordResult>, HydrationError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn import_all(
         &self,
         records: Vec<Arc<[u8]>>,
@@ -320,6 +452,13 @@ impl<R: Send + Sync + 'static> HydrationSet<R> {
     }
 }
 
+///
+/// # Parameters
+/// - `record` (`&[u8]`): The record supplied to this operation.
+/// - `limits` (`ParseLimits`): Explicit resource bounds enforced while processing this input.
+///
+/// # Returns
+/// Type: `Result<Arc<[u8]>, HydrationError>`.
 fn routing_key(record: &[u8], limits: ParseLimits) -> Result<Arc<[u8]>, HydrationError> {
     if record.len() > limits.bytes.get() {
         return Err(HydrationError::Schema(SchemaIssue::new(
@@ -352,6 +491,17 @@ fn routing_key(record: &[u8], limits: ParseLimits) -> Result<Arc<[u8]>, Hydratio
 impl<A: Send + Sync + 'static> AtomRef<A> {
     /// The mutation gate keeps the value and revision from different commits
     /// from being combined into one exported record.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `schema` (`HydrationSchema<A>`): Codec and validation rules for the application value.
+    ///
+    /// # Returns
+    /// Type: `Effect<Arc<[u8]>, HydrationError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn export<R: Send + Sync + 'static>(
         &self,
         schema: HydrationSchema<A>,
@@ -381,6 +531,20 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
             })
     }
 
+    /// Decode and apply hydration records under the selected conflict policy.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `schema` (`HydrationSchema<A>`): Codec and validation rules for the application value.
+    /// - `bytes` (`Arc<[u8]>`): Encoded bytes to validate, decode, write, or transfer.
+    /// - `policy` (`HydrationConflictPolicy`): The caller-supplied behavior policy.
+    ///
+    /// # Returns
+    /// Type: `Effect<HydrationImportOutcome, HydrationError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn import<R: Send + Sync + 'static>(
         &self,
         schema: HydrationSchema<A>,

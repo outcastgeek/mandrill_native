@@ -13,6 +13,27 @@ const errors = @import("rpc_error.zig");
 const wire = @import("wire_codec.zig");
 const Issue = @import("../schema/schema_issue.zig").Issue;
 
+/// Specialize a typed rpc client from its definition.
+/// Parameters:
+/// - `operation: comptime anytype`: Compile-time statically inferred input checked when this operation is
+///   instantiated.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `MiddlewareError: comptime type`: Compile-time typed failure introduced by middleware.
+/// - `request_wire: comptime wire.WireCodec(@TypeOf(operation).Request, R)`: Wire codec for the operation’s request type and environment.
+/// - `success_wire: comptime wire.WireCodec(@TypeOf(operation).Success, R)`: Wire codec for the operation’s success channel.
+/// - `failure_wire: comptime wire.WireCodec(@TypeOf(operation).DomainError, R)`: Wire codec for the operation’s typed failure channel.
+/// - `select_session: comptime fn (*const R) *const transport.Session(R, ProviderError)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_registry: comptime fn (*const R) *registry_module.Registry(R)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_policy: comptime fn (*const R) transport.Policy`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_correlation: comptime fn (*const R, *const @TypeOf(operation).Request) envelope.Correlation`: Compile-time typed selector from the current environment; its result
+///   must remain valid through use.
+/// - `select_metadata: comptime fn (*const R, *const @TypeOf(operation).Request) []const envelope.View.Entry`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// Returns (`type`): typed unary RPC client derived from a completed operation.
 pub fn UnaryClient(
     comptime operation: anytype,
     comptime R: type,
@@ -37,41 +58,70 @@ pub fn UnaryClient(
     }
     return struct {
         const Self = @This();
+        /// Typed request payload or request record for this operation.
         pub const Request = Op.Request;
+        /// Value type carried by the successful channel.
         pub const Success = Op.Success;
+        /// Domain-specific error type carried by the operation.
         pub const DomainError = Op.DomainError;
+        /// Typed session error variant or error channel described by `transport.Error(ProviderError)`.
         pub const SessionError = transport.Error(ProviderError);
+        /// Typed failure channel combining domain and provider errors.
         pub const Failure = errors.Error(DomainError, MiddlewareError, SessionError);
+        /// Lazy Effect for result; success, error, and environment types are fixed by
+        /// `effects.Effect(Success, Failure, R)`.
         pub const Result = effects.Effect(Success, Failure, R);
         const Registry = registry_module.Registry(R);
         const Pending = Registry.Pending;
         const Bytes = outcomes.OwnedSlice(u8);
         const Lease = struct { pending: *Pending, registry: *Registry, request: *const Request, policy: transport.Policy };
         const SendCapture = struct {
+            /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements
+            /// `deinit` and must be released after use.
             pub const effect_owned_payload = true;
             lease: Lease,
             frame: Bytes,
 
+            /// Release resources owned by this value.
+            /// Parameters:
+            /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+            /// Returns (`void`): no value.
             pub fn deinit(self: *@This()) void {
                 self.frame.deinit();
                 self.* = undefined;
             }
 
+            /// Duplicate this value; marked owning payloads are cloned, while ordinary
+            /// borrowed fields retain their original lifetime.
+            /// Parameters:
+            /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+            /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
             pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
                 return .{ .lease = self.lease, .frame = try self.frame.clone() };
             }
         };
         const ReplyOwner = struct {
+            /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements
+            /// `deinit` and must be released after use.
             pub const effect_owned_payload = true;
             value: *envelope.Envelope,
             allocator: std.mem.Allocator,
 
+            /// Release resources owned by this value.
+            /// Parameters:
+            /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+            /// Returns (`void`): no value.
             pub fn deinit(self: *@This()) void {
                 self.value.deinit();
                 self.allocator.destroy(self.value);
                 self.* = undefined;
             }
 
+            /// Duplicate this value; marked owning payloads are cloned, while ordinary
+            /// borrowed fields retain their original lifetime.
+            /// Parameters:
+            /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+            /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
             pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
                 const target = try self.allocator.create(envelope.Envelope);
                 errdefer self.allocator.destroy(target);
@@ -229,6 +279,11 @@ pub fn UnaryClient(
 
         /// The selected request remains borrowed until this Effect joins.
         /// Registration precedes encoding so an early response is not orphaned.
+        ///
+        /// Parameters:
+        /// - `select_request: comptime fn (*const R) *const Request`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// Returns (`Result`): The typed operation result or description selected by this API.
         pub fn call(comptime select_request: fn (*const R) *const Request) Result {
             const Acquire = effects.Effect(Lease, Failure, R);
             const acquisition = Acquire.fromOutcome(struct {

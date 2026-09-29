@@ -1,3 +1,5 @@
+//! Durable workflow operation binding.
+
 use super::{
     ActivityRunError, ChildWait, DurableBranch, DurableChild, DurableClock, DurableClockError,
     DurableDeferred, DurableParallel, DurableParallelError, DurableRace, DurableRaceError,
@@ -8,18 +10,39 @@ use super::{
 use crate::{Effect, HasTaskSpawner, HasWallClock, WallClock};
 use std::num::{NonZeroU32, NonZeroUsize};
 
+/// Type alias for engine error in workflow durable.
+///
+/// # Type parameters
+/// - `R`: Environment type.
 type EngineError<R> = <<R as HasWorkflowEngine>::Engine as WorkflowEngine>::Error;
+/// Type alias for wall clock error in workflow durable.
+///
+/// # Type parameters
+/// - `R`: Environment type.
 type WallClockError<R> = <<R as HasWallClock>::Clock as WallClock>::Error;
+/// Type alias for branch results in workflow durable.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 type BranchResults<A, E> = Vec<Result<A, E>>;
 
 /// Deterministic workflow coordination description. Its constructor is
 /// private: ordinary Effects belong inside named activity bodies, not as
 /// directly retryable workflow coordination steps.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
+/// - `R`: Environment type. Bound or type: `Send + Sync + 'static`.
 pub struct Durable<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> {
     effect: Effect<A, E, R>,
 }
 
 impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Clone for Durable<A, E, R> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             effect: self.effect.clone(),
@@ -28,24 +51,78 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Clone for D
 }
 
 impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Durable<A, E, R> {
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `effect` (`Effect<A, E, R>`): The effect supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub(crate) fn from_effect(effect: Effect<A, E, R>) -> Self {
         Self { effect }
     }
 
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Returns
+    /// Type: `Effect<A, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub(crate) fn into_effect(self) -> Effect<A, E, R> {
         self.effect
     }
 
+    /// Produce a fresh successful value when this description is executed.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bound: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `value` (`impl Fn() -> A + Send + Sync + 'static`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn succeed_with(value: impl Fn() -> A + Send + Sync + 'static) -> Self {
         Self::from_effect(Effect::sync(value))
     }
 
     /// Consume an owned result produced within one workflow evaluation.
     /// A replay rebuilds the workflow body and therefore obtains fresh values.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bound: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Parameters
+    /// - `value` (`impl FnOnce() -> A + Send + 'static`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn succeed_once(value: impl FnOnce() -> A + Send + 'static) -> Self {
         Self::from_effect(Effect::sync_once(value))
     }
 
+    /// Transform successful values while preserving other outcome channels.
+    ///
+    /// # Type parameters
+    /// - `B`: Transformed value type. Bounds: `Send + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `map` (`impl Fn(A) -> B + Send + Sync + 'static`): The map supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Durable<B, E, R>`.
     pub fn map<B: Send + 'static>(
         self,
         map: impl Fn(A) -> B + Send + Sync + 'static,
@@ -53,6 +130,19 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Durable<A, 
         Durable::from_effect(self.effect.map(map))
     }
 
+    /// Transform the expected error channel without changing other workflow outcomes.
+    ///
+    /// # Type parameters
+    /// - `F`: Bounds: `Send + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `map` (`impl Fn(E) -> F + Send + Sync + 'static`): The map supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Durable<A, F, R>`.
     pub fn map_error<F: Send + 'static>(
         self,
         map: impl Fn(E) -> F + Send + Sync + 'static,
@@ -60,6 +150,19 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Durable<A, 
         Durable::from_effect(self.effect.map_error(map))
     }
 
+    /// Build a dependent operation from each successful value.
+    ///
+    /// # Type parameters
+    /// - `B`: Transformed value type. Bounds: `Send + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `next` (`impl Fn(A) -> Durable<B, E, R> + Send + Sync + 'static`): Next value or state produced by the transition.
+    ///
+    /// # Returns
+    /// Type: `Durable<B, E, R>`.
     pub fn flat_map<B: Send + 'static>(
         self,
         next: impl Fn(A) -> Durable<B, E, R> + Send + Sync + 'static,
@@ -71,6 +174,18 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Durable<A, 
 impl<E: Send + 'static, R: Send + Sync + 'static> Durable<(), E, R> {
     /// Rebuild the iterator on each evaluation. The caller supplies a
     /// deterministic source and stable activity identities inside `body`.
+    ///
+    /// # Type parameters
+    /// - `Items`: Input collection or iterator type. Additional bound: `IntoIterator + 'static`. Additional bound: `:Item: Send + 'static`. Additional bound: `:IntoIter: Send + 'static`.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `items` (`impl Fn() -> Items + Send + Sync + 'static`): The items supplied to this operation.
+    /// - `body` (`impl Fn(Items::Item) -> Durable<(), E, R> + Send + Sync + 'static`): Application callback or effect executed inside the owning scope.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn for_each<Items>(
         items: impl Fn() -> Items + Send + Sync + 'static,
         body: impl Fn(Items::Item) -> Durable<(), E, R> + Send + Sync + 'static,
@@ -85,6 +200,23 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Durable<(), E, R> {
         }))
     }
 
+    /// Select the named activity registered with this workflow.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `A`: Application value type. Bounds: `Send + 'static`.
+    /// - `DomainError`: Bounds: `Send + 'static`.
+    /// - `BodyError`: Bounds: `Send + 'static`.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `description` (`WorkflowActivity<A, DomainError>`): The description supplied to this operation.
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `attempt` (`NonZeroU32`): Ordinal execution or delivery attempt being recorded.
+    /// - `body` (`impl Fn() -> Effect<Result<A, DomainError>, BodyError, R> + Send + Sync + 'static`): Application callback or effect executed inside the owning scope.
+    ///
+    /// # Returns
+    /// Type: `Durable<Result<A, DomainError>, ActivityRunError<EngineError<R>, BodyError>, R>`.
     pub fn activity<A: Send + 'static, DomainError: Send + 'static, BodyError: Send + 'static>(
         description: WorkflowActivity<A, DomainError>,
         run: WorkflowRunId,
@@ -98,6 +230,18 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Durable<(), E, R> {
     }
 
     #[must_use]
+    /// Record or await a named signal so replay observes the same value.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `A`: Application value type. Bounds: `Send + 'static`.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `token` (`DurableDeferred<A>`): Fencing token that identifies the current claim or owner.
+    ///
+    /// # Returns
+    /// Type: `Durable<DurableSignalWait<A>, DurableSignalError<EngineError<R>>, R>`.
     pub fn signal<A: Send + 'static>(
         token: DurableDeferred<A>,
     ) -> Durable<DurableSignalWait<A>, DurableSignalError<EngineError<R>>, R>
@@ -108,6 +252,18 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Durable<(), E, R> {
     }
 
     #[must_use]
+    /// Wait on a recorded deadline rather than a transient timer alone.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `deadline` (`RecordedDeadline`): The deadline for the pending operation.
+    ///
+    /// # Returns
+    /// Type: `Durable<super::DeadlineWait, DurableClockError<EngineError<R>, WallClockError<R>>, R>`.
     pub fn deadline(
         run: WorkflowRunId,
         deadline: RecordedDeadline,
@@ -119,6 +275,18 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Durable<(), E, R> {
     }
 
     #[must_use]
+    /// Await a child workflow through a recorded parent/child relationship.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `parent` (`WorkflowRunId`): Parent scope, span, or workflow identity.
+    /// - `child` (`WorkflowRunId`): Child workflow or scope-owned task being observed.
+    ///
+    /// # Returns
+    /// Type: `Durable<ChildWait, EngineError<R>, R>`.
     pub fn child_wait(
         parent: WorkflowRunId,
         child: WorkflowRunId,
@@ -130,6 +298,22 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Durable<(), E, R> {
     }
 
     #[must_use]
+    /// Describe another attempt under the supplied retry policy.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `A`: Application value type. Bounds: `Send + 'static`.
+    /// - `DomainError`: Bounds: `Send + 'static`.
+    /// - `BodyError`: Bounds: `Send + 'static`.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `branch` (`DurableBranch<A, DomainError, BodyError, R>`): The branch supplied to this operation.
+    /// - `policy` (`DurableRetryPolicy`): The caller-supplied behavior policy.
+    ///
+    /// # Returns
+    /// Type: `Durable<Result<A, DomainError>, DurableRetryError<EngineError<R>, BodyError>, R>`.
     pub fn retry<A: Send + 'static, DomainError: Send + 'static, BodyError: Send + 'static>(
         run: WorkflowRunId,
         branch: DurableBranch<A, DomainError, BodyError, R>,
@@ -142,6 +326,23 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Durable<(), E, R> {
     }
 
     #[must_use]
+    /// Coordinate multiple durable branches and record their results for replay.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `A`: Application value type. Bounds: `Send + 'static`.
+    /// - `DomainError`: Bounds: `Send + 'static`.
+    /// - `BodyError`: Bounds: `Send + 'static`.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `attempt` (`NonZeroU32`): Ordinal execution or delivery attempt being recorded.
+    /// - `concurrency` (`NonZeroUsize`): Positive bound on independently admitted work.
+    /// - `branches` (`Vec<DurableBranch<A, DomainError, BodyError, R>>`): The branches supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Durable<BranchResults<A, DomainError>, DurableParallelError<EngineError<R>, BodyError>, R>`.
     pub fn parallel<A: Send + 'static, DomainError: Send + 'static, BodyError: Send + 'static>(
         run: WorkflowRunId,
         attempt: NonZeroU32,
@@ -155,6 +356,23 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Durable<(), E, R> {
     }
 
     #[must_use]
+    /// Run durable branches with recorded retry decisions.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `A`: Application value type. Bounds: `Send + 'static`.
+    /// - `DomainError`: Bounds: `Send + 'static`.
+    /// - `BodyError`: Bounds: `Send + 'static`.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `concurrency` (`NonZeroUsize`): Positive bound on independently admitted work.
+    /// - `policy` (`DurableRetryPolicy`): The caller-supplied behavior policy.
+    /// - `branches` (`Vec<DurableBranch<A, DomainError, BodyError, R>>`): The branches supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Durable<BranchResults<A, DomainError>, DurableRetryError<EngineError<R>, BodyError>, R>`.
     pub fn parallel_retry<
         A: Send + 'static,
         DomainError: Send + 'static,
@@ -177,6 +395,24 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Durable<(), E, R> {
     }
 
     #[must_use]
+    /// Record which durable branch wins so replay chooses the same result.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `A`: Application value type. Bounds: `Send + 'static`.
+    /// - `DomainError`: Bounds: `Send + 'static`.
+    /// - `BodyError`: Bounds: `Send + 'static`.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+    /// - `race` (`WorkflowRaceId`): Stable identity or definition of the durable race.
+    /// - `attempt` (`NonZeroU32`): Ordinal execution or delivery attempt being recorded.
+    /// - `left` (`DurableBranch<A, DomainError, BodyError, R>`): The left supplied to this operation.
+    /// - `right` (`DurableBranch<A, DomainError, BodyError, R>`): Right-hand operation composed with this one.
+    ///
+    /// # Returns
+    /// Type: `Durable<Result<A, DomainError>, DurableRaceError<EngineError<R>, BodyError>, R>`.
     pub fn race<A: Send + 'static, DomainError: Send + 'static, BodyError: Send + 'static>(
         run: WorkflowRunId,
         race: WorkflowRaceId,
@@ -191,6 +427,22 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Durable<(), E, R> {
     }
 }
 
+/// Select the named activity registered with this workflow.
+///
+/// # Type parameters
+/// - `A`: Application value type. Additional bound: `Send + 'static`.
+/// - `DomainError`: Expected domain-error type. Additional bound: `Send + 'static`.
+/// - `BodyError`: Error produced by the registered workflow body. Additional bound: `Send + 'static`.
+/// - `R`: Environment type. Additional bound: `HasWorkflowEngine + Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `description` (`WorkflowActivity<A, DomainError>`): The description supplied to this operation.
+/// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
+/// - `attempt` (`NonZeroU32`): Ordinal execution or delivery attempt being recorded.
+/// - `body` (`impl Fn() -> Effect<Result<A, DomainError>, BodyError, R> + Send + Sync + 'static`): Application callback or effect executed inside the owning scope.
+///
+/// # Returns
+/// Type: `Durable<Result<A, DomainError>, ActivityRunError<EngineError<R>, BodyError>, R>`.
 pub fn activity<A, DomainError, BodyError, R>(
     description: WorkflowActivity<A, DomainError>,
     run: WorkflowRunId,

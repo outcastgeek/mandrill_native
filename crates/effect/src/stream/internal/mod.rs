@@ -1,3 +1,5 @@
+//! Private stream buffering mechanics.
+
 mod buffer;
 
 pub use buffer::StreamBufferOptions;

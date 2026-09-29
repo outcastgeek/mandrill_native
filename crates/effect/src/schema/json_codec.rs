@@ -1,3 +1,5 @@
+//! JSON codecs for primitives and composites.
+
 use super::{
     Decimal, IssueSegment, JsonValue, PrimitiveShape, PureCodec, SchemaAst, SchemaIssue,
     SchemaIssueKind, SchemaShape, StringPattern, ValueKind,
@@ -12,6 +14,13 @@ const DECIMAL_SYNTAX: &str = "decimal_syntax";
 const STABLE_KEY_ENCODING: &str = "stable_key_encoding";
 
 #[must_use]
+/// Classify a JSON value for typed mismatch diagnostics.
+///
+/// # Parameters
+/// - `value` (`&JsonValue`): Value read, transformed, encoded, or stored by this operation.
+///
+/// # Returns
+/// Type: `ValueKind`.
 pub fn value_kind(value: &JsonValue) -> ValueKind {
     match value {
         JsonValue::Null => ValueKind::Null,
@@ -24,6 +33,14 @@ pub fn value_kind(value: &JsonValue) -> ValueKind {
     }
 }
 
+///
+/// # Parameters
+/// - `expected` (`ValueKind`): Value or revision required for the proposed state transition.
+/// - `value` (`&JsonValue`): Value read, transformed, encoded, or stored by this operation.
+///
+/// # Returns
+/// Type: `SchemaIssue`.
+/// Returns `SchemaIssue`.
 fn mismatch(expected: ValueKind, value: &JsonValue) -> SchemaIssue {
     SchemaIssue::new(SchemaIssueKind::TypeMismatch {
         expected,
@@ -32,6 +49,10 @@ fn mismatch(expected: ValueKind, value: &JsonValue) -> SchemaIssue {
 }
 
 #[must_use]
+/// Build the codec and shape for JSON null.
+///
+/// # Returns
+/// Type: `PureCodec<(), JsonValue>`.
 pub fn json_null() -> PureCodec<(), JsonValue> {
     PureCodec::with_ast(
         SchemaAst::primitive(PrimitiveShape::Null),
@@ -47,6 +68,10 @@ pub fn json_null() -> PureCodec<(), JsonValue> {
 }
 
 #[must_use]
+/// Build the codec and shape for a JSON boolean.
+///
+/// # Returns
+/// Type: `PureCodec<bool, JsonValue>`.
 pub fn json_bool() -> PureCodec<bool, JsonValue> {
     PureCodec::with_ast(
         SchemaAst::primitive(PrimitiveShape::Boolean),
@@ -62,6 +87,10 @@ pub fn json_bool() -> PureCodec<bool, JsonValue> {
 }
 
 #[must_use]
+/// Build the codec and shape for a JSON string.
+///
+/// # Returns
+/// Type: `PureCodec<String, JsonValue>`.
 pub fn json_string() -> PureCodec<String, JsonValue> {
     PureCodec::with_ast(
         SchemaAst::primitive(PrimitiveShape::String),
@@ -76,6 +105,14 @@ pub fn json_string() -> PureCodec<String, JsonValue> {
     )
 }
 
+/// Build a string codec with the supplied pattern constraint.
+///
+/// # Parameters
+/// - `pattern` (`StringPattern`): The pattern supplied to this operation.
+/// - `issue_code` (`impl Into<Arc<str>>`): The issue code supplied to this operation.
+///
+/// # Returns
+/// Type: `Result<PureCodec<String, JsonValue>, SchemaIssue>`.
 pub fn json_string_pattern(
     pattern: StringPattern,
     issue_code: impl Into<Arc<str>>,
@@ -117,6 +154,10 @@ pub fn json_string_pattern(
 }
 
 #[must_use]
+/// Build the codec and shape for a signed JSON integer.
+///
+/// # Returns
+/// Type: `PureCodec<i64, JsonValue>`.
 pub fn json_i64() -> PureCodec<i64, JsonValue> {
     PureCodec::with_ast(
         SchemaAst::new(SchemaShape::IntegerRange {
@@ -138,6 +179,10 @@ pub fn json_i64() -> PureCodec<i64, JsonValue> {
 }
 
 #[must_use]
+/// Build the codec and shape for an unsigned JSON integer.
+///
+/// # Returns
+/// Type: `PureCodec<u64, JsonValue>`.
 pub fn json_u64() -> PureCodec<u64, JsonValue> {
     PureCodec::with_ast(
         SchemaAst::new(SchemaShape::UnsignedRange {
@@ -159,6 +204,10 @@ pub fn json_u64() -> PureCodec<u64, JsonValue> {
 }
 
 #[must_use]
+/// Build a finite floating-point JSON codec.
+///
+/// # Returns
+/// Type: `PureCodec<f64, JsonValue>`.
 pub fn json_f64() -> PureCodec<f64, JsonValue> {
     PureCodec::with_ast(
         SchemaAst::primitive(PrimitiveShape::Number),
@@ -183,6 +232,8 @@ pub fn json_f64() -> PureCodec<f64, JsonValue> {
 /// Encode an exact decimal as a canonical JSON string. A JSON number may
 /// already have lost precision before it reaches a codec, so it is rejected.
 #[must_use]
+/// # Returns
+/// Type: `PureCodec<Decimal, JsonValue>`.
 pub fn json_decimal() -> PureCodec<Decimal, JsonValue> {
     PureCodec::with_ast(
         SchemaAst::new(SchemaShape::Checked {
@@ -207,6 +258,8 @@ pub fn json_decimal() -> PureCodec<Decimal, JsonValue> {
 
 /// Persist a UTC epoch-millisecond value as a signed JSON integer.
 #[must_use]
+/// # Returns
+/// Type: `PureCodec<UtcMillis, JsonValue>`.
 pub fn json_utc_millis() -> PureCodec<UtcMillis, JsonValue> {
     let integer = json_i64();
     PureCodec::with_ast(
@@ -218,6 +271,11 @@ pub fn json_utc_millis() -> PureCodec<UtcMillis, JsonValue> {
 
 /// Persist a domain-checked stable key using its versioned byte encoding.
 #[must_use]
+/// # Type parameters
+/// - `D`: Identity-domain type. Bounds: `KeyDomain`.
+///
+/// # Returns
+/// Type: `PureCodec<StableKey<D>, JsonValue>`.
 pub fn json_stable_key<D: KeyDomain>() -> PureCodec<StableKey<D>, JsonValue> {
     let bytes = json_bytes(None);
     PureCodec::with_ast(
@@ -246,6 +304,16 @@ pub fn json_stable_key<D: KeyDomain>() -> PureCodec<StableKey<D>, JsonValue> {
 }
 
 #[must_use]
+/// Allow JSON null alongside the supplied value codec.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bounds: `Send + 'static`.
+///
+/// # Parameters
+/// - `value` (`PureCodec<A, JsonValue>`): Value read, transformed, encoded, or stored by this operation.
+///
+/// # Returns
+/// Type: `PureCodec<Option<A>, JsonValue>`.
 pub fn json_nullable<A: Send + 'static>(
     value: PureCodec<A, JsonValue>,
 ) -> PureCodec<Option<A>, JsonValue> {
@@ -273,6 +341,15 @@ pub fn json_nullable<A: Send + 'static>(
 /// A collection limit is a caller-supplied policy. `None` deliberately allows
 /// the full already-decoded JSON array; no hidden capacity is selected.
 #[must_use]
+/// # Type parameters
+/// - `A`: Application value type. Bounds: `Send + 'static`.
+///
+/// # Parameters
+/// - `element` (`PureCodec<A, JsonValue>`): The element supplied to this operation.
+/// - `maximum` (`Option<std::num::NonZeroUsize>`): Upper bound enforced by this policy.
+///
+/// # Returns
+/// Type: `PureCodec<Vec<A>, JsonValue>`.
 pub fn json_array<A: Send + 'static>(
     element: PureCodec<A, JsonValue>,
     maximum: Option<std::num::NonZeroUsize>,
@@ -325,6 +402,16 @@ pub fn json_array<A: Send + 'static>(
 
 /// A JSON pair has exactly two elements. Element issues retain their indices.
 #[must_use]
+/// # Type parameters
+/// - `A`: Application value type. Bounds: `Send + 'static`.
+/// - `B`: Transformed value type. Bounds: `Send + 'static`.
+///
+/// # Parameters
+/// - `first` (`PureCodec<A, JsonValue>`): First value or branch in the ordered composition.
+/// - `second` (`PureCodec<B, JsonValue>`): The second supplied to this operation.
+///
+/// # Returns
+/// Type: `PureCodec<(A, B), JsonValue>`.
 pub fn json_tuple2<A: Send + 'static, B: Send + 'static>(
     first: PureCodec<A, JsonValue>,
     second: PureCodec<B, JsonValue>,
@@ -370,6 +457,11 @@ pub fn json_tuple2<A: Send + 'static, B: Send + 'static>(
 /// JSON byte arrays use unsigned integer elements and reject out-of-range
 /// bytes rather than truncating them. Binary framing can use a different codec.
 #[must_use]
+/// # Parameters
+/// - `maximum` (`Option<std::num::NonZeroUsize>`): Upper bound enforced by this policy.
+///
+/// # Returns
+/// Type: `PureCodec<Vec<u8>, JsonValue>`.
 pub fn json_bytes(maximum: Option<std::num::NonZeroUsize>) -> PureCodec<Vec<u8>, JsonValue> {
     let ast = SchemaAst::new(SchemaShape::Sequence {
         element: SchemaAst::new(SchemaShape::IntegerRange {
@@ -426,6 +518,11 @@ pub fn json_bytes(maximum: Option<std::num::NonZeroUsize>) -> PureCodec<Vec<u8>,
 
 /// Derive a literal codec from an explicit application-owned JSON value.
 #[must_use]
+/// # Parameters
+/// - `value` (`Arc<JsonValue>`): Value read, transformed, encoded, or stored by this operation.
+///
+/// # Returns
+/// Type: `PureCodec<(), JsonValue>`.
 pub fn json_literal(value: Arc<JsonValue>) -> PureCodec<(), JsonValue> {
     let ast = SchemaAst::new(SchemaShape::Literal(Arc::clone(&value)));
     let decode = Arc::clone(&value);

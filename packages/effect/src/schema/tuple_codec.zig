@@ -5,6 +5,11 @@ const outcomes = @import("../outcome.zig");
 const Issue = @import("schema_issue.zig").Issue;
 const PureCodec = @import("codec.zig").PureCodec;
 
+/// Compute the tuple value type decoded by the supplied element codecs.
+/// Parameters:
+/// - `elements: comptime anytype`: Compile-time statically inferred input checked when this operation is
+///   instantiated.
+/// Returns (`type`): tuple type produced by decoding each supplied element codec.
 pub fn Values(comptime elements: anytype) type {
     const Info = @typeInfo(@TypeOf(elements));
     if (Info != .array or Info.array.child != type)
@@ -16,14 +21,25 @@ pub fn Values(comptime elements: anytype) type {
     };
     return struct {
         const Self = @This();
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = owns;
         items: Items,
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             inline for (elements, 0..) |_, index| outcomes.discardPayload(&self.items[index]);
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!Self`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const Self) error{OutOfMemory}!Self {
             var copy: Items = undefined;
             var initialized: usize = 0;
@@ -63,6 +79,11 @@ fn valueType(comptime codecs: anytype, comptime declaration: []const u8) type {
     return Values(elements);
 }
 
+/// Compose a codec over a fixed tuple of element codecs.
+/// Parameters:
+/// - `codecs: comptime anytype`: Compile-time typed codec/schema fixing the corresponding decoded and encoded value
+///   types.
+/// Returns (`PureCodec( valueType(codecs, "Decoded"), valueType(codecs, "Representation"), )`): A typed codec or schema preserving the declared decoded value, representation, and environments.
 pub fn tuple(comptime codecs: anytype) PureCodec(
     valueType(codecs, "Decoded"),
     valueType(codecs, "Representation"),

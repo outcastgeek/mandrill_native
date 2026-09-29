@@ -9,6 +9,11 @@ const Cancellation = @import("../internal/runtime.zig").Cancellation;
 const Waiter = @import("../internal/waiter.zig").Waiter;
 const TransactionError = @import("transaction_error.zig").Error;
 
+/// Specialize the typed decision outcome for transactional operations.
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// Returns (`type`): transaction result distinguishing commit, retry, and typed failure.
 pub fn Decision(comptime A: type, comptime E: type) type {
     return union(enum) {
         const Self = @This();
@@ -16,6 +21,10 @@ pub fn Decision(comptime A: type, comptime E: type) type {
         fail: E,
         retry,
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             switch (self.*) {
                 .commit => outcomes.discardPayload(&self.commit),
@@ -29,21 +38,32 @@ pub fn Decision(comptime A: type, comptime E: type) type {
 
 /// A domain may contain many cells of T. Distinct domains remain isolated,
 /// including when their values happen to have the same Zig type.
+///
+/// Parameters:
+/// - `T: comptime type`: Value type stored or transported by the returned component.
+/// Returns (`type`): isolated in-memory transaction domain containing cells and synchronized journal state.
 pub fn Domain(comptime T: type) type {
     if (outcomes.ownsPayload(T))
         @compileError("transaction cells require a non-owning copyable value; own resources in a scope outside the transaction");
     return struct {
         const Self = @This();
+        /// One value and revision owned by a transaction domain.
         pub const Cell = struct {
             domain: *Self,
             value: T,
             version: u64 = 0,
 
+            /// Create a domain cell containing the initial value.
+            /// Parameters:
+            /// - `domain: *Self`: Transaction domain containing the cells and journal for this operation.
+            /// - `value: T`: initial value owned by the new domain cell.
+            /// Returns (`Cell`): A transactional cell owned by this domain.
             pub fn init(domain: *Self, value: T) Cell {
                 return .{ .domain = domain, .value = value };
             }
         };
 
+        /// Read and write set for one optimistic transaction attempt.
         pub const Journal = struct {
             const Entry = struct {
                 cell: *Cell,
@@ -73,6 +93,12 @@ pub fn Domain(comptime T: type) type {
 
             /// Null means the journal has a fault; the transaction runner
             /// returns its typed error or defect even if a callback ignores it.
+            ///
+            /// Parameters:
+            /// - `self: *Journal`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+            /// - `cell: *Cell`: Transactional cell read or written through the journal.
+            /// Returns (`?T`): staged or committed cell value; `null` marks a
+            /// journal fault that `atomically` later publishes as a typed outcome.
             pub fn read(self: *Journal, cell: *Cell) ?T {
                 if (self.fault != null) return null;
                 if (cell.domain != self.domain) {
@@ -91,11 +117,24 @@ pub fn Domain(comptime T: type) type {
                 return current;
             }
 
+            /// Write through the selected capability.
+            /// Parameters:
+            /// - `self: *Journal`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+            /// - `cell: *Cell`: Transactional cell read or written through the journal.
+            /// - `value: T`: replacement value staged until the domain commits.
+            /// Returns (`void`): no value.
             pub fn write(self: *Journal, cell: *Cell, value: T) void {
                 if (self.read(cell) == null) return;
                 self.find(cell).?.staged = value;
             }
 
+            /// Update the current state with the supplied callback.
+            /// Parameters:
+            /// - `self: *Journal`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+            /// - `cell: *Cell`: Transactional cell read or written through the journal.
+            /// - `change: comptime fn (T) T`: Compile-time typed function selected at comptime; no runtime callback
+            ///   lookup is required.
+            /// Returns (`void`): no value.
             pub fn modify(self: *Journal, cell: *Cell, comptime change: fn (T) T) void {
                 const current = self.read(cell) orelse return;
                 self.write(cell, change(current));
@@ -110,6 +149,11 @@ pub fn Domain(comptime T: type) type {
         waiters: ?*Waiter = null,
         closed: bool = false,
 
+        /// Create a memory-backed transaction domain using caller-provided capabilities.
+        /// Parameters:
+        /// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Self`): a domain containing synchronized transactional state.
         pub fn init(env: anytype) Self {
             const R = @typeInfo(@TypeOf(env)).pointer.child;
             if (R == void or !@hasField(R, "io") or @FieldType(R, "io") != std.Io)
@@ -117,6 +161,10 @@ pub fn Domain(comptime T: type) type {
             return .{ .io = env.io };
         }
 
+        /// Stop the capability and release its retained resources.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn shutdown(self: *Self) void {
             self.mutex.lockUncancelable(self.io);
             self.closed = true;
@@ -124,6 +172,10 @@ pub fn Domain(comptime T: type) type {
             self.mutex.unlock(self.io);
         }
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             self.shutdown();
             std.debug.assert(self.waiters == null);
@@ -180,6 +232,18 @@ pub fn Domain(comptime T: type) type {
         /// transaction inputs. The callback must be pure and repeatable because
         /// a conflicting read set is evaluated again. It cannot suspend or
         /// publish side effects; those belong before or after atomically.
+        ///
+        /// Parameters:
+        /// - `A: comptime type`: Value type produced by a successful computation.
+        /// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+        /// - `R: comptime type`: Caller-defined environment type supplying the dependencies needed by this operation.
+        /// - `Capture: comptime type`: Compile-time captured state type retained by the composed operation.
+        /// - `capture: *const Capture`: Operation-specific state retained until the callback completes.
+        /// - `select: comptime fn (*const R) *Self`: Compile-time typed function selected at comptime; no runtime callback
+        ///   lookup is required.
+        /// - `evaluate: comptime fn (*const Capture, *Journal) Decision(A, E)`: Compile-time typed function selected at comptime; no runtime callback
+        ///   lookup is required.
+        /// Returns (`effects.Effect(A, TransactionError(E), R)`): typed result of an in-memory atomic journal attempt, retried on conflict.
         pub fn atomically(
             comptime A: type,
             comptime E: type,

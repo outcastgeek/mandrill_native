@@ -10,6 +10,13 @@ const representation = @import("internal/representation.zig");
 
 /// The wire tag is explicit metadata; renaming a Zig field cannot silently
 /// change data already stored or exchanged with another process.
+///
+/// Parameters:
+/// - `field_name: comptime []const u8`: Compile-time field name used as the stable schema key.
+/// - `wire_tag: comptime []const u8`: Stable encoded discriminator for this case.
+/// - `codec: comptime anytype`: Compile-time typed codec/schema fixing the corresponding decoded and encoded value
+///   types.
+/// Returns (`@TypeOf(.{ .field_name = field_name, .wire_tag = wire_tag, .codec = codec, .nested = false, })`): A compile-time descriptor containing the declared field or case metadata.
 pub fn taggedCase(comptime field_name: []const u8, comptime wire_tag: []const u8, comptime codec: anytype) @TypeOf(.{
     .field_name = field_name,
     .wire_tag = wire_tag,
@@ -19,6 +26,12 @@ pub fn taggedCase(comptime field_name: []const u8, comptime wire_tag: []const u8
     return .{ .field_name = field_name, .wire_tag = wire_tag, .codec = codec, .nested = false };
 }
 
+/// Define a nested tagged-union case.
+/// Parameters:
+/// - `field_name: comptime []const u8`: Compile-time field name used as the stable schema key.
+/// - `wire_tag: comptime []const u8`: Stable encoded discriminator for this case.
+/// - `Child: comptime type`: Compile-time child schema or value type.
+/// Returns (`@TypeOf(.{ .field_name = field_name, .wire_tag = wire_tag, .codec = Child, .nested = true, })`): A compile-time descriptor containing the declared field or case metadata.
 pub fn nestedCase(comptime field_name: []const u8, comptime wire_tag: []const u8, comptime Child: type) @TypeOf(.{
     .field_name = field_name,
     .wire_tag = wire_tag,
@@ -32,6 +45,14 @@ fn caseCodecType(comptime item: anytype) type {
     return if (item.nested) item.codec else @TypeOf(item.codec);
 }
 
+/// Specialize a tagged-union schema from its declared cases and wire discriminator.
+/// Parameters:
+/// - `T: comptime type`: Value type stored or transported by the returned component.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `discriminator: comptime []const u8`: Compile-time field used to identify a variant.
+/// - `payload_name: comptime []const u8`: Compile-time field carrying the variant payload.
+/// - `cases: comptime anytype`: Compile-time statically inferred input checked when this operation is instantiated.
+/// Returns (`type`): tagged-union schema with checked cases and a stable wire discriminator.
 pub fn Variant(
     comptime T: type,
     comptime R: type,
@@ -79,7 +100,9 @@ pub fn Variant(
         }
     }
     return struct {
+        /// Application value type produced by this codec.
         pub const Decoded = T;
+        /// Exact caller environment type required when the description runs.
         pub const Environment = R;
 
         fn encodedCases() [cases.len]ast.Case {
@@ -90,6 +113,8 @@ pub fn Variant(
             return result;
         }
 
+        /// Return the structural representation node for this schema.
+        /// Returns (`*const ast.Node`): A borrowed read-only pointer; keep its owner alive while using it.
         pub fn encodedNode() *const ast.Node {
             const Metadata = struct {
                 const case_nodes = encodedCases();
@@ -102,6 +127,12 @@ pub fn Variant(
             return &Metadata.node;
         }
 
+        /// Construct a typed value from the supplied parts.
+        /// Parameters:
+        /// - `name: comptime []const u8`: Compile-time stable, nonempty identity component validated at definition
+        ///   time.
+        /// - `payload: @FieldType(T, name)`: payload for the selected Zig union case.
+        /// Returns (`T`): The typed stored or computed value; ownership follows the enclosing type contract.
         pub fn make(comptime name: []const u8, payload: @FieldType(T, name)) T {
             inline for (cases) |item| {
                 if (std.mem.eql(u8, item.field_name, name)) return @unionInit(T, name, payload);
@@ -109,6 +140,13 @@ pub fn Variant(
             @compileError("Zig case is not part of this variant schema");
         }
 
+        /// Project the selected variant payload.
+        /// Parameters:
+        /// - `name: comptime []const u8`: Compile-time stable, nonempty identity component validated at definition
+        ///   time.
+        /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
+        ///   joined it.
+        /// Returns (`?*const @FieldType(T, name)`): selected variant payload, or `null` when the tag does not match.
         pub fn project(comptime name: []const u8, value: *const T) ?*const @FieldType(T, name) {
             inline for (cases) |item| {
                 if (std.mem.eql(u8, item.field_name, name)) {
@@ -144,11 +182,24 @@ pub fn Variant(
             };
         }
 
+        /// Decode immediately and return the typed validation outcome.
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `json: *const std.json.Value`: JSON value or document to decode, encode, or validate.
+        /// Returns (`outcomes.Exit(T, Issue)`): Carries `T` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn decodeDirect(env: *const R, json: *const std.json.Value) outcomes.Exit(T, Issue) {
             var state: structural.DecodeState = .{};
             return decodeWithin(env, json, &state);
         }
 
+        /// Decode within the caller-supplied depth or size limits.
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `json: *const std.json.Value`: JSON value or document to decode, encode, or validate.
+        /// - `state: *structural.DecodeState`: Mutable operation state, retained for the duration of this call.
+        /// Returns (`outcomes.Exit(T, Issue)`): Carries `T` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn decodeWithin(env: *const R, json: *const std.json.Value, state: *structural.DecodeState) outcomes.Exit(T, Issue) {
             if (json.* != .object) return .{ .fail = Issue.init(env, .decode, .{ .expected = .object }) };
             for (json.object.keys()) |key| {
@@ -180,6 +231,10 @@ pub fn Variant(
             return at(env, discriminator, .{ .expected = .tagged_case });
         }
 
+        /// Decode a value from its wire representation.
+        /// Parameters:
+        /// - `json: *const std.json.Value`: JSON value or document to decode, encode, or validate.
+        /// Returns (`effects.Effect(T, Issue, R)`): typed tagged-union value selected by its encoded discriminator.
         pub fn decode(json: *const std.json.Value) effects.Effect(T, Issue, R) {
             return effects.Effect(T, Issue, R).fromBorrowed(std.json.Value, json, struct {
                 fn run(input: *const std.json.Value, env: *const R) outcomes.Exit(T, Issue) {
@@ -190,11 +245,27 @@ pub fn Variant(
 
         /// Structural parents pass a scratch allocator derived from R. The
         /// resulting JSON value borrows that scratch storage until stringify.
+        ///
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
+        ///   joined it.
+        /// - `temporary: std.mem.Allocator`: Temporary state retained only for the duration of this operation.
+        /// Returns (`outcomes.Exit(std.json.Value, Issue)`): Carries `std.json.Value` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn encodeValueDirect(env: *const R, value: *const T, temporary: std.mem.Allocator) outcomes.Exit(std.json.Value, Issue) {
             var state: structural.EncodeState = .{ .scratch = temporary };
             return encodeWithin(env, value, &state);
         }
 
+        /// Encode within the caller-supplied depth or size limits.
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
+        ///   joined it.
+        /// - `state: *structural.EncodeState`: Mutable operation state, retained for the duration of this call.
+        /// Returns (`outcomes.Exit(std.json.Value, Issue)`): Carries `std.json.Value` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn encodeWithin(env: *const R, value: *const T, state: *structural.EncodeState) outcomes.Exit(std.json.Value, Issue) {
             var object: std.json.ObjectMap = .{};
             const active = @tagName(std.meta.activeTag(value.*));
@@ -224,6 +295,13 @@ pub fn Variant(
             unreachable; // Exhaustive comptime case validation above.
         }
 
+        /// Encode directly into owned bytes.
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
+        ///   joined it.
+        /// Returns (`outcomes.Exit(outcomes.OwnedSlice(u8), Issue)`): Carries `outcomes.OwnedSlice(u8)` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn encodeBytesDirect(env: *const R, value: *const T) outcomes.Exit(outcomes.OwnedSlice(u8), Issue) {
             var arena = std.heap.ArenaAllocator.init(env.allocator);
             defer arena.deinit();
@@ -238,6 +316,13 @@ pub fn Variant(
             return .{ .success = .{ .items = bytes, .allocator = env.allocator } };
         }
 
+        /// Validate input immediately against this schema.
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
+        ///   joined it.
+        /// Returns (`outcomes.Exit(void, Issue)`): Carries no value on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn validateDirect(env: *const R, value: *const T) outcomes.Exit(void, Issue) {
             var arena = std.heap.ArenaAllocator.init(env.allocator);
             defer arena.deinit();
@@ -249,6 +334,11 @@ pub fn Variant(
             };
         }
 
+        /// Validate the value against its declared contract.
+        /// Parameters:
+        /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
+        ///   joined it.
+        /// Returns (`effects.Effect(void, Issue, R)`): unit success when the discriminator and selected case satisfy the declared schema.
         pub fn validate(value: *const T) effects.Effect(void, Issue, R) {
             return effects.Effect(void, Issue, R).fromBorrowed(T, value, struct {
                 fn run(input: *const T, env: *const R) outcomes.Exit(void, Issue) {
@@ -257,6 +347,11 @@ pub fn Variant(
             }.run);
         }
 
+        /// Describe encoding to owned bytes as a lazy Effect.
+        /// Parameters:
+        /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
+        ///   joined it.
+        /// Returns (`effects.Effect(outcomes.OwnedSlice(u8), Issue, R)`): owned JSON bytes for the selected tagged-union case.
         pub fn encodeBytes(value: *const T) effects.Effect(outcomes.OwnedSlice(u8), Issue, R) {
             return effects.Effect(outcomes.OwnedSlice(u8), Issue, R).fromBorrowed(T, value, struct {
                 fn run(input: *const T, env: *const R) outcomes.Exit(outcomes.OwnedSlice(u8), Issue) {
@@ -265,6 +360,15 @@ pub fn Variant(
             }.run);
         }
 
+        /// Parse encoded bytes immediately under declared limits.
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `bytes: []const u8`: Borrowed input; keep its owner alive until the operation has copied or
+        ///   joined it.
+        /// - `limits: @import("schema_builder.zig").ParseLimits`: Caller-selected, validated behavior or resource bounds; no hidden default
+        ///   is installed.
+        /// Returns (`outcomes.Exit(legacy.Parsed(T), Issue)`): Carries `legacy.Parsed(T)` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn parseBytesDirect(
             env: *const R,
             bytes: []const u8,

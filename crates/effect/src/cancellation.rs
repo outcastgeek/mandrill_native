@@ -1,9 +1,12 @@
+//! Cancellation state and notifications for Effect execution.
+
 use crate::internal::notification::notify_all;
 use event_listener::Event;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 #[derive(Default)]
+/// Typed state used by cancellation.
 struct State {
     requested: AtomicBool,
     changed: Event,
@@ -12,6 +15,9 @@ struct State {
 }
 
 impl Drop for State {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         let parent = self
             .parent
@@ -22,6 +28,13 @@ impl Drop for State {
     }
 }
 
+///
+/// # Parameters
+/// - `address` (`*const State`): Stable destination address of the entity receiving this request.
+/// - `parent` (`&Option<FlatDrop<Arc<State>>>`): Parent scope, span, or workflow identity.
+///
+/// # Returns
+/// Type: `()`.
 fn unlink(address: *const State, parent: &Option<FlatDrop<Arc<State>>>) {
     if let Some(parent) = parent.as_ref().and_then(FlatDrop::as_ref) {
         parent
@@ -40,6 +53,10 @@ pub struct Cancellation {
 
 impl Cancellation {
     #[must_use]
+    /// Construct a `Cancellation` from its required inputs and explicit policies.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new() -> Self {
         Self::default()
     }
@@ -49,6 +66,8 @@ impl Cancellation {
     /// Parent registration stays alive until the child is dropped. Teardown
     /// unregisters the weak child link and destroys ancestors iteratively.
     #[must_use]
+    /// # Returns
+    /// Type: `Self`.
     pub fn child(&self) -> Self {
         let mut state = State::default();
         state.parent = Mutex::new(Some(FlatDrop::new(Arc::clone(&self.state))));
@@ -72,6 +91,9 @@ impl Cancellation {
 
     /// Returns true only for the first request. Every registered waiter wakes.
     #[must_use]
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     pub fn request(&self) -> bool {
         let first = !self.state.requested.swap(true, Ordering::AcqRel);
         if !first {
@@ -103,6 +125,8 @@ impl Cancellation {
         true
     }
 
+    /// # Returns
+    /// Type: `()`.
     pub(crate) fn unlink(&self) {
         let parent = self
             .state
@@ -114,11 +138,19 @@ impl Cancellation {
     }
 
     #[must_use]
+    /// Check whether cancellation has already been requested.
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     pub fn is_requested(&self) -> bool {
         self.state.requested.load(Ordering::Acquire)
     }
 
     /// Registration precedes the flag check, so an intervening request cannot be lost.
+    ///
+    /// # Returns
+    /// Type: `()`.
     pub async fn cancelled(&self) {
         loop {
             let listener = self.state.changed.listen();

@@ -1,3 +1,5 @@
+//! Scoped pull streams and effectful stream composition.
+
 use crate::internal::workflow::{self, bind, success};
 use crate::{Defect, Effect, Exit, LibraryDefect, Release, Scope};
 use futures_util::future::{Either, select};
@@ -6,17 +8,32 @@ use std::sync::{Arc, Mutex};
 mod internal;
 pub use internal::StreamBufferOptions;
 
+/// A batch of stream items transferred together from a reader.
+///
+/// # Type parameters
+/// - `A`: Application value type.
 pub enum Chunk<A> {
+    /// A batch of application values is available. Contains `Vec<A>`.
     Values(Vec<A>),
+    /// The stream has no further items.
     End,
 }
 
+/// The scoped handle that pulls the next batch from an open stream.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
+/// - `R`: Environment type. Bound or type: `Send + Sync + 'static`.
 pub struct StreamReader<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> {
     pull: Effect<Chunk<A>, E, R>,
 }
 impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Clone
     for StreamReader<A, E, R>
 {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             pull: self.pull.clone(),
@@ -25,18 +42,55 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Clone
 }
 impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> StreamReader<A, E, R> {
     #[must_use]
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `pull` (`Effect<Chunk<A>, E, R>`): The pull supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub const fn new(pull: Effect<Chunk<A>, E, R>) -> Self {
         Self { pull }
     }
+    /// Request the next stream chunk within the reader’s scope.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Returns
+    /// Type: `Effect<Chunk<A>, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn pull(&self) -> Effect<Chunk<A>, E, R> {
         self.pull.clone()
     }
 }
+/// Shared stream opener. Its callback uses trait-object dispatch, while the
+/// item, error, and environment types remain checked at compilation.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
+/// - `R`: Environment type.
 type Open<A, E, R> = Arc<dyn Fn(Scope<E>) -> Effect<StreamReader<A, E, R>, E, R> + Send + Sync>;
+/// A scoped stream description whose opener runs when the stream is consumed.
+/// The opener's vtable is process-local and is never serialized.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
+/// - `R`: Environment type. Bound or type: `Send + Sync + 'static`.
 pub struct Stream<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> {
     open: Open<A, E, R>,
 }
 impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Clone for Stream<A, E, R> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             open: Arc::clone(&self.open),
@@ -45,6 +99,18 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Clone for S
 }
 impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Stream<A, E, R> {
     #[must_use]
+    /// Construct a `Stream` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `open` (`impl Fn(Scope<E>) -> Effect<StreamReader<A, E, R>, E, R> + Send + Sync + 'static`): The open supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(
         open: impl Fn(Scope<E>) -> Effect<StreamReader<A, E, R>, E, R> + Send + Sync + 'static,
     ) -> Self {
@@ -52,11 +118,39 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Stream<A, E
             open: Arc::new(open),
         }
     }
+    /// Open the resource within its declared scope and ownership boundary.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `scope` (`Scope<E>`): Owner that joins child work and releases resources at close.
+    ///
+    /// # Returns
+    /// Type: `Effect<StreamReader<A, E, R>, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn open(&self, scope: Scope<E>) -> Effect<StreamReader<A, E, R>, E, R> {
         let open = Arc::clone(&self.open);
         Effect::defer(move || open(scope.clone()))
     }
     #[must_use]
+    /// Build a stream from a callback that produces scoped chunks.
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `acquire` (`Effect<T, E, R>`): Description that obtains the resource before its body runs.
+    /// - `pull` (`impl Fn(crate::ResourceValue<T>) -> Effect<Chunk<A>, E, R> + Send + Sync + 'static`): The pull supplied to this operation.
+    /// - `release` (`impl Fn(T) -> Release<E, R> + Send + Sync + 'static`): The release supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn from_pull<T: Send + Sync + 'static>(
         acquire: Effect<T, E, R>,
         pull: impl Fn(crate::ResourceValue<T>) -> Effect<Chunk<A>, E, R> + Send + Sync + 'static,
@@ -73,6 +167,19 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Stream<A, E
         })
     }
     #[must_use]
+    /// Build a stream that yields values from a fresh iterable per execution.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bound: `Send + Sync + 'static`.
+    /// - `I`: Input type. Bounds: `Iterator<Item = A> + Send + 'static`.
+    ///
+    /// # Parameters
+    /// - `factory` (`impl Fn() -> I + Send + Sync + 'static`): Factory invoked to create fresh data for an execution.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn from_iterable<I: Iterator<Item = A> + Send + 'static>(
         factory: impl Fn() -> I + Send + Sync + 'static,
     ) -> Self {
@@ -96,6 +203,20 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Stream<A, E
         )
     }
     #[must_use]
+    /// Run an Effect for each stream item while preserving stream scope and errors.
+    ///
+    /// # Type parameters
+    /// - `B`: Transformed value type. Bounds: `Send + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `transform` (`impl Fn(A) -> Effect<B, E, R> + Send + Sync + 'static`): Callback applied to the selected value or error.
+    ///
+    /// # Returns
+    /// Type: `Stream<B, E, R>`.
+    /// Returns a scoped stream with the declared item, error, and environment types.
     pub fn map_effect<B: Send + 'static>(
         self,
         transform: impl Fn(A) -> Effect<B, E, R> + Send + Sync + 'static,
@@ -117,6 +238,19 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Stream<A, E
             })
         })
     }
+    /// Pull the stream into a collection under the caller’s explicit bound.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `limit` (`Option<usize>`): The caller-supplied limit.
+    ///
+    /// # Returns
+    /// Type: `Effect<Vec<A>, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn run_collect(&self, limit: Option<usize>) -> Effect<Vec<A>, E, R> {
         let stream = self.clone();
         Scope::scoped(move |scope| {
@@ -128,6 +262,19 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Stream<A, E
             })
         })
     }
+    /// Consume stream items with the supplied Effect callback.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `consume` (`impl Fn(A) -> Effect<(), E, R> + Send + Sync + 'static`): The consume supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn run_for_each(
         &self,
         consume: impl Fn(A) -> Effect<(), E, R> + Send + Sync + 'static,
@@ -153,6 +300,16 @@ impl<A: Send + 'static, E: Send + 'static, R: crate::HasTaskSpawner + Send + Syn
     /// Values drain before the source's terminal outcome; scope cancellation
     /// interrupts the child and discards unread buffered values.
     #[must_use]
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bound: `crate::HasTaskSpawner + Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `options` (`StreamBufferOptions`): Caller-selected bounds and behavior for this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn buffer(self, options: StreamBufferOptions) -> Self {
         internal::buffered(self, options)
     }
@@ -162,10 +319,35 @@ impl<A: Send + 'static, E: Send + 'static, R: crate::HasTaskSpawner + Send + Syn
     /// before a terminal failure, which cancels the other producer. Both
     /// sources must end successfully before the merged reader ends.
     #[must_use]
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `R`: Environment type. Bound: `crate::HasTaskSpawner + Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `other` (`Self`): Second value used for comparison or composition.
+    /// - `options` (`StreamBufferOptions`): Caller-selected bounds and behavior for this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn merge(self, other: Self, options: StreamBufferOptions) -> Self {
         internal::merged(self, other, options)
     }
 }
+///
+/// # Type parameters
+/// - `A`: Bounds: `Send + 'static`.
+/// - `E`: Bounds: `Send + 'static`.
+/// - `R`: Bounds: `Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `reader` (`StreamReader<A, E, R>`): Scoped handle used to pull further items.
+/// - `values` (`Vec<A>`): Owned values processed in their declared order.
+/// - `limit` (`Option<usize>`): The caller-supplied limit.
+///
+/// # Returns
+/// Type: `workflow::Workflow<Vec<A>, E, R>`.
+/// Returns `workflow::Workflow<Vec<A>, E, R>`.
 fn collect<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static>(
     reader: StreamReader<A, E, R>,
     mut values: Vec<A>,
@@ -184,6 +366,19 @@ fn collect<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static>(
         }
     })
 }
+///
+/// # Type parameters
+/// - `A`: Bounds: `Send + 'static`.
+/// - `E`: Bounds: `Send + 'static`.
+/// - `R`: Bounds: `Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `reader` (`StreamReader<A, E, R>`): Scoped handle used to pull further items.
+/// - `consume` (`Arc<dyn Fn(A) -> Effect<(), E, R> + Send + Sync>`): The consume supplied to this operation.
+///
+/// # Returns
+/// Type: `workflow::Workflow<(), E, R>`.
+/// Returns `workflow::Workflow<(), E, R>`.
 fn each<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static>(
     reader: StreamReader<A, E, R>,
     consume: Arc<dyn Fn(A) -> Effect<(), E, R> + Send + Sync>,
@@ -193,6 +388,20 @@ fn each<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static>(
         Chunk::Values(chunk) => drain_chunk(reader, chunk.into_iter(), consume),
     })
 }
+///
+/// # Type parameters
+/// - `A`: Bounds: `Send + 'static`.
+/// - `E`: Bounds: `Send + 'static`.
+/// - `R`: Bounds: `Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `reader` (`StreamReader<A, E, R>`): Scoped handle used to pull further items.
+/// - `chunk` (`std::vec::IntoIter<A>`): The chunk supplied to this operation.
+/// - `consume` (`Arc<dyn Fn(A) -> Effect<(), E, R> + Send + Sync>`): The consume supplied to this operation.
+///
+/// # Returns
+/// Type: `workflow::Workflow<(), E, R>`.
+/// Returns `workflow::Workflow<(), E, R>`.
 fn drain_chunk<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static>(
     reader: StreamReader<A, E, R>,
     mut chunk: std::vec::IntoIter<A>,
@@ -211,6 +420,21 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Stream<A, E
     /// A cancellation request interrupts a blocked lock or next-item wait and
     /// releases the scoped source. Whether a partially polled item can be
     /// replayed depends on the supplied async stream's own contract.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `X`: Bounds: `Send + 'static`.
+    /// - `S`: Service or storage type. Bounds: `futures_util::stream::Stream<Item = Result<A, X>> + Unpin + Send + 'static`.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `factory` (`impl Fn() -> S + Send + Sync + 'static`): Factory invoked to create fresh data for an execution.
+    /// - `on_error` (`impl Fn(X) -> E + Send + Sync + 'static`): Callback that maps a source error into the declared error type.
+    /// - `dispose` (`impl Fn(S) -> Release<E, R> + Send + Sync + 'static`): The dispose supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn from_async_iterable<
         X: Send + 'static,
         S: futures_util::stream::Stream<Item = Result<A, X>> + Unpin + Send + 'static,

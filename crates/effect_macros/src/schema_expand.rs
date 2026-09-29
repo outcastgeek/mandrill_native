@@ -1,3 +1,5 @@
+//! Expansion of typed record schema declarations.
+
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote, quote_spanned};
 use std::collections::BTreeSet;
@@ -6,6 +8,7 @@ use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{Expr, Path, Token, braced, parenthesized};
 
+/// Typed schema field used by schema expand.
 struct SchemaField {
     name: Ident,
     codec: Expr,
@@ -13,6 +16,12 @@ struct SchemaField {
 }
 
 impl Parse for SchemaField {
+    ///
+    /// # Parameters
+    /// - `input` (`ParseStream<'_>`): Owned input decoded or consumed by this operation.
+    ///
+    /// # Returns
+    /// Type: `syn::Result<Self>`.
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let name = input.parse()?;
         input.parse::<Token![:]>()?;
@@ -51,18 +60,26 @@ impl Parse for SchemaField {
     }
 }
 
+/// Typed record schema input used by schema expand.
 pub(crate) struct RecordSchemaInput {
     record: Path,
     fields: Vec<SchemaField>,
     policy: Expr,
 }
 
+/// Variants of schema input used by schema expand.
 pub(crate) enum SchemaInput {
     Record(Box<RecordSchemaInput>),
     Enum(Box<crate::schema_enum_expand::SchemaEnumInput>),
 }
 
 impl Parse for SchemaInput {
+    ///
+    /// # Parameters
+    /// - `input` (`ParseStream<'_>`): Owned input decoded or consumed by this operation.
+    ///
+    /// # Returns
+    /// Type: `syn::Result<Self>`.
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         if input.peek(Token![enum]) {
             return input.parse().map(|parsed| Self::Enum(Box::new(parsed)));
@@ -74,6 +91,12 @@ impl Parse for SchemaInput {
 }
 
 impl Parse for RecordSchemaInput {
+    ///
+    /// # Parameters
+    /// - `input` (`ParseStream<'_>`): Owned input decoded or consumed by this operation.
+    ///
+    /// # Returns
+    /// Type: `syn::Result<Self>`.
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         input.parse::<Token![struct]>()?;
         let record = input.parse()?;
@@ -100,6 +123,11 @@ impl Parse for RecordSchemaInput {
     }
 }
 
+/// # Parameters
+/// - `input` (`SchemaInput`): The input value or factory consumed by this operation.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn expand(input: SchemaInput) -> syn::Result<TokenStream> {
     match input {
         SchemaInput::Record(record) => expand_record(*record),
@@ -107,6 +135,12 @@ pub(crate) fn expand(input: SchemaInput) -> syn::Result<TokenStream> {
     }
 }
 
+///
+/// # Parameters
+/// - `input` (`RecordSchemaInput`): Owned input decoded or consumed by this operation.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 fn expand_record(input: RecordSchemaInput) -> syn::Result<TokenStream> {
     let effect = crate::expand::effect_crate_path()?;
     let record = &input.record;

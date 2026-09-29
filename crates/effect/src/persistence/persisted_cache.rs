@@ -1,3 +1,5 @@
+//! Composition of memory cache with stored results.
+
 use super::internal::cache_gate::CacheGate;
 use super::{
     HasKeyValueStore, KeyValueStore, Persistable, PersistedRecordError, StoreRead, StoredValue,
@@ -16,58 +18,103 @@ use std::time::Duration;
 /// processes, or between two independently constructed cache instances.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CorruptCacheRecord {
+    /// Reject the conflicting input without applying its proposed state change.
     Reject,
+    /// Discard the corrupt cache record and load fresh data.
     EvictAndReload,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The expiry, capacity, and version rules for a cache backed by a store.
 pub struct PersistedCachePolicy {
+    /// Expiry policy applied to records in the backing store. Type: `Option<Duration>`.
     pub persistent_ttl: Option<Duration>,
+    /// Whether expected load failures are retained in the cache. Type: `bool`.
     pub persist_failures: bool,
+    /// Policy for a stored record that fails schema decoding. Type: `CorruptCacheRecord`.
     pub corrupt_record: CorruptCacheRecord,
 }
 
 /// Memory retention for a persisted cache. Stable encoded identity determines
 /// equality for both memory and backing records, so it is not configurable.
+///
+/// # Type parameters
+/// - `E`: Domain-error type.
 pub struct PersistedCacheMemory<E> {
+    /// Time for which the stored value remains valid. Type: `Option<Duration>`.
     pub ttl: Option<Duration>,
+    /// The maximum admitted capacity. Type: `CacheCapacity`.
     pub capacity: CacheCapacity,
+    /// Predicate selecting expected errors that remain cached. Type: `Arc<dyn Fn(&E) -> bool + Send + Sync>`.
     pub cache_failure: Arc<dyn Fn(&E) -> bool + Send + Sync>,
 }
 
+/// Stable identity used by persistence persisted cache operations.
+///
+/// # Type parameters
+/// - `K`: Key type used for identity or lookup.
 struct CacheKey<K> {
     request: Arc<K>,
     identity: Arc<[u8]>,
 }
 
 #[derive(Debug)]
+/// A schema, policy, or store failure while using a persisted cache.
+///
+/// # Type parameters
+/// - `E`: Domain-error type.
+/// - `Backend`: Backend-specific error or provider type.
+/// - `Clock`: Clock provider type.
 pub enum PersistedCacheError<E, Backend, Clock> {
+    /// The application’s expected domain operation failed. Retains the `E` detail.
     Domain(E),
+    /// The stable identity is invalid or incompatible. Retains the `KeyError` detail.
     Identity(KeyError),
+    /// Encoding the typed value failed. Retains the `SchemaIssue` detail.
     Encode(SchemaIssue),
+    /// Decoding the stored or transported value failed. Retains the `SchemaIssue` detail.
     Decode(SchemaIssue),
+    /// The recorded version differs from the declared version.
     VersionMismatch,
+    /// The stored outcome is not supported.
     UnsupportedStoredOutcome,
+    /// The selected time conversion or clock operation failed. Retains the `TimeError` detail.
     Time(TimeError),
+    /// The selected clock could not schedule or observe the requested time. Retains the `Clock` detail.
     Clock(Clock),
+    /// Coordinating accepted work through the provider failed. Retains the `SemaphoreError` detail.
     Coordination(SemaphoreError),
+    /// Reading the selected source failed. Retains the `Backend` detail.
     Read(Backend),
     /// The provider may have committed before its acknowledgement was lost.
     UncertainWrite {
+        /// Key used to address the stored value. Type: `Arc<[u8]>`.
         key: Arc<[u8]>,
+        /// The underlying failure or provider cause. Type: `Backend`.
         source: Backend,
     },
     /// The provider may have removed the record before acknowledgement was lost.
     UncertainRemoval {
+        /// Key used to address the stored value. Type: `Arc<[u8]>`.
         key: Arc<[u8]>,
+        /// The underlying failure or provider cause. Type: `Backend`.
         source: Backend,
     },
+    /// An owned input was already consumed.
     InputConsumed,
 }
 
 /// A per-environment cache. Construct one instance for each environment whose
 /// loader or service projections differ; the memory cache captures the creating
 /// environment as its scoped load context.
+///
+/// # Type parameters
+/// - `K`: Key type used for identity or lookup.
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
+/// - `Backend`: Backend-specific error or provider type.
+/// - `ClockError`: Error returned by the clock capability.
+/// - `D`: Identity-domain type.
 pub struct PersistedCache<K, A, E, Backend, ClockError, D>
 where
     K: Send + Sync + 'static,
@@ -92,6 +139,9 @@ where
     ClockError: Send + 'static,
     D: KeyDomain,
 {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             memory: self.memory.clone(),
@@ -111,6 +161,27 @@ where
     ClockError: Send + 'static,
     D: KeyDomain,
 {
+    /// Create a `PersistedCache` through the declared Effect and environment capabilities.
+    ///
+    /// # Type parameters
+    /// - `Backend`: Backend-specific error or provider type.
+    /// - `ClockError`: Error returned by the clock capability.
+    /// - `R`: Environment type. Additional bound: `HasClock + HasTaskSpawner + HasKeyValueStore + HasWallClock + Send + Sync + 'static`. Additional bound: `:Store: KeyValueStore<Error = Backend>`.
+    /// - `A`: Success or application-value type.
+    /// - `D`: Stable-key domain type.
+    /// - `E`: Domain-error type.
+    /// - `K`: Type supplied by the enclosing impl or trait.
+    ///
+    /// # Parameters
+    /// - `scope` (`Scope<SharedValue<PersistedCacheError<E, Backend, ClockError>>>`): Owner that joins child work and releases resources at close.
+    /// - `memory` (`PersistedCacheMemory<PersistedCacheError<E, Backend, ClockError>>`): The memory supplied to this operation.
+    /// - `definition` (`Persistable<K, A, E, D>`): The typed definition used by this operation.
+    /// - `policy` (`PersistedCachePolicy`): The caller-supplied behavior policy.
+    /// - `load` (`impl Fn(&K) -> Effect<A, E, R> + Send + Sync + 'static`): The load supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<Self, SharedValue<PersistedCacheError<E, Backend, ClockError>>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn make<R>(
         scope: Scope<SharedValue<PersistedCacheError<E, Backend, ClockError>>>,
         memory: PersistedCacheMemory<PersistedCacheError<E, Backend, ClockError>>,
@@ -148,6 +219,23 @@ where
         })
     }
 
+    /// Read the current value through the declared storage or state capability.
+    ///
+    /// # Type parameters
+    /// - `Backend`: Backend-specific error or provider type.
+    /// - `ClockError`: Error returned by the clock capability.
+    /// - `D`: Identity-domain type.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `K`: Type supplied by the enclosing impl or trait.
+    ///
+    /// # Parameters
+    /// - `key` (`K`): Stable key used to locate or identify the selected value.
+    ///
+    /// # Returns
+    /// Type: `Effect<SharedValue<A>, SharedValue<PersistedCacheError<E, Backend, ClockError>>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn get<R: Send + Sync + 'static>(
         &self,
         key: K,
@@ -183,6 +271,22 @@ where
     /// Lookups and invalidation for the same stable identity are serialized
     /// within this instance. Separate cache instances and processes still
     /// require coordination from their backing-store capability.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type.
+    /// - `Backend`: Backend-specific error or provider type.
+    /// - `ClockError`: Error returned by the clock capability.
+    /// - `D`: Identity-domain type.
+    /// - `R`: Environment type. Additional bound: `HasKeyValueStore + Send + Sync + 'static`. Additional bound: `:Store: KeyValueStore<Error = Backend>`.
+    /// - `E`: Domain-error type.
+    /// - `K`: Type supplied by the enclosing impl or trait.
+    ///
+    /// # Parameters
+    /// - `key` (`K`): Stable key used to locate or identify the selected value.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), SharedValue<PersistedCacheError<E, Backend, ClockError>>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn invalidate<R>(
         &self,
         key: K,
@@ -241,6 +345,20 @@ where
         })
     }
 
+    /// Stop accepting new work and describe the settlement of owned work.
+    ///
+    /// # Type parameters
+    /// - `K`: Key type used for identity or lookup.
+    /// - `A`: Application value type.
+    /// - `Backend`: Backend-specific error or provider type.
+    /// - `ClockError`: Error returned by the clock capability.
+    /// - `D`: Identity-domain type.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Returns
+    /// Type: `Effect<crate::PoolEndStatus, SharedValue<PersistedCacheError<E, Backend, ClockError>>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn shutdown<R: Send + Sync + 'static>(
         &self,
     ) -> Effect<crate::PoolEndStatus, SharedValue<PersistedCacheError<E, Backend, ClockError>>, R>
@@ -249,6 +367,25 @@ where
     }
 }
 
+///
+/// # Type parameters
+/// - `K`: Key type used for identity or lookup. Additional bound: `Send + Sync + 'static`.
+/// - `A`: Successful application-value type. Additional bound: `Send + 'static`.
+/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
+/// - `B`: Transformed success-value type. Additional bound: `Send + 'static`.
+/// - `W`: Workflow or writer type. Additional bound: `Send + 'static`.
+/// - `D`: Stable identity-domain type. Additional bound: `KeyDomain`.
+/// - `R`: Environment type supplying required capabilities. Additional bound: `HasKeyValueStore + HasWallClock + Send + Sync + 'static`. Additional bound: `:Store: KeyValueStore<Error = B>`. Additional bound: `:Clock: WallClock<Error = W>`.
+///
+/// # Parameters
+/// - `application` (`Effect<A, E, R>`): The application supplied to this operation.
+/// - `key` (`Arc<[u8]>`): Stable key used to locate or identify the selected value.
+/// - `definition` (`Persistable<K, A, E, D>`): The definition supplied to this operation.
+/// - `policy` (`PersistedCachePolicy`): The caller-supplied behavior policy.
+///
+/// # Returns
+/// Type: `Effect<A, PersistedCacheError<E, B, W>, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 fn load_persisted<K, A, E, B, W, D, R>(
     application: Effect<A, E, R>,
     key: Arc<[u8]>,
@@ -324,6 +461,26 @@ where
         })
 }
 
+///
+/// # Type parameters
+/// - `K`: Key type used for identity or lookup. Additional bound: `Send + Sync + 'static`.
+/// - `A`: Successful application-value type. Additional bound: `Send + 'static`.
+/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
+/// - `B`: Transformed success-value type. Additional bound: `Send + 'static`.
+/// - `W`: Workflow or writer type. Additional bound: `Send + 'static`.
+/// - `D`: Stable identity-domain type. Additional bound: `KeyDomain`.
+/// - `R`: Environment type supplying required capabilities. Additional bound: `HasKeyValueStore + HasWallClock + Send + Sync + 'static`. Additional bound: `:Store: KeyValueStore<Error = B>`. Additional bound: `:Clock: WallClock<Error = W>`.
+///
+/// # Parameters
+/// - `error` (`PersistedCacheError<E, B, W>`): Expected or provider error preserved in the returned outcome.
+/// - `key` (`Arc<[u8]>`): Stable key used to locate or identify the selected value.
+/// - `application` (`Effect<A, E, R>`): The application supplied to this operation.
+/// - `definition` (`Persistable<K, A, E, D>`): The definition supplied to this operation.
+/// - `policy` (`PersistedCachePolicy`): The caller-supplied behavior policy.
+///
+/// # Returns
+/// Type: `Effect<A, PersistedCacheError<E, B, W>, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 fn handle_bad_record<K, A, E, B, W, D, R>(
     error: PersistedCacheError<E, B, W>,
     key: Arc<[u8]>,
@@ -370,6 +527,25 @@ where
     }
 }
 
+///
+/// # Type parameters
+/// - `K`: Key type used for identity or lookup. Additional bound: `Send + Sync + 'static`.
+/// - `A`: Successful application-value type. Additional bound: `Send + 'static`.
+/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
+/// - `B`: Transformed success-value type. Additional bound: `Send + 'static`.
+/// - `W`: Workflow or writer type. Additional bound: `Send + 'static`.
+/// - `D`: Stable identity-domain type. Additional bound: `KeyDomain`.
+/// - `R`: Environment type supplying required capabilities. Additional bound: `HasKeyValueStore + HasWallClock + Send + Sync + 'static`. Additional bound: `:Store: KeyValueStore<Error = B>`. Additional bound: `:Clock: WallClock<Error = W>`.
+///
+/// # Parameters
+/// - `application` (`Effect<A, E, R>`): The application supplied to this operation.
+/// - `key` (`Arc<[u8]>`): Stable key used to locate or identify the selected value.
+/// - `definition` (`Persistable<K, A, E, D>`): The definition supplied to this operation.
+/// - `policy` (`PersistedCachePolicy`): The caller-supplied behavior policy.
+///
+/// # Returns
+/// Type: `Effect<A, PersistedCacheError<E, B, W>, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 fn load_and_store<K, A, E, B, W, D, R>(
     application: Effect<A, E, R>,
     key: Arc<[u8]>,

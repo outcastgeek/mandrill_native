@@ -8,6 +8,10 @@ const keys = @import("../primary_key.zig");
 const journal = @import("event_journal.zig");
 const EventError = @import("event_log_error.zig").Error;
 
+/// Construct an in-memory event journal provider with caller-owned runtime resources.
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): in-memory implementation of the event journal provider.
 pub fn MemoryEventJournal(comptime R: type) type {
     return struct {
         const Self = @This();
@@ -23,6 +27,11 @@ pub fn MemoryEventJournal(comptime R: type) type {
         entries: std.array_list.Managed(journal.Entry),
         by_id: std.StringHashMap(usize),
 
+        /// Create an in-memory event journal using the caller environment.
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Self`): an event journal bound to the supplied environment.
         pub fn init(env: *const R) Self {
             if (R == void or !@hasField(R, "allocator") or @FieldType(R, "allocator") != std.mem.Allocator)
                 @compileError("MemoryEventJournal requires caller allocator in R");
@@ -36,6 +45,10 @@ pub fn MemoryEventJournal(comptime R: type) type {
             };
         }
 
+        /// Expose this implementation through its capability interface.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`Store`): A capability adapter referencing the selected implementation; keep its backing state alive while in use.
         pub fn capability(self: *Self) Store {
             return Store.fromProvider(self, &.{
                 .append = appendEffect,
@@ -177,6 +190,10 @@ pub fn MemoryEventJournal(comptime R: type) type {
 
         /// Scope closure joins all users before deinit. Keys in `by_id` borrow
         /// the owned IDs in `entries` and are not freed a second time.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             self.mutex.lockUncancelable(self.io);
             for (self.entries.items) |*entry| entry.deinit();

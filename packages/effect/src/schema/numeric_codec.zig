@@ -6,6 +6,10 @@ const Issue = @import("schema_issue.zig").Issue;
 const PureCodec = @import("codec.zig").PureCodec;
 const deadlines = @import("../deadline.zig");
 
+/// Specialize validated decimal text for the selected numeric value type.
+/// Parameters:
+/// - `T: comptime type`: Value type stored or transported by the returned component.
+/// Returns (`type`): validated decimal-text representation for the selected numeric type.
 pub fn DecimalText(comptime T: type) type {
     const info = @typeInfo(T);
     if (info != .int) @compileError("DecimalText requires an integer type");
@@ -18,10 +22,18 @@ pub fn DecimalText(comptime T: type) type {
         buffer: [maximum_text_bytes]u8,
         len: usize,
 
+        /// Borrow the represented byte slice.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`[]const u8`): A borrowed slice; keep the owner alive while using it.
         pub fn slice(self: *const Self) []const u8 {
             return self.buffer[0..self.len];
         }
 
+        /// Format the validated numeric value as decimal text.
+        /// Parameters:
+        /// - `value: T`: validated numeric value formatted as decimal text.
+        /// Returns (`Self`): decimal representation of the validated numeric value.
         pub fn format(value: T) Self {
             var result: Self = .{ .buffer = undefined, .len = 0 };
             const written = std.fmt.bufPrint(&result.buffer, "{d}", .{value}) catch unreachable;
@@ -33,6 +45,10 @@ pub fn DecimalText(comptime T: type) type {
 
 /// Rejects signs on nonnegative values, leading zeroes and any other spelling
 /// that does not round-trip to the one stable decimal representation.
+///
+/// Parameters:
+/// - `T: comptime type`: Value type stored or transported by the returned component.
+/// Returns (`PureCodec(T, DecimalText(T))`): A typed codec or schema preserving the declared decoded value, representation, and environments.
 pub fn integer(comptime T: type) PureCodec(T, DecimalText(T)) {
     const Text = DecimalText(T);
     return PureCodec(T, Text).init(struct {
@@ -71,16 +87,29 @@ pub const wall_instant = PureCodec(deadlines.WallInstant, DecimalText(i128)).ini
 
 /// Fixed-scale decimal arithmetic keeps the exact signed coefficient. Scale
 /// is part of the Zig type and therefore part of the schema identity.
+///
+/// Parameters:
+/// - `T: comptime type`: Value type stored or transported by the returned component.
+/// - `fractional_digits: comptime usize`: Compile-time the fractional digits input required by this typed
+///   operation.
+/// Returns (`type`): signed coefficient paired with its compile-time fractional scale.
 pub fn FixedDecimal(comptime T: type, comptime fractional_digits: usize) type {
     const info = @typeInfo(T);
     if (info != .int or info.int.signedness != .signed)
         @compileError("fixed decimal coefficients require a signed integer type");
     return struct {
+        /// Number of fractional decimal digits fixed at comptime.
         pub const scale = fractional_digits;
         coefficient: T,
     };
 }
 
+/// Specialize fixed-scale decimal text for a numeric type and fractional-digit count.
+/// Parameters:
+/// - `T: comptime type`: Value type stored or transported by the returned component.
+/// - `fractional_digits: comptime usize`: Compile-time the fractional digits input required by this typed
+///   operation.
+/// Returns (`type`): validated decimal text for the selected fixed-scale value.
 pub fn FixedDecimalText(comptime T: type, comptime fractional_digits: usize) type {
     const info = @typeInfo(T);
     if (info != .int or info.int.signedness != .signed)
@@ -95,10 +124,18 @@ pub fn FixedDecimalText(comptime T: type, comptime fractional_digits: usize) typ
         buffer: [maximum_text_bytes]u8,
         len: usize,
 
+        /// Borrow the represented byte slice.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`[]const u8`): A borrowed slice; keep the owner alive while using it.
         pub fn slice(self: *const Self) []const u8 {
             return self.buffer[0..self.len];
         }
 
+        /// Format the validated numeric value as decimal text.
+        /// Parameters:
+        /// - `value: FixedDecimal(T, fractional_digits)`: validated numeric value formatted as decimal text.
+        /// Returns (`Self`): decimal representation of the fixed-decimal value with its configured scale.
         pub fn format(value: FixedDecimal(T, fractional_digits)) Self {
             var result: Self = .{ .buffer = undefined, .len = 0 };
             var digits_buffer: [@bitSizeOf(T)]u8 = undefined;
@@ -137,6 +174,12 @@ pub fn FixedDecimalText(comptime T: type, comptime fractional_digits: usize) typ
     };
 }
 
+/// Construct a fixed-scale decimal codec.
+/// Parameters:
+/// - `T: comptime type`: Value type stored or transported by the returned component.
+/// - `fractional_digits: comptime usize`: Compile-time the fractional digits input required by this typed
+///   operation.
+/// Returns (`PureCodec(FixedDecimal(T, fractional_digits), FixedDecimalText(T, fractional_digits))`): A typed codec or schema preserving the declared decoded value, representation, and environments.
 pub fn fixedDecimal(comptime T: type, comptime fractional_digits: usize) PureCodec(FixedDecimal(T, fractional_digits), FixedDecimalText(T, fractional_digits)) {
     const Value = FixedDecimal(T, fractional_digits);
     const Text = FixedDecimalText(T, fractional_digits);

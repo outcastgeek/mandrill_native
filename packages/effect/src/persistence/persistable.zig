@@ -12,19 +12,35 @@ const Issue = @import("../schema/schema_issue.zig").Issue;
 const storage = @import("key_value_store.zig");
 const PersistenceError = @import("persistence_error.zig").Error;
 
+/// Specialize schema-backed persisted reads and writes with stable identity.
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// Returns (`type`): schema-backed persisted read result with explicit missing or decoded states.
 pub fn ReadResult(comptime A: type, comptime E: type) type {
     return union(enum) {
         const Self = @This();
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = true;
         found: typed.DecodedExit(A, E),
         missing,
         expired,
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             if (self.* == .found) self.found.deinit();
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!Self`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const Self) error{OutOfMemory}!Self {
             return switch (self.*) {
                 .found => |value| .{ .found = try value.clone() },
@@ -34,6 +50,15 @@ pub fn ReadResult(comptime A: type, comptime E: type) type {
     };
 }
 
+/// Specialize schema-backed persisted reads and writes with stable identity.
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `DecodeR: comptime type`: Environment type passed to the decoding side of the codec.
+/// - `EncodeR: comptime type`: Environment type passed to the encoding side of the codec.
+/// Returns (`type`): typed persisted value operations using a stable key and selected codec.
 pub fn Persistable(
     comptime A: type,
     comptime E: type,
@@ -53,17 +78,28 @@ pub fn Persistable(
             const schema_version_bytes: usize = @sizeOf(u32);
         };
         const WriteRequest = struct {
+            /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements
+            /// `deinit` and must be released after use.
             pub const effect_owned_payload = true;
             key: outcomes.OwnedSlice(u8),
             bytes: outcomes.OwnedSlice(u8),
             expiry: deadlines.Deadline,
 
+            /// Release resources owned by this value.
+            /// Parameters:
+            /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+            /// Returns (`void`): no value.
             pub fn deinit(self: *@This()) void {
                 self.key.deinit();
                 self.bytes.deinit();
                 self.* = undefined;
             }
 
+            /// Duplicate this value; marked owning payloads are cloned, while ordinary
+            /// borrowed fields retain their original lifetime.
+            /// Parameters:
+            /// - `self: *const @This()`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+            /// Returns (`error{OutOfMemory}!@This()`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
             pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
                 var key = try self.key.clone();
                 errdefer key.deinit();
@@ -80,6 +116,25 @@ pub fn Persistable(
         select_decode_environment: *const fn (*const R) *const DecodeR,
         select_encode_environment: *const fn (*const R) *const EncodeR,
 
+        /// Construct a statically checked definition.
+        /// Parameters:
+        /// - `codec: comptime Codec`: Compile-time typed codec/schema fixing the corresponding decoded and encoded
+        ///   value types.
+        /// - `schema_version: comptime u32`: Compile-time stable version used to reject incompatible encoded or
+        ///   replayed data.
+        /// - `limits: comptime wire.Limits`: Compile-time caller-selected, validated behavior or resource bounds; no
+        ///   hidden default is installed.
+        /// - `select_store: comptime fn (*const R) *const Store`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// - `select_key: comptime fn (*const R) []const u8`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// - `select_expiry: comptime fn (*const R) deadlines.Deadline`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// - `select_decode_environment: comptime fn (*const R) *const DecodeR`: Compile-time typed selector from the current
+        ///   environment; its result must remain valid through use.
+        /// - `select_encode_environment: comptime fn (*const R) *const EncodeR`: Compile-time typed selector from the current
+        ///   environment; its result must remain valid through use.
+        /// Returns (`Self`): A constructed instance; its provider and allocation ownership follow the containing type.
         pub fn define(
             comptime codec: Codec,
             comptime schema_version: u32,
@@ -104,6 +159,11 @@ pub fn Persistable(
             return definition;
         }
 
+        /// Validate the value against its declared contract.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// Returns (`void`): no value.
         pub fn validate(comptime self: Self) void {
             if (comptime self.schema_version == 0) @compileError("persisted schema version zero is reserved for missing version metadata");
             if (comptime !self.limits.valid()) @compileError("persisted outcome wire limits must be valid");
@@ -185,6 +245,13 @@ pub fn Persistable(
             return .{ .success = .{ .key = key, .bytes = bytes, .expiry = self.select_expiry(env) } };
         }
 
+        /// Read through the selected capability.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `construction_env: *const R`: Borrowed caller environment supplying allocator, I/O, and
+        ///   selected capabilities.
+        /// Returns (`effects.Effect(Read, Failure, R)`): missing or decoded stored value, checked against its stable schema identity.
         pub fn read(comptime self: Self, construction_env: *const R) effects.Effect(Read, Failure, R) {
             self.validate();
             const Acquire = effects.Effect(outcomes.OwnedSlice(u8), Failure, R);
@@ -221,6 +288,13 @@ pub fn Persistable(
             }.decode);
         }
 
+        /// Write through the selected capability.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `select_outcome: comptime fn (*const R) *const Outcome`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// Returns (`Store.WriteEffect`): typed acknowledgement after encoding and storing the supplied outcome.
         pub fn write(comptime self: Self, comptime select_outcome: fn (*const R) *const Outcome) Store.WriteEffect {
             self.validate();
             return Store.WriteEffect.deferEffect(struct {
@@ -233,6 +307,15 @@ pub fn Persistable(
         /// A dynamic lookup result can be persisted without installing that
         /// result as another field of R. The borrowed outcome is encoded into
         /// owned bytes before the storage provider can suspend.
+        ///
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// - `construction_env: *const R`: Borrowed caller environment supplying allocator, I/O, and
+        ///   selected capabilities.
+        /// - `source: *const Outcome`: Borrowed input; keep its owner alive until the operation has copied or
+        ///   joined it.
+        /// Returns (`Store.WriteEffect`): typed acknowledgement after encoding and storing the supplied value.
         pub fn writeValue(comptime self: Self, construction_env: *const R, source: *const Outcome) Store.WriteEffect {
             self.validate();
             const Acquire = effects.Effect(WriteRequest, Failure, R);
@@ -255,6 +338,11 @@ pub fn Persistable(
             }.release);
         }
 
+        /// Remove the selected entry.
+        /// Parameters:
+        /// - `self: comptime Self`: Compile-time current value passed by value; ownership follows this
+        ///   operation’s contract.
+        /// Returns (`Store.WriteEffect`): typed acknowledgement after removing the stable persisted key.
         pub fn remove(comptime self: Self) Store.WriteEffect {
             self.validate();
             const Acquire = effects.Effect(outcomes.OwnedSlice(u8), Failure, R);

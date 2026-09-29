@@ -1,3 +1,5 @@
+//! Expansion of the Effect computation macro.
+
 use proc_macro_crate::{FoundCrate, crate_name};
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{quote, quote_spanned};
@@ -9,6 +11,11 @@ use syn::{Expr, Stmt};
 // also declares `extern crate self as effect` for its own expansions.
 const EFFECT_PACKAGE_NAME: &str = "effect";
 
+/// # Parameters
+/// - `statements` (`Vec<Stmt>`): Rust statements parsed and lowered by the procedural macro.
+///
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn expand(statements: Vec<Stmt>) -> syn::Result<TokenStream> {
     let needs_native_control =
         crate::parse::validate(&statements).is_err() || crate::parse::has_loops(&statements);
@@ -21,6 +28,8 @@ pub(crate) fn expand(statements: Vec<Stmt>) -> syn::Result<TokenStream> {
     Ok(quote!(#path::reusable(move || { #body })))
 }
 
+/// # Returns
+/// Type: `syn::Result<TokenStream>`.
 pub(crate) fn effect_crate_path() -> syn::Result<TokenStream> {
     let name = match crate_name(EFFECT_PACKAGE_NAME)
         .map_err(|error| syn::Error::new(Span::call_site(), error))?
@@ -32,6 +41,14 @@ pub(crate) fn effect_crate_path() -> syn::Result<TokenStream> {
     Ok(quote!(::#ident))
 }
 
+///
+/// # Parameters
+/// - `statements` (`&[Stmt]`): Rust statements parsed and lowered by the procedural macro.
+/// - `path` (`&TokenStream`): Location of the field, file, or configuration value being processed.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 fn lower(statements: &[Stmt], path: &TokenStream) -> TokenStream {
     let Some((statement, remaining)) = statements.split_first() else {
         return quote!(#path::success(()));
@@ -84,12 +101,27 @@ fn lower(statements: &[Stmt], path: &TokenStream) -> TokenStream {
     }
 }
 
+///
+/// # Parameters
+/// - `expr` (`&Expr`): Rust syntax expression parsed or expanded by this macro.
+///
+/// # Returns
+/// Type: `bool`.
+/// Returns whether the requested condition holds.
 fn is_control_flow(expr: &Expr) -> bool {
     crate::parse::has_effect_steps(expr)
         && (matches!(expr, Expr::If(_) | Expr::Match(_))
             || matches!(expr, Expr::Block(block) if block.label.is_none()))
 }
 
+///
+/// # Parameters
+/// - `expr` (`&Expr`): Rust syntax expression parsed or expanded by this macro.
+/// - `path` (`&TokenStream`): Location of the field, file, or configuration value being processed.
+///
+/// # Returns
+/// Type: `TokenStream`.
+/// Returns the expanded Rust tokens.
 fn expression(expr: &Expr, path: &TokenStream) -> TokenStream {
     if let Expr::If(expr) = expr {
         let attrs = &expr.attrs;

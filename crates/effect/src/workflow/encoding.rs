@@ -1,7 +1,15 @@
+//! Stable encodings of workflow identities and records.
+
 use super::WorkflowCodecError;
 use crate::{JsonValue, ParseLimits, SchemaIssueKind};
 use std::sync::Arc;
 
+/// # Parameters
+/// - `value` (`&JsonValue`): Value read, transformed, encoded, or stored by this operation.
+/// - `limits` (`ParseLimits`): Explicit resource bounds enforced while processing this input.
+///
+/// # Returns
+/// Type: `Result<Arc<[u8]>, WorkflowCodecError>`.
 pub(super) fn encode_json(
     value: &JsonValue,
     limits: ParseLimits,
@@ -11,6 +19,12 @@ pub(super) fn encode_json(
     Ok(Arc::from(bytes))
 }
 
+/// # Parameters
+/// - `bytes` (`&[u8]`): Encoded bytes to validate, decode, write, or transfer.
+/// - `limits` (`ParseLimits`): Explicit resource bounds enforced while processing this input.
+///
+/// # Returns
+/// Type: `Result<JsonValue, WorkflowCodecError>`.
 pub(super) fn decode_json(
     bytes: &[u8],
     limits: ParseLimits,

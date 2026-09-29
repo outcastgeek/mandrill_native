@@ -7,12 +7,17 @@ const tx_ref = @import("tx_subscription_ref.zig");
 const tx_error = @import("transaction_error.zig");
 const registry = @import("../reactivity/atom_registry.zig");
 
+/// Typed cause of a transaction change notification or resynchronization.
 pub const ObservationCause = union(enum) {
     failure: registry.Error,
     defect: outcomes.Defect,
     interrupted,
 };
 
+/// Specialize the typed transactional error channel from its compile-time error type.
+/// Parameters:
+/// - `T: comptime type`: Value type stored or transported by the returned component.
+/// Returns (`type`): typed failure union for observing committed transaction changes.
 pub fn Error(comptime T: type) type {
     return union(enum) {
         transaction: tx_error.Error(void),
@@ -22,6 +27,19 @@ pub fn Error(comptime T: type) type {
 
 /// The committed version remains available even if local notification fails.
 /// Repeating from the last observed version repairs a missed notification.
+///
+/// Parameters:
+/// - `T: comptime type`: Value type stored or transported by the returned component.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `select_capture: comptime fn (*const R) *const tx_ref.SubscriptionRef(T).AwaitCapture`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_domain: comptime fn (*const R) *tx.Domain`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_registry: comptime fn (*const R) *registry.Registry`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_key: comptime fn (*const R) []const u8`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// Returns (`effects.Effect(tx.Observed(T), Error(T), R)`): observed committed revision followed by reactive invalidation.
 pub fn awaitAndInvalidate(
     comptime T: type,
     comptime R: type,

@@ -1,9 +1,15 @@
+//! Deferred values, latches, references, and queues with explicit ownership.
 const diagnostics = @import("internal/diagnostics.zig");
 const std = @import("std");
 const outcomes = @import("outcome.zig");
 const Cancellation = @import("internal/runtime.zig").Cancellation;
 const Waiter = @import("internal/waiter.zig").Waiter;
 
+/// Specialize a one-shot typed completion cell by success and error types.
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// Returns (`type`): a one-shot cell holding an owning `Exit(A, E)` and allowing typed waiters.
 pub fn Deferred(comptime A: type, comptime E: type) type {
     return struct {
         const Self = @This();
@@ -13,12 +19,22 @@ pub fn Deferred(comptime A: type, comptime E: type) type {
         copy_failed: bool = false,
         waiters: ?*Waiter = null,
 
+        /// Create an empty one-shot completion cell using the environment I/O.
+        /// Parameters:
+        /// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Self`): an uncompleted cell ready for one owning `Exit(A, E)`.
         pub fn init(env: anytype) Self {
             return .{ .io = env.io };
         }
 
         /// Takes ownership only when true is returned. A rejected value remains
         /// owned by the caller; successful observers get separate metadata refs.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `value: outcomes.Exit(A, E)`: completed Exit transferred only when this call returns `true`.
+        /// Returns (`bool`): `true` only if this call filled the previously empty cell and took ownership of `value`.
         pub fn complete(self: *Self, value: outcomes.Exit(A, E)) bool {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
@@ -30,6 +46,11 @@ pub fn Deferred(comptime A: type, comptime E: type) type {
 
         /// Retains an independent result while preserving whether that copy
         /// succeeded. The source owner still owns the original result.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `value: outcomes.Exit(A, E)`: source Exit retained by the caller; this method stores an independent observation.
+        /// Returns (`bool`): `true` only if this call filled the empty cell with an observation copy.
         pub fn completeCopy(self: *Self, value: outcomes.Exit(A, E)) bool {
             var result = value.observe();
             self.mutex.lockUncancelable(self.io);
@@ -44,16 +65,27 @@ pub fn Deferred(comptime A: type, comptime E: type) type {
             return true;
         }
 
+        /// Observe the current completion state.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`?outcomes.Exit(A, E)`): Carries `A` on `.success` or `E` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn poll(self: *Self) ?outcomes.Exit(A, E) {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             return if (self.value) |value| value.clone() else null;
         }
 
+        /// Wait for completion while observing cancellation.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `token: ?*const Cancellation`: Cancellation token observed by this operation; its owner must outlive
+        ///   pending work.
+        /// Returns (`outcomes.Exit(A, E)`): Carries `A` on `.success` or `E` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn waitToken(self: *Self, token: ?*const Cancellation) outcomes.Exit(A, E) {
             return self.waitObserved(token).exit;
         }
 
+        /// Typed wait result record; release owned state with `deinit`.
         pub const WaitResult = struct { exit: outcomes.Exit(A, E), observer_interrupted: bool = false, clone_failed: bool = false };
 
         fn observation(self: *const Self, value: outcomes.Exit(A, E)) WaitResult {
@@ -61,6 +93,12 @@ pub fn Deferred(comptime A: type, comptime E: type) type {
             return .{ .exit = result.exit, .clone_failed = self.copy_failed or !result.copied };
         }
 
+        /// Wait and report both completion and interruption.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `token: ?*const Cancellation`: Cancellation token observed by this operation; its owner must outlive
+        ///   pending work.
+        /// Returns (`WaitResult`): Completion status, including interruption or provider defects where declared.
         pub fn waitObserved(self: *Self, token: ?*const Cancellation) WaitResult {
             var waiter: Waiter = .{ .io = self.io };
             self.mutex.lockUncancelable(self.io);
@@ -89,6 +127,12 @@ pub fn Deferred(comptime A: type, comptime E: type) type {
 
         /// Waits for settlement without copying an owning result. Controllers
         /// use this before transferring their own retained diagnostic outcome.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `token: ?*const Cancellation`: Cancellation token observed by this operation; its owner must outlive
+        ///   pending work.
+        /// Returns (`bool`): `true` when completion became observable before cancellation.
         pub fn waitReadyToken(self: *Self, token: ?*const Cancellation) bool {
             var waiter: Waiter = .{ .io = self.io };
             self.mutex.lockUncancelable(self.io);
@@ -113,6 +157,10 @@ pub fn Deferred(comptime A: type, comptime E: type) type {
             return !interrupted and !(if (token) |cancellation| cancellation.isRequested() else false);
         }
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             std.debug.assert(self.waiters == null);
             if (self.value) |*value| value.deinit();
@@ -121,10 +169,20 @@ pub fn Deferred(comptime A: type, comptime E: type) type {
     };
 }
 
+/// Specialize a one-shot synchronization gate by its error type.
+/// Parameters:
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// Returns (`type`): a one-shot gate that opens with a typed completion outcome.
 pub fn Latch(comptime E: type) type {
     return Deferred(void, E);
 }
 
+/// Infer the typed result of a Ref update callback.
+/// Parameters:
+/// - `T: comptime type`: Value type stored or transported by the returned component.
+/// - `updater: comptime anytype`: Compile-time statically inferred input checked when this operation is
+///   instantiated.
+/// Returns (`type`): the type of the `result` field returned by a `Ref.modify` callback.
 pub fn modificationResult(comptime T: type, comptime updater: anytype) type {
     const info = switch (@typeInfo(@TypeOf(updater))) {
         .@"fn" => |info| info,
@@ -140,6 +198,10 @@ pub fn modificationResult(comptime T: type, comptime updater: anytype) type {
     return @FieldType(Change, "result");
 }
 
+/// Specialize an atomic typed reference by its stored value type.
+/// Parameters:
+/// - `T: comptime type`: Value type stored or transported by the returned component.
+/// Returns (`type`): a synchronized, non-owning reference to a copyable `T`.
 pub fn Ref(comptime T: type) type {
     if (outcomes.ownsPayload(T)) @compileError(diagnostics.ref_values_must_be_borrowed_handles_or_ordinary_copyable_values_an_owning);
     return struct {
@@ -148,19 +210,40 @@ pub fn Ref(comptime T: type) type {
         mutex: std.Io.Mutex = .init,
         value: T,
 
+        /// Create a synchronized reference containing the initial value.
+        /// Parameters:
+        /// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `value: T`: initial copyable value held by the synchronized reference.
+        /// Returns (`Self`): a reference whose reads and writes use the environment I/O mutex.
         pub fn init(env: anytype, value: T) Self {
             return .{ .io = env.io, .value = value };
         }
+        /// Look up the selected value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`T`): The typed stored or computed value; ownership follows the enclosing type contract.
         pub fn get(self: *Self) T {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             return self.value;
         }
+        /// Replace the current value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `value: T`: replacement reference value committed under the lock.
+        /// Returns (`void`): no value.
         pub fn set(self: *Self, value: T) void {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             self.value = value;
         }
+        /// Update the current state with the supplied callback.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `updater: comptime anytype`: Compile-time statically inferred input checked when this operation is
+        ///   instantiated.
+        /// Returns (`modificationResult(T, updater)`): The callback’s statically inferred update result and new stored value.
         pub fn modify(self: *Self, comptime updater: anytype) modificationResult(T, updater) {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
@@ -168,6 +251,12 @@ pub fn Ref(comptime T: type) type {
             self.value = next.value;
             return next.result;
         }
+        /// Apply a typed update callback to the current reference value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `transform: comptime fn (T) T`: Compile-time typed callback; its signature is checked at comptime where
+        ///   static.
+        /// Returns (`void`): no value.
         pub fn update(self: *Self, comptime transform: fn (T) T) void {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
@@ -176,11 +265,17 @@ pub fn Ref(comptime T: type) type {
     };
 }
 
+/// `QueueError` cases: `shutdown`.
 pub const QueueError = enum { shutdown };
 
+/// Specialize a typed queue; capacity is selected by its runtime constructor.
+/// Parameters:
+/// - `T: comptime type`: Value type stored or transported by the returned component.
+/// Returns (`type`): a queue of `T` whose capacity and shutdown policy are selected by its constructor.
 pub fn Queue(comptime T: type) type {
     return struct {
         const Self = @This();
+        /// `TryOffer` cases: `accepted`, `full`, `closed`.
         pub const TryOffer = enum { accepted, full, closed };
         const BufferNode = struct { value: T, next: ?*BufferNode = null };
         const Offer = struct { value: T, result: ?outcomes.Exit(void, QueueError) = null, waiter: Waiter, previous: ?*Offer = null, next: ?*Offer = null, token: ?*const Cancellation };
@@ -202,6 +297,12 @@ pub fn Queue(comptime T: type) type {
         closed: bool = false,
 
         /// null is explicit unbounded admission; zero is a rendezvous queue.
+        ///
+        /// Parameters:
+        /// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `capacity: ?usize`: `null` for unbounded, zero for rendezvous, or a positive buffered-item limit.
+        /// Returns (`outcomes.Exit(Self, QueueError)`): Carries `Self` on `.success` or `QueueError` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn init(env: anytype, capacity: ?usize) outcomes.Exit(Self, QueueError) {
             const items = env.allocator.alloc(T, capacity orelse 0) catch return .{ .die = outcomes.Defect.out_of_memory };
             return .{ .success = .{ .allocator = env.allocator, .io = env.io, .capacity = capacity, .items = items } };
@@ -274,6 +375,12 @@ pub fn Queue(comptime T: type) type {
 
         /// Never waits for capacity. Ownership moves only on `accepted`;
         /// otherwise the caller retains `value`, including after a defect.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `value: *T`: Mutable input or buffer; ownership transfer is specified by the returned
+        ///   type.
+        /// Returns (`outcomes.Exit(TryOffer, QueueError)`): Carries `TryOffer` on `.success` or `QueueError` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn tryOfferOwned(self: *Self, value: *T) outcomes.Exit(TryOffer, QueueError) {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
@@ -291,6 +398,13 @@ pub fn Queue(comptime T: type) type {
             return .{ .success = .accepted };
         }
 
+        /// Offer a queue item while observing cancellation.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `value: T`: queue item transferred only after the offer commits.
+        /// - `token: ?*const Cancellation`: Cancellation token observed by this operation; its owner must outlive
+        ///   pending work.
+        /// Returns (`outcomes.Exit(void, QueueError)`): Carries no value on `.success` or `QueueError` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn offerToken(self: *Self, value: T, token: ?*const Cancellation) outcomes.Exit(void, QueueError) {
             self.mutex.lockUncancelable(self.io);
             if (if (token) |cancellation| cancellation.isRequested() else false) {
@@ -332,6 +446,12 @@ pub fn Queue(comptime T: type) type {
             return .interrupted;
         }
 
+        /// Take a queue item while observing cancellation.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `token: ?*const Cancellation`: Cancellation token observed by this operation; its owner must outlive
+        ///   pending work.
+        /// Returns (`outcomes.Exit(T, QueueError)`): Carries `T` on `.success` or `QueueError` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn takeToken(self: *Self, token: ?*const Cancellation) outcomes.Exit(T, QueueError) {
             self.mutex.lockUncancelable(self.io);
             if (if (token) |cancellation| cancellation.isRequested() else false) {
@@ -378,6 +498,11 @@ pub fn Queue(comptime T: type) type {
             return .interrupted;
         }
 
+        /// Stop the capability and release its retained resources.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `drain: bool`: Whether pending work is drained before shutdown.
+        /// Returns (`void`): no value.
         pub fn shutdown(self: *Self, drain: bool) void {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
@@ -398,12 +523,20 @@ pub fn Queue(comptime T: type) type {
             }
         }
 
+        /// Read the current number of elements.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`usize`): The current size or count reported by this operation.
         pub fn size(self: *Self) usize {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             return self.count;
         }
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             std.debug.assert(self.waiters == null and self.offers == null and self.takers == null);
             while (self.count != 0) {

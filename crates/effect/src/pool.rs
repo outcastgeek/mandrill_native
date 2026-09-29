@@ -1,3 +1,5 @@
+//! Scoped resource pooling, leases, and shutdown.
+
 use crate::internal::gate::{Gate, GateError};
 use crate::internal::notification::notify_all;
 use crate::internal::outcome;
@@ -17,17 +19,33 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
+/// Type alias for owned future in pool.
+///
+/// # Type parameters
+/// - `T`: Value or item type.
+/// - `E`: Domain-error type.
 type OwnedFuture<T, E> = Pin<Box<dyn Future<Output = Exit<T, E>> + Send>>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Explicit resource bounds for pool.
 pub enum PoolCapacity {
+    /// No explicit capacity bound is imposed.
     Unbounded,
+    /// The supplied positive capacity bound is enforced. Contains `NonZeroUsize`.
     Bounded(NonZeroUsize),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The status reported when a pool lease or owner reaches its end boundary.
 pub enum PoolEndStatus {
+    /// Cleanup settled without a retained failure.
     Clean,
+    /// The operation completed with a failure.
     Failed,
 }
+/// Typed state used by pool.
+///
+/// # Type parameters
+/// - `T`: Value or item type. Bound or type: `Send + Sync + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct State<T: Send + Sync + 'static, E: Send + 'static> {
     closed: bool,
     resources: usize,
@@ -37,12 +55,26 @@ struct State<T: Send + Sync + 'static, E: Send + 'static> {
     shutdown: Shutdown<E>,
     population: Vec<Arc<Population<E>>>,
 }
+/// Variants of shutdown used by pool.
+///
+/// # Type parameters
+/// - `E`: Domain-error type.
 enum Shutdown<E> {
     Open,
     Closing,
     Closed(Option<Exit<(), E>>),
 }
+/// Type alias for validate in pool.
+///
+/// # Type parameters
+/// - `T`: Value or item type.
+/// - `E`: Domain-error type.
 type Validate<T, E> = Arc<dyn Fn(&T, Context) -> OwnedFuture<bool, E> + Send + Sync>;
+/// Typed inner used by pool.
+///
+/// # Type parameters
+/// - `T`: Value or item type. Bound or type: `Send + Sync + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct Inner<T: Send + Sync + 'static, E: Send + 'static> {
     state: Mutex<State<T, E>>,
     changed: Event,
@@ -55,20 +87,36 @@ struct Inner<T: Send + Sync + 'static, E: Send + 'static> {
     dispose: Arc<dyn Fn(T, Context) -> OwnedFuture<(), E> + Send + Sync>,
     spawn: Arc<dyn Fn(crate::ScheduledTask) -> Result<(), Defect> + Send + Sync>,
 }
+/// A scoped collection of reusable resources with explicit capacity and disposal.
+///
+/// # Type parameters
+/// - `T`: Value or item type. Bound or type: `Send + Sync + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 pub struct Pool<T: Send + Sync + 'static, E: Send + 'static> {
     inner: Arc<Inner<T, E>>,
 }
 impl<T: Send + Sync + 'static, E: Send + 'static> Clone for Pool<T, E> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
         }
     }
 }
+/// Typed slot used by pool.
+///
+/// # Type parameters
+/// - `T`: Value or item type. Bound or type: `Send + Sync + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct Slot<T: Send + Sync + 'static, E: Send + 'static> {
     pool: Weak<Inner<T, E>>,
 }
 impl<T: Send + Sync + 'static, E: Send + 'static> Drop for Slot<T, E> {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         if let Some(pool) = self.pool.upgrade() {
             pool.state
@@ -79,12 +127,20 @@ impl<T: Send + Sync + 'static, E: Send + 'static> Drop for Slot<T, E> {
         }
     }
 }
+/// Typed entry used by pool.
+///
+/// # Type parameters
+/// - `T`: Value or item type. Bound or type: `Send + Sync + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct Entry<T: Send + Sync + 'static, E: Send + 'static> {
     value: RwLock<Option<T>>,
     returned: Mutex<Duration>,
     slot: Slot<T, E>,
 }
 impl<T: Send + Sync + 'static, E: Send + 'static> Drop for Entry<T, E> {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         if self
             .value
@@ -101,24 +157,46 @@ impl<T: Send + Sync + 'static, E: Send + 'static> Drop for Entry<T, E> {
         }
     }
 }
+/// Typed lease state used by pool.
+///
+/// # Type parameters
+/// - `T`: Value or item type. Bound or type: `Send + Sync + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct LeaseState<T: Send + Sync + 'static, E: Send + 'static> {
     entry: Option<Arc<Entry<T, E>>>,
     phase: LeasePhase<E>,
 }
+/// Variants of lease phase used by pool.
+///
+/// # Type parameters
+/// - `E`: Domain-error type.
 enum LeasePhase<E> {
     Open,
     Closing,
     Closed(Option<Exit<(), E>>),
 }
+/// Typed lease inner used by pool.
+///
+/// # Type parameters
+/// - `T`: Value or item type. Bound or type: `Send + Sync + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct LeaseInner<T: Send + Sync + 'static, E: Send + 'static> {
     pool: Pool<T, E>,
     state: Mutex<LeaseState<T, E>>,
     changed: Event,
 }
+/// An invalidatable borrowed view of one resource owned by a pool.
+///
+/// # Type parameters
+/// - `T`: Value or item type. Bound or type: `Send + Sync + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 pub struct PoolLease<T: Send + Sync + 'static, E: Send + 'static> {
     inner: Arc<LeaseInner<T, E>>,
 }
 impl<T: Send + Sync + 'static, E: Send + 'static> Clone for PoolLease<T, E> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -126,6 +204,18 @@ impl<T: Send + Sync + 'static, E: Send + 'static> Clone for PoolLease<T, E> {
     }
 }
 impl<T: Send + Sync + 'static, E: Send + 'static> PoolLease<T, E> {
+    /// Borrow the contained value only for the duration of the supplied callback.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `A`: Application value type.
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `inspect` (`impl FnOnce(&T) -> A`): The inspect supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<A, Defect>`.
     pub fn with<A>(&self, inspect: impl FnOnce(&T) -> A) -> Result<A, Defect> {
         let entry = self
             .inner
@@ -147,6 +237,9 @@ impl<T: Send + Sync + 'static, E: Send + 'static> PoolLease<T, E> {
             None => Err(Defect::from(LibraryDefect::PoolLeaseEnded)),
         }
     }
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn abandon(&self) {
         let entry = {
             let mut state = self
@@ -168,6 +261,10 @@ impl<T: Send + Sync + 'static, E: Send + 'static> PoolLease<T, E> {
         notify_all(&self.inner.changed);
         notify_all(&self.inner.pool.inner.changed);
     }
+    ///
+    /// # Returns
+    /// Type: `PoolEndStatus`.
+    /// Returns `PoolEndStatus`.
     fn status(&self) -> PoolEndStatus {
         let state = self
             .inner
@@ -185,6 +282,13 @@ impl<T: Send + Sync + 'static, E: Send + 'static> PoolLease<T, E> {
             | LeasePhase::Closing => PoolEndStatus::Failed,
         }
     }
+    ///
+    /// # Parameters
+    /// - `retire` (`bool`): The retire supplied to this operation.
+    /// - `context` (`Context`): Execution context carrying cancellation, scope, and trace state.
+    ///
+    /// # Returns
+    /// Type: `()`.
     async fn end(&self, retire: bool, context: Context) {
         let entry = {
             let mut state = self
@@ -234,12 +338,43 @@ impl<T: Send + Sync + 'static, E: Send + 'static> PoolLease<T, E> {
             }
         }
     }
+    /// End this claim or lease and return its settlement status.
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type. Bound: `Send + Sync + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Returns
+    /// Type: `Effect<PoolEndStatus, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn release<R: Send + Sync + 'static>(&self) -> Effect<PoolEndStatus, E, R> {
         self.end_effect(false)
     }
+    /// Remove the leased resource from reuse and start its disposal path.
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type. Bound: `Send + Sync + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Returns
+    /// Type: `Effect<PoolEndStatus, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn discard<R: Send + Sync + 'static>(&self) -> Effect<PoolEndStatus, E, R> {
         self.end_effect(true)
     }
+    ///
+    /// # Type parameters
+    /// - `R`: Bounds: `Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `retire` (`bool`): The retire supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<PoolEndStatus, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn end_effect<R: Send + Sync + 'static>(&self, retire: bool) -> Effect<PoolEndStatus, E, R> {
         let lease = self.clone();
         Effect::new(move |_, context, finish| {
@@ -251,6 +386,16 @@ impl<T: Send + Sync + 'static, E: Send + 'static> PoolLease<T, E> {
         })
         .uninterruptible()
     }
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `context` (`Context`): Execution context carrying cancellation, scope, and trace state.
+    ///
+    /// # Returns
+    /// Type: `Exit<(), E>`.
+    /// Returns `Exit<(), E>`.
     async fn finalize(&self, context: Context) -> Exit<(), E> {
         self.end(false, context).await;
         let mut state = self
@@ -266,11 +411,19 @@ impl<T: Send + Sync + 'static, E: Send + 'static> PoolLease<T, E> {
         }
     }
 }
+/// Typed lease driver used by pool.
+///
+/// # Type parameters
+/// - `T`: Value or item type. Bound or type: `Send + Sync + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct LeaseDriver<T: Send + Sync + 'static, E: Send + 'static> {
     lease: PoolLease<T, E>,
     settled: bool,
 }
 impl<T: Send + Sync + 'static, E: Send + 'static> Drop for LeaseDriver<T, E> {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         if !self.settled {
             self.lease
@@ -286,6 +439,24 @@ impl<T: Send + Sync + 'static, E: Send + 'static> Drop for LeaseDriver<T, E> {
     }
 }
 impl<T: Send + Sync + 'static, E: Send + 'static> Pool<T, E> {
+    /// Create a `Pool` through the declared Effect and environment capabilities.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `HasClock + crate::HasTaskSpawner + Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `scope` (`Scope<E>`): Owner that joins child work and releases resources at close.
+    /// - `capacity` (`PoolCapacity`): The caller-supplied capacity bound.
+    /// - `idle_ttl` (`Option<Duration>`): The idle ttl supplied to this operation.
+    /// - `create` (`Effect<T, E, R>`): The create supplied to this operation.
+    /// - `validate` (`impl Fn(&T) -> Effect<bool, E, R> + Send + Sync + 'static`): The validate supplied to this operation.
+    /// - `dispose` (`impl Fn(T) -> Effect<(), E, R> + Send + Sync + 'static`): The dispose supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<Self, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn make<R: HasClock + crate::HasTaskSpawner + Send + Sync + 'static>(
         scope: Scope<E>,
         capacity: PoolCapacity,
@@ -361,9 +532,22 @@ impl<T: Send + Sync + 'static, E: Send + 'static> Pool<T, E> {
             scope.register_or_release(finalizer, pool, finish)
         })
     }
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn abandon(&self) {
         self.abandon_entry(None);
     }
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type.
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `entry` (`Option<Arc<Entry<T, E>>>`): Stored record or event selected for this transition.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn abandon_entry(&self, entry: Option<Arc<Entry<T, E>>>) {
         {
             let mut state = self
@@ -383,6 +567,18 @@ impl<T: Send + Sync + 'static, E: Send + 'static> Pool<T, E> {
         let _ = self.inner.cancellation.request();
         notify_all(&self.inner.changed);
     }
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type.
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `entry` (`Arc<Entry<T, E>>`): Stored record or event selected for this transition.
+    /// - `context` (`Context`): Execution context carrying cancellation, scope, and trace state.
+    ///
+    /// # Returns
+    /// Type: `Exit<(), E>`.
+    /// Returns `Exit<(), E>`.
     async fn dispose_entry(&self, entry: Arc<Entry<T, E>>, context: Context) -> Exit<(), E> {
         let value = entry
             .value
@@ -401,6 +597,19 @@ impl<T: Send + Sync + 'static, E: Send + 'static> Pool<T, E> {
         drop(entry);
         result
     }
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type.
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `entry` (`Arc<Entry<T, E>>`): Stored record or event selected for this transition.
+    /// - `retire` (`bool`): The retire supplied to this operation.
+    /// - `context` (`Context`): Execution context carrying cancellation, scope, and trace state.
+    ///
+    /// # Returns
+    /// Type: `Exit<(), E>`.
+    /// Returns `Exit<(), E>`.
     async fn return_entry(
         &self,
         entry: Arc<Entry<T, E>>,
@@ -435,6 +644,17 @@ impl<T: Send + Sync + 'static, E: Send + 'static> Pool<T, E> {
             Err(panic) => outcome::append_cleanup(Exit::Die(Defect::from_panic(panic)), cleanup),
         }
     }
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type.
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `context` (`Context`): Execution context carrying cancellation, scope, and trace state.
+    ///
+    /// # Returns
+    /// Type: `Exit<Arc<Entry<T, E>>, E>`.
+    /// Returns `Exit<Arc<Entry<T, E>>, E>`.
     async fn acquire_entry(&self, context: Context) -> Exit<Arc<Entry<T, E>>, E> {
         if self
             .inner
@@ -585,6 +805,19 @@ impl<T: Send + Sync + 'static, E: Send + 'static> Pool<T, E> {
             }
         }
     }
+    /// Acquire a resource and register the matching release obligation.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `scope` (`Scope<E>`): Owner that joins child work and releases resources at close.
+    ///
+    /// # Returns
+    /// Type: `Effect<PoolLease<T, E>, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn acquire<R: Send + Sync + 'static>(
         &self,
         scope: Scope<E>,
@@ -670,6 +903,19 @@ impl<T: Send + Sync + 'static, E: Send + 'static> Pool<T, E> {
             }))
         })
     }
+    /// Change the pool’s permitted resource count under its ownership rules.
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type. Bound: `Send + Sync + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `capacity` (`PoolCapacity`): The caller-supplied capacity bound.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn set_capacity<R: Send + Sync + 'static>(
         &self,
         capacity: PoolCapacity,
@@ -690,6 +936,19 @@ impl<T: Send + Sync + 'static, E: Send + 'static> Pool<T, E> {
             Exit::Success(())
         })
     }
+    /// Check whether the pool has an idle resource available for reuse.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    /// - `T`: Value or item type.
+    ///
+    /// # Parameters
+    /// - `predicate` (`impl Fn(&T) -> bool + Send + Sync + 'static`): The condition used to select or validate values.
+    ///
+    /// # Returns
+    /// Type: `Effect<bool, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn exists_idle<R: Send + Sync + 'static>(
         &self,
         predicate: impl Fn(&T) -> bool + Send + Sync + 'static,
@@ -722,6 +981,19 @@ impl<T: Send + Sync + 'static, E: Send + 'static> Pool<T, E> {
             }
         })
     }
+    /// Populate the pool toward the requested size through its task provider.
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type. Bound: `Send + Sync + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `target` (`usize`): The target supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<(), E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn ensure_size<R: Send + Sync + 'static>(&self, target: usize) -> Effect<(), E, R> {
         let pool = self.clone();
         Effect::new(move |_, context, finish| {
@@ -874,6 +1146,12 @@ impl<T: Send + Sync + 'static, E: Send + 'static> Pool<T, E> {
             }))
         })
     }
+    ///
+    /// # Parameters
+    /// - `context` (`Context`): Execution context carrying cancellation, scope, and trace state.
+    ///
+    /// # Returns
+    /// Type: `()`.
     async fn shutdown_start(&self, context: Context) {
         let idle = {
             let mut state = self
@@ -987,6 +1265,16 @@ impl<T: Send + Sync + 'static, E: Send + 'static> Pool<T, E> {
             }
         }
     }
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `context` (`Context`): Execution context carrying cancellation, scope, and trace state.
+    ///
+    /// # Returns
+    /// Type: `Exit<(), E>`.
+    /// Returns `Exit<(), E>`.
     async fn shutdown_owned(&self, context: Context) -> Exit<(), E> {
         self.shutdown_start(context).await;
         let mut state = self
@@ -1001,6 +1289,16 @@ impl<T: Send + Sync + 'static, E: Send + 'static> Pool<T, E> {
             }
         }
     }
+    /// Stop accepting new work and describe the settlement of owned work.
+    ///
+    /// # Type parameters
+    /// - `T`: Value or item type. Bound: `Send + Sync + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Returns
+    /// Type: `Effect<PoolEndStatus, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn shutdown<R: Send + Sync + 'static>(&self) -> Effect<PoolEndStatus, E, R> {
         let pool = self.clone();
         Effect::new(move |_, context, finish| {
@@ -1033,11 +1331,19 @@ impl<T: Send + Sync + 'static, E: Send + 'static> Pool<T, E> {
         .uninterruptible()
     }
 }
+/// Typed shutdown driver used by pool.
+///
+/// # Type parameters
+/// - `T`: Value or item type. Bound or type: `Send + Sync + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct ShutdownDriver<T: Send + Sync + 'static, E: Send + 'static> {
     pool: Pool<T, E>,
     settled: bool,
 }
 impl<T: Send + Sync + 'static, E: Send + 'static> Drop for ShutdownDriver<T, E> {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         if !self.settled {
             self.pool
@@ -1053,15 +1359,33 @@ impl<T: Send + Sync + 'static, E: Send + 'static> Drop for ShutdownDriver<T, E> 
     }
 }
 
+/// Variants of population state used by pool.
+///
+/// # Type parameters
+/// - `E`: Domain-error type.
 enum PopulationState<E> {
     Pending,
     Settled(Option<Exit<(), E>>),
 }
+/// Typed population used by pool.
+///
+/// # Type parameters
+/// - `E`: Domain-error type.
 struct Population<E> {
     state: Mutex<PopulationState<E>>,
     changed: Event,
 }
 impl<E> Population<E> {
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `outcome` (`Exit<(), E>`): Complete terminal outcome, including expected errors and cleanup failures.
+    /// - `override_rejection` (`bool`): The override rejection supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn publish(&self, outcome: Exit<(), E>, override_rejection: bool) {
         let discarded = {
             let mut state = self
@@ -1080,6 +1404,13 @@ impl<E> Population<E> {
         drop(discarded);
         notify_all(&self.changed);
     }
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type.
+    ///
+    /// # Returns
+    /// Type: `Option<Exit<(), E>>`.
+    /// Returns the value when present, or `None`.
     fn take(&self) -> Option<Exit<(), E>> {
         let mut state = self
             .state
@@ -1090,6 +1421,10 @@ impl<E> Population<E> {
             PopulationState::Settled(outcome) => Some(outcome.take().unwrap_or(Exit::Success(()))),
         }
     }
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     fn observed(&self) -> bool {
         matches!(
             *self

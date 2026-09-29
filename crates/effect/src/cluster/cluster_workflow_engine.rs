@@ -1,3 +1,5 @@
+//! Workflow control through typed Cluster messages.
+
 use super::{ClusterEntityType, EntityDispatcher, EntityRegistrationError};
 use crate::Effect;
 use crate::rpc::{RpcHandler, RpcOperation};
@@ -7,8 +9,14 @@ use crate::workflow::{
 use std::sync::Mutex;
 
 #[derive(Debug)]
+/// A failure translating an addressed cluster command to a workflow engine operation.
+///
+/// # Type parameters
+/// - `EngineError`: Error returned by the workflow engine.
 pub enum ClusterWorkflowError<EngineError> {
+    /// The workflow engine rejected or could not complete the operation. Retains the `EngineError` detail.
     Engine(EngineError),
+    /// An owned input was already consumed.
     InputConsumed,
 }
 
@@ -18,6 +26,18 @@ pub enum ClusterWorkflowError<EngineError> {
 pub struct ClusterWorkflowEngine;
 
 impl ClusterWorkflowEngine {
+    /// Borrow the typed entity dispatcher registered with this adapter.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Additional bound: `HasWorkflowEngine + Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `policy` (`crate::rpc::RpcEnvelopePolicy`): The caller-supplied behavior policy.
+    /// - `entity_type` (`ClusterEntityType`): Stable type identity used for addressed dispatch.
+    /// - `operation` (`RpcOperation<WorkflowCommand, WorkflowReply, ClusterWorkflowError<<R::Engine as WorkflowEngine>::Error>>`): Typed operation definition or callback selected for execution.
+    ///
+    /// # Returns
+    /// Type: `Result<EntityDispatcher<R>, EntityRegistrationError>`.
     pub fn dispatcher<R>(
         policy: crate::rpc::RpcEnvelopePolicy,
         entity_type: ClusterEntityType,
@@ -38,6 +58,18 @@ impl ClusterWorkflowEngine {
         )
     }
 
+    /// Register the supplied definition, rejecting an identity or compatibility conflict.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Additional bound: `HasWorkflowEngine + Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `dispatcher` (`&mut EntityDispatcher<R>`): The dispatcher supplied to this operation.
+    /// - `entity_type` (`ClusterEntityType`): Stable type identity used for addressed dispatch.
+    /// - `operation` (`RpcOperation<WorkflowCommand, WorkflowReply, ClusterWorkflowError<<R::Engine as WorkflowEngine>::Error>>`): Typed operation definition or callback selected for execution.
+    ///
+    /// # Returns
+    /// Type: `Result<(), EntityRegistrationError>`.
     pub fn register<R>(
         dispatcher: &mut EntityDispatcher<R>,
         entity_type: ClusterEntityType,
@@ -57,6 +89,17 @@ impl ClusterWorkflowEngine {
         )
     }
 
+    /// Return the typed handler registered for this definition.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Additional bound: `HasWorkflowEngine + Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `operation` (`RpcOperation<WorkflowCommand, WorkflowReply, ClusterWorkflowError<<R::Engine as WorkflowEngine>::Error>>`): Typed operation definition or callback selected for execution.
+    ///
+    /// # Returns
+    /// Type: `RpcHandler<WorkflowCommand, WorkflowReply, ClusterWorkflowError<<R::Engine as WorkflowEngine>::Error>, R>`.
+    /// Returns the value described by this method's return type.
     pub fn handler<R>(
         operation: RpcOperation<
             WorkflowCommand,
@@ -75,6 +118,17 @@ impl ClusterWorkflowEngine {
         RpcHandler::new(operation, Self::dispatch::<R>)
     }
 
+    /// Decode and route an addressed command to the workflow engine.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Additional bound: `HasWorkflowEngine + Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `command` (`WorkflowCommand`): The command supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<WorkflowReply, ClusterWorkflowError<<R::Engine as WorkflowEngine>::Error>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn dispatch<R>(
         command: WorkflowCommand,
     ) -> Effect<WorkflowReply, ClusterWorkflowError<<R::Engine as WorkflowEngine>::Error>, R>

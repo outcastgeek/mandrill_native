@@ -7,6 +7,17 @@ const effects = @import("../effect.zig");
 const outcomes = @import("../outcome.zig");
 const journals = @import("event_journal.zig");
 
+/// Replay journal entries before following live events.
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `select_journal: comptime fn (*const R) *const journals.Journal(R, ProviderError)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_cursor: comptime fn (*const R) journals.Cursor`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_policy: comptime fn (*const R) journals.ReadPolicy`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// Returns (`effects.Stream(journals.ReadPage, journals.Journal(R, ProviderError).Failure, R)`): A lazy typed Stream; the caller consumes it under its scope and handles terminal Exit.
 pub fn catchUp(
     comptime R: type,
     comptime ProviderError: type,

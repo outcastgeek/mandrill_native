@@ -1,3 +1,5 @@
+//! Typed RPC calls over an injected session capability.
+
 use super::{
     RpcCallId, RpcEnvelope, RpcEnvelopeKind, RpcEnvelopePolicy, RpcOperation, RpcWireError,
 };
@@ -14,47 +16,87 @@ use std::sync::{Arc, Mutex};
 /// It must make cancellation of an in-flight exchange observable according to
 /// its provider contract; the core never starts an ambient runtime.
 pub trait RpcChannel: Send + Sync + 'static {
+    /// Provider-specific failure type returned by this capability.
     type Error: Send + 'static;
+    /// # Parameters
+    /// - `request` (`FrameParts`): The typed request to process.
+    ///
+    /// # Returns
+    /// Type: `Effect<Vec<u8>, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn exchange(&self, request: FrameParts) -> Effect<Vec<u8>, Self::Error>;
 }
 
+/// Selects the RPC channel used for typed client calls.
 pub trait HasRpcChannel {
+    /// RPC channel selected by this environment.
     type Channel: RpcChannel;
+    /// # Returns
+    /// Type: `Arc<Self::Channel>`.
     fn rpc_channel(&self) -> Arc<Self::Channel>;
 }
 
 impl<T: RpcChannel> HasRpcChannel for Arc<T> {
+    /// Type alias for channel in rpc client.
     type Channel = T;
 
+    ///
+    /// # Returns
+    /// Type: `Arc<Self::Channel>`.
+    /// Returns `Arc<Self::Channel>`.
     fn rpc_channel(&self) -> Arc<Self::Channel> {
         Arc::clone(self)
     }
 }
 
 #[derive(Debug)]
+/// A transport, wire, or typed reply failure observed by an RPC client.
+///
+/// # Type parameters
+/// - `E`: Domain-error type.
+/// - `Backend`: Backend-specific error or provider type.
 pub enum RpcClientError<E, Backend> {
+    /// The application’s expected domain operation failed. Retains the `E` detail.
     Domain(E),
+    /// The request failed its declared schema validation. Retains the `SchemaIssue` detail.
     RequestSchema(SchemaIssue),
+    /// The response failed its declared schema validation. Retains the `SchemaIssue` detail.
     ResponseSchema(SchemaIssue),
+    /// RPC framing or envelope validation failed. Retains the `RpcWireError` detail.
     Wire(RpcWireError),
     /// The request may have reached the server and committed. Reconcile by
     /// the stable call ID before retrying a mutation.
     UncertainTransport {
+        /// Identity of the RPC call. Type: `RpcCallId`.
         call: RpcCallId,
+        /// The underlying failure or provider cause. Type: `Backend`.
         source: Backend,
     },
+    /// The provider rejected work before accepting ownership. Retains the `SemaphoreError` detail.
     Admission(SemaphoreError),
+    /// The required response is missing.
     MissingResponse,
+    /// Unexpected additional responses were present.
     ExtraResponses,
+    /// The correlation differs from the required or recorded value.
     CorrelationMismatch,
+    /// The operation differs from the required or recorded value.
     OperationMismatch,
+    /// The received response kind is invalid in the current protocol state. Retains the `RpcEnvelopeKind` detail.
     UnexpectedResponseKind(RpcEnvelopeKind),
+    /// An owned input was already consumed.
     InputConsumed,
 }
 
 /// Admission is scoped to this client instance. The caller chooses its exact
 /// capacity; shared cross-process admission requires a stronger capability.
 /// The transport remains entirely in R.
+///
+/// # Type parameters
+/// - `Q`: Request type.
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
+/// - `Backend`: Backend-specific error or provider type.
 pub struct RpcClient<Q, A, E, Backend>
 where
     Q: Send + 'static,
@@ -75,6 +117,9 @@ where
     E: Send + 'static,
     Backend: Send + 'static,
 {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             operation: self.operation.clone(),
@@ -93,6 +138,21 @@ where
     Backend: Send + 'static,
 {
     #[must_use]
+    /// Construct a `RpcClient` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `Backend`: Backend-specific error or provider type.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `Q`: Request type.
+    ///
+    /// # Parameters
+    /// - `operation` (`RpcOperation<Q, A, E>`): Typed operation definition or callback selected for execution.
+    /// - `policy` (`RpcEnvelopePolicy`): The caller-supplied behavior policy.
+    /// - `maximum_in_flight` (`NonZeroUsize`): The maximum in flight supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(
         operation: RpcOperation<Q, A, E>,
         policy: RpcEnvelopePolicy,
@@ -106,6 +166,23 @@ where
         }
     }
 
+    /// Invoke the typed operation through its selected channel or handler.
+    ///
+    /// # Type parameters
+    /// - `Backend`: Backend-specific error or provider type.
+    /// - `R`: Environment type. Additional bound: `HasRpcChannel + Send + Sync + 'static`. Additional bound: `:Channel: RpcChannel<Error = Backend>`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `Q`: Request type.
+    ///
+    /// # Parameters
+    /// - `request` (`Q`): The typed request to process.
+    /// - `call` (`RpcCallId`): Identity and contents of the selected RPC call.
+    /// - `metadata` (`BTreeMap<Arc<str>, Arc<str>>`): Version, identity, or protection data associated with the payload.
+    ///
+    /// # Returns
+    /// Type: `Effect<A, RpcClientError<E, Backend>, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn call<R>(
         &self,
         request: Q,
@@ -203,6 +280,21 @@ where
     }
 }
 
+///
+/// # Type parameters
+/// - `Q`: Request payload type. Additional bound: `Send + 'static`.
+/// - `A`: Successful application-value type. Additional bound: `Send + 'static`.
+/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
+/// - `Backend`: Backend-specific error or provider type. Additional bound: `Send + 'static`.
+///
+/// # Parameters
+/// - `operation` (`&RpcOperation<Q, A, E>`): Typed operation definition or callback selected for execution.
+/// - `call` (`&RpcCallId`): Identity and contents of the selected RPC call.
+/// - `bytes` (`&[u8]`): Encoded bytes to validate, decode, write, or transfer.
+/// - `policy` (`RpcEnvelopePolicy`): The caller-supplied behavior policy.
+///
+/// # Returns
+/// Type: `Result<A, RpcClientError<E, Backend>>`.
 fn decode_response<Q, A, E, Backend>(
     operation: &RpcOperation<Q, A, E>,
     call: &RpcCallId,

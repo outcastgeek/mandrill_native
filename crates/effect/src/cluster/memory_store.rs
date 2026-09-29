@@ -1,3 +1,5 @@
+//! Volatile in-memory Cluster message storage.
+
 use super::{
     AcceptedRequest, ActivationId, ActivationLease, ActivationOutcome, ActivationPhase,
     ActivationStatus, ClaimOptions, ClaimToken, ClusterActivationStore, ClusterAddress,
@@ -12,8 +14,10 @@ use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 
+/// Type alias for message key in cluster memory store.
 type MessageKey = (ClusterAddress, ClusterRequestId);
 
+/// Variants of internal state used by cluster memory store.
 enum InternalState {
     Pending,
     Claimed(ClaimToken),
@@ -28,11 +32,13 @@ enum InternalState {
     },
 }
 
+/// Typed observer state used by cluster memory store.
 struct ObserverState {
     last_acknowledged: Option<NonZeroU64>,
     reply_acknowledged: bool,
 }
 
+/// Typed record used by cluster memory store.
 struct Record {
     request: AcceptedRequest,
     order: NonZeroU64,
@@ -42,6 +48,7 @@ struct Record {
     observers: BTreeMap<ClusterObserverId, ObserverState>,
 }
 
+/// Typed memory state used by cluster memory store.
 struct MemoryState {
     records: BTreeMap<MessageKey, Record>,
     current_owner: BTreeMap<ClusterAddress, ActivationStatus>,
@@ -58,6 +65,9 @@ pub struct MemoryClusterMessageStore {
 }
 
 impl Clone for MemoryClusterMessageStore {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             state: Arc::clone(&self.state),
@@ -68,6 +78,13 @@ impl Clone for MemoryClusterMessageStore {
 
 impl MemoryClusterMessageStore {
     #[must_use]
+    /// Construct a `MemoryClusterMessageStore` from its required inputs and explicit policies.
+    ///
+    /// # Parameters
+    /// - `capacity` (`MessageStoreCapacity`): The caller-supplied capacity bound.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(capacity: MessageStoreCapacity) -> Self {
         Self {
             state: Arc::new(Mutex::new(MemoryState {
@@ -81,10 +98,29 @@ impl MemoryClusterMessageStore {
     }
 
     #[must_use]
+    /// Build a scoped dependency layer for this service.
+    ///
+    /// # Parameters
+    /// - `capacity` (`MessageStoreCapacity`): The caller-supplied capacity bound.
+    ///
+    /// # Returns
+    /// Type: `Layer<(), ClusterStoreError, Self>`.
     pub fn layer(capacity: MessageStoreCapacity) -> Layer<(), ClusterStoreError, Self> {
         Layer::make_with(move || Self::new(capacity))
     }
 
+    ///
+    /// # Type parameters
+    /// - `I`: Bounds: `Send + 'static`.
+    /// - `O`: Bounds: `Send + 'static`.
+    ///
+    /// # Parameters
+    /// - `input` (`I`): Owned input decoded or consumed by this operation.
+    /// - `mutate` (`impl FnOnce(&mut MemoryState, I) -> Result<O, ClusterStoreError> + Send + 'static`): The mutate supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<O, ClusterStoreError>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn transact<I: Send + 'static, O: Send + 'static>(
         &self,
         input: I,
@@ -109,6 +145,13 @@ impl MemoryClusterMessageStore {
     }
 }
 
+///
+/// # Parameters
+/// - `state` (`&InternalState`): Current or replacement state owned by this operation.
+///
+/// # Returns
+/// Type: `MessageDisposition`.
+/// Returns `MessageDisposition`.
 fn disposition(state: &InternalState) -> MessageDisposition {
     match state {
         InternalState::Pending => MessageDisposition::Pending,
@@ -118,6 +161,13 @@ fn disposition(state: &InternalState) -> MessageDisposition {
     }
 }
 
+///
+/// # Parameters
+/// - `record` (`&Record`): The record supplied to this operation.
+///
+/// # Returns
+/// Type: `bool`.
+/// Returns whether the requested condition holds.
 fn acknowledged(record: &Record) -> bool {
     record
         .observers
@@ -125,12 +175,27 @@ fn acknowledged(record: &Record) -> bool {
         .all(|observer| observer.reply_acknowledged)
 }
 
+///
+/// # Parameters
+/// - `record` (`&Record`): The record supplied to this operation.
+/// - `now` (`UtcMillis`): The caller-supplied current time.
+///
+/// # Returns
+/// Type: `bool`.
+/// Returns whether the requested condition holds.
 fn expiry(record: &Record, now: UtcMillis) -> bool {
     matches!(&record.state, InternalState::Completed { retained_until, .. }
         if now >= *retained_until)
         && acknowledged(record)
 }
 
+///
+/// # Parameters
+/// - `record` (`&Record`): The record supplied to this operation.
+///
+/// # Returns
+/// Type: `SavedMessage`.
+/// Returns `SavedMessage`.
 fn recorded(record: &Record) -> SavedMessage {
     let state = match &record.state {
         InternalState::Pending => SavedMessageState::Pending,
@@ -169,6 +234,17 @@ fn recorded(record: &Record) -> SavedMessage {
     }
 }
 
+///
+/// # Type parameters
+/// - `'a`: Lifetime parameter.
+///
+/// # Parameters
+/// - `state` (`&'a mut MemoryState`): Current or replacement state owned by this operation.
+/// - `token` (`&ClaimToken`): Fencing token that identifies the current claim or owner.
+/// - `now` (`UtcMillis`): The caller-supplied current time.
+///
+/// # Returns
+/// Type: `Result<&'a mut Record, ClusterStoreError>`.
 fn verify_claim<'a>(
     state: &'a mut MemoryState,
     token: &ClaimToken,
@@ -202,8 +278,16 @@ fn verify_claim<'a>(
 }
 
 impl ClusterMessageStore for MemoryClusterMessageStore {
+    /// Type alias for error in cluster memory store.
     type Error = ClusterStoreError;
 
+    ///
+    /// # Parameters
+    /// - `request` (`AcceptedRequest`): Typed request submitted to a handler or transport.
+    ///
+    /// # Returns
+    /// Type: `Effect<MessageAcceptance, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn accept(&self, request: AcceptedRequest) -> Effect<MessageAcceptance, Self::Error> {
         let capacity = self.capacity;
         self.transact(request, move |state, request| {
@@ -254,6 +338,13 @@ impl ClusterMessageStore for MemoryClusterMessageStore {
         })
     }
 
+    ///
+    /// # Parameters
+    /// - `options` (`ClaimOptions`): Caller-selected bounds and behavior for this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<Vec<MessageClaim>, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn claim(&self, options: ClaimOptions) -> Effect<Vec<MessageClaim>, Self::Error> {
         self.transact(options, |state, options| {
             if options.lease_until <= options.now {
@@ -369,6 +460,15 @@ impl ClusterMessageStore for MemoryClusterMessageStore {
         })
     }
 
+    ///
+    /// # Parameters
+    /// - `token` (`ClaimToken`): Fencing token that identifies the current claim or owner.
+    /// - `chunk` (`SavedChunk`): The chunk supplied to this operation.
+    /// - `now` (`UtcMillis`): The caller-supplied current time.
+    ///
+    /// # Returns
+    /// Type: `Effect<StoreMutation, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn save_chunk(
         &self,
         token: ClaimToken,
@@ -403,6 +503,13 @@ impl ClusterMessageStore for MemoryClusterMessageStore {
         })
     }
 
+    ///
+    /// # Parameters
+    /// - `completion` (`CompletedReply`): The completion supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<StoreCompletion, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn complete(&self, completion: CompletedReply) -> Effect<StoreCompletion, Self::Error> {
         self.transact(completion, |state, completion| {
             let token = completion.token;
@@ -459,6 +566,14 @@ impl ClusterMessageStore for MemoryClusterMessageStore {
         })
     }
 
+    ///
+    /// # Parameters
+    /// - `address` (`ClusterAddress`): Stable destination address of the entity receiving this request.
+    /// - `request` (`ClusterRequestId`): Typed request submitted to a handler or transport.
+    ///
+    /// # Returns
+    /// Type: `Effect<Option<SavedMessage>, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn inspect(
         &self,
         address: ClusterAddress,
@@ -469,6 +584,13 @@ impl ClusterMessageStore for MemoryClusterMessageStore {
         })
     }
 
+    ///
+    /// # Parameters
+    /// - `scan` (`MessageScan`): Bounded request for records in a selected state.
+    ///
+    /// # Returns
+    /// Type: `Effect<MessageInspection, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn scan(&self, scan: MessageScan) -> Effect<MessageInspection, Self::Error> {
         self.transact(scan, |state, scan| {
             let mut messages = state
@@ -487,6 +609,16 @@ impl ClusterMessageStore for MemoryClusterMessageStore {
         })
     }
 
+    ///
+    /// # Parameters
+    /// - `address` (`ClusterAddress`): Stable destination address of the entity receiving this request.
+    /// - `request` (`ClusterRequestId`): Typed request submitted to a handler or transport.
+    /// - `observer` (`ClusterObserverId`): Stable identity of the client observing recorded results.
+    /// - `after` (`Option<NonZeroU64>`): Cursor or instant after which results are selected.
+    ///
+    /// # Returns
+    /// Type: `Effect<StoreObservation, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn observe(
         &self,
         address: ClusterAddress,
@@ -526,6 +658,16 @@ impl ClusterMessageStore for MemoryClusterMessageStore {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `address` (`ClusterAddress`): Stable destination address of the entity receiving this request.
+    /// - `request` (`ClusterRequestId`): Typed request submitted to a handler or transport.
+    /// - `observer` (`ClusterObserverId`): Stable identity of the client observing recorded results.
+    /// - `sequence` (`NonZeroU64`): Ordered stream position used to reject gaps or duplicates.
+    ///
+    /// # Returns
+    /// Type: `Effect<StoreMutation, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn acknowledge_chunk(
         &self,
         address: ClusterAddress,
@@ -562,6 +704,15 @@ impl ClusterMessageStore for MemoryClusterMessageStore {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `address` (`ClusterAddress`): Stable destination address of the entity receiving this request.
+    /// - `request` (`ClusterRequestId`): Typed request submitted to a handler or transport.
+    /// - `observer` (`ClusterObserverId`): Stable identity of the client observing recorded results.
+    ///
+    /// # Returns
+    /// Type: `Effect<StoreMutation, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn acknowledge_reply(
         &self,
         address: ClusterAddress,
@@ -598,6 +749,15 @@ impl ClusterMessageStore for MemoryClusterMessageStore {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `address` (`ClusterAddress`): Stable destination address of the entity receiving this request.
+    /// - `request` (`ClusterRequestId`): Typed request submitted to a handler or transport.
+    /// - `observer` (`ClusterObserverId`): Stable identity of the client observing recorded results.
+    ///
+    /// # Returns
+    /// Type: `Effect<bool, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn detach_observer(
         &self,
         address: ClusterAddress,
@@ -616,6 +776,13 @@ impl ClusterMessageStore for MemoryClusterMessageStore {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `now` (`UtcMillis`): The caller-supplied current time.
+    ///
+    /// # Returns
+    /// Type: `Effect<usize, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn cleanup(&self, now: UtcMillis) -> Effect<usize, Self::Error> {
         self.transact(now, |state, now| {
             let before = state.records.len();
@@ -626,15 +793,31 @@ impl ClusterMessageStore for MemoryClusterMessageStore {
 }
 
 impl HasClusterMessageStore for Arc<MemoryClusterMessageStore> {
+    /// Type alias for store in cluster memory store.
     type Store = MemoryClusterMessageStore;
+    ///
+    /// # Returns
+    /// Type: `Arc<Self::Store>`.
+    /// Returns `Arc<Self::Store>`.
     fn cluster_message_store(&self) -> Arc<Self::Store> {
         Arc::clone(self)
     }
 }
 
 impl ClusterActivationStore for MemoryClusterMessageStore {
+    /// Type alias for error in cluster memory store.
     type Error = ClusterStoreError;
 
+    ///
+    /// # Parameters
+    /// - `address` (`ClusterAddress`): Stable destination address of the entity receiving this request.
+    /// - `activation` (`ActivationId`): The activation supplied to this operation.
+    /// - `now` (`UtcMillis`): The caller-supplied current time.
+    /// - `lease_until` (`UtcMillis`): Instant at which the claim or activation lease expires.
+    ///
+    /// # Returns
+    /// Type: `Effect<ActivationOutcome, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn activate(
         &self,
         address: ClusterAddress,
@@ -700,6 +883,15 @@ impl ClusterActivationStore for MemoryClusterMessageStore {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `owner` (`ClusterOwner`): Worker or scope identity used to fence stale operations.
+    /// - `now` (`UtcMillis`): The caller-supplied current time.
+    /// - `lease_until` (`UtcMillis`): Instant at which the claim or activation lease expires.
+    ///
+    /// # Returns
+    /// Type: `Effect<ActivationLease, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn renew(
         &self,
         owner: ClusterOwner,
@@ -728,6 +920,14 @@ impl ClusterActivationStore for MemoryClusterMessageStore {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `owner` (`ClusterOwner`): Worker or scope identity used to fence stale operations.
+    /// - `now` (`UtcMillis`): The caller-supplied current time.
+    ///
+    /// # Returns
+    /// Type: `Effect<PassivationOutcome, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn passivate(
         &self,
         owner: ClusterOwner,
@@ -769,6 +969,14 @@ impl ClusterActivationStore for MemoryClusterMessageStore {
         })
     }
 
+    ///
+    /// # Parameters
+    /// - `owner` (`ClusterOwner`): Worker or scope identity used to fence stale operations.
+    /// - `now` (`UtcMillis`): The caller-supplied current time.
+    ///
+    /// # Returns
+    /// Type: `Effect<bool, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn abandon(&self, owner: ClusterOwner, now: UtcMillis) -> Effect<bool, Self::Error> {
         self.transact((owner, now), |state, (owner, now)| {
             let status = state
@@ -786,6 +994,13 @@ impl ClusterActivationStore for MemoryClusterMessageStore {
         })
     }
 
+    ///
+    /// # Parameters
+    /// - `address` (`ClusterAddress`): Stable destination address of the entity receiving this request.
+    ///
+    /// # Returns
+    /// Type: `Effect<Option<ActivationStatus>, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn inspect_activation(
         &self,
         address: ClusterAddress,
@@ -797,7 +1012,12 @@ impl ClusterActivationStore for MemoryClusterMessageStore {
 }
 
 impl HasClusterActivationStore for Arc<MemoryClusterMessageStore> {
+    /// Type alias for store in cluster memory store.
     type Store = MemoryClusterMessageStore;
+    ///
+    /// # Returns
+    /// Type: `Arc<Self::Store>`.
+    /// Returns `Arc<Self::Store>`.
     fn cluster_activation_store(&self) -> Arc<Self::Store> {
         Arc::clone(self)
     }

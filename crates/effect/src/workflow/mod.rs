@@ -1,3 +1,12 @@
+//! Typed workflow definitions and engine capabilities.
+//!
+//! A definition's stable identity, version, and compatibility signature name
+//! recorded execution history. [`Durable`] coordinates replayable steps;
+//! ordinary Effect work belongs in named activities. The workflow engine is an
+//! `R` capability and need not use Cluster. A memory engine can reconstruct
+//! supplied snapshots but does not guarantee crash recovery. Where physical
+//! durability matters, provider marker traits express the required warranty.
+
 mod activity;
 mod compensation;
 mod durable;

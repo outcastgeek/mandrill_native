@@ -7,8 +7,10 @@ const Cancellation = @import("internal/runtime.zig").Cancellation;
 const Waiter = @import("internal/waiter.zig").Waiter;
 const keys = @import("primary_key.zig");
 
+/// Permit-gate failure for invalid capacity, shutdown, or invalid release.
 pub const Error = enum { invalid_capacity, shutdown, invalid_release };
 
+/// I/O-aware permit gate with a fixed limit and synchronized availability.
 pub const Semaphore = struct {
     const Self = @This();
     const Admission = struct {
@@ -27,6 +29,11 @@ pub const Semaphore = struct {
     closed: bool = false,
 
     /// Capacity is an explicit, positive caller policy; there is no default.
+    ///
+    /// Parameters:
+    /// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected capabilities.
+    /// - `capacity: usize`: initial positive maximum number of concurrent permits.
+    /// Returns (`outcomes.Result(Self, Error)`): An ok/err Result; owned payloads must be released according to their type contract.
     pub fn init(env: anytype, capacity: usize) outcomes.Result(Self, Error) {
         if (capacity == 0) return .{ .err = .invalid_capacity };
         return .{ .ok = .{ .io = env.io, .limit = capacity, .available = capacity } };
@@ -94,6 +101,18 @@ pub const Semaphore = struct {
     /// The only public acquisition path owns the permit through a structured
     /// finalizer. The body keeps its own typed E; admission errors are mapped
     /// explicitly instead of silently becoming defects or native error unions.
+    ///
+    /// Parameters:
+    /// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+    /// - `A: comptime type`: Value type produced by a successful computation.
+    /// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+    /// - `select: comptime fn (*const R) *Self`: Compile-time typed function selected at comptime; no runtime callback lookup is
+    ///   required.
+    /// - `map_error: comptime fn (Error) E`: Compile-time typed function selected at comptime; no runtime callback lookup
+    ///   is required.
+    /// - `use: comptime fn (void) effects.Effect(A, E, R)`: Compile-time typed function selected at comptime; no runtime callback lookup is
+    ///   required.
+    /// Returns (`effects.Effect(A, E, R)`): body result after a permit is acquired and released even on failure.
     pub fn withPermit(
         comptime R: type,
         comptime A: type,
@@ -121,6 +140,10 @@ pub const Semaphore = struct {
 
     /// Stop new admission and wake queued callers. Already owned permits must
     /// still return before deinitialization; shutdown does not revoke them.
+    ///
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn shutdown(self: *Self) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -128,6 +151,10 @@ pub const Semaphore = struct {
         Waiter.signalAll(self.waiters);
     }
 
+    /// Release resources owned by this value.
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn deinit(self: *Self) void {
         self.mutex.lockUncancelable(self.io);
         const drained = self.waiters == null and self.waiter_tail == null and self.available == self.limit;
@@ -137,6 +164,7 @@ pub const Semaphore = struct {
     }
 };
 
+/// Typed failure from validating a partition key or acquiring its semaphore.
 pub const PartitionError = union(enum) {
     invalid_capacity,
     invalid_key: keys.Error,
@@ -166,6 +194,13 @@ pub const PartitionedSemaphore = struct {
     entries: std.StringHashMap(*Entry),
     closed: bool = false,
 
+    /// Create keyed semaphores with explicit partition and permit limits.
+    /// Parameters:
+    /// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected capabilities.
+    /// - `max_partitions: usize`: Caller-supplied upper bound on partition state.
+    /// - `permits_per_partition: usize`: The permits per partition input required by this typed
+    ///   operation.
+    /// Returns (`outcomes.Result(Self, PartitionError)`): An ok/err Result; owned payloads must be released according to their type contract.
     pub fn init(env: anytype, max_partitions: usize, permits_per_partition: usize) outcomes.Result(Self, PartitionError) {
         if (max_partitions == 0 or permits_per_partition == 0) return .{ .err = .invalid_capacity };
         return .{ .ok = .{
@@ -292,6 +327,20 @@ pub const PartitionedSemaphore = struct {
         };
     }
 
+    /// Acquire a semaphore permit for a scoped body.
+    /// Parameters:
+    /// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+    /// - `A: comptime type`: Value type produced by a successful computation.
+    /// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+    /// - `select: comptime fn (*const R) *Self`: Compile-time typed function selected at comptime; no runtime callback lookup is
+    ///   required.
+    /// - `select_key: comptime fn (*const R) []const u8`: Compile-time typed selector from the current environment; its result must
+    ///   remain valid through use.
+    /// - `map_error: comptime fn (PartitionError) E`: Compile-time typed function selected at comptime; no runtime callback lookup
+    ///   is required.
+    /// - `use: comptime fn (void) effects.Effect(A, E, R)`: Compile-time typed function selected at comptime; no runtime callback lookup is
+    ///   required.
+    /// Returns (`effects.Effect(A, E, R)`): body result after a partition-specific permit is acquired and released.
     pub fn withPermit(
         comptime R: type,
         comptime A: type,
@@ -332,6 +381,10 @@ pub const PartitionedSemaphore = struct {
         }.finish);
     }
 
+    /// Stop the capability and release its retained resources.
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn shutdown(self: *Self) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -340,6 +393,10 @@ pub const PartitionedSemaphore = struct {
         while (iterator.next()) |item| item.value_ptr.*.semaphore.shutdown();
     }
 
+    /// Release resources owned by this value.
+    /// Parameters:
+    /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn deinit(self: *Self) void {
         self.mutex.lockUncancelable(self.io);
         const drained = self.closed and self.entries.count() == 0;

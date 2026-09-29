@@ -1,8 +1,11 @@
+//! Per-key coordination of cache lookup and invalidation.
+
 use crate::{Effect, Semaphore, SemaphoreError, SemaphorePermit};
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, Weak};
 
+/// Type alias for gates in persistence internal cache gate.
 type Gates = BTreeMap<Arc<[u8]>, Weak<Semaphore>>;
 
 /// Serializes one persisted key's lookup and invalidation without coupling
@@ -12,6 +15,7 @@ pub(crate) struct CacheGate {
     gates: Arc<Mutex<Gates>>,
 }
 
+/// Typed gate handle used by persistence internal cache gate.
 struct GateHandle {
     gates: Arc<Mutex<Gates>>,
     key: Arc<[u8]>,
@@ -19,6 +23,9 @@ struct GateHandle {
 }
 
 impl Clone for GateHandle {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             gates: Arc::clone(&self.gates),
@@ -29,6 +36,9 @@ impl Clone for GateHandle {
 }
 
 impl Drop for GateHandle {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         let mut gates = self
             .gates
@@ -52,12 +62,21 @@ pub(crate) struct CacheGatePermit {
 }
 
 impl CacheGate {
+    /// # Returns
+    /// Type: `Self`.
     pub(crate) fn new() -> Self {
         Self {
             gates: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
+    ///
+    /// # Parameters
+    /// - `key` (`Arc<[u8]>`): Stable key used to locate or identify the selected value.
+    ///
+    /// # Returns
+    /// Type: `GateHandle`.
+    /// Returns `GateHandle`.
     fn handle(&self, key: Arc<[u8]>) -> GateHandle {
         let semaphore = {
             let mut gates = self
@@ -79,6 +98,15 @@ impl CacheGate {
         }
     }
 
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `key` (`Arc<[u8]>`): Stable key used to locate or identify the selected value.
+    ///
+    /// # Returns
+    /// Type: `Effect<CacheGatePermit, SemaphoreError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub(crate) fn acquire<R: Send + Sync + 'static>(
         &self,
         key: Arc<[u8]>,

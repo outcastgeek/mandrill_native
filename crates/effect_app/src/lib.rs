@@ -1,3 +1,13 @@
+//! An executable example that composes asynchronous, CPU, and blocking work.
+//!
+//! [`AppConfig`] requires explicit worker counts, admission capacities, file
+//! paths, retry policy, and telemetry bounds. [`LiveApp::new`] constructs the
+//! providers and shared [`AppEnv`]; [`application`] describes the work without
+//! executing it. The environment supplies Tokio tasks and blocking work, Rayon
+//! CPU execution, and logging/tracing in one `R`. The final [`Exit`] is rendered
+//! by [`describe`], preserving the distinction between expected errors,
+//! defects, interruption, and cleanup failure.
+
 pub mod native;
 use effect::{
     AdmissionCapacity, Cache, CacheCapacity, CacheConfig, Cancellation, Console,
@@ -16,99 +26,180 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug)]
+/// Application failures retain I/O, JSON, arithmetic, and resource causes.
 pub enum AppError {
+    /// Filesystem or stream I/O failed. Carries the original error.
     Io(std::io::Error),
+    /// The input contains invalid JSON syntax.
     JsonSyntax(serde_json::Error),
+    /// The JSON document could not be decoded as application input.
     Document(serde_json::Error),
+    /// The input contains no samples to process.
     EmptySamples,
+    /// Sample arithmetic exceeded its supported range.
     ArithmeticOverflow,
+    /// Resource acquisition, use, or release failed.
     Resource(effect::Defect),
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Input document containing the samples processed by this application.
 pub struct Input {
+    /// Samples read from the input document. Type: `Vec<i64>`.
     pub samples: Vec<i64>,
 }
+/// Paths for the input, final output, and staging output files.
 pub struct Files {
+    /// Path to the input document. Type: `PathBuf`.
     pub input: PathBuf,
+    /// Path to the final output document. Type: `PathBuf`.
     pub output: PathBuf,
+    /// Path used while writing output before it is finalized. Type: `PathBuf`.
     pub staging: PathBuf,
 }
+/// Explicit worker, admission, telemetry, cache, retry, and file policies.
 pub struct AppConfig {
+    /// Input, final output, and staging paths. Type: `Files`.
     pub files: Files,
+    /// Number of asynchronous runtime workers. Type: `NonZeroUsize`.
     pub async_workers: NonZeroUsize,
+    /// Number of Rayon CPU workers. Type: `NonZeroUsize`.
     pub cpu_workers: NonZeroUsize,
+    /// Maximum number of Tokio blocking workers. Type: `NonZeroUsize`.
     pub blocking_workers: NonZeroUsize,
+    /// Maximum admitted asynchronous tasks. Type: `NonZeroUsize`.
     pub task_admission: NonZeroUsize,
+    /// Maximum admitted CPU jobs. Type: `NonZeroUsize`.
     pub cpu_admission: NonZeroUsize,
+    /// Maximum admitted blocking jobs. Type: `NonZeroUsize`.
     pub blocking_admission: NonZeroUsize,
+    /// The capacity allocated to telemetry. Type: `NonZeroUsize`.
     pub telemetry_capacity: NonZeroUsize,
+    /// Behavior when diagnostic capacity is exhausted. Type: `DiagnosticOverflow`.
     pub diagnostic_overflow: DiagnosticOverflow,
+    /// The capacity allocated to metadata. Type: `NonZeroUsize`.
     pub metadata_capacity: NonZeroUsize,
+    /// Time to retain cached metadata. Type: `Duration`.
     pub metadata_ttl: Duration,
+    /// Number of retries after an initial attempt. Type: `usize`.
     pub retries: usize,
+    /// Delay between retry attempts. Type: `Duration`.
     pub retry_delay: Duration,
+    /// Minimum application log level. Type: `LogLevel`.
     pub log_level: LogLevel,
 }
+/// Application environment selecting Tokio tasks, Rayon CPU work, and Tokio
+/// blocking work together. These concrete providers use static trait dispatch;
+/// a vtable is involved only when an application selects a trait object.
 pub struct AppEnv {
+    /// The token that requests cancellation. Type: `Cancellation`.
     pub cancellation: Cancellation,
+    /// Tokio task spawning capability. Type: `TokioTasks`.
     pub tasks: TokioTasks,
+    /// Rayon CPU execution capability. Type: `RayonCpu`.
     pub cpu: RayonCpu,
+    /// Tokio blocking execution capability. Type: `TokioBlocking`.
     pub blocking: TokioBlocking,
+    /// Clock and scheduling capability. Type: `TokioClock`.
     pub clock: TokioClock,
+    /// Application logging capability. Type: `Logger`.
     pub logger: Logger,
+    /// Application tracing capability. Type: `Tracer`.
     pub tracer: Tracer,
+    /// Shared file paths for application effects. Type: `Arc<Files>`.
     pub files: Arc<Files>,
+    /// Number of retries after an initial attempt. Type: `usize`.
     pub retries: usize,
+    /// Delay between retry attempts. Type: `Duration`.
     pub retry_delay: Duration,
+    /// The capacity allocated to metadata. Type: `NonZeroUsize`.
     pub metadata_capacity: NonZeroUsize,
+    /// Time to retain cached metadata. Type: `Duration`.
     pub metadata_ttl: Duration,
 }
 impl HasCancellation for AppEnv {
+    ///
+    /// # Returns
+    /// Type: `&Cancellation`.
     fn cancellation(&self) -> &Cancellation {
         &self.cancellation
     }
 }
 impl HasTaskSpawner for AppEnv {
+    /// Type alias for tasks in lib.
     type Tasks = TokioTasks;
+    ///
+    /// # Returns
+    /// Type: `&TokioTasks`.
     fn task_spawner(&self) -> &TokioTasks {
         &self.tasks
     }
 }
 impl HasCpuExecutor for AppEnv {
+    /// Type alias for executor in lib.
     type Executor = RayonCpu;
+    ///
+    /// # Returns
+    /// Type: `&RayonCpu`.
     fn cpu_executor(&self) -> &RayonCpu {
         &self.cpu
     }
 }
 impl HasBlockingExecutor for AppEnv {
+    /// Type alias for executor in lib.
     type Executor = TokioBlocking;
+    ///
+    /// # Returns
+    /// Type: `&TokioBlocking`.
     fn blocking_executor(&self) -> &TokioBlocking {
         &self.blocking
     }
 }
 impl HasClock for AppEnv {
+    /// Type alias for clock in lib.
     type Clock = TokioClock;
+    ///
+    /// # Returns
+    /// Type: `&TokioClock`.
     fn clock(&self) -> &TokioClock {
         &self.clock
     }
 }
 impl HasLogger for AppEnv {
+    ///
+    /// # Returns
+    /// Type: `&Logger`.
     fn logger(&self) -> &Logger {
         &self.logger
     }
 }
 impl HasTracer for AppEnv {
+    ///
+    /// # Returns
+    /// Type: `&Tracer`.
     fn tracer(&self) -> &Tracer {
         &self.tracer
     }
 }
+/// Owns the configured application environment, runtime, and diagnostics.
 pub struct LiveApp {
+    /// Shared application capability environment. Type: `Arc<AppEnv>`.
     pub env: Arc<AppEnv>,
+    /// Runtime that executes asynchronous application effects. Type: `Arc<tokio::runtime::Runtime>`.
     pub runtime: Arc<tokio::runtime::Runtime>,
+    /// Diagnostic events emitted during execution. Type: `Diagnostics`.
     pub diagnostics: Diagnostics,
 }
 impl LiveApp {
+    /// Build the Tokio runtime, Rayon pool, diagnostics, and one shared
+    /// environment from the application's explicit configuration.
+    /// A provider construction failure is returned as a `Defect`.
+    ///
+    /// # Parameters
+    /// - `config` (`AppConfig`): The config supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, effect::Defect>`.
     pub fn new(config: AppConfig) -> Result<Self, effect::Defect> {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
@@ -181,6 +272,10 @@ impl LiveApp {
             diagnostics,
         })
     }
+    /// Wait for accepted work to settle and collect retained outcomes.
+    ///
+    /// # Returns
+    /// Type: `()`.
     pub async fn drain(&self) {
         self.env.tasks.stop().wait().await;
         self.env.cpu.stop().wait().await;
@@ -188,14 +283,23 @@ impl LiveApp {
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
+/// Stable identity used by lib operations.
 enum DocumentId {
     Input,
 }
+/// The computed sample sum and size of the input document after a successful run.
 pub struct Report {
+    /// Sum of all validated input samples. Type: `i128`.
     pub sum: i128,
+    /// The encoded bytes for input. Type: `u64`.
     pub input_bytes: u64,
 }
+/// Type alias for error in lib.
 type Error = SharedValue<AppError>;
+///
+/// # Returns
+/// Type: `Schema<Input, AppError>`.
+/// Returns `Schema<Input, AppError>`.
 fn schema() -> Schema<Input, AppError> {
     Schema::from_decoder(|value| {
         let input = Input::deserialize(value).map_err(AppError::Document)?;
@@ -205,12 +309,20 @@ fn schema() -> Schema<Input, AppError> {
         Ok(input)
     })
 }
+///
+/// # Returns
+/// Type: `Effect<Vec<u8>, Error, AppEnv>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 fn fetch() -> Effect<Vec<u8>, Error, AppEnv> {
     Effect::try_future_with_env(
         |env: Arc<AppEnv>, _| async move { tokio::fs::read(&env.files.input).await },
         |error| SharedValue::new(AppError::Io(error)),
     )
 }
+///
+/// # Returns
+/// Type: `Effect<u64, AppError, AppEnv>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 fn metadata() -> Effect<u64, AppError, AppEnv> {
     Effect::try_future_with_env(
         |env: Arc<AppEnv>, _| async move {
@@ -224,6 +336,10 @@ fn metadata() -> Effect<u64, AppError, AppEnv> {
 /// Reads a JSON document, validates it, computes on Rayon, shares a concurrent
 /// metadata load, writes on the blocking provider, and atomically renames the
 /// supplied staging file. Both file paths and every scheduling limit are input.
+///
+/// # Returns
+/// Type: `Effect<Report, Error, AppEnv>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 pub fn application() -> Effect<Report, Error, AppEnv> {
     Scope::scoped(|scope| {
         effect! {
@@ -261,6 +377,14 @@ pub fn application() -> Effect<Report, Error, AppEnv> {
     }).with_span(stringify!(application))
 }
 #[must_use]
+/// Render every terminal channel as a human-readable command-line result.
+/// This consumes the complete exit, including retained cleanup failures.
+///
+/// # Parameters
+/// - `outcome` (`Exit<Report, Error>`): Complete terminal outcome, including expected errors and cleanup failures.
+///
+/// # Returns
+/// Type: `String`.
 pub fn describe(outcome: Exit<Report, Error>) -> String {
     match outcome {
         Exit::Success(report) => format!("sum={} input_bytes={}", report.sum, report.input_bytes),
@@ -282,11 +406,25 @@ pub fn describe(outcome: Exit<Report, Error>) -> String {
         }
     }
 }
+///
+/// # Parameters
+/// - `error` (`&Error`): Expected or provider error preserved in the returned outcome.
+///
+/// # Returns
+/// Type: `String`.
+/// Returns `String`.
 fn describe_error(error: &Error) -> String {
     error
         .with(|error| format!("{error:?}"))
         .unwrap_or_else(|defect| format!("{defect:?}"))
 }
+///
+/// # Parameters
+/// - `failure` (`effect::CleanupFailure<Error>`): Expected error or cleanup failure retained in this outcome.
+///
+/// # Returns
+/// Type: `String`.
+/// Returns `String`.
 fn describe_cleanup(failure: effect::CleanupFailure<Error>) -> String {
     match failure {
         effect::CleanupFailure::ReleaseFailure(error) => describe_error(&error),
@@ -297,6 +435,13 @@ fn describe_cleanup(failure: effect::CleanupFailure<Error>) -> String {
 
 /// Sequential application state across async CPU boundaries uses ordinary Rust
 /// mutation. Each document and each partial sum moves into its next step.
+///
+/// # Parameters
+/// - `factory` (`impl Fn() -> Vec<Input> + Send + Sync + 'static`): Factory invoked to create fresh data for an execution.
+///
+/// # Returns
+/// Type: `Effect<i128, Error, AppEnv>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 pub fn sum_documents(
     factory: impl Fn() -> Vec<Input> + Send + Sync + 'static,
 ) -> Effect<i128, Error, AppEnv> {

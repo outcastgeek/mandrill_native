@@ -5,6 +5,8 @@ const std = @import("std");
 const outcomes = @import("outcome.zig");
 const deadlines = @import("deadline.zig");
 
+/// Calendar evaluation failures: invalid civil input or policy, arithmetic
+/// overflow, unavailable zone data, or a zone provider that breaks its contract.
 pub const Error = enum {
     invalid_date,
     invalid_policy,
@@ -13,16 +15,30 @@ pub const Error = enum {
     zone_contract,
 };
 
+/// Represent allowed values in one cron field as a compile-time-sized bit set.
+/// Values range from `first` through `first + count - 1`; invalid selections
+/// are rejected at compilation by `only`.
+/// Parameters:
+/// - `count: comptime comptime_int`: number of representable field values.
+/// - `first: comptime comptime_int`: smallest representable field value.
+/// Returns (`type`): bit-set type supporting `all`, `only`, `has`, and `valid`.
 pub fn FieldSet(comptime count: comptime_int, comptime first: comptime_int) type {
     const Bits = std.meta.Int(.unsigned, count);
     return struct {
         const Self = @This();
         bits: Bits,
 
+        /// Construct a field set containing every allowed value.
+        /// Returns (`Self`): bit set with every value in this field's range enabled.
         pub fn all() Self {
             return .{ .bits = std.math.maxInt(Bits) };
         }
 
+        /// Construct a field set containing one selected value.
+        /// Parameters:
+        /// - `values: comptime []const u8`: nonempty list of allowed values,
+        ///   each within this field's compile-time range.
+        /// Returns (`Self`): bit set containing exactly the selected values.
         pub fn only(comptime values: []const u8) Self {
             if (values.len == 0) @compileError("calendar field set cannot be empty");
             var bits: Bits = 0;
@@ -34,24 +50,39 @@ pub fn FieldSet(comptime count: comptime_int, comptime first: comptime_int) type
             return .{ .bits = bits };
         }
 
+        /// Check whether a field set contains the selected value.
+        /// Parameters:
+        /// - `self: Self`: bit set to search; passed by value without allocation.
+        /// - `value: u8`: candidate field value, including out-of-range values.
+        /// Returns (`bool`): `true` only when `value` is in range and enabled.
         pub fn has(self: Self, value: u8) bool {
             if (value < first or value >= first + count) return false;
             return self.bits & (@as(Bits, 1) << @intCast(value - first)) != 0;
         }
 
+        /// Check that this set enables at least one value.
+        /// Parameters:
+        /// - `self: Self`: bit set to check.
+        /// Returns (`bool`): `false` for an empty set, which cannot match a date.
         pub fn valid(self: Self) bool {
             return self.bits != 0;
         }
     };
 }
 
+/// Cron minute set covering values 0 through 59.
 pub const Minutes = FieldSet(60, 0);
+/// Cron hour set covering values 0 through 23.
 pub const Hours = FieldSet(24, 0);
+/// Cron day-of-month set covering values 1 through 31.
 pub const Days = FieldSet(31, 1);
+/// Cron month set covering values 1 through 12.
 pub const Months = FieldSet(12, 1);
 /// Sunday is 0, Saturday is 6; this is part of the rule's wire contract.
 pub const Weekdays = FieldSet(7, 0);
 
+/// Civil date and clock minute without a time zone. Validate before converting
+/// it to an epoch minute; the day bound depends on month and leap year.
 pub const LocalMinute = struct {
     year: i32,
     month: u8,
@@ -59,12 +90,23 @@ pub const LocalMinute = struct {
     hour: u8,
     minute: u8,
 
+    /// Validate the Gregorian date and 24-hour clock fields.
+    /// Parameters:
+    /// - `self: LocalMinute`: civil minute to validate.
+    /// Returns (`bool`): `true` when month, day, hour, and minute are in range.
     pub fn valid(self: LocalMinute) bool {
         return self.month >= 1 and self.month <= 12 and self.day >= 1 and
             self.day <= daysInMonth(self.year, self.month) and
             self.hour < 24 and self.minute < 60;
     }
 
+    /// Convert this local civil minute to a minute count on the proleptic
+    /// Gregorian timeline. No time-zone offset is applied here.
+    /// Parameters:
+    /// - `self: LocalMinute`: valid civil date and minute to convert.
+    /// Returns (`outcomes.Result(i64, Error)`): `.ok` epoch minute,
+    /// `.err.invalid_date` for invalid fields, or `.err.overflow` when it
+    /// cannot fit in `i64`.
     pub fn epochMinute(self: LocalMinute) outcomes.Result(i64, Error) {
         if (!self.valid()) return .{ .err = .invalid_date };
         const day = daysFromCivil(self.year, self.month, self.day);
@@ -75,6 +117,13 @@ pub const LocalMinute = struct {
             return .{ .err = .overflow } };
     }
 
+    /// Compute the immediately following civil minute, crossing day, month,
+    /// and year boundaries as needed.
+    /// Parameters:
+    /// - `self: LocalMinute`: current civil minute.
+    /// Returns (`outcomes.Result(LocalMinute, Error)`): `.ok` next minute,
+    /// `.err.invalid_date` for invalid input, or `.err.overflow` at the
+    /// representable time boundary.
     pub fn next(self: LocalMinute) outcomes.Result(LocalMinute, Error) {
         const current = switch (self.epochMinute()) {
             .ok => |value| value,
@@ -151,6 +200,7 @@ fn fromEpochMinute(value: i64) outcomes.Result(LocalMinute, Error) {
     } };
 }
 
+/// Calendar rule selecting allowed minute, hour, day, month, and weekday fields.
 pub const Rule = struct {
     minute: Minutes,
     hour: Hours,
@@ -158,11 +208,20 @@ pub const Rule = struct {
     month: Months,
     weekday: Weekdays,
 
+    /// Check whether this value satisfies its structural invariants.
+    /// Parameters:
+    /// - `self: Rule`: Receiver passed by value: the struct itself is copied, while any referenced storage keeps its original ownership and lifetime.
+    /// Returns (`bool`): `true` only when every calendar field set is nonempty.
     pub fn valid(self: Rule) bool {
         return self.minute.valid() and self.hour.valid() and self.day.valid() and
             self.month.valid() and self.weekday.valid();
     }
 
+    /// Check whether a civil time matches the cron rule.
+    /// Parameters:
+    /// - `self: Rule`: Receiver passed by value: the struct itself is copied, while any referenced storage keeps its original ownership and lifetime.
+    /// - `local: LocalMinute`: Local civil-minute value converted by the zone.
+    /// Returns (`bool`): `true` when the valid local minute belongs to every selected calendar field.
     pub fn matches(self: Rule, local: LocalMinute) bool {
         if (!self.valid() or !local.valid()) return false;
         const weekday: u8 = @intCast(@mod(daysFromCivil(local.year, local.month, local.day) + 4, 7));
@@ -172,12 +231,18 @@ pub const Rule = struct {
     }
 };
 
+/// `OverlapPolicy` cases: `first`, `last`, `both`.
 pub const OverlapPolicy = enum { first, last, both };
+/// Explicit bounds on local minutes searched and zone candidates examined.
 pub const SearchPolicy = struct {
     max_local_minutes: usize,
     max_candidates_per_local: usize,
     overlap: OverlapPolicy,
 
+    /// Check whether this value satisfies its structural invariants.
+    /// Parameters:
+    /// - `self: SearchPolicy`: Receiver passed by value: the struct itself is copied, while any referenced storage keeps its original ownership and lifetime.
+    /// Returns (`bool`): `true` only when both search bounds are positive.
     pub fn valid(self: SearchPolicy) bool {
         return self.max_local_minutes > 0 and self.max_candidates_per_local > 0;
     }
@@ -190,15 +255,34 @@ pub const Zone = struct {
     userdata: ?*anyopaque,
     vtable: *const VTable,
 
+    /// Typed function-pointer interface for this capability. Implement every
+    /// hook with the exact signature below; keep the table valid while the
+    /// capability or pending work can invoke it.
     pub const VTable = struct {
+        /// Convert an instant to local civil time.
+        /// Parameters (callback order):
+        /// - `1: ?*anyopaque`: opaque provider or handle context; keep it live until the hook and any retained work complete.
+        /// - `2: deadlines.WallInstant`: typed input consumed by this hook.
+        /// Returns (`outcomes.Result(LocalMinute, Error)`): typed ok/err Result.
         to_local: *const fn (?*anyopaque, deadlines.WallInstant) outcomes.Result(LocalMinute, Error),
+        /// Find the next matching instant.
+        /// Parameters (callback order):
+        /// - `1: ?*anyopaque`: opaque provider or handle context; keep it live until the hook and any retained work complete.
+        /// - `2: LocalMinute`: typed input consumed by this hook.
+        /// - `3: ?deadlines.WallInstant`: optional typed input; null means absent.
+        /// Returns (`outcomes.Result(?deadlines.WallInstant, Error)`): typed ok/err Result.
         next_candidate: *const fn (?*anyopaque, LocalMinute, ?deadlines.WallInstant) outcomes.Result(?deadlines.WallInstant, Error),
     };
 };
 
+/// Time-zone provider with a fixed number of minutes east of UTC.
 pub const FixedOffset = struct {
     minutes_east_of_utc: i32,
 
+    /// Expose this fixed offset as a timezone capability.
+    /// Parameters:
+    /// - `self: *const FixedOffset`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+    /// Returns (`Zone`): A timezone adapter borrowing this fixed offset.
     pub fn zone(self: *const FixedOffset) Zone {
         return .{ .userdata = @ptrCast(@constCast(self)), .vtable = &.{ .to_local = toLocal, .next_candidate = nextCandidate } };
     }
@@ -229,6 +313,14 @@ pub const FixedOffset = struct {
 /// Returns null when the caller's search bound is exhausted. The caller
 /// chooses catch-up behavior by advancing its retained occurrence cursor;
 /// this evaluator never reads the ambient clock.
+///
+/// Parameters:
+/// - `rule: Rule`: Validated schedule rule used to find the next occurrence.
+/// - `zone: Zone`: Time zone used to interpret the calendar rule.
+/// - `after: deadlines.WallInstant`: Caller-supplied time or cursor boundary used for ordering and retention.
+/// - `policy: SearchPolicy`: Caller-selected, validated behavior or resource bounds; no hidden default is
+///   installed.
+/// Returns (`outcomes.Result(?deadlines.WallInstant, Error)`): An ok/err Result; owned payloads must be released according to their type contract.
 pub fn nextAfter(rule: Rule, zone: Zone, after: deadlines.WallInstant, policy: SearchPolicy) outcomes.Result(?deadlines.WallInstant, Error) {
     if (!rule.valid() or !policy.valid()) return .{ .err = .invalid_policy };
     var local = switch (zone.vtable.to_local(zone.userdata, after)) {

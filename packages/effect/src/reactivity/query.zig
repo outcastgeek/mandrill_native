@@ -13,9 +13,15 @@ const async_result = @import("async_result.zig");
 const services = @import("../services.zig");
 const diagnostics = @import("../internal/diagnostics.zig");
 
+/// Specialize the typed reactivity error channel from its compile-time error type.
+/// Parameters:
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// Returns (`type`): typed query failure union retaining provider and domain errors.
 pub fn Error(comptime E: type) type {
     return union(enum) {
         const Self = @This();
+        /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
+        /// and must be released after use.
         pub const effect_owned_payload = outcomes.ownsPayload(E);
         evaluation: E,
         invalidation: invalidation.Error,
@@ -24,11 +30,20 @@ pub fn Error(comptime E: type) type {
         disposed,
         refresh_required,
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             if (self.* == .evaluation) outcomes.discardPayload(&self.evaluation);
             self.* = undefined;
         }
 
+        /// Duplicate this value; marked owning payloads are cloned, while ordinary
+        /// borrowed fields retain their original lifetime.
+        /// Parameters:
+        /// - `self: *const Self`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+        /// Returns (`error{OutOfMemory}!Self`): copied value on success; `OutOfMemory` if owned storage could not be cloned. The source remains valid.
         pub fn clone(self: *const Self) error{OutOfMemory}!Self {
             return switch (self.*) {
                 .evaluation => |value| .{ .evaluation = try outcomes.clonePayload(value) },
@@ -38,10 +53,17 @@ pub fn Error(comptime E: type) type {
     };
 }
 
+/// Specialize the typed state outcome for reactivity operations.
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// Returns (`type`): observable query state distinguishing pending, success, and failure.
 pub fn State(comptime A: type, comptime E: type) type {
     return struct {
         const Self = @This();
+        /// Typed result channel described by `async_result.AsyncResult(A, E)`.
         pub const Result = async_result.AsyncResult(A, E);
+        /// Typed failure channel combining domain and provider errors.
         pub const Failure = Error(E);
         const Ref = subscription_ref.SubscriptionRef(Result);
         const single_evaluation_per_query: usize = 1;
@@ -60,6 +82,16 @@ pub fn State(comptime A: type, comptime E: type) type {
         /// A configured interval is a request policy, not a timer. A caller
         /// supplies its clock through R when requesting a refresh; no ambient
         /// clock or background worker is created by the query.
+        ///
+        /// Parameters:
+        /// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `registry: *invalidation.Registry`: Caller-supplied capability or scoped state; no concrete backend is
+        ///   selected here.
+        /// - `key: []const u8`: Stable identity used for matching, deduplication, or replay.
+        /// - `capacity: usize`: buffer capacity for observable query changes.
+        /// - `interval: std.Io.Duration`: Requested interval between scheduled operations.
+        /// Returns (`outcomes.Exit(Self, Failure)`): Carries `Self` on `.success` or `Failure` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn initWithRefreshInterval(env: anytype, registry: *invalidation.Registry, key: []const u8, capacity: usize, interval: std.Io.Duration) outcomes.Exit(Self, Failure) {
             if (interval.nanoseconds <= 0) return .{ .die = .{ .kind = .invalid_configuration, .message = diagnostics.query_refresh_interval_must_be_positive } };
             var prepared = init(env, registry, key, capacity);
@@ -70,6 +102,12 @@ pub fn State(comptime A: type, comptime E: type) type {
         /// Claim an expired refresh once per interval. Reading retained state
         /// never publishes an invalidation, so expiry cannot form a synchronous
         /// notification loop. A forced request bypasses the interval.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `clock: services.Clock`: Caller-selected clock capability.
+        /// - `force: bool`: Whether to bypass the normal freshness or cache check.
+        /// Returns (`outcomes.Exit(bool, Failure)`): Carries `bool` on `.success` or `Failure` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn claimRefresh(self: *Self, clock: services.Clock, force: bool) outcomes.Exit(bool, Failure) {
             const now = clock.now();
             self.mutex.lockUncancelable(self.io);
@@ -91,6 +129,15 @@ pub fn State(comptime A: type, comptime E: type) type {
         /// The watch exists before the initial result is installed. The caller
         /// owns the returned state inside a scope and joins its pump before
         /// deinit; capacity is an explicit observation-retention policy.
+        ///
+        /// Parameters:
+        /// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `registry: *invalidation.Registry`: Caller-supplied capability or scoped state; no concrete backend is
+        ///   selected here.
+        /// - `key: []const u8`: Stable identity used for matching, deduplication, or replay.
+        /// - `capacity: usize`: buffer capacity for observable query changes.
+        /// Returns (`outcomes.Exit(Self, Failure)`): Carries `Self` on `.success` or `Failure` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn init(env: anytype, registry: *invalidation.Registry, key: []const u8, capacity: usize) outcomes.Exit(Self, Failure) {
             const watched = registry.watch(key);
             const watch = switch (watched) {
@@ -130,6 +177,10 @@ pub fn State(comptime A: type, comptime E: type) type {
             } };
         }
 
+        /// Read through the selected capability.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`outcomes.Exit(Result, Failure)`): Carries `Result` on `.success` or `Failure` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn read(self: *Self) outcomes.Exit(Result, Failure) {
             const observed = self.values.get();
             return switch (observed) {
@@ -141,6 +192,10 @@ pub fn State(comptime A: type, comptime E: type) type {
             };
         }
 
+        /// Read the current observable state.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`outcomes.Exit(*Ref.Observation, Failure)`): Carries `*Ref.Observation` on `.success` or `Failure` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn observe(self: *Self) outcomes.Exit(*Ref.Observation, Failure) {
             const opened = self.values.observe();
             return switch (opened) {
@@ -203,6 +258,10 @@ pub fn State(comptime A: type, comptime E: type) type {
 
         /// Streaming adapters register the active generation before the
         /// first event. A newer invalidation makes a later event obsolete.
+        ///
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`outcomes.Exit(void, Failure)`): Carries no value on `.success` or `Failure` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn beginStream(self: *Self) outcomes.Exit(void, Failure) {
             return self.begin();
         }
@@ -278,6 +337,11 @@ pub fn State(comptime A: type, comptime E: type) type {
             };
         }
 
+        /// Update reactive query state from one stream event.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `evaluated: outcomes.Exit(A, E)`: Terminal Exit produced by the evaluated Effect.
+        /// Returns (`outcomes.Exit(bool, Failure)`): Carries `bool` on `.success` or `Failure` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn acceptStreamEvent(self: *Self, evaluated: outcomes.Exit(A, E)) outcomes.Exit(bool, Failure) {
             return self.finish(evaluated);
         }
@@ -290,6 +354,10 @@ pub fn State(comptime A: type, comptime E: type) type {
             return .{ .success = {} };
         }
 
+        /// Stop the capability and release its retained resources.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn shutdown(self: *Self) void {
             self.mutex.lockUncancelable(self.io);
             self.closed = true;
@@ -298,6 +366,10 @@ pub fn State(comptime A: type, comptime E: type) type {
             self.values.shutdown();
         }
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             self.shutdown();
             self.watch.deinit();
@@ -310,6 +382,16 @@ pub fn State(comptime A: type, comptime E: type) type {
 
 /// A query is a compile-time pairing of its evaluator and selected state.
 /// It uses the caller's R for all engines, allocator, I/O and services.
+///
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `select_state: comptime fn (*const R) *State(A, E)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `evaluate: comptime fn (*const R) effects.Effect(A, E, R)`: Compile-time typed function selected at comptime; no runtime callback lookup is
+///   required.
+/// Returns (`effects.Effect(void, Error(E), R)`): query result fetched and committed to observable state.
 pub fn refresh(
     comptime A: type,
     comptime E: type,
@@ -337,6 +419,19 @@ pub fn refresh(
 /// Retains the previous result while a claimed refresh runs. The injected
 /// clock makes expiry deterministic, and the existing scoped permit makes a
 /// refresh waiting behind another evaluation cancellable.
+///
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `select_state: comptime fn (*const R) *State(A, E)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_clock: comptime fn (*const R) services.Clock`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `evaluate: comptime fn (*const R) effects.Effect(A, E, R)`: Compile-time typed function selected at comptime; no runtime callback lookup is
+///   required.
+/// - `force: comptime bool`: Compile-time choice to bypass normal freshness or reuse checks.
+/// Returns (`effects.Effect(void, Error(E), R)`): query result fetched only when the stored state is stale.
 pub fn refreshIfStale(
     comptime A: type,
     comptime E: type,
@@ -412,6 +507,16 @@ fn cycle(
 /// The caller runs this Effect in a scoped fiber and joins it on disposal.
 /// Notifications received while evaluating are coalesced by refresh's dirty
 /// bit; an event gap forces the same conservative refresh path.
+///
+/// Parameters:
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `select_state: comptime fn (*const R) *State(A, E)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `evaluate: comptime fn (*const R) effects.Effect(A, E, R)`: Compile-time typed function selected at comptime; no runtime callback lookup is
+///   required.
+/// Returns (`effects.Effect(void, Error(E), R)`): observable state after consuming the selected update stream.
 pub fn pump(
     comptime A: type,
     comptime E: type,

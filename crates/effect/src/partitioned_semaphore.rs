@@ -1,3 +1,5 @@
+//! Per-key admission with shared permit ownership.
+
 use crate::internal::runtime;
 use crate::{
     CleanupFailure, Defect, Effect, Exit, Finalization, PrimaryOutcome, Semaphore, SemaphoreError,
@@ -8,11 +10,19 @@ use std::num::NonZeroUsize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
+/// Typed state used by partitioned semaphore.
+///
+/// # Type parameters
+/// - `K`: Key type used for identity or lookup.
 struct State<K> {
     closed: bool,
     partitions: BTreeMap<K, Semaphore>,
 }
 
+/// Typed inner used by partitioned semaphore.
+///
+/// # Type parameters
+/// - `K`: Key type used for identity or lookup.
 struct Inner<K> {
     state: Mutex<State<K>>,
     capacity: NonZeroUsize,
@@ -21,11 +31,17 @@ struct Inner<K> {
 /// Independent FIFO admission per typed key. Keys move into the index without
 /// a Clone bound. Partitions remain indexed until explicit idle pruning or
 /// close; no hidden TTL, eviction cadence or unbounded background task exists.
+///
+/// # Type parameters
+/// - `K`: Key type used for identity or lookup. Bound or type: `Ord + Send + 'static`.
 pub struct PartitionedSemaphore<K: Ord + Send + 'static> {
     inner: Arc<Inner<K>>,
 }
 
 impl<K: Ord + Send + 'static> Clone for PartitionedSemaphore<K> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -35,6 +51,16 @@ impl<K: Ord + Send + 'static> Clone for PartitionedSemaphore<K> {
 
 impl<K: Ord + Send + 'static> PartitionedSemaphore<K> {
     #[must_use]
+    /// Construct a `PartitionedSemaphore` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `K`: Key type used for identity or lookup. Bound: `Ord + Send + 'static`.
+    ///
+    /// # Parameters
+    /// - `capacity_per_partition` (`NonZeroUsize`): The capacity per partition supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(capacity_per_partition: NonZeroUsize) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -47,6 +73,18 @@ impl<K: Ord + Send + 'static> PartitionedSemaphore<K> {
         }
     }
 
+    /// Create a `PartitionedSemaphore` through the declared Effect and environment capabilities.
+    ///
+    /// # Type parameters
+    /// - `K`: Key type used for identity or lookup. Bound: `Ord + Send + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Parameters
+    /// - `capacity_per_partition` (`NonZeroUsize`): The capacity per partition supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<Self, SemaphoreError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn make<R: Send + Sync + 'static>(
         capacity_per_partition: NonZeroUsize,
     ) -> Effect<Self, SemaphoreError, R> {
@@ -55,6 +93,18 @@ impl<K: Ord + Send + 'static> PartitionedSemaphore<K> {
 
     /// Move one key into the first started execution. A reusable recipe uses
     /// `acquire_with` to create a fresh owned key for each run.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `K`: Type supplied by the enclosing impl or trait.
+    ///
+    /// # Parameters
+    /// - `key` (`K`): Stable key used to locate or identify the selected value.
+    /// - `count` (`NonZeroUsize`): Caller-selected number of iterations, values, or permits.
+    ///
+    /// # Returns
+    /// Type: `Effect<SemaphorePermit, SemaphoreError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn acquire<R: Send + Sync + 'static>(
         &self,
         key: K,
@@ -72,6 +122,19 @@ impl<K: Ord + Send + 'static> PartitionedSemaphore<K> {
         )
     }
 
+    /// Acquire the semaphore partition selected by the supplied key.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `K`: Type supplied by the enclosing impl or trait.
+    ///
+    /// # Parameters
+    /// - `key` (`impl Fn() -> K + Send + Sync + 'static`): Stable key used to locate or identify the selected value.
+    /// - `count` (`NonZeroUsize`): Caller-selected number of iterations, values, or permits.
+    ///
+    /// # Returns
+    /// Type: `Effect<SemaphorePermit, SemaphoreError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn acquire_with<R: Send + Sync + 'static>(
         &self,
         key: impl Fn() -> K + Send + Sync + 'static,
@@ -80,6 +143,18 @@ impl<K: Ord + Send + 'static> PartitionedSemaphore<K> {
         self.acquire_candidate(move || Ok(key()), count)
     }
 
+    ///
+    /// # Type parameters
+    /// - `R`: Bounds: `Send + Sync + 'static`.
+    /// - `K`: Type supplied by the enclosing impl or trait.
+    ///
+    /// # Parameters
+    /// - `key` (`impl Fn() -> Result<K, SemaphoreError> + Send + Sync + 'static`): Stable key used to locate or identify the selected value.
+    /// - `count` (`NonZeroUsize`): Caller-selected number of iterations, values, or permits.
+    ///
+    /// # Returns
+    /// Type: `Effect<SemaphorePermit, SemaphoreError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn acquire_candidate<R: Send + Sync + 'static>(
         &self,
         key: impl Fn() -> Result<K, SemaphoreError> + Send + Sync + 'static,
@@ -103,6 +178,15 @@ impl<K: Ord + Send + 'static> PartitionedSemaphore<K> {
         })
     }
 
+    ///
+    /// # Type parameters
+    /// - `K`: Type supplied by the enclosing impl or trait.
+    ///
+    /// # Parameters
+    /// - `key` (`K`): Stable key used to locate or identify the selected value.
+    ///
+    /// # Returns
+    /// Type: `Result<Semaphore, SemaphoreError>`.
     fn partition(&self, key: K) -> Result<Semaphore, SemaphoreError> {
         let (semaphore, unused_key) = {
             let mut state = self
@@ -126,6 +210,14 @@ impl<K: Ord + Send + 'static> PartitionedSemaphore<K> {
 
     /// Remove only partitions that have no outstanding permit, waiter or
     /// separately owned recipe. The caller controls when this scan is paid.
+    ///
+    /// # Type parameters
+    /// - `K`: Key type used for identity or lookup. Bound: `Ord + Send + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Returns
+    /// Type: `Effect<usize, SemaphoreError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn prune_idle<R: Send + Sync + 'static>(&self) -> Effect<usize, SemaphoreError, R> {
         let partitions = self.clone();
         Effect::ready(move |_, _| {
@@ -158,6 +250,15 @@ impl<K: Ord + Send + 'static> PartitionedSemaphore<K> {
         })
     }
 
+    /// Close admission and settle owned operations before returning.
+    ///
+    /// # Type parameters
+    /// - `K`: Key type used for identity or lookup. Bound: `Ord + Send + 'static`.
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    ///
+    /// # Returns
+    /// Type: `Effect<bool, SemaphoreError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn close<R: Send + Sync + 'static>(&self) -> Effect<bool, SemaphoreError, R> {
         let partitions = self.clone();
         Effect::ready(move |_, _| {
@@ -187,6 +288,17 @@ impl<K: Ord + Send + 'static> PartitionedSemaphore<K> {
     }
 }
 
+///
+/// # Type parameters
+/// - `A`: Successful application-value type.
+///
+/// # Parameters
+/// - `value` (`A`): Value read, transformed, encoded, or stored by this operation.
+/// - `defects` (`Vec<Defect>`): The defects supplied to this operation.
+///
+/// # Returns
+/// Type: `Exit<A, SemaphoreError>`.
+/// Returns `Exit<A, SemaphoreError>`.
 fn cleanup_outcome<A>(value: A, defects: Vec<Defect>) -> Exit<A, SemaphoreError> {
     let mut failures = defects.into_iter().map(CleanupFailure::ReleaseDefect);
     match failures.next() {

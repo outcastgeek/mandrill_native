@@ -4,6 +4,10 @@ const outcomes = @import("../outcome.zig");
 const deferred = @import("durable_deferred.zig");
 const workflow = @import("workflow_types.zig");
 
+/// Construct an in-memory durable deferred provider with caller-owned runtime resources.
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// Returns (`type`): in-memory provider for durable deferred completion records.
 pub fn MemoryDurableDeferred(comptime R: type) type {
     return struct {
         const Self = @This();
@@ -35,6 +39,11 @@ pub fn MemoryDurableDeferred(comptime R: type) type {
         items: std.array_list.Managed(Item),
         closed: bool = false,
 
+        /// Create an in-memory durable-deferred store using the caller environment.
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Self`): a durable-deferred store bound to the supplied environment.
         pub fn init(env: *const R) Self {
             if (R == void or !@hasField(R, "allocator") or @FieldType(R, "allocator") != std.mem.Allocator)
                 @compileError("memory durable deferred requires caller allocator in R");
@@ -43,6 +52,10 @@ pub fn MemoryDurableDeferred(comptime R: type) type {
             return .{ .allocator = env.allocator, .io = env.io, .items = std.array_list.Managed(Item).init(env.allocator) };
         }
 
+        /// Expose this implementation through its capability interface.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`Store`): A capability adapter referencing the selected implementation; keep its backing state alive while in use.
         pub fn capability(self: *Self) Store {
             return Store.fromProvider(self, &.{ .observe = observeEffect, .complete = completeEffect, .release_wait = releaseEffect });
         }
@@ -179,6 +192,10 @@ pub fn MemoryDurableDeferred(comptime R: type) type {
             return .{ .success = {} };
         }
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             self.mutex.lockUncancelable(self.io);
             self.closed = true;

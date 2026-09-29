@@ -1,3 +1,5 @@
+//! Typed entity registration and dispatch.
+
 use super::{ClusterAddress, ClusterEntityType, ReplyKind, SavedReply};
 use crate::encoding::{FrameDecodeFailure, FrameDecoder};
 use crate::rpc::{
@@ -10,35 +12,67 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
+/// A framing, address, codec, or handler failure in typed entity dispatch.
 pub enum EntityDispatchError {
+    /// RPC framing or envelope validation failed. Retains the `RpcWireError` detail.
     Wire(RpcWireError),
+    /// The request failed its declared schema validation. Retains the `SchemaIssue` detail.
     RequestSchema(SchemaIssue),
+    /// The reply failed its declared schema validation. Retains the `SchemaIssue` detail.
     ReplySchema(SchemaIssue),
+    /// The operation is not recognized.
     UnknownOperation {
+        /// Stable type identity of the addressed entity. Type: `ClusterEntityType`.
         entity_type: ClusterEntityType,
+        /// Registered operation associated with this value. Type: `OperationId`.
         operation: OperationId,
+        /// The declared compatibility version. Type: `RpcVersion`.
         version: RpcVersion,
     },
+    /// The supplied operation does not match the required or recorded value.
     WrongOperation,
+    /// The address differs from the required or recorded value.
     AddressMismatch,
+    /// The received kind is invalid in the current protocol state. Retains the `RpcEnvelopeKind` detail.
     UnexpectedKind(RpcEnvelopeKind),
+    /// An expected-error value appeared where the protocol required another outcome.
     UnexpectedExpectedError,
+    /// The required frame is missing.
     MissingFrame,
+    /// Unexpected additional frames were present.
     ExtraFrames,
+    /// An owned input was already consumed.
     InputConsumed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// A conflict or invalid definition detected while registering an entity handler.
 pub enum EntityRegistrationError {
+    /// The  already exists or occurred twice.
     Duplicate {
+        /// Stable type identity of the addressed entity. Type: `ClusterEntityType`.
         entity_type: ClusterEntityType,
+        /// Registered operation associated with this value. Type: `OperationId`.
         operation: OperationId,
+        /// The declared compatibility version. Type: `RpcVersion`.
         version: RpcVersion,
     },
 }
 
+/// Executes accepted entity messages through a typed application capability.
 pub trait ClusterExecutor<R: Send + Sync + 'static>: Send + Sync + 'static {
+    /// Provider-specific failure type returned by this capability.
     type Error: Send + 'static;
+    /// # Type parameters
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `address` (`ClusterAddress`): Stable destination address of the entity receiving this request.
+    /// - `encoded_request` (`Arc<[u8]>`): The encoded request supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<SavedReply, Self::Error, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn execute(
         &self,
         address: ClusterAddress,
@@ -46,17 +80,29 @@ pub trait ClusterExecutor<R: Send + Sync + 'static>: Send + Sync + 'static {
     ) -> Effect<SavedReply, Self::Error, R>;
 }
 
+/// Selects the Cluster executor in an application environment.
 pub trait HasClusterExecutor: Sized + Send + Sync + 'static {
+    /// Executor selected by this environment.
     type Executor: ClusterExecutor<Self>;
+    /// # Returns
+    /// Type: `Arc<Self::Executor>`.
     fn cluster_executor(&self) -> Arc<Self::Executor>;
 }
 
+/// Private vtable-dispatched handler after typed entity registration. Stored
+/// messages retain encoded data and identity, not the live handler closure.
+///
+/// # Type parameters
+/// - `R`: Environment type.
 type Dispatch<R> = Arc<
     dyn Fn(ClusterAddress, RpcEnvelope) -> Effect<SavedReply, EntityDispatchError, R> + Send + Sync,
 >;
 
-/// Typed registrations share one private encoded dispatch map. No application
+/// A registry that decodes addressed requests, validates their target, and invokes typed handlers.
 /// request, success or domain-error value is downcast at runtime.
+///
+/// # Type parameters
+/// - `R`: Environment type. Bound or type: `Send + Sync + 'static`.
 pub struct EntityDispatcher<R: Send + Sync + 'static> {
     policy: RpcEnvelopePolicy,
     handlers: BTreeMap<(ClusterEntityType, OperationId, RpcVersion), Dispatch<R>>,
@@ -64,6 +110,9 @@ pub struct EntityDispatcher<R: Send + Sync + 'static> {
 }
 
 impl<R: Send + Sync + 'static> Clone for EntityDispatcher<R> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             policy: self.policy,
@@ -74,6 +123,12 @@ impl<R: Send + Sync + 'static> Clone for EntityDispatcher<R> {
 }
 
 impl<R: Send + Sync + 'static> EntityDispatcher<R> {
+    ///
+    /// # Parameters
+    /// - `policy` (`RpcEnvelopePolicy`): The caller-supplied behavior policy.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn empty(policy: RpcEnvelopePolicy) -> Self {
         Self {
             policy,
@@ -82,6 +137,21 @@ impl<R: Send + Sync + 'static> EntityDispatcher<R> {
         }
     }
 
+    /// Create a protocol with its first typed handler already registered.
+    ///
+    /// # Type parameters
+    /// - `Q`: Request type. Additional bound: `Send + 'static`.
+    /// - `A`: Application value type. Additional bound: `Send + 'static`.
+    /// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `policy` (`RpcEnvelopePolicy`): The caller-supplied behavior policy.
+    /// - `entity_type` (`ClusterEntityType`): Stable type identity used for addressed dispatch.
+    /// - `handler` (`RpcHandler<Q, A, E, R>`): The handler invoked for the matching request or event.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, EntityRegistrationError>`.
     pub fn from_handler<Q, A, E>(
         policy: RpcEnvelopePolicy,
         entity_type: ClusterEntityType,
@@ -95,6 +165,22 @@ impl<R: Send + Sync + 'static> EntityDispatcher<R> {
         Self::from_addressed_handler(policy, entity_type, handler, |_, _| true)
     }
 
+    /// Register a first handler that validates the request against its addressed entity.
+    ///
+    /// # Type parameters
+    /// - `Q`: Request type. Additional bound: `Send + 'static`.
+    /// - `A`: Application value type. Additional bound: `Send + 'static`.
+    /// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `policy` (`RpcEnvelopePolicy`): The caller-supplied behavior policy.
+    /// - `entity_type` (`ClusterEntityType`): Stable type identity used for addressed dispatch.
+    /// - `handler` (`RpcHandler<Q, A, E, R>`): The handler invoked for the matching request or event.
+    /// - `accepts` (`impl Fn(&ClusterAddress, &Q) -> bool + Send + Sync + 'static`): The accepts supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, EntityRegistrationError>`.
     pub fn from_addressed_handler<Q, A, E>(
         policy: RpcEnvelopePolicy,
         entity_type: ClusterEntityType,
@@ -111,6 +197,20 @@ impl<R: Send + Sync + 'static> EntityDispatcher<R> {
         Ok(dispatcher)
     }
 
+    /// Register the supplied definition, rejecting an identity or compatibility conflict.
+    ///
+    /// # Type parameters
+    /// - `Q`: Request type. Additional bound: `Send + 'static`.
+    /// - `A`: Application value type. Additional bound: `Send + 'static`.
+    /// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `entity_type` (`ClusterEntityType`): Stable type identity used for addressed dispatch.
+    /// - `handler` (`RpcHandler<Q, A, E, R>`): The handler invoked for the matching request or event.
+    ///
+    /// # Returns
+    /// Type: `Result<(), EntityRegistrationError>`.
     pub fn register<Q, A, E>(
         &mut self,
         entity_type: ClusterEntityType,
@@ -127,6 +227,20 @@ impl<R: Send + Sync + 'static> EntityDispatcher<R> {
     /// Validate the decoded request against its actual Cluster address
     /// before invoking the handler. Protocol adapters use this to prevent a
     /// saved request from being replayed against a different logical entity.
+    ///
+    /// # Type parameters
+    /// - `Q`: Request type. Additional bound: `Send + 'static`.
+    /// - `A`: Application value type. Additional bound: `Send + 'static`.
+    /// - `E`: Domain-error type. Additional bound: `Send + 'static`.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `entity_type` (`ClusterEntityType`): Stable type identity used for addressed dispatch.
+    /// - `handler` (`RpcHandler<Q, A, E, R>`): The handler invoked for the matching request or event.
+    /// - `accepts` (`impl Fn(&ClusterAddress, &Q) -> bool + Send + Sync + 'static`): The accepts supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<(), EntityRegistrationError>`.
     pub fn register_addressed<Q, A, E>(
         &mut self,
         entity_type: ClusterEntityType,
@@ -241,6 +355,17 @@ impl<R: Send + Sync + 'static> EntityDispatcher<R> {
         Ok(())
     }
 
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `address` (`ClusterAddress`): Stable destination address of the entity receiving this request.
+    /// - `encoded_request` (`Arc<[u8]>`): The encoded request supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<SavedReply, EntityDispatchError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn dispatch(
         &self,
         address: ClusterAddress,
@@ -252,6 +377,17 @@ impl<R: Send + Sync + 'static> EntityDispatcher<R> {
         })
     }
 
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `address` (`ClusterAddress`): Stable destination address of the entity receiving this request.
+    /// - `encoded_request` (`Arc<[u8]>`): The encoded request supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<SavedReply, EntityDispatchError, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn dispatch_now(
         &self,
         address: ClusterAddress,
@@ -299,7 +435,19 @@ impl<R: Send + Sync + 'static> EntityDispatcher<R> {
 }
 
 impl<R: Send + Sync + 'static> ClusterExecutor<R> for EntityDispatcher<R> {
+    /// Type alias for error in cluster entity.
     type Error = EntityDispatchError;
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `address` (`ClusterAddress`): Stable destination address of the entity receiving this request.
+    /// - `encoded_request` (`Arc<[u8]>`): The encoded request supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<SavedReply, Self::Error, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn execute(
         &self,
         address: ClusterAddress,

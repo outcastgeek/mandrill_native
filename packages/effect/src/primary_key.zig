@@ -6,7 +6,9 @@ const effects = @import("effect.zig");
 const outcomes = @import("outcome.zig");
 const runtime = @import("internal/runtime.zig");
 
+/// `Version` cases: `first`.
 pub const Version = enum(u8) { first = 1 };
+/// `PartKind` cases: `text`, `bytes`, `unsigned`.
 pub const PartKind = enum(u8) { text, bytes, unsigned };
 
 /// A borrowed description. Each slice and the selected environment must live
@@ -22,16 +24,32 @@ const Key = struct {
     parts: []const Part,
 };
 
+/// Specialize a stable, namespaced key for one application domain. The domain
+/// acts as a structural comptime interface: it must expose a nonempty UTF-8
+/// `key_namespace`, or compilation fails.
+/// Parameters:
+/// - `Domain: comptime type`: Type whose `key_namespace` defines the encoded
+///   key namespace and distinguishes this key from other domains.
+/// Returns (`type`): A typed key description containing borrowed `Part` values;
+/// encoding copies them into an owning buffer using `R.allocator`.
 pub fn TypedKey(comptime Domain: type) type {
     if (!@hasDecl(Domain, "key_namespace")) @compileError("a key domain needs a stable key_namespace");
     const namespace: []const u8 = Domain.key_namespace;
     if (namespace.len == 0) @compileError("a key domain needs a nonempty key_namespace");
     if (!std.unicode.utf8ValidateSlice(namespace)) @compileError("key_namespace must be UTF-8");
     return struct {
+        /// Domain type used to namespace and validate this key.
         pub const domain = Domain;
+        /// Stable domain namespace used when encoding keys.
         pub const key_namespace = namespace;
         parts: []const Part,
 
+        /// Encode a value into its wire representation.
+        /// Parameters:
+        /// - `R: comptime type`: Caller-defined environment type supplying the dependencies needed by this operation.
+        /// - `select: comptime fn (*const R) @This()`: Compile-time typed function selected at comptime; no runtime callback
+        ///   lookup is required.
+        /// Returns (`effects.Effect(outcomes.OwnedSlice(u8), Error, R)`): stable owned key bytes derived from the selected identity fields.
         pub fn encode(comptime R: type, comptime select: fn (*const R) @This()) effects.Effect(outcomes.OwnedSlice(u8), Error, R) {
             const Field = @tagName(runtime.EnvironmentField.allocator);
             if (R == void or !@hasField(R, Field)) @compileError("PrimaryKey.encode requires the caller allocator in R");
@@ -43,6 +61,11 @@ pub fn TypedKey(comptime Domain: type) type {
             }.encodeSelected);
         }
 
+        /// Validate a key or encoded value without taking ownership.
+        /// Parameters:
+        /// - `encoded: []const u8`: Borrowed input; keep its owner alive until the operation has copied or
+        ///   joined it.
+        /// Returns (`outcomes.Result(void, Error)`): An ok/err Result; owned payloads must be released according to their type contract.
         pub fn inspect(encoded: []const u8) outcomes.Result(void, Error) {
             const checked = inspectEncoded(encoded);
             return switch (checked) {
@@ -56,6 +79,12 @@ pub fn TypedKey(comptime Domain: type) type {
 /// Internal and provider code may assemble a short-lived parts array inside
 /// one Effect callback. Encoding copies it before that callback returns.
 /// The allocator is selected only through the caller's environment.
+///
+/// Parameters:
+/// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected capabilities.
+/// - `namespace: comptime []const u8`: Compile-time stable, nonempty identity component validated at definition time.
+/// - `parts: []const Part`: Borrowed typed key parts copied during encoding.
+/// Returns (`outcomes.Exit(outcomes.OwnedSlice(u8), Error)`): Carries `outcomes.OwnedSlice(u8)` on `.success` or `Error` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
 pub fn encodeDirect(env: anytype, comptime namespace: []const u8, parts: []const Part) outcomes.Exit(outcomes.OwnedSlice(u8), Error) {
     const R = @typeInfo(@TypeOf(env)).pointer.child;
     if (R == void or !@hasField(R, "allocator") or @FieldType(R, "allocator") != std.mem.Allocator)
@@ -65,6 +94,7 @@ pub fn encodeDirect(env: anytype, comptime namespace: []const u8, parts: []const
     return encodeBorrowed(env.allocator, .{ .namespace = namespace, .parts = parts });
 }
 
+/// Typed key-validation failure; reject invalid or unstable encoded identity before storage.
 pub const Error = union(enum) {
     empty_namespace,
     invalid_text,
@@ -146,11 +176,20 @@ fn writeBytes(buffer: []u8, cursor: *usize, bytes: []const u8) void {
     cursor.* += bytes.len;
 }
 
+/// Compare two encoded keys by their canonical bytes.
+/// Parameters:
+/// - `left: []const u8`: Left-hand operand in the composition.
+/// - `right: []const u8`: Right-hand operand in the composition.
+/// Returns (`bool`): `true` when both encoded key byte sequences are identical.
 pub fn equalEncoded(left: []const u8, right: []const u8) bool {
     return std.mem.eql(u8, left, right);
 }
 
 /// Validates the entire byte sequence. The returned namespace borrows encoded.
+///
+/// Parameters:
+/// - `encoded: []const u8`: Borrowed input; keep its owner alive until the operation has copied or joined it.
+/// Returns (`outcomes.Result([]const u8, Error)`): An ok/err Result; owned payloads must be released according to their type contract.
 pub fn inspectEncoded(encoded: []const u8) outcomes.Result([]const u8, Error) {
     var cursor: usize = 0;
     const version = readByte(encoded, &cursor) orelse return .{ .err = .malformed };

@@ -7,15 +7,21 @@ const outcomes = @import("../outcome.zig");
 const ast = @import("schema_ast.zig");
 const Issue = @import("schema_issue.zig").Issue;
 
+/// Caller-selected maximum schema depth and emitted JSON Schema byte count.
 pub const Limits = struct {
     max_depth: usize,
     max_output_bytes: usize,
 
+    /// Check whether this value satisfies its structural invariants.
+    /// Parameters:
+    /// - `self: Limits`: Receiver passed by value: the struct itself is copied, while any referenced storage keeps its original ownership and lifetime.
+    /// Returns (`bool`): `true` when both maximum depth and output-byte bound are positive.
     pub fn valid(self: Limits) bool {
         return self.max_depth > 0 and self.max_output_bytes > 0;
     }
 };
 
+/// `Dialect` cases: `draft_2020_12`.
 pub const Dialect = enum { draft_2020_12 };
 const draft_2020_12_uri = "https://json-schema.org/draft/2020-12/schema";
 const supported_pattern_dialect = "ecma262";
@@ -284,6 +290,15 @@ const Emitter = struct {
 
 /// The caller supplies the entire named definition table and resource limits.
 /// References remain references, so recursive names do not recursively emit.
+///
+/// Parameters:
+/// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected capabilities.
+/// - `definitions: []const ast.Definition`: Static definitions to register or validate.
+/// - `root_name: []const u8`: Root schema or operation name used in diagnostics.
+/// - `limits: Limits`: Caller-selected, validated behavior or resource bounds; no hidden default is
+///   installed.
+/// - `dialect: comptime Dialect`: Compile-time encoding dialect selected for this codec.
+/// Returns (`outcomes.Exit(outcomes.OwnedSlice(u8), Issue)`): Carries `outcomes.OwnedSlice(u8)` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
 pub fn exportSchema(
     env: anytype,
     definitions: []const ast.Definition,

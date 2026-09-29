@@ -1,3 +1,5 @@
+//! Observable initial, pending, success, and failure states.
+
 use crate::{Exit, SharedValue};
 use std::num::NonZeroU64;
 
@@ -6,26 +8,46 @@ use std::num::NonZeroU64;
 /// interruption or finalization failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AsyncResultPhase {
+    /// This is the first recorded state of the operation.
     Initial,
+    /// The operation has started and is not yet terminal.
     Running,
+    /// The owned work has reached a terminal state.
     Settled,
 }
 
+/// The pending, successful, or failed state of an asynchronous reactive computation.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 pub enum AsyncResult<A: Send + 'static, E: Send + 'static> {
+    /// This is the first recorded state of the operation.
     Initial,
+    /// The operation has started and is not yet terminal.
     Running {
+        /// The ownership generation used for fencing. Type: `NonZeroU64`.
         generation: NonZeroU64,
+        /// Last successful value retained during refresh. Type: `Option<SharedValue<A>>`.
         previous_success: Option<SharedValue<A>>,
+        /// Whether a newer evaluation is in progress. Type: `bool`.
         refreshing: bool,
     },
+    /// The owned work has reached a terminal state.
     Settled {
+        /// The ownership generation used for fencing. Type: `NonZeroU64`.
         generation: NonZeroU64,
+        /// The recorded outcome of this operation. Type: `Exit<SharedValue<A>, SharedValue<E>>`.
         outcome: Exit<SharedValue<A>, SharedValue<E>>,
+        /// Last successful value retained during refresh. Type: `Option<SharedValue<A>>`.
         previous_success: Option<SharedValue<A>>,
     },
 }
 
 impl<A: Send + 'static, E: Send + 'static> Clone for AsyncResult<A, E> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         match self {
             Self::Initial => Self::Initial,
@@ -53,6 +75,12 @@ impl<A: Send + 'static, E: Send + 'static> Clone for AsyncResult<A, E> {
 
 impl<A: Send + 'static, E: Send + 'static> AsyncResult<A, E> {
     #[must_use]
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    ///
+    /// # Returns
+    /// Type: `AsyncResultPhase`.
     pub const fn phase(&self) -> AsyncResultPhase {
         match self {
             Self::Initial => AsyncResultPhase::Initial,
@@ -62,6 +90,13 @@ impl<A: Send + 'static, E: Send + 'static> AsyncResult<A, E> {
     }
 
     #[must_use]
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    ///
+    /// # Returns
+    /// Type: `Option<NonZeroU64>`.
+    /// Returns the value when present, or `None`.
     pub const fn generation(&self) -> Option<NonZeroU64> {
         match self {
             Self::Initial => None,
@@ -72,6 +107,15 @@ impl<A: Send + 'static, E: Send + 'static> AsyncResult<A, E> {
     }
 
     #[must_use]
+    /// Borrow the last successful value retained during a later refresh.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Returns
+    /// Type: `Option<&SharedValue<A>>`.
+    /// Returns the value when present, or `None`.
     pub fn previous_success(&self) -> Option<&SharedValue<A>> {
         match self {
             Self::Initial => None,
@@ -85,6 +129,15 @@ impl<A: Send + 'static, E: Send + 'static> AsyncResult<A, E> {
     }
 
     #[must_use]
+    /// Borrow the current successful value if evaluation has completed.
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    /// - `A`: Success or application-value type.
+    ///
+    /// # Returns
+    /// Type: `Option<&SharedValue<A>>`.
+    /// Returns the value when present, or `None`.
     pub fn current_success(&self) -> Option<&SharedValue<A>> {
         match self {
             Self::Settled {
@@ -102,6 +155,13 @@ impl<A: Send + 'static, E: Send + 'static> AsyncResult<A, E> {
     }
 
     #[must_use]
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     pub const fn refreshing(&self) -> bool {
         matches!(
             self,
@@ -113,6 +173,15 @@ impl<A: Send + 'static, E: Send + 'static> AsyncResult<A, E> {
     }
 
     #[must_use]
+    /// Borrow the complete current asynchronous result state.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Returns
+    /// Type: `Option<&Exit<SharedValue<A>, SharedValue<E>>>`.
+    /// Returns the value when present, or `None`.
     pub fn outcome(&self) -> Option<&Exit<SharedValue<A>, SharedValue<E>>> {
         match self {
             Self::Settled { outcome, .. } => Some(outcome),
@@ -121,6 +190,19 @@ impl<A: Send + 'static, E: Send + 'static> AsyncResult<A, E> {
     }
 
     #[must_use]
+    /// Apply the selected terminal action to a fenced claim.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `generation` (`NonZeroU64`): The generation supplied to this operation.
+    /// - `outcome` (`Exit<A, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+    /// - `previous_success` (`Option<SharedValue<A>>`): The previous success supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn settle(
         generation: NonZeroU64,
         outcome: Exit<A, E>,

@@ -1,16 +1,21 @@
+//! Capabilities for task submission and cancellation.
+
 use crate::{Cancellation, Defect, LibraryDefect};
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+/// Type alias for task future in execution.
 type TaskFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
+/// Variants of task event used by execution.
 pub(crate) enum TaskEvent {
     Started,
     Lost(Defect),
 }
 
+/// Type alias for task notification in execution.
 type TaskNotification = Box<dyn FnMut(TaskEvent) + Send>;
 
 /// Ownership-aware work submitted by Effect to an environment's task provider.
@@ -28,6 +33,12 @@ pub struct ScheduledTask {
 }
 
 impl ScheduledTask {
+    /// # Parameters
+    /// - `pending` (`impl FnOnce(crate::admission::Settlement) -> TaskFuture`): The pending supplied to this operation.
+    /// - `notification` (`impl FnMut(TaskEvent) + Send + 'static`): The notification supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub(crate) fn new(
         pending: impl FnOnce(crate::admission::Settlement) -> TaskFuture,
         notification: impl FnMut(TaskEvent) + Send + 'static,
@@ -41,11 +52,22 @@ impl ScheduledTask {
         }
     }
 
+    /// # Parameters
+    /// - `action` (`impl FnOnce() + Send + 'static`): State transition selected for this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub(crate) fn on_settled(self, action: impl FnOnce() + Send + 'static) -> Self {
         self.settlement.add(action);
         self
     }
 
+    ///
+    /// # Parameters
+    /// - `defect` (`Defect`): The defect supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn fail(&mut self, defect: Defect) {
         drop(self.pending.take());
         self.settlement.release();
@@ -56,8 +78,16 @@ impl ScheduledTask {
 }
 
 impl Future for ScheduledTask {
+    /// Type alias for output in execution.
     type Output = ();
 
+    ///
+    /// # Parameters
+    /// - `cx` (`&mut Context<'_>`): Rust task context used to register the current waker.
+    ///
+    /// # Returns
+    /// Type: `Poll<()>`.
+    /// Returns `Poll<()>`.
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
         if !this.started {
@@ -86,6 +116,9 @@ impl Future for ScheduledTask {
 }
 
 impl Drop for ScheduledTask {
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn drop(&mut self) {
         self.fail(Defect::from(LibraryDefect::ScheduledTaskDropped));
     }
@@ -105,14 +138,22 @@ impl Drop for ScheduledTask {
 /// observation; this contract is more than a fire-and-forget future submission.
 /// No runtime, pool, worker count, or admission policy is created by the core.
 pub trait TaskSpawner: Send + Sync + 'static {
+    /// # Parameters
+    /// - `task` (`ScheduledTask`): The task supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<(), Defect>`.
     fn spawn(&self, task: ScheduledTask) -> Result<(), Defect>;
 }
 
 /// Only operations that schedule children require this environment capability.
 /// Providers may be concrete application types or public trait objects.
 pub trait HasTaskSpawner {
+    /// Task-spawning capability selected by this environment.
     type Tasks: TaskSpawner + ?Sized;
 
+    /// # Returns
+    /// Type: `&Self::Tasks`.
     fn task_spawner(&self) -> &Self::Tasks;
 }
 
@@ -123,10 +164,16 @@ pub trait HasTaskSpawner {
 /// clock, or worker pool. Plain [`crate::Effect::run`] needs no such capability.
 pub trait HasCancellation {
     /// The external request source for this run. Clones observe the same request.
+    ///
+    /// # Returns
+    /// Type: `&Cancellation`.
     fn cancellation(&self) -> &Cancellation;
 }
 
 impl HasCancellation for Cancellation {
+    ///
+    /// # Returns
+    /// Type: `&Cancellation`.
     fn cancellation(&self) -> &Cancellation {
         self
     }

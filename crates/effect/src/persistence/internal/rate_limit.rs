@@ -1,3 +1,5 @@
+//! In-memory atomic rate-limit accounting.
+
 use super::super::rate_limiter::{
     AdaptiveFeedback, AdaptiveSignal, AdaptiveWindowPolicy, FeedbackOutcome, HasRateLimitStore,
     MemoryRateLimitError, RateLimitDecision, RateLimitPolicy, RateLimitStore,
@@ -9,6 +11,7 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Variants of counter used by persistence internal rate limit.
 enum Counter {
     Fixed {
         window: i128,
@@ -27,18 +30,27 @@ enum Counter {
     },
 }
 
+/// Typed token bucket spec used by persistence internal rate limit.
 struct TokenBucketSpec {
     capacity: NonZeroU64,
     refill: NonZeroU64,
     period: NonZeroU64,
 }
 
+/// Typed entry used by persistence internal rate limit.
 struct Entry {
     policy: RateLimitPolicy,
     counter: Counter,
 }
 
 impl Entry {
+    ///
+    /// # Parameters
+    /// - `policy` (`RateLimitPolicy`): The caller-supplied behavior policy.
+    /// - `now` (`UtcMillis`): The caller-supplied current time.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn new(policy: RateLimitPolicy, now: UtcMillis) -> Self {
         let counter = match policy {
             RateLimitPolicy::FixedWindow { period, .. } => Counter::Fixed {
@@ -60,6 +72,13 @@ impl Entry {
         Self { policy, counter }
     }
 
+    ///
+    /// # Parameters
+    /// - `now` (`UtcMillis`): The caller-supplied current time.
+    /// - `cost` (`NonZeroU64`): Capacity units charged to this request.
+    ///
+    /// # Returns
+    /// Type: `Result<RateLimitDecision, MemoryRateLimitError>`.
     fn acquire(
         &mut self,
         now: UtcMillis,
@@ -117,6 +136,12 @@ impl Entry {
         }
     }
 
+    ///
+    /// # Parameters
+    /// - `report` (`AdaptiveFeedback`): The report supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<FeedbackOutcome, MemoryRateLimitError>`.
     fn feedback(
         &mut self,
         report: AdaptiveFeedback,
@@ -152,10 +177,25 @@ impl Entry {
     }
 }
 
+///
+/// # Parameters
+/// - `now` (`UtcMillis`): The caller-supplied current time.
+/// - `period` (`NonZeroU64`): The period supplied to this operation.
+///
+/// # Returns
+/// Type: `i128`.
+/// Returns `i128`.
 fn window_index(now: UtcMillis, period: NonZeroU64) -> i128 {
     i128::from(now.value()).div_euclid(i128::from(period.get()))
 }
 
+///
+/// # Parameters
+/// - `now` (`UtcMillis`): The caller-supplied current time.
+/// - `period` (`NonZeroU64`): The period supplied to this operation.
+///
+/// # Returns
+/// Type: `Result<Duration, MemoryRateLimitError>`.
 fn window_retry(now: UtcMillis, period: NonZeroU64) -> Result<Duration, MemoryRateLimitError> {
     let length = i128::from(period.get());
     let next = window_index(now, period)
@@ -169,6 +209,17 @@ fn window_retry(now: UtcMillis, period: NonZeroU64) -> Result<Duration, MemoryRa
     Ok(Duration::from_millis(wait))
 }
 
+///
+/// # Parameters
+/// - `window` (`&mut i128`): The window supplied to this operation.
+/// - `used` (`&mut u64`): The used supplied to this operation.
+/// - `capacity` (`NonZeroU64`): The caller-supplied capacity bound.
+/// - `period` (`NonZeroU64`): The period supplied to this operation.
+/// - `now` (`UtcMillis`): The caller-supplied current time.
+/// - `cost` (`NonZeroU64`): Capacity units charged to this request.
+///
+/// # Returns
+/// Type: `Result<RateLimitDecision, MemoryRateLimitError>`.
 fn window_allowance(
     window: &mut i128,
     used: &mut u64,
@@ -204,6 +255,17 @@ fn window_allowance(
     Ok(decision)
 }
 
+///
+/// # Parameters
+/// - `tokens` (`&mut u64`): The tokens supplied to this operation.
+/// - `remainder` (`&mut u128`): The remainder supplied to this operation.
+/// - `last` (`&mut UtcMillis`): The last supplied to this operation.
+/// - `spec` (`TokenBucketSpec`): The spec supplied to this operation.
+/// - `now` (`UtcMillis`): The caller-supplied current time.
+/// - `cost` (`NonZeroU64`): Capacity units charged to this request.
+///
+/// # Returns
+/// Type: `Result<RateLimitDecision, MemoryRateLimitError>`.
 fn token_allowance(
     tokens: &mut u64,
     remainder: &mut u128,
@@ -271,6 +333,7 @@ fn token_allowance(
     Ok(decision)
 }
 
+/// Typed state used by persistence internal rate limit.
 struct State {
     entries: BTreeMap<Arc<[u8]>, Entry>,
     capacity: RateLimitStoreCapacity,
@@ -284,6 +347,13 @@ pub struct MemoryRateLimitStore {
 
 impl MemoryRateLimitStore {
     #[must_use]
+    /// Construct a `MemoryRateLimitStore` from its required inputs and explicit policies.
+    ///
+    /// # Parameters
+    /// - `capacity` (`RateLimitStoreCapacity`): The caller-supplied capacity bound.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(capacity: RateLimitStoreCapacity) -> Self {
         Self {
             state: Arc::new(Mutex::new(State {
@@ -294,10 +364,24 @@ impl MemoryRateLimitStore {
     }
 
     #[must_use]
+    /// Build a scoped dependency layer for this service.
+    ///
+    /// # Parameters
+    /// - `capacity` (`RateLimitStoreCapacity`): The caller-supplied capacity bound.
+    ///
+    /// # Returns
+    /// Type: `Layer<(), MemoryRateLimitError, Arc<Self>>`.
     pub fn layer(capacity: RateLimitStoreCapacity) -> Layer<(), MemoryRateLimitError, Arc<Self>> {
         Layer::make_with(move || Arc::new(Self::new(capacity)))
     }
 
+    ///
+    /// # Parameters
+    /// - `state` (`&State`): Current or replacement state owned by this operation.
+    ///
+    /// # Returns
+    /// Type: `bool`.
+    /// Returns whether the requested condition holds.
     fn has_room(state: &State) -> bool {
         match state.capacity {
             RateLimitStoreCapacity::Unbounded => true,
@@ -307,16 +391,32 @@ impl MemoryRateLimitStore {
 }
 
 impl HasRateLimitStore for Arc<MemoryRateLimitStore> {
+    /// Type alias for store in persistence internal rate limit.
     type Store = MemoryRateLimitStore;
 
+    ///
+    /// # Returns
+    /// Type: `Arc<Self::Store>`.
+    /// Returns `Arc<Self::Store>`.
     fn rate_limit_store(&self) -> Arc<Self::Store> {
         Arc::clone(self)
     }
 }
 
 impl RateLimitStore for MemoryRateLimitStore {
+    /// Type alias for error in persistence internal rate limit.
     type Error = MemoryRateLimitError;
 
+    ///
+    /// # Parameters
+    /// - `key` (`Arc<[u8]>`): Stable key used to locate or identify the selected value.
+    /// - `policy` (`RateLimitPolicy`): The caller-supplied behavior policy.
+    /// - `now` (`UtcMillis`): The caller-supplied current time.
+    /// - `cost` (`NonZeroU64`): Capacity units charged to this request.
+    ///
+    /// # Returns
+    /// Type: `Effect<RateLimitDecision, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn acquire(
         &self,
         key: Arc<[u8]>,
@@ -354,6 +454,15 @@ impl RateLimitStore for MemoryRateLimitStore {
         )
     }
 
+    ///
+    /// # Parameters
+    /// - `key` (`Arc<[u8]>`): Stable key used to locate or identify the selected value.
+    /// - `policy` (`AdaptiveWindowPolicy`): The caller-supplied behavior policy.
+    /// - `report` (`AdaptiveFeedback`): The report supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<FeedbackOutcome, Self::Error>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn feedback(
         &self,
         key: Arc<[u8]>,

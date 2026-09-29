@@ -1,3 +1,12 @@
+//! Logical entity execution and recoverable message delivery.
+//!
+//! An addressed request is accepted by a message store before a runner claims
+//! and executes it. Ownership generations and claim leases fence stale workers;
+//! replies are recorded before delivery. The store is the authority for those
+//! decisions. In-memory providers preserve the logical rules only while the
+//! process lives. `ClusterWorkflowEngine` connects addressed delivery to an
+//! independent workflow engine, without becoming a second workflow journal.
+
 mod activation;
 mod client;
 mod cluster_workflow_engine;

@@ -5,6 +5,8 @@ const std = @import("std");
 const outcomes = @import("../outcome.zig");
 const Protocol = @import("rpc_error.zig").Protocol;
 
+/// Transport-neutral wire message kind, including unary requests/responses, stream events,
+/// acknowledgements, cancellation, and failure channels.
 pub const Kind = enum(u8) {
     request,
     response,
@@ -16,10 +18,15 @@ pub const Kind = enum(u8) {
     response_defect,
     response_interrupted,
 };
+/// Wire integer type for each length-delimited field. Limits validate values before conversion.
 pub const Length = u32;
+/// Wire integer type for metadata-entry counts.
 pub const Count = u32;
+/// Wire protocol version integer.
 pub const Version = u32;
+/// Request/response correlation identifier carried across frames.
 pub const Correlation = u128;
+/// Ordering number for stream chunks, terminal events, and acknowledgements.
 pub const Sequence = u64;
 const Bytes = outcomes.OwnedSlice(u8);
 const fixed_header_bytes = @sizeOf(Version) + @sizeOf(Kind) + @sizeOf(Correlation) +
@@ -33,6 +40,8 @@ fn carriesSequence(kind: Kind) bool {
     };
 }
 
+/// Caller-selected maximum envelope, operation, payload, metadata-count, and metadata-byte sizes.
+/// `valid` checks representability by the wire integer types.
 pub const Limits = struct {
     max_envelope_bytes: usize,
     max_operation_bytes: usize,
@@ -40,6 +49,10 @@ pub const Limits = struct {
     max_metadata_entries: usize,
     max_metadata_bytes: usize,
 
+    /// Check whether this value satisfies its structural invariants.
+    /// Parameters:
+    /// - `self: Limits`: Receiver passed by value: the struct itself is copied, while any referenced storage keeps its original ownership and lifetime.
+    /// Returns (`bool`): `true` when envelope, operation, payload, and metadata limits fit the wire length types.
     pub fn valid(self: Limits) bool {
         return self.max_envelope_bytes > 0 and self.max_operation_bytes > 0 and
             self.max_operation_bytes <= std.math.maxInt(Length) and
@@ -49,17 +62,29 @@ pub const Limits = struct {
     }
 };
 
+/// Owned RPC metadata key/value pair. Its byte buffers must be released with `deinit`.
 pub const Metadata = struct {
+    /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit` and
+    /// must be released after use.
     pub const effect_owned_payload = true;
     key: Bytes,
     value: Bytes,
 
+    /// Release resources owned by this value.
+    /// Parameters:
+    /// - `self: *Metadata`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn deinit(self: *Metadata) void {
         self.key.deinit();
         self.value.deinit();
         self.* = undefined;
     }
 
+    /// Duplicate this value; marked owning payloads are cloned, while ordinary
+    /// borrowed fields retain their original lifetime.
+    /// Parameters:
+    /// - `self: *const Metadata`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+    /// Returns (`error{OutOfMemory}!Metadata`): A `Metadata` on success; `OutOfMemory` if required allocation fails.
     pub fn clone(self: *const Metadata) error{OutOfMemory}!Metadata {
         var key = try self.key.clone();
         errdefer key.deinit();
@@ -67,7 +92,11 @@ pub const Metadata = struct {
     }
 };
 
+/// Owned decoded RPC message containing kind, correlation, operation, metadata, and payload. Call
+/// `deinit` after dispatch or forwarding.
 pub const Envelope = struct {
+    /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit` and
+    /// must be released after use.
     pub const effect_owned_payload = true;
     version: Version,
     kind: Kind,
@@ -78,6 +107,10 @@ pub const Envelope = struct {
     payload: Bytes,
     allocator: std.mem.Allocator,
 
+    /// Release resources owned by this value.
+    /// Parameters:
+    /// - `self: *Envelope`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+    /// Returns (`void`): no value.
     pub fn deinit(self: *Envelope) void {
         self.operation.deinit();
         for (self.metadata) |*entry| entry.deinit();
@@ -86,6 +119,11 @@ pub const Envelope = struct {
         self.* = undefined;
     }
 
+    /// Duplicate this value; marked owning payloads are cloned, while ordinary
+    /// borrowed fields retain their original lifetime.
+    /// Parameters:
+    /// - `self: *const Envelope`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+    /// Returns (`error{OutOfMemory}!Envelope`): A `Envelope` on success; `OutOfMemory` if required allocation fails.
     pub fn clone(self: *const Envelope) error{OutOfMemory}!Envelope {
         var operation = try self.operation.clone();
         errdefer operation.deinit();
@@ -112,6 +150,7 @@ pub const Envelope = struct {
     }
 };
 
+/// Borrowed view of an RPC envelope used without transferring its buffer ownership.
 pub const View = struct {
     version: Version,
     kind: Kind,
@@ -121,6 +160,7 @@ pub const View = struct {
     metadata: []const Entry,
     payload: []const u8,
 
+    /// Typed entry record.
     pub const Entry = struct { key: []const u8, value: []const u8 };
 };
 
@@ -161,6 +201,14 @@ fn validText(source: []const u8) bool {
     return source.len > 0 and std.unicode.utf8ValidateSlice(source);
 }
 
+/// Encode a value into its wire representation.
+/// Parameters:
+/// - `allocator: std.mem.Allocator`: Caller-owned allocator; allocations and retained values stay in this allocation
+///   domain.
+/// - `value: View`: envelope view whose identity, metadata, and payload are framed for the wire.
+/// - `limits: Limits`: Caller-selected, validated behavior or resource bounds; no hidden default is
+///   installed.
+/// Returns (`outcomes.Exit(Bytes, Protocol)`): Carries `Bytes` on `.success` or `Protocol` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
 pub fn encode(allocator: std.mem.Allocator, value: View, limits: Limits) outcomes.Exit(Bytes, Protocol) {
     if (!limits.valid() or !validText(value.operation) or
         value.operation.len > limits.max_operation_bytes or value.payload.len > limits.max_payload_bytes or
@@ -207,6 +255,14 @@ pub fn encode(allocator: std.mem.Allocator, value: View, limits: Limits) outcome
     return .{ .success = .{ .items = owned, .allocator = allocator } };
 }
 
+/// Decode a value from its wire representation.
+/// Parameters:
+/// - `allocator: std.mem.Allocator`: Caller-owned allocator; allocations and retained values stay in this allocation
+///   domain.
+/// - `input: []const u8`: Borrowed input; keep its owner alive until the operation has copied or joined it.
+/// - `limits: Limits`: Caller-selected, validated behavior or resource bounds; no hidden default is
+///   installed.
+/// Returns (`outcomes.Exit(Envelope, Protocol)`): Carries `Envelope` on `.success` or `Protocol` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
 pub fn decode(allocator: std.mem.Allocator, input: []const u8, limits: Limits) outcomes.Exit(Envelope, Protocol) {
     if (!limits.valid() or input.len > limits.max_envelope_bytes) return .{ .fail = .frame_too_large };
     var cursor: usize = 0;

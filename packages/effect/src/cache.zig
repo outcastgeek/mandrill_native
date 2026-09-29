@@ -1,3 +1,4 @@
+//! Scoped cache with caller-selected capacity, expiry, and in-flight sharing.
 const diagnostics = @import("internal/diagnostics.zig");
 const std = @import("std");
 const outcomes = @import("outcome.zig");
@@ -6,6 +7,10 @@ const execution = @import("executor.zig");
 const primitives = @import("primitives.zig");
 const Cancellation = @import("internal/runtime.zig").Cancellation;
 
+/// Specialize cache key hashing, equality, and retention callbacks.
+/// Parameters:
+/// - `Key: comptime type`: Key type used to identify or look up entries in this component.
+/// Returns (`type`): key hashing, equality, retain, and release callbacks required by the cache.
 pub fn KeyPolicy(comptime Key: type) type {
     return struct {
         userdata: ?*anyopaque,
@@ -15,6 +20,11 @@ pub fn KeyPolicy(comptime Key: type) type {
     };
 }
 
+/// Specialize capacity, TTL, and admission settings for a typed cache.
+/// Parameters:
+/// - `Key: comptime type`: Key type used to identify or look up entries in this component.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// Returns (`type`): cache policy type for capacity, time-to-live, and in-flight admission.
 pub fn Config(comptime Key: type, comptime E: type) type {
     return struct {
         keys: KeyPolicy(Key),
@@ -27,9 +37,17 @@ pub fn Config(comptime Key: type, comptime E: type) type {
     };
 }
 
+/// Specialize a cache by its key, value, and typed error channels.
+/// Parameters:
+/// - `Key: comptime type`: Key type used to identify or look up entries in this component.
+/// - `A: comptime type`: Value type produced by a successful computation.
+/// - `E: comptime type`: Expected application-failure type; defects and interruption remain separate outcomes.
+/// Returns (`type`): shared cache type with typed keys, values, failures, and caller-selected providers.
 pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
     return struct {
         const Self = @This();
+        /// `Loader` is a callback interface with `userdata: *anyopaque`, `run: *const fn (*anyopaque,
+        /// Key, *const Cancellation) outcomes.Exit(A, E)`, `deinit: *const fn (*anyopaque) void`.
         pub const Loader = struct {
             userdata: *anyopaque,
             run: *const fn (*anyopaque, Key, *const Cancellation) outcomes.Exit(A, E),
@@ -101,6 +119,14 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
         manager_metadata: *Aggregate,
         closing: outcomes.Exit(void, E) = .{ .success = {} },
 
+        /// Construct the selected resource or definition.
+        /// Parameters:
+        /// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// - `config: Config(Key, E)`: Caller-selected, validated behavior or resource bounds; no hidden default
+        ///   is installed.
+        /// - `loader: Loader`: Typed loader callback used when the cache misses.
+        /// Returns (`outcomes.Exit(*Self, E)`): Carries `*Self` on `.success` or `E` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn create(env: anytype, config: Config(Key, E), loader: Loader) outcomes.Exit(*Self, E) {
             if (config.time_to_live) |ttl| if (ttl.nanoseconds < 0) return .{ .die = .{ .kind = .invalid_configuration, .message = diagnostics.cache_ttl_must_be_non_negative } };
             const cache = env.allocator.create(Self) catch return .{ .die = outcomes.Defect.out_of_memory };
@@ -162,6 +188,13 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
             self.allocator.free(entries);
         }
 
+        /// Look up a cache entry while observing cancellation.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `key: Key`: Stable identity used for matching, deduplication, or replay.
+        /// - `token: ?*const Cancellation`: Cancellation token observed by this operation; its owner must outlive
+        ///   pending work.
+        /// Returns (`outcomes.Exit(A, E)`): Carries `A` on `.success` or `E` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn getToken(self: *Self, key: Key, token: ?*const Cancellation) outcomes.Exit(A, E) {
             self.mutex.lockUncancelable(self.io);
             self.users += 1;
@@ -404,6 +437,11 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
             }
         }
 
+        /// Invalidate the selected cached or observable value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// - `key: Key`: Stable identity used for matching, deduplication, or replay.
+        /// Returns (`outcomes.Exit(void, E)`): Carries no value on `.success` or `E` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn invalidate(self: *Self, key: Key) outcomes.Exit(void, E) {
             self.mutex.lockUncancelable(self.io);
             self.users += 1;
@@ -482,6 +520,10 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
             }
         };
 
+        /// Stop the capability and release its retained resources.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`outcomes.Exit(void, E)`): Carries no value on `.success` or `E` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn shutdown(self: *Self) outcomes.Exit(void, E) {
             self.closing_mutex.lockUncancelable(self.io);
             defer self.closing_mutex.unlock(self.io);
@@ -510,6 +552,10 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
             return self.closing.clone();
         }
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             std.debug.assert(self.manager_joined and self.users == 0);
             var current = self.entries;

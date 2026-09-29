@@ -1,3 +1,5 @@
+//! Typed reactive query descriptions and refresh behavior.
+
 use super::{
     AsyncResult, InvalidationBatch, InvalidationError, InvalidationKey, InvalidationRegistry,
 };
@@ -9,14 +11,20 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A source, dependency, or evaluation failure in a reactive query.
 pub enum ReactiveQueryError {
+    /// The ation failed validation. Carries `InvalidationError`.
     Invalidation(InvalidationError),
+    /// Another stream pull is already in progress.
     ConcurrentPull,
+    /// No further generation can be allocated without exceeding its range.
     GenerationExhausted,
+    /// The subscriber’s owning source has closed.
     SubscriptionEnded,
 }
 
 #[derive(Clone, Copy)]
+/// Variants of query stage used by reactivity query.
 enum QueryStage {
     Initial,
     NeedEvaluation,
@@ -25,6 +33,10 @@ enum QueryStage {
     Waiting,
 }
 
+/// Typed query state used by reactivity query.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
 struct QueryState<A: Send + 'static> {
     stage: QueryStage,
     generation: Option<NonZeroU64>,
@@ -35,6 +47,11 @@ struct QueryState<A: Send + 'static> {
 /// An inert description of a query and its stable invalidation dependencies.
 /// Each stream open creates independent state and subscribes before the first
 /// evaluation. The evaluation itself remains an Effect in R.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
+/// - `R`: Environment type. Bound or type: `Send + Sync + 'static`.
 pub struct ReactiveQuery<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> {
     registry: InvalidationRegistry,
     dependencies: Arc<[InvalidationKey]>,
@@ -44,6 +61,9 @@ pub struct ReactiveQuery<A: Send + 'static, E: Send + 'static, R: Send + Sync + 
 impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Clone
     for ReactiveQuery<A, E, R>
 {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             registry: self.registry.clone(),
@@ -55,6 +75,20 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Clone
 
 impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> ReactiveQuery<A, E, R> {
     #[must_use]
+    /// Construct a `ReactiveQuery` from its required inputs and explicit policies.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Parameters
+    /// - `registry` (`InvalidationRegistry`): Registry that owns definitions and rejects identity conflicts.
+    /// - `dependencies` (`impl IntoIterator<Item = InvalidationKey>`): The dependencies supplied to this operation.
+    /// - `evaluate` (`impl Fn() -> Effect<A, E, R> + Send + Sync + 'static`): The evaluate supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub fn new(
         registry: InvalidationRegistry,
         dependencies: impl IntoIterator<Item = InvalidationKey>,
@@ -76,6 +110,14 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> ReactiveQue
     /// evaluates. Later pulls wait for relevant invalidations. A lagged bounded
     /// subscription forces resnapshot/reload rather than losing an update.
     #[must_use]
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    /// - `R`: Environment type.
+    ///
+    /// # Returns
+    /// Type: `Stream<AsyncResult<A, E>, ReactiveQueryError, R>`.
+    /// Returns a scoped stream with the declared item, error, and environment types.
     pub fn stream(&self) -> Stream<AsyncResult<A, E>, ReactiveQueryError, R> {
         let query = self.clone();
         Stream::new(move |scope: Scope<ReactiveQueryError>| {
@@ -104,6 +146,20 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> ReactiveQue
     }
 }
 
+///
+/// # Type parameters
+/// - `A`: Successful application-value type. Additional bound: `Send + 'static`.
+/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type supplying required capabilities. Additional bound: `Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `query` (`ReactiveQuery<A, E, R>`): The query supplied to this operation.
+/// - `subscription` (`ResourceValue<Subscription<InvalidationBatch>>`): The subscription supplied to this operation.
+/// - `state` (`Arc<Mutex<QueryState<A>>>`): Current or replacement state owned by this operation.
+///
+/// # Returns
+/// Type: `Effect<Chunk<AsyncResult<A, E>>, ReactiveQueryError, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 fn query_pull<A, E, R>(
     query: ReactiveQuery<A, E, R>,
     subscription: ResourceValue<Subscription<InvalidationBatch>>,
@@ -168,6 +224,20 @@ where
     })
 }
 
+///
+/// # Type parameters
+/// - `A`: Successful application-value type. Additional bound: `Send + 'static`.
+/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type supplying required capabilities. Additional bound: `Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `query` (`ReactiveQuery<A, E, R>`): The query supplied to this operation.
+/// - `_subscription` (`ResourceValue<Subscription<InvalidationBatch>>`): The subscription supplied to this operation.
+/// - `state` (`Arc<Mutex<QueryState<A>>>`): Current or replacement state owned by this operation.
+///
+/// # Returns
+/// Type: `Effect<Chunk<AsyncResult<A, E>>, ReactiveQueryError, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 fn evaluate_query<A, E, R>(
     query: ReactiveQuery<A, E, R>,
     _subscription: ResourceValue<Subscription<InvalidationBatch>>,
@@ -254,6 +324,20 @@ where
         }))
 }
 
+///
+/// # Type parameters
+/// - `A`: Successful application-value type. Additional bound: `Send + 'static`.
+/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
+/// - `R`: Environment type supplying required capabilities. Additional bound: `Send + Sync + 'static`.
+///
+/// # Parameters
+/// - `query` (`ReactiveQuery<A, E, R>`): The query supplied to this operation.
+/// - `subscription` (`ResourceValue<Subscription<InvalidationBatch>>`): The subscription supplied to this operation.
+/// - `state` (`Arc<Mutex<QueryState<A>>>`): Current or replacement state owned by this operation.
+///
+/// # Returns
+/// Type: `Effect<Chunk<AsyncResult<A, E>>, ReactiveQueryError, R>`.
+/// Returns a lazy `Effect` with the declared success, error, and environment types.
 fn wait_invalidation<A, E, R>(
     query: ReactiveQuery<A, E, R>,
     subscription: ResourceValue<Subscription<InvalidationBatch>>,

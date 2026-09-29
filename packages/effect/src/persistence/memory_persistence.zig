@@ -8,6 +8,11 @@ const contracts = @import("key_value_store.zig");
 const batches = @import("batch_store.zig");
 const PersistenceError = @import("persistence_error.zig").Error;
 
+/// Construct an in-memory persistence provider with caller-owned runtime resources.
+/// Parameters:
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `now: comptime fn (*const R) deadlines.WallInstant`: Compile-time caller-supplied time or cursor boundary used for ordering and retention.
+/// Returns (`type`): in-memory encoded key/value provider using caller-owned runtime state.
 pub fn MemoryPersistence(comptime R: type, comptime now: fn (*const R) deadlines.WallInstant) type {
     return struct {
         const Self = @This();
@@ -31,6 +36,11 @@ pub fn MemoryPersistence(comptime R: type, comptime now: fn (*const R) deadlines
         data: std.StringHashMap(Entry),
         next_revision: u64 = 0,
 
+        /// Create an in-memory key/value persistence provider using the caller environment.
+        /// Parameters:
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Self`): a persistence provider bound to the supplied environment.
         pub fn init(env: *const R) Self {
             if (R == void or !@hasField(R, "allocator") or @FieldType(R, "allocator") != std.mem.Allocator)
                 @compileError("MemoryPersistence requires caller allocator in R");
@@ -39,14 +49,26 @@ pub fn MemoryPersistence(comptime R: type, comptime now: fn (*const R) deadlines
             return .{ .allocator = env.allocator, .io = env.io, .data = std.StringHashMap(Entry).init(env.allocator) };
         }
 
+        /// Expose the in-memory key-value-store capability.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`Plain`): Plain key-value-store capability adapter.
         pub fn keyValue(self: *Self) Plain {
             return Plain.fromProvider(self, &.{ .read = plainRead, .write = plainWrite, .remove = plainRemove });
         }
 
+        /// Expose the in-memory conditional-write capability.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`Conditional`): Conditional-write capability adapter.
         pub fn conditional(self: *Self) Conditional {
             return Conditional.fromProvider(self, &.{ .read_versioned = conditionalRead, .compare_exchange = compareExchange });
         }
 
+        /// Expose the in-memory batch-store capability.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`Batch`): Batch-store capability adapter.
         pub fn batch(self: *Self) Batch {
             return Batch.fromProvider(self, &.{ .read_many = batchRead, .write_many = batchWrite, .remove_many = batchRemove });
         }
@@ -253,6 +275,10 @@ pub fn MemoryPersistence(comptime R: type, comptime now: fn (*const R) deadlines
             self.allocator.free(removed.value.value);
         }
 
+        /// Release resources owned by this value.
+        /// Parameters:
+        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+        /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
             self.mutex.lockUncancelable(self.io);
             var iterator = self.data.iterator();

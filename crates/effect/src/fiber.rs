@@ -1,3 +1,5 @@
+//! Owned concurrent Effect execution and result observation.
+
 use crate::execution::TaskEvent;
 use crate::internal::notification::notify_all;
 use crate::internal::outcome;
@@ -13,6 +15,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Variants of admission used by fiber.
 enum Admission {
     Submitting,
     Accepted,
@@ -20,6 +23,11 @@ enum Admission {
     Panicked,
 }
 
+/// Variants of completion used by fiber.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 enum Completion<A: Send + 'static, E: Send + 'static> {
     Pending,
     Ready(Exit<A, E>),
@@ -28,6 +36,11 @@ enum Completion<A: Send + 'static, E: Send + 'static> {
     Consumed,
 }
 
+/// Typed state used by fiber.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct State<A: Send + 'static, E: Send + 'static> {
     admission: Admission,
     started: bool,
@@ -39,18 +52,29 @@ struct State<A: Send + 'static, E: Send + 'static> {
 }
 
 #[derive(Clone, Copy)]
+/// Variants of joined origin used by fiber.
 pub(crate) enum JoinedOrigin {
     Program,
     DriverLost,
     ObservationFailed,
 }
 
+/// Typed joined used by fiber.
+///
+/// # Type parameters
+/// - `A`: Application value type.
+/// - `E`: Domain-error type.
 pub(crate) struct Joined<A, E> {
     pub(crate) outcome: Exit<A, E>,
     pub(crate) protected: bool,
     pub(crate) origin: JoinedOrigin,
 }
 
+/// Typed inner used by fiber.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct Inner<A: Send + 'static, E: Send + 'static> {
     cancellation: Cancellation,
     state: Mutex<State<A, E>>,
@@ -60,10 +84,15 @@ struct Inner<A: Send + 'static, E: Send + 'static> {
 /// Terminal classification. Observing it does not consume or recover errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutcomeStatus {
+    /// The operation completed successfully.
     Succeeded,
+    /// The operation completed with a failure.
     Failed,
+    /// The operation ended in a defect outside its expected-error channel.
     Defected,
+    /// Execution was interrupted.
     Interrupted,
+    /// Cleanup failed after the primary operation settled.
     FinalizationFailed,
 }
 
@@ -71,6 +100,16 @@ pub enum OutcomeStatus {
 pub type FiberStatus = OutcomeStatus;
 
 impl OutcomeStatus {
+    ///
+    /// # Type parameters
+    /// - `A`: Successful application-value type.
+    /// - `E`: Expected application-error type.
+    ///
+    /// # Parameters
+    /// - `outcome` (`&Exit<A, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     const fn of<A, E>(outcome: &Exit<A, E>) -> Self {
         match outcome {
             Exit::Success(_) => Self::Succeeded,
@@ -91,12 +130,19 @@ impl OutcomeStatus {
 /// outcome/status, with no additional environment or provider reference.
 #[derive(Debug)]
 #[must_use = "inspect the shared outcome to handle its complete exit"]
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 pub struct SharedExit<A: Send + 'static, E: Send + 'static> {
     outcome: Arc<Mutex<Exit<A, E>>>,
     status: OutcomeStatus,
 }
 
 impl<A: Send + 'static, E: Send + 'static> Clone for SharedExit<A, E> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             outcome: Arc::clone(&self.outcome),
@@ -106,6 +152,15 @@ impl<A: Send + 'static, E: Send + 'static> Clone for SharedExit<A, E> {
 }
 
 impl<A: Send + 'static, E: Send + 'static> SharedExit<A, E> {
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `outcome` (`Exit<A, E>`): Complete terminal outcome, including expected errors and cleanup failures.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub(crate) fn new(outcome: Exit<A, E>) -> Self {
         Self {
             status: OutcomeStatus::of(&outcome),
@@ -114,12 +169,29 @@ impl<A: Send + 'static, E: Send + 'static> SharedExit<A, E> {
     }
 
     #[must_use]
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    ///
+    /// # Returns
+    /// Type: `OutcomeStatus`.
     pub const fn status(&self) -> OutcomeStatus {
         self.status
     }
 
     /// Borrow the outcome without cloning or moving its payloads. Panicking
     /// inspection becomes a defect and leaves the canonical outcome intact.
+    ///
+    /// # Type parameters
+    /// - `B`: Transformed value type.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `inspect` (`impl FnOnce(&Exit<A, E>) -> B`): The inspect supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<B, Defect>`.
     pub fn with<B>(&self, inspect: impl FnOnce(&Exit<A, E>) -> B) -> Result<B, Defect> {
         let outcome = self
             .outcome
@@ -128,6 +200,12 @@ impl<A: Send + 'static, E: Send + 'static> SharedExit<A, E> {
         catch_unwind(AssertUnwindSafe(|| inspect(&outcome))).map_err(Defect::from_panic)
     }
 
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Returns
+    /// Type: `Result<Exit<A, E>, Self>`.
     pub(crate) fn into_owned(self) -> Result<Exit<A, E>, Self> {
         match Arc::try_unwrap(self.outcome) {
             Ok(outcome) => Ok(outcome
@@ -147,11 +225,18 @@ impl<A: Send + 'static, E: Send + 'static> SharedExit<A, E> {
 /// A or E. Shared observations are repeatable and retain the same payloads.
 /// Owned transfer after sharing succeeds only when all shared handles are gone.
 /// Cloning a Fiber or SharedExit clones Arc ownership, never result/error data.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 pub struct Fiber<A: Send + 'static, E: Send + 'static> {
     inner: Arc<Inner<A, E>>,
 }
 
 impl<A: Send + 'static, E: Send + 'static> Clone for Fiber<A, E> {
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -160,6 +245,7 @@ impl<A: Send + 'static, E: Send + 'static> Clone for Fiber<A, E> {
 }
 
 #[derive(Clone, Copy)]
+/// Variants of observation mode used by fiber.
 enum ObservationMode {
     Await,
     Interrupt,
@@ -167,16 +253,27 @@ enum ObservationMode {
 }
 
 #[derive(Clone, Copy)]
+/// Variants of ownership used by fiber.
 enum Ownership {
     Owned,
     Shared,
 }
 
+/// Variants of observed used by fiber.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 enum Observed<A: Send + 'static, E: Send + 'static> {
     Owned(Exit<A, E>),
     Shared(SharedExit<A, E>),
 }
 
+/// Variants of cleanup used by fiber.
+///
+/// # Type parameters
+/// - `A`: Application value type. Bound or type: `Send + 'static`.
+/// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 enum Cleanup<A: Send + 'static, E: Send + 'static> {
     Observed,
     Outcome(Exit<A, E>),
@@ -184,6 +281,12 @@ enum Cleanup<A: Send + 'static, E: Send + 'static> {
 }
 
 impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
+    ///
+    /// # Parameters
+    /// - `cancellation` (`Cancellation`): The cancellation token for this operation.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     fn new(cancellation: Cancellation) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -202,6 +305,9 @@ impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
         }
     }
 
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn started(&self) {
         self.inner
             .state
@@ -210,6 +316,12 @@ impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
             .started = true;
     }
 
+    ///
+    /// # Parameters
+    /// - `admission` (`Admission`): The admission supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn admitted(&self, admission: Admission) {
         self.inner
             .state
@@ -219,6 +331,17 @@ impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
         notify_all(&self.inner.changed);
     }
 
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `completion` (`Completion<A, E>`): The completion supplied to this operation.
+    /// - `protected` (`bool`): The protected supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `()`.
     fn publish(&self, completion: Completion<A, E>, protected: bool) {
         {
             let mut state = self
@@ -247,6 +370,13 @@ impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
     }
 
     /// Await classification without marking an error observed.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    ///
+    /// # Returns
+    /// Type: `FiberStatus`.
     pub async fn settled(&self) -> FiberStatus {
         loop {
             let changed = self.inner.changed.listen();
@@ -263,12 +393,25 @@ impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
         }
     }
 
+    /// # Type parameters
+    /// - `A`: Application value type. Bound: `Send + 'static`.
+    /// - `E`: Domain-error type. Bound: `Send + 'static`.
+    ///
+    /// # Returns
+    /// Type: `()`.
     pub(crate) fn cancel(&self) {
         let _ = self.inner.cancellation.request();
     }
 
     /// A parallel operation owns every branch and joins even after cancellation.
     /// Payloads move once; no observer or extra shared-data allocation is needed.
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Returns
+    /// Type: `Joined<A, E>`.
     pub(crate) async fn take_owned(&self) -> Joined<A, E> {
         let outcome = match self
             .observe(
@@ -304,11 +447,29 @@ impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
 
     /// Transfer the complete child outcome once. Cancellation leaves the child
     /// unobserved; its scope continues to own it and retains its failures.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Returns
+    /// Type: `Effect<Exit<A, E>, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn await_exit<R: Send + Sync + 'static>(&self) -> Effect<Exit<A, E>, E, R> {
         self.owned_observation(ObservationMode::Await)
     }
 
     /// Transfer the child outcome directly into the caller's E channel once.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Returns
+    /// Type: `Effect<A, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn join<R: Send + Sync + 'static>(&self) -> Effect<A, E, R> {
         let fiber = self.clone();
         Effect::new(move |_, context, finish| {
@@ -336,20 +497,59 @@ impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
 
     /// Request interruption, then join even if the caller is cancelled while
     /// waiting. A cancelled caller leaves the joined outcome unobserved.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Returns
+    /// Type: `Effect<Exit<A, E>, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn interrupt<R: Send + Sync + 'static>(&self) -> Effect<Exit<A, E>, E, R> {
         self.owned_observation(ObservationMode::Interrupt)
     }
 
     /// Repeatable shared observation. A and E are retained without cloning.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Returns
+    /// Type: `Effect<SharedExit<A, E>, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn await_exit_shared<R: Send + Sync + 'static>(&self) -> Effect<SharedExit<A, E>, E, R> {
         self.shared_observation(ObservationMode::Await)
     }
 
     /// Repeatable cancel-and-join with shared ownership of the same outcome.
+    ///
+    /// # Type parameters
+    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Returns
+    /// Type: `Effect<SharedExit<A, E>, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn interrupt_shared<R: Send + Sync + 'static>(&self) -> Effect<SharedExit<A, E>, E, R> {
         self.shared_observation(ObservationMode::Interrupt)
     }
 
+    ///
+    /// # Type parameters
+    /// - `R`: Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `mode` (`ObservationMode`): Selected behavior for this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<Exit<A, E>, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn owned_observation<R: Send + Sync + 'static>(
         &self,
         mode: ObservationMode,
@@ -377,6 +577,18 @@ impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
         })
     }
 
+    ///
+    /// # Type parameters
+    /// - `R`: Bounds: `Send + Sync + 'static`.
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `mode` (`ObservationMode`): Selected behavior for this operation.
+    ///
+    /// # Returns
+    /// Type: `Effect<SharedExit<A, E>, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn shared_observation<R: Send + Sync + 'static>(
         &self,
         mode: ObservationMode,
@@ -404,6 +616,18 @@ impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
         })
     }
 
+    ///
+    /// # Type parameters
+    /// - `A`: Success or application-value type.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `cancellation` (`Cancellation`): The cancellation token for this operation.
+    /// - `mode` (`ObservationMode`): Selected behavior for this operation.
+    /// - `ownership` (`Ownership`): The ownership supplied to this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Option<Observed<A, E>>, Defect>`.
     async fn observe(
         &self,
         cancellation: Cancellation,
@@ -486,6 +710,13 @@ impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
         }
     }
 
+    ///
+    /// # Type parameters
+    /// - `E`: Domain-error type.
+    ///
+    /// # Returns
+    /// Type: `Exit<(), E>`.
+    /// Returns `Exit<(), E>`.
     async fn cleanup(&self) -> Exit<(), E> {
         let _ = self.inner.cancellation.request();
         loop {
@@ -548,6 +779,18 @@ impl<E: Send + 'static> Scope<E> {
     /// Register ownership before submitting through the current R. Closing
     /// rejects without accessing the provider. Cleanup cancels and joins every
     /// submitted task, including provider rejection/panic and cancellation races.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Additional bound: `Send + 'static`.
+    /// - `R`: Environment type. Additional bound: `HasTaskSpawner + Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `program` (`Effect<A, E, R>`): Lazy Effect description executed or transformed here.
+    ///
+    /// # Returns
+    /// Type: `Effect<Fiber<A, E>, E, R>`.
+    /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn fork<A, R>(&self, program: Effect<A, E, R>) -> Effect<Fiber<A, E>, E, R>
     where
         A: Send + 'static,
@@ -561,6 +804,20 @@ impl<E: Send + 'static> Scope<E> {
 
     /// Already-entered parallel operations finish admission and own joining
     /// regardless of a later parent request. R still supplies the only provider.
+    ///
+    /// # Type parameters
+    /// - `A`: Application value type. Additional bound: `Send + 'static`.
+    /// - `R`: Environment type. Additional bound: `HasTaskSpawner + Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `program` (`Effect<A, E, R>`): Lazy Effect description executed or transformed here.
+    /// - `env` (`&Arc<R>`): The environment supplying this operation's capabilities.
+    /// - `context` (`Context`): Execution context carrying cancellation, scope, and trace state.
+    /// - `finish` (`Finish<Fiber<A, E>, E>`): Continuation receiving the complete terminal outcome.
+    ///
+    /// # Returns
+    /// Type: `Step`.
     pub(crate) fn start_parallel<A, R>(
         &self,
         program: Effect<A, E, R>,
@@ -575,6 +832,21 @@ impl<E: Send + 'static> Scope<E> {
         self.submit(program, env, context, finish)
     }
 
+    ///
+    /// # Type parameters
+    /// - `A`: Successful application-value type. Additional bound: `Send + 'static`.
+    /// - `R`: Environment type supplying required capabilities. Additional bound: `HasTaskSpawner + Send + Sync + 'static`.
+    /// - `E`: Domain-error type.
+    ///
+    /// # Parameters
+    /// - `program` (`Effect<A, E, R>`): Lazy Effect description executed or transformed here.
+    /// - `env` (`&Arc<R>`): The environment supplying this operation's capabilities.
+    /// - `child_context` (`Context`): The child context supplied to this operation.
+    /// - `finish` (`Finish<Fiber<A, E>, E>`): Continuation receiving the complete terminal outcome.
+    ///
+    /// # Returns
+    /// Type: `Step`.
+    /// Returns `Step`.
     fn submit<A, R>(
         &self,
         program: Effect<A, E, R>,

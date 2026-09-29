@@ -1,3 +1,5 @@
+//! Bounded wire envelopes and correlation metadata.
+
 use super::{OperationId, OperationIdError, RpcVersion};
 use crate::encoding::{FrameDecodeFailure, FrameDecoder, FrameError, FrameParts, FramePolicy};
 use crate::{JsonValue, ParseLimits, SchemaIssue, SchemaIssueKind, SchemaResource};
@@ -26,15 +28,26 @@ mod wire {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Stable identity used by rpc envelope operations.
 pub struct RpcCallId(Arc<str>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// An invalid stable identity for one RPC call.
 pub enum RpcCallIdError {
+    /// No value is present.
     Empty,
+    /// The character failed validation.
     InvalidCharacter,
 }
 
 impl RpcCallId {
+    /// Construct a `RpcCallId` from its required inputs and explicit policies.
+    ///
+    /// # Parameters
+    /// - `value` (`impl Into<Arc<str>>`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, RpcCallIdError>`.
     pub fn new(value: impl Into<Arc<str>>) -> Result<Self, RpcCallIdError> {
         let value = value.into();
         if value.trim().is_empty() {
@@ -47,23 +60,38 @@ impl RpcCallId {
     }
 
     #[must_use]
+    /// Borrow the textual representation without allocating a new string.
+    ///
+    /// # Returns
+    /// Type: `&str`.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The request, success, or domain-error role encoded in an RPC envelope.
 pub enum RpcEnvelopeKind {
+    /// The envelope contains an RPC request.
     Request,
+    /// The operation succeeded.
     Success,
+    /// The application handler returned its declared error type.
     DomainError,
+    /// The envelope contains one streaming RPC item.
     StreamChunk,
+    /// The stream has reached its terminal result.
     StreamEnd,
+    /// Acknowledge the selected recorded value.
     Acknowledge,
+    /// Cancel the selected work under its ownership rules.
     Cancel,
 }
 
 impl RpcEnvelopeKind {
+    ///
+    /// # Returns
+    /// Type: `&'static str`.
     const fn as_wire(self) -> &'static str {
         match self {
             Self::Request => wire::REQUEST,
@@ -76,6 +104,13 @@ impl RpcEnvelopeKind {
         }
     }
 
+    ///
+    /// # Parameters
+    /// - `value` (`&str`): Value read, transformed, encoded, or stored by this operation.
+    ///
+    /// # Returns
+    /// Type: `Option<Self>`.
+    /// Returns the value when present, or `None`.
     fn from_wire(value: &str) -> Option<Self> {
         match value {
             wire::REQUEST => Some(Self::Request),
@@ -91,28 +126,43 @@ impl RpcEnvelopeKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Explicit framing and JSON resource limits for RPC messages.
 pub struct RpcEnvelopePolicy {
+    /// Maximum frame size and framing behavior for RPC messages. Type: `FramePolicy`.
     pub frame: FramePolicy,
+    /// JSON parser resource bounds applied to RPC messages. Type: `ParseLimits`.
     pub json: ParseLimits,
 }
 
 #[derive(Debug)]
+/// A malformed frame, envelope, or encoded payload at the RPC wire boundary.
 pub enum RpcWireError {
+    /// The frame is malformed or exceeds its declared bounds. Retains the `FrameError` detail.
     Frame(FrameError),
+    /// JSON parsing or encoding failed. Retains the `SchemaIssue` detail.
     Json(SchemaIssue),
+    /// The envelope failed validation.
     InvalidEnvelope,
+    /// The operation failed validation. Carries `OperationIdError`.
     InvalidOperation(OperationIdError),
+    /// The call failed validation. Carries `RpcCallIdError`.
     InvalidCall(RpcCallIdError),
+    /// The revision failed validation.
     InvalidRevision,
+    /// The kind is not recognized.
     UnknownKind,
+    /// The sequence failed validation.
     InvalidSequence,
+    /// Shared synchronization state was poisoned by a prior failure.
     Poisoned,
 }
 
 #[derive(Debug)]
+/// The typed wire-level failure returned for an encoded call.
 pub struct RpcWireFailure {
     /// Valid earlier frames from the same input chunk remain visible.
     pub completed: Vec<RpcEnvelope>,
+    /// The typed error carried by this result. Type: `RpcWireError`.
     pub error: RpcWireError,
 }
 
@@ -121,17 +171,30 @@ pub struct RpcWireFailure {
 /// operation codec decodes them.
 #[derive(Debug)]
 pub struct RpcEnvelope {
+    /// Registered operation associated with this value. Type: `OperationId`.
     pub operation: OperationId,
+    /// The declared compatibility version. Type: `RpcVersion`.
     pub version: RpcVersion,
+    /// Identity of the RPC call. Type: `RpcCallId`.
     pub call: RpcCallId,
+    /// Typed discriminator for this state. Type: `RpcEnvelopeKind`.
     pub kind: RpcEnvelopeKind,
     /// Stream chunks and their acknowledgements carry a positive sequence.
     pub sequence: Option<NonZeroU64>,
+    /// The payload carried by this request or record. Type: `JsonValue`.
     pub payload: JsonValue,
+    /// Application or protocol metadata attached to this value. Type: `BTreeMap<Arc<str>, Arc<str>>`.
     pub metadata: BTreeMap<Arc<str>, Arc<str>>,
 }
 
 impl RpcEnvelope {
+    /// Encode the typed value using this definition’s declared representation.
+    ///
+    /// # Parameters
+    /// - `policy` (`RpcEnvelopePolicy`): The caller-supplied behavior policy.
+    ///
+    /// # Returns
+    /// Type: `Result<FrameParts, RpcWireError>`.
     pub fn encode(self, policy: RpcEnvelopePolicy) -> Result<FrameParts, RpcWireError> {
         validate_sequence(self.kind, self.sequence)?;
         let mut metadata = serde_json::Map::new();
@@ -170,6 +233,14 @@ impl RpcEnvelope {
         FrameParts::new(bytes, policy.frame).map_err(RpcWireError::Frame)
     }
 
+    /// Validate the encoded input and reconstruct its typed value.
+    ///
+    /// # Parameters
+    /// - `payload` (`&[u8]`): Application data moved into the message or stored record.
+    /// - `policy` (`RpcEnvelopePolicy`): The caller-supplied behavior policy.
+    ///
+    /// # Returns
+    /// Type: `Result<Self, RpcWireError>`.
     pub fn decode(payload: &[u8], policy: RpcEnvelopePolicy) -> Result<Self, RpcWireError> {
         if payload.len() > policy.json.bytes.get() {
             return Err(RpcWireError::Json(SchemaIssue::new(
@@ -259,6 +330,13 @@ impl RpcEnvelope {
     }
 }
 
+///
+/// # Parameters
+/// - `kind` (`RpcEnvelopeKind`): The kind supplied to this operation.
+/// - `sequence` (`Option<NonZeroU64>`): Ordered stream position used to reject gaps or duplicates.
+///
+/// # Returns
+/// Type: `Result<(), RpcWireError>`.
 fn validate_sequence(
     kind: RpcEnvelopeKind,
     sequence: Option<NonZeroU64>,
@@ -287,6 +365,11 @@ pub struct RpcEnvelopeDecoder {
 
 impl RpcEnvelopeDecoder {
     #[must_use]
+    /// # Parameters
+    /// - `policy` (`RpcEnvelopePolicy`): The caller-supplied behavior policy.
+    ///
+    /// # Returns
+    /// Type: `Self`.
     pub const fn new(policy: RpcEnvelopePolicy) -> Self {
         Self {
             frames: FrameDecoder::new(policy.frame),
@@ -295,6 +378,13 @@ impl RpcEnvelopeDecoder {
         }
     }
 
+    /// Append a value through this collection’s ordering and capacity rules.
+    ///
+    /// # Parameters
+    /// - `bytes` (`&[u8]`): Encoded bytes to validate, decode, write, or transfer.
+    ///
+    /// # Returns
+    /// Type: `Result<Vec<RpcEnvelope>, RpcWireFailure>`.
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<RpcEnvelope>, RpcWireFailure> {
         if self.poisoned {
             return Err(RpcWireFailure {

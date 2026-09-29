@@ -7,6 +7,14 @@ fn has(comptime T: type, comptime name: []const u8) bool {
     };
 }
 
+/// Enforce the structural codec interface at comptime. A codec must expose
+/// `Decoded` plus either a representation codec pair or a structural schema
+/// decode/encode pair; incomplete implementations fail compilation.
+/// Parameters:
+/// - `C: comptime type`: Candidate codec or schema type whose declarations are
+///   inspected at compile time.
+/// Returns (`void`): No runtime value; successful specialization proves that
+///   the required type members and codec entry points are present.
 pub fn require(comptime C: type) void {
     if (!has(C, "Decoded"))
         @compileError("schema must expose its decoded application type");

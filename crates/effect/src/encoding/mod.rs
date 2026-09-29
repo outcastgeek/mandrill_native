@@ -1,3 +1,5 @@
+//! Shared payload encoding and framing interfaces.
+
 mod frame;
 mod ndjson;
 mod schema_binary;

@@ -8,6 +8,20 @@ const wire = @import("wire_codec.zig");
 const dispatch = @import("internal/dispatch.zig");
 const Semaphore = @import("../semaphore.zig").Semaphore;
 
+/// Specialize a unary RPC server for a closed protocol and caller environment.
+/// Parameters:
+/// - `handler: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where static.
+/// - `request_wire: comptime wire.WireCodec(@TypeOf(handler.operation).Request, @TypeOf(handler).Environment)`: Wire codec for the operation’s request type and environment.
+/// - `success_wire: comptime wire.WireCodec(@TypeOf(handler.operation).Success, @TypeOf(handler).Environment)`: Wire codec for the operation’s success channel.
+/// - `failure_wire: comptime wire.WireCodec(@TypeOf(handler.operation).DomainError, @TypeOf(handler).Environment)`: Wire codec for the operation’s typed failure channel.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `select_session: comptime fn (*const @TypeOf(handler).Environment) *const transport.Session(@TypeOf(handler).Environment, ProviderError)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_policy: comptime fn (*const @TypeOf(handler).Environment) transport.Policy`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_admission: comptime fn (*const @TypeOf(handler).Environment) *Semaphore`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// Returns (`type`): typed unary server for one completed RPC operation.
 pub fn UnaryServer(
     comptime handler: anytype,
     comptime request_wire: wire.WireCodec(@TypeOf(handler.operation).Request, @TypeOf(handler).Environment),
@@ -24,6 +38,18 @@ pub fn UnaryServer(
 
 /// Builds a closed encoded server from typed handler/codec bindings. The
 /// generated routes and runtime dispatch remain private to this package.
+///
+/// Parameters:
+/// - `bindings: comptime anytype`: Compile-time statically inferred input checked when this operation is
+///   instantiated.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `select_session: comptime anytype`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_policy: comptime anytype`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_admission: comptime anytype`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// Returns (`type`): server dispatching a closed typed protocol.
 pub fn ProtocolServer(
     comptime bindings: anytype,
     comptime ProviderError: type,
@@ -49,6 +75,17 @@ pub fn ProtocolServer(
 
 /// The server's caller-owned semaphore is the admission authority for every
 /// received request; its capacity must match the selected protocol policy.
+///
+/// Parameters:
+/// - `Dispatcher: comptime type`: Compile-time typed request dispatcher.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `select_session: comptime fn (*const Dispatcher.Environment) *const transport.Session(Dispatcher.Environment, ProviderError)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_policy: comptime fn (*const Dispatcher.Environment) transport.Policy`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_admission: comptime fn (*const Dispatcher.Environment) *Semaphore`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// Returns (`type`): server whose caller-owned semaphore controls request admission.
 pub fn BoundedServer(
     comptime Dispatcher: type,
     comptime ProviderError: type,
@@ -59,7 +96,9 @@ pub fn BoundedServer(
     const Base = EncodedServer(Dispatcher, ProviderError, select_session, select_policy);
     const R = Dispatcher.Environment;
     return struct {
+        /// Typed failure channel combining domain and provider errors.
         pub const Failure = Base.Failure;
+        /// Typed result channel described by `Base.Result`.
         pub const Result = Base.Result;
 
         fn admissionFailure(problem: @import("../semaphore.zig").Error) Failure {
@@ -69,6 +108,8 @@ pub fn BoundedServer(
             };
         }
 
+        /// Serve one framed RPC request.
+        /// Returns (`Result`): The typed operation result or description selected by this API.
         pub fn serveOne() Result {
             return Result.deferEffect(struct {
                 fn start(env: *const R) Result {
@@ -84,6 +125,12 @@ pub fn BoundedServer(
             }.start);
         }
 
+        /// Decode and dispatch one RPC frame.
+        /// Parameters:
+        /// - `frame: []const u8`: Encoded protocol frame to parse, dispatch, or transmit.
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Dispatcher.Result`): The dispatcher’s typed response or protocol failure for this frame.
         pub fn invokeFrame(frame: []const u8, env: *const R) Dispatcher.Result {
             return Base.invokeFrame(frame, env);
         }
@@ -92,6 +139,15 @@ pub fn BoundedServer(
 
 /// Runs a checked closed encoded protocol (or one unary route) against a
 /// caller-provided session. The dispatcher has no transport-specific state.
+///
+/// Parameters:
+/// - `Dispatcher: comptime type`: Compile-time typed request dispatcher.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// - `select_session: comptime fn (*const Dispatcher.Environment) *const transport.Session(Dispatcher.Environment, ProviderError)`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// - `select_policy: comptime fn (*const Dispatcher.Environment) transport.Policy`: Compile-time typed selector from the current environment; its result must
+///   remain valid through use.
+/// Returns (`type`): encoded server applying codecs and typed handlers to framed requests.
 pub fn EncodedServer(
     comptime Dispatcher: type,
     comptime ProviderError: type,
@@ -107,7 +163,10 @@ pub fn EncodedServer(
     const Session = transport.Session(R, ProviderError);
     return struct {
         const Self = @This();
+        /// Typed failure channel combining domain and provider errors.
         pub const Failure = Dispatcher.Failure;
+        /// Lazy Effect for result; success, error, and environment types are fixed by
+        /// `effects.Effect(void, Failure, R)`.
         pub const Result = effects.Effect(void, Failure, R);
         const Bytes = outcomes.OwnedSlice(u8);
 
@@ -141,6 +200,8 @@ pub fn EncodedServer(
         /// Process one complete request frame with typed handler and codecs.
         /// A provider may run several of these in a caller-owned scope, with
         /// its selected concurrency bound and disconnect policy.
+        ///
+        /// Returns (`Result`): The typed operation result or description selected by this API.
         pub fn serveOne() Result {
             return Result.deferEffect(struct {
                 fn start(env: *const R) Result {
@@ -156,6 +217,12 @@ pub fn EncodedServer(
 
         /// Direct encoded invocation is useful to in-process adapters. The
         /// same route handles a frame no matter which session delivered it.
+        ///
+        /// Parameters:
+        /// - `frame: []const u8`: Encoded protocol frame to parse, dispatch, or transmit.
+        /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
+        ///   capabilities.
+        /// Returns (`Dispatcher.Result`): The dispatcher’s typed response or protocol failure for this frame.
         pub fn invokeFrame(frame: []const u8, env: *const R) Dispatcher.Result {
             return Dispatcher.serveFrame(frame, env);
         }

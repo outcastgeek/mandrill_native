@@ -5,6 +5,7 @@ const effects = @import("effect.zig");
 const keys = @import("primary_key.zig");
 const std = @import("std");
 
+/// `BatchError` is a tagged choice.
 pub const BatchError = union(enum) {
     invalid_key,
     empty_batch,
@@ -12,6 +13,12 @@ pub const BatchError = union(enum) {
     unavailable,
 };
 
+/// Specialize a batched resolver with typed job, success, and provider-error channels.
+/// Parameters:
+/// - `Definition: comptime type`: Compile-time typed definition used to derive this API.
+/// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
+/// - `ProviderError: comptime type`: Failure type reported by the selected provider and retained in the typed error channel.
+/// Returns (`type`): batched resolver type carrying job, result, provider failure, and environment contracts.
 pub fn Resolver(comptime Definition: type, comptime R: type, comptime ProviderError: type) type {
     comptime {
         if (!@hasDecl(Definition, "Input") or !@hasDecl(Definition, "Success") or
@@ -20,22 +27,40 @@ pub fn Resolver(comptime Definition: type, comptime R: type, comptime ProviderEr
     }
     return struct {
         const Self = @This();
+        /// Typed request or input value decoded by this definition.
         pub const Input = Definition.Input;
+        /// Value type carried by the successful channel.
         pub const Success = Definition.Success;
+        /// Domain-specific error type carried by the operation.
         pub const DomainError = Definition.DomainError;
+        /// Typed terminal outcome for item exit; its success and failure types are fixed by
+        /// `outcomes.Exit(Success, DomainError)`.
         pub const ItemExit = outcomes.Exit(Success, DomainError);
+        /// Owned results buffer paired with its allocator; release it with `deinit`.
         pub const Results = outcomes.OwnedSlice(ItemExit);
+        /// Typed failure channel combining domain and provider errors.
         pub const Failure = union(enum) {
             const Own = @This();
+            /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements
+            /// `deinit` and must be released after use.
             pub const effect_owned_payload = outcomes.ownsPayload(ProviderError);
             operation: BatchError,
             provider: ProviderError,
 
+            /// Release resources owned by this value.
+            /// Parameters:
+            /// - `self: *Own`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
+            /// Returns (`void`): no value.
             pub fn deinit(self: *Own) void {
                 if (self.* == .provider) outcomes.discardPayload(&self.provider);
                 self.* = undefined;
             }
 
+            /// Duplicate this value; marked owning payloads are cloned, while ordinary
+            /// borrowed fields retain their original lifetime.
+            /// Parameters:
+            /// - `self: *const Own`: Borrowed receiver; the caller keeps the referenced object alive through this call, and this pointer cannot mutate it.
+            /// Returns (`error{OutOfMemory}!Own`): A `Own` on success; `OutOfMemory` if required allocation fails.
             pub fn clone(self: *const Own) error{OutOfMemory}!Own {
                 return switch (self.*) {
                     .provider => |value| .{ .provider = try outcomes.clonePayload(value) },
@@ -43,7 +68,10 @@ pub fn Resolver(comptime Definition: type, comptime R: type, comptime ProviderEr
                 };
             }
         };
+        /// Lazy Effect for batch effect; success, error, and environment types are fixed by
+        /// `effects.Effect(Results, Failure, R)`.
         pub const BatchEffect = effects.Effect(Results, Failure, R);
+        /// One resolver request together with its typed completion target and batching identity.
         pub const Job = struct {
             key: []const u8,
             input: *const Input,
@@ -63,14 +91,38 @@ pub fn Resolver(comptime Definition: type, comptime R: type, comptime ProviderEr
         /// The provider must preserve input order and return exactly one Exit
         /// per job. It may group jobs using its caller-provided grouping
         /// policy, but it cannot erase per-request domain errors.
+        /// Typed function-pointer interface for this capability. Implement every
+        /// hook with the exact signature below; keep the table valid while the
+        /// capability or pending work can invoke it.
         pub const VTable = struct {
+            /// Resolve a batch in input order.
+            /// Parameters (callback order):
+            /// - `1: ?*anyopaque`: opaque provider or handle context; keep it live until the hook and any retained work complete.
+            /// - `2: *const R`: borrowed generic environment `R`, including caller-supplied runtime services.
+            /// - `3: []const Job`: borrowed input slice; keep it valid through deferred use or copy before retaining it.
+            /// Returns (`BatchEffect`): lazy typed Effect; run it with its declared environment to obtain Exit.
             resolve_batch: *const fn (?*anyopaque, *const R, []const Job) BatchEffect,
         };
 
+        /// Wrap a caller-supplied provider implementation.
+        /// Parameters:
+        /// - `data: ?*anyopaque`: Borrowed provider context passed unchanged to every hook.
+        ///   Its owner keeps it alive through any pending effect or operation.
+        /// - `vtable: *const VTable`: Borrowed table of exactly typed callbacks; keep it
+        ///   alive for every use of this capability, including deferred execution.
+        /// Returns (`Self`): A non-owning adapter referencing `data` and `vtable`; no
+        ///   provider state is allocated or transferred by this constructor.
         pub fn fromProvider(data: ?*anyopaque, vtable: *const VTable) Self {
             return .{ .userdata = data, .vtable = vtable };
         }
 
+        /// Resolve the requested jobs as one typed batch.
+        /// Parameters:
+        /// - `select_resolver: comptime fn (*const R) *const Self`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// - `select_jobs: comptime fn (*const R) []const Job`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// Returns (`BatchEffect`): typed results for one bounded batch of jobs.
         pub fn resolveBatch(comptime select_resolver: fn (*const R) *const Self, comptime select_jobs: fn (*const R) []const Job) BatchEffect {
             return BatchEffect.deferEffect(struct {
                 fn start(env: *const R) BatchEffect {
@@ -98,6 +150,15 @@ pub fn Resolver(comptime Definition: type, comptime R: type, comptime ProviderEr
         /// grouping key. Each provider call sees only jobs in one group, while
         /// the returned Exits retain the original input order. The caller's
         /// jobs and their inputs remain borrowed until this Effect settles.
+        ///
+        /// Parameters:
+        /// - `select_resolver: comptime fn (*const R) *const Self`: Compile-time typed selector from the current environment; its
+        ///   result must remain valid through use.
+        /// - `select_jobs: comptime fn (*const R) []const Job`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// - `select_group: comptime fn (*const Job) []const u8`: Compile-time typed selector from the current environment; its result
+        ///   must remain valid through use.
+        /// Returns (`BatchEffect`): typed results after partitioning the input batch by stable caller-selected group.
         pub fn resolveGrouped(
             comptime select_resolver: fn (*const R) *const Self,
             comptime select_jobs: fn (*const R) []const Job,
