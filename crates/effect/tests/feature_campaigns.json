@@ -1,0 +1,50 @@
+{
+  "seed": 20260927,
+  "target": "aarch64-apple-darwin",
+  "profiles": ["debug", "release"],
+  "budgets": {
+    "bytes": 4096,
+    "depth": 32,
+    "width": 4096,
+    "steps": 1000000,
+    "seconds": 900
+  },
+  "artifacts": "scratch/reports/effect-core-schema-cluster-workflow/campaigns",
+  "campaigns": {
+    "schema": {"seeds": 1000},
+    "encoded_input": {"mutations": 100000, "formats": ["schema", "rpc", "stored_outcome", "queue", "hydration", "event", "replica", "shared"]},
+    "persistence": {
+      "seeds": 1000,
+      "transitions": 100,
+      "records": {"keys": 4, "ttl_millis": 7},
+      "queue": {"maximum_attempts": 3, "lease_millis": 5, "retention_millis": 7},
+      "rate_limit": {
+        "capacity": 5,
+        "refill": 3,
+        "period_millis": 7,
+        "adaptive_minimum": 2,
+        "adaptive_initial": 5,
+        "adaptive_maximum": 8,
+        "adaptive_increase": 2,
+        "adaptive_decrease": 3,
+        "simultaneous_callers": 10
+      }
+    },
+    "rpc": {"seeds": 1000, "transitions": 100},
+    "reactivity": {"seeds": 1000, "transitions": 100},
+    "delivery": {
+      "seeds": 1000,
+      "transitions": 100,
+      "claim_lease_millis": 3,
+      "retention_millis": 2,
+      "maximum_attempts": 3
+    },
+    "workflow": {"seeds": 1000, "transitions": 100},
+    "eventlog": {"seeds": 1000, "transitions": 100, "identities": 16, "page_limit": 7},
+    "transaction": {"seeds": 1000, "transitions": 100, "initial_balance": 32, "max_transfer": 64},
+    "native_contention": {"operations_per_feature": 10000, "levels": [1, 2, 8, 32], "max_conflicts": 10000},
+    "schema_first_use": {"callers": 32, "rounds": 1000},
+    "bridges": {"seeds": 1000, "transitions": 100, "task_workers": 4, "cpu_workers": 4, "queued_jobs": 64},
+    "lifecycle_retention": {"cycles": 1000, "warmup_cycles": 100}
+  }
+}

@@ -7,10 +7,13 @@ edition = "2024"
 default = []
 
 [dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 effect-macros = { path = "../effect_macros" }
 event-listener = "5.4.2"
 futures-util = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+serde_stacker = { workspace = true }
 
 [dev-dependencies]
 futures-executor = "0.3.34"

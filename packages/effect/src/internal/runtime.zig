@@ -79,7 +79,10 @@ pub const Services = struct {
     // fields. This preserves the chosen provider across field replacement and
     // avoids nested optional-struct tags in the interpreter representation.
     allocator: ?*const std.mem.Allocator.VTable = null,
-    allocator_data: ?*anyopaque = null,
+    // The allocator vtable is the presence tag. A valid stateless allocator
+    // may use address zero for its context; wrapping that pointer in an
+    // optional would mistake it for absence.
+    allocator_data: *anyopaque = undefined,
     io: ?*const std.Io.VTable = null,
     io_data: ?*anyopaque = null,
     cancellation: ?*const Cancellation = null,
@@ -90,7 +93,7 @@ pub const Services = struct {
 
     pub inline fn allocatorValue(self: Services) ?std.mem.Allocator {
         const vtable = self.allocator orelse return null;
-        return .{ .ptr = self.allocator_data.?, .vtable = vtable };
+        return .{ .ptr = self.allocator_data, .vtable = vtable };
     }
 
     pub inline fn ioValue(self: Services) ?std.Io {

@@ -1,0 +1,105 @@
+//! Versioned binary envelope for a schema codec's binary representation.
+//! Wire layout (v1): version:u8, schema-name-length:u32 big endian,
+//! payload-length:u32 big endian, UTF-8 schema name, codec payload. The
+//! schema codec owns the payload grammar; this module owns identity, framing
+//! and limits shared by event replication and stored outcomes.
+const std = @import("std");
+const outcomes = @import("../outcome.zig");
+const Issue = @import("../schema/schema_issue.zig").Issue;
+
+pub const Version = enum(u8) { v1 = 1 };
+pub const Length = u32;
+pub const length_bytes = @sizeOf(Length);
+pub const header_bytes = @sizeOf(Version) + 2 * length_bytes;
+
+pub const Limits = struct {
+    max_schema_name_bytes: usize,
+    max_payload_bytes: usize,
+    max_frame_bytes: usize,
+
+    pub fn valid(self: Limits) bool {
+        const parts = std.math.add(usize, self.max_schema_name_bytes, self.max_payload_bytes) catch return false;
+        const total = std.math.add(usize, header_bytes, parts) catch return false;
+        return self.max_schema_name_bytes > 0 and self.max_payload_bytes > 0 and
+            self.max_schema_name_bytes <= std.math.maxInt(Length) and
+            self.max_payload_bytes <= std.math.maxInt(Length) and
+            self.max_frame_bytes >= total;
+    }
+};
+
+pub const View = struct { version: Version, schema_name: []const u8, payload: []const u8 };
+
+fn writeLength(target: []u8, value: Length) void {
+    var remaining = value;
+    var index = target.len;
+    while (index > 0) {
+        index -= 1;
+        target[index] = @truncate(remaining);
+        remaining >>= @bitSizeOf(u8);
+    }
+}
+
+fn readLength(source: []const u8) Length {
+    var value: Length = 0;
+    for (source) |byte| value = (value << @bitSizeOf(u8)) | byte;
+    return value;
+}
+
+pub fn inspect(frame: []const u8, limits: Limits) outcomes.Result(View, Issue) {
+    if (!limits.valid() or frame.len > limits.max_frame_bytes)
+        return .{ .err = Issue.pure(.decode, .size_limit) };
+    if (frame.len < header_bytes)
+        return .{ .err = Issue.pure(.decode, .invalid_value) };
+    if (frame[0] != @intFromEnum(Version.v1))
+        return .{ .err = Issue.pure(.decode, .incompatible_version) };
+    const version: Version = .v1;
+    const schema_length: usize = readLength(frame[@sizeOf(Version)..][0..length_bytes]);
+    const payload_length: usize = readLength(frame[@sizeOf(Version) + length_bytes ..][0..length_bytes]);
+    if (schema_length == 0 or schema_length > limits.max_schema_name_bytes or
+        payload_length > limits.max_payload_bytes)
+        return .{ .err = Issue.pure(.decode, .size_limit) };
+    const body = std.math.add(usize, schema_length, payload_length) catch
+        return .{ .err = Issue.pure(.decode, .size_limit) };
+    const total = std.math.add(usize, header_bytes, body) catch
+        return .{ .err = Issue.pure(.decode, .size_limit) };
+    if (total != frame.len)
+        return .{ .err = Issue.pure(.decode, .invalid_value) };
+    const name = frame[header_bytes..][0..schema_length];
+    if (!std.unicode.utf8ValidateSlice(name))
+        return .{ .err = Issue.pure(.decode, .invalid_utf8) };
+    return .{ .ok = .{ .version = version, .schema_name = name, .payload = frame[header_bytes + schema_length ..] } };
+}
+
+pub fn encode(env: anytype, comptime schema_name: []const u8, payload: []const u8, limits: Limits) outcomes.Exit(outcomes.OwnedSlice(u8), Issue) {
+    comptime {
+        if (schema_name.len == 0 or !std.unicode.utf8ValidateSlice(schema_name))
+            @compileError("binary codec schema name must be nonempty UTF-8 metadata");
+    }
+    if (!limits.valid() or schema_name.len > limits.max_schema_name_bytes or
+        payload.len > limits.max_payload_bytes)
+        return .{ .fail = Issue.init(env, .encode, .size_limit) };
+    const body = std.math.add(usize, schema_name.len, payload.len) catch
+        return .{ .fail = Issue.init(env, .encode, .size_limit) };
+    const total = std.math.add(usize, header_bytes, body) catch
+        return .{ .fail = Issue.init(env, .encode, .size_limit) };
+    if (total > limits.max_frame_bytes)
+        return .{ .fail = Issue.init(env, .encode, .size_limit) };
+    const frame = env.allocator.alloc(u8, total) catch return .{ .die = outcomes.Defect.out_of_memory };
+    frame[0] = @intFromEnum(Version.v1);
+    writeLength(frame[@sizeOf(Version)..][0..length_bytes], @intCast(schema_name.len));
+    writeLength(frame[@sizeOf(Version) + length_bytes ..][0..length_bytes], @intCast(payload.len));
+    @memcpy(frame[header_bytes..][0..schema_name.len], schema_name);
+    @memcpy(frame[header_bytes + schema_name.len ..], payload);
+    return .{ .success = .{ .items = frame, .allocator = env.allocator } };
+}
+
+pub fn decode(env: anytype, comptime schema_name: []const u8, frame: []const u8, limits: Limits) outcomes.Exit(outcomes.OwnedSlice(u8), Issue) {
+    const view = switch (inspect(frame, limits)) {
+        .ok => |value| value,
+        .err => |problem| return .{ .fail = problem },
+    };
+    if (!std.mem.eql(u8, view.schema_name, schema_name))
+        return .{ .fail = Issue.init(env, .decode, .incompatible_version) };
+    const payload = env.allocator.dupe(u8, view.payload) catch return .{ .die = outcomes.Defect.out_of_memory };
+    return .{ .success = .{ .items = payload, .allocator = env.allocator } };
+}

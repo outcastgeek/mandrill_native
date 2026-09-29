@@ -1,0 +1,9 @@
+# Cluster
+
+Cluster separates accepted messages, ownership/activation, execution and recorded replies. Stable addresses and request IDs determine identity; store claims and ownership generations fence stale workers. The message store owns accepted requests and completion records. `MemoryClusterMessageStore` is process-local and cannot satisfy a physical-durability promise; an external provider must document its restart and multi-process guarantees.
+
+`ClusterWorkflowEngine` is an adapter from addressed Cluster delivery to the independent `WorkflowEngine`. It dispatches typed `WorkflowCommand` values to that engine and returns `WorkflowReply` values; it does not create another workflow journal. `ClusterWorkflowEngine::register` couples an entity type with an RPC operation and verifies that the addressed entity ID matches the workflow run ID. The [adapter test](../../tests/cluster_workflow_bridge.rs) checks registration failure, start, inspect and completion against one engine instance.
+
+The [runner bridge test](../../tests/cluster_runner_bridge.rs) covers accepted-message claim, adapter execution and recorded-reply delivery with message-store, scheduler and wall-clock capabilities supplied by the environment. It demonstrates reclaim after an engine rejection and expired claim lease, then routes an encoded cancellation through `EntityDispatcher`, `ClusterRunner` and `ClusterWorkflowEngine`, checking the saved framed reply and workflow state. The [RPC dispatcher test](../../tests/rpc_cluster_dispatch.rs) separately covers frame and envelope decoding, address checks and typed reply encoding.
+
+The external [provider-neutral consumer](../../tests/fixtures/shared/provider_program.rs) registers an `entity!` handler in `entity_macro` and executes an addressed framed call without a host or transport dependency in the definition.

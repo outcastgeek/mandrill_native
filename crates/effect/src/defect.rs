@@ -5,7 +5,9 @@ use std::sync::Arc;
 ///
 /// These conditions occupy the defect channel. Diagnostic wording is for
 /// people; use this identity when inspecting or recording a library failure.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Serialized variant names are part of the stored-outcome version 1 protocol;
+/// renaming one requires a deliberate format migration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LibraryDefect {
     MissingEffectRecipe,
     MissingInterpreterOutcome,
@@ -54,6 +56,9 @@ pub enum LibraryDefect {
     WeakCacheLoadConsumed,
     WeakCacheKeyDropped,
     StreamReaderStillOwned,
+    StreamProducerSlotMissing,
+    StreamBufferValueMissing,
+    RequestResolverUnexpectedSuccess,
     InvalidRandomSample,
     SyncCallbackConsumed,
     TraceCountOverflow,
@@ -97,6 +102,13 @@ impl LibraryDefect {
             Self::ScheduleCountOverflow => "Schedule recurrence count overflowed",
             Self::InvalidSchedulePolicy => "Schedule policy is invalid",
             Self::StreamCollectionLimitExceeded => "Stream exceeded the caller's collection limit",
+            Self::StreamProducerSlotMissing => {
+                "Stream producer slot was missing during observation"
+            }
+            Self::StreamBufferValueMissing => "Stream buffer value was missing during admission",
+            Self::RequestResolverUnexpectedSuccess => {
+                "Failure-only request conversion received success"
+            }
             Self::MissingScheduleRecipe => "Schedule recipe was missing",
             Self::ProviderClosed => "Provider admission is closed",
             Self::ProviderCapacityFull => "Provider admission capacity is full",
@@ -125,7 +137,7 @@ impl LibraryDefect {
 }
 
 /// Classification independent of a defect's human-readable diagnostic.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DefectKind {
     /// Explicit diagnostic supplied by application or adapter code.
     Custom,

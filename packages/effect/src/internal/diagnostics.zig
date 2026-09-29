@@ -36,6 +36,7 @@ pub const Operation = enum {
 };
 
 pub const allocation_failed = "Effect allocation failed";
+pub const rpc_handler_finalization_failed = "RPC handler finalization failed";
 pub const suspended_binding_allocator = "Suspended binding requires an allocator supplied through its environment";
 pub const owned_binding_allocator = "Runtime description construction requires an allocator supplied through its environment";
 pub const provision_allocator = "Environment provision requires the bound allocator for suspended work";
@@ -62,7 +63,7 @@ pub const native_io_capability = "tryIo requires environment .io: std.Io";
 pub const defer_result = "deferEffect factory must return the same Effect(A, E, R)";
 pub const recovery_result = "catchAll must return the same Effect; adapt errors/environments explicitly";
 pub const resource_allocator_capability = "acquireRelease requires environment .allocator: std.mem.Allocator";
-pub const finalizer_contract = "acquireRelease finalizer must accept the resource and PrimaryOutcome(E), and return Effect(void, E, R)";
+pub const finalizer_contract = "acquireRelease finalizer must accept the resource and PrimaryOutcome(E), optionally followed by *const R, and return Effect(void, E, R)";
 pub const projection_contract = "provideSome must return a borrowed pointer to the required environment";
 pub const allocator_field = "Effect environment .allocator must be std.mem.Allocator";
 pub const io_field = "Effect environment .io must be std.Io";
@@ -82,6 +83,8 @@ pub const http_transfer_and_redirect_buffers_must_be_non_empty = "HTTP transfer 
 pub const invalid_http_header = "Invalid HTTP header";
 pub const clock_sleep_duration_must_be_non_negative = "Clock sleep duration must be non-negative";
 pub const clock_deadline_overflowed = "Clock deadline overflowed";
+pub const query_refresh_interval_must_be_positive = "Query refresh interval must be positive";
+pub const query_refresh_deadline_overflowed = "Query refresh deadline overflowed";
 pub const manual_clock_cannot_move_backwards = "Manual clock cannot move backwards";
 pub const manual_clock_timestamp_overflowed = "Manual clock timestamp overflowed";
 pub const ref_values_must_be_borrowed_handles_or_ordinary_copyable_values_an_owning = "Ref values must be borrowed handles or ordinary copyable values; an owning payload requires an explicit ownership adapter";
@@ -144,3 +147,4 @@ pub const native_operation_requires_independent_i_o_progress = "Native operation
 
 pub const native_allocator_capability = "Native Effect execution requires environment .allocator: std.mem.Allocator";
 pub const native_future_io_capability = "Native Effect execution requires environment .io: std.Io";
+pub const owned_effect_outcome_can_run_only_once = "An owned Effect outcome can run only once";

@@ -22,6 +22,12 @@ cases = {
     "unhandled_exit": "switch must handle all possibilities",
     "owned_wrong_error": "flatMapOwned error type mismatch",
     "owned_const_source": "cast discards const qualifier",
+    "wrong_workflow_effect": "WorkflowBuilder accepts only its described durable steps",
+    "incomplete_record_builder": "has no member named 'build'",
+    "unpaired_rpc_operation": "protocol members must pair operations with handlers",
+    "wrong_rpc_stream_handler": "cannot cast into return type 'effect.Stream",
+    "forged_rpc_descriptor": "an RPC operation needs a stable name",
+    "transaction_rejects_effect": "transaction composition accepts only a typed transaction description",
 }
 for name, diagnostic in cases.items():
     checked = subprocess.run(

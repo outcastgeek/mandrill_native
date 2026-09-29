@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run typed outcome and representation tests");
     test_step.dependOn(boundedTests(b, tests));
     const provider_step = b.step("provider-test", "Run external facility, native I/O and mixed-provider lifecycle tests");
-    for ([_][]const u8{ "proofs/void-binding.zig", "proofs/runtime-binding.zig", "proofs/codegen.zig", "proofs/facilities.zig", "proofs/concurrency-contracts.zig", "proofs/mixed-pipeline.zig", "proofs/lifecycle-contracts.zig" }) |source| {
+    for ([_][]const u8{ "proofs/void-binding.zig", "proofs/runtime-binding.zig", "proofs/codegen.zig", "proofs/facilities.zig", "proofs/concurrency-contracts.zig", "proofs/mixed-pipeline.zig", "proofs/lifecycle-contracts.zig", "proofs/new-compositions.zig" }) |source| {
         const consumer_tests = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(source),
             .target = target,
@@ -40,6 +40,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.step("example", "Run an external consumer of the Effect module").dependOn(&b.addRunArtifact(example).step);
+
+    const independent_consumer = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "run", b.fmt("-Doptimize={s}", .{@tagName(optimize)}) });
+    independent_consumer.setCwd(b.path("tests/capabilities/consumer"));
+    b.step("consumer", "Build and execute the independent public-module package")
+        .dependOn(&independent_consumer.step);
 
     const fmt = b.addFmt(.{ .paths = &.{ "src", "examples", "proofs", "tests", "build.zig" }, .check = true });
     b.step("fmt", "Check Zig formatting").dependOn(&fmt.step);

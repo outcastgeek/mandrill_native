@@ -1147,11 +1147,14 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 name = "effect"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "effect-macros",
  "event-listener 5.4.2",
  "futures-executor",
  "futures-util",
+ "serde",
  "serde_json",
+ "serde_stacker",
 ]
 
 [[package]]
@@ -3288,6 +3291,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "serde_stacker"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4936375d50c4be7eff22293a9344f8e46f323ed2b3c243e52f89138d9bb0f4a"
+dependencies = [
+ "serde",
+ "serde_core",
+ "stacker",
 ]
 
 [[package]]

@@ -4,15 +4,110 @@ use futures_executor::block_on;
 use futures_util::future::join;
 use std::cell::Cell;
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Barrier, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
+use std::task::{Context, Poll};
 use std::time::Duration;
 #[path = "support/drive.rs"]
 mod drive;
 #[path = "support/task_cases.rs"]
 pub mod tasks;
+
+struct PendingItems(Arc<AtomicUsize>);
+
+impl futures_util::stream::Stream for PendingItems {
+    type Item = Result<usize, ()>;
+
+    fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Poll::Pending
+    }
+}
+
+#[test]
+fn async_iterable_pull_settles_and_disposes_when_cancelled() {
+    let environment = Arc::new(Env::default());
+    let entered = Arc::new(AtomicUsize::new(0));
+    let disposed = Arc::new(AtomicUsize::new(0));
+    let stream: Stream<usize, (), Env> = Stream::from_async_iterable(
+        {
+            let entered = Arc::clone(&entered);
+            move || PendingItems(Arc::clone(&entered))
+        },
+        |error| error,
+        {
+            let disposed = Arc::clone(&disposed);
+            move |items| {
+                let disposed = Arc::clone(&disposed);
+                Release::sync(move || {
+                    drop(items);
+                    disposed.fetch_add(1, Ordering::SeqCst);
+                })
+            }
+        },
+    );
+    let mut running = Box::pin(
+        stream
+            .run_collect(None)
+            .run_cancellable(Arc::clone(&environment)),
+    );
+    drive::until(running.as_mut(), || entered.load(Ordering::SeqCst) > 0);
+    assert!(environment.cancel.request());
+    assert!(matches!(block_on(running), Exit::Interrupted));
+    assert_eq!(disposed.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn subscription_snapshot_and_publication_share_one_boundary() {
+    const RACE_ROUNDS: usize = 1_000;
+    let environment = Arc::new(());
+    let capacity = NonZeroUsize::new(2).expect("positive fixture capacity");
+
+    for _ in 0..RACE_ROUNDS {
+        let reference = SubscriptionRef::new(0_usize, capacity, PubSubOverflow::Backpressure);
+        let start = Arc::new(Barrier::new(2));
+        let (snapshot, published) = std::thread::scope(|threads| {
+            let subscribe = threads.spawn(|| {
+                start.wait();
+                block_on(reference.subscribe().run(Arc::clone(&environment)))
+            });
+            let publish = threads.spawn(|| {
+                start.wait();
+                block_on(reference.set(1).run(Arc::clone(&environment)))
+            });
+            (
+                subscribe.join().expect("subscriber thread"),
+                publish.join().expect("publisher thread"),
+            )
+        });
+        assert!(matches!(published, Exit::Success(_)));
+        let snapshot = match snapshot {
+            Exit::Success(snapshot) => snapshot,
+            _ => panic!("subscription must succeed"),
+        };
+
+        match *snapshot.value {
+            0 => {
+                let next = block_on(snapshot.subscription.take().run(Arc::clone(&environment)));
+                assert!(
+                    matches!(next, Exit::Success(SubscriptionEvent::Item(value)) if *value == 1)
+                );
+            }
+            1 => {}
+            other => panic!("unexpected snapshot value {other}"),
+        }
+
+        assert!(matches!(
+            block_on(reference.set(2).run(Arc::clone(&environment))),
+            Exit::Success(_)
+        ));
+        let next = block_on(snapshot.subscription.take().run(Arc::clone(&environment)));
+        assert!(matches!(next, Exit::Success(SubscriptionEvent::Item(value)) if *value == 2));
+    }
+}
 
 #[derive(Default)]
 struct Env {

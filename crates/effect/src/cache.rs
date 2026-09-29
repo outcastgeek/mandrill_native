@@ -582,8 +582,14 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
         &self,
         key: K,
     ) -> Effect<SharedValue<A>, SharedValue<E>, R> {
+        self.get_shared(Arc::new(key))
+    }
+
+    pub(crate) fn get_shared<R: Send + Sync + 'static>(
+        &self,
+        key: Arc<K>,
+    ) -> Effect<SharedValue<A>, SharedValue<E>, R> {
         let cache = self.clone();
-        let key = Arc::new(key);
         Effect::new(move |_, context, finish| {
             let cache = cache.clone();
             let key = Arc::clone(&key);
@@ -638,8 +644,14 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
         cleanup
     }
     pub fn invalidate<R: Send + Sync + 'static>(&self, key: K) -> Effect<(), SharedValue<E>, R> {
+        self.invalidate_shared(Arc::new(key))
+    }
+
+    pub(crate) fn invalidate_shared<R: Send + Sync + 'static>(
+        &self,
+        key: Arc<K>,
+    ) -> Effect<(), SharedValue<E>, R> {
         let cache = self.clone();
-        let key = Arc::new(key);
         Effect::new(move |_, _, finish| {
             let cache = cache.clone();
             let key = Arc::clone(&key);

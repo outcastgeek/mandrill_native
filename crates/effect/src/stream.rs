@@ -1,6 +1,10 @@
 use crate::internal::workflow::{self, bind, success};
 use crate::{Defect, Effect, Exit, LibraryDefect, Release, Scope};
+use futures_util::future::{Either, select};
 use std::sync::{Arc, Mutex};
+
+mod internal;
+pub use internal::StreamBufferOptions;
 
 pub enum Chunk<A> {
     Values(Vec<A>),
@@ -140,6 +144,28 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Stream<A, E
         })
     }
 }
+
+impl<A: Send + 'static, E: Send + 'static, R: crate::HasTaskSpawner + Send + Sync + 'static>
+    Stream<A, E, R>
+{
+    /// Prefetch through a child owned by the opening scope. `capacity` bounds
+    /// queued values, while `pull_batch` controls each downstream chunk.
+    /// Values drain before the source's terminal outcome; scope cancellation
+    /// interrupts the child and discards unread buffered values.
+    #[must_use]
+    pub fn buffer(self, options: StreamBufferOptions) -> Self {
+        internal::buffered(self, options)
+    }
+
+    /// Merge two scoped sources. Arrival order across sources is deliberately
+    /// unspecified; each source retains its own order. Queued values drain
+    /// before a terminal failure, which cancels the other producer. Both
+    /// sources must end successfully before the merged reader ends.
+    #[must_use]
+    pub fn merge(self, other: Self, options: StreamBufferOptions) -> Self {
+        internal::merged(self, other, options)
+    }
+}
 fn collect<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static>(
     reader: StreamReader<A, E, R>,
     mut values: Vec<A>,
@@ -182,6 +208,9 @@ fn drain_chunk<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static>(
 
 impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Stream<A, E, R> {
     #[must_use]
+    /// A cancellation request interrupts a blocked lock or next-item wait and
+    /// releases the scoped source. Whether a partially polled item can be
+    /// replayed depends on the supplied async stream's own contract.
     pub fn from_async_iterable<
         X: Send + 'static,
         S: futures_util::stream::Stream<Item = Result<A, X>> + Unpin + Send + 'static,
@@ -206,12 +235,22 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Stream<A, E
                     let on_error = Arc::clone(&on_error);
                     crate::internal::runtime::Step::Suspended(Box::pin(async move {
                         let work = async {
-                            let mut stream = stream.lock().await;
+                            let lock = std::pin::pin!(stream.lock());
+                            let cancelled = std::pin::pin!(context.cancellation.cancelled());
+                            let mut stream = match select(lock, cancelled).await {
+                                Either::Left((stream, _)) => stream,
+                                Either::Right(_) => return Exit::Interrupted,
+                            };
                             use futures_util::StreamExt;
-                            match stream.next().await {
-                                Some(Ok(value)) => Exit::Success(Chunk::Values(vec![value])),
-                                Some(Err(error)) => Exit::Fail(on_error(error)),
-                                None => Exit::Success(Chunk::End),
+                            let next = std::pin::pin!(stream.next());
+                            let cancelled = std::pin::pin!(context.cancellation.cancelled());
+                            match select(next, cancelled).await {
+                                Either::Left((Some(Ok(value)), _)) => {
+                                    Exit::Success(Chunk::Values(vec![value]))
+                                }
+                                Either::Left((Some(Err(error)), _)) => Exit::Fail(on_error(error)),
+                                Either::Left((None, _)) => Exit::Success(Chunk::End),
+                                Either::Right(_) => Exit::Interrupted,
                             }
                         };
                         let result = futures_util::FutureExt::catch_unwind(

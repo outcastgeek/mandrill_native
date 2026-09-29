@@ -91,6 +91,18 @@ impl Audit {
 }
 
 impl<'ast> Visit<'ast> for Audit {
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if item.attrs.iter().any(|attribute| {
+            attribute.path().is_ident("cfg")
+                && attribute
+                    .parse_args::<syn::Ident>()
+                    .is_ok_and(|condition| condition == "test")
+        }) {
+            return;
+        }
+        syn::visit::visit_item_mod(self, item);
+    }
+
     fn visit_attribute(&mut self, _: &'ast syn::Attribute) {
         // Rust compiler metadata (documentation, module paths, and must_use
         // diagnostics) is covered by the written inventory, not policy values.
@@ -197,7 +209,31 @@ fn production_literals_match_the_reviewed_semantic_inventory()
         let relative = file.strip_prefix(workspace)?.to_owned();
         violations.extend(audit(relative, &std::fs::read_to_string(file)?)?);
     }
-    assert!(violations.is_empty(), "{}", violations.join("\n"));
+    violations.sort();
+    let mut reviewed = include_str!("source_policy_inventory.txt")
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    reviewed.sort();
+    if violations != reviewed {
+        let mut additions = violations.clone();
+        let mut removals = reviewed.clone();
+        for entry in &reviewed {
+            if let Some(index) = additions.iter().position(|candidate| candidate == entry) {
+                additions.remove(index);
+            }
+        }
+        for entry in &violations {
+            if let Some(index) = removals.iter().position(|candidate| candidate == entry) {
+                removals.remove(index);
+            }
+        }
+        assert!(
+            additions.is_empty() && removals.is_empty(),
+            "production literals changed; review the inventory: added {additions:#?}; removed {removals:#?}"
+        );
+    }
     Ok(())
 }
 

@@ -285,6 +285,13 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
         })
     }
 
+    /// Observe the complete exit as data, retaining expected errors, defects,
+    /// interruption and finalization failures without erasing their channels.
+    /// This is useful for diagnostics and reactive state descriptions.
+    pub fn materialize_exit(self) -> Effect<Exit<A, E>, std::convert::Infallible, R> {
+        self.bind_exit(workflow::success)
+    }
+
     pub fn result(self) -> Effect<Result<A, E>, E, R> {
         self.either()
     }
@@ -441,6 +448,21 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
 }
 
 impl<E: Send + 'static, R: Send + Sync + 'static> Effect<(), E, R> {
+    /// Walk a fresh iterator sequentially without collecting per-item
+    /// programs or results. The factory is reevaluated for each Effect run.
+    pub fn for_each_sequential<Items>(
+        items: impl Fn() -> Items + Send + Sync + 'static,
+        body: impl Fn(Items::Item) -> Self + Send + Sync + 'static,
+    ) -> Self
+    where
+        Items: IntoIterator + 'static,
+        Items::Item: Send + 'static,
+        Items::IntoIter: Send + 'static,
+    {
+        let body = Arc::new(body);
+        workflow::reusable(move || walk_unit(items().into_iter(), Arc::clone(&body)))
+    }
+
     /// Check a lazy guard before each iteration and create a fresh body only
     /// when it succeeds. Failures and cancellation stop further iterations.
     pub fn while_loop(
@@ -455,6 +477,20 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Effect<(), E, R> {
             }
         });
         workflow::reusable(move || iterate((), Arc::clone(&step)))
+    }
+}
+
+fn walk_unit<I, E, R, F>(mut items: I, body: Arc<F>) -> Workflow<(), E, R>
+where
+    I: Iterator + Send + 'static,
+    I::Item: Send + 'static,
+    E: Send + 'static,
+    R: Send + Sync + 'static,
+    F: Fn(I::Item) -> Effect<(), E, R> + Send + Sync + 'static,
+{
+    match items.next() {
+        Some(item) => workflow::bind(body(item), move |()| walk_unit(items, body)),
+        None => workflow::success(()),
     }
 }
 

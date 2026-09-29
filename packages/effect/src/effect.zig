@@ -275,7 +275,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                     return parent.finish(callback(borrowed, parent.env));
                 }
             };
-            return .{ .value = .{ .borrowed = capture }, .start = Adapter.start };
+            return .{ .value = .{ .borrowed = @ptrCast(capture) }, .start = Adapter.start };
         }
 
         fn captureOwned(allocator: std.mem.Allocator, capture: anytype, comptime suspended: bool, comptime callback: fn (*const @TypeOf(capture), *const R, ?*const rt.Cancellation) outcomes.Exit(A, E)) Self {
@@ -285,6 +285,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                 capture: Capture,
                 fn destroy(header: *rt.DescriptionNode) void {
                     const node: *@This() = @alignCast(@fieldParentPtr("header", header));
+                    outcomes.discardPayload(&node.capture);
                     header.allocator.destroy(node);
                 }
                 fn origin(environment: *const anyopaque, _: *const anyopaque) rt.Services {
@@ -301,7 +302,11 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                     return program.start.?(state, parent);
                 }
             };
-            const node = allocator.create(Node) catch return die(outcomes.Defect.out_of_memory);
+            const node = allocator.create(Node) catch {
+                var abandoned = capture;
+                outcomes.discardPayload(&abandoned);
+                return die(outcomes.Defect.out_of_memory);
+            };
             node.* = .{ .header = .{ .previous = null, .allocator = allocator, .destroy = Node.destroy, .origin = .{ .data = node, .resolve = Node.origin } }, .capture = capture };
             return .{ .value = .{ .borrowed = node }, .ready = if (suspended) null else Node.ready, .start = if (suspended) Node.start else null, .ownership = &node.header };
         }
@@ -317,6 +322,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
 
                 fn destroy(header: *rt.DescriptionNode) void {
                     const node: *@This() = @alignCast(@fieldParentPtr("header", header));
+                    outcomes.discardPayload(&node.capture);
                     header.allocator.destroy(node);
                 }
 
@@ -329,14 +335,89 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                     return callback(&node.capture, supplied);
                 }
             };
-            const allocator = rt.services(R, env).allocatorValue() orelse
+            const allocator = rt.services(R, env).allocatorValue() orelse {
+                var abandoned = capture;
+                outcomes.discardPayload(&abandoned);
                 return die(.{ .kind = .invalid_configuration, .message = diagnostics.owned_binding_allocator });
-            const node = allocator.create(Node) catch return die(outcomes.Defect.out_of_memory);
+            };
+            const node = allocator.create(Node) catch {
+                var abandoned = capture;
+                outcomes.discardPayload(&abandoned);
+                return die(outcomes.Defect.out_of_memory);
+            };
             node.* = .{
                 .header = .{ .previous = null, .allocator = allocator, .destroy = Node.destroy, .origin = .{ .data = node, .resolve = Node.origin } },
                 .capture = capture,
             };
             return .{ .value = .{ .borrowed = node }, .ready = Node.ready, .ownership = &node.header };
+        }
+
+        /// Owns a runtime capture while exposing the active branch token to
+        /// a cancellation-aware synchronous provider operation.
+        pub fn fromOwnedCancellable(
+            env: *const R,
+            capture: anytype,
+            comptime callback: fn (*const @TypeOf(capture), *const R, ?*const rt.Cancellation) outcomes.Exit(A, E),
+        ) Self {
+            const allocator = rt.services(R, env).allocatorValue() orelse {
+                var abandoned = capture;
+                outcomes.discardPayload(&abandoned);
+                return die(.{ .kind = .invalid_configuration, .message = diagnostics.owned_binding_allocator });
+            };
+            return captureOwned(allocator, capture, false, callback);
+        }
+
+        /// A runtime continuation may create an owning result after the
+        /// program starts. This description transfers that Exit exactly once.
+        /// If cancellation or disposal prevents execution, its owner is
+        /// released with the description. No allocator or I/O argument is
+        /// duplicated outside the caller's R.
+        pub fn fromOwnedOutcome(env: *const R, supplied: outcomes.Exit(A, E)) Self {
+            const Node = struct {
+                header: rt.DescriptionNode,
+                outcome: ?outcomes.Exit(A, E),
+                claimed: std.atomic.Value(bool) = .init(false),
+
+                fn destroy(header: *rt.DescriptionNode) void {
+                    const node: *@This() = @alignCast(@fieldParentPtr("header", header));
+                    if (node.outcome) |*remaining| remaining.deinit();
+                    header.allocator.destroy(node);
+                }
+
+                fn origin(env_data: *const anyopaque, _: *const anyopaque) rt.Services {
+                    return rt.services(R, @ptrCast(@alignCast(env_data)));
+                }
+
+                fn ready(_: *const R, stored: Value, _: *rt.State) outcomes.Exit(A, E) {
+                    const node: *@This() = @ptrCast(@alignCast(@constCast(stored.borrowed)));
+                    if (node.claimed.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
+                        return .{ .die = .{ .kind = .invalid_configuration, .message = diagnostics.owned_effect_outcome_can_run_only_once } };
+                    const resolved = node.outcome.?;
+                    node.outcome = null;
+                    return resolved;
+                }
+            };
+            const allocator = rt.services(R, env).allocatorValue() orelse {
+                var abandoned = supplied;
+                abandoned.deinit();
+                return die(.{ .kind = .invalid_configuration, .message = diagnostics.owned_binding_allocator });
+            };
+            const node = allocator.create(Node) catch {
+                var abandoned = supplied;
+                abandoned.deinit();
+                return die(outcomes.Defect.out_of_memory);
+            };
+            node.* = .{ .header = .{
+                .previous = null,
+                .allocator = allocator,
+                .destroy = Node.destroy,
+                .origin = .{ .data = node, .resolve = Node.origin },
+            }, .outcome = supplied };
+            return .{ .value = .{ .borrowed = node }, .ready = Node.ready, .ownership = &node.header };
+        }
+
+        pub fn fromOwnedSuccess(env: *const R, value: A) Self {
+            return fromOwnedOutcome(env, .{ .success = value });
         }
 
         fn afterDynamic(self: *Self, allocator: std.mem.Allocator, comptime complete: fn (outcomes.Exit(A, E), *const R, *rt.State, *outcomes.CleanupStorage(E)) outcomes.Exit(A, E)) Self {
@@ -562,7 +643,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                     return .{ .data = frame, .advance = null, .suspended = Frame.continueAsync };
                 }
             };
-            return .{ .value = .{ .borrowed = capture }, .start = Adapter.start };
+            return .{ .value = .{ .borrowed = @ptrCast(capture) }, .start = Adapter.start };
         }
 
         pub fn awaitDeferred(deferred: *primitives.Deferred(A, E)) Self {
@@ -826,6 +907,138 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.handle, null);
         }
 
+        /// Carries an owned runtime value through a suspended continuation.
+        /// `next` may inspect the capture while constructing its returned
+        /// Effect; any data needed after that return must be copied into the
+        /// new description. The capture is released exactly once.
+        pub fn flatMapCapturedOwned(
+            self: *Self,
+            env: *const R,
+            comptime B: type,
+            capture: anytype,
+            comptime next: fn (*const @TypeOf(capture), A, *const R) Effect(B, E, R),
+        ) Effect(B, E, R) {
+            const Capture = @TypeOf(capture);
+            const Out = Effect(B, E, R);
+            const Node = struct {
+                const BoundNode = @This();
+                header: rt.DescriptionNode,
+                source: Self,
+                capture: Capture,
+
+                fn destroy(header: *rt.DescriptionNode) void {
+                    const node: *@This() = @alignCast(@fieldParentPtr("header", header));
+                    outcomes.discardPayload(&node.capture);
+                    header.allocator.destroy(node);
+                }
+
+                fn origin(env_data: *const anyopaque, source_data: *const anyopaque) rt.Services {
+                    const node: *const @This() = @ptrCast(@alignCast(source_data));
+                    const supplied: *const R = @ptrCast(@alignCast(env_data));
+                    return node.source.services(supplied);
+                }
+
+                fn resolve(supplied: *const R, value: Out.Value) rt.Services {
+                    const node: *const @This() = @ptrCast(@alignCast(value.borrowed));
+                    return node.header.origin.services(supplied);
+                }
+
+                fn continueWith(node: *const @This(), result_value: outcomes.Exit(A, E), state: *rt.State, parent: *Out.Job) rt.Step {
+                    const produced: Out = switch (result_value) {
+                        .success => |value| if (state.cancelled()) blk: {
+                            var discarded = value;
+                            outcomes.discardPayload(&discarded);
+                            break :blk Out.interrupted();
+                        } else next(&node.capture, value, parent.env),
+                        else => Out.terminalFailure(result_value),
+                    };
+                    parent.replace(produced);
+                    return parent.tail(state);
+                }
+
+                fn start(state: *rt.State, parent: *Out.Job) rt.Step {
+                    const node: *const @This() = @ptrCast(@alignCast(parent.program.value.borrowed));
+                    const Frame = struct {
+                        child: Job,
+                        evaluated: outcomes.Exit(A, E) = undefined,
+                        parent: *Out.Job,
+                        node: *const BoundNode,
+                        allocator: std.mem.Allocator,
+
+                        fn complete(active: *rt.State, data: ?*anyopaque) rt.Step {
+                            const frame: *@This() = @ptrCast(@alignCast(data.?));
+                            const evaluated = frame.evaluated;
+                            const target = frame.parent;
+                            const captured = frame.node;
+                            frame.allocator.destroy(frame);
+                            return BoundNode.continueWith(captured, evaluated, active, target);
+                        }
+                    };
+                    var current = node.source;
+                    const enclosing = state.services;
+                    var produced_owner: ?*rt.DescriptionNode = null;
+                    while (true) {
+                        state.services = current.services(parent.env).inherit(enclosing);
+                        if (current.delivery == .ordinary and state.cancelled()) {
+                            rt.DescriptionNode.deinit(produced_owner);
+                            return node.continueWith(.interrupted, state, parent);
+                        }
+                        if (current.reduce) |reduce| {
+                            const produced = reduce(parent.env, current.value, state);
+                            rt.DescriptionNode.deinit(produced_owner);
+                            produced_owner = produced.ownership;
+                            current = produced;
+                            continue;
+                        }
+                        if (current.ready) |ready| {
+                            const evaluated = ready(parent.env, current.value, state);
+                            rt.DescriptionNode.deinit(produced_owner);
+                            return node.continueWith(evaluated, state, parent);
+                        }
+                        break;
+                    }
+                    const allocator = state.services.allocatorValue() orelse {
+                        rt.DescriptionNode.deinit(produced_owner);
+                        return parent.finish(.{ .die = .{
+                            .kind = .invalid_configuration,
+                            .message = diagnostics.suspended_binding_allocator,
+                        } });
+                    };
+                    const frame = allocator.create(Frame) catch {
+                        rt.DescriptionNode.deinit(produced_owner);
+                        return parent.finish(.{ .die = outcomes.Defect.out_of_memory });
+                    };
+                    frame.* = .{ .parent = parent, .node = node, .allocator = allocator, .child = .{
+                        .program = current,
+                        .inherited = state.services,
+                        .owned = produced_owner,
+                        .env = parent.env,
+                        .sink = .{ .output = &frame.evaluated, .next_step = .{ .data = frame, .advance = Frame.complete } },
+                    } };
+                    return frame.child.step();
+                }
+            };
+            const allocator = self.services(env).allocatorValue() orelse {
+                self.deinit();
+                var abandoned = capture;
+                outcomes.discardPayload(&abandoned);
+                return Out.die(.{ .kind = .invalid_configuration, .message = diagnostics.owned_binding_allocator });
+            };
+            const node = allocator.create(Node) catch {
+                self.deinit();
+                var abandoned = capture;
+                outcomes.discardPayload(&abandoned);
+                return Out.die(outcomes.Defect.out_of_memory);
+            };
+            node.* = .{
+                .header = .{ .previous = self.ownership, .allocator = allocator, .destroy = Node.destroy, .origin = .{ .data = node, .resolve = Node.origin } },
+                .source = self.*,
+                .capture = capture,
+            };
+            self.* = undefined;
+            return .{ .value = .{ .borrowed = node }, .ownership = &node.header, .resolve = Node.resolve, .start = Node.start };
+        }
+
         fn bindExitOwned(self: *Self, env: *const R, comptime Out: type, comptime next: fn (outcomes.Exit(A, E), *const R, *rt.State) Out, scoped_services: ?rt.Services) Out {
             const Node = struct {
                 header: rt.DescriptionNode,
@@ -925,6 +1138,19 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.next);
         }
 
+        /// Consumes a runtime-built description while retaining the same
+        /// typed environment and error. The mapped value is transferred to
+        /// an owning continuation only when execution reaches this step.
+        pub fn mapOwned(self: *Self, env: *const R, comptime transform: anytype) Effect(unaryResult(transform, A, .map), E, R) {
+            const B = unaryResult(transform, A, .map);
+            const Out = Effect(B, E, R);
+            return self.flatMapOwned(env, struct {
+                fn next(value: A, supplied: *const R) Out {
+                    return Out.fromOwnedSuccess(supplied, transform(value));
+                }
+            }.next);
+        }
+
         pub fn mapError(comptime self: Self, comptime transform: anytype) Effect(A, unaryResult(transform, E, .mapError), R) {
             const F = unaryResult(transform, E, .mapError);
             const Out = Effect(A, F, R);
@@ -933,6 +1159,18 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                     return Out.terminalExit(outcomes.mapError(F, value, state.services.allocatorValue(), transform));
                 }
             }.handle);
+        }
+
+        /// Maps a runtime-built owning description without discarding its
+        /// capture or requiring that its value be known at comptime.
+        pub fn mapErrorOwned(self: *Self, env: *const R, comptime transform: anytype) Effect(A, unaryResult(transform, E, .mapError), R) {
+            const F = unaryResult(transform, E, .mapError);
+            const Out = Effect(A, F, R);
+            return self.bindExitOwned(env, Out, struct {
+                fn handle(value: outcomes.Exit(A, E), _: *const R, state: *rt.State) Out {
+                    return Out.terminalExit(outcomes.mapError(F, value, state.services.allocatorValue(), transform));
+                }
+            }.handle, null);
         }
 
         inline fn terminalExit(value: outcomes.Exit(A, E)) Self {
@@ -958,6 +1196,42 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
 
         pub fn result(comptime self: Self) Effect(outcomes.Result(A, E), E, R) {
             return self.either();
+        }
+
+        /// Reify the entire terminal outcome as an owning success value.
+        /// Domain failure, interruption, defect and failed cleanup remain
+        /// distinct; callers can observe them without an error-union catch.
+        pub fn exit(comptime self: Self) Effect(outcomes.Exit(A, E), E, R) {
+            const Out = Effect(outcomes.Exit(A, E), E, R);
+            return self.bindExit(Out, struct {
+                fn handle(value: outcomes.Exit(A, E), _: *const R, _: *rt.State) Out {
+                    return Out.succeedMoved(value);
+                }
+            }.handle);
+        }
+
+        /// Reifies a runtime-built description's full Exit. This consumes
+        /// the description exactly once; its owner remains with the returned
+        /// Effect until execution or disposal.
+        pub fn exitOwned(self: *Self, env: *const R) Effect(outcomes.Exit(A, E), E, R) {
+            const Out = Effect(outcomes.Exit(A, E), E, R);
+            return self.bindExitOwned(env, Out, struct {
+                fn handle(value: outcomes.Exit(A, E), _: *const R, _: *rt.State) Out {
+                    return Out.succeedMoved(value);
+                }
+            }.handle, null);
+        }
+
+        /// Reifies every terminal path, including typed failure and cleanup,
+        /// into an owned Exit value. The resulting Effect has no domain-error
+        /// value because the original error is inside that Exit.
+        pub fn materializeOwned(self: *Self, env: *const R) Effect(outcomes.Exit(A, E), void, R) {
+            const Out = Effect(outcomes.Exit(A, E), void, R);
+            return self.bindExitOwned(env, Out, struct {
+                fn handle(value: outcomes.Exit(A, E), _: *const R, _: *rt.State) Out {
+                    return Out.succeedMoved(value);
+                }
+            }.handle, null);
         }
 
         pub fn option(comptime self: Self) Effect(?A, E, R) {
@@ -2346,18 +2620,77 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
 
         pub fn acquireRelease(comptime self: Self, comptime use: anytype, comptime release: anytype) continuationResult(use, A, R, .acquireRelease_body) {
             const Out = continuationResult(use, A, R, .acquireRelease_body);
-            const Release = Effect(void, E, R);
-            comptime requireEffect(Out, E, R, .acquireRelease_body);
             if (self.resolve == null and (R == void or !@hasField(R, @tagName(rt.EnvironmentField.allocator))))
                 @compileError(diagnostics.resource_allocator_capability);
+            return acquireReleaseKernel(use, release, struct {
+                fn select(_: *const R, _: Out.Value) Self {
+                    return self;
+                }
+            }.select, @as(Out.Value, .none), null);
+        }
+
+        /// Consumes a runtime-owned acquisition while retaining the same
+        /// bracket semantics and cleanup ordering as `acquireRelease`.
+        pub fn acquireReleaseOwned(self: *Self, env: *const R, comptime use: anytype, comptime release: anytype) continuationResult(use, A, R, .acquireRelease_body) {
+            const Out = continuationResult(use, A, R, .acquireRelease_body);
+            if (R == void or !@hasField(R, @tagName(rt.EnvironmentField.allocator)))
+                @compileError(diagnostics.resource_allocator_capability);
+            const Node = struct {
+                header: rt.DescriptionNode,
+                source: Self,
+
+                fn destroy(header: *rt.DescriptionNode) void {
+                    const node: *@This() = @alignCast(@fieldParentPtr("header", header));
+                    header.allocator.destroy(node);
+                }
+
+                fn origin(env_data: *const anyopaque, source_data: *const anyopaque) rt.Services {
+                    const node: *const @This() = @ptrCast(@alignCast(source_data));
+                    return node.source.services(@ptrCast(@alignCast(env_data)));
+                }
+
+                fn select(_: *const R, value: Out.Value) Self {
+                    const node: *const @This() = @ptrCast(@alignCast(value.borrowed));
+                    return node.source;
+                }
+            };
+            const allocator = self.services(env).allocatorValue() orelse {
+                self.deinit();
+                return Out.die(.{ .kind = .invalid_configuration, .message = diagnostics.resource_allocator });
+            };
+            const node = allocator.create(Node) catch {
+                self.deinit();
+                return Out.die(outcomes.Defect.out_of_memory);
+            };
+            node.* = .{
+                .header = .{ .previous = self.ownership, .allocator = allocator, .destroy = Node.destroy, .origin = .{ .data = node, .resolve = Node.origin } },
+                .source = self.*,
+            };
+            self.* = undefined;
+            return acquireReleaseKernel(use, release, Node.select, .{ .borrowed = node }, &node.header);
+        }
+
+        fn acquireReleaseKernel(
+            comptime use: anytype,
+            comptime release: anytype,
+            comptime select: anytype,
+            stored: continuationResult(use, A, R, .acquireRelease_body).Value,
+            description_owner: ?*rt.DescriptionNode,
+        ) continuationResult(use, A, R, .acquireRelease_body) {
+            const Out = continuationResult(use, A, R, .acquireRelease_body);
+            const Release = Effect(void, E, R);
+            comptime requireEffect(Out, E, R, .acquireRelease_body);
             _ = functionInfo(release, .acquireRelease_finalizer);
             const Finalizer = fn (A, outcomes.PrimaryOutcome(E)) Release;
-            if (@TypeOf(release) != Finalizer)
+            const EnvironmentFinalizer = fn (A, outcomes.PrimaryOutcome(E), *const R) Release;
+            if (@TypeOf(release) != Finalizer and @TypeOf(release) != EnvironmentFinalizer)
                 @compileError(diagnostics.finalizer_contract);
             return .{
+                .value = stored,
+                .ownership = description_owner,
                 .resolve = struct {
-                    fn resolve(env: *const R, _: Out.Value) rt.Services {
-                        return self.services(env);
+                    fn resolve(env: *const R, value: Out.Value) rt.Services {
+                        return select(env, value).services(env);
                     }
                 }.resolve,
                 .start = struct {
@@ -2370,6 +2703,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                         const release_prefix_capacity = @typeInfo(ReleasePrefix).@"struct".fields.len;
                         parent: *Out.Job,
                         allocator: std.mem.Allocator,
+                        source: Self,
                         acquisition: Job,
                         acquired: outcomes.Exit(A, E) = undefined,
                         body: Out.Job,
@@ -2410,9 +2744,12 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                             const frame: *@This() = @ptrCast(@alignCast(data.?));
                             frame.body_protected_failure = state.protected_failure;
                             frame.body_result = state.publish(frame.body_result);
-                            state.services = self.services(frame.parent.env).inherit(frame.parent.inherited);
+                            state.services = frame.source.services(frame.parent.env).inherit(frame.parent.inherited);
                             state.protection += 1;
-                            const finalizer = release(frame.resource, frame.body_result.primary());
+                            const finalizer = if (comptime @TypeOf(release) == EnvironmentFinalizer)
+                                release(frame.resource, frame.body_result.primary(), frame.parent.env)
+                            else
+                                release(frame.resource, frame.body_result.primary());
                             frame.finalizer = .{ .program = finalizer, .inherited = state.services, .owned = finalizer.ownership, .env = frame.parent.env, .sink = .{
                                 .output = &frame.cleanup,
                                 .next_step = .{ .data = frame, .advance = cleanupStep },
@@ -2452,7 +2789,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                             const frame: *@This() = @ptrCast(@alignCast(data.?));
                             state.protection -= 1;
                             state.protected_failure = frame.body_protected_failure;
-                            state.services = self.services(frame.parent.env).inherit(frame.parent.inherited);
+                            state.services = frame.source.services(frame.parent.env).inherit(frame.parent.inherited);
                             var evaluated = state.publish(frame.body_result);
                             switch (frame.cleanup) {
                                 .success => {},
@@ -2485,8 +2822,9 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                         // all structurally required cleanup links BEFORE acquisition. Cleanup
                         // never allocates after a resource has been acquired.
                         const frame = allocator.create(Frame) catch return parent.finish(.{ .die = outcomes.Defect.out_of_memory });
-                        frame.* = .{ .parent = parent, .allocator = allocator, .acquisition = undefined, .body = undefined, .finalizer = undefined };
-                        frame.acquisition = .{ .program = self, .inherited = state.services, .env = parent.env, .sink = .{
+                        const source = select(parent.env, parent.program.value);
+                        frame.* = .{ .parent = parent, .allocator = allocator, .source = source, .acquisition = undefined, .body = undefined, .finalizer = undefined };
+                        frame.acquisition = .{ .program = source, .inherited = state.services, .env = parent.env, .sink = .{
                             .output = &frame.acquired,
                             .next_step = .{ .data = frame, .advance = Frame.acquiredStep },
                         } };
@@ -2517,6 +2855,76 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                     return project(env);
                 }
             }.projectEnv);
+        }
+
+        /// Bridge a runtime-built description into a larger environment. The
+        /// supplied source environment must remain alive until the returned
+        /// Effect has joined or been disposed; callers can retain it in an
+        /// owning continuation capture.
+        pub fn provideOwned(self: *Self, source_env: *const R, comptime Large: type, outer_env: *const Large) Effect(A, E, Large) {
+            const Out = Effect(A, E, Large);
+            const Node = struct {
+                header: rt.DescriptionNode,
+                source: Self,
+                source_env: *const R,
+
+                fn destroy(header: *rt.DescriptionNode) void {
+                    const node: *@This() = @alignCast(@fieldParentPtr("header", header));
+                    header.allocator.destroy(node);
+                }
+
+                fn origin(_: *const anyopaque, data: *const anyopaque) rt.Services {
+                    const node: *const @This() = @ptrCast(@alignCast(data));
+                    return node.source.services(node.source_env);
+                }
+
+                fn resolve(_: *const Large, value: Out.Value) rt.Services {
+                    const node: *const @This() = @ptrCast(@alignCast(value.borrowed));
+                    return node.source.services(node.source_env);
+                }
+
+                const Frame = struct {
+                    child: Job,
+                    evaluated: outcomes.Exit(A, E) = undefined,
+                    parent: *Out.Job,
+                    allocator: std.mem.Allocator,
+
+                    fn complete(_: *rt.State, data: ?*anyopaque) rt.Step {
+                        const frame: *@This() = @ptrCast(@alignCast(data.?));
+                        const evaluated = frame.evaluated;
+                        const parent = frame.parent;
+                        frame.allocator.destroy(frame);
+                        return parent.finish(evaluated);
+                    }
+                };
+
+                fn start(state: *rt.State, parent: *Out.Job) rt.Step {
+                    const node: *const @This() = @ptrCast(@alignCast(parent.program.value.borrowed));
+                    const allocator = state.services.allocatorValue() orelse return parent.finish(.{ .die = .{
+                        .kind = .invalid_configuration,
+                        .message = diagnostics.provision_allocator,
+                    } });
+                    const frame = allocator.create(Frame) catch return parent.finish(.{ .die = outcomes.Defect.out_of_memory });
+                    frame.* = .{ .parent = parent, .allocator = allocator, .child = .{
+                        .program = node.source,
+                        .inherited = state.services,
+                        .env = node.source_env,
+                        .sink = .{ .output = &frame.evaluated, .next_step = .{ .data = frame, .advance = Frame.complete } },
+                    } };
+                    return frame.child.step();
+                }
+            };
+            const allocator = rt.services(Large, outer_env).allocatorValue() orelse {
+                self.deinit();
+                return Out.die(.{ .kind = .invalid_configuration, .message = diagnostics.provision_allocator });
+            };
+            const node = allocator.create(Node) catch {
+                self.deinit();
+                return Out.die(outcomes.Defect.out_of_memory);
+            };
+            node.* = .{ .header = .{ .previous = self.ownership, .allocator = allocator, .destroy = Node.destroy, .origin = .{ .data = node, .resolve = Node.origin } }, .source = self.*, .source_env = source_env };
+            self.* = undefined;
+            return .{ .value = .{ .borrowed = node }, .ownership = &node.header, .resolve = Node.resolve, .start = Node.start };
         }
 
         fn bridge(comptime self: Self, comptime Large: type, comptime project: fn (*const Large, Effect(A, E, Large).Value) *const R) Effect(A, E, Large) {
@@ -2954,10 +3362,99 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
         const Open = Effect(Reader, E, R);
         const Pull = Effect(Chunk(A), E, R);
         const Unit = Effect(void, E, R);
-        open_fn: *const fn (*Scope) Open,
+        open_fn: ?*const fn (*Scope) Open = null,
+        captured: ?*const anyopaque = null,
+        captured_open_fn: ?*const fn (*const anyopaque, *Scope) Open = null,
 
-        pub fn open(comptime self: Self, scope: *Scope) Open {
-            return self.open_fn(scope);
+        pub fn open(self: Self, scope: *Scope) Open {
+            if (self.captured_open_fn) |open_captured| return open_captured(self.captured.?, scope);
+            return self.open_fn.?(scope);
+        }
+
+        /// Borrow request-specific construction state without a heap node.
+        /// The capture must outlive the opened reader and its scope.
+        pub fn fromCaptured(
+            comptime Capture: type,
+            capture: *const Capture,
+            comptime build: fn (*const Capture, *Scope) Open,
+        ) Self {
+            return .{ .captured = capture, .captured_open_fn = struct {
+                fn invoke(raw: *const anyopaque, scope: *Scope) Open {
+                    return build(@ptrCast(@alignCast(raw)), scope);
+                }
+            }.invoke };
+        }
+
+        /// Reinterprets expected stream failures while preserving the source
+        /// scope, pull state, cancellation and finalizer outcomes.
+        pub fn mapError(comptime self: Self, comptime transform: anytype) Stream(A, unaryResult(transform, E, .mapError), R) {
+            const F = unaryResult(transform, E, .mapError);
+            const Mapped = Stream(A, F, R);
+            const Bridge = struct {
+                allocator: std.mem.Allocator,
+                scope: Scope,
+                reader: ?Reader = null,
+            };
+            const Acquire = Effect(*Bridge, F, R);
+            const MappedUnit = Effect(void, F, R);
+            const Adapter = struct {
+                fn allocate(env: *const R) outcomes.Exit(*Bridge, F) {
+                    const bridge = env.allocator.create(Bridge) catch return .{ .die = outcomes.Defect.out_of_memory };
+                    bridge.* = .{ .allocator = env.allocator, .scope = Scope.init(env) };
+                    return .{ .success = bridge };
+                }
+
+                fn opened(bridge: *const *Bridge, reader: Reader, env: *const R) Acquire {
+                    bridge.*.reader = reader;
+                    return Acquire.fromOwnedSuccess(env, bridge.*);
+                }
+
+                fn use(bridge: *Bridge, env: *const R) Acquire {
+                    var opening = self.open(&bridge.scope);
+                    var mapped = opening.mapErrorOwned(env, transform);
+                    return mapped.flatMapCapturedOwned(env, *Bridge, bridge, opened);
+                }
+
+                fn afterClose(bridge: *const *Bridge, result: outcomes.Exit(void, F), env: *const R) MappedUnit {
+                    if (bridge.*.reader) |*reader| reader.deinit();
+                    bridge.*.scope.deinit();
+                    bridge.*.allocator.destroy(bridge.*);
+                    return MappedUnit.fromOwnedOutcome(env, result);
+                }
+
+                fn close(bridge: *Bridge) MappedUnit {
+                    return MappedUnit.deferBorrowed(Bridge, bridge, struct {
+                        fn run(current: *const Bridge, env: *const R) MappedUnit {
+                            const mutable = @constCast(current);
+                            var closing = Effect(void, E, R).closeScope(&mutable.scope);
+                            var mapped = closing.mapErrorOwned(env, transform);
+                            var settled = mapped.materializeOwned(env);
+                            var aligned = settled.mapErrorOwned(env, struct {
+                                fn impossible(_: void) F {
+                                    unreachable;
+                                }
+                            }.impossible);
+                            return aligned.flatMapCapturedOwned(env, void, mutable, afterClose);
+                        }
+                    }.run);
+                }
+
+                fn cleanupFailed(bridge: *Bridge, primary: outcomes.PrimaryOutcome(F)) MappedUnit {
+                    return if (primary == .succeeded) MappedUnit.succeed({}) else close(bridge);
+                }
+
+                fn pull(bridge: *Bridge) Effect(Chunk(A), F, R) {
+                    const Out = Effect(Chunk(A), F, R);
+                    return Out.deferBorrowed(Bridge, bridge, struct {
+                        fn run(current: *const Bridge, env: *const R) Out {
+                            var source = current.reader.?.pull.borrow();
+                            return source.mapErrorOwned(env, transform);
+                        }
+                    }.run);
+                }
+            };
+            const acquired = Acquire.fromOutcome(Adapter.allocate).acquireRelease(Adapter.use, Adapter.cleanupFailed);
+            return Mapped.fromPull(acquired, Adapter.pull, Adapter.close);
         }
 
         pub fn fromPull(comptime acquisition: anytype, comptime pull: fn (@TypeOf(acquisition).Success) Pull, comptime release: fn (@TypeOf(acquisition).Success) Unit) Self {
@@ -3289,7 +3786,15 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
             return Out.scoped(Adapter.useScope);
         }
 
-        pub fn runForEach(comptime self: Self, comptime consume: fn (A) Unit) Unit {
+        pub fn runForEach(comptime self: Self, comptime consume: anytype) Unit {
+            const Parameters = @typeInfo(@TypeOf(consume)).@"fn".params;
+            comptime {
+                if (Parameters.len != 1 and Parameters.len != 2)
+                    @compileError("stream consumer accepts an item and optionally R");
+                if (Parameters[0].type.? != A or
+                    (Parameters.len == 2 and Parameters[1].type.? != *const R))
+                    @compileError("stream consumer must accept the stream item and caller R");
+            }
             const Adapter = struct {
                 const Frame = struct {
                     parent: *Unit.Job,
@@ -3332,7 +3837,10 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
                             frame.chunk.success.deinit();
                             return frame.finish(.{ .die = outcomes.Defect.out_of_memory });
                         };
-                        const program = consume(value);
+                        const program = if (comptime Parameters.len == 2)
+                            consume(value, frame.parent.env)
+                        else
+                            consume(value);
                         frame.consuming = .{ .program = program, .owned = program.ownership, .inherited = state.services, .env = frame.parent.env, .sink = .{ .output = &frame.consumed, .next_step = .{ .data = frame, .advance = consumedStep } } };
                         return frame.consuming.step();
                     }
@@ -3371,6 +3879,8 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
     };
 }
 
+/// Execute a description and return its full typed Exit.
+/// Runtime services come from the caller's environment.
 pub inline fn run(env: anytype, program: anytype) outcomes.Exit(@TypeOf(program).Success, @TypeOf(program).Error) {
     if (program.entry) |entry| return entry(env, program.value);
     return runDriver(false, env, program);

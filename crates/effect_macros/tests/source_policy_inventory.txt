@@ -1,0 +1,509 @@
+# Exact reviewed source-literal multiset. See source_policy_inventory.md for contract rationale.
+effect/src/cluster/memory_store.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/cluster/memory_store.rs: fixed integer 0usize needs a documented contract and inventory review
+effect/src/cluster/memory_store.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/cluster/memory_store.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/cluster/memory_store.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/cluster/memory_store.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/cluster/memory_store.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/cluster/types.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 0_u64 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 0_u64 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 0_usize needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 0_usize needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 12 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 1_000 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 1_u64 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 1_u64 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 1_u64 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 1_u64 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 2 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 23 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 24 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 31 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 59 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 59 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 60 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 60 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 7 needs a documented contract and inventory review
+effect/src/cron.rs: fixed integer 7 needs a documented contract and inventory review
+effect/src/cron.rs: this literal form needs an inventory review
+effect/src/cron.rs: this literal form needs an inventory review
+effect/src/cron.rs: this literal form needs an inventory review
+effect/src/cron.rs: unreviewed string expression "*"
+effect/src/duration.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/duration.rs: fixed integer 1_000_000 needs a documented contract and inventory review
+effect/src/encoding/frame.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/frame.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/frame.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/frame.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/frame.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/frame.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/frame.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/frame.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/frame.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/frame.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/frame.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/encoding/ndjson.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/ndjson.rs: this literal form needs an inventory review
+effect/src/encoding/ndjson.rs: this literal form needs an inventory review
+effect/src/encoding/ndjson.rs: this literal form needs an inventory review
+effect/src/encoding/ndjson.rs: this literal form needs an inventory review
+effect/src/encoding/ndjson.rs: this literal form needs an inventory review
+effect/src/encoding/schema_binary.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/encoding/schema_binary.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/encoding/schema_binary.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 2 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 2 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 3 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 4 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 5 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 6 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 7 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 8 needs a documented contract and inventory review
+effect/src/encoding/schema_binary/internal.rs: fixed integer 8 needs a documented contract and inventory review
+effect/src/eventlog/event.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/eventlog/event_journal.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/eventlog/event_log.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/eventlog/event_log_remote.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/eventlog/event_log_remote.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/eventlog/event_log_remote.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/eventlog/event_log_remote.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/eventlog/event_log_remote.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/eventlog/event_log_remote.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/eventlog/event_log_remote.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/eventlog/event_log_remote.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/eventlog/memory_event_journal.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/eventlog/memory_event_journal.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/eventlog/memory_event_journal.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/eventlog/memory_event_journal.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/eventlog/memory_event_journal.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/eventlog/memory_event_journal.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/eventlog/memory_event_journal.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/eventlog/memory_event_journal.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/eventlog/memory_event_journal.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/eventlog/projection.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/eventlog/replica_cursor.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/eventlog/replica_cursor.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/metric.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/metric.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/metric.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/persistence/internal/memory_store.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/persistence/internal/memory_store.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/persistence/internal/queue_delivery.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/persistence/internal/queue_delivery.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/persistence/internal/queue_delivery.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/persistence/internal/queue_delivery.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/persistence/internal/queue_delivery.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/persistence/internal/queue_delivery.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/persistence/internal/queue_delivery.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/persistence/internal/rate_limit.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/persistence/internal/rate_limit.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/persistence/internal/rate_limit.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/persistence/internal/rate_limit.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/persistence/internal/rate_limit.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/persistence/internal/rate_limit.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/persistence/internal/rate_limit.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/persistence/mod.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/persistence/persistable.rs: unreviewed string expression "outcome"
+effect/src/persistence/persistable.rs: unreviewed string expression "record_version"
+effect/src/persistence/rate_limiter.rs: fixed integer 1_000_000 needs a documented contract and inventory review
+effect/src/persistence/result_store.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/persistence/result_store.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/persistence/result_store.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/persistence/result_store.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/primary_key.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/primary_key.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/primary_key.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/primary_key.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/primary_key.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/primary_key.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/primary_key.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/primary_key.rs: fixed integer 1usize needs a documented contract and inventory review
+effect/src/primary_key.rs: fixed integer 2 needs a documented contract and inventory review
+effect/src/primary_key.rs: fixed integer 3 needs a documented contract and inventory review
+effect/src/primary_key.rs: unreviewed string expression "StableKey"
+effect/src/primary_key.rs: unreviewed string expression "domain"
+effect/src/primary_key.rs: unreviewed string expression "encoded"
+effect/src/reactivity/atom_ref.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/reactivity/atom_registry.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/reactivity/hydration.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/reactivity/hydration.rs: unreviewed string expression "atom"
+effect/src/reactivity/hydration.rs: unreviewed string expression "revision"
+effect/src/reactivity/hydration.rs: unreviewed string expression "value"
+effect/src/reactivity/hydration.rs: unreviewed string expression "version"
+effect/src/reactivity/invalidation.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/reactivity/query.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/request_resolver.rs: unreviewed string expression "BatchFailed"
+effect/src/request_resolver.rs: unreviewed string expression "CardinalityMismatch"
+effect/src/request_resolver.rs: unreviewed string expression "Closed"
+effect/src/request_resolver.rs: unreviewed string expression "ConflictingGroup"
+effect/src/request_resolver.rs: unreviewed string expression "InputConsumed"
+effect/src/request_resolver.rs: unreviewed string expression "RequestFailed"
+effect/src/request_resolver.rs: unreviewed string expression "Uncompleted"
+effect/src/request_resolver.rs: unreviewed string expression "WrongEnvironment"
+effect/src/request_resolver.rs: unreviewed string expression "actual"
+effect/src/request_resolver.rs: unreviewed string expression "expected"
+effect/src/rpc/envelope.rs: unreviewed string expression "acknowledge"
+effect/src/rpc/envelope.rs: unreviewed string expression "call"
+effect/src/rpc/envelope.rs: unreviewed string expression "cancel"
+effect/src/rpc/envelope.rs: unreviewed string expression "domain_error"
+effect/src/rpc/envelope.rs: unreviewed string expression "kind"
+effect/src/rpc/envelope.rs: unreviewed string expression "metadata"
+effect/src/rpc/envelope.rs: unreviewed string expression "operation"
+effect/src/rpc/envelope.rs: unreviewed string expression "payload"
+effect/src/rpc/envelope.rs: unreviewed string expression "request"
+effect/src/rpc/envelope.rs: unreviewed string expression "revision"
+effect/src/rpc/envelope.rs: unreviewed string expression "sequence"
+effect/src/rpc/envelope.rs: unreviewed string expression "stream_chunk"
+effect/src/rpc/envelope.rs: unreviewed string expression "stream_end"
+effect/src/rpc/envelope.rs: unreviewed string expression "success"
+effect/src/rpc/streaming.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/rpc/streaming_server.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/decimal.rs: this literal form needs an inventory review
+effect/src/schema/decimal.rs: this literal form needs an inventory review
+effect/src/schema/decimal.rs: this literal form needs an inventory review
+effect/src/schema/decimal.rs: this literal form needs an inventory review
+effect/src/schema/decimal.rs: unreviewed string expression ""
+effect/src/schema/decimal.rs: unreviewed string expression ""
+effect/src/schema/decimal.rs: unreviewed string expression ""
+effect/src/schema/decimal.rs: unreviewed string expression "-"
+effect/src/schema/decimal.rs: unreviewed string expression "."
+effect/src/schema/decimal.rs: unreviewed string expression "0"
+effect/src/schema/decimal.rs: unreviewed string expression "0"
+effect/src/schema/decimal.rs: unreviewed string expression "{sign}{integer}{separator}{fraction}"
+effect/src/schema/internal/parser.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 0usize needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 0usize needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 0usize needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 1usize needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: unreviewed string expression "JSON value"
+effect/src/schema/internal/preparation.rs: fixed integer 0usize needs a documented contract and inventory review
+effect/src/schema/internal/preparation.rs: fixed integer 0usize needs a documented contract and inventory review
+effect/src/schema/internal/preparation.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/internal/preparation.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/internal/preparation.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_codec.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/json_codec.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/json_codec.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_codec.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_codec.rs: fixed integer 2 needs a documented contract and inventory review
+effect/src/schema/json_codec.rs: unreviewed string expression "decimal_syntax"
+effect/src/schema/json_codec.rs: unreviewed string expression "stable_key_encoding"
+effect/src/schema/json_schema.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/json_schema.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_schema.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_schema.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_schema.rs: this literal form needs an inventory review
+effect/src/schema/json_schema.rs: this literal form needs an inventory review
+effect/src/schema/json_schema.rs: this literal form needs an inventory review
+effect/src/schema/json_schema.rs: this literal form needs an inventory review
+effect/src/schema/json_schema.rs: this literal form needs an inventory review
+effect/src/schema/json_schema.rs: this literal form needs an inventory review
+effect/src/schema/json_schema.rs: this literal form needs an inventory review
+effect/src/schema/json_schema.rs: this literal form needs an inventory review
+effect/src/schema/json_schema.rs: this literal form needs an inventory review
+effect/src/schema/json_schema.rs: this literal form needs an inventory review
+effect/src/schema/json_schema.rs: this literal form needs an inventory review
+effect/src/schema/json_schema.rs: this literal form needs an inventory review
+effect/src/schema/json_schema.rs: this literal form needs an inventory review
+effect/src/schema/json_schema.rs: this literal form needs an inventory review
+effect/src/schema/json_schema.rs: this literal form needs an inventory review
+effect/src/schema/json_schema.rs: this literal form needs an inventory review
+effect/src/schema/json_schema.rs: this literal form needs an inventory review
+effect/src/schema/json_schema.rs: this literal form needs an inventory review
+effect/src/schema/json_schema.rs: this literal form needs an inventory review
+effect/src/schema/json_schema.rs: unreviewed string expression "#/$defs/{escaped}"
+effect/src/schema/json_schema.rs: unreviewed string expression "$defs"
+effect/src/schema/json_schema.rs: unreviewed string expression "$ref"
+effect/src/schema/json_schema.rs: unreviewed string expression "$schema"
+effect/src/schema/json_schema.rs: unreviewed string expression "^{escaped}"
+effect/src/schema/json_schema.rs: unreviewed string expression "^{escaped}$"
+effect/src/schema/json_schema.rs: unreviewed string expression "additionalProperties"
+effect/src/schema/json_schema.rs: unreviewed string expression "anyOf"
+effect/src/schema/json_schema.rs: unreviewed string expression "array"
+effect/src/schema/json_schema.rs: unreviewed string expression "array"
+effect/src/schema/json_schema.rs: unreviewed string expression "boolean"
+effect/src/schema/json_schema.rs: unreviewed string expression "const"
+effect/src/schema/json_schema.rs: unreviewed string expression "default"
+effect/src/schema/json_schema.rs: unreviewed string expression "description"
+effect/src/schema/json_schema.rs: unreviewed string expression "https://json-schema.org/draft/2020-12/schema"
+effect/src/schema/json_schema.rs: unreviewed string expression "integer"
+effect/src/schema/json_schema.rs: unreviewed string expression "items"
+effect/src/schema/json_schema.rs: unreviewed string expression "maxItems"
+effect/src/schema/json_schema.rs: unreviewed string expression "maxItems"
+effect/src/schema/json_schema.rs: unreviewed string expression "maxLength"
+effect/src/schema/json_schema.rs: unreviewed string expression "maximum"
+effect/src/schema/json_schema.rs: unreviewed string expression "maximum"
+effect/src/schema/json_schema.rs: unreviewed string expression "minItems"
+effect/src/schema/json_schema.rs: unreviewed string expression "minLength"
+effect/src/schema/json_schema.rs: unreviewed string expression "minimum"
+effect/src/schema/json_schema.rs: unreviewed string expression "minimum"
+effect/src/schema/json_schema.rs: unreviewed string expression "null"
+effect/src/schema/json_schema.rs: unreviewed string expression "number"
+effect/src/schema/json_schema.rs: unreviewed string expression "object"
+effect/src/schema/json_schema.rs: unreviewed string expression "pattern"
+effect/src/schema/json_schema.rs: unreviewed string expression "prefixItems"
+effect/src/schema/json_schema.rs: unreviewed string expression "properties"
+effect/src/schema/json_schema.rs: unreviewed string expression "required"
+effect/src/schema/json_schema.rs: unreviewed string expression "string"
+effect/src/schema/json_schema.rs: unreviewed string expression "title"
+effect/src/schema/json_schema.rs: unreviewed string expression "type"
+effect/src/schema/json_schema.rs: unreviewed string expression "type"
+effect/src/schema/json_schema.rs: unreviewed string expression "type"
+effect/src/schema/json_schema.rs: unreviewed string expression "type"
+effect/src/schema/json_schema.rs: unreviewed string expression "{escaped}$"
+effect/src/schema/json_schema.rs: unreviewed string expression "~0"
+effect/src/schema/json_schema.rs: unreviewed string expression "~1"
+effect/src/schema/outcome_codec.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/outcome_codec.rs: unreviewed string expression "defect"
+effect/src/schema/outcome_codec.rs: unreviewed string expression "defected"
+effect/src/schema/outcome_codec.rs: unreviewed string expression "error"
+effect/src/schema/outcome_codec.rs: unreviewed string expression "failed"
+effect/src/schema/outcome_codec.rs: unreviewed string expression "failure"
+effect/src/schema/outcome_codec.rs: unreviewed string expression "finalization_failed"
+effect/src/schema/outcome_codec.rs: unreviewed string expression "first"
+effect/src/schema/outcome_codec.rs: unreviewed string expression "interrupted"
+effect/src/schema/outcome_codec.rs: unreviewed string expression "kind"
+effect/src/schema/outcome_codec.rs: unreviewed string expression "message"
+effect/src/schema/outcome_codec.rs: unreviewed string expression "primary"
+effect/src/schema/outcome_codec.rs: unreviewed string expression "rest"
+effect/src/schema/outcome_codec.rs: unreviewed string expression "succeeded"
+effect/src/schema/outcome_codec.rs: unreviewed string expression "success"
+effect/src/schema/outcome_codec.rs: unreviewed string expression "value"
+effect/src/schema/outcome_codec.rs: unreviewed string expression "version"
+effect/src/schema/schema_builder.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/schema_builder.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/schema_issue.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/schema_issue.rs: unreviewed string expression "{:?} at {:?}"
+effect/src/stream/internal/buffer.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/stream/internal/buffer.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/stream/internal/buffer.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/stream/internal/buffer.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/stream/internal/buffer.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/stream/internal/buffer.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/transactional/internal/journal.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/transactional/internal/journal.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/transactional/internal/journal.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/transactional/transaction.rs: fixed integer 0usize needs a documented contract and inventory review
+effect/src/transactional/transaction.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/transactional/tx_pub_sub.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/transactional/tx_pub_sub.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/transactional/tx_pub_sub.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/transactional/tx_pub_sub.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/transactional/tx_reentrant_lock.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/transactional/tx_reentrant_lock.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/transactional/tx_reentrant_lock.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/transactional/tx_reentrant_lock.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/transactional/tx_ref.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/transactional/tx_ref.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/workflow/durable_parallel.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/workflow/memory_workflow_engine.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/workflow/memory_workflow_engine.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/workflow/memory_workflow_engine.rs: fixed integer 0usize needs a documented contract and inventory review
+effect/src/workflow/memory_workflow_engine.rs: fixed integer 0usize needs a documented contract and inventory review
+effect/src/workflow/memory_workflow_engine.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/workflow/memory_workflow_engine.rs: fixed integer 1 needs a documented contract and inventory review
+effect_macros/src/descriptor_expand.rs: fixed integer 0 needs a documented contract and inventory review
+effect_macros/src/descriptor_expand.rs: fixed integer 0 needs a documented contract and inventory review
+effect_macros/src/descriptor_expand.rs: fixed integer 0 needs a documented contract and inventory review
+effect_macros/src/descriptor_expand.rs: fixed integer 0 needs a documented contract and inventory review
+effect_macros/src/descriptor_expand.rs: fixed integer 0 needs a documented contract and inventory review
+effect_macros/src/descriptor_expand.rs: fixed integer 1 needs a documented contract and inventory review
+effect_macros/src/descriptor_expand.rs: fixed integer 1 needs a documented contract and inventory review
+effect_macros/src/descriptor_expand.rs: fixed integer 1 needs a documented contract and inventory review
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "accepted"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "accepts"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "after"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "attempt"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "before"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "before"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "body"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "body"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "body"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "capacity"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "capacity"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "changes"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "chunk"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "chunk"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "compatibility"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "compatibility"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "dependencies"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "description"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "dispatcher"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "duplicate descriptor field"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "effect"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "entity requires exactly one of policy or dispatcher"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "entity_type"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "error"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "error"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "error"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "error"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "error"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "error"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "error"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "error_codec"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "error_codec"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "error_identity"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "evaluate"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "evaluate"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "event group requires at least one typed event"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "events must be a bracketed list of typed event definitions"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "events"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "expected `:` after descriptor field"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "expected a braced body or effect! block"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "expected a braced body or workflow! block"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "expected a closure with an Effect body"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "expected a one-argument closure with a durable workflow body"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "expected a synchronous closure with the required parameters"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "expected a synchronous one-argument workflow closure"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "fold"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "group"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "group"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "handler"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "handler"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "handler"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "handlers must be a bracketed list of typed handlers"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "handlers must be a bracketed list of typed streaming handlers"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "handlers"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "handlers"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "id"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "id"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "id"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "id"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "id"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "id"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "id"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "idempotency_key"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "initial"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "initial"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "input"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "input"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "input"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "key"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "limits"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "limits"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "limits"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "limits"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "limits"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "limits"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "limits"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "missing descriptor field: `{first}` or `{second}`"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "missing descriptor field: {name}"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "name"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "name"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "overflow"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "overflow"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "payload"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "payload"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "payload_identity"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "policy"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "policy"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "policy"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "protocol requires at least one typed handler"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "read"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "registry"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "registry"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "registry"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "request"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "request"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "run"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "run"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "run"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "specify either `{first}` or `{second}`, not both"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "stream protocol requires at least one typed handler"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "success"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "success"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "success"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "success"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "success"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "success"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "success_identity"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "tag"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "terminal"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "terminal"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "unknown descriptor field: {name}"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "version"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "version"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "version"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "version"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "version"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "version"
+effect_macros/src/descriptor_expand.rs: unreviewed string expression "workflow"
+effect_macros/src/durable_expand.rs: unreviewed string expression "only the final expression may omit a semicolon"
+effect_macros/src/lib.rs: unreviewed string expression "id"
+effect_macros/src/lib.rs: unreviewed string expression "name"
+effect_macros/src/persistable_expand.rs: unreviewed string expression "error"
+effect_macros/src/persistable_expand.rs: unreviewed string expression "expected `{expected}`"
+effect_macros/src/persistable_expand.rs: unreviewed string expression "key"
+effect_macros/src/persistable_expand.rs: unreviewed string expression "namespace"
+effect_macros/src/persistable_expand.rs: unreviewed string expression "request"
+effect_macros/src/persistable_expand.rs: unreviewed string expression "success"
+effect_macros/src/persistable_expand.rs: unreviewed string expression "unexpected tokens after persistable policy"
+effect_macros/src/persistable_expand.rs: unreviewed string expression "version"
+effect_macros/src/schema_enum_expand.rs: unreviewed string expression "__effect_variant_codec_{index}"
+effect_macros/src/schema_enum_expand.rs: unreviewed string expression "__effect_variant_decoder_{index}"
+effect_macros/src/schema_enum_expand.rs: unreviewed string expression "content_field"
+effect_macros/src/schema_enum_expand.rs: unreviewed string expression "duplicate enum field"
+effect_macros/src/schema_enum_expand.rs: unreviewed string expression "duplicate enum variant"
+effect_macros/src/schema_enum_expand.rs: unreviewed string expression "enum needs variants"
+effect_macros/src/schema_enum_expand.rs: unreviewed string expression "expected `{expected}`"
+effect_macros/src/schema_enum_expand.rs: unreviewed string expression "one payload codec is required"
+effect_macros/src/schema_enum_expand.rs: unreviewed string expression "policy"
+effect_macros/src/schema_enum_expand.rs: unreviewed string expression "tag_field"
+effect_macros/src/schema_enum_expand.rs: unreviewed string expression "unexpected tokens after enum schema policy"
+effect_macros/src/schema_expand.rs: unreviewed string expression "__effect_schema_codec_{index}"
+effect_macros/src/schema_expand.rs: unreviewed string expression "duplicate schema field"
+effect_macros/src/schema_expand.rs: unreviewed string expression "expected `(missing, omit)` or `(missing, omit, pure_default)`"
+effect_macros/src/schema_expand.rs: unreviewed string expression "expected `policy`"
+effect_macros/src/schema_expand.rs: unreviewed string expression "policy"
+effect_macros/src/schema_expand.rs: unreviewed string expression "unexpected tokens after schema policy"
+effect_macros/src/transaction_expand.rs: unreviewed string expression "only the final expression may omit a semicolon"

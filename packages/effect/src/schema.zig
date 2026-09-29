@@ -14,6 +14,14 @@ pub fn Parsed(comptime A: type) type {
         value: A,
         document: *Document,
 
+        /// Takes ownership of an already parsed JSON document. On allocation
+        /// failure the caller still owns both arguments and must release them.
+        pub fn init(allocator: std.mem.Allocator, source: std.json.Parsed(std.json.Value), value: A) error{OutOfMemory}!@This() {
+            const document = try allocator.create(Document);
+            document.* = .{ .source = source, .allocator = allocator };
+            return .{ .value = value, .document = document };
+        }
+
         /// Decoder views into JSON remain valid until this owner is destroyed.
         /// Independently allocated application payloads keep their own contract.
         pub fn deinit(self: *@This()) void {
@@ -81,27 +89,34 @@ pub fn Schema(comptime A: type, comptime E: type) type {
         pub fn parse(comptime self: Self, comptime R: type, comptime text: fn (*const R) []const u8, comptime on_syntax: fn (std.json.ParseError(std.json.Scanner)) E) effects.Effect(Parsed(A), E, R) {
             return effects.Effect(Parsed(A), E, R).fromOutcome(struct {
                 fn parse(env: *const R) outcomes.Exit(Parsed(A), E) {
-                    var document = std.json.parseFromSlice(std.json.Value, env.allocator, text(env), .{ .allocate = .alloc_always }) catch |err| {
-                        if (err == error.OutOfMemory) return .{ .die = outcomes.Defect.out_of_memory };
-                        return .{ .fail = on_syntax(err) };
-                    };
-                    const value = self.decoder(document.value);
-                    if (value == .success) {
-                        const owner = env.allocator.create(Document) catch {
-                            var discarded = value;
-                            discarded.deinit();
-                            document.deinit();
-                            return .{ .die = outcomes.Defect.out_of_memory };
-                        };
-                        owner.* = .{ .source = document, .allocator = env.allocator };
-                        return .{ .success = .{ .value = value.success, .document = owner } };
-                    }
-                    // Declared errors must own their data or borrow independent
-                    // input; a failed decoder cannot return document-backed views.
-                    document.deinit();
-                    return outcomes.castFailure(Parsed(A), value);
+                    return self.parseBytes(env, text(env), on_syntax);
                 }
             }.parse);
+        }
+
+        /// Parses a runtime-owned byte slice without requiring that slice to
+        /// be installed into R. The document copies strings and remains owned
+        /// by Parsed(A); callers may release the source bytes after this call.
+        pub fn parseBytes(comptime self: Self, env: anytype, bytes: []const u8, comptime on_syntax: fn (std.json.ParseError(std.json.Scanner)) E) outcomes.Exit(Parsed(A), E) {
+            var document = std.json.parseFromSlice(std.json.Value, env.allocator, bytes, .{ .allocate = .alloc_always }) catch |err| {
+                if (err == error.OutOfMemory) return .{ .die = outcomes.Defect.out_of_memory };
+                return .{ .fail = on_syntax(err) };
+            };
+            const value = self.decoder(document.value);
+            if (value == .success) {
+                const owner = env.allocator.create(Document) catch {
+                    var discarded = value;
+                    discarded.deinit();
+                    document.deinit();
+                    return .{ .die = outcomes.Defect.out_of_memory };
+                };
+                owner.* = .{ .source = document, .allocator = env.allocator };
+                return .{ .success = .{ .value = value.success, .document = owner } };
+            }
+            // Declared errors must own their data or borrow independent input;
+            // a failed decoder cannot return document-backed views.
+            document.deinit();
+            return outcomes.castFailure(Parsed(A), value);
         }
     };
 }

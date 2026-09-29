@@ -2,42 +2,7 @@ const diagnostics = @import("internal/diagnostics.zig");
 const std = @import("std");
 const outcomes = @import("outcome.zig");
 const Cancellation = @import("internal/runtime.zig").Cancellation;
-
-// Waiters own persistent events, so cancellation/completion before a native
-// wait cannot be lost. Unregister synchronizes callback lifetime before removal.
-const Waiter = struct {
-    previous: ?*Waiter = null,
-    next: ?*Waiter = null,
-    io: std.Io,
-    event: std.Io.Event = .unset,
-    registration: Cancellation.Registration = .{ .data = null, .forward = wake },
-
-    fn wake(data: ?*anyopaque) void {
-        const waiter: *Waiter = @ptrCast(@alignCast(data.?));
-        waiter.event.set(waiter.io);
-    }
-
-    fn register(self: *Waiter, first: *?*Waiter, token: ?*const Cancellation) void {
-        self.next = first.*;
-        if (first.*) |head| head.previous = self;
-        first.* = self;
-        self.registration.data = self;
-        if (token) |cancellation| cancellation.register(&self.registration);
-    }
-
-    fn remove(self: *Waiter, first: *?*Waiter) void {
-        if (self.previous) |previous| previous.next = self.next else first.* = self.next;
-        if (self.next) |next| next.previous = self.previous;
-    }
-
-    fn signalAll(first: ?*Waiter) void {
-        var current = first;
-        while (current) |waiter| {
-            waiter.event.set(waiter.io);
-            current = waiter.next;
-        }
-    }
-};
+const Waiter = @import("internal/waiter.zig").Waiter;
 
 pub fn Deferred(comptime A: type, comptime E: type) type {
     return struct {
@@ -216,6 +181,7 @@ pub const QueueError = enum { shutdown };
 pub fn Queue(comptime T: type) type {
     return struct {
         const Self = @This();
+        pub const TryOffer = enum { accepted, full, closed };
         const BufferNode = struct { value: T, next: ?*BufferNode = null };
         const Offer = struct { value: T, result: ?outcomes.Exit(void, QueueError) = null, waiter: Waiter, previous: ?*Offer = null, next: ?*Offer = null, token: ?*const Cancellation };
         const Taker = struct { result: ?outcomes.Exit(T, QueueError) = null, waiter: Waiter, previous: ?*Taker = null, next: ?*Taker = null, token: ?*const Cancellation };
@@ -304,6 +270,25 @@ pub fn Queue(comptime T: type) type {
             if (self.buffered == null) self.buffer_tail = null;
             self.allocator.destroy(node);
             return value;
+        }
+
+        /// Never waits for capacity. Ownership moves only on `accepted`;
+        /// otherwise the caller retains `value`, including after a defect.
+        pub fn tryOfferOwned(self: *Self, value: *T) outcomes.Exit(TryOffer, QueueError) {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            if (self.closed) return .{ .success = .closed };
+            if (self.popTaker()) |taker| {
+                taker.result = .{ .success = value.* };
+                value.* = undefined;
+                taker.waiter.event.set(self.io);
+                return .{ .success = .accepted };
+            }
+            if (self.capacity != null and self.count >= self.capacity.?)
+                return .{ .success = .full };
+            if (!self.appendBuffer(value.*)) return .{ .die = outcomes.Defect.out_of_memory };
+            value.* = undefined;
+            return .{ .success = .accepted };
         }
 
         pub fn offerToken(self: *Self, value: T, token: ?*const Cancellation) outcomes.Exit(void, QueueError) {

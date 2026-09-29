@@ -12,6 +12,16 @@ const EFFECT_PACKAGE_NAME: &str = "effect";
 pub(crate) fn expand(statements: Vec<Stmt>) -> syn::Result<TokenStream> {
     let needs_native_control =
         crate::parse::validate(&statements).is_err() || crate::parse::has_loops(&statements);
+    let path = effect_crate_path()?;
+    let path = quote!(#path::__private);
+    if needs_native_control {
+        return Ok(crate::async_expand::expand(statements, &path));
+    }
+    let body = lower(&statements, &path);
+    Ok(quote!(#path::reusable(move || { #body })))
+}
+
+pub(crate) fn effect_crate_path() -> syn::Result<TokenStream> {
     let name = match crate_name(EFFECT_PACKAGE_NAME)
         .map_err(|error| syn::Error::new(Span::call_site(), error))?
     {
@@ -19,12 +29,7 @@ pub(crate) fn expand(statements: Vec<Stmt>) -> syn::Result<TokenStream> {
         FoundCrate::Name(name) => name,
     };
     let ident = Ident::new(&name, Span::call_site());
-    let path = quote!(::#ident::__private);
-    if needs_native_control {
-        return Ok(crate::async_expand::expand(statements, &path));
-    }
-    let body = lower(&statements, &path);
-    Ok(quote!(#path::reusable(move || { #body })))
+    Ok(quote!(::#ident))
 }
 
 fn lower(statements: &[Stmt], path: &TokenStream) -> TokenStream {
