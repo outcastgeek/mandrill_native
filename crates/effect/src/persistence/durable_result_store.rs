@@ -69,32 +69,23 @@ where
         .provide_some(|environment: &R| DurableStoreView(environment.durable_key_value_store()))
 }
 
-/// Batch reads retain the original per-slot result and failure ordering.
+type DurableBatch<A, E, R> = Effect<
+    Vec<Result<StoredLookup<A, E>, PersistenceError<DurableBackend<R>>>>,
+    PersistenceError<DurableBackend<R>>,
+    R,
+>;
+
+/// Lazily read an ordered batch through R's declared durable key-value provider.
 ///
-/// # Type parameters
-/// - `R`: Environment type. Additional bound: `HasDurableKeyValueStore + Send + Sync + 'static`.
-/// - `I`: Input type. Additional bound: `Send + 'static`.
-/// - `A`: Application value type. Additional bound: `Send + 'static`.
-/// - `E`: Domain-error type. Additional bound: `Send + 'static`.
-/// - `D`: Identity-domain type. Additional bound: `KeyDomain`.
-///
-/// # Parameters
-/// - `definition` (`Persistable<I, A, E, D>`): The typed definition used by this operation.
-/// - `inputs` (`impl Fn() -> Vec<I> + Send + Sync + 'static`): The inputs supplied to this operation.
-/// - `now` (`UtcMillis`): The caller-supplied current time.
-///
-/// # Returns
-/// Type: `Effect<Vec<Result<StoredLookup<A, E>, PersistenceError<DurableBackend<R>>>>, PersistenceError<DurableBackend<R>>, R>`.
-/// Returns a lazy `Effect` with the declared success, error, and environment types.
+/// The input factory supplies fresh owned inputs for each execution. Each slot
+/// retains its original lookup or persistence error in input order; an outer error
+/// represents batch-level failure. Actual persistence guarantees belong to the
+/// provider, not this type alias or adapter.
 pub fn read_many_durable<R, I, A, E, D>(
     definition: Persistable<I, A, E, D>,
     inputs: impl Fn() -> Vec<I> + Send + Sync + 'static,
     now: UtcMillis,
-) -> Effect<
-    Vec<Result<StoredLookup<A, E>, PersistenceError<DurableBackend<R>>>>,
-    PersistenceError<DurableBackend<R>>,
-    R,
->
+) -> DurableBatch<A, E, R>
 where
     R: HasDurableKeyValueStore + Send + Sync + 'static,
     I: Send + 'static,

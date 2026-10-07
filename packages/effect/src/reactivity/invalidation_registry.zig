@@ -103,7 +103,7 @@ pub const Registry = struct {
                             .item => |batch| {
                                 var matched = false;
                                 for (batch.keys.items) |entry| {
-                                    if (std.mem.eql(u8, entry.items, watch.key.items)) {
+                                    if (std.mem.eql(u8, entry.items, current_watch.key.items)) {
                                         matched = true;
                                         break;
                                     }

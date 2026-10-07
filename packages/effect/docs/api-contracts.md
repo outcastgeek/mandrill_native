@@ -62,10 +62,52 @@ resource pointer must never be reused. These contracts cannot be proved by Zig's
 | `Deferred`, `EffectDeferred`, `Latch`, `EffectLatch` | Complete once; waiters own events and synchronized cancellation registrations. Completion owns an accepted Exit; rejected completion remains caller-owned. Poll/wait results are independently owning clones. Latch opens once. |
 | `Ref`, `EffectRef` | Locked borrowed/copyable state, get/set/update/modify. Owning stored payloads are rejected without an ownership adapter. Modify infers result type and validates replacement type at comptime. |
 | `Queue`, `EffectQueue` | Explicit bounded, unbounded (null), or rendezvous (zero) capacity. FIFO waiter transfer, backpressure, synchronized cancellation. A committed transfer wins over late cancellation. Offer consumes a value only on success; the Effect wrapper discards rejected factory-produced owning values. Shutdown optionally drains buffered values; nondraining shutdown disposes owned values. |
-| `Stream.fromPull/fromIterable/fromAsyncIterable/open/mapEffect/runCollect/runForEach` | Scope owns acquisition/iterator release. Readers own pull descriptions; pulls return owned/borrowed chunks or end. Collect uses an explicit optional limit and releases partial results on failure. Async iterator operations are joined before iterator disposal. Repeated executions acquire fresh iterators. |
+| `Stream.fromPull/fromIterable/fromAsyncIterable/fromAsyncIterableEffect/open/mapEffect/runCollect/runForEach` | Scope owns acquisition/iterator release. Readers own pull descriptions; pulls return owned/borrowed chunks or end. Collect uses an explicit optional limit and releases partial results on failure. Async iterator operations are joined before iterator disposal. Repeated executions acquire fresh iterators. |
 | `Fetch.request/text/fetchText`, `Http.NativeClient` | Scope owns acquired responses even after late cancellation or status rejection. Request/status acceptance/body limits are consumer policy. Response body/cache owners clone independently; native readers are cancelled/drained before disposal. Native HTTP uses the supplied std.http.Client, allocator/io, and transfer buffers. Text returns body bytes; no automatic charset transcoding. |
 | `EffectWebSocket` | Typed native transport in R; limits and connect options selected from R. Send/receive serialization, UTF-8 validation and bounded fragment assembly. Close races handshake/clock and drains both; timeout retains handshake cleanup. Managed connection owns native abort/disposal, including failed initialization. Adapter abort must unblock outstanding operations. No bundled WebSocket protocol engine. |
 | `Cache`, `EffectCache` | Captured environment/providers, explicit key retain/release/equality and failure-cache policy. Shared in-flight load; cancelling one observer leaves shared load alive. Explicit TTL/capacity/inflight admission. Invalidate/shutdown drain affected work and preserve unobserved cleanup; failed result copies do not suppress diagnostics. |
 | `Pool`, `EffectPool` | Captured factory environment. FIFO borrowers, exclusive leases, validation/TTL on acquisition, explicit capacity and population target. Factories committed to borrowers participate in population observation. Resource disposal runs outside the ownership lock. Lease release/discard is idempotent; lease scope destroys bookkeeping. Shutdown waits for committed work and leases and retains diagnostics. |
 | `Console`, `NativeConsole`, `EffectConsole` | Injected output/error writers; no process-global output destination installed. Native write failures stay inside typed Exit. |
 | `WeakCache` | Unsupported GC ephemeron contract, rejected with a deliberate compiler diagnostic. No ordinary map is advertised as a weak cache. |
+
+## Reference-update capabilities
+
+The [2026-10-06 reference update](reference-update-2026-10-06.md) records the
+fixed F1–F8, T1–T10 and Z1–Z5 dispositions and verification results.
+
+| Operations | Contract |
+| --- | --- |
+| `Codec.validate`, `DomainCodec.validate`, `PureCodec.validateDirect` | Execute encoding once, discard successful representations once, and preserve the encoding environment and typed error. Pure validation needs no Effect frame. |
+| `requirePure`, `JsonCodec.requireWriter` | Require actual public capability witnesses. AST shape, method names and service-free type names alone are insufficient. Direct writing is preserved only by implementations that provide it. |
+| `NativeRecordBuilder`, `NativeField`, `NativeCodec.sequence/array/map/option` | Representation-generic construction with separate direction environments. Required/optional/defaulted fields are checked against named Zig metadata. Default representations decode only when absent. Borrowed default outputs must own their storage. Child effects run on the shared trampoline; no nested run or JSON conversion is required. Map contracts own their entry/uniqueness semantics. |
+| `DomainCodec.ofSchema/optional/array/map` | Preserve application errors with independently supplied decode/encode issue mappings. Mapping callbacks own their input issues. Pure schema mappings and their optional compositions keep checked direct execution. |
+| `JsonNumberCodec.exact`, `JsonConstraints`, `JsonAlternatives` | Exact decimal tokens, Unicode-scalar limits, explicit bounded pattern capabilities, enum unknown policies, prefix/rest and unique arrays, property-name/count/pattern/additional checks. Every matching object pattern applies. oneOf requires one success; anyOf retains original representation and typed matches; allOf merges compatible encodings and rejects conflicts. |
+| `JsonConstraints.withLimits`, `JsonWriter` | Positive independent output-byte, JSON-depth, value-byte and integer-digit limits. The structural adapter is an explicit generic fallback; the writer capability uses the supported direct path. Output owns the caller allocator. |
+| `SchemaIssueCodec` | Versioned owning issue envelopes with owned field/property/alternative paths, constraint operands, match indices, limit details and related failures. Caller limits bound input bytes, JSON depth, issue depth/count and output. |
+| `DependencyCache` | Scoped finite retention and explicit positive in-flight/dependency limits; typed capacity failures, generation-selection observations, nonloading tryGet, copied replacements/dependencies and conservative invalidation of unfinished generations. Policy callbacks and cancel/join execute outside cache locks. Borrowed inputs remain alive until join. |
+| `CallbackPubSub` | Finite capacity and nonblocking overflow policies only. A boolean reports source acceptance, not subscriber delivery. Release subscriptions before shutdown/deinit. |
+| `EventReplicaRemote.bindAuthorized` | Authorize the borrowed identity before invoking session binding. Rejection skips binding; identity and provider capabilities remain alive through join. |
+
+A caller may supply an arena with a thread-safe backing allocator for concurrent allocation. Zig 0.17 arena allocation supports concurrent callers when its backing allocator is thread-safe. Reset and deinit are exclusive lifetime operations: perform them only after every Effect, I/O task, executor callback, provider and result borrowing or owning that arena has joined and been released.
+
+`JsonSurface.Limits` separates UTF-8 input bytes/value bytes/JSON depth, schema preparation nodes/edges/depth, issue count, integer digits, and output writer limits. `withLimits` with this selector exposes `parseBytesDirect` and `parseBytes` returning an owning `Parsed(A)`. Writer-only selectors retain the DOM adapter and do not claim an input-document byte budget. Direct writer evidence selects tree-free record and variant encoding; schemas without that evidence use checked representation fallback.
+
+`WorkflowTypes.ResumeRequest` carries `expected_revision`; providers compare it with the stored checkpoint revision atomically before changing suspended/running state. Poll returns the observed revision in those states. `resumeExecution` observes then submits the fenced request; custom callers can use `resumeChecked`. Cluster resume commands carry the same request. For a failed-run retry, pass the observed completed reply bytes as `expected_terminal_reply` and its `revision`; the provider checks both atomically and removes that terminal checkpoint before queuing. Plain resume never replays a completed run. Previously recorded activities remain available for typed replay. A stale resume returns `stale_revision` without mutation.
+
+RPC normal EOF calls `StreamRegistry.stopIntake`, preserving accepted frames for draining and rejecting new registrations. Receive returns `end_of_input` so the driver stops reading. Abnormal close and scope release discard unread buffered frames and retain existing cancellation behavior.
+
+Known primitive JSON codecs carry explicit encoded-shape pointers. `JsonCodec.refine` and `transform` retain their child shape and named executable checks; `asCodec` and domain issue mappings retain that same immutable metadata. Exact JSON Schema export rejects checks with unknown portable semantics; conservative export keeps the underlying shape. Arbitrary callbacks receive no inferred shape witness.
+
+
+JSON parsing uses Zig 0.17 `std.json.Scanner` and `parseFromSlice`; bounded writing
+uses `std.json.Stringify` over a checked `std.Io.Writer` sink. Effect keeps the
+caller’s byte/depth/digit policies, typed issues, owned outputs, exact decimals and
+schema-to-JSON-Schema translation. It does not provide a second JSON syntax or
+escaping implementation. Container-local std emitters preserve caller depths
+above std’s fixed 256-level debug grammar stack. Standard short control escapes
+and finite-float spelling may differ while denoting the same JSON value; exact
+`number_string` tokens are retained verbatim.
+
+Source API comments document units, inclusive bounds, borrowing, destruction,
+direction environments and callback ownership. Complete public-module examples
+remain in `proofs/reference-update.zig` and `tests/capabilities/consumer/src/main.zig`.

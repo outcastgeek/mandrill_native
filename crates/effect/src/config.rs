@@ -264,41 +264,29 @@ impl<A: Send + 'static> Config<A> {
         }
     }
 
+    /// Set a fresh owned default factory used only when the source returns absence.
+    ///
+    /// The default is independently validated without encoding or decoding it. Present
+    /// null or invalid source data still follows the ordinary schema decode. A missing
+    /// borrowed validator or rejected default becomes ConfigError::Invalid.
     #[must_use]
-    /// Use the supplied fallback only when the requested configuration is absent.
-    ///
-    /// # Type parameters
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Parameters
-    /// - `make` (`impl Fn() -> A + Send + Sync + 'static`): The make supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Self`.
     pub fn with_default(mut self, make: impl Fn() -> A + Send + Sync + 'static) -> Self {
         self.default = Some(Arc::new(make));
         self
     }
 
+    /// Borrow the source lookup path; it selects no storage or environment naming convention.
     #[must_use]
-    /// # Type parameters
-    /// - `A`: Application value type. Bound: `Send + 'static`.
-    ///
-    /// # Returns
-    /// Type: `&ConfigPath`.
     pub const fn path(&self) -> &ConfigPath {
         &self.path
     }
 
-    /// Read and decode the selected value from its backing store.
+    /// Lazily read the environment's configuration source and decode with the pure schema.
     ///
-    /// # Type parameters
-    /// - `R`: Environment type. Additional bound: `HasConfigSource + Send + Sync + 'static`.
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Returns
-    /// Type: `Effect<A, ConfigError<<R::Source as ConfigSource>::Error>, R>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// Source and schema failures retain separate variants and the requested path.
+    /// Defaults apply only to source absence and require independent borrowed
+    /// validation; present null or invalid values do not select the default. Callback
+    /// panics become defects rather than typed source errors.
     pub fn load<R>(&self) -> Effect<A, ConfigError<<R::Source as ConfigSource>::Error>, R>
     where
         R: HasConfigSource + Send + Sync + 'static,
@@ -335,7 +323,16 @@ impl<A: Send + 'static> Config<A> {
                                     }),
                                 },
                                 Ok(None) => match &config.default {
-                                    Some(make) => Exit::Success(make()),
+                                    Some(make) => {
+                                        let value = make();
+                                        match config.schema.validate_ref(&value) {
+                                            Ok(()) => Exit::Success(value),
+                                            Err(issue) => Exit::Fail(ConfigError::Invalid {
+                                                path: config.path.clone(),
+                                                issue,
+                                            }),
+                                        }
+                                    }
                                     None => Exit::Fail(ConfigError::Missing {
                                         path: config.path.clone(),
                                     }),
@@ -433,5 +430,123 @@ impl HasConfigSource for MemoryConfigSource {
     /// Type: `&Self::Source`.
     fn config_source(&self) -> &Self::Source {
         self
+    }
+}
+
+type ConfigDefault<A, D> = Arc<dyn Fn() -> Effect<A, SchemaIssue, D> + Send + Sync>;
+
+/// Reusable configuration lookup with an effectful decoder in `D` and encoder metadata in `E`.
+///
+/// `D` supplies the configuration source and all decode services. Load never uses
+/// encode capabilities. Absent-value defaults are lazily constructed and checked
+/// through an independent borrowed witness, preserving owned payloads.
+pub struct EffectConfig<A: Send + 'static, D: Send + Sync + 'static, E: Send + Sync + 'static> {
+    path: ConfigPath,
+    codec: crate::Codec<A, JsonValue, D, E>,
+    default: Option<ConfigDefault<A, D>>,
+}
+impl<A: Send + 'static, D: Send + Sync + 'static, E: Send + Sync + 'static> Clone
+    for EffectConfig<A, D, E>
+{
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            codec: self.codec.clone(),
+            default: self.default.as_ref().map(Arc::clone),
+        }
+    }
+}
+impl<A: Send + 'static, D: Send + Sync + 'static, E: Send + Sync + 'static> EffectConfig<A, D, E> {
+    /// Describe a configuration lookup at path using an effectful JSON codec; no source access occurs at construction.
+    #[must_use]
+    pub fn new(path: ConfigPath, codec: crate::Codec<A, JsonValue, D, E>) -> Self {
+        Self {
+            path,
+            codec,
+            default: None,
+        }
+    }
+    /// Set a lazy default effect factory in D, used only when the source returns absence.
+    ///
+    /// Present null or invalid data follows normal decode. The default's owned value
+    /// needs a genuine pure borrowed validator; failure or absence of that witness
+    /// becomes ConfigError::Invalid without accessing E or replaying representations.
+    #[must_use]
+    pub fn with_default(
+        mut self,
+        factory: impl Fn() -> Effect<A, SchemaIssue, D> + Send + Sync + 'static,
+    ) -> Self {
+        self.default = Some(Arc::new(factory));
+        self
+    }
+    /// Borrow the source lookup path; it selects no storage or environment naming convention.
+    #[must_use]
+    pub const fn path(&self) -> &ConfigPath {
+        &self.path
+    }
+}
+impl<A: Send + 'static, D: HasConfigSource + Send + Sync + 'static, E: Send + Sync + 'static>
+    EffectConfig<A, D, E>
+{
+    /// Create a reusable lazy source lookup and schema decode in `D`.
+    ///
+    /// Source errors and schema issues retain separate ConfigError variants and paths.
+    /// On absence, run the configured factory and independently validate its borrowed
+    /// result; otherwise report Missing. Defaults do not require encode capabilities.
+    /// Defects, interruption and cleanup failures retain their effect outcome channels.
+    pub fn load(&self) -> Effect<A, ConfigError<<D::Source as ConfigSource>::Error>, D> {
+        let config = self.clone();
+        Effect::<_, ConfigError<<D::Source as ConfigSource>::Error>, D>::service(move |env: &D| {
+            let path = config.path.clone();
+            env.config_source()
+                .load(path.clone())
+                .map_error(move |error| ConfigError::Source {
+                    path: path.clone(),
+                    error,
+                })
+                .provide_some(|_: &D| ())
+        })
+        .flat_map(std::convert::identity)
+        .flat_map({
+            let config = self.clone();
+            move |value| {
+                let path = config.path.clone();
+                match value {
+                    Some(value) => config
+                        .codec
+                        .decode_once(
+                            Arc::try_unwrap(value).unwrap_or_else(|shared| shared.as_ref().clone()),
+                        )
+                        .map_error(move |issue| ConfigError::Invalid {
+                            path: path.clone(),
+                            issue,
+                        }),
+                    None => match &config.default {
+                        Some(default) => {
+                            let default = Arc::clone(default);
+                            let codec = config.codec.clone();
+                            Effect::defer(move || default())
+                                .flat_map(move |value| {
+                                    let codec = codec.clone();
+                                    Effect::try_sync_once(
+                                        move || {
+                                            codec.validate_default_ref(&value)?;
+                                            Ok(value)
+                                        },
+                                        std::convert::identity,
+                                    )
+                                })
+                                .map_error(move |issue| ConfigError::Invalid {
+                                    path: path.clone(),
+                                    issue,
+                                })
+                        }
+                        None => {
+                            Effect::fail_with(move || ConfigError::Missing { path: path.clone() })
+                        }
+                    },
+                }
+            }
+        })
     }
 }

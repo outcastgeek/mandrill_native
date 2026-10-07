@@ -10,6 +10,41 @@ use crate::{Effect, KeyDomain, StableKey};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+/// An application authorization decision bound to one replica source and journal stream.
+///
+/// Construct it before import. Import verifies this identity before journal or
+/// cursor access; possessing an unprotected batch alone does not authorize it.
+/// Clones retain the same decision and do not re-run the application's check.
+#[derive(Clone)]
+pub struct ReplicaImportPermit {
+    source: ReplicaId,
+    stream: JournalStream,
+}
+impl ReplicaImportPermit {
+    /// Apply the supplied authorization check eagerly and retain its accepted source/stream.
+    ///
+    /// A rejection is returned unchanged as E before any journal or cursor access.
+    /// The application defines the authority; this method adds no authentication
+    /// mechanism and the resulting permit is valid only for matching batch identities.
+    pub fn authorize<E>(
+        source: ReplicaId,
+        stream: JournalStream,
+        check: impl FnOnce(&ReplicaId, &JournalStream) -> Result<(), E>,
+    ) -> Result<Self, E> {
+        check(&source, &stream)?;
+        Ok(Self { source, stream })
+    }
+    pub(crate) fn authenticated(batch: &ReplicaBatch) -> Self {
+        Self {
+            source: batch.source.clone(),
+            stream: batch.stream.clone(),
+        }
+    }
+    fn accepts(&self, batch: &ReplicaBatch) -> bool {
+        self.source == batch.source && self.stream == batch.stream
+    }
+}
+
 /// Type alias for journal error in eventlog event log remote.
 ///
 /// # Type parameters
@@ -338,6 +373,8 @@ pub enum ReplicaExportError<JournalError> {
 /// # Type parameters
 /// - `JournalError`: Error returned by the event journal.
 pub enum ReplicaImportError<JournalError> {
+    /// The permit does not authorize this batch's replica source and stream; no journal or cursor access is allowed.
+    Unauthorized,
     /// The append may have committed; the journal outcome could not be confirmed.
     UncertainAppend {
         /// Event associated with this record. Type: `EventId`.
@@ -513,23 +550,24 @@ impl EventReplicator {
         })
     }
 
-    /// Check the saved source cursor before import. A page already acknowledged
-    /// returns without touching the journal, and an out-of-order page cannot
-    /// append. After import, compare-and-advance still fences concurrent calls.
-    /// If that update fails, event-ID deduplication makes a retry safe.
+    /// Lazily import an authorized bounded batch and conditionally advance its source cursor.
     ///
-    /// # Type parameters
-    /// - `R`: Environment type. Additional bound: `HasEventJournal + HasReplicaCursorStore + Send + Sync + 'static`.
-    ///
-    /// # Parameters
-    /// - `batch` (`ReplicaBatch`): Ordered group of values processed together.
-    ///
-    /// # Returns
-    /// Type: `ReplicaSyncEffect<R>`.
-    pub fn import_and_ack<R>(batch: ReplicaBatch) -> ReplicaSyncEffect<R>
+    /// The permit must match source and stream before any journal or cursor access.
+    /// An already acknowledged page returns zero imported entries without replaying
+    /// it. Cursor/history conflicts retain authoritative state; journal event IDs
+    /// deduplicate retries, and cursor acknowledgement follows successful import.
+    pub fn import_and_ack<R>(
+        batch: ReplicaBatch,
+        permit: ReplicaImportPermit,
+    ) -> ReplicaSyncEffect<R>
     where
         R: HasEventJournal + HasReplicaCursorStore + Send + Sync + 'static,
     {
+        if !permit.accepts(&batch) {
+            return Effect::from_result_once(Err(ReplicaSyncError::Import(
+                ReplicaImportError::Unauthorized,
+            )));
+        }
         let key = ReplicaCursorKey {
             source: batch.source.clone(),
             stream: batch.stream.clone(),
@@ -544,6 +582,7 @@ impl EventReplicator {
             let key_for_read = key.clone();
             let key_for_import = key.clone();
             let batch = batch.clone();
+            let permit = permit.clone();
             store
                 .load(key.clone())
                 .map_error(move |source| ReplicaSyncError::CursorRead {
@@ -563,7 +602,7 @@ impl EventReplicator {
                             actual: current,
                         });
                     }
-                    Self::import::<R>(batch.clone())
+                    Self::import::<R>(batch.clone(), permit.clone())
                         .map_error(ReplicaSyncError::Import)
                         .flat_map({
                             let key = key_for_import.clone();
@@ -573,26 +612,21 @@ impl EventReplicator {
         })
     }
 
-    /// Import an ordered bounded batch into the ordinary journal authority.
-    /// Event IDs deduplicate retries; a gap or conflicting history stops the
-    /// batch before later entries are admitted. The source cursor is advanced
-    /// by the caller only after this result has been acknowledged.
+    /// Lazily import an authorized ordered batch into the existing journal authority.
     ///
-    /// # Type parameters
-    /// - `R`: Environment type. Additional bound: `HasEventJournal + Send + Sync + 'static`.
-    ///
-    /// # Parameters
-    /// - `batch` (`ReplicaBatch`): Ordered group of values processed together.
-    ///
-    /// # Returns
-    /// Type: `Effect<ReplicaImport, ReplicaImportError<<R::Journal as EventJournal>::Error>, R>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// Rejects a mismatched permit before store access. Event IDs deduplicate retries;
+    /// a gap or conflicting history prevents admitting later entries. This operation
+    /// does not advance the replica cursor; acknowledge only after inspecting its result.
     pub fn import<R>(
         batch: ReplicaBatch,
+        permit: ReplicaImportPermit,
     ) -> Effect<ReplicaImport, ReplicaImportError<<R::Journal as EventJournal>::Error>, R>
     where
         R: HasEventJournal + Send + Sync + 'static,
     {
+        if !permit.accepts(&batch) {
+            return Effect::from_result_once(Err(ReplicaImportError::Unauthorized));
+        }
         if batch.entries.len() > batch.maximum_entries.get()
             || batch
                 .entries

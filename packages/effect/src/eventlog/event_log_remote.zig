@@ -383,3 +383,26 @@ pub fn ConflictHandler(comptime R: type, comptime Resolution: type, comptime Han
         }
     };
 }
+
+/// Validate replica identity before binding an unencrypted session. The bind
+/// callback is never constructed on rejection; provider failures and cleanup
+/// outcomes retain the same typed channel.
+pub fn bindAuthorized(comptime A: type, comptime R: type, comptime ProviderError: type, identity: *const message.Identity, comptime select_authority: fn (*const R) *const SessionAuthority(R, ProviderError), comptime bind: fn (message.Identity, *const R) effects.Effect(A, Error(ProviderError), R)) effects.Effect(A, Error(ProviderError), R) {
+    const Out = effects.Effect(A, Error(ProviderError), R);
+    return Out.deferBorrowed(message.Identity, identity, struct {
+        fn start(value: *const message.Identity, env: *const R) Out {
+            const authority = select_authority(env);
+            var checking = authority.validate(authority.userdata, env, value.*);
+            return checking.flatMapCapturedOwned(env, A, value.*, struct {
+                fn accepted(saved: *const message.Identity, allowed: bool, supplied: *const R) Out {
+                    if (!allowed) return Out.fromOutcome(struct {
+                        fn reject(_: *const R) outcomes.Exit(A, Error(ProviderError)) {
+                            return .{ .fail = .rejected_session };
+                        }
+                    }.reject);
+                    return bind(saved.*, supplied);
+                }
+            }.accepted);
+        }
+    }.start);
+}

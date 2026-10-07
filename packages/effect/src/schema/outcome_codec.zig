@@ -234,40 +234,40 @@ const Writer = struct {
             .provider_unavailable => .provider_unavailable,
             .invalid_configuration => .invalid_configuration,
         };
-        try self.byte(@intFromEnum(tag));
+        try self.byte(@backingInt(tag));
         try self.payload(value.diagnostic.items);
     }
 
     fn primary(self: *Writer, value: Primary) FormatError!void {
         switch (value) {
             .success => |bytes| {
-                try self.byte(@intFromEnum(PrimaryTag.success));
+                try self.byte(@backingInt(PrimaryTag.success));
                 try self.payload(bytes.items);
             },
             .failure => |bytes| {
-                try self.byte(@intFromEnum(PrimaryTag.failure));
+                try self.byte(@backingInt(PrimaryTag.failure));
                 try self.payload(bytes.items);
             },
             .defect => |defect_value| {
-                try self.byte(@intFromEnum(PrimaryTag.defect));
+                try self.byte(@backingInt(PrimaryTag.defect));
                 try self.defect(defect_value);
             },
-            .interrupted => try self.byte(@intFromEnum(PrimaryTag.interrupted)),
-            .succeeded_before_cleanup_failure => try self.byte(@intFromEnum(PrimaryTag.succeeded_before_cleanup_failure)),
+            .interrupted => try self.byte(@backingInt(PrimaryTag.interrupted)),
+            .succeeded_before_cleanup_failure => try self.byte(@backingInt(PrimaryTag.succeeded_before_cleanup_failure)),
         }
     }
 
     fn cleanup(self: *Writer, value: Cleanup) FormatError!void {
         switch (value) {
             .failure => |bytes| {
-                try self.byte(@intFromEnum(CleanupTag.failure));
+                try self.byte(@backingInt(CleanupTag.failure));
                 try self.payload(bytes.items);
             },
             .defect => |defect_value| {
-                try self.byte(@intFromEnum(CleanupTag.defect));
+                try self.byte(@backingInt(CleanupTag.defect));
                 try self.defect(defect_value);
             },
-            .interrupted => try self.byte(@intFromEnum(CleanupTag.interrupted)),
+            .interrupted => try self.byte(@backingInt(CleanupTag.interrupted)),
         }
     }
 };
@@ -362,7 +362,7 @@ pub fn encode(env: anytype, stored: *const StoredExit, limits: Limits) outcomes.
     var writer = Writer.init(env.allocator, limits);
     defer writer.bytes.deinit();
     const failure: ?FormatError = blk: {
-        writer.unsigned(u16, @intFromEnum(Version.first)) catch |problem| break :blk problem;
+        writer.unsigned(u16, @backingInt(Version.first)) catch |problem| break :blk problem;
         writer.primary(stored.primary) catch |problem| break :blk problem;
         writer.unsigned(u32, @intCast(stored.cleanup.items.len)) catch |problem| break :blk problem;
         for (stored.cleanup.items) |entry| writer.cleanup(entry) catch |problem| break :blk problem;
@@ -389,7 +389,7 @@ pub fn decode(env: anytype, encoded: []const u8, limits: Limits) outcomes.Exit(S
     if (encoded.len > limits.max_total_bytes) return .{ .fail = Issue.init(env, .decode, .size_limit) };
     var reader: Reader = .{ .allocator = env.allocator, .source = encoded, .limits = limits };
     const wire_version = reader.unsigned(u16) catch |problem| return formatFailure(env, problem, .decode);
-    if (wire_version != @intFromEnum(Version.first)) return formatFailure(env, error.IncompatibleVersion, .decode);
+    if (wire_version != @backingInt(Version.first)) return formatFailure(env, error.IncompatibleVersion, .decode);
     var primary = reader.primary() catch |problem| return formatFailure(env, problem, .decode);
     var keep_primary = false;
     defer if (!keep_primary) primary.deinit();

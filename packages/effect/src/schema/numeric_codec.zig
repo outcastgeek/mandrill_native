@@ -139,7 +139,7 @@ pub fn FixedDecimalText(comptime T: type, comptime fractional_digits: usize) typ
         pub fn format(value: FixedDecimal(T, fractional_digits)) Self {
             var result: Self = .{ .buffer = undefined, .len = 0 };
             var digits_buffer: [@bitSizeOf(T)]u8 = undefined;
-            const magnitude: std.meta.Int(.unsigned, @bitSizeOf(T)) = @abs(value.coefficient);
+            const magnitude: @Int(.unsigned, @bitSizeOf(T)) = @abs(value.coefficient);
             const digits = std.fmt.bufPrint(&digits_buffer, "{d}", .{magnitude}) catch unreachable;
             var cursor: usize = 0;
             if (value.coefficient < 0) {

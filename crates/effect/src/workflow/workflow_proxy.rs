@@ -81,17 +81,23 @@ pub enum WorkflowCommand {
         /// The declared compatibility version. Type: `WorkflowVersion`.
         version: WorkflowVersion,
     },
-    /// Continue a previously suspended workflow run.
+    /// Resume a suspended run or retry a previously failed exact reset.
+    ///
+    /// Some(checkpoint) carries the failed reset fence; None permits ordinary Suspended
+    /// resume and cannot reset a Running body. Completed runs acknowledge recorded
+    /// state. A stale fence cannot reset a replacement execution.
     Resume {
         /// Stable identity of the workflow run. Type: `WorkflowRunId`.
         run: WorkflowRunId,
+        /// Exact failed-reset ownership, or None for ordinary suspended resume.
+        checkpoint: Option<super::WorkflowCheckpoint>,
     },
     /// Apply the selected state transition.
     Transition {
         /// Stable identity of the workflow run. Type: `WorkflowRunId`.
         run: WorkflowRunId,
-        /// The value required by the requested condition. Type: `WorkflowStatus`.
-        expected: WorkflowStatus,
+        /// Status and execution counter that must both still match; not a status-only comparison.
+        expected: super::WorkflowCheckpoint,
         /// Next position after the current record. Type: `WorkflowStatus`.
         next: WorkflowStatus,
     },
@@ -205,7 +211,7 @@ impl WorkflowCommand {
             | Self::InspectActivity { run, .. }
             | Self::InspectSignal { run, .. }
             | Self::WaitSignal { run, .. }
-            | Self::Resume { run }
+            | Self::Resume { run, .. }
             | Self::Cancel { run }
             | Self::Transition { run, .. }
             | Self::ForceInterrupt { run }

@@ -1,6 +1,6 @@
 # Effect for Zig
 
-A Zig 0.16 port of the Mandrill F# Effect library. `Effect(A, E, R)` describes
+A Zig 0.17 port of the Mandrill F# Effect library. `Effect(A, E, R)` describes
 lazy work. `R` supplies application services, allocator, I/O, cancellation, and
 execution providers. `run` and `runAsync().join()` return `Exit(A, E)` directly:
 success, typed failure, interruption, defect, or failed finalization. Consumers
@@ -120,7 +120,7 @@ From this package directory:
 
 ```sh
 zig build test example compile-fail fmt codegen --summary all
-zig build test example compile-fail fmt -Doptimize=ReleaseSafe --summary all
+zig build test example compile-fail fmt -Doptimize=safe --summary all
 zig build provider-test
 ```
 
@@ -133,5 +133,13 @@ compositions with equivalent handwritten Zig and writes assembly/LLVM IR under
 
 Allocating tests use `std.testing.allocator`, including beneath tracking and
 failure-injection allocators. The test target also proves that deliberately
-leaking fixtures fail Zig's native test runner in Debug and ReleaseSafe.
+leaking fixtures fail Zig's native test runner in debug and safe.
 Python 3 runs the verification scripts; the library has no Python dependency.
+
+See [the 2026-10-06 reference update](docs/reference-update-2026-10-06.md) for native/domain codec contracts, explicit JSON limits, dependency-cache ownership, and fixed reference dispositions.
+
+For UTF-8 parsing, select `JsonSurface.Limits` with independent `input`, `schema`, `maximum_issues`, `maximum_integer_digits`, and `output` fields. `JsonConstraints.withLimits(Schema, selectLimits).parseBytesDirect(&env, bytes, .reject)` returns `Exit(Parsed(Schema.Decoded), SchemaIssue.Issue)`. Keep the Parsed owner until its borrowed fields are no longer used. The independent consumer includes a complete exact-number example using these limits and its caller SafeAllocator.
+
+`JsonCodec.requireWriter(Schema)` requires child-checked public evidence. Records and variants with eligible children write directly; variant `encodeBytesWith` also accepts explicit bounds and retains a checked fallback. `DomainCodec.Directed` preserves each direction's pure evidence independently; `decodeIn` and `encodeIn` project only that direction's environment.
+
+Workflow providers accept `WorkflowTypes.ResumeRequest` and compare `expected_revision` at mutation time. Failed-run retry supplies the observed `expected_terminal_reply`; completed poll replies include their revision. RPC receive drivers handle `end_of_input` by stopping intake and allowing pending stream consumers to drain.

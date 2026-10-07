@@ -7,6 +7,36 @@ const execution = @import("executor.zig");
 const primitives = @import("primitives.zig");
 const Cancellation = @import("internal/runtime.zig").Cancellation;
 
+/// Lookup selection, fixed before waiting for a generation.
+pub const CacheObservation = enum {
+    /// Selected a still-retained settled entry.
+    retained,
+    /// Selected a generation already being loaded by another observer.
+    shared,
+    /// Admitted the generation whose loader supplies this value.
+    loaded,
+};
+/// Observed A plus selection provenance fixed before waiting.
+/// When A is marked owning, deinit/clone release/copy its ownership independently.
+pub fn CacheLookup(comptime A: type) type {
+    return struct {
+        pub const effect_owned_payload = outcomes.ownsPayload(A);
+        /// Independent observation of the selected cache value.
+        value: A,
+        /// Provenance chosen before waiting; settlement does not relabel it.
+        observation: CacheObservation,
+        /// Discard a marked owning observed value once.
+        pub fn deinit(self: *@This()) void {
+            outcomes.discardPayload(&self.value);
+            self.* = undefined;
+        }
+        /// Clone the observed value without changing its generation-selection provenance.
+        pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
+            return .{ .value = try outcomes.clonePayload(self.value), .observation = self.observation };
+        }
+    };
+}
+
 /// Specialize cache key hashing, equality, and retention callbacks.
 /// Parameters:
 /// - `Key: comptime type`: Key type used to identify or look up entries in this component.
@@ -34,6 +64,7 @@ pub fn Config(comptime Key: type, comptime E: type) type {
         // its own explicit consumer policy; null deliberately permits growth.
         maximum_inflight: ?usize,
         cache_failure: *const fn (E) bool,
+        capacity_error: ?*const fn () E = null,
     };
 }
 
@@ -46,6 +77,11 @@ pub fn Config(comptime Key: type, comptime E: type) type {
 pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
     return struct {
         const Self = @This();
+        const dependency_aware = switch (@typeInfo(A)) {
+            .@"struct", .@"union" => @hasDecl(A, "cache_dependencies"),
+            else => false,
+        };
+        const DependencySnapshot = if (dependency_aware) A else void;
         /// `Loader` is a callback interface with `userdata: *anyopaque`, `run: *const fn (*anyopaque,
         /// Key, *const Cancellation) outcomes.Exit(A, E)`, `deinit: *const fn (*anyopaque) void`.
         pub const Loader = struct {
@@ -70,6 +106,7 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
             expires: ?std.Io.Timestamp = null,
             accessed: std.Io.Timestamp,
             outcome: outcomes.Exit(A, E) = undefined,
+            dependency_snapshot: ?DependencySnapshot = null,
             completion: primitives.Deferred(A, E),
             metadata: ?*Aggregate,
             aggregation: ?*Aggregate,
@@ -84,6 +121,7 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
                 self.completion.deinit();
                 const retained = if (self.metadata) |metadata| metadata.storage.retained() else false;
                 if (self.settled) self.outcome.deinit();
+                if (comptime dependency_aware) if (self.dependency_snapshot) |*value| value.deinit();
                 if (!retained) if (self.metadata) |metadata| cache.allocator.destroy(metadata);
                 if (self.aggregation) |aggregation| cache.allocator.destroy(aggregation);
                 cache.config.keys.release(cache.config.keys.userdata, &self.key);
@@ -92,6 +130,17 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
             fn load(data: *anyopaque) void {
                 const self: *Entry = @ptrCast(@alignCast(data));
                 self.outcome = self.cache.loader.run(self.cache.loader.userdata, self.key, &self.cancellation);
+                if (comptime dependency_aware) {
+                    if (self.outcome == .success) {
+                        self.dependency_snapshot = self.outcome.success.clone() catch {
+                            self.outcome.deinit();
+                            self.outcome = .{ .die = outcomes.Defect.out_of_memory };
+                            self.ready.store(true, .release);
+                            self.cache.wake.set(self.cache.io);
+                            return;
+                        };
+                    }
+                }
                 self.ready.store(true, .release);
                 self.cache.wake.set(self.cache.io);
             }
@@ -126,7 +175,7 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
         /// - `config: Config(Key, E)`: Caller-selected, validated behavior or resource bounds; no hidden default
         ///   is installed.
         /// - `loader: Loader`: Typed loader callback used when the cache misses.
-        /// Returns (`outcomes.Exit(*Self, E)`): Carries `*Self` on `.success` or `E` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
+        /// Returns (`outcomes.Exit(*Self, E)`): Carries `*Self` on `.success` or `E` on `.fail`; `.die`, `.interrupted`, and `.finalization_failed` preserve other terminal causes.
         pub fn create(env: anytype, config: Config(Key, E), loader: Loader) outcomes.Exit(*Self, E) {
             if (config.time_to_live) |ttl| if (ttl.nanoseconds < 0) return .{ .die = .{ .kind = .invalid_configuration, .message = diagnostics.cache_ttl_must_be_non_negative } };
             const cache = env.allocator.create(Self) catch return .{ .die = outcomes.Defect.out_of_memory };
@@ -165,7 +214,7 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
             self.wake.set(self.io);
         }
 
-        const Snapshot = struct { entry: *Entry, retained: bool, invalidated: bool, expires: ?std.Io.Timestamp };
+        const Snapshot = struct { entry: *Entry, retained: bool, invalidated: bool, expires: ?std.Io.Timestamp, settled: bool };
         fn snapshot(self: *Self) ?[]Snapshot {
             var count: usize = 0;
             var current = self.entries;
@@ -178,7 +227,7 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
             for (entries) |*item| {
                 const entry = current.?;
                 entry.retain();
-                item.* = .{ .entry = entry, .retained = entry.retained, .invalidated = entry.invalidated, .expires = entry.expires };
+                item.* = .{ .entry = entry, .retained = entry.retained, .invalidated = entry.invalidated, .expires = entry.expires, .settled = entry.settled };
                 current = entry.next;
             }
             return entries;
@@ -194,8 +243,17 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
         /// - `key: Key`: Stable identity used for matching, deduplication, or replay.
         /// - `token: ?*const Cancellation`: Cancellation token observed by this operation; its owner must outlive
         ///   pending work.
-        /// Returns (`outcomes.Exit(A, E)`): Carries `A` on `.success` or `E` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
+        /// Returns (`outcomes.Exit(A, E)`): Carries `A` on `.success` or `E` on `.fail`; `.die`, `.interrupted`, and `.finalization_failed` preserve other terminal causes.
         pub fn getToken(self: *Self, key: Key, token: ?*const Cancellation) outcomes.Exit(A, E) {
+            const selected = self.getObservedToken(key, token);
+            return switch (selected) {
+                .success => |lookup| .{ .success = lookup.value },
+                else => outcomes.castFailure(A, selected),
+            };
+        }
+        /// Select a retained/shared/new generation before waiting and return an independent value observation.
+        /// Cancellation removes this observer; the scoped shared load and other observers keep their own lifetimes.
+        pub fn getObservedToken(self: *Self, key: Key, token: ?*const Cancellation) outcomes.Exit(CacheLookup(A), E) {
             self.mutex.lockUncancelable(self.io);
             self.users += 1;
             self.mutex.unlock(self.io);
@@ -246,18 +304,22 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
                     continue;
                 }
                 if (selected) |entry| {
+                    const observation: CacheObservation = if (entry.settled) .retained else .shared;
                     entry.retain();
                     entry.accessed = now;
                     self.changed();
                     self.mutex.unlock(self.io);
                     self.releaseSnapshot(entries);
                     defer entry.release();
-                    return self.observe(entry, token);
+                    return self.observeLookup(entry, token, observation);
                 }
                 const saturated = if (self.config.maximum_inflight) |limit| self.inflight >= limit else false;
                 self.mutex.unlock(self.io);
                 self.releaseSnapshot(entries);
-                if (saturated) return .{ .die = .{ .kind = .provider_unavailable, .message = diagnostics.cache_in_flight_admission_capacity_is_exhausted } };
+                if (saturated) {
+                    if (self.config.capacity_error) |make_error| return .{ .fail = make_error() };
+                    return .{ .die = .{ .kind = .provider_unavailable, .message = diagnostics.cache_in_flight_admission_capacity_is_exhausted } };
+                }
                 const owned_key = self.config.keys.retain(self.config.keys.userdata, key) catch return .{ .die = outcomes.Defect.out_of_memory };
                 const entry = self.allocator.create(Entry) catch {
                     var discarded = owned_key;
@@ -279,7 +341,7 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
                 };
                 aggregation.* = .{ .allocator = self.allocator, .storage = .{ .owner = aggregation, .release = Aggregate.destroy, .allocator = self.allocator } };
                 metadata.* = .{ .allocator = self.allocator, .storage = .{ .owner = metadata, .release = Aggregate.destroy, .allocator = self.allocator } };
-                entry.* = .{ .cache = self, .key = owned_key, .accessed = now, .completion = .{ .io = self.io }, .metadata = metadata, .aggregation = aggregation };
+                entry.* = .{ .cache = self, .key = owned_key, .accessed = .{ .nanoseconds = 0 }, .completion = .{ .io = self.io }, .metadata = metadata, .aggregation = aggregation };
                 self.mutex.lockUncancelable(self.io);
                 if (self.closed or self.revision != revision) {
                     self.mutex.unlock(self.io);
@@ -303,7 +365,68 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
                 self.changed();
                 self.mutex.unlock(self.io);
                 defer entry.release();
-                return self.observe(entry, token);
+                return self.observeLookup(entry, token, .loaded);
+            }
+        }
+
+        fn observeLookup(self: *Self, entry: *Entry, token: ?*const Cancellation, observation: CacheObservation) outcomes.Exit(CacheLookup(A), E) {
+            const result = self.observe(entry, token);
+            return switch (result) {
+                .success => |value| .{ .success = .{ .value = value, .observation = observation } },
+                else => outcomes.castFailure(CacheLookup(A), result),
+            };
+        }
+
+        /// Inspect settled successful entries only; never starts or waits for a load.
+        pub fn tryGet(self: *Self, key: Key) outcomes.Exit(?A, E) {
+            while (true) {
+                self.mutex.lockUncancelable(self.io);
+                if (self.closed) {
+                    self.mutex.unlock(self.io);
+                    return .{ .success = null };
+                }
+                const revision = self.revision;
+                const entries = self.snapshot() orelse {
+                    self.mutex.unlock(self.io);
+                    return .{ .die = outcomes.Defect.out_of_memory };
+                };
+                self.mutex.unlock(self.io);
+                const now = self.clock.now();
+                var selected: ?*Entry = null;
+                for (entries) |item| {
+                    if (item.settled and item.retained and !item.invalidated and
+                        (item.expires == null or now.nanoseconds < item.expires.?.nanoseconds) and
+                        self.config.keys.equal(self.config.keys.userdata, item.entry.key, key))
+                    {
+                        selected = item.entry;
+                        break;
+                    }
+                }
+                self.mutex.lockUncancelable(self.io);
+                if (revision != self.revision) {
+                    self.mutex.unlock(self.io);
+                    self.releaseSnapshot(entries);
+                    continue;
+                }
+                if (selected) |entry| entry.retain();
+                self.mutex.unlock(self.io);
+                self.releaseSnapshot(entries);
+                const entry = selected orelse return .{ .success = null };
+                defer entry.release();
+                // Deferred.tryGet clones outside the cache lock and cannot suspend.
+                const value = entry.completion.poll();
+                if (value) |result| {
+                    return switch (result) {
+                        .success => |success| .{ .success = success },
+                        .die => |defect| .{ .die = defect },
+                        else => blk: {
+                            var discarded = result;
+                            discarded.deinit();
+                            break :blk .{ .success = null };
+                        },
+                    };
+                }
+                return .{ .success = null };
             }
         }
 
@@ -441,8 +564,34 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
         /// Parameters:
         /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
         /// - `key: Key`: Stable identity used for matching, deduplication, or replay.
-        /// Returns (`outcomes.Exit(void, E)`): Carries no value on `.success` or `E` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
+        /// Returns (`outcomes.Exit(void, E)`): Carries no value on `.success` or `E` on `.fail`; `.die`, `.interrupted`, and `.finalization_failed` preserve other terminal causes.
         pub fn invalidate(self: *Self, key: Key) outcomes.Exit(void, E) {
+            return self.invalidateMatching(Key, key, struct {
+                fn matches(cache: *Self, candidate: Key, _: ?*const DependencySnapshot, target: Key) bool {
+                    return cache.config.keys.equal(cache.config.keys.userdata, candidate, target);
+                }
+            }.matches, null);
+        }
+        /// Exclude every selected generation, release settled entries and cancel/join excluded loaders outside the mutex.
+        pub fn clear(self: *Self) outcomes.Exit(void, E) {
+            return self.invalidateMatching(void, {}, struct {
+                fn matches(_: *Self, _: Key, _: ?*const DependencySnapshot, _: void) bool {
+                    return true;
+                }
+            }.matches, null);
+        }
+        /// Invalidate matching settled dependency owners and conservatively exclude unfinished generations with unknown dependencies.
+        pub fn invalidateDependency(self: *Self, dependency: A.Dependency) outcomes.Exit(void, E) {
+            if (!dependency_aware) @compileError("dependency invalidation requires a dependency cache");
+            return self.invalidateMatching(A.Dependency, dependency, struct {
+                fn matches(_: *Self, _: Key, metadata: ?*const DependencySnapshot, target: A.Dependency) bool {
+                    // Unknown dependencies include active generations and retained failures.
+                    const value = metadata orelse return true;
+                    return value.dependsOn(target);
+                }
+            }.matches, null);
+        }
+        fn invalidateMatching(self: *Self, comptime Input: type, input: Input, comptime matchesEntry: fn (*Self, Key, ?*const DependencySnapshot, Input) bool, replacement: ?*Entry) outcomes.Exit(void, E) {
             self.mutex.lockUncancelable(self.io);
             self.users += 1;
             self.mutex.unlock(self.io);
@@ -463,7 +612,24 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
                     self.releaseSnapshot(entries);
                     return .{ .die = outcomes.Defect.out_of_memory };
                 };
-                for (entries, matches) |item, *match| match.* = self.config.keys.equal(self.config.keys.userdata, item.entry.key, key);
+                for (entries, matches) |item, *match| {
+                    const metadata: ?*const DependencySnapshot = if (comptime dependency_aware)
+                        (if (item.settled and item.entry.dependency_snapshot != null) &item.entry.dependency_snapshot.? else null)
+                    else
+                        null;
+                    match.* = matchesEntry(self, item.entry.key, metadata, input);
+                }
+                // Time is sampled after user equality and all replacement copies.
+                // Retry the sample when a competing mutation invalidates the snapshot.
+                const settled_at: ?std.Io.Timestamp = if (replacement != null) self.clock.now() else null;
+                const expires: ?std.Io.Timestamp = if (settled_at != null and self.config.time_to_live != null) blk: {
+                    const end = std.math.add(i96, settled_at.?.nanoseconds, self.config.time_to_live.?.nanoseconds) catch {
+                        self.allocator.free(matches);
+                        self.releaseSnapshot(entries);
+                        return .{ .die = .{ .kind = .invalid_configuration, .message = diagnostics.cache_expiration_timestamp_overflowed } };
+                    };
+                    break :blk .{ .nanoseconds = end };
+                } else null;
                 self.mutex.lockUncancelable(self.io);
                 if (self.revision != revision) {
                     self.mutex.unlock(self.io);
@@ -471,10 +637,30 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
                     self.releaseSnapshot(entries);
                     continue;
                 }
+                if (replacement != null and self.closed) {
+                    self.mutex.unlock(self.io);
+                    self.allocator.free(matches);
+                    self.releaseSnapshot(entries);
+                    return .{ .die = .{ .kind = .invalid_configuration, .message = diagnostics.cache_is_closed } };
+                }
                 for (entries, matches) |item, match| if (match) {
                     item.entry.invalidated = true;
                     item.entry.retained = false;
                 };
+                if (replacement) |entry| {
+                    if (self.closed) {
+                        self.mutex.unlock(self.io);
+                        self.allocator.free(matches);
+                        self.releaseSnapshot(entries);
+                        return .{ .die = .{ .kind = .invalid_configuration, .message = diagnostics.cache_is_closed } };
+                    }
+                    entry.accessed = settled_at.?;
+                    entry.expires = expires;
+                    entry.next = self.entries;
+                    self.entries = entry;
+                    entry.retain(); // cache list ownership; caller keeps its construction reference
+                    self.trim();
+                }
                 self.changed();
                 self.mutex.unlock(self.io);
                 var result: outcomes.Exit(void, E) = .{ .success = {} };
@@ -494,21 +680,40 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
                         entry.aggregation.?.storage.appendFailures(&result, completed);
                         if (entry.aggregation.?.storage.retained()) entry.aggregation = null;
                         if (entry.metadata.?.storage.retained()) entry.metadata = null;
-                    } else if (completed == .fail) {
-                        var discarded = completed;
-                        discarded.deinit();
-                    }
-                    if (completed == .success) {
-                        var discarded = completed;
-                        discarded.deinit();
                     }
                     self.changed();
                     self.mutex.unlock(self.io);
+                    if (completed == .success or completed == .fail) {
+                        var discarded = completed;
+                        discarded.deinit();
+                    }
                 };
                 self.allocator.free(matches);
                 self.releaseSnapshot(entries);
                 return result;
             }
+        }
+
+        /// Copy replacement data before atomically excluding earlier equal-key generations.
+        pub fn set(self: *Self, key: Key, value: *const A) outcomes.Exit(void, E) {
+            const owned_key = self.config.keys.retain(self.config.keys.userdata, key) catch return .{ .die = outcomes.Defect.out_of_memory };
+            const entry = self.allocator.create(Entry) catch {
+                var discarded = owned_key;
+                self.config.keys.release(self.config.keys.userdata, &discarded);
+                return .{ .die = outcomes.Defect.out_of_memory };
+            };
+            entry.* = .{ .cache = self, .key = owned_key, .accessed = .{ .nanoseconds = 0 }, .completion = .{ .io = self.io }, .metadata = null, .aggregation = null };
+            defer entry.release();
+            const copied = outcomes.clonePayload(value.*) catch return .{ .die = outcomes.Defect.out_of_memory };
+            entry.outcome = .{ .success = copied };
+            entry.settled = true;
+            if (comptime dependency_aware) entry.dependency_snapshot = copied.clone() catch return .{ .die = outcomes.Defect.out_of_memory };
+            if (!entry.completion.completeCopy(entry.outcome) or entry.completion.copy_failed) return .{ .die = outcomes.Defect.out_of_memory };
+            return self.invalidateMatching(Key, key, struct {
+                fn matches(cache: *Self, candidate: Key, _: ?*const DependencySnapshot, target: Key) bool {
+                    return cache.config.keys.equal(cache.config.keys.userdata, candidate, target);
+                }
+            }.matches, entry);
         }
 
         const Aggregate = struct {
@@ -523,7 +728,7 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
         /// Stop the capability and release its retained resources.
         /// Parameters:
         /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
-        /// Returns (`outcomes.Exit(void, E)`): Carries no value on `.success` or `E` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
+        /// Returns (`outcomes.Exit(void, E)`): Carries no value on `.success` or `E` on `.fail`; `.die`, `.interrupted`, and `.finalization_failed` preserve other terminal causes.
         pub fn shutdown(self: *Self) outcomes.Exit(void, E) {
             self.closing_mutex.lockUncancelable(self.io);
             defer self.closing_mutex.unlock(self.io);

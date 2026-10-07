@@ -502,3 +502,22 @@ fn schedule_exhaustion_delay_cancellation_and_timeout_cleanup_keep_full_outcomes
     );
     env.tasks.finish();
 }
+
+#[test]
+fn failed_schedule_decision_preserves_nonclone_primary_and_nested_cleanup_order() {
+    struct Owned(String);
+    let env = Arc::new(Env::default());
+    let schedule = Schedule::<Owned, ()>::unfold((), |_, _, _, _| {
+        Err(Defect::from(LibraryDefect::ProviderClosed))
+    });
+    let effect = Effect::<(), Owned, Env>::fail_with(|| Owned(String::from("primary")))
+        .retry(schedule)
+        .ensuring(
+            Effect::fail_with(|| Owned(String::from("outer")))
+                .ensuring(Effect::fail_with(|| Owned(String::from("inner")))),
+        );
+    let outcome = block_on(effect.run(env));
+    assert!(
+        matches!(outcome,Exit::FinalizationFailed(ref details) if matches!(&details.primary,PrimaryOutcome::Failed(Owned(message)) if message=="primary")&&matches!(&details.first,CleanupFailure::ReleaseDefect(defect) if defect.kind()==DefectKind::Library(LibraryDefect::ProviderClosed))&&matches!(details.rest.as_slice(),[CleanupFailure::ReleaseFailure(Owned(outer)),CleanupFailure::ReleaseFailure(Owned(inner))] if outer=="outer"&&inner=="inner"))
+    );
+}

@@ -118,17 +118,12 @@ impl ClusterWorkflowEngine {
         RpcHandler::new(operation, Self::dispatch::<R>)
     }
 
-    /// Decode and route an addressed command to the workflow engine.
+    /// Lazily dispatch one owned workflow command through R's existing engine.
     ///
-    /// # Type parameters
-    /// - `R`: Environment type. Additional bound: `HasWorkflowEngine + Send + Sync + 'static`.
-    ///
-    /// # Parameters
-    /// - `command` (`WorkflowCommand`): The command supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Effect<WorkflowReply, ClusterWorkflowError<<R::Engine as WorkflowEngine>::Error>, R>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// Resume honors the optional exact reset checkpoint: absence resumes only
+    /// Suspended state, and stale fences cannot reset newer Running executions.
+    /// Completed runs return recorded snapshots. This is a single-use command effect;
+    /// no secondary journal or storage durability is supplied by the bridge.
     pub fn dispatch<R>(
         command: WorkflowCommand,
     ) -> Effect<WorkflowReply, ClusterWorkflowError<<R::Engine as WorkflowEngine>::Error>, R>
@@ -203,18 +198,22 @@ impl ClusterWorkflowEngine {
                     .map_error(ClusterWorkflowError::Engine)
                     .provide_some(|_: &R| ())
                     .map(WorkflowReply::SignalWait),
-                WorkflowCommand::Resume { run } => {
+                WorkflowCommand::Resume { run, checkpoint } => {
                     let resume_engine = engine.clone();
                     engine
                         .inspect(run.clone())
                         .map_error(ClusterWorkflowError::Engine)
                         .provide_some(|_: &R| ())
                         .flat_map(move |snapshot| match snapshot {
-                            Some(snapshot) if snapshot.status == WorkflowStatus::Suspended => {
+                            Some(snapshot)
+                                if snapshot.status == WorkflowStatus::Suspended
+                                    || (snapshot.status == WorkflowStatus::Running
+                                        && checkpoint.is_some()) =>
+                            {
                                 resume_engine
                                     .transition(
                                         run.clone(),
-                                        WorkflowStatus::Suspended,
+                                        checkpoint.clone().unwrap_or_else(|| snapshot.checkpoint()),
                                         WorkflowStatus::Ready,
                                     )
                                     .map_error(ClusterWorkflowError::Engine)

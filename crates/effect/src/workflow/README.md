@@ -6,6 +6,8 @@ A workflow definition and its stable run ID, version and compatibility signature
 
 `DurableQueue` provides the result-before-ack replay protocol with either volatile or durable providers. When process-loss recovery is required, construct `DurableQueue::new(queue).require_physical_durability::<ProductionEnv>()` and use the returned `DurableRequiredQueue<Payload, Domain, ProductionEnv>`. `ProductionEnv` must expose the same queue and workflow capabilities used by those operations; its queue store must implement `DurablePersistedQueueStore` and its engine `DurableWorkflowEngine`. Those markers are explicit provider warranties about acknowledged state surviving each provider's documented restart boundary. Neither memory provider implements them, so a memory-only environment fails to compile at this constructor.
 
-`DurableDeferred<A>` binds a typed signal to one run and definition version. Its result can be inspected after recording, including when a queue acknowledgement is lost. The [queue/workflow bridge test](../../tests/queue_workflow_bridge.rs) demonstrates result-before-ack ordering and recovery from a stale settlement token in a native release build. The queue and workflow engine remain separate authorities; providers must uphold their respective acknowledgement and recovery contracts.
+`DurableDeferred<A>` binds a typed signal to one run and definition version. Its result can be inspected after recording, including when a queue acknowledgement is lost. The queue and workflow engine remain separate authorities; providers must uphold their respective acknowledgement and recovery contracts.
 
-The external [provider-neutral consumer](../../tests/fixtures/shared/provider_program.rs) composes `activity!` and `workflow!` in `workflow_cpu`, then runs the same definition with the independent and mixed-provider environments.
+See the [provider-neutral example](../../tests/fixtures/shared/provider_program.rs),
+`workflow_cpu`, for `activity!` and `workflow!` composition with providers supplied
+through `R`.

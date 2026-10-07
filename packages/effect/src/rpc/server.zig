@@ -60,7 +60,7 @@ pub fn ProtocolServer(
     const Info = @typeInfo(@TypeOf(bindings));
     if (Info != .@"struct" or !Info.@"struct".is_tuple or bindings.len == 0)
         @compileError("RPC server needs a nonempty tuple of typed handler/codec bindings");
-    const RouteTypes = std.meta.Tuple(&([_]type{type} ** bindings.len));
+    const RouteTypes = @Tuple(&@as([bindings.len]type, @splat(type)));
     comptime var routes: RouteTypes = undefined;
     inline for (bindings, 0..) |binding, index| {
         const B = @TypeOf(binding);

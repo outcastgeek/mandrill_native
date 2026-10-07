@@ -747,3 +747,178 @@ fn abandoned_cache_and_live_weak_association_reject_new_work_and_can_be_drained(
     ));
     env.tasks.finish();
 }
+#[test]
+fn dependency_cache_observes_retention_sets_and_fences_dependencies() {
+    let env = Arc::new(Env::default());
+    let loads = count();
+    let witness = Arc::clone(&loads);
+    let program: Effect<(), SharedValue<DependencyCacheError<()>>, Env> = Scope::scoped(
+        move |scope| {
+            let loads = Arc::clone(&loads);
+            effect! {
+                let loads=Arc::clone(&loads);
+                let cache=DependencyCache::make(scope.clone(),DependencyCachePolicy{retention:nz(2),maximum_active:nz(1),maximum_dependencies:nz(1),key_equal:Arc::new(|left:&usize,right|left==right),dependency_equal:Arc::new(|left:&usize,right|left==right),cache_failure:Arc::new(|_:&()|false),ttl:CacheTtl::Fixed(None)},move |key|{let key=*key;let loads=Arc::clone(&loads);Effect::sync(move ||{loads.fetch_add(1,Ordering::SeqCst);(key,vec![key])})})?;
+                let observed=cache.get_observed(1)?;assert_eq!(observed.observation,CacheObservation::Loaded);
+                let observed=cache.get_observed(1)?;assert_eq!(observed.observation,CacheObservation::Retained);
+                cache.set(1,7,vec![2])?;let value=cache.try_get(1)?;assert_eq!(value.unwrap().with(|value|*value),Ok(7));
+                cache.invalidate_dependency(2)?;let missing=cache.try_get(1)?;assert!(missing.is_none());
+                let observed=cache.get_observed(1)?;assert_eq!(observed.observation,CacheObservation::Loaded);
+                cache.clear()?;let missing=cache.try_get(1)?;assert!(missing.is_none());
+            }
+        },
+    );
+    assert!(matches!(block_on(program.run(env)), Exit::Success(())));
+    assert_eq!(witness.load(Ordering::SeqCst), 2);
+}
+#[test]
+fn dynamic_cache_ttl_failure_settles_and_preserves_cleanup() {
+    let env = Arc::new(Env::default());
+    let program: Effect<(), SharedValue<()>, Env> = Scope::scoped(|scope| {
+        Cache::make_with_options(
+            scope,
+            CacheConfig {
+                equal: Arc::new(|left: &usize, right| left == right),
+                ttl: None,
+                capacity: CacheCapacity::Bounded(NonZeroUsize::MIN),
+                cache_failure: Arc::new(|_: &()| false),
+            },
+            CacheOptions {
+                ttl: CacheTtl::Outcome(Arc::new(|_| {
+                    Err(Defect::from(LibraryDefect::ClockDeadlineOverflow))
+                })),
+                admission: CacheAdmission::Unbounded,
+            },
+            |_| Effect::succeed(1usize),
+        )
+        .flat_map(|cache| cache.get(1).map(|_| ()))
+    });
+    assert!(matches!(
+        block_on(program.run(env)),
+        Exit::FinalizationFailed(_)
+    ));
+}
+
+#[test]
+fn bounded_cache_admission_rejects_before_dispatch_and_recovers_after_retirement() {
+    let env = Arc::new(Env::default());
+    let calls = count();
+    let loaded = Arc::clone(&calls);
+    let started = Latch::new();
+    let released = Latch::new();
+    let program: Effect<(), SharedValue<&'static str>, Env> = Scope::scoped(move |scope| {
+        let loaded = Arc::clone(&loaded);
+        let started = started.clone();
+        let released = released.clone();
+        effect! {
+            let scope=scope.clone();let loaded=Arc::clone(&loaded);let started=started.clone();let released=released.clone();
+            let load_started=started.clone();let load_released=released.clone();
+            let cache=Cache::make_with_options(scope.clone(),CacheConfig{equal:Arc::new(|a:&usize,b|a==b),ttl:None,capacity:CacheCapacity::NoRetention,cache_failure:Arc::new(|_|false)},CacheOptions{ttl:CacheTtl::Fixed(None),admission:CacheAdmission::Bounded{maximum:nz(1),capacity_error:Arc::new(||"full")}},move |_|{let loaded=Arc::clone(&loaded);let started=load_started.clone();let released=load_released.clone();effect!{let loaded=Arc::clone(&loaded);let started=started.clone();let released=released.clone();Effect::sync(move||{loaded.fetch_add(1,Ordering::SeqCst);})?;started.open()?;released.await_open()?;7usize}})?;
+            let first=scope.fork(cache.get_observed(1))?;started.await_open()?;
+            let denied=cache.get_observed(2).either()?;assert!(matches!(denied,Err(error) if error.with(|error|*error)==Ok("full")));
+            released.open()?;let observed=first.join()?;assert_eq!(observed.observation,CacheObservation::Loaded);
+            let observed=cache.get_observed(2)?;assert_eq!(observed.observation,CacheObservation::Loaded);
+        }
+    });
+    assert!(matches!(
+        block_on(program.run(Arc::clone(&env))),
+        Exit::Success(())
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    env.tasks.finish();
+}
+
+#[test]
+fn cache_observation_distinguishes_shared_loading_and_set_fences_active_generation() {
+    let env = Arc::new(Env::default());
+    let slot = Arc::new(Mutex::new(None::<Cache<usize, usize, ()>>));
+    let exposed = Arc::clone(&slot);
+    let loads = count();
+    let entered = Arc::clone(&loads);
+    let comparisons = count();
+    let matched = Arc::clone(&comparisons);
+    let released = Latch::new();
+    let load_release = released.clone();
+    let blocked_release = Latch::new();
+    let program: Effect<(), SharedValue<()>, Env> = Scope::scoped(move |scope| {
+        let exposed = Arc::clone(&exposed);
+        let entered = Arc::clone(&entered);
+        let matched = Arc::clone(&matched);
+        let load_release = load_release.clone();
+        let blocked_release = blocked_release.clone();
+        Cache::make(
+            scope,
+            CacheConfig {
+                equal: Arc::new(move |left: &usize, right| {
+                    matched.fetch_add(1, Ordering::SeqCst);
+                    left == right
+                }),
+                ttl: None,
+                capacity: CacheCapacity::Unbounded,
+                cache_failure: Arc::new(|_| false),
+            },
+            move |key| {
+                let key = *key;
+                let entered = Arc::clone(&entered);
+                let released = if key == 2 {
+                    blocked_release.clone()
+                } else {
+                    load_release.clone()
+                };
+                Effect::sync(move || {
+                    entered.fetch_add(1, Ordering::SeqCst);
+                })
+                .zip(released.await_open())
+                .map(move |_| key)
+            },
+        )
+        .flat_map(move |cache| {
+            *exposed.lock().unwrap() = Some(cache);
+            Effect::from_future(|_| std::future::pending::<()>())
+        })
+    });
+    let mut program = Box::pin(program.run(Arc::clone(&env)));
+    drive::until(program.as_mut(), || slot.lock().unwrap().is_some());
+    let cache = slot.lock().unwrap().take().unwrap();
+    let first = cache.get_observed(1);
+    let mut first = Box::pin(first.run(Arc::clone(&env)));
+    drive::until(first.as_mut(), || loads.load(Ordering::SeqCst) == 1);
+    comparisons.store(0, Ordering::SeqCst);
+    let second = cache.get_observed(1);
+    let mut second = Box::pin(second.run(Arc::clone(&env)));
+    drive::until(second.as_mut(), || comparisons.load(Ordering::SeqCst) > 0);
+    assert!(matches!(
+        block_on(released.open::<(), Env>().run(Arc::clone(&env))),
+        Exit::Success(true)
+    ));
+    let first = match block_on(first) {
+        Exit::Success(value) => value,
+        _ => panic!("loaded"),
+    };
+    let second = match block_on(second) {
+        Exit::Success(value) => value,
+        _ => panic!("shared"),
+    };
+    assert_eq!(first.observation, CacheObservation::Loaded);
+    assert_eq!(second.observation, CacheObservation::Shared);
+    assert!(
+        matches!(block_on(cache.get_observed(1).run(Arc::clone(&env))),Exit::Success(value) if value.observation==CacheObservation::Retained)
+    );
+    // A fresh blocked producer is replaced, joined, and cannot publish over set.
+    let third = cache.get_observed(2);
+    let mut third = Box::pin(third.run(Arc::clone(&env)));
+    drive::until(third.as_mut(), || loads.load(Ordering::SeqCst) == 2);
+    assert!(matches!(
+        block_on(cache.set(2, 99).run(Arc::clone(&env))),
+        Exit::Success(())
+    ));
+    assert!(!matches!(block_on(third), Exit::Success(_)));
+    assert!(
+        matches!(block_on(cache.get_observed(2).run(Arc::clone(&env))),Exit::Success(value) if value.value.with(|value|*value)==Ok(99))
+    );
+    drop(program);
+    assert!(matches!(
+        block_on(cache.shutdown::<Env>().run(Arc::clone(&env))),
+        Exit::Success(_)
+    ));
+    env.tasks.finish();
+}

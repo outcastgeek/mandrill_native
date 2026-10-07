@@ -37,6 +37,8 @@ pub enum WorkflowEngineError {
     RaceWinnerMissing,
     /// An incompatible child is already recorded.
     ChildConflict,
+    /// No further execution owner can be allocated.
+    ExecutionExhausted,
     /// An incompatible state is already recorded.
     StateConflict,
     /// An owned input was already consumed.
@@ -138,18 +140,17 @@ pub trait WorkflowEngine: Send + Sync + 'static {
     /// Type: `Effect<Option<WorkflowSnapshot>, Self::Error>`.
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn inspect(&self, run: WorkflowRunId) -> Effect<Option<WorkflowSnapshot>, Self::Error>;
-    /// # Parameters
-    /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
-    /// - `expected` (`WorkflowStatus`): Value or revision required for the proposed state transition.
-    /// - `next` (`WorkflowStatus`): Next value or state produced by the transition.
+    /// Lazily conditionally transition this run using the complete expected checkpoint.
     ///
-    /// # Returns
-    /// Type: `Effect<WorkflowSnapshot, Self::Error>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// Providers must atomically compare status and execution ownership with `expected`
+    /// before writing `next`; stale checkpoints must not reset or replace a newer
+    /// execution. Return the authoritative snapshot or the provider's typed rejection.
+    /// Entering a new Running execution advances its ownership counter. Storage
+    /// durability depends on the provider, not on this method's return type.
     fn transition(
         &self,
         run: WorkflowRunId,
-        expected: WorkflowStatus,
+        expected: super::WorkflowCheckpoint,
         next: WorkflowStatus,
     ) -> Effect<WorkflowSnapshot, Self::Error>;
     /// # Parameters

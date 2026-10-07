@@ -1,10 +1,10 @@
 .{
     .name = .effect_capability_consumer,
     .version = "0.0.1",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .fingerprint = 0x73d3199edf1f69c8,
     .dependencies = .{
-        .effect = .{ .path = "../../.." },
+        .effect = .{ .path = "effect" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

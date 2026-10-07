@@ -14,4 +14,6 @@ Run the [release example](../../examples/transaction_reactivity.rs) with:
 cargo run -p effect --example transaction_reactivity --release
 ```
 
-The external [provider-neutral consumer](../../tests/fixtures/shared/provider_program.rs) builds and commits a `transaction!` program in `transaction_cpu` with the transaction domain supplied through `R`.
+See the [provider-neutral example](../../tests/fixtures/shared/provider_program.rs),
+`transaction_cpu`, for a `transaction!` program with the transaction domain
+supplied through `R`.

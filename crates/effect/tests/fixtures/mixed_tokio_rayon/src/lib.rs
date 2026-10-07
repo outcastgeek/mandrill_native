@@ -1,3 +1,7 @@
+extern crate effect as fx;
+#[cfg(test)]
+#[path = "../../shared/reference_update.rs"]
+mod reference_update;
 #[cfg(test)]
 #[path = "../../../support/drive.rs"]
 mod drive;
@@ -96,6 +100,8 @@ mod tests {
         });
         (runtime, env)
     }
+    #[test]
+    fn reference_update_paths(){let(runtime,env)=fixture(2,4);runtime.block_on(super::reference_update::exercise(env));}
     #[derive(Default)]
     struct Gate {
         entered: AtomicUsize,

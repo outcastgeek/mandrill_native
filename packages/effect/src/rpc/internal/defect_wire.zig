@@ -19,7 +19,7 @@ pub fn encode(env: anytype, defect: outcomes.Defect, max_payload_bytes: usize) o
     const size = std.math.add(usize, @sizeOf(u8), defect.message.len) catch return .{ .fail = .frame_too_large };
     if (size > max_payload_bytes) return .{ .fail = .frame_too_large };
     const bytes = env.allocator.alloc(u8, size) catch return .{ .die = outcomes.Defect.out_of_memory };
-    bytes[0] = @intFromEnum(defect.kind);
+    bytes[0] = @backingInt(defect.kind);
     std.mem.copyForwards(u8, bytes[@sizeOf(u8)..], defect.message);
     return .{ .success = .{ .items = bytes, .allocator = env.allocator } };
 }
@@ -34,7 +34,13 @@ pub fn decode(env: anytype, bytes: []const u8) outcomes.Exit(RemoteDefect, Proto
     if (!@hasField(R, "allocator") or @FieldType(R, "allocator") != std.mem.Allocator)
         @compileError("RPC defect wire requires R.allocator");
     if (bytes.len < @sizeOf(u8)) return .{ .fail = .malformed_envelope };
-    const kind = std.meta.intToEnum(outcomes.Defect.Kind, bytes[0]) catch return .{ .fail = .malformed_envelope };
+    const kind_info = @typeInfo(outcomes.Defect.Kind).@"enum";
+    var known_kind = false;
+    inline for (kind_info.field_values) |candidate| {
+        if (candidate == bytes[0]) known_kind = true;
+    }
+    if (!known_kind) return .{ .fail = .malformed_envelope };
+    const kind: outcomes.Defect.Kind = @fromBackingInt(@as(kind_info.tag_type, @intCast(bytes[0])));
     const text = bytes[@sizeOf(u8)..];
     if (!std.unicode.utf8ValidateSlice(text)) return .{ .fail = .malformed_envelope };
     const copied = env.allocator.dupe(u8, text) catch return .{ .die = outcomes.Defect.out_of_memory };

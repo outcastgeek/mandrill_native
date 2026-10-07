@@ -11,6 +11,10 @@ pub enum IssueSegment {
     Index(usize),
     /// The issue is located at a tagged enum variant. Contains `Arc<str>`.
     Variant(Arc<str>),
+    /// A property-name constraint failed at this name, rather than in its encoded value.
+    PropertyName(Arc<str>),
+    /// Zero-based alternative index whose constraint or decode produced this issue.
+    Alternative(usize),
 }
 
 /// Representation classes used in type mismatch diagnostics.
@@ -28,7 +32,7 @@ pub enum ValueKind {
     String,
     /// The encoded value is an ordered sequence.
     Sequence,
-    /// Persist the selected coordination result.
+    /// The encoded value is a named-field record or JSON object.
     Record,
     /// The message contains binary data.
     Binary,
@@ -107,21 +111,58 @@ pub enum SchemaIssueKind {
     Multiple,
     /// An owned input was already consumed.
     InputConsumed,
+    /// An operation requires a genuine independent type-validation witness that the codec does not provide.
+    MissingValidator,
+    /// No branch matched; child issues retain bounded branch diagnostics.
+    NoAlternative,
+    /// More than one alternative matched where exactly one is required.
+    AmbiguousAlternatives {
+        /// Zero-based matching alternative indexes in declaration order.
+        matches: Vec<usize>,
+    },
+    /// A named constraint failed with its declared operand or accepted range.
+    Constraint {
+        /// Constraint identifier, such as minimum or stringLength.
+        name: Arc<str>,
+        /// Constraint operand or range as diagnostic text, not an executable policy.
+        operand: Arc<str>,
+    },
+    /// A configured operation would exceed a resource bound; this is not an ordinary branch mismatch.
+    ResourceDemand {
+        /// Resource whose demand exceeded its configured bound.
+        resource: SchemaResource,
+        /// Caller-supplied maximum for the selected resource.
+        limit: usize,
+        /// Required or observed demand, saturated when arithmetic cannot represent it.
+        observed: usize,
+    },
+    /// A bounded pattern search exceeds its per-pattern demand or overflows its demand calculation.
+    PatternBudget,
+    /// Intersected encoding outputs disagree on a value that cannot be merged losslessly.
+    MergeConflict,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// The parser resource whose configured bound was exceeded.
 pub enum SchemaResource {
-    /// The encoded value is a byte sequence.
+    /// Encoded or input byte count, including JSON escaping and punctuation when writing.
     Bytes,
-    /// The nesting-depth limit was exceeded.
+    /// Schema traversal depth, or legacy parser nesting depth where no separate JSON policy is supplied.
     Depth,
-    /// The binary field width does not match its declaration.
+    /// Number of items or fields in one collection.
     Width,
-    /// The recorded step limit was reached.
+    /// Visited schema or representation nodes, as charged by the operation.
     Steps,
-    /// The maximum number of collected validation issues was reached.
+    /// Issue-tree nodes retained during bounded accumulation, including composite nodes.
     Issues,
+    /// JSON value nesting depth, counting the root as one independently of schema wrappers.
+    JsonDepth,
+    /// ASCII digits in a numeric token or materialized integer, as defined by the operation.
+    IntegerDigits,
+    /// Unicode scalar count in a string or property name.
+    StringLength,
+    /// Cumulative conservative pattern-search demand within a configured invocation.
+    PatternSteps,
 }
 
 /// A typed issue with its encoded-side path, ordered from root to leaf.

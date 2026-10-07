@@ -850,3 +850,47 @@ pub const WorkflowEngine = @import("workflow/workflow_engine.zig").WorkflowEngin
 pub const WorkflowEngineError = @import("workflow/workflow_engine.zig").Error;
 /// In-memory workflow-engine provider.
 pub const MemoryWorkflowEngine = @import("workflow/memory_workflow_engine.zig").MemoryWorkflowEngine;
+
+/// Native record/object/sequence contracts with shared-runtime composition.
+pub const NativeCodec = @import("schema/native_codec.zig");
+/// Static required/optional/default native field declarations; representation and ownership are checked at build time.
+pub const NativeField = NativeCodec;
+/// Staged native record builder with independent decoding/encoding environments and caller object contract.
+pub const NativeRecordBuilder = NativeCodec.Builder;
+/// Representation-generic domain failures, independent pure/effectful directions and typed issue ownership mappings.
+pub const DomainCodec = @import("schema/domain_codec.zig");
+/// Exact decimal token ownership/arithmetic and bounded arbitrary-width integer conversion, without f64 rounding.
+pub const JsonNumberCodec = @import("schema/json_number_codec.zig");
+/// Typed Unicode/enum/array/prefix/object validation with explicit caller-selected pattern capabilities.
+pub const JsonConstraints = @import("schema/json_constraints.zig");
+/// Owning oneOf/anyOf/allOf candidates with immutable metadata and invocation-local parse state.
+pub const JsonAlternatives = @import("schema/json_alternatives.zig");
+/// std.json-backed bounded writer and checked tree-free Effect adapters; successful bytes own R.allocator.
+pub const JsonWriter = @import("schema/json_writer.zig");
+/// Version-one owned diagnostic wire codec with explicit input, JSON and related-issue bounds.
+pub const SchemaIssueCodec = @import("schema/issue_codec.zig");
+/// Require actual public pure-direction evidence; service-requiring codecs cannot masquerade as direct Result codecs.
+pub const requirePure = @import("schema/codec.zig").requirePure;
+/// Scoped dependency-aware cache sharing the existing caller runtime and generation engine.
+pub const DependencyCache = @import("effect.zig").DependencyCache;
+/// Finite retention/admission and per-entry dependency limits with explicit ownership callbacks.
+pub const DependencyCacheConfig = @import("dependency_cache.zig").Config;
+/// Owning loader payload and individually retained dependency metadata.
+pub const DependencyCacheLoaded = @import("dependency_cache.zig").Loaded;
+/// Caller equality/retain/release contract for dependency identities and their pointed-to storage.
+pub const DependencyPolicy = @import("dependency_cache.zig").DependencyPolicy;
+/// Provenance chosen before waiting: retained, shared in-flight or newly loaded generation.
+pub const CacheObservation = @import("cache.zig").CacheObservation;
+/// Value observation plus provenance; marked payload ownership is cloned/released independently.
+pub const CacheLookup = @import("cache.zig").CacheLookup;
+/// Scoped finite-capacity callback publication with explicit nonblocking overflow policy; acceptance is not subscriber delivery.
+pub const CallbackPubSub = @import("pub_sub.zig").CallbackPubSub;
+/// Pure byte-representation schema adapter with checked direct execution and explicit framing bounds.
+pub const PureSchemaBinary = @import("encoding/schema_binary.zig").Pure;
+
+/// Independent JSON input, preparation and output limits.
+pub const JsonSurface = @import("schema/json_surface.zig");
+/// Require public imported payload ownership evidence.
+pub const requireOwnedPayload = @import("outcome.zig").requireOwned;
+/// Bounds selected by a framed RPC session's caller.
+pub const RpcSessionPolicy = @import("rpc/session.zig").Policy;

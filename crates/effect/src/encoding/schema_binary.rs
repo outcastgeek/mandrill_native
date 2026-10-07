@@ -157,6 +157,7 @@ impl From<SchemaIssue> for BinaryError {
 
 /// An owned single-value binary codec. The caller supplies every resource
 /// limit; no process-global cache, executor or provider is consulted.
+#[derive(Clone)]
 pub struct SchemaBinary {
     ast: SchemaAst,
     identity: BinaryIdentity,
@@ -269,17 +270,7 @@ impl SchemaBinary {
         self.encode_json(&encoded)
     }
 
-    /// Check binary identity and bounds before decoding a typed value.
-    ///
-    /// # Type parameters
-    /// - `A`: Application value type. Bounds: `Send + 'static`.
-    ///
-    /// # Parameters
-    /// - `codec` (`&PureCodec<A, JsonValue>`): The codec used to convert and validate values.
-    /// - `input` (`&[u8]`): The input value or factory consumed by this operation.
-    ///
-    /// # Returns
-    /// Type: `Result<A, BinaryError>`.
+    /// Check codec AST identity, decode bounded binary bytes, then validate through the typed JSON decoder; schema and format failures remain distinct BinaryError variants.
     pub fn decode_typed<A: Send + 'static>(
         &self,
         codec: &PureCodec<A, JsonValue>,
@@ -289,6 +280,54 @@ impl SchemaBinary {
         codec
             .decode_ref(&self.decode_json(input)?)
             .map_err(Into::into)
+    }
+
+    /// Adapt this same binary format to owned effectful directions with separate `D` and `E`.
+    ///
+    /// The codec must share this binary codec's AST identity or construction returns
+    /// CodecSchemaMismatch. Decode parses bytes then runs the schema in `D`; encode
+    /// runs the schema in `E` then emits binary bytes under existing limits. Schema
+    /// errors map to BinaryError; defects, interruption and cleanup remain unchanged.
+    /// Owned validation uses the schema's independent validation direction. Format 1
+    /// retains its lossless i64/u64/f64 restriction on numbers; this adapter adds no
+    /// new wire format or physical persistence guarantee.
+    pub fn effect_codec<A: Send + 'static, D: Send + Sync + 'static, E: Send + Sync + 'static>(
+        &self,
+        codec: crate::Codec<A, JsonValue, D, E>,
+    ) -> Result<crate::DomainCodec<A, Vec<u8>, BinaryError, D, E>, BinaryError> {
+        if self.ast.identity() != codec.ast().identity() {
+            return Err(BinaryError::CodecSchemaMismatch);
+        }
+        let binary = self.clone();
+        let encoder = self.clone();
+        let decode = codec.clone();
+        let validate = codec.clone();
+        Ok(crate::DomainCodec::new(
+            codec.ast().clone(),
+            move |bytes: Vec<u8>| {
+                let binary = binary.clone();
+                let decode = decode.clone();
+                crate::Effect::try_sync_once(
+                    move || binary.decode_json(&bytes),
+                    std::convert::identity,
+                )
+                .flat_map(move |value| decode.decode_once(value).map_error(BinaryError::from))
+            },
+            move |value| {
+                let binary = encoder.clone();
+                codec
+                    .encode_once(value)
+                    .map_error(BinaryError::from)
+                    .flat_map(move |value| {
+                        let binary = binary.clone();
+                        crate::Effect::try_sync_once(
+                            move || binary.encode_json(&value),
+                            std::convert::identity,
+                        )
+                    })
+            },
+            move |value| validate.validate_once(value).map_error(BinaryError::from),
+        ))
     }
 
     ///

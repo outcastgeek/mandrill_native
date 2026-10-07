@@ -23,6 +23,20 @@ pub const Kind = union(enum) {
     depth_limit,
     size_limit,
     multiple,
+    /// A declared value constraint rejected the input; detail may own operands.
+    constraint,
+    /// Alternative acceptance/ambiguity failed; detail records matching branches.
+    alternatives,
+    /// Child encoders produced incompatible overlapping representations.
+    conflict,
+    /// A caller-selected structural/input/output budget was exceeded.
+    resource_limit,
+    /// Expanded decimal digits exceed policy or cannot be represented by the counter.
+    integer_digits,
+    /// Provider-reported matching timeout/work exhaustion.
+    pattern_timeout,
+    /// Provider rejected or failed a declared pattern.
+    pattern_failure,
     custom: []const u8,
 };
 
@@ -30,6 +44,10 @@ pub const Kind = union(enum) {
 pub const PathElement = union(enum) {
     field: outcomes.OwnedSlice(u8),
     index: usize,
+    /// Owned object key where its name codec failed.
+    property_name: outcomes.OwnedSlice(u8),
+    /// Zero-based branch index where a child codec failed.
+    alternative: usize,
 
     /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit` and
     /// must be released after use.
@@ -40,7 +58,11 @@ pub const PathElement = union(enum) {
     /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
     /// Returns (`void`): no value.
     pub fn deinit(self: *@This()) void {
-        if (self.* == .field) self.field.deinit();
+        switch (self.*) {
+            .field => self.field.deinit(),
+            .property_name => self.property_name.deinit(),
+            else => {},
+        }
         self.* = undefined;
     }
 
@@ -53,6 +75,81 @@ pub const PathElement = union(enum) {
         return switch (self.*) {
             .field => |name| .{ .field = try name.clone() },
             .index => |value| .{ .index = value },
+            .property_name => |name| .{ .property_name = try name.clone() },
+            .alternative => |value| .{ .alternative = value },
+        };
+    }
+};
+
+/// Structured details own all runtime text and matching-alternative metadata.
+pub const Detail = union(enum) {
+    /// Constraint identifier and expected/actual values; all three runtime strings are owned.
+    constraint: struct { name: outcomes.OwnedSlice(u8), expected: outcomes.OwnedSlice(u8), actual: outcomes.OwnedSlice(u8) },
+    /// Owned zero-based indices of successful alternatives, including ambiguous matches.
+    alternatives: outcomes.OwnedSlice(usize),
+    /// Exceeded budget with its inclusive limit and attempted count in that resource’s units.
+    resource: struct { resource: Resource, limit: usize, actual: usize },
+    /// Expanded decimal integer-part bound; null required means its count could not fit.
+    integer_digits: struct { limit: usize, required: ?usize },
+    /// Owned dialect/source and the provider timeout in nanoseconds.
+    pattern: struct { dialect: outcomes.OwnedSlice(u8), source: outcomes.OwnedSlice(u8), timeout_nanoseconds: i96 },
+    /// Identity of the explicit caller budget that was exceeded; units follow the selected resource.
+    pub const Resource = enum {
+        /// Distinct immutable schema nodes visited during preparation.
+        schema_nodes,
+        /// Child links counted during schema preparation.
+        schema_edges,
+        /// Schema traversal levels, with the root at level one.
+        schema_depth,
+        /// Simultaneous JSON values, including root and scalars.
+        json_depth,
+        /// UTF-8 bytes in an input envelope/document.
+        input_bytes,
+        /// Emitted UTF-8 bytes, including syntax and escapes.
+        output_bytes,
+        /// Unescaped string/key or lexical numeric bytes.
+        value_bytes,
+        /// Retained structured validation issue count.
+        issues,
+        /// Decimal integer-part digits after exponent expansion.
+        integer_digits,
+        /// Work steps reported by a selected pattern provider.
+        pattern_steps,
+    };
+    /// Release owned text/index arrays in this detail once; numeric resource counters own no storage.
+    pub fn deinit(self: *@This()) void {
+        switch (self.*) {
+            .constraint => |*value| {
+                value.name.deinit();
+                value.expected.deinit();
+                value.actual.deinit();
+            },
+            .alternatives => |*value| value.deinit(),
+            .pattern => |*value| {
+                value.dialect.deinit();
+                value.source.deinit();
+            },
+            else => {},
+        }
+        self.* = undefined;
+    }
+    /// Copy owned diagnostic text/index arrays into an independent detail; primitive counters copy by value.
+    pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
+        return switch (self.*) {
+            .constraint => |value| blk: {
+                var name = try value.name.clone();
+                errdefer name.deinit();
+                var expected = try value.expected.clone();
+                errdefer expected.deinit();
+                break :blk .{ .constraint = .{ .name = name, .expected = expected, .actual = try value.actual.clone() } };
+            },
+            .alternatives => |value| .{ .alternatives = try value.clone() },
+            .pattern => |value| blk: {
+                var dialect = try value.dialect.clone();
+                errdefer dialect.deinit();
+                break :blk .{ .pattern = .{ .dialect = dialect, .source = try value.source.clone(), .timeout_nanoseconds = value.timeout_nanoseconds } };
+            },
+            .resource, .integer_digits => self.*,
         };
     }
 };
@@ -71,6 +168,8 @@ pub const Issue = struct {
     allocator: ?std.mem.Allocator = null,
     related: ?[]Issue = null,
     limit_reached: bool = false,
+    detail: ?Detail = null,
+    owned_custom: ?outcomes.OwnedSlice(u8) = null,
 
     /// The caller selects the allocation domain through its environment.
     /// `custom` identifiers must be static definition metadata, never a view
@@ -145,6 +244,8 @@ pub const Issue = struct {
     /// - `self: *Issue`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
     /// Returns (`void`): no value.
     pub fn deinit(self: *Issue) void {
+        if (self.detail) |*detail| detail.deinit();
+        if (self.owned_custom) |*custom_| custom_.deinit();
         if (self.path) |elements| {
             for (elements) |*element| element.deinit();
             self.allocator.?.free(elements);
@@ -164,6 +265,11 @@ pub const Issue = struct {
     pub fn clone(self: *const Issue) error{OutOfMemory}!Issue {
         var result: Issue = .{ .direction = self.direction, .kind = self.kind, .allocator = self.allocator, .limit_reached = self.limit_reached };
         errdefer result.deinit();
+        if (self.detail) |*detail| result.detail = try detail.clone();
+        if (self.owned_custom) |custom_| {
+            result.owned_custom = try custom_.clone();
+            result.kind = .{ .custom = result.owned_custom.?.items };
+        }
         if (self.path) |elements| {
             const allocator = self.allocator.?;
             const owned = try allocator.alloc(PathElement, elements.len);
@@ -216,6 +322,19 @@ pub const Issue = struct {
     /// Returns (`PathError!void`): A `void` on success, or a Zig error in `PathError`.
     pub fn prependIndex(self: *Issue, index: usize) PathError!void {
         try self.prepend(.{ .index = index });
+    }
+
+    /// Add a zero-based branch index at the front of an owning issue path.
+    pub fn prependAlternative(self: *Issue, index: usize) PathError!void {
+        try self.prepend(.{ .alternative = index });
+    }
+    /// Copy a property name into the issue’s allocator and prepend a property-name validation location.
+    /// The name may be released after this call; a missing allocator or OOM leaves the issue unchanged.
+    pub fn prependPropertyName(self: *Issue, name: []const u8) PathError!void {
+        const allocator = self.allocator orelse return error.MissingAllocator;
+        const copied = try allocator.dupe(u8, name);
+        errdefer allocator.free(copied);
+        try self.prepend(.{ .property_name = .{ .items = copied, .allocator = allocator } });
     }
 
     fn prepend(self: *Issue, first: PathElement) PathError!void {

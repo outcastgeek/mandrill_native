@@ -1,4 +1,7 @@
 # Exact reviewed source-literal multiset. See source_policy_inventory.md for contract rationale.
+effect/src/cache.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/cache.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/cache.rs: unreviewed string expression "SharedValue"
 effect/src/cluster/memory_store.rs: fixed integer 0 needs a documented contract and inventory review
 effect/src/cluster/memory_store.rs: fixed integer 0usize needs a documented contract and inventory review
 effect/src/cluster/memory_store.rs: fixed integer 1 needs a documented contract and inventory review
@@ -7,6 +10,21 @@ effect/src/cluster/memory_store.rs: fixed integer 1 needs a documented contract 
 effect/src/cluster/memory_store.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/cluster/memory_store.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/cluster/types.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/cluster/types.rs: unreviewed string expression " # Parameters"
+effect/src/cluster/types.rs: unreviewed string expression " # Returns"
+effect/src/cluster/types.rs: unreviewed string expression " # Returns"
+effect/src/cluster/types.rs: unreviewed string expression " # Type parameters"
+effect/src/cluster/types.rs: unreviewed string expression " - `D`: Identity-domain type. Bounds: `KeyDomain`."
+effect/src/cluster/types.rs: unreviewed string expression " - `key` (`StableKey<D>`): Stable key used to locate or identify the selected value."
+effect/src/cluster/types.rs: unreviewed string expression " Borrow the stable encoded bytes without transferring ownership."
+effect/src/cluster/types.rs: unreviewed string expression " Stable Cluster identity encoded as validated, namespaced bytes."
+effect/src/cluster/types.rs: unreviewed string expression " Type: `&[u8]`."
+effect/src/cluster/types.rs: unreviewed string expression " Type: `Self`."
+effect/src/cluster/types.rs: unreviewed string expression " Wrap a typed stable key while preserving its identity bytes."
+effect/src/cluster/types.rs: unreviewed string expression ""
+effect/src/cluster/types.rs: unreviewed string expression ""
+effect/src/cluster/types.rs: unreviewed string expression ""
+effect/src/cluster/types.rs: unreviewed string expression ""
 effect/src/cron.rs: fixed integer 0 needs a documented contract and inventory review
 effect/src/cron.rs: fixed integer 0 needs a documented contract and inventory review
 effect/src/cron.rs: fixed integer 0 needs a documented contract and inventory review
@@ -104,6 +122,21 @@ effect/src/encoding/schema_binary/internal.rs: fixed integer 7 needs a documente
 effect/src/encoding/schema_binary/internal.rs: fixed integer 8 needs a documented contract and inventory review
 effect/src/encoding/schema_binary/internal.rs: fixed integer 8 needs a documented contract and inventory review
 effect/src/eventlog/event.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/eventlog/event.rs: unreviewed string expression " # Parameters"
+effect/src/eventlog/event.rs: unreviewed string expression " # Returns"
+effect/src/eventlog/event.rs: unreviewed string expression " # Returns"
+effect/src/eventlog/event.rs: unreviewed string expression " # Type parameters"
+effect/src/eventlog/event.rs: unreviewed string expression " - `D`: Identity-domain type. Bounds: `KeyDomain`."
+effect/src/eventlog/event.rs: unreviewed string expression " - `key` (`StableKey<D>`): Stable key used to locate or identify the selected value."
+effect/src/eventlog/event.rs: unreviewed string expression " Borrow the stable encoded bytes without transferring ownership."
+effect/src/eventlog/event.rs: unreviewed string expression " Stable EventLog identity encoded as validated, namespaced bytes."
+effect/src/eventlog/event.rs: unreviewed string expression " Type: `&[u8]`."
+effect/src/eventlog/event.rs: unreviewed string expression " Type: `Self`."
+effect/src/eventlog/event.rs: unreviewed string expression " Wrap a typed stable key while preserving its identity bytes."
+effect/src/eventlog/event.rs: unreviewed string expression ""
+effect/src/eventlog/event.rs: unreviewed string expression ""
+effect/src/eventlog/event.rs: unreviewed string expression ""
+effect/src/eventlog/event.rs: unreviewed string expression ""
 effect/src/eventlog/event_journal.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/eventlog/event_log.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/eventlog/event_log_remote.rs: fixed integer 0 needs a documented contract and inventory review
@@ -166,6 +199,8 @@ effect/src/primary_key.rs: fixed integer 3 needs a documented contract and inven
 effect/src/primary_key.rs: unreviewed string expression "StableKey"
 effect/src/primary_key.rs: unreviewed string expression "domain"
 effect/src/primary_key.rs: unreviewed string expression "encoded"
+effect/src/pub_sub.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/pub_sub.rs: fixed integer 0 needs a documented contract and inventory review
 effect/src/reactivity/atom_ref.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/reactivity/atom_registry.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/reactivity/hydration.rs: fixed integer 1 needs a documented contract and inventory review
@@ -201,6 +236,10 @@ effect/src/rpc/envelope.rs: unreviewed string expression "stream_end"
 effect/src/rpc/envelope.rs: unreviewed string expression "success"
 effect/src/rpc/streaming.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/rpc/streaming_server.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/codec.rs: unreviewed string expression "direct_json_writer"
+effect/src/schema/codec.rs: unreviewed string expression "direct_json_writer"
+effect/src/schema/codec.rs: unreviewed string expression "direct_json_writer"
+effect/src/schema/codec.rs: unreviewed string expression "direct_json_writer"
 effect/src/schema/decimal.rs: this literal form needs an inventory review
 effect/src/schema/decimal.rs: this literal form needs an inventory review
 effect/src/schema/decimal.rs: this literal form needs an inventory review
@@ -213,10 +252,62 @@ effect/src/schema/decimal.rs: unreviewed string expression "."
 effect/src/schema/decimal.rs: unreviewed string expression "0"
 effect/src/schema/decimal.rs: unreviewed string expression "0"
 effect/src/schema/decimal.rs: unreviewed string expression "{sign}{integer}{separator}{fraction}"
+effect/src/schema/enum_builder.rs: unreviewed string expression "discriminant"
+effect/src/schema/exact_number.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/exact_number.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/exact_number.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/exact_number.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/exact_number.rs: fixed integer 0u8 needs a documented contract and inventory review
+effect/src/schema/exact_number.rs: fixed integer 0u8 needs a documented contract and inventory review
+effect/src/schema/exact_number.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/exact_number.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/exact_number.rs: fixed integer 10 needs a documented contract and inventory review
+effect/src/schema/exact_number.rs: fixed integer 10u8 needs a documented contract and inventory review
+effect/src/schema/exact_number.rs: fixed integer 10u8 needs a documented contract and inventory review
+effect/src/schema/exact_number.rs: this literal form needs an inventory review
+effect/src/schema/exact_number.rs: this literal form needs an inventory review
+effect/src/schema/exact_number.rs: this literal form needs an inventory review
+effect/src/schema/exact_number.rs: this literal form needs an inventory review
+effect/src/schema/exact_number.rs: this literal form needs an inventory review
+effect/src/schema/exact_number.rs: this literal form needs an inventory review
+effect/src/schema/exact_number.rs: this literal form needs an inventory review
+effect/src/schema/exact_number.rs: this literal form needs an inventory review
+effect/src/schema/exact_number.rs: this literal form needs an inventory review
+effect/src/schema/exact_number.rs: this literal form needs an inventory review
+effect/src/schema/exact_number.rs: unreviewed string expression "0"
+effect/src/schema/exact_number.rs: unreviewed string expression "0"
+effect/src/schema/exact_number.rs: unreviewed string expression "0"
+effect/src/schema/exact_number.rs: unreviewed string expression "0"
+effect/src/schema/exact_number.rs: unreviewed string expression "0"
+effect/src/schema/exact_number.rs: unreviewed string expression "0"
+effect/src/schema/exact_number.rs: unreviewed string expression "0"
+effect/src/schema/exact_number.rs: unreviewed string expression "0"
+effect/src/schema/exact_number.rs: unreviewed string expression "0"
+effect/src/schema/exact_number.rs: unreviewed string expression "exact_json_number"
+effect/src/schema/exact_number.rs: unreviewed string expression "exclusiveMaximum"
+effect/src/schema/exact_number.rs: unreviewed string expression "exclusiveMinimum"
+effect/src/schema/exact_number.rs: unreviewed string expression "integer"
+effect/src/schema/exact_number.rs: unreviewed string expression "integer"
+effect/src/schema/exact_number.rs: unreviewed string expression "maximum"
+effect/src/schema/exact_number.rs: unreviewed string expression "minimum"
+effect/src/schema/exact_number.rs: unreviewed string expression "multipleOf"
+effect/src/schema/internal/parser.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 0 needs a documented contract and inventory review
 effect/src/schema/internal/parser.rs: fixed integer 0 needs a documented contract and inventory review
 effect/src/schema/internal/parser.rs: fixed integer 0usize needs a documented contract and inventory review
 effect/src/schema/internal/parser.rs: fixed integer 0usize needs a documented contract and inventory review
-effect/src/schema/internal/parser.rs: fixed integer 0usize needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
@@ -225,7 +316,34 @@ effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contrac
 effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/schema/internal/parser.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/schema/internal/parser.rs: fixed integer 1usize needs a documented contract and inventory review
-effect/src/schema/internal/parser.rs: unreviewed string expression "JSON value"
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: this literal form needs an inventory review
+effect/src/schema/internal/parser.rs: unreviewed string expression "false"
+effect/src/schema/internal/parser.rs: unreviewed string expression "invalid JSON at byte {}"
+effect/src/schema/internal/parser.rs: unreviewed string expression "null"
+effect/src/schema/internal/parser.rs: unreviewed string expression "true"
 effect/src/schema/internal/preparation.rs: fixed integer 0usize needs a documented contract and inventory review
 effect/src/schema/internal/preparation.rs: fixed integer 0usize needs a documented contract and inventory review
 effect/src/schema/internal/preparation.rs: fixed integer 1 needs a documented contract and inventory review
@@ -233,11 +351,83 @@ effect/src/schema/internal/preparation.rs: fixed integer 1 needs a documented co
 effect/src/schema/internal/preparation.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/schema/json_codec.rs: fixed integer 0 needs a documented contract and inventory review
 effect/src/schema/json_codec.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/json_codec.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/json_codec.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/json_codec.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/json_codec.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/json_codec.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/json_codec.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_codec.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_codec.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_codec.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_codec.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/schema/json_codec.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/schema/json_codec.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/schema/json_codec.rs: fixed integer 2 needs a documented contract and inventory review
 effect/src/schema/json_codec.rs: unreviewed string expression "decimal_syntax"
 effect/src/schema/json_codec.rs: unreviewed string expression "stable_key_encoding"
+effect/src/schema/json_constraints.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/json_constraints.rs: fixed integer 0usize needs a documented contract and inventory review
+effect/src/schema/json_constraints.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_constraints.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_constraints.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_constraints.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_constraints.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_constraints.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_constraints.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_constraints.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_constraints.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_constraints.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_constraints.rs: fixed integer 11 needs a documented contract and inventory review
+effect/src/schema/json_constraints.rs: fixed integer 12 needs a documented contract and inventory review
+effect/src/schema/json_constraints.rs: fixed integer 13 needs a documented contract and inventory review
+effect/src/schema/json_constraints.rs: fixed integer 16 needs a documented contract and inventory review
+effect/src/schema/json_constraints.rs: fixed integer 16 needs a documented contract and inventory review
+effect/src/schema/json_constraints.rs: fixed integer 18 needs a documented contract and inventory review
+effect/src/schema/json_constraints.rs: fixed integer 23 needs a documented contract and inventory review
+effect/src/schema/json_constraints.rs: fixed integer 36 needs a documented contract and inventory review
+effect/src/schema/json_constraints.rs: fixed integer 4 needs a documented contract and inventory review
+effect/src/schema/json_constraints.rs: fixed integer 8 needs a documented contract and inventory review
+effect/src/schema/json_constraints.rs: fixed integer 8 needs a documented contract and inventory review
+effect/src/schema/json_constraints.rs: this literal form needs an inventory review
+effect/src/schema/json_constraints.rs: unreviewed string expression "additionalItems"
+effect/src/schema/json_constraints.rs: unreviewed string expression "additionalItems"
+effect/src/schema/json_constraints.rs: unreviewed string expression "allOf"
+effect/src/schema/json_constraints.rs: unreviewed string expression "arrayLength"
+effect/src/schema/json_constraints.rs: unreviewed string expression "array_constraints"
+effect/src/schema/json_constraints.rs: unreviewed string expression "checked_string"
+effect/src/schema/json_constraints.rs: unreviewed string expression "false"
+effect/src/schema/json_constraints.rs: unreviewed string expression "false"
+effect/src/schema/json_constraints.rs: unreviewed string expression "multiplePatterns"
+effect/src/schema/json_constraints.rs: unreviewed string expression "multiplePatterns"
+effect/src/schema/json_constraints.rs: unreviewed string expression "oneOf"
+effect/src/schema/json_constraints.rs: unreviewed string expression "propertyCount"
+effect/src/schema/json_constraints.rs: unreviewed string expression "propertyCount"
+effect/src/schema/json_constraints.rs: unreviewed string expression "propertyCount"
+effect/src/schema/json_constraints.rs: unreviewed string expression "propertyCount"
+effect/src/schema/json_constraints.rs: unreviewed string expression "reject"
+effect/src/schema/json_constraints.rs: unreviewed string expression "reject"
+effect/src/schema/json_constraints.rs: unreviewed string expression "requiredPrefix"
+effect/src/schema/json_constraints.rs: unreviewed string expression "requiredPrefix"
+effect/src/schema/json_constraints.rs: unreviewed string expression "stringLength"
+effect/src/schema/json_constraints.rs: unreviewed string expression "true"
+effect/src/schema/json_constraints.rs: unreviewed string expression "true"
+effect/src/schema/json_constraints.rs: unreviewed string expression "true"
+effect/src/schema/json_constraints.rs: unreviewed string expression "uniqueItems"
+effect/src/schema/json_constraints.rs: unreviewed string expression "uniqueItems"
+effect/src/schema/json_constraints.rs: unreviewed string expression "uniqueItems"
+effect/src/schema/json_constraints.rs: unreviewed string expression "uuid"
+effect/src/schema/json_constraints.rs: unreviewed string expression "uuid"
+effect/src/schema/json_constraints.rs: unreviewed string expression "uuid"
+effect/src/schema/json_constraints.rs: unreviewed string expression "v4"
+effect/src/schema/json_constraints.rs: unreviewed string expression "v4"
+effect/src/schema/json_constraints.rs: unreviewed string expression "v4"
+effect/src/schema/json_constraints.rs: unreviewed string expression "{}..={}"
+effect/src/schema/json_constraints.rs: unreviewed string expression "{}..={}"
+effect/src/schema/json_constraints.rs: unreviewed string expression "{}..={}"
+effect/src/schema/json_constraints.rs: unreviewed string expression "{}..={}"
+effect/src/schema/json_constraints.rs: unreviewed string expression "{}..={}"
+effect/src/schema/json_constraints.rs: unreviewed string expression "{}..={}"
 effect/src/schema/json_schema.rs: fixed integer 0 needs a documented contract and inventory review
 effect/src/schema/json_schema.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/schema/json_schema.rs: fixed integer 1 needs a documented contract and inventory review
@@ -303,6 +493,39 @@ effect/src/schema/json_schema.rs: unreviewed string expression "type"
 effect/src/schema/json_schema.rs: unreviewed string expression "{escaped}$"
 effect/src/schema/json_schema.rs: unreviewed string expression "~0"
 effect/src/schema/json_schema.rs: unreviewed string expression "~1"
+effect/src/schema/json_writer.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/json_writer.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/json_writer.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/json_writer.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_writer.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_writer.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_writer.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/json_writer.rs: this literal form needs an inventory review
+effect/src/schema/json_writer.rs: this literal form needs an inventory review
+effect/src/schema/json_writer.rs: this literal form needs an inventory review
+effect/src/schema/json_writer.rs: this literal form needs an inventory review
+effect/src/schema/json_writer.rs: this literal form needs an inventory review
+effect/src/schema/json_writer.rs: this literal form needs an inventory review
+effect/src/schema/json_writer.rs: this literal form needs an inventory review
+effect/src/schema/json_writer.rs: this literal form needs an inventory review
+effect/src/schema/json_writer.rs: this literal form needs an inventory review
+effect/src/schema/json_writer.rs: this literal form needs an inventory review
+effect/src/schema/json_writer.rs: this literal form needs an inventory review
+effect/src/schema/json_writer.rs: this literal form needs an inventory review
+effect/src/schema/json_writer.rs: this literal form needs an inventory review
+effect/src/schema/json_writer.rs: this literal form needs an inventory review
+effect/src/schema/json_writer.rs: this literal form needs an inventory review
+effect/src/schema/json_writer.rs: this literal form needs an inventory review
+effect/src/schema/json_writer.rs: this literal form needs an inventory review
+effect/src/schema/json_writer.rs: this literal form needs an inventory review
+effect/src/schema/json_writer.rs: this literal form needs an inventory review
+effect/src/schema/json_writer.rs: this literal form needs an inventory review
+effect/src/schema/json_writer.rs: this literal form needs an inventory review
+effect/src/schema/json_writer.rs: this literal form needs an inventory review
+effect/src/schema/json_writer.rs: this literal form needs an inventory review
+effect/src/schema/json_writer.rs: unreviewed string expression "\\u{:04x}"
+effect/src/schema/native_codec.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/native_codec.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/schema/outcome_codec.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/schema/outcome_codec.rs: unreviewed string expression "defect"
 effect/src/schema/outcome_codec.rs: unreviewed string expression "defected"
@@ -320,6 +543,21 @@ effect/src/schema/outcome_codec.rs: unreviewed string expression "succeeded"
 effect/src/schema/outcome_codec.rs: unreviewed string expression "success"
 effect/src/schema/outcome_codec.rs: unreviewed string expression "value"
 effect/src/schema/outcome_codec.rs: unreviewed string expression "version"
+effect/src/schema/parse_context.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/parse_context.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/parse_context.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/schema/parse_context.rs: fixed integer 0usize needs a documented contract and inventory review
+effect/src/schema/parse_context.rs: fixed integer 0usize needs a documented contract and inventory review
+effect/src/schema/parse_context.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/parse_context.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/parse_context.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/parse_context.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/parse_context.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/parse_context.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/parse_context.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/parse_context.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/schema/parse_context.rs: fixed integer 1usize needs a documented contract and inventory review
+effect/src/schema/schema_ast.rs: unreviewed string expression "discriminant"
 effect/src/schema/schema_builder.rs: fixed integer 0 needs a documented contract and inventory review
 effect/src/schema/schema_builder.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/schema/schema_issue.rs: fixed integer 0 needs a documented contract and inventory review
@@ -330,6 +568,8 @@ effect/src/stream/internal/buffer.rs: fixed integer 0 needs a documented contrac
 effect/src/stream/internal/buffer.rs: fixed integer 0 needs a documented contract and inventory review
 effect/src/stream/internal/buffer.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/stream/internal/buffer.rs: fixed integer 1 needs a documented contract and inventory review
+effect/src/telemetry.rs: unreviewed string expression "SharedAnnotations"
+effect/src/telemetry.rs: unreviewed string expression "entries"
 effect/src/transactional/internal/journal.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/transactional/internal/journal.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/transactional/internal/journal.rs: fixed integer 1 needs a documented contract and inventory review
@@ -348,8 +588,10 @@ effect/src/transactional/tx_ref.rs: fixed integer 1 needs a documented contract 
 effect/src/workflow/durable_parallel.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/workflow/memory_workflow_engine.rs: fixed integer 0 needs a documented contract and inventory review
 effect/src/workflow/memory_workflow_engine.rs: fixed integer 0 needs a documented contract and inventory review
+effect/src/workflow/memory_workflow_engine.rs: fixed integer 0 needs a documented contract and inventory review
 effect/src/workflow/memory_workflow_engine.rs: fixed integer 0usize needs a documented contract and inventory review
 effect/src/workflow/memory_workflow_engine.rs: fixed integer 0usize needs a documented contract and inventory review
+effect/src/workflow/memory_workflow_engine.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/workflow/memory_workflow_engine.rs: fixed integer 1 needs a documented contract and inventory review
 effect/src/workflow/memory_workflow_engine.rs: fixed integer 1 needs a documented contract and inventory review
 effect_macros/src/descriptor_expand.rs: fixed integer 0 needs a documented contract and inventory review
@@ -501,9 +743,24 @@ effect_macros/src/schema_enum_expand.rs: unreviewed string expression "policy"
 effect_macros/src/schema_enum_expand.rs: unreviewed string expression "tag_field"
 effect_macros/src/schema_enum_expand.rs: unreviewed string expression "unexpected tokens after enum schema policy"
 effect_macros/src/schema_expand.rs: unreviewed string expression "__effect_schema_codec_{index}"
+effect_macros/src/schema_expand.rs: unreviewed string expression "default_with"
+effect_macros/src/schema_expand.rs: unreviewed string expression "duplicate default_with attribute"
+effect_macros/src/schema_expand.rs: unreviewed string expression "duplicate optional attribute"
 effect_macros/src/schema_expand.rs: unreviewed string expression "duplicate schema field"
 effect_macros/src/schema_expand.rs: unreviewed string expression "expected `(missing, omit)` or `(missing, omit, pure_default)`"
-effect_macros/src/schema_expand.rs: unreviewed string expression "expected `policy`"
+effect_macros/src/schema_expand.rs: unreviewed string expression "expected comma between schema options"
+effect_macros/src/schema_expand.rs: unreviewed string expression "expected optional or default_with"
+effect_macros/src/schema_expand.rs: unreviewed string expression "expected schema field attribute"
+effect_macros/src/schema_expand.rs: unreviewed string expression "missing unknown_fields"
+effect_macros/src/schema_expand.rs: unreviewed string expression "native defaults use #[schema(default_with = factory)]"
+effect_macros/src/schema_expand.rs: unreviewed string expression "native schemas require representation and unknown_fields"
+effect_macros/src/schema_expand.rs: unreviewed string expression "optional and default_with are mutually exclusive"
+effect_macros/src/schema_expand.rs: unreviewed string expression "optional"
 effect_macros/src/schema_expand.rs: unreviewed string expression "policy"
-effect_macros/src/schema_expand.rs: unreviewed string expression "unexpected tokens after schema policy"
+effect_macros/src/schema_expand.rs: unreviewed string expression "representation"
+effect_macros/src/schema_expand.rs: unreviewed string expression "schema field attributes require an explicit representation"
+effect_macros/src/schema_expand.rs: unreviewed string expression "schema requires an explicit policy"
+effect_macros/src/schema_expand.rs: unreviewed string expression "schema"
+effect_macros/src/schema_expand.rs: unreviewed string expression "unknown or duplicate schema option"
+effect_macros/src/schema_expand.rs: unreviewed string expression "unknown_fields"
 effect_macros/src/transaction_expand.rs: unreviewed string expression "only the final expression may omit a semicolon"

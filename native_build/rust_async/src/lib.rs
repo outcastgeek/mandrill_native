@@ -33,12 +33,16 @@ impl Cancellation {
         Arc::new(Self::default())
     }
 
-    /// Returns false if terminal completion had already won the race.
+    /// Atomically request cancellation only while completion has not claimed the terminal state.
+    ///
+    /// Returns false if terminal completion already won; accepted requests wake
+    /// cancellation waiters. Repeated requests remain idempotent and do not acquire
+    /// execution or drain ownership.
     #[must_use]
     pub fn request(&self) -> bool {
         let result = self
             .state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 if state & TERMINAL != 0 {
                     None
                 } else {
@@ -100,10 +104,11 @@ const STOPPING: usize = 1 << (usize::BITS - 1);
 
 struct Permit(Arc<Admission>);
 impl Permit {
+    /// Atomically reserve one operation below the configured limit unless stopping has begun; the returned permit owns release and drain notification.
     fn acquire(admission: &Arc<Admission>) -> Result<Self, AdmissionError> {
         admission
             .state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 if state & STOPPING != 0 || state >= admission.limit {
                     None
                 } else {

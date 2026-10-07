@@ -5,6 +5,7 @@ const outcomes = @import("../outcome.zig");
 const effects = @import("../effect.zig");
 const legacy = @import("../schema.zig");
 const Issue = @import("schema_issue.zig").Issue;
+const Ast = @import("schema_ast.zig");
 
 /// Bidirectional codec interface specialized at comptime. The decoder and
 /// encoder are statically typed functions; each constructs a lazy Effect, and
@@ -29,7 +30,11 @@ pub fn Codec(comptime Value: type, comptime Encoded: type, comptime DecodeEnv: t
         /// Environment required to run encoding effects.
         pub const EncodingEnvironment = EncodeEnv;
 
+        /// Optional explicit immutable representation witness; null means no shape may be inferred from callbacks.
+        encoded_shape: ?*const Ast.Node = null,
+        /// Selected decode callback; borrowed input remains alive through direct use or lazy join.
         decoder: *const fn (*const Encoded) effects.Effect(Value, Issue, DecodeEnv),
+        /// Selected encode callback; returned representation follows its declared ownership contract.
         encoder: *const fn (*const Value) effects.Effect(Encoded, Issue, EncodeEnv),
 
         /// Pair effectful decoding and encoding callbacks for this representation.
@@ -74,6 +79,21 @@ pub fn Codec(comptime Value: type, comptime Encoded: type, comptime DecodeEnv: t
             return effects.Effect(Encoded, Issue, EncodeEnv).deferBorrowed(Value, value, struct {
                 fn start(input: *const Value, _: *const EncodeEnv) effects.Effect(Encoded, Issue, EncodeEnv) {
                     return self.encoder(input);
+                }
+            }.start);
+        }
+
+        /// Validation executes encoding exactly once and releases its output.
+        pub fn validate(comptime self: Self, value: *const Value) effects.Effect(void, Issue, EncodeEnv) {
+            return effects.Effect(void, Issue, EncodeEnv).deferBorrowed(Value, value, struct {
+                fn start(input: *const Value, env: *const EncodeEnv) effects.Effect(void, Issue, EncodeEnv) {
+                    var encoded = self.encode(input);
+                    return encoded.mapOwned(env, struct {
+                        fn discard(value_: Encoded) void {
+                            var owned = value_;
+                            outcomes.discardPayload(&owned);
+                        }
+                    }.discard);
                 }
             }.start);
         }
@@ -138,9 +158,17 @@ pub fn PureCodec(comptime Value: type, comptime Encoded: type) type {
         pub const DecodingEnvironment = void;
         /// Environment required to run encoding effects.
         pub const EncodingEnvironment = void;
+        pub const pure_decoding = true;
+        pub const pure_encoding = true;
 
+        /// Optional explicit immutable representation witness; null means no shape may be inferred from callbacks.
+        encoded_shape: ?*const Ast.Node = null,
+        /// Selected decode callback; borrowed input remains alive through direct use or lazy join.
         decoder: *const fn (*const Encoded) outcomes.Result(Value, Issue),
+        /// Selected encode callback; returned representation follows its declared ownership contract.
         encoder: *const fn (*const Value) outcomes.Result(Encoded, Issue),
+        /// Optional checked direct JSON writer; eligibility requires this actual callback, not just a method name.
+        writer: ?*const fn (*const Value, *@import("json_writer.zig").Writer) outcomes.Exit(void, Issue) = null,
 
         /// Pair pure decoding and encoding callbacks for this representation.
         /// Parameters:
@@ -154,6 +182,28 @@ pub fn PureCodec(comptime Value: type, comptime Encoded: type) type {
             comptime encode_value: fn (*const Value) outcomes.Result(Encoded, Issue),
         ) Self {
             return .{ .decoder = decode_value, .encoder = encode_value };
+        }
+
+        /// Pair pure decode/encode callbacks with real direct JSON writer evidence.
+        /// The writer must validate encode semantics once, borrow the value, and preserve typed issues and all Exit failure channels.
+        pub fn initWriter(comptime decode_value: fn (*const Encoded) outcomes.Result(Value, Issue), comptime encode_value: fn (*const Value) outcomes.Result(Encoded, Issue), comptime write_value: fn (*const Value, *@import("json_writer.zig").Writer) outcomes.Exit(void, Issue)) Self {
+            return .{ .decoder = decode_value, .encoder = encode_value, .writer = write_value };
+        }
+        /// Execute pure encoding once and discard a marked owning representation; return its typed validation Result.
+        pub fn validateDirect(self: Self, value: *const Value) outcomes.Result(void, Issue) {
+            var result = self.encodeDirect(value);
+            return switch (result) {
+                .ok => blk: {
+                    outcomes.discardPayload(&result.ok);
+                    break :blk .{ .ok = {} };
+                },
+                .err => |problem| .{ .err = problem },
+            };
+        }
+        /// Invoke the statically selected direct writer; reject missing writer evidence at comptime. Borrow value/output for this call.
+        pub fn writeJson(comptime self: Self, value: *const Value, writer_: *@import("json_writer.zig").Writer) outcomes.Exit(void, Issue) {
+            const write_value = self.writer orelse @compileError("codec has no direct JSON writer evidence");
+            return write_value(value, writer_);
         }
 
         /// Decode immediately and return the typed validation outcome.
@@ -182,15 +232,31 @@ pub fn PureCodec(comptime Value: type, comptime Encoded: type) type {
         ///   operation’s contract.
         /// Returns (`Codec(Value, Encoded, void, void)`): A typed codec or schema preserving the declared decoded value, representation, and environments.
         pub fn asCodec(comptime self: Self) Codec(Value, Encoded, void, void) {
-            return Codec(Value, Encoded, void, void).init(struct {
+            var result = Codec(Value, Encoded, void, void).init(struct {
                 fn decodeValue(encoded: *const Encoded) effects.Effect(Value, Issue, void) {
-                    return effects.Effect(Value, Issue, void).fromResult(self.decodeDirect(encoded));
+                    return effects.Effect(Value, Issue, void).fromBorrowed(Encoded, encoded, struct {
+                        fn run(input: *const Encoded, _: *const void) outcomes.Exit(Value, Issue) {
+                            return switch (self.decodeDirect(input)) {
+                                .ok => |decoded| .{ .success = decoded },
+                                .err => |issue| .{ .fail = issue },
+                            };
+                        }
+                    }.run);
                 }
             }.decodeValue, struct {
                 fn encodeValue(value: *const Value) effects.Effect(Encoded, Issue, void) {
-                    return effects.Effect(Encoded, Issue, void).fromResult(self.encodeDirect(value));
+                    return effects.Effect(Encoded, Issue, void).fromBorrowed(Value, value, struct {
+                        fn run(input: *const Value, _: *const void) outcomes.Exit(Encoded, Issue) {
+                            return switch (self.encodeDirect(input)) {
+                                .ok => |encoded| .{ .success = encoded },
+                                .err => |issue| .{ .fail = issue },
+                            };
+                        }
+                    }.run);
                 }
             }.encodeValue);
+            result.encoded_shape = self.encoded_shape;
+            return result;
         }
 
         /// An old decoder can read the new JSON codec. The caller explicitly
@@ -215,4 +281,12 @@ pub fn PureCodec(comptime Value: type, comptime Encoded: type) type {
             }.decodeValue);
         }
     };
+}
+
+/// Static evidence cannot be inferred merely from AST metadata or method names.
+pub fn requirePure(comptime child: anytype) @TypeOf(child) {
+    const C = @TypeOf(child);
+    if (!@hasDecl(C, "pure_decoding") or !@hasDecl(C, "pure_encoding") or !C.pure_decoding or !C.pure_encoding or C.DecodingEnvironment != void or C.EncodingEnvironment != void)
+        @compileError("codec requires services and cannot provide pure codec evidence");
+    return child;
 }

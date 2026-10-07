@@ -5,7 +5,7 @@ use crate::{
     Defect, Effect, Exit, Finalization, PubSubError, PubSubOverflow, PubSubShutdown, PublishReport,
     Semaphore, SemaphoreError, SharedValue, SubscriptionRef,
 };
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
@@ -58,6 +58,7 @@ pub enum AtomDependencyError<E: Send + 'static> {
 pub struct AtomRef<A: Send + Sync + 'static> {
     pub(super) id: AtomId,
     pub(super) registry: AtomRegistry,
+    owner: Arc<()>,
     pub(super) value: SubscriptionRef<A>,
     pub(super) revision: Arc<Mutex<std::num::NonZeroU64>>,
     pub(super) mutation: Semaphore,
@@ -71,6 +72,7 @@ impl<A: Send + Sync + 'static> Clone for AtomRef<A> {
         Self {
             id: self.id.clone(),
             registry: self.registry.clone(),
+            owner: Arc::clone(&self.owner),
             value: self.value.clone(),
             revision: Arc::clone(&self.revision),
             mutation: self.mutation.clone(),
@@ -79,20 +81,7 @@ impl<A: Send + Sync + 'static> Clone for AtomRef<A> {
 }
 
 impl<A: Send + Sync + 'static> AtomRef<A> {
-    /// Construct a `AtomRef` from its required inputs and explicit policies.
-    ///
-    /// # Type parameters
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Parameters
-    /// - `registry` (`AtomRegistry`): Registry that owns definitions and rejects identity conflicts.
-    /// - `id` (`AtomId`): Stable identity of the selected record or operation.
-    /// - `initial` (`A`): Initial value used before any state transition.
-    /// - `capacity` (`NonZeroUsize`): The caller-supplied capacity bound.
-    /// - `overflow` (`PubSubOverflow`): Behavior when the configured buffer capacity is full.
-    ///
-    /// # Returns
-    /// Type: `Result<Self, AtomRegistryError>`.
+    /// Register a fresh source owner and initial shared value with explicit publication capacity; duplicate/disposed registration fails without replacing a live source.
     pub fn new(
         registry: AtomRegistry,
         id: AtomId,
@@ -100,10 +89,11 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
         capacity: NonZeroUsize,
         overflow: PubSubOverflow,
     ) -> Result<Self, AtomRegistryError> {
-        registry.register(id.clone(), AtomKind::Source)?;
+        let owner = registry.register_owned(id.clone(), AtomKind::Source)?;
         Ok(Self {
             id,
             registry,
+            owner,
             value: SubscriptionRef::new(initial, capacity, overflow),
             revision: Arc::new(Mutex::new(std::num::NonZeroU64::MIN)),
             mutation: Semaphore::full(NonZeroUsize::MIN),
@@ -122,15 +112,7 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
         &self.id
     }
 
-    /// Read the selected state without assuming it has been modified.
-    ///
-    /// # Type parameters
-    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Returns
-    /// Type: `Effect<Arc<A>, AtomRefError, R>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// Lazily borrow the current source value through a shared Arc; this direct read does not register a derived dependency.
     pub fn read<R: Send + Sync + 'static>(&self) -> Effect<Arc<A>, AtomRefError, R> {
         self.value.read().map_error(AtomRefError::Publication)
     }
@@ -155,18 +137,12 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
         })
     }
 
-    /// Replace the current value through the declared state capability.
+    /// Lazily replace one owned source value after acquiring its mutation permit.
     ///
-    /// # Type parameters
-    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Parameters
-    /// - `next` (`A`): Next value or state produced by the transition.
-    ///
-    /// # Returns
-    /// Type: `Effect<PublishReport, AtomRefError, R>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// Registration ownership, version change and invalidation metadata are checked in
+    /// the publication guard; a stale handle cannot affect a replacement registration.
+    /// Notifications and discarded-value cleanup happen outside the graph gate. A
+    /// committed notification failure is distinct from a rejected mutation.
     pub fn set<R: Send + Sync + 'static>(&self, next: A) -> Effect<PublishReport, AtomRefError, R> {
         let source = self.clone();
         let next = Mutex::new(Some(next));
@@ -193,20 +169,55 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
                                 let revision = Arc::clone(&source.revision);
                                 let registry = source.registry.clone();
                                 let id = source.id.clone();
+                                let committed = Arc::new(Mutex::new(None));
+                                let captured = Arc::clone(&committed);
+                                let commit_registry = registry.clone();
+                                let commit_id = id.clone();
+                                let commit_owner = Arc::clone(&source.owner);
                                 source
                                     .value
-                                    .set_with_commit(next, move |_| {
-                                        *revision
+                                    .set_with_guard(next, move |_| {
+                                        let result = commit_registry
+                                            .commit_source(&commit_id, &commit_owner);
+                                        let accepted = result.is_ok();
+                                        if accepted {
+                                            *revision.lock().unwrap_or_else(
+                                                std::sync::PoisonError::into_inner,
+                                            ) = upcoming;
+                                        }
+                                        *captured
                                             .lock()
                                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                            upcoming;
+                                            Some(result);
+                                        accepted
                                     })
                                     .map_error(AtomRefError::Publication)
-                                    .flat_map(move |report| {
-                                        registry
-                                            .changed(id.clone())
-                                            .map_error(AtomRefError::CommittedWithoutInvalidation)
-                                            .map(move |_| report)
+                                    .materialize_exit()
+                                    .map_error(|never: std::convert::Infallible| match never {})
+                                    .flat_map(move |publication| {
+                                        let decision = committed
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                            .take();
+                                        match decision {
+                                            Some(Ok(keys)) => Effect::from_exit_once(publication)
+                                                .ensuring(registry.notify(keys).map_error(
+                                                    AtomRefError::CommittedWithoutInvalidation,
+                                                )),
+                                            Some(Err(error)) => Effect::from_result_once(Err(
+                                                AtomRefError::Registry(error),
+                                            ))
+                                            .ensuring(
+                                                Effect::from_exit_once(publication).map(|_| ()),
+                                            ),
+                                            None => {
+                                                Effect::from_exit_once(publication).flat_map(|_| {
+                                                    Effect::from_result_once(Err(
+                                                        AtomRefError::InputConsumed,
+                                                    ))
+                                                })
+                                            }
+                                        }
                                     })
                             }
                             None => Effect::from_result_once(Err(AtomRefError::RevisionExhausted)),
@@ -233,18 +244,10 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
         self.value.stream()
     }
 
-    /// Release owned native state and await its disposal where required.
+    /// Lazily close this source's publication channel and remove only its owned registration.
     ///
-    /// # Type parameters
-    /// - `A`: Application value type. Bound: `Send + Sync + 'static`.
-    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
-    ///
-    /// # Parameters
-    /// - `mode` (`PubSubShutdown`): Selected behavior for this operation.
-    ///
-    /// # Returns
-    /// Type: `Effect<(), AtomRefError, R>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// Late disposal preserves a replacement with the same ID. The acquired mutation
+    /// permit is released through protected cleanup, including failures.
     pub fn dispose<R: Send + Sync + 'static>(
         &self,
         mode: PubSubShutdown,
@@ -262,7 +265,7 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
                     .flat_map(move |_| {
                         source
                             .registry
-                            .remove(source.id.clone())
+                            .remove_owned(source.id.clone(), Some(Arc::clone(&source.owner)))
                             .map_error(AtomRefError::Registry)
                             .map(|_| ())
                     })
@@ -272,13 +275,11 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
     }
 }
 
-/// A derived evaluator records only source reads that actually execute. On a
-/// successful run, its collected set atomically replaces the previous graph
-/// dependencies after cycle validation.
+/// Per-evaluation dependency observations; clones share the first version recorded for each actually executed read.
 #[derive(Clone)]
 pub struct AtomReadContext {
     registry: AtomRegistry,
-    dependencies: Arc<Mutex<BTreeSet<AtomId>>>,
+    dependencies: Arc<Mutex<BTreeMap<AtomId, Arc<()>>>>,
 }
 
 impl AtomReadContext {
@@ -290,22 +291,15 @@ impl AtomReadContext {
     pub(crate) fn new(registry: AtomRegistry) -> Self {
         Self {
             registry,
-            dependencies: Arc::new(Mutex::new(BTreeSet::new())),
+            dependencies: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
-    /// Read the selected state without assuming it has been modified.
+    /// Lazily read a source and record its first observed version for this evaluation.
     ///
-    /// # Type parameters
-    /// - `A`: Application value type. Bounds: `Send + Sync + 'static`.
-    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
-    ///
-    /// # Parameters
-    /// - `source` (`&AtomRef<A>`): Underlying provider or input from which values are read.
-    ///
-    /// # Returns
-    /// Type: `Effect<Arc<A>, AtomRefError, R>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// Holds the source mutation permit across version and value acquisition. Foreign
+    /// registries and stale source owners fail before returning a dependency value;
+    /// final publication rechecks the version under the graph gate.
     pub fn read<A: Send + Sync + 'static, R: Send + Sync + 'static>(
         &self,
         source: &AtomRef<A>,
@@ -314,39 +308,56 @@ impl AtomReadContext {
             return Effect::from_result_once(Err(AtomRefError::ForeignRegistry));
         }
         let dependencies = Arc::clone(&self.dependencies);
-        let id = source.id.clone();
         let source = source.clone();
-        Effect::sync(move || {
-            dependencies
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(id.clone());
-        })
-        .flat_map(move |_| source.read())
+        source
+            .mutation
+            .acquire(NonZeroUsize::MIN)
+            .map_error(AtomRefError::Admission)
+            .flat_map(move |permit| {
+                let source = source.clone();
+                let dependencies = Arc::clone(&dependencies);
+                let read = Effect::try_sync(
+                    {
+                        let source = source.clone();
+                        move || {
+                            source
+                                .registry
+                                .dependency_version(&source.id, &source.owner)
+                                .map_err(AtomRefError::Registry)
+                        }
+                    },
+                    std::convert::identity,
+                )
+                .flat_map(move |version| {
+                    let dependencies = Arc::clone(&dependencies);
+                    let id = source.id.clone();
+                    source.read().map(move |value| {
+                        dependencies
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .entry(id.clone())
+                            .or_insert_with(|| Arc::clone(&version));
+                        value
+                    })
+                });
+                read.ensuring(Effect::sync_once(move || drop(permit)))
+            })
     }
 
     /// # Returns
     /// Type: `BTreeSet<AtomId>`.
-    pub(crate) fn collected(&self) -> BTreeSet<AtomId> {
+    pub(crate) fn collected(&self) -> BTreeMap<AtomId, Arc<()>> {
         self.dependencies
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
-    /// Evaluate a derived atom after checking its dependencies.
+    /// Lazily read a derived dependency from the same registry and record its version.
     ///
-    /// # Type parameters
-    /// - `A`: Application value type. Additional bound: `Send + 'static`.
-    /// - `E`: Domain-error type. Additional bound: `Send + 'static`.
-    /// - `R`: Environment type. Additional bound: `Send + Sync + 'static`.
-    ///
-    /// # Parameters
-    /// - `derived` (`&Atom<A, E, R>`): The derived supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Effect<SharedValue<A>, AtomDependencyError<E>, R>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// Rejects a replaced owner as Unavailable. Version is captured before status
+    /// inspection so a concurrent change conservatively rejects the consuming build
+    /// at commit, rather than accepting stale state as a current dependency.
     pub fn read_derived<A, E, R>(
         &self,
         derived: &Atom<A, E, R>,
@@ -361,14 +372,25 @@ impl AtomReadContext {
         }
         let dependencies = Arc::clone(&self.dependencies);
         let id = derived.id().clone();
+        let owner = derived.registration_owner();
         let derived = derived.clone();
-        Effect::sync(move || {
+        let registry = self.registry.clone();
+        Effect::try_sync(
+            move || {
+                registry
+                    .dependency_version(&id, &owner)
+                    .map(|version| (id.clone(), version))
+                    .map_err(|_| AtomDependencyError::Unavailable)
+            },
+            std::convert::identity,
+        )
+        .flat_map(move |(id, version)| {
+            let dependencies = Arc::clone(&dependencies);
             dependencies
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(id.clone());
-        })
-        .flat_map(move |_| {
+                .entry(id)
+                .or_insert(version);
             derived
                 .read()
                 .map_error(AtomDependencyError::Read)

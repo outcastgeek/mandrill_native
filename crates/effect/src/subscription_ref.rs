@@ -136,6 +136,13 @@ impl<A: Send + Sync + 'static> SubscriptionRef<A> {
         self.hub.publish_with_commit(value, commit)
     }
 
+    pub(crate) fn set_with_guard<R: Send + Sync + 'static>(
+        &self,
+        value: A,
+        guard: impl Fn(&A) -> bool + Send + Sync + 'static,
+    ) -> Effect<PublishReport, PubSubError, R> {
+        self.hub.publish_with_guard(value, guard)
+    }
     /// Compute and publish a replacement value for this subscription reference.
     ///
     /// # Type parameters

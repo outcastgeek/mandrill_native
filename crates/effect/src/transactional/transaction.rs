@@ -2,9 +2,12 @@
 
 use super::HasTransactionDomain;
 use super::internal::journal::{JournalError, TxJournal};
-use crate::Effect;
+use crate::internal::runtime::{self, Step};
+use crate::{Defect, Effect, Exit};
+use futures_util::FutureExt;
 use futures_util::future::{poll_fn, select};
 use std::num::NonZeroUsize;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::task::Poll;
 
@@ -215,6 +218,7 @@ impl<A: Send + 'static, E: Send + 'static> Transaction<A, E> {
     ///
     /// # Returns
     /// Type: `Transaction<B, E>`.
+    #[doc(alias = "flatMap")]
     pub fn flat_map<B: Send + 'static>(
         self,
         next: impl Fn(A) -> Transaction<B, E> + Send + Sync + 'static,
@@ -262,28 +266,23 @@ impl<A: Send + 'static, E: Send + 'static> Transaction<A, E> {
         })
     }
 
-    /// Validate the read set and commit all transaction writes as one state change.
+    /// Lazily validate and commit transaction writes in R's transaction domain.
     ///
-    /// # Type parameters
-    /// - `R`: Environment type. Additional bound: `HasTransactionDomain + Send + Sync + 'static`.
-    /// - `A`: Success or application-value type.
-    /// - `E`: Domain-error type.
-    ///
-    /// # Parameters
-    /// - `policy` (`TransactionPolicy`): The caller-supplied behavior policy.
-    ///
-    /// # Returns
-    /// Type: `Effect<A, TransactionError<E>, R>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// Each conflict retry evaluates against a fresh journal under max_conflicts.
+    /// Cancellation during conflict/cell/permit waits remains interruption; it does not
+    /// commit writes or become a typed domain error. Defects are caught and application
+    /// captures are destroyed outside commit gates. Transaction composition excludes
+    /// arbitrary Effect/Future bindings; this boundary is stronger than effect composition.
     pub fn atomically<R>(&self, policy: TransactionPolicy) -> Effect<A, TransactionError<E>, R>
     where
         R: HasTransactionDomain + Send + Sync + 'static,
     {
         let transaction = self.clone();
-        Effect::try_future_with_env(
-            move |env: Arc<R>, cancellation| {
-                let transaction = transaction.clone();
-                async move {
+        Effect::new(move |env: Arc<R>, context, finish| {
+            let cancellation = context.cancellation.clone();
+            let transaction = transaction.clone();
+            Step::Suspended(Box::pin(async move {
+                let result = AssertUnwindSafe(async move {
                     let domain = env.transaction_domain();
                     let mut conflicts = 0usize;
                     loop {
@@ -297,6 +296,8 @@ impl<A: Send + 'static, E: Send + 'static> Transaction<A, E> {
                                     return Err(TransactionError::Cancelled);
                                 }
                                 match journal.commit() {
+                                    // No suspension follows commit: the successful value is
+                                    // handed to the owning continuation in this poll.
                                     Ok(_) => return Ok(value),
                                     Err(JournalError::Conflict) => {}
                                     Err(error) => {
@@ -344,27 +345,27 @@ impl<A: Send + 'static, E: Send + 'static> Transaction<A, E> {
                         }
                         yield_after_conflict().await;
                     }
-                }
-            },
-            std::convert::identity,
-        )
+                })
+                .catch_unwind()
+                .await;
+                let outcome = match result {
+                    Ok(Ok(value)) => Exit::Success(value),
+                    Ok(Err(TransactionError::Cancelled)) => Exit::Interrupted,
+                    Ok(Err(error)) => Exit::Fail(error),
+                    Err(panic) => Exit::Die(Defect::from_panic(panic)),
+                };
+                runtime::finish(finish, outcome)
+            }))
+        })
     }
 }
 
 impl<E: Send + 'static> Transaction<(), E> {
-    /// The iterable is rebuilt for every optimistic retry. Each iteration
-    /// shares this transaction's journal and publishes no writes until commit.
+    /// Rebuild the input iterable for each transaction evaluation and consume its items in order.
     ///
-    /// # Type parameters
-    /// - `Items`: Input collection or iterator type. Additional bound: `IntoIterator + 'static`.
-    /// - `E`: Domain-error type.
-    ///
-    /// # Parameters
-    /// - `items` (`impl Fn() -> Items + Send + Sync + 'static`): The items supplied to this operation.
-    /// - `body` (`impl Fn(Items::Item) -> Transaction<(), E> + Send + Sync + 'static`): Application callback or effect executed inside the owning scope.
-    ///
-    /// # Returns
-    /// Type: `Self`.
+    /// Owned items need no Clone bound. The first failure or retry request stops that
+    /// attempt; a conflict retry starts with a fresh iterable and journal. The body
+    /// constructs transactions, not arbitrary asynchronous effects.
     pub fn for_each<Items>(
         items: impl Fn() -> Items + Send + Sync + 'static,
         body: impl Fn(Items::Item) -> Transaction<(), E> + Send + Sync + 'static,

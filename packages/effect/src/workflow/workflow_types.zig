@@ -202,18 +202,43 @@ pub const RecordedActivity = struct {
     }
 };
 
-/// Observed lifecycle state of a workflow execution, including pending, running, suspended, and
-/// terminal forms.
+/// Owning terminal reply plus the checkpoint revision observed under the storage mutex.
+/// Keep it alive through an explicit reset that borrows its bytes; deinit releases the copied reply.
+pub const CheckpointReply = struct {
+    /// Poll result owns its terminal bytes and requires deinit or clone.
+    pub const effect_owned_payload = true;
+    /// Owned encoded terminal reply copied by poll.
+    items: []u8,
+    /// Originating allocator for items and clones.
+    allocator: std.mem.Allocator,
+    /// Checkpoint revision captured atomically with these bytes.
+    revision: u64,
+    /// Free the copied reply once; any borrowed reset request must already have joined.
+    pub fn deinit(self: *@This()) void {
+        self.allocator.free(self.items);
+        self.* = undefined;
+    }
+    /// Create an independent reply owner with the same observed checkpoint revision.
+    pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
+        return .{ .items = try self.allocator.dupe(u8, self.items), .allocator = self.allocator, .revision = self.revision };
+    }
+};
+
+/// Owning poll snapshot. State revisions fence resumes; activation generations fence owners separately.
 pub const ExecutionState = union(enum) {
     /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit` and
     /// must be released after use.
     pub const effect_owned_payload = true;
     absent,
     queued,
-    running,
-    cancellation_requested,
-    suspended,
-    completed: Bytes,
+    /// Current checkpoint revision of an active execution.
+    running: u64,
+    /// Current checkpoint revision after an accepted cancellation request; durability is provider-defined.
+    cancellation_requested: u64,
+    /// Current revision of a suspended checkpoint.
+    suspended: u64,
+    /// Owned terminal reply and its observed revision.
+    completed: CheckpointReply,
     terminal_cancelled,
 
     /// Release resources owned by this value.
@@ -249,8 +274,30 @@ pub const Submission = struct {
 /// Submission acknowledgement; `possibly_accepted` requires lookup before retrying an external
 /// submission.
 pub const SubmitResult = enum { accepted, already_present, possibly_accepted };
-/// Outcome of a workflow control command. `possibly_recorded` requires reconciliation before retry.
-pub const ControlResult = enum { recorded, already_recorded, absent, possibly_recorded };
+/// Borrowed resume compare-and-set request against a checkpoint revision, not an activation generation.
+/// Custom providers compare revision and any terminal bytes in the same storage transaction as reset.
+pub const ResumeRequest = struct {
+    /// Borrowed encoded execution identity, retained by the caller through join.
+    execution: ExecutionId,
+    /// Checkpoint revision observed by poll; a mismatch forbids mutation.
+    expected_revision: u64,
+    /// Explicit failed-run retry supplies the terminal reply it observed. Plain
+    /// resume never resets a completed run. Providers compare both atomically.
+    expected_terminal_reply: ?[]const u8 = null,
+};
+/// Storage acknowledgement; ambiguous writes require reconciliation before retry.
+pub const ControlResult = enum {
+    /// The fenced state transition was committed.
+    recorded,
+    /// No transition is needed; plain completed-run resume never replays the run.
+    already_recorded,
+    /// No stored execution exists.
+    absent,
+    /// The provider cannot confirm whether the write committed; poll/reconcile first.
+    possibly_recorded,
+    /// Observed revision or supplied terminal bytes no longer match; storage is unchanged.
+    stale_revision,
+};
 /// Outcome of recording an activity under its activation fence, including conflict and ambiguous-write
 /// states.
 pub const RecordResult = enum { recorded, already_recorded, conflicting_record, stale_activation, possibly_recorded };

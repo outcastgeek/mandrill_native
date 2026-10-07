@@ -644,6 +644,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                     return Ok(existing.clone());
                 }
                 let snapshot = WorkflowSnapshot {
+                    execution: 0,
                     handle: handle.clone(),
                     compatibility,
                     encoded_input: Arc::clone(&encoded_input),
@@ -695,7 +696,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
     fn transition(
         &self,
         run: WorkflowRunId,
-        expected: WorkflowStatus,
+        expected: super::WorkflowCheckpoint,
         next: WorkflowStatus,
     ) -> Effect<WorkflowSnapshot, Self::Error> {
         let state = Arc::clone(&self.state);
@@ -706,7 +707,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                     .runs
                     .get_mut(&run)
                     .ok_or(WorkflowEngineError::MissingRun)?;
-                if snapshot.status != expected {
+                if snapshot.checkpoint() != expected {
                     return Err(WorkflowEngineError::StateConflict);
                 }
                 if matches!(
@@ -726,12 +727,18 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                 ) {
                     return Err(WorkflowEngineError::InvalidTransition);
                 }
+                if next == WorkflowStatus::Running {
+                    snapshot.execution = snapshot
+                        .execution
+                        .checked_add(1)
+                        .ok_or(WorkflowEngineError::ExecutionExhausted)?;
+                }
                 snapshot.status = next.clone();
                 if next == WorkflowStatus::Running {
                     snapshot.wake_reason = None;
                 } else if next == WorkflowStatus::Ready {
                     snapshot.waiting_on = None;
-                    if expected == WorkflowStatus::Suspended {
+                    if expected.status == WorkflowStatus::Suspended {
                         snapshot.wake_reason = Some(WorkflowWakeReason::Manual);
                     }
                 }

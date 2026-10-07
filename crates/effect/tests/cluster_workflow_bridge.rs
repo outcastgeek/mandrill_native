@@ -251,3 +251,98 @@ fn cluster_workflow_commands_use_the_same_engine_records() {
         matches!(block_on(engine.inspect(run).run(Arc::new(()))), Exit::Success(Some(snapshot)) if snapshot.status == WorkflowStatus::Completed(outcome))
     );
 }
+
+#[test]
+fn cluster_resume_retries_only_the_supplied_execution_checkpoint_and_acknowledges_completion() {
+    let engine = Arc::new(MemoryWorkflowEngine::new());
+    let env = Arc::new(Environment(Arc::clone(&engine)));
+    let namespace = KeyNamespace::<Domain>::new("fenced-resume").unwrap();
+    let run = WorkflowRunId::from_stable(
+        StableKey::new(&namespace, [KeySegment::Text("run".into())]).unwrap(),
+    );
+    let definition = WorkflowDefinitionId::new("fenced-resume").unwrap();
+    let version = WorkflowVersion::new(NonZeroU32::MIN);
+    assert!(matches!(
+        block_on(
+            engine
+                .register(WorkflowRegistration {
+                    id: definition.clone(),
+                    version,
+                    compatibility: Arc::from(&b"resume"[..])
+                })
+                .run(Arc::new(()))
+        ),
+        Exit::Success(())
+    ));
+    let ready = match block_on(
+        engine
+            .start(
+                WorkflowHandle {
+                    run: run.clone(),
+                    definition,
+                    version,
+                },
+                Arc::from([]),
+            )
+            .run(Arc::new(())),
+    ) {
+        Exit::Success(snapshot) => snapshot,
+        _ => panic!("start"),
+    };
+    let first = match block_on(
+        engine
+            .transition(run.clone(), ready.checkpoint(), WorkflowStatus::Running)
+            .run(Arc::new(())),
+    ) {
+        Exit::Success(snapshot) => snapshot,
+        _ => panic!("running"),
+    };
+    assert!(
+        matches!(block_on(ClusterWorkflowEngine::dispatch::<Environment>(WorkflowCommand::Resume{run:run.clone(),checkpoint:None}).run(Arc::clone(&env))),Exit::Success(WorkflowReply::Snapshot(Some(snapshot))) if snapshot.checkpoint()==first.checkpoint())
+    );
+    assert!(
+        matches!(block_on(ClusterWorkflowEngine::dispatch::<Environment>(WorkflowCommand::Resume{run:run.clone(),checkpoint:Some(first.checkpoint())}).run(Arc::clone(&env))),Exit::Success(WorkflowReply::Snapshot(Some(snapshot))) if snapshot.status==WorkflowStatus::Ready)
+    );
+    let ready = match block_on(engine.inspect(run.clone()).run(Arc::new(()))) {
+        Exit::Success(Some(snapshot)) => snapshot,
+        _ => panic!("inspect"),
+    };
+    let second = match block_on(
+        engine
+            .transition(run.clone(), ready.checkpoint(), WorkflowStatus::Running)
+            .run(Arc::new(())),
+    ) {
+        Exit::Success(snapshot) => snapshot,
+        _ => panic!("new running"),
+    };
+    assert!(matches!(
+        block_on(
+            ClusterWorkflowEngine::dispatch::<Environment>(WorkflowCommand::Resume {
+                run: run.clone(),
+                checkpoint: Some(first.checkpoint())
+            })
+            .run(Arc::clone(&env))
+        ),
+        Exit::Fail(ClusterWorkflowError::Engine(
+            WorkflowEngineError::StateConflict
+        ))
+    ));
+    assert!(
+        matches!(block_on(engine.inspect(run.clone()).run(Arc::new(()))),Exit::Success(Some(snapshot)) if snapshot.checkpoint()==second.checkpoint())
+    );
+    let outcome = EncodedWorkflowOutcome {
+        kind: WorkflowOutcomeKind::Succeeded,
+        payload: Arc::from(&b"done"[..]),
+    };
+    assert!(matches!(
+        block_on(
+            engine
+                .complete(run.clone(), outcome.clone())
+                .run(Arc::new(()))
+        ),
+        Exit::Success(_)
+    ));
+    assert!(
+        matches!(block_on(ClusterWorkflowEngine::dispatch::<Environment>(WorkflowCommand::Resume{run,checkpoint:Some(first.checkpoint())}).run(env)),Exit::Success(WorkflowReply::Snapshot(Some(snapshot))) if snapshot.status==WorkflowStatus::Completed(outcome.clone()))
+    );
+}

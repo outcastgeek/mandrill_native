@@ -234,7 +234,7 @@ pub fn encode(allocator: std.mem.Allocator, value: View, limits: Limits) outcome
     defer buffer.deinit();
     buffer.ensureTotalCapacity(encoded_bytes) catch return .{ .die = outcomes.Defect.out_of_memory };
     appendInteger(&buffer, Version, value.version) catch return .{ .die = outcomes.Defect.out_of_memory };
-    buffer.append(@intFromEnum(value.kind)) catch return .{ .die = outcomes.Defect.out_of_memory };
+    buffer.append(@backingInt(value.kind)) catch return .{ .die = outcomes.Defect.out_of_memory };
     appendInteger(&buffer, Correlation, value.correlation) catch return .{ .die = outcomes.Defect.out_of_memory };
     if (value.sequence) |sequence| appendInteger(&buffer, Sequence, sequence) catch
         return .{ .die = outcomes.Defect.out_of_memory };

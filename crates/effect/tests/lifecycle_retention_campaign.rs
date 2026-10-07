@@ -216,7 +216,9 @@ fn configured_lifecycle_cycles_release_all_eight_feature_families() {
         assert_eq!(
             run(engine.transition(
                 handle.run.clone(),
-                WorkflowStatus::Ready,
+                run(engine.inspect(handle.run.clone()))
+                    .expect("run")
+                    .checkpoint(),
                 WorkflowStatus::Running
             ))
             .status,
@@ -248,15 +250,23 @@ fn configured_lifecycle_cycles_release_all_eight_feature_families() {
         assert_eq!(
             run(engine.transition(
                 handle.run.clone(),
-                WorkflowStatus::Running,
+                run(engine.inspect(handle.run.clone()))
+                    .expect("run")
+                    .checkpoint(),
                 WorkflowStatus::Suspended
             ))
             .status,
             WorkflowStatus::Suspended
         );
         assert_eq!(
-            run(engine.transition(handle.run, WorkflowStatus::Suspended, WorkflowStatus::Ready))
-                .status,
+            run(engine.transition(
+                handle.run.clone(),
+                run(engine.inspect(handle.run.clone()))
+                    .expect("run")
+                    .checkpoint(),
+                WorkflowStatus::Ready
+            ))
+            .status,
             WorkflowStatus::Ready
         );
         drop(engine);

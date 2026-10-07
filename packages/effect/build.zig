@@ -28,7 +28,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run typed outcome and representation tests");
     test_step.dependOn(boundedTests(b, tests));
     const provider_step = b.step("provider-test", "Run external facility, native I/O and mixed-provider lifecycle tests");
-    for ([_][]const u8{ "proofs/void-binding.zig", "proofs/runtime-binding.zig", "proofs/codegen.zig", "proofs/facilities.zig", "proofs/concurrency-contracts.zig", "proofs/mixed-pipeline.zig", "proofs/lifecycle-contracts.zig", "proofs/new-compositions.zig" }) |source| {
+    for ([_][]const u8{ "proofs/void-binding.zig", "proofs/runtime-binding.zig", "proofs/codegen.zig", "proofs/facilities.zig", "proofs/concurrency-contracts.zig", "proofs/mixed-pipeline.zig", "proofs/lifecycle-contracts.zig", "proofs/new-compositions.zig", "proofs/reference-update.zig" }) |source| {
         const consumer_tests = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(source),
             .target = target,
@@ -41,10 +41,10 @@ pub fn build(b: *std.Build) void {
     }
 
     const leak_check = b.addSystemCommand(&.{"python3"});
-    leak_check.addFileArg(b.path("tests/check_leak_detection.py"));
+    leak_check.addFileArg2(b.path("tests/check_leak_detection.py"), .{});
     leak_check.addArg(b.graph.zig_exe);
     test_step.dependOn(&leak_check.step);
-    b.step("leak-check", "Prove allocator leaks fail the native test runner in Debug and ReleaseSafe").dependOn(&leak_check.step);
+    b.step("leak-check", "Prove allocator leaks fail the native test runner in debug and safe").dependOn(&leak_check.step);
 
     const example = b.addExecutable(.{
         .name = "effect-port-example",
@@ -57,16 +57,19 @@ pub fn build(b: *std.Build) void {
     });
     b.step("example", "Run an external consumer of the Effect module").dependOn(&b.addRunArtifact(example).step);
 
-    const independent_consumer = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "run", b.fmt("-Doptimize={s}", .{@tagName(optimize)}) });
-    independent_consumer.setCwd(b.path("tests/capabilities/consumer"));
+    const independent_consumer = b.addSystemCommand(&.{"python3"});
+    independent_consumer.addFileArg2(b.path("tests/stage_consumer.py"), .{});
+    independent_consumer.addArg(b.graph.zig_exe);
+    independent_consumer.addArg(b.fmt("{s}", .{@tagName(optimize)}));
+    independent_consumer.addDirectoryArg2(b.path("."), .{});
     b.step("consumer", "Build and execute the independent public-module package")
         .dependOn(&independent_consumer.step);
 
-    const fmt = b.addFmt(.{ .paths = &.{ "src", "examples", "proofs", "tests", "build.zig" }, .check = true });
+    const fmt = b.addFmt(.{ .paths = b.pathList(&.{ "src", "examples", "proofs", "tests", "build.zig" }), .check = true });
     b.step("fmt", "Check Zig formatting").dependOn(&fmt.step);
 
     const negative = b.addSystemCommand(&.{"python3"});
-    negative.addFileArg(b.path("tests/check_compile_fail.py"));
+    negative.addFileArg2(b.path("tests/check_compile_fail.py"), .{});
     negative.addArg(b.graph.zig_exe);
     b.step("compile-fail", "Check invalid consumers fail for the intended reason").dependOn(&negative.step);
 
@@ -78,11 +81,11 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("proofs/codegen.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .imports = &.{.{ .name = "effect", .module = b.createModule(.{
                 .root_source_file = b.path("src/root.zig"),
                 .target = target,
-                .optimize = .ReleaseFast,
+                .optimize = .fast,
             }) }},
         }),
     });
@@ -90,8 +93,8 @@ pub fn build(b: *std.Build) void {
     const optimized_ir = codegen.getEmittedLlvmIr();
     const installed_ir = b.addInstallFile(optimized_ir, "proofs/effect-codegen.ll");
     const check_codegen = b.addSystemCommand(&.{"python3"});
-    check_codegen.addFileArg(b.path("tests/check_codegen.py"));
-    check_codegen.addFileArg(optimized_ir);
+    check_codegen.addFileArg2(b.path("tests/check_codegen.py"), .{});
+    check_codegen.addFileArg2(optimized_ir, .{});
     const codegen_step = b.step("codegen", "Verify static composition matches handwritten optimized Zig");
     codegen_step.dependOn(&assembly.step);
     codegen_step.dependOn(&installed_ir.step);
@@ -100,8 +103,8 @@ pub fn build(b: *std.Build) void {
 
 fn boundedTests(b: *std.Build, binary: *std.Build.Step.Compile) *std.Build.Step {
     const run = b.addSystemCommand(&.{"python3"});
-    run.addFileArg(b.path("tests/run_bounded.py"));
+    run.addFileArg2(b.path("tests/run_bounded.py"), .{});
     run.addArg("120"); // Test-only subprocess watchdog; not a runtime library policy.
-    run.addArtifactArg(binary);
+    run.addArtifactArg2(binary, .{});
     return &run.step;
 }

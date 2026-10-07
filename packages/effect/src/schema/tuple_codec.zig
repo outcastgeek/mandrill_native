@@ -14,7 +14,7 @@ pub fn Values(comptime elements: anytype) type {
     const Info = @typeInfo(@TypeOf(elements));
     if (Info != .array or Info.array.child != type)
         @compileError("tuple value elements must be a comptime array of types");
-    const Items = std.meta.Tuple(&elements);
+    const Items = @Tuple(&elements);
     const owns = comptime blk: {
         for (elements) |Element| if (outcomes.ownsPayload(Element)) break :blk true;
         break :blk false;

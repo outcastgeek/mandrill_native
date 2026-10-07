@@ -7,7 +7,7 @@ cancellation/resource hierarchy. There is no backend parameter or run-options
 provider table. A Pool/Cache retains its construction environment through owned
 closures so its resources and producers keep that environment alive.
 
-| Provider | Supplied owner / configuration | Contract and tested boundary |
+| Provider | Supplied owner / configuration | Contract |
 | --- | --- | --- |
 | `TokioTasks` | Arc<Runtime>, explicit AdmissionCapacity | Multi-thread runtime with more than one actual worker; independent tasks, prompt admission, no inline user work; stop/drain joins retained drivers |
 | `TokioBlocking` | Arc<Runtime>, capacity, Diagnostics | spawn_blocking owns jobs; cancellation does not abort a running callback; stop/drain waits settlement and worker diagnostics |
@@ -56,8 +56,8 @@ fragment sequencing. The provider honors the supplied receive-buffer request.
 Close uses the R clock and explicit timeout; timeout/cancellation aborts and
 joins the handshake. Release aborts, joins all admitted operations, and awaits
 dispose. A provider that cannot make abort settle work cannot meet this contract.
-The shipped neutral mock verifies lifecycle behavior; no concrete network SDK
-adapter is shipped or advertised.
+A concrete network SDK adapter must supply these lifecycle guarantees; the
+core supplies only the transport contract.
 
 ## Ownership and failure limits
 
@@ -83,45 +83,16 @@ successful associations use weak key and weak entry references and consumer
 ownership, not ephemerons. Active producers and unobserved cleanup are separate,
 strongly owned lifetimes.
 
-## Measured costs
+## Execution costs
 
-Reproduce the allocation/timing probe from the workspace root:
-
-```sh
-cargo build --release --manifest-path scratch/plans/effect-rust/verification/measurement/Cargo.toml
-scratch/plans/effect-rust/verification/measurement/target/release/effect-measurement 10000 100
-```
-
-These explicit arguments choose a benchmark workload of 10,000 runs with 100
-pure map transitions; they are not defaults or library policy. The standalone
-probe warms executor/thread-local initialization, instruments the System
-allocator, black-boxes results, and checks exact outputs. Its release profile
-matches the workspace's size optimization/LTO settings.
-
-| Measured case | Time per run | Allocations per run | Bytes allocated per run | Peak additional live bytes | Post-case retained delta |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Ordinary future/loop | 0.161 µs | 0 | 0 | 0 | 0 |
-| Reused Effect recipe | 49.871 µs | 1,109 | 79,008 | 9,344 | 0 |
-| Construct/run/drop Effect | 60.127 µs | 1,412 | 86,304 | 14,960 | 0 |
-
-This is a narrow microbenchmark on the development machine, with allocator
-instrumentation overhead. It establishes substantial boxed-interpreter overhead
-for tiny pure steps, not universal application throughput or a leak proof.
-Recipe sharing avoids reconstructing descriptions; it does not remove per-run
-continuations, FlatDrop work, cancellation state, locks, or Arc operations.
-The measurement binary was 369,344 bytes; its first local release build took
-7.73 seconds with shared dependency caches. This is not a cold-build estimate.
+Recipe sharing avoids reconstructing descriptions; each run still creates
+continuations and cancellation state and performs FlatDrop work, locking and
+Arc ownership operations. Concurrent execution retains shared source/factory
+state, result slots, worker join futures and per-item execution contexts. Fixed
+workers avoid per-input task submission. These mechanisms incur runtime costs
+whose impact depends on the application workload.
 
 Macro parsing/lowering, Rust ownership/capability checks, static metadata, typed
 constants, and empty annotation initialization execute at compilation. Dynamic
 programs, provider admission, cancellation, JSON input, resource state, and live
-schedule decisions execute at runtime. The compile fixtures use actual const
-initializers for growth/sample/capacity/defect values. No zero-overhead claim is
-made. Allocation/retention measurements and workload limits are recorded in the
-implementation verification directory.
-
-Mixed-provider tests coordinate occupied CPU workers and async progress with
-signals, rather than elapsed-time guesses. They also cover a finite 256-item
-load, ordered results with four admitted traversal workers, complete drains,
-and 100 sequential children through capacity one. Test timeouts only detect
-hangs. These checks establish those bounded workloads, not a production SLO.
+schedule decisions execute at runtime.

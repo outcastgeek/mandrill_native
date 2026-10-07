@@ -579,3 +579,35 @@ pub fn PubSub(comptime T: type) type {
         }
     };
 }
+
+/// Callback façade permits only nonblocking overflow policies. Publication
+/// acceptance says the open source accepted the item under that policy.
+pub fn CallbackPubSub(comptime T: type) type {
+    return struct {
+        pub const Policy = enum { drop_oldest, drop_newest, reject };
+        bus: PubSub(T),
+        pub fn init(env: anytype, capacity: usize, replay: usize, policy: Policy) outcomes.Exit(@This(), Error) {
+            const result = PubSub(T).init(env, capacity, replay, switch (policy) {
+                .drop_oldest => .drop_oldest,
+                .drop_newest => .drop_newest,
+                .reject => .reject,
+            });
+            return switch (result) {
+                .success => |bus| .{ .success = .{ .bus = bus } },
+                else => outcomes.castFailure(@This(), result),
+            };
+        }
+        pub fn publish(self: *@This(), value: T) bool {
+            var result = self.bus.publishImmediate(value);
+            defer result.deinit();
+            return result == .success;
+        }
+        pub fn shutdown(self: *@This()) void {
+            self.bus.shutdown();
+        }
+        pub fn deinit(self: *@This()) void {
+            self.bus.shutdown();
+            self.bus.deinit();
+        }
+    };
+}

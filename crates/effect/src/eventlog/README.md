@@ -8,12 +8,14 @@ For memory compaction, obtain the journal's `retention_authority()`, register re
 
 `EventObservation::reconcile` maps committed entries to reactive invalidation keys. It advances the returned cursor only after notification succeeds. On notification failure, `EventObservationError::Notification` carries `replay_after`, so a consumer can re-read from the prior cursor. A notification is never evidence of an append or a replacement for the journal.
 
-The [bridge test](../../tests/eventlog_bridge.rs) executes append → projection → invalidation and injects fold and notification failures. Run it in an optimized native binary with:
+For an append → projection → invalidation example, including fold and
+notification failure handling, see the [bridge example](../../tests/eventlog_bridge.rs).
+Run it with:
 
 ```sh
 cargo test -p effect --release --test eventlog_bridge
 ```
 
-The external [provider-neutral consumer](../../tests/fixtures/shared/provider_program.rs) builds `event!` and `projection!` definitions in `event_cpu` and the replica catch-up path, then executes them with journal capabilities supplied through `R`.
-
-The [configured EventLog campaign](../../tests/eventlog_campaign.rs) compares 1,000 seeded 100-step histories against independent journal and projection-count/checkpoint models in debug and native release. It covers append/cursor/read/compaction decisions, successful projection advancement and explicit truncated-history rejection. Replica, protection and recovery histories require separate acceptance evidence.
+See the [provider-neutral example](../../tests/fixtures/shared/provider_program.rs),
+`event_cpu` and the replica catch-up path, for `event!` and `projection!`
+definitions with journal capabilities supplied through `R`.

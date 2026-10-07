@@ -362,6 +362,8 @@ pub enum WorkflowWakeReason {
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A replayable view of a run’s identity, history, waits, and outcome.
 pub struct WorkflowSnapshot {
+    /// Execution ownership counter, incremented before every new running body.
+    pub execution: u64,
     /// Handle used to observe or settle this operation. Type: `WorkflowHandle`.
     pub handle: WorkflowHandle,
     /// Signature used to validate replay compatibility. Type: `Arc<[u8]>`.
@@ -386,6 +388,28 @@ pub struct WorkflowSnapshot {
     pub waiting_on: Option<WorkflowWait>,
     /// Recorded reason this workflow run became runnable. Type: `Option<WorkflowWakeReason>`.
     pub wake_reason: Option<WorkflowWakeReason>,
+}
+/// Expected status and execution identity for an atomic workflow transition.
+///
+/// Status alone is insufficient: a newer body may again be Running. Carry this
+/// exact checkpoint through a failed reset and retry it, rather than reading a
+/// new owner's checkpoint and resetting unrelated work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowCheckpoint {
+    /// Lifecycle state that must still match when the conditional transition commits.
+    pub status: WorkflowStatus,
+    /// Execution ownership counter observed with status; starting a new Running body advances it.
+    pub execution: u64,
+}
+impl WorkflowSnapshot {
+    /// Capture this snapshot's status and execution counter together for a later fenced transition.
+    #[must_use]
+    pub fn checkpoint(&self) -> WorkflowCheckpoint {
+        WorkflowCheckpoint {
+            status: self.status.clone(),
+            execution: self.execution,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -63,6 +63,8 @@ impl PubSubOptions {
 pub enum PubSubError {
     /// The provider is shutting down and cannot accept this work.
     Shutdown,
+    /// A synchronous callback attempt was rejected because the channel gate was held.
+    Contended,
     /// The replay failed validation.
     InvalidReplay,
     /// No further subscription id can be allocated without exceeding its range.
@@ -139,7 +141,7 @@ struct Inner<A> {
 ///
 /// # Type parameters
 /// - `A`: Application value type.
-type CommitHook<A> = Arc<dyn Fn(&A) + Send + Sync>;
+type CommitHook<A> = Arc<dyn Fn(&A) -> bool + Send + Sync>;
 
 /// A bounded, executor-independent broadcast hub. Payloads are shared through
 /// Arc; publishing never requires `A: Clone`. Backpressure checks all current
@@ -490,10 +492,35 @@ impl<A: Send + Sync + 'static> PubSub<A> {
                     .take()
                     .ok_or(PubSubError::PublishValueConsumed)
             },
-            Some(Arc::new(commit)),
+            Some(Arc::new(move |value| {
+                commit(value);
+                true
+            })),
         )
     }
 
+    /// Use a trusted metadata-only guard after deciding capacity and before publication.
+    ///
+    /// False rejects without appending or replacing current state. The guard runs under
+    /// the channel gate and must not invoke application callbacks, await or reenter the
+    /// channel; notification and discarded-value destruction happen after unlocking.
+    pub(crate) fn publish_with_guard<R: Send + Sync + 'static>(
+        &self,
+        value: A,
+        guard: impl Fn(&A) -> bool + Send + Sync + 'static,
+    ) -> Effect<PublishReport, PubSubError, R> {
+        let value = Mutex::new(Some(value));
+        self.publish_candidate(
+            move || {
+                value
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .ok_or(PubSubError::PublishValueConsumed)
+            },
+            Some(Arc::new(guard)),
+        )
+    }
     ///
     /// # Type parameters
     /// - `R`: Bounds: `Send + Sync + 'static`.
@@ -618,6 +645,80 @@ impl<A: Send + Sync + 'static> Inner<A> {
     /// # Returns
     /// Type: `Exit<PublishReport, PubSubError>`.
     /// Returns `Exit<PublishReport, PubSubError>`.
+    fn publish_locked(
+        &self,
+        state: &mut State<A>,
+        value: &Arc<A>,
+        commit: Option<&CommitHook<A>>,
+    ) -> PublishAttempt<A> {
+        let full = state
+            .subscribers
+            .values()
+            .filter(|subscriber| subscriber.buffered.len() == self.options.capacity.get())
+            .count();
+        if full > usize::default() && matches!(self.options.overflow, PubSubOverflow::Backpressure)
+        {
+            PublishAttempt::Wait
+        } else if state.subscribers.values().any(|subscriber| {
+            subscriber.buffered.len() == self.options.capacity.get()
+                && subscriber.dropped == usize::MAX
+        }) {
+            PublishAttempt::Failed(PubSubError::LagCountOverflow)
+        } else {
+            if commit.is_some_and(|commit| !commit(value)) {
+                return PublishAttempt::Complete(
+                    PublishReport {
+                        delivered: usize::default(),
+                        dropped: usize::default(),
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                );
+            }
+            let mut discarded = Vec::new();
+            let mut notifications = Vec::with_capacity(state.subscribers.len());
+            let mut delivered = usize::default();
+            for subscriber in state.subscribers.values_mut() {
+                let full = subscriber.buffered.len() == self.options.capacity.get();
+                if full {
+                    subscriber.dropped += NonZeroUsize::MIN.get();
+                    match self.options.overflow {
+                        PubSubOverflow::DropNewest => {
+                            notifications.push(Arc::clone(&subscriber.changed));
+                            continue;
+                        }
+                        PubSubOverflow::DropOldest => {
+                            discarded.extend(subscriber.buffered.pop_front());
+                        }
+                        PubSubOverflow::Backpressure => {
+                            return PublishAttempt::Wait;
+                        }
+                    }
+                }
+                subscriber.buffered.push_back(Arc::clone(value));
+                notifications.push(Arc::clone(&subscriber.changed));
+                delivered += NonZeroUsize::MIN.get();
+            }
+            if let ReplayPolicy::Last(limit) = self.options.replay {
+                if state.history.len() == limit.get() {
+                    discarded.extend(state.history.pop_front());
+                }
+                state.history.push_back(Arc::clone(value));
+            }
+            if self.retain_current {
+                discarded.extend(state.current.replace(Arc::clone(value)));
+            }
+            PublishAttempt::Complete(
+                PublishReport {
+                    delivered,
+                    dropped: full,
+                },
+                discarded,
+                notifications,
+            )
+        }
+    }
+
     async fn publish(
         &self,
         value: Arc<A>,
@@ -626,7 +727,7 @@ impl<A: Send + Sync + 'static> Inner<A> {
     ) -> Exit<PublishReport, PubSubError> {
         loop {
             let changed = self.space_changed.listen();
-            let attempt = 'attempt: {
+            let attempt = {
                 let mut state = self
                     .state
                     .lock()
@@ -637,66 +738,7 @@ impl<A: Send + Sync + 'static> Inner<A> {
                 if state.closed {
                     return Exit::Fail(PubSubError::Shutdown);
                 }
-                let full = state
-                    .subscribers
-                    .values()
-                    .filter(|subscriber| subscriber.buffered.len() == self.options.capacity.get())
-                    .count();
-                if full > usize::default()
-                    && matches!(self.options.overflow, PubSubOverflow::Backpressure)
-                {
-                    PublishAttempt::Wait
-                } else if state.subscribers.values().any(|subscriber| {
-                    subscriber.buffered.len() == self.options.capacity.get()
-                        && subscriber.dropped == usize::MAX
-                }) {
-                    PublishAttempt::Failed(PubSubError::LagCountOverflow)
-                } else {
-                    if let Some(commit) = &commit {
-                        commit(&value);
-                    }
-                    let mut discarded = Vec::new();
-                    let mut notifications = Vec::with_capacity(state.subscribers.len());
-                    let mut delivered = usize::default();
-                    for subscriber in state.subscribers.values_mut() {
-                        let full = subscriber.buffered.len() == self.options.capacity.get();
-                        if full {
-                            subscriber.dropped += NonZeroUsize::MIN.get();
-                            match self.options.overflow {
-                                PubSubOverflow::DropNewest => {
-                                    notifications.push(Arc::clone(&subscriber.changed));
-                                    continue;
-                                }
-                                PubSubOverflow::DropOldest => {
-                                    discarded.extend(subscriber.buffered.pop_front());
-                                }
-                                PubSubOverflow::Backpressure => {
-                                    break 'attempt PublishAttempt::Wait;
-                                }
-                            }
-                        }
-                        subscriber.buffered.push_back(Arc::clone(&value));
-                        notifications.push(Arc::clone(&subscriber.changed));
-                        delivered += NonZeroUsize::MIN.get();
-                    }
-                    if let ReplayPolicy::Last(limit) = self.options.replay {
-                        if state.history.len() == limit.get() {
-                            discarded.extend(state.history.pop_front());
-                        }
-                        state.history.push_back(Arc::clone(&value));
-                    }
-                    if self.retain_current {
-                        discarded.extend(state.current.replace(Arc::clone(&value)));
-                    }
-                    PublishAttempt::Complete(
-                        PublishReport {
-                            delivered,
-                            dropped: full,
-                        },
-                        discarded,
-                        notifications,
-                    )
-                }
+                self.publish_locked(&mut state, &value, commit.as_ref())
             };
             match attempt {
                 PublishAttempt::Wait => {
@@ -898,5 +940,146 @@ impl<A: Send + Sync + 'static> SubscriptionInner<A> {
             let cancelled = std::pin::pin!(cancellation.cancelled());
             let _ = select(changed, cancelled).await;
         }
+    }
+}
+
+/// Full-buffer policy for synchronous callback publication; backpressure is deliberately unavailable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallbackOverflow {
+    /// Discard the incoming publication when subscriber capacity is full.
+    DropNewest,
+    /// Evict the oldest buffered publication to admit the incoming one.
+    DropOldest,
+}
+/// How synchronous publication responds when another operation owns the channel gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallbackContention {
+    /// Discard the incoming value if the channel gate is already held.
+    DropNewest,
+    /// Return PubSubError::Contended when the gate cannot be acquired immediately.
+    Reject,
+}
+/// Explicit capacity, history, overflow and gate-contention settings for [`CallbackPubSub`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallbackPubSubOptions {
+    /// Maximum retained publication capacity; must also accommodate requested replay history.
+    pub capacity: NonZeroUsize,
+    /// Policy when publication buffers are full; neither choice waits for consumers.
+    pub overflow: CallbackOverflow,
+    /// Bounded publication history supplied to new subscriptions.
+    pub replay: ReplayPolicy,
+    /// Immediate drop or typed rejection when another operation owns the gate.
+    pub contention: CallbackContention,
+}
+/// Why a synchronous callback publication discarded its incoming value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallbackDrop {
+    /// The buffer policy dropped the incoming value; retains the publication counts.
+    Full(PublishReport),
+    /// The callback publication could not acquire the channel gate.
+    Contended,
+}
+/// Immediate callback publication result, distinct from typed channel errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallbackPublish {
+    /// Publication committed according to the buffer policy; inspect delivery/drop counts in the report.
+    Accepted(PublishReport),
+    /// The incoming value was discarded due to full buffers or gate contention.
+    Dropped(CallbackDrop),
+    /// The channel has shut down; no value was published.
+    Closed,
+}
+/// A synchronous publication facade over the scoped [`PubSub`] engine.
+///
+/// [`Self::try_publish`] uses try_lock and never waits for backpressure or the gate.
+/// It may allocate and notify observers; it is not a hard real-time or wait-free
+/// primitive. Clones share the channel, while subscriptions and streams retain
+/// normal scope-owned cancellation and cleanup.
+pub struct CallbackPubSub<A: Send + Sync + 'static> {
+    hub: PubSub<A>,
+    contention: CallbackContention,
+}
+impl<A: Send + Sync + 'static> Clone for CallbackPubSub<A> {
+    fn clone(&self) -> Self {
+        Self {
+            hub: self.hub.clone(),
+            contention: self.contention,
+        }
+    }
+}
+impl<A: Send + Sync + 'static> CallbackPubSub<A> {
+    /// Create a shared callback channel; replay larger than capacity returns InvalidReplay.
+    pub fn new(options: CallbackPubSubOptions) -> Result<Self, PubSubError> {
+        Ok(Self {
+            hub: PubSub::new(PubSubOptions {
+                capacity: options.capacity,
+                overflow: match options.overflow {
+                    CallbackOverflow::DropNewest => PubSubOverflow::DropNewest,
+                    CallbackOverflow::DropOldest => PubSubOverflow::DropOldest,
+                },
+                replay: options.replay,
+            })?,
+            contention: options.contention,
+        })
+    }
+    /// Consume one value and attempt publication immediately, without waiting for capacity.
+    ///
+    /// Gate contention follows the configured drop/reject policy. A closed channel
+    /// returns Closed; a full-buffer drop returns its report. Waking subscribers and
+    /// destroying discarded values occur outside the channel gate.
+    pub fn try_publish(&self, value: A) -> Result<CallbackPublish, PubSubError> {
+        let value = Arc::new(value);
+        let attempt = {
+            let mut state = match self.hub.inner.state.try_lock() {
+                Ok(state) => state,
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return match self.contention {
+                        CallbackContention::DropNewest => {
+                            Ok(CallbackPublish::Dropped(CallbackDrop::Contended))
+                        }
+                        CallbackContention::Reject => Err(PubSubError::Contended),
+                    };
+                }
+            };
+            if state.closed {
+                return Ok(CallbackPublish::Closed);
+            }
+            self.hub.inner.publish_locked(&mut state, &value, None)
+        };
+        match attempt {
+            PublishAttempt::Complete(report, discarded, notifications) => {
+                for changed in notifications {
+                    notify_all(&changed);
+                }
+                drop(discarded);
+                Ok(if report.delivered == 0 && report.dropped > 0 {
+                    CallbackPublish::Dropped(CallbackDrop::Full(report))
+                } else {
+                    CallbackPublish::Accepted(report)
+                })
+            }
+            PublishAttempt::Failed(error) => Err(error),
+            PublishAttempt::Wait => Err(PubSubError::Contended),
+        }
+    }
+    /// Lazily register a subscription whose unsubscription is owned by scope, using the same channel history.
+    pub fn subscribe_scoped<R: Send + Sync + 'static>(
+        &self,
+        scope: &Scope<PubSubError>,
+    ) -> Effect<ResourceValue<Subscription<A>>, PubSubError, R> {
+        self.hub.subscribe_scoped(scope)
+    }
+    /// Create a reusable scoped stream of shared publications; each opening registers its own subscription.
+    #[must_use]
+    pub fn stream<R: Send + Sync + 'static>(&self) -> Stream<Arc<A>, PubSubError, R> {
+        self.hub.stream()
+    }
+    /// Lazily close the channel with the supplied drain/discard policy and settle subscriber notifications.
+    pub fn shutdown<R: Send + Sync + 'static>(
+        &self,
+        mode: PubSubShutdown,
+    ) -> Effect<bool, PubSubError, R> {
+        self.hub.shutdown(mode)
     }
 }

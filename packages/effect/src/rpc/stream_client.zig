@@ -389,7 +389,7 @@ pub fn StreamClient(
         /// Returns (`Next`): The next typed description produced by the continuation.
         pub fn next(comptime select_handle: fn (*const R) *Handle) Next {
             const Acquire = effects.Effect(Handle, Failure, R);
-            const acquisition = Acquire.fromOutcome(struct {
+            const acquisition = comptime Acquire.fromOutcome(struct {
                 fn enter(env: *const R) outcomes.Exit(Handle, Failure) {
                     const handle = select_handle(env);
                     handle.shared.mutex.lockUncancelable(env.io);
@@ -432,7 +432,7 @@ pub fn StreamClient(
         /// Returns (`Open`): The typed operation result or description selected by this API.
         pub fn open(comptime select_request: fn (*const R) *const Request) Open {
             const Acquire = effects.Effect(Registered, Failure, R);
-            const acquisition = Acquire.fromOutcome(struct {
+            const acquisition = comptime Acquire.fromOutcome(struct {
                 fn register(env: *const R) outcomes.Exit(Registered, Failure) {
                     const policy = select_policy(env);
                     if (!policy.valid()) return .{ .fail = .{ .session = .invalid_configuration } };

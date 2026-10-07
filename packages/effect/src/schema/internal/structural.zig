@@ -5,6 +5,8 @@ const std = @import("std");
 /// Decoder traversal state and resource counters for structural schemas.
 pub const DecodeState = struct {
     depth: usize = 0,
+    maximum_depth: ?usize = null,
+    maximum_issues: ?usize = null,
 
     /// Enter a structural node while tracking recursion and depth.
     /// Parameters:
@@ -12,7 +14,7 @@ pub const DecodeState = struct {
     /// - `max_depth: usize`: Maximum nesting depth accepted by the parser.
     /// Returns (`bool`): `true` after incrementing depth below `max_depth`; `false` without entering at the bound.
     pub fn enter(self: *DecodeState, max_depth: usize) bool {
-        if (self.depth >= max_depth) return false;
+        if (self.depth >= @min(max_depth, self.maximum_depth orelse max_depth)) return false;
         self.depth += 1;
         return true;
     }
@@ -30,6 +32,7 @@ pub const DecodeState = struct {
 pub const EncodeState = struct {
     scratch: std.mem.Allocator,
     depth: usize = 0,
+    maximum_depth: ?usize = null,
 
     /// Enter a structural node while tracking recursion and depth.
     /// Parameters:
@@ -37,7 +40,7 @@ pub const EncodeState = struct {
     /// - `max_depth: usize`: Maximum nesting depth accepted by the parser.
     /// Returns (`bool`): `true` after incrementing depth below `max_depth`; `false` without entering at the bound.
     pub fn enter(self: *EncodeState, max_depth: usize) bool {
-        if (self.depth >= max_depth) return false;
+        if (self.depth >= @min(max_depth, self.maximum_depth orelse max_depth)) return false;
         self.depth += 1;
         return true;
     }

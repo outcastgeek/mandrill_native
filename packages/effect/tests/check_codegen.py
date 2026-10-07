@@ -36,16 +36,19 @@ def instructions(name):
     result = []
     for line in body.group(1).splitlines():
         line = line.strip()
-        if not line or line.startswith('#dbg_') or re.match(r'^[-A-Za-z0-9_.$]+:', line):
+        if not line or line.startswith('#dbg_') or re.match(rf'^{symbol}:', line):
             continue
         line = re.sub(r', ![-A-Za-z0-9_.]+ ![0-9]+', '', line)
-        line = re.sub(r'%[-A-Za-z0-9_.$]+', lambda match: registers.setdefault(match.group(), f'%{len(registers)}'), line)
+        line = re.sub(rf'%{symbol}', lambda match: registers.setdefault(match.group(), f'%{len(registers)}'), line)
         result.append(line)
     return result
 
 
 failures = []
 for baseline, consumers in (
+    ("handwritten_write_boolean", ("pure_write_boolean",)),
+    ("handwritten_tagged_integer", ("specialized_tagged_integer",)),
+    ("handwritten_validate_u8", ("pure_validate_u8",)),
     ("handwritten", ("effect_map", "effect_bind", "effect_environment_bind")),
     ("handwritten_two_binds", ("effect_two_binds",)),
     ("handwritten_eight_binds", ("effect_eight_binds",)),

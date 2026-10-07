@@ -870,12 +870,12 @@ test "native HTTP performs a loopback request through the supplied client and I/
     var peer: Peer = .{ .listener = &listener, .io = env.io };
     var serving = try env.io.concurrent(Peer.run, .{&peer});
     defer serving.cancel(env.io);
-    const uri = try std.fmt.allocPrint(env.allocator, "http://127.0.0.1:{d}/", .{listener.socket.address.ip4.port});
+    const uri = try env.allocator.print("http://127.0.0.1:{d}/", .{listener.socket.address.ip4.port});
     defer env.allocator.free(uri);
     env.json = uri;
     var client: std.http.Client = .{ .allocator = env.allocator, .io = env.io };
     defer client.deinit();
-    var native: fx.Http.Native = .{ .client = &client, .options = .{}, .redirect_buffer_bytes = 2048, .transfer_buffer_bytes = 2048, .maximum_body_bytes = 64 };
+    var native: fx.Http.Native = .{ .client = &client, .options = .{}, .redirect_buffer_bytes = 2048, .transfer_buffer_bytes = 2048, .maximum_body_bytes = "native-body".len };
     env.http_transport = native.transport();
     const F = struct {
         fn request(environment: *const Env) fx.Http.Request {
@@ -1160,12 +1160,17 @@ test "async iterable streams own and release their native iterator" {
             }.destroy);
         }
     };
-    const stream = comptime fx.Stream(u32, E, Env).fromAsyncIterable(Iterator, F.create, F.next, F.release);
+    const stream = comptime fx.Stream(u32, E, Env).fromAsyncIterableEffect(Iterator, fx.Effect(*Iterator, E, Env).fromOutcome(F.create), F.next, F.release);
     var running = fx.runAsync(&env, stream.runCollect(3));
     defer running.deinit();
     var collected = running.join();
     defer collected.deinit();
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, collected.success.items);
+    try std.testing.expectEqual(@as(usize, 1), harness.released.load(.acquire));
+    const rejected = comptime fx.Stream(u32, E, Env).fromAsyncIterableEffect(Iterator, fx.Effect(*Iterator, E, Env).fail(.expected), F.next, F.release);
+    var failed = fx.run(&env, rejected.runCollect(3));
+    defer failed.deinit();
+    try std.testing.expect(failed == .fail and failed.fail == .expected);
     try std.testing.expectEqual(@as(usize, 1), harness.released.load(.acquire));
 }
 

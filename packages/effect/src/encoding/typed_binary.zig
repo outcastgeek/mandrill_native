@@ -34,21 +34,21 @@ fn supported(comptime T: type) bool {
             info.bits == 64 or info.bits == 128,
         .float => |info| info.bits == 16 or info.bits == 32 or info.bits == 64 or info.bits == 128,
         .@"enum" => |info| blk: {
-            inline for (info.fields) |field| {
-                if (field.value < 0 or field.value > std.math.maxInt(u32)) break :blk false;
+            inline for (info.field_values) |tag_value| {
+                if (tag_value < 0 or tag_value > std.math.maxInt(u32)) break :blk false;
             }
             break :blk true;
         },
         .optional => |info| supported(info.child),
         .array => |info| supported(info.child),
-        .pointer => |info| info.size == .slice and info.is_const and supported(info.child),
+        .pointer => |info| info.size == .slice and info.attrs.@"const" and supported(info.child),
         .@"struct" => |info| blk: {
-            inline for (info.fields) |field| if (field.is_comptime or !supported(field.type)) break :blk false;
+            inline for (info.field_types, info.field_attrs) |Field, attrs| if (attrs.@"comptime" or !supported(Field)) break :blk false;
             break :blk true;
         },
         .@"union" => |info| blk: {
             if (info.tag_type == null) break :blk false;
-            inline for (info.fields) |field| if (!supported(field.type)) break :blk false;
+            inline for (info.field_types) |Field| if (!supported(Field)) break :blk false;
             break :blk true;
         },
         else => false,
@@ -78,16 +78,26 @@ fn encodeValue(comptime T: type, value: T, out: *std.array_list.Managed(u8), lim
         .void => {},
         .bool => try appendByte(out, if (value) 1 else 0, limits.frame.max_payload_bytes),
         .int => |info| {
-            const U = std.meta.Int(.unsigned, info.bits);
+            const U = @Int(.unsigned, info.bits);
             const bits: U = if (info.signedness == .signed) @bitCast(value) else value;
             try appendUnsigned(out, bits, limits.frame.max_payload_bytes);
         },
         .float => |info| {
             if (!std.math.isFinite(value)) return error.InvalidValue;
-            const U = std.meta.Int(.unsigned, info.bits);
+            const U = @Int(.unsigned, info.bits);
             try appendUnsigned(out, @as(U, @bitCast(value)), limits.frame.max_payload_bytes);
         },
-        .@"enum" => try appendUnsigned(out, @as(u32, @intCast(@intFromEnum(value))), limits.frame.max_payload_bytes),
+        .@"enum" => |info| {
+            const tag = @backingInt(value);
+            if (info.mode == .nonexhaustive) {
+                var valid = false;
+                inline for (info.field_values) |known| if (tag == known) {
+                    valid = true;
+                };
+                if (!valid) return error.InvalidValue;
+            }
+            try appendUnsigned(out, @as(u32, @intCast(tag)), limits.frame.max_payload_bytes);
+        },
         .optional => |info| {
             if (value) |present| {
                 try appendByte(out, 1, limits.frame.max_payload_bytes);
@@ -103,8 +113,8 @@ fn encodeValue(comptime T: type, value: T, out: *std.array_list.Managed(u8), lim
             try appendUnsigned(out, @as(Count, @intCast(value.len)), limits.frame.max_payload_bytes);
             for (value) |item| try encodeValue(info.child, item, out, limits, depth + 1);
         },
-        .@"struct" => |info| inline for (info.fields) |field|
-            try encodeValue(field.type, @field(value, field.name), out, limits, depth + 1),
+        .@"struct" => |info| inline for (info.field_names, info.field_types) |field_name, Field|
+            try encodeValue(Field, @field(value, field_name), out, limits, depth + 1),
         .@"union" => |info| {
             try encodeValue(info.tag_type.?, std.meta.activeTag(value), out, limits, depth + 1);
             switch (value) {
@@ -147,19 +157,19 @@ fn decodeValue(comptime T: type, allocator: std.mem.Allocator, cursor: *Cursor, 
             break :blk byte == 1;
         },
         .int => |info| blk: {
-            const U = std.meta.Int(.unsigned, info.bits);
+            const U = @Int(.unsigned, info.bits);
             const bits = try readUnsigned(U, cursor);
             break :blk if (info.signedness == .signed) @as(T, @bitCast(bits)) else @as(T, bits);
         },
         .float => |info| blk: {
-            const value: T = @bitCast(try readUnsigned(std.meta.Int(.unsigned, info.bits), cursor));
+            const value: T = @bitCast(try readUnsigned(@Int(.unsigned, info.bits), cursor));
             if (!std.math.isFinite(value)) return error.Invalid;
             break :blk value;
         },
         .@"enum" => |info| blk: {
             const tag = try readUnsigned(u32, cursor);
-            inline for (info.fields) |field| {
-                if (tag == field.value) break :blk @enumFromInt(tag);
+            inline for (info.field_values) |tag_value| {
+                if (tag == tag_value) break :blk @fromBackingInt(@as(info.tag_type, @intCast(tag)));
             }
             return error.Invalid;
         },
@@ -184,16 +194,16 @@ fn decodeValue(comptime T: type, allocator: std.mem.Allocator, cursor: *Cursor, 
         },
         .@"struct" => |info| blk: {
             var result: T = undefined;
-            inline for (info.fields) |field| @field(result, field.name) =
-                try decodeValue(field.type, allocator, cursor, limits, depth + 1);
+            inline for (info.field_names, info.field_types) |field_name, Field| @field(result, field_name) =
+                try decodeValue(Field, allocator, cursor, limits, depth + 1);
             break :blk result;
         },
         .@"union" => |info| blk: {
             const tag = try decodeValue(info.tag_type.?, allocator, cursor, limits, depth + 1);
-            inline for (info.fields) |field| {
-                if (tag == @field(info.tag_type.?, field.name)) {
-                    const payload = try decodeValue(field.type, allocator, cursor, limits, depth + 1);
-                    break :blk @unionInit(T, field.name, payload);
+            inline for (info.field_names, info.field_types) |field_name, Field| {
+                if (tag == @field(info.tag_type.?, field_name)) {
+                    const payload = try decodeValue(Field, allocator, cursor, limits, depth + 1);
+                    break :blk @unionInit(T, field_name, payload);
                 }
             }
             return error.Invalid;
@@ -261,8 +271,8 @@ fn cloneValue(comptime T: type, value: T, allocator: std.mem.Allocator) error{Ou
         },
         .@"struct" => |info| blk: {
             var result: T = undefined;
-            inline for (info.fields) |field| @field(result, field.name) =
-                try cloneValue(field.type, @field(value, field.name), allocator);
+            inline for (info.field_names, info.field_types) |field_name, Field| @field(result, field_name) =
+                try cloneValue(Field, @field(value, field_name), allocator);
             break :blk result;
         },
         .@"union" => switch (value) {

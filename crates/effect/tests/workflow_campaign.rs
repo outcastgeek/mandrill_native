@@ -94,7 +94,10 @@ fn configured_workflow_histories_match_replay_and_transition_model() {
                     };
                     let snapshot = run(engine.transition(
                         handle.run.clone(),
-                        expected_status.clone(),
+                        run(engine.inspect(handle.run.clone()))
+                            .expect("inspect")
+                            .expect("run")
+                            .checkpoint(),
                         next_status.clone(),
                     ))
                     .expect("valid transition");

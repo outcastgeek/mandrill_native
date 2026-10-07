@@ -203,22 +203,11 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> WeakCache<K
     ) -> Effect<WeakCacheValue<K, A, E>, SharedValue<E>, R> {
         self.get_partition(CachePartition::Default, key, load)
     }
-    /// Locate or create the weak association for the selected cache partition.
+    /// Lazily acquire a weakly indexed value in this partition using the existing cache engine.
     ///
-    /// # Type parameters
-    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
-    /// - `A`: Success or application-value type.
-    /// - `E`: Domain-error type.
-    /// - `K`: Type supplied by the enclosing impl or trait.
-    ///
-    /// # Parameters
-    /// - `partition` (`CachePartition`): The partition supplied to this operation.
-    /// - `key` (`&Arc<K>`): Stable key used to locate or identify the selected value.
-    /// - `load` (`impl Fn() -> Effect<A, E, R> + Send + Sync + 'static`): The load supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Effect<WeakCacheValue<K, A, E>, SharedValue<E>, R>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// Live ownership reuses producer outcomes without copying payloads. Selection
+    /// preserves typed capacity rejection, defects and interruption; weak indexing does
+    /// not introduce a second retention or task-provider mechanism.
     pub fn get_partition<R: Send + Sync + 'static>(
         &self,
         partition: CachePartition,
@@ -274,7 +263,7 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> WeakCache<K
                                     entry
                                 }
                                 Ok(None) => return Exit::Interrupted,
-                                Err(defect) => return Exit::Die(defect),
+                                Err(error) => return error.exit(),
                             }
                         }
                     };

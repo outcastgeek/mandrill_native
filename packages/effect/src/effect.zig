@@ -12,11 +12,11 @@ const primitives = @import("primitives.zig");
 
 const EffectTypeMember = enum { Success, Error, Environment };
 
-fn functionInfo(comptime callback: anytype, comptime operation: diagnostics.Operation) std.builtin.Type.Fn {
+fn functionInfo(comptime callback: anytype, comptime operation: diagnostics.Operation) std.lang.Type.Fn {
     if (@typeInfo(@TypeOf(callback)) != .@"fn")
         @compileError(operation.label() ++ diagnostics.expected_known_function);
     const info = @typeInfo(@TypeOf(callback)).@"fn";
-    if (info.is_generic or info.return_type == null)
+    if (info.is_generic or info.return_type == null or info.attrs.varargs)
         @compileError(operation.label() ++ diagnostics.expected_typed_callback);
     return info;
 }
@@ -24,10 +24,10 @@ fn functionInfo(comptime callback: anytype, comptime operation: diagnostics.Oper
 fn unaryResult(comptime callback: anytype, comptime Input: type, comptime operation: diagnostics.Operation) type {
     const info = functionInfo(callback, operation);
     const expected = @typeInfo(fn (Input) void).@"fn";
-    if (info.params.len != expected.params.len)
+    if (info.param_types.len != expected.param_types.len)
         @compileError(operation.label() ++ diagnostics.expected_callback_input ++ @typeName(Input) ++ diagnostics.explicit_callback_conversion);
-    inline for (info.params, expected.params) |actual, required| {
-        if (actual.type != required.type)
+    inline for (info.param_types, expected.param_types) |actual, required| {
+        if (actual != required)
             @compileError(operation.label() ++ diagnostics.expected_callback_input ++ @typeName(Input) ++ diagnostics.explicit_callback_conversion);
     }
     return info.return_type.?;
@@ -36,9 +36,9 @@ fn unaryResult(comptime callback: anytype, comptime Input: type, comptime operat
 fn continuationResult(comptime callback: anytype, comptime Input: type, comptime R: type, comptime operation: diagnostics.Operation) type {
     const info = functionInfo(callback, operation);
     const expected = @typeInfo(fn (Input, *const R) void).@"fn";
-    if (info.params.len != expected.params.len) return unaryResult(callback, Input, operation);
-    inline for (info.params, expected.params) |actual, required| {
-        if (actual.type != required.type)
+    if (info.param_types.len != expected.param_types.len) return unaryResult(callback, Input, operation);
+    inline for (info.param_types, expected.param_types) |actual, required| {
+        if (actual != required)
             @compileError(operation.label() ++ diagnostics.expected_callback_input ++ @typeName(Input) ++ diagnostics.continuation_environment ++ @typeName(R));
     }
     return info.return_type.?;
@@ -46,7 +46,7 @@ fn continuationResult(comptime callback: anytype, comptime Input: type, comptime
 
 inline fn callContinuation(comptime callback: anytype, value: anytype, env: anytype) @typeInfo(@TypeOf(callback)).@"fn".return_type.? {
     const expected = @typeInfo(fn (@TypeOf(value), @TypeOf(env)) void).@"fn";
-    if (comptime @typeInfo(@TypeOf(callback)).@"fn".params.len == expected.params.len)
+    if (comptime @typeInfo(@TypeOf(callback)).@"fn".param_types.len == expected.param_types.len)
         return @call(.always_inline, callback, .{ value, env });
     return @call(.always_inline, callback, .{value});
 }
@@ -107,6 +107,12 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         delivery: rt.Delivery = .ordinary,
         ownership: ?*rt.DescriptionNode = null,
 
+        const AdapterJob = Job;
+        /// Internal typed trampoline bridge for codecs that execute on this Effect kernel.
+        pub const RuntimeAdapter = struct {
+            /// Borrowed running job; factories transfer owned descriptions to the job.
+            pub const Job = AdapterJob;
+        };
         const Job = struct {
             program: Self,
             inherited: rt.Services,
@@ -123,6 +129,14 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                 self.program = produced;
             }
 
+            /// Releases the job's owned description and transfers this Exit to its sink.
+            pub fn adapterFinish(self: *Job, evaluated: outcomes.Exit(A, E)) rt.Step {
+                return self.finish(evaluated);
+            }
+            /// Schedules the next step on the same kernel without completing the job.
+            pub fn adapterStep(self: *Job) rt.Step {
+                return self.step();
+            }
             fn finish(self: *Job, evaluated: outcomes.Exit(A, E)) rt.Step {
                 rt.DescriptionNode.deinit(self.owned);
                 self.owned = null;
@@ -259,7 +273,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         /// - `callback: comptime fn (*const Capture, *const R) outcomes.Exit(A, E)`: operation invoked with the capture and environment when reached.
         /// Returns (`Self`): lazy effect borrowing `capture`; it owns no capture storage.
         pub fn fromBorrowed(comptime Capture: type, capture: *const Capture, comptime callback: fn (*const Capture, *const R) outcomes.Exit(A, E)) Self {
-            return .{ .value = .{ .borrowed = capture }, .ready = struct {
+            return .{ .value = .{ .borrowed = @ptrCast(capture) }, .ready = struct {
                 fn ready(env: *const R, stored: Value, _: *rt.State) outcomes.Exit(A, E) {
                     const borrowed: *const Capture = @ptrCast(@alignCast(stored.borrowed));
                     return callback(borrowed, env);
@@ -277,7 +291,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         /// Returns (`Self`): lazy effect borrowing `capture` and propagating
         /// cancellation through its callback's optional token.
         pub fn fromCancellableBorrowed(comptime Capture: type, capture: *const Capture, comptime callback: fn (*const Capture, *const R, ?*const rt.Cancellation) outcomes.Exit(A, E)) Self {
-            return .{ .value = .{ .borrowed = capture }, .ready = struct {
+            return .{ .value = .{ .borrowed = @ptrCast(capture) }, .ready = struct {
                 fn ready(env: *const R, stored: Value, state: *rt.State) outcomes.Exit(A, E) {
                     const borrowed: *const Capture = @ptrCast(@alignCast(stored.borrowed));
                     return callback(borrowed, env, if (state.protection != 0) null else state.branch_cancellation orelse state.origin_cancellation orelse state.services.cancellation);
@@ -720,7 +734,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         ///   that builds the inner effect from borrowed state at execution.
         /// Returns (`Self`): lazy, reusable description borrowing `capture`.
         pub fn deferBorrowed(comptime Capture: type, capture: *const Capture, comptime factory: fn (*const Capture, *const R) Self) Self {
-            return .{ .value = .{ .borrowed = capture }, .start = struct {
+            return .{ .value = .{ .borrowed = @ptrCast(capture) }, .start = struct {
                 fn start(_: *rt.State, parent: *Job) rt.Step {
                     const borrowed: *const Capture = @ptrCast(@alignCast(@constCast(parent.program.value.borrowed)));
                     parent.replace(factory(borrowed, parent.env));
@@ -1861,7 +1875,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                     return callback(borrowed, env, state.branch_cancellation.?);
                 }
             }.ready };
-            return program.dispatchValue(.{ .borrowed = capture }, kind);
+            return program.dispatchValue(.{ .borrowed = @ptrCast(capture) }, kind);
         }
 
         fn executor(env: *const R, comptime kind: execution.Kind) execution.Executor {
@@ -1967,8 +1981,8 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         pub fn race(comptime self: Self, comptime right: Self) Self {
             const Adapter = struct {
                 const Side = enum { left, right };
-                const Competitors = std.meta.Tuple(&.{ Self, Self });
-                const count = @typeInfo(Competitors).@"struct".fields.len;
+                const Competitors = @Tuple(&.{ Self, Self });
+                const count = @typeInfo(Competitors).@"struct".field_names.len;
                 const Worker = struct {
                     frame: *Frame,
                     side: Side,
@@ -2044,8 +2058,8 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                             worker.origin.unregister();
                         }
                         const chosen = frame.winner.?;
-                        state.protected_failure = frame.workers[@intFromEnum(chosen)].protected_failure;
-                        var result_value = frame.workers[@intFromEnum(chosen)].evaluated;
+                        state.protected_failure = frame.workers[@backingInt(chosen)].protected_failure;
+                        var result_value = frame.workers[@backingInt(chosen)].evaluated;
                         for (&frame.workers) |*worker| {
                             if (worker.side != chosen) {
                                 if (worker.evaluated == .success) outcomes.discardPayload(&worker.evaluated.success);
@@ -3205,8 +3219,8 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                         // failure and its first cleanup record. All remaining
                         // records already own linked storage. Reserve exactly the
                         // tuple's field count, not a tuning constant.
-                        const ReleasePrefix = std.meta.Tuple(&.{ outcomes.PrimaryOutcome(E), outcomes.CleanupFailure(E) });
-                        const release_prefix_capacity = @typeInfo(ReleasePrefix).@"struct".fields.len;
+                        const ReleasePrefix = @Tuple(&.{ outcomes.PrimaryOutcome(E), outcomes.CleanupFailure(E) });
+                        const release_prefix_capacity = @typeInfo(ReleasePrefix).@"struct".field_names.len;
                         parent: *Out.Job,
                         allocator: std.mem.Allocator,
                         source: Self,
@@ -4273,8 +4287,8 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
                             const result_value = next(@constCast(borrowed), env);
                             if (result_value != .success) return outcomes.castFailure(Chunk(A), result_value);
                             if (result_value.success) |value| {
-                                const Single = std.meta.Tuple(&.{A});
-                                const values = env.allocator.alloc(A, @typeInfo(Single).@"struct".fields.len) catch {
+                                const Single = @Tuple(&.{A});
+                                const values = env.allocator.alloc(A, @typeInfo(Single).@"struct".field_names.len) catch {
                                     var discarded = value;
                                     outcomes.discardPayload(&discarded);
                                     return .{ .die = outcomes.Defect.out_of_memory };
@@ -4299,9 +4313,11 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
         /// - `release: comptime fn (*Iterator) Unit`: Compile-time typed callback; its signature is checked at comptime where
         ///   static.
         /// Returns (`Self`): a stream that joins asynchronous iterator operations before releasing the iterator.
-        pub fn fromAsyncIterable(comptime Iterator: type, comptime factory: fn (*const R) outcomes.Exit(*Iterator, E), comptime next: fn (*const Iterator, *const R) asynchronous.Async(?A, E).Start, comptime release: fn (*Iterator) Unit) Self {
+        /// Acquire the native iterator through a typed lazy Effect, then use
+        /// the existing scoped pull/finalization path.
+        pub fn fromAsyncIterableEffect(comptime Iterator: type, comptime acquisition: Effect(*Iterator, E, R), comptime next: fn (*const Iterator, *const R) asynchronous.Async(?A, E).Start, comptime release: fn (*Iterator) Unit) Self {
             const Next = Effect(?A, E, R);
-            return fromPull(comptime Effect(*Iterator, E, R).fromOutcome(factory), struct {
+            return fromPull(acquisition, struct {
                 const Frame = struct {
                     parent: *Pull.Job,
                     allocator: std.mem.Allocator,
@@ -4312,8 +4328,8 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
                         const value = state.publish(frame.result_value);
                         var result_value: outcomes.Exit(Chunk(A), E) = undefined;
                         if (value != .success) result_value = outcomes.castFailure(Chunk(A), value) else if (value.success) |item| {
-                            const Single = std.meta.Tuple(&.{A});
-                            const values = frame.allocator.alloc(A, @typeInfo(Single).@"struct".fields.len) catch {
+                            const Single = @Tuple(&.{A});
+                            const values = frame.allocator.alloc(A, @typeInfo(Single).@"struct".field_names.len) catch {
                                 var discarded = item;
                                 outcomes.discardPayload(&discarded);
                                 const parent = frame.parent;
@@ -4341,6 +4357,15 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
                     return .{ .value = .{ .borrowed = iterator }, .start = start };
                 }
             }.pull, release);
+        }
+
+        /// Lazily acquire a native iterator from R, then scope-own its release.
+        /// next borrows the iterator through each asynchronous move; cancellation
+        /// joins a pending move and protected disposal before publishing Exit.
+        /// Failed acquisition does not invoke release. Use fromAsyncIterableEffect
+        /// when acquisition itself needs a typed Effect rather than a direct factory.
+        pub fn fromAsyncIterable(comptime Iterator: type, comptime factory: fn (*const R) outcomes.Exit(*Iterator, E), comptime next: fn (*const Iterator, *const R) asynchronous.Async(?A, E).Start, comptime release: fn (*Iterator) Unit) Self {
+            return fromAsyncIterableEffect(Iterator, comptime Effect(*Iterator, E, R).fromOutcome(factory), next, release);
         }
 
         /// Transform stream elements with a typed Effect.
@@ -4576,12 +4601,12 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
         ///   instantiated.
         /// Returns (`Unit`): A lazy unit-valued Effect; execution yields a typed Exit with no success payload.
         pub fn runForEach(comptime self: Self, comptime consume: anytype) Unit {
-            const Parameters = @typeInfo(@TypeOf(consume)).@"fn".params;
+            const Parameters = @typeInfo(@TypeOf(consume)).@"fn".param_types;
             comptime {
                 if (Parameters.len != 1 and Parameters.len != 2)
                     @compileError("stream consumer accepts an item and optionally R");
-                if (Parameters[0].type.? != A or
-                    (Parameters.len == 2 and Parameters[1].type.? != *const R))
+                if (Parameters[0].? != A or
+                    (Parameters.len == 2 and Parameters[1].? != *const R))
                     @compileError("stream consumer must accept the stream item and caller R");
             }
             const Adapter = struct {
@@ -5286,6 +5311,157 @@ pub fn EffectCache(comptime Key: type, comptime A: type, comptime E: type, compt
     };
 }
 
+/// Scoped dependency cache using the same caller runtime and generation engine.
+pub fn DependencyCache(comptime Key: type, comptime Dependency: type, comptime A: type, comptime E: type, comptime R: type) type {
+    return struct {
+        const deps = @import("dependency_cache.zig");
+        /// Owning A and individually retained dependency metadata returned by the loader.
+        pub const Loaded = deps.Loaded(Dependency, A);
+        /// Finite retention, in-flight and metadata bounds selected from the current R.
+        pub const Config = deps.Config(Key, Dependency, E);
+        /// Scoped shared-generation cache storing Loaded values; use the adapter for value observations.
+        pub const Core = @import("cache.zig").Cache(Key, Loaded, E);
+        const Out = Effect(*Core, E, R);
+        const Unit = Effect(void, E, R);
+        const Plain = EffectCache(Key, Loaded, E, R);
+        /// Lazily install a dependency cache in the caller scope. R provides allocator, I/O and a selected independent async engine.
+        /// The loader runs on that runtime; its owning dependency result is validated/reowned before retention.
+        /// Scope shutdown cancels/joins loads and releases values/keys/dependencies.
+        pub fn makeDependent(scope: *scopes.Scope(E), comptime select: fn (*const R) Config, comptime load: fn (Key) Effect(Loaded, E, R)) Out {
+            const Adapter = struct {
+                fn ready(env: *const R, _: Out.Value, state: *rt.State) outcomes.Exit(*Core, E) {
+                    const config = select(env);
+                    if (!config.valid()) return .{ .fail = config.capacity_error() };
+                    const Context = ManagedEnvironment(R);
+                    const context = Context.create(env, state) orelse return .{ .die = outcomes.Defect.out_of_memory };
+                    const result = Core.create(env, config.core(), .{
+                        .userdata = context,
+                        .run = struct {
+                            fn run(data: *anyopaque, key: Key, token: *const rt.Cancellation) outcomes.Exit(Loaded, E) {
+                                const captured: *Context = @ptrCast(@alignCast(data));
+                                const selected = select(&captured.env);
+                                var result = captured.execute(load(key), token, false, true);
+                                if (result == .success and result.success.dependencies.len > selected.maximum_dependencies_per_entry) {
+                                    result.deinit();
+                                    return .{ .fail = selected.capacity_error() };
+                                }
+                                if (result == .success) {
+                                    const owned = result.success.reown(&captured.env, selected.dependency_policy) catch {
+                                        result.deinit();
+                                        return .{ .die = outcomes.Defect.out_of_memory };
+                                    };
+                                    return .{ .success = owned };
+                                }
+                                return result;
+                            }
+                        }.run,
+                        .deinit = struct {
+                            fn destroy(data: *anyopaque) void {
+                                const captured: *Context = @ptrCast(@alignCast(data));
+                                captured.destroy();
+                            }
+                        }.destroy,
+                    });
+                    if (result != .success) context.destroy();
+                    return result;
+                }
+                fn release(value: *Core) Unit {
+                    return Unit.cleanupBorrowed(Core, value, struct {
+                        fn close(input: *const Core, _: *const R) outcomes.Exit(void, E) {
+                            const owned = @constCast(input);
+                            const result = owned.shutdown();
+                            owned.deinit();
+                            return result;
+                        }
+                    }.close);
+                }
+            };
+            const acquire: Out = .{ .ready = Adapter.ready };
+            return acquire.scopeAcquire(scope, Adapter.release);
+        }
+        /// Lazily observe A, releasing copied dependency metadata while transferring any marked owning value.
+        pub fn get(value: *Core, key: Key) Effect(A, E, R) {
+            const Capture = struct { cache: *Core, key: Key };
+            return Effect(A, E, R).captureOwned(value.allocator, Capture{ .cache = value, .key = key }, true, struct {
+                fn run(input: *const Capture, _: *const R, token: ?*const rt.Cancellation) outcomes.Exit(A, E) {
+                    var result = input.cache.getToken(input.key, token);
+                    return switch (result) {
+                        .success => .{ .success = result.success.takeValue() },
+                        else => outcomes.castFailure(A, result),
+                    };
+                }
+            }.run);
+        }
+        /// Lazily return A plus provenance chosen before waiting; an observer’s cancellation does not destroy other observers.
+        pub fn getObserved(value: *Core, key: Key) Effect(deps.CacheLookup(A), E, R) {
+            const Capture = struct { cache: *Core, key: Key };
+            const Lookup = deps.CacheLookup(A);
+            return Effect(Lookup, E, R).captureOwned(value.allocator, Capture{ .cache = value, .key = key }, true, struct {
+                fn run(input: *const Capture, _: *const R, token: ?*const rt.Cancellation) outcomes.Exit(Lookup, E) {
+                    var result = input.cache.getObservedToken(input.key, token);
+                    return switch (result) {
+                        .success => .{ .success = .{ .value = result.success.value.takeValue(), .observation = result.success.observation } },
+                        else => outcomes.castFailure(Lookup, result),
+                    };
+                }
+            }.run);
+        }
+        /// Nonloading lazy observation: null means no settled value; no loader is admitted.
+        pub fn tryGet(value: *Core, key: Key) Effect(?A, E, R) {
+            const Capture = struct { cache: *Core, key: Key };
+            return Effect(?A, E, R).captureOwned(value.allocator, Capture{ .cache = value, .key = key }, false, struct {
+                fn run(input: *const Capture, _: *const R, _: ?*const rt.Cancellation) outcomes.Exit(?A, E) {
+                    var result = input.cache.tryGet(input.key);
+                    return switch (result) {
+                        .success => .{ .success = if (result.success) |*loaded| loaded.takeValue() else null },
+                        else => outcomes.castFailure(?A, result),
+                    };
+                }
+            }.run);
+        }
+        /// The Effect borrows replacement data until joined; the generation
+        /// obtains its own value and deep dependency copies before installation.
+        pub fn set(value: *Core, key: Key, replacement: *const A, dependencies: []const Dependency, comptime select: fn (*const R) Config) Unit {
+            const Capture = struct { cache: *Core, key: Key, value: *const A, dependencies: []const Dependency };
+            return Unit.captureOwned(value.allocator, Capture{ .cache = value, .key = key, .value = replacement, .dependencies = dependencies }, true, struct {
+                fn run(input: *const Capture, env: *const R, _: ?*const rt.Cancellation) outcomes.Exit(void, E) {
+                    const config = select(env);
+                    if (input.dependencies.len > config.maximum_dependencies_per_entry) return .{ .fail = config.capacity_error() };
+                    var copied = outcomes.clonePayload(input.value.*) catch return .{ .die = outcomes.Defect.out_of_memory };
+                    var loaded = Loaded.init(env, copied, input.dependencies, config.dependency_policy) catch {
+                        outcomes.discardPayload(&copied);
+                        return .{ .die = outcomes.Defect.out_of_memory };
+                    };
+                    defer loaded.deinit();
+                    return input.cache.set(input.key, &loaded);
+                }
+            }.run);
+        }
+        /// Lazy key invalidation from the existing core adapter; exclude generations then cancel/join outside cache locks.
+        pub const invalidate = Plain.invalidate;
+        /// Lazy scoped shutdown; stop admission, cancel/join loaders and release retained owners.
+        pub const shutdown = Plain.shutdown;
+        /// Lazily invalidate this borrowed dependency identity; keep its pointed-to data alive through join.
+        /// Unknown unfinished dependency sets are conservatively excluded.
+        pub fn invalidateDependency(value: *Core, dependency: Dependency) Unit {
+            const Capture = struct { cache: *Core, dependency: Dependency };
+            return Unit.captureOwned(value.allocator, Capture{ .cache = value, .dependency = dependency }, true, struct {
+                fn run(input: *const Capture, _: *const R, _: ?*const rt.Cancellation) outcomes.Exit(void, E) {
+                    return input.cache.invalidateDependency(input.dependency);
+                }
+            }.run);
+        }
+        /// Lazily exclude all current entries and join excluded work using the same core lifetime machinery.
+        pub fn clear(value: *Core) Unit {
+            return Unit.fromNativeCancellableBorrowed(Core, value, struct {
+                fn run(input: *const Core, _: *const R, _: ?*const rt.Cancellation) outcomes.Exit(void, E) {
+                    return @constCast(input).clear();
+                }
+            }.run);
+        }
+    };
+}
+
 /// Specialize scoped pool operations as Effects.
 /// Parameters:
 /// - `A: comptime type`: Value type produced by a successful computation.
@@ -5765,7 +5941,7 @@ pub fn EffectWebSocket(comptime R: type) type {
                     connection: ?*sockets.Connection = null,
                     body: Out.Job = undefined,
                     body_result: outcomes.Exit(Out.Success, E) = undefined,
-                    storage: [@typeInfo(Cleanup).@"enum".fields.len]outcomes.CleanupStorage(E) = undefined,
+                    storage: [@typeInfo(Cleanup).@"enum".field_names.len]outcomes.CleanupStorage(E) = undefined,
                     references: std.atomic.Value(usize) = .init(1),
                     fn release(data: *anyopaque) void {
                         const frame: *@This() = @ptrCast(@alignCast(data));
@@ -5796,8 +5972,8 @@ pub fn EffectWebSocket(comptime R: type) type {
                     }
                     fn append(frame: *@This(), comptime operation: Cleanup, cleanup: outcomes.Exit(void, sockets.Error)) void {
                         const mapped = outcomes.mapError(E, cleanup, frame.allocator, map_error);
-                        frame.storage[@intFromEnum(operation)].appendExit(&frame.body_result, mapped);
-                        if (frame.storage[@intFromEnum(operation)].retained()) _ = frame.references.fetchAdd(1, .monotonic);
+                        frame.storage[@backingInt(operation)].appendExit(&frame.body_result, mapped);
+                        if (frame.storage[@backingInt(operation)].retained()) _ = frame.references.fetchAdd(1, .monotonic);
                     }
                     fn bodyStep(state: *rt.State, data: ?*anyopaque) rt.Step {
                         const frame: *@This() = @ptrCast(@alignCast(data.?));

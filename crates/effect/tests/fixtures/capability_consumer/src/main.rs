@@ -1,3 +1,6 @@
+extern crate effect as fx;
+#[path = "../../shared/reference_update.rs"]
+mod reference_update;
 mod host;
 mod host_clock;
 mod persistence_provider;
@@ -196,6 +199,7 @@ fn supplied_runtime_capabilities() {
         wall_clock: effect::TestWallClock::new(UtcMillis::new(1)),
         monotonic_clock: HostClock::new(),
     });
+    drive(reference_update::exercise(Arc::clone(&environment)));
     let program = provider_program::run::<HostEnvironment>();
     assert_eq!(success(drive(program.run(Arc::clone(&environment)))), 42);
     environment.tasks.wait_idle();
@@ -426,7 +430,7 @@ fn workflow(namespace: &KeyNamespace<Domain>) {
     ).run(Arc::new(()))));
     assert_eq!(started.status, WorkflowStatus::Ready);
     success(drive(engine.transition(
-        run.clone(), WorkflowStatus::Ready, WorkflowStatus::Running,
+        run.clone(), success(drive(engine.inspect(run.clone()).run(Arc::new(())))).expect("run").checkpoint(), WorkflowStatus::Running,
     ).run(Arc::new(()))));
     let outcome = EncodedWorkflowOutcome {
         kind: WorkflowOutcomeKind::Succeeded,

@@ -222,7 +222,7 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
             @compileError("SchemaBuilder.Record fields must be a tuple");
         if (!@hasField(R, "allocator") or @FieldType(R, "allocator") != std.mem.Allocator)
             @compileError("SchemaBuilder.Record requires R.allocator");
-        if (fields.len != info.@"struct".fields.len)
+        if (fields.len != info.@"struct".field_names.len)
             @compileError("each Zig record field needs exactly one schema field");
         var extensions_count: usize = 0;
         for (fields, 0..) |field, index| {
@@ -271,6 +271,52 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
         pub const Decoded = T;
         /// Exact caller environment type required when the description runs.
         pub const Environment = R;
+
+        pub const supports_direct_writer = blk: {
+            for (fields) |field| {
+                if (field.extension) continue;
+                if (!@import("json_writer.zig").capable(field.codec)) break :blk false;
+            }
+            break :blk true;
+        };
+        /// Eligible records serialize fields once without constructing a JSON tree.
+        pub fn writeJson(env: *const R, value: *const T, writer: *@import("json_writer.zig").Writer) outcomes.Exit(void, Issue) {
+            if (!supports_direct_writer) @compileError("record child has no direct JSON writer evidence");
+            writer.enter() catch |problem| return outcomes.castFailure(void, @import("json_writer.zig").failureWith(env, .encode, problem, writer));
+            defer writer.leave();
+            writer.write("{") catch |problem| return outcomes.castFailure(void, @import("json_writer.zig").failureWith(env, .encode, problem, writer));
+            var first = true;
+            inline for (fields) |field| {
+                if (comptime field.extension) {
+                    const extras = &@field(value.*, field.name);
+                    for (extras.values.keys(), extras.values.values()) |key, json_value| {
+                        inline for (fields) |known| if (!known.extension and std.mem.eql(u8, key, known.name)) return .{ .fail = Issue.init(env, .encode, .duplicate_field) };
+                        if (!first) writer.write(",") catch |problem| return outcomes.castFailure(void, @import("json_writer.zig").failureWith(env, .encode, problem, writer));
+                        first = false;
+                        writer.quoted(key) catch |problem| return outcomes.castFailure(void, @import("json_writer.zig").failureWith(env, .encode, problem, writer));
+                        writer.write(":") catch |problem| return outcomes.castFailure(void, @import("json_writer.zig").failureWith(env, .encode, problem, writer));
+                        writer.json(&json_value) catch |problem| return outcomes.castFailure(void, @import("json_writer.zig").failureWith(env, .encode, problem, writer));
+                    }
+                    continue;
+                }
+                const present = if (comptime field.presence == .optional) @field(value.*, field.name) != null else true;
+                if (present) {
+                    if (!first) writer.write(",") catch |problem| return outcomes.castFailure(void, @import("json_writer.zig").failureWith(env, .encode, problem, writer));
+                    first = false;
+                    writer.quoted(field.name) catch |problem| return outcomes.castFailure(void, @import("json_writer.zig").failureWith(env, .encode, problem, writer));
+                    writer.write(":") catch |problem| return outcomes.castFailure(void, @import("json_writer.zig").failureWith(env, .encode, problem, writer));
+                    const input = if (comptime field.presence == .optional) &@field(value.*, field.name).? else &@field(value.*, field.name);
+                    const result = if (comptime field.nested) field.codec.writeJson(env, input, writer) else field.codec.writeJson(input, writer);
+                    switch (result) {
+                        .success => {},
+                        .fail => |issue| return outcomes.castFailure(void, fieldFailure(env, field.name, issue)),
+                        else => return result,
+                    }
+                }
+            }
+            writer.write("}") catch |problem| return outcomes.castFailure(void, @import("json_writer.zig").failureWith(env, .encode, problem, writer));
+            return .{ .success = {} };
+        }
 
         fn encodedFields() [fields.len - (if (policy.unknown_fields == .preserve) @as(usize, 1) else 0)]ast.Field {
             var result: [fields.len - (if (policy.unknown_fields == .preserve) @as(usize, 1) else 0)]ast.Field = undefined;
@@ -332,9 +378,10 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
         const Collector = struct {
             list: std.array_list.Managed(Issue),
             limit_reached: bool = false,
+            maximum: usize,
 
-            fn init(allocator: std.mem.Allocator) Collector {
-                return .{ .list = std.array_list.Managed(Issue).init(allocator) };
+            fn init(allocator: std.mem.Allocator, maximum: ?usize) Collector {
+                return .{ .list = std.array_list.Managed(Issue).init(allocator), .maximum = @min(policy.max_issues orelse 1, maximum orelse (policy.max_issues orelse 1)) };
             }
 
             fn deinit(self: *Collector) void {
@@ -348,7 +395,7 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
                     discarded.deinit();
                     return error.OutOfMemory;
                 };
-                self.limit_reached = self.list.items.len >= policy.max_issues.?;
+                self.limit_reached = self.list.items.len >= self.maximum;
             }
 
             fn finish(self: *Collector, env: *const R) outcomes.Exit(T, Issue) {
@@ -400,7 +447,7 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
         /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
         ///   capabilities.
         /// - `json: *const std.json.Value`: JSON value or document to decode, encode, or validate.
-        /// Returns (`outcomes.Exit(T, Issue)`): Carries `T` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
+        /// Returns (`outcomes.Exit(T, Issue)`): Carries `T` on `.success` or `Issue` on `.fail`; `.die`, `.interrupted`, and `.finalization_failed` preserve other terminal causes.
         pub fn decodeDirect(env: *const R, json: *const std.json.Value) outcomes.Exit(T, Issue) {
             var state: structural.DecodeState = .{};
             return decodeWithin(env, json, &state);
@@ -413,10 +460,10 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
         ///   capabilities.
         /// - `json: *const std.json.Value`: JSON value or document to decode, encode, or validate.
         /// - `state: *structural.DecodeState`: Mutable operation state, retained for the duration of this call.
-        /// Returns (`outcomes.Exit(T, Issue)`): Carries `T` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
+        /// Returns (`outcomes.Exit(T, Issue)`): Carries `T` on `.success` or `Issue` on `.fail`; `.die`, `.interrupted`, and `.finalization_failed` preserve other terminal causes.
         pub fn decodeWithin(env: *const R, json: *const std.json.Value, state: *structural.DecodeState) outcomes.Exit(T, Issue) {
             if (json.* != .object) return .{ .fail = Issue.init(env, .decode, .{ .expected = .object }) };
-            var collector = Collector.init(env.allocator);
+            var collector = Collector.init(env.allocator, state.maximum_issues);
             defer collector.deinit();
             if (policy.unknown_fields == .reject) {
                 for (json.object.keys()) |key| {
@@ -432,7 +479,7 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
             }
             var result: T = undefined;
             var initialized: [fields.len]bool = @splat(false);
-            for (fields, 0..) |field, index| {
+            inline for (fields, 0..) |field, index| {
                 if (comptime field.extension) {
                     const collected = collectExtensions(env, json);
                     switch (collected) {
@@ -482,8 +529,31 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
                             const made = field.default_value(env);
                             switch (made) {
                                 .success => |value| {
-                                    @field(result, field.name) = value;
-                                    initialized[index] = true;
+                                    const checked = if (comptime field.nested) field.codec.validateDirect(env, &value) else blk: {
+                                        const valid = field.codec.validateDirect(&value);
+                                        break :blk switch (valid) {
+                                            .ok => outcomes.Exit(void, Issue){ .success = {} },
+                                            .err => |issue| outcomes.Exit(void, Issue){ .fail = issue },
+                                        };
+                                    };
+                                    if (checked != .success) {
+                                        var discarded = value;
+                                        outcomes.discardPayload(&discarded);
+                                        if (checked == .fail) {
+                                            var issue = checked.fail;
+                                            issue.direction = .decode;
+                                            if (noteFailure(env, &collector, fieldFailure(env, field.name, issue))) |terminal| {
+                                                releasePartial(&result, &initialized);
+                                                return terminal;
+                                            }
+                                        } else {
+                                            releasePartial(&result, &initialized);
+                                            return outcomes.castFailure(T, checked);
+                                        }
+                                    } else {
+                                        @field(result, field.name) = value;
+                                        initialized[index] = true;
+                                    }
                                 },
                                 .fail => |issue| {
                                     if (noteFailure(env, &collector, fieldFailure(env, field.name, issue))) |terminal| {
@@ -508,7 +578,7 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
         }
 
         fn releasePartial(value: *T, initialized: *[fields.len]bool) void {
-            for (fields, 0..) |field, index| {
+            inline for (fields, 0..) |field, index| {
                 if (initialized[index]) outcomes.discardPayload(&@field(value.*, field.name));
             }
         }
@@ -536,7 +606,7 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
         ///   joined it.
         /// - `limits: ParseLimits`: Caller-selected, validated behavior or resource bounds; no hidden default
         ///   is installed.
-        /// Returns (`outcomes.Exit(legacy.Parsed(T), Issue)`): Carries `legacy.Parsed(T)` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
+        /// Returns (`outcomes.Exit(legacy.Parsed(T), Issue)`): Carries `legacy.Parsed(T)` on `.success` or `Issue` on `.fail`; `.die`, `.interrupted`, and `.finalization_failed` preserve other terminal causes.
         pub fn parseBytesDirect(
             env: *const R,
             bytes: []const u8,
@@ -562,7 +632,7 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
         /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
         ///   joined it.
         /// - `temporary: std.mem.Allocator`: Temporary state retained only for the duration of this operation.
-        /// Returns (`outcomes.Exit(std.json.Value, Issue)`): Carries `std.json.Value` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
+        /// Returns (`outcomes.Exit(std.json.Value, Issue)`): Carries `std.json.Value` on `.success` or `Issue` on `.fail`; `.die`, `.interrupted`, and `.finalization_failed` preserve other terminal causes.
         pub fn encodeValueDirect(env: *const R, value: *const T, temporary: std.mem.Allocator) outcomes.Exit(std.json.Value, Issue) {
             var state: structural.EncodeState = .{ .scratch = temporary };
             return encodeWithin(env, value, &state);
@@ -576,7 +646,7 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
         /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
         ///   joined it.
         /// - `state: *structural.EncodeState`: Mutable operation state, retained for the duration of this call.
-        /// Returns (`outcomes.Exit(std.json.Value, Issue)`): Carries `std.json.Value` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
+        /// Returns (`outcomes.Exit(std.json.Value, Issue)`): Carries `std.json.Value` on `.success` or `Issue` on `.fail`; `.die`, `.interrupted`, and `.finalization_failed` preserve other terminal causes.
         pub fn encodeWithin(env: *const R, value: *const T, state: *structural.EncodeState) outcomes.Exit(std.json.Value, Issue) {
             var object: std.json.ObjectMap = .{};
             inline for (fields) |field| {
@@ -594,15 +664,15 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
                     }
                     continue;
                 }
-                if (comptime field.presence == .optional) {
-                    if (@field(value.*, field.name) == null) continue;
-                }
-                const field_value = if (comptime field.presence == .optional) @field(value.*, field.name).? else @field(value.*, field.name);
-                const encoded = encodeField(field, env, &field_value, state);
-                switch (encoded) {
-                    .success => |json_value| object.put(state.scratch, field.name, json_value) catch return .{ .die = outcomes.Defect.out_of_memory },
-                    .fail => |issue| return outcomes.castFailure(std.json.Value, fieldFailure(env, field.name, issue)),
-                    else => return outcomes.castFailure(std.json.Value, encoded),
+                const present = if (comptime field.presence == .optional) @field(value.*, field.name) != null else true;
+                if (present) {
+                    const field_value = if (comptime field.presence == .optional) @field(value.*, field.name).? else @field(value.*, field.name);
+                    const encoded = encodeField(field, env, &field_value, state);
+                    switch (encoded) {
+                        .success => |json_value| object.put(state.scratch, field.name, json_value) catch return .{ .die = outcomes.Defect.out_of_memory },
+                        .fail => |issue| return outcomes.castFailure(std.json.Value, fieldFailure(env, field.name, issue)),
+                        else => return outcomes.castFailure(std.json.Value, encoded),
+                    }
                 }
             }
             return .{ .success = .{ .object = object } };
@@ -616,7 +686,7 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
         ///   capabilities.
         /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
         ///   joined it.
-        /// Returns (`outcomes.Exit(outcomes.OwnedSlice(u8), Issue)`): Carries `outcomes.OwnedSlice(u8)` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
+        /// Returns (`outcomes.Exit(outcomes.OwnedSlice(u8), Issue)`): Carries `outcomes.OwnedSlice(u8)` on `.success` or `Issue` on `.fail`; `.die`, `.interrupted`, and `.finalization_failed` preserve other terminal causes.
         pub fn encodeBytesDirect(env: *const R, value: *const T) outcomes.Exit(outcomes.OwnedSlice(u8), Issue) {
             var arena = std.heap.ArenaAllocator.init(env.allocator);
             defer arena.deinit();
@@ -639,7 +709,7 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
         ///   capabilities.
         /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
         ///   joined it.
-        /// Returns (`outcomes.Exit(void, Issue)`): Carries no value on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
+        /// Returns (`outcomes.Exit(void, Issue)`): Carries no value on `.success` or `Issue` on `.fail`; `.die`, `.interrupted`, and `.finalization_failed` preserve other terminal causes.
         pub fn validateDirect(env: *const R, value: *const T) outcomes.Exit(void, Issue) {
             var arena = std.heap.ArenaAllocator.init(env.allocator);
             defer arena.deinit();

@@ -1,4 +1,13 @@
-//! Schema compatibility adapters and public codec exports.
+//! Pure, owned effectful and domain-error codecs with explicit representation policies.
+//!
+//! [`Codec`] separates decode and encode environments; providers remain in those
+//! environments. [`NativeRecordBuilder`] composes owned fields without a JSON
+//! bridge or payload cloning. [`DomainCodec`] maps only schema failures into an
+//! application error type. [`SchemaPolicy`] gives each configured invocation
+//! fresh traversal and pattern budgets, independent of JSON nesting limits.
+//! Independent type validators and direct writers are separate witnesses:
+//! defaults never infer a validator from an encoder, and direct writing never
+//! silently falls back to ordinary encoding.
 //!
 //! [`PureCodec`] keeps decoding, encoding, and encoded-side structure together.
 //! [`SchemaAst`] describes a representation; it does not construct an unchecked
@@ -14,11 +23,17 @@ use std::sync::Arc;
 
 mod codec;
 mod decimal;
+mod domain_codec;
 mod enum_builder;
+mod exact_number;
 pub(crate) mod internal;
 mod json_codec;
+mod json_constraints;
 mod json_schema;
+mod json_writer;
+mod native_codec;
 mod outcome_codec;
+mod parse_context;
 mod schema_ast;
 mod schema_builder;
 mod schema_issue;
@@ -26,20 +41,35 @@ mod variant_schema;
 
 pub use codec::{Codec, EffectSchema, PureCodec};
 pub use decimal::{Decimal, DecimalError};
+pub use domain_codec::DomainCodec;
 pub use enum_builder::TaggedEnumBuilder;
+pub use exact_number::{JsonExactNumber, NumericConstraint, json_exact_number};
 pub use json_codec::{
     json_array, json_bool, json_bytes, json_decimal, json_f64, json_i64, json_literal, json_null,
     json_nullable, json_stable_key, json_string, json_string_pattern, json_tuple2, json_u64,
     json_utc_millis, value_kind,
 };
+pub use json_constraints::{
+    AnyOfValue, ArrayConstraints, CheckedPattern, LiteralEnumValue, MultiplePatternPolicy,
+    ObjectConstraints, PatternPolicy, PatternProperty, PrefixElement, PrefixValue,
+    StringConstraints, UnknownLiteralPolicy, json_all_of, json_any_of, json_array_constraints,
+    json_literal_enum, json_object_constraints, json_one_of, json_prefix_rest,
+    json_string_constraints,
+};
 pub use json_schema::{
     JsonSchemaDocument, RepresentationError, RepresentationLimits, RepresentationPrecision,
     export_json_schema,
+};
+pub use json_writer::{JsonWriter, JsonWriterPolicy};
+pub use native_codec::{
+    JsonRepresentation, NativeField, NativeFields, NativeNil, NativeRecordBuilder,
+    ObjectRepresentation, SequenceRepresentation, native_array, native_map,
 };
 pub use outcome_codec::{
     StoredCleanup, StoredDefect, StoredFinalization, StoredOutcome, StoredPrimary,
     stored_outcome_codec,
 };
+pub use parse_context::{ConfiguredCodec, IssueBudget, ParseContext, SchemaPolicy};
 pub use schema_ast::{
     PrimitiveShape, SchemaAst, SchemaProperty, SchemaReference, SchemaShape, StringLengthUnit,
     StringPattern,

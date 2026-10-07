@@ -98,6 +98,12 @@ pub fn ownsPayload(comptime T: type) bool {
     };
 }
 
+/// Explicit witness for imported owning application payloads.
+pub fn requireOwned(comptime T: type) type {
+    if (!ownsPayload(T) or !@hasDecl(T, "clone") or !@hasDecl(T, "deinit")) @compileError("owned payload requires public ownership, clone and deinit evidence");
+    return T;
+}
+
 /// Library-generated owners and consumer owners can declare this comptime
 /// contract. Unmarked values keep their normal Zig borrowing/ownership rules.
 ///
@@ -539,8 +545,8 @@ pub fn mapError(comptime F: type, value: anytype, allocator: ?std.mem.Allocator,
 /// can append failures without allocating during resource release.
 pub fn CleanupStorage(comptime E: type) type {
     return struct {
-        const Prefix = std.meta.Tuple(&.{ PrimaryOutcome(E), CleanupFailure(E) });
-        nodes: [@typeInfo(Prefix).@"struct".fields.len]CleanupNode(E) = undefined,
+        const Prefix = @Tuple(&.{ PrimaryOutcome(E), CleanupFailure(E) });
+        nodes: [@typeInfo(Prefix).@"struct".field_names.len]CleanupNode(E) = undefined,
         references: std.atomic.Value(usize) = .init(0),
         owner: *anyopaque,
         release: *const fn (*anyopaque) void,

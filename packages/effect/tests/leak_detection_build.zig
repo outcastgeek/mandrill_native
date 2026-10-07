@@ -10,5 +10,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = &.{if (leak) "leak detector rejects unreleased allocation" else "leak detector accepts complete teardown"},
     });
-    b.default_step.dependOn(&b.addRunArtifact(fixture).step);
+    const run = b.addRunArtifact(fixture);
+    run.has_side_effects = true;
+    b.default_step.dependOn(&run.step);
 }

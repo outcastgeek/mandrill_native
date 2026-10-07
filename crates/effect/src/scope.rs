@@ -321,18 +321,12 @@ impl<E: Send + 'static> Scope<E> {
         self.add_release(move || Release::from_effect(finalizer.clone()))
     }
 
-    /// Register a fresh single-use release on each execution.
+    /// Lazily register a factory for a fresh single-use release when scope cleanup runs.
     ///
-    /// # Type parameters
-    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
-    /// - `E`: Domain-error type.
-    ///
-    /// # Parameters
-    /// - `factory` (`impl Fn() -> Release<E, R> + Send + Sync + 'static`): Factory invoked to create fresh data for an execution.
-    ///
-    /// # Returns
-    /// Type: `Effect<(), E, R>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// Construction and execution run in protected cleanup context; a panic while
+    /// constructing the release becomes a retained cleanup defect. If registration
+    /// finds the scope closed, the release runs immediately. Re-executing registration
+    /// creates another finalizer; the release payload itself is not cloned.
     pub fn add_release<R: Send + Sync + 'static>(
         &self,
         factory: impl Fn() -> Release<E, R> + Send + Sync + 'static,
@@ -341,10 +335,11 @@ impl<E: Send + 'static> Scope<E> {
         let factory = Arc::new(factory);
         Effect::new(move |env, context, finish| {
             let factory = Arc::clone(&factory);
+            let context = context.protected();
             let finalizer =
                 Registered::new(
                     move |finish| match catch_unwind(AssertUnwindSafe(|| factory())) {
-                        Ok(release) => release.execute(env, context.protected(), finish),
+                        Ok(release) => release.execute(env, context, finish),
                         Err(panic) => runtime::finish(finish, Exit::Die(Defect::from_panic(panic))),
                     },
                 );

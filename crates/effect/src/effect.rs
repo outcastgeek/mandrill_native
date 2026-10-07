@@ -416,6 +416,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
     /// # Returns
     /// Type: `Effect<A, E, L>`.
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    #[doc(alias = "provideSome")]
     pub fn provide_some<L: Send + Sync + 'static>(
         self,
         project: impl Fn(&L) -> R + Send + Sync + 'static,
@@ -442,6 +443,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
     /// # Returns
     /// Type: `Effect<B, E, R>`.
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    #[doc(alias = "flatMap")]
     pub fn flat_map<B: Send + 'static>(
         self,
         next: impl Fn(A) -> Effect<B, E, R> + Send + Sync + 'static,
@@ -535,6 +537,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
     /// # Returns
     /// Type: `Effect<A, E2, R>`.
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    #[doc(alias = "mapError")]
     pub fn map_error<E2: Send + 'static>(
         self,
         transform: impl Fn(E) -> E2 + Send + Sync + 'static,
@@ -1326,6 +1329,21 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
                     Exit::Die(Defect::from(LibraryDefect::FutureFactoryConsumed)),
                 ),
             }
+        })
+    }
+}
+
+impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E, R> {
+    /// Transfer one full owned outcome into execution without cloning errors or cleanup failures; repeated execution yields the consumed-outcome defect.
+    pub(crate) fn from_exit_once(outcome: Exit<A, E>) -> Self {
+        let pending = std::sync::Mutex::new(Some(outcome));
+        Self::new(move |_, _, finish| {
+            let outcome = pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .unwrap_or_else(|| Exit::Die(Defect::from(LibraryDefect::WorkflowConsumed)));
+            runtime::finish(finish, outcome)
         })
     }
 }

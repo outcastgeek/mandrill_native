@@ -443,10 +443,36 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Stream<A, E
         on_error: impl Fn(X) -> E + Send + Sync + 'static,
         dispose: impl Fn(S) -> Release<E, R> + Send + Sync + 'static,
     ) -> Self {
+        let factory = Arc::new(factory);
+        Self::from_async_iterable_effect(
+            move || {
+                let factory = Arc::clone(&factory);
+                Effect::sync(move || factory())
+            },
+            on_error,
+            dispose,
+        )
+    }
+
+    /// Acquire a fresh owned asynchronous iterator effect for each scoped stream opening.
+    ///
+    /// `factory` runs lazily in `R` and may fail or suspend. Pulls map iterator errors
+    /// through `on_error` and remain cancellation-aware. Once acquired, `dispose`
+    /// receives ownership exactly once through scope release, including interrupted
+    /// consumption; cleanup failures retain the existing release outcome semantics.
+    /// No runtime is selected and the iterator need not be Clone.
+    pub fn from_async_iterable_effect<
+        X: Send + 'static,
+        S: futures_util::stream::Stream<Item = Result<A, X>> + Unpin + Send + 'static,
+    >(
+        factory: impl Fn() -> Effect<S, E, R> + Send + Sync + 'static,
+        on_error: impl Fn(X) -> E + Send + Sync + 'static,
+        dispose: impl Fn(S) -> Release<E, R> + Send + Sync + 'static,
+    ) -> Self {
         let on_error = Arc::new(on_error);
         let dispose = Arc::new(dispose);
         Self::from_pull(
-            Effect::sync(move || Arc::new(futures_util::lock::Mutex::new(factory()))),
+            Effect::defer(factory).map(|stream| Arc::new(futures_util::lock::Mutex::new(stream))),
             move |resource| {
                 let on_error = Arc::clone(&on_error);
                 Effect::new(move |env, context, finish| {

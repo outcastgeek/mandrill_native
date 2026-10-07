@@ -11,12 +11,22 @@ use std::sync::Arc;
 ///
 /// # Type parameters
 /// - `T`: Value or item type.
-type VariantDecode<T> = Arc<dyn Fn(&JsonValue) -> Result<T, SchemaIssue> + Send + Sync>;
+type VariantDecode<T> =
+    Arc<dyn Fn(&JsonValue, Option<&super::ParseContext>) -> Result<T, SchemaIssue> + Send + Sync>;
 /// Type alias for variant encode in schema enum builder.
 ///
 /// # Type parameters
 /// - `T`: Value or item type.
-type VariantEncode<T> = Arc<dyn Fn(&T) -> Option<Result<JsonValue, SchemaIssue>> + Send + Sync>;
+type VariantEncode<T> = Arc<
+    dyn Fn(&T, Option<&super::ParseContext>) -> Option<Result<JsonValue, SchemaIssue>>
+        + Send
+        + Sync,
+>;
+
+type VariantValidator<T> =
+    Arc<dyn Fn(&T, Option<&super::ParseContext>) -> Result<(), SchemaIssue> + Send + Sync>;
+type VariantWriter<T> =
+    Arc<dyn Fn(&T, &mut super::JsonWriter) -> Result<(), SchemaIssue> + Send + Sync>;
 
 /// Typed variant used by schema enum builder.
 ///
@@ -28,6 +38,8 @@ struct Variant<T> {
     decode: VariantDecode<T>,
     matches: Arc<dyn Fn(&T) -> bool + Send + Sync>,
     encode: VariantEncode<T>,
+    writer: Option<VariantWriter<T>>,
+    validate: Option<VariantValidator<T>>,
 }
 
 /// A builder that registers tagged variants and their codecs before producing a checked schema.
@@ -64,20 +76,11 @@ impl<T: Send + 'static> TaggedEnumBuilder<T> {
         }
     }
 
-    /// Register one tagged variant with its discriminator and codec.
+    /// Add a tag with its payload codec, owned constructor and borrowed variant projection.
     ///
-    /// # Type parameters
-    /// - `P`: Payload type. Bounds: `Send + 'static`.
-    /// - `T`: Value or item type.
-    ///
-    /// # Parameters
-    /// - `tag` (`impl Into<Arc<str>>`): The tag supplied to this operation.
-    /// - `codec` (`PureCodec<P, JsonValue>`): The codec used to convert and validate values.
-    /// - `project` (`impl for<'a> Fn(&'a T) -> Option<&'a P> + Send + Sync + 'static`): The project supplied to this operation.
-    /// - `construct` (`impl Fn(P) -> T + Send + Sync + 'static`): The construct supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Result<Self, SchemaIssue>`.
+    /// `project` must return Some only for this variant. Duplicate/empty tags fail
+    /// construction. Payload validation and writing propagate only when the codec has
+    /// genuine witnesses; projection never encodes a value merely to identify a tag.
     pub fn variant<P: Send + 'static>(
         mut self,
         tag: impl Into<Arc<str>>,
@@ -93,26 +96,59 @@ impl<T: Send + 'static> TaggedEnumBuilder<T> {
         let decode = codec.clone();
         let project = Arc::new(project);
         let matcher = Arc::clone(&project);
+        let writer = if codec.has_writer() {
+            let codec = codec.clone();
+            let project = Arc::clone(&project);
+            Some(Arc::new(move |value: &T, writer: &mut super::JsonWriter| {
+                codec.write_into(
+                    project(value).ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidTag))?,
+                    writer,
+                )
+            })
+                as Arc<
+                    dyn Fn(&T, &mut super::JsonWriter) -> Result<(), SchemaIssue> + Send + Sync,
+                >)
+        } else {
+            None
+        };
+        let validate = if codec.has_type_validator() {
+            let codec = codec.clone();
+            let project = Arc::clone(&project);
+            Some(
+                Arc::new(move |value: &T, context: Option<&super::ParseContext>| {
+                    codec.validate_in_ref(
+                        project(value)
+                            .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidTag))?,
+                        context,
+                    )
+                }) as VariantValidator<T>,
+            )
+        } else {
+            None
+        };
         self.variants.push(Variant {
             tag,
             schema,
-            decode: Arc::new(move |payload| decode.decode_ref(payload).map(&construct)),
+            writer,
+            validate,
+            decode: Arc::new(move |payload, context| {
+                decode.decode_in_ref(payload, context).map(&construct)
+            }),
             matches: Arc::new(move |value| matcher(value).is_some()),
-            encode: Arc::new(move |value| project(value).map(|payload| codec.encode_ref(payload))),
+            encode: Arc::new(move |value, context| {
+                project(value).map(|payload| codec.encode_in_ref(payload, context))
+            }),
         });
         Ok(self)
     }
 
-    /// Record the terminal status and release remaining operation ownership.
+    /// Prepare a tagged JSON object codec using the explicit parse policy.
     ///
-    /// # Type parameters
-    /// - `T`: Value or item type.
-    ///
-    /// # Parameters
-    /// - `policy` (`ParsePolicy`): The caller-supplied behavior policy.
-    ///
-    /// # Returns
-    /// Type: `Result<PureCodec<T, JsonValue>, SchemaIssue>`.
+    /// Rejects empty/equal tag and content field names or an empty variant list.
+    /// Decode selects the tag before payload decoding; encode/typed validation reject
+    /// zero or multiple matching projections. Independent validation or writing is
+    /// available only if every variant supplies the corresponding payload witness.
+    /// Discriminator metadata records the tag field without changing wire tags.
     pub fn finish(self, policy: ParsePolicy) -> Result<PureCodec<T, JsonValue>, SchemaIssue> {
         if self.tag_field.is_empty()
             || self.content_field.is_empty()
@@ -141,16 +177,26 @@ impl<T: Send + 'static> TaggedEnumBuilder<T> {
                 policy.unknown_fields,
             )?);
         }
-        let ast = SchemaAst::new(SchemaShape::Union(shapes));
+        let ast = SchemaAst::new(SchemaShape::Union(shapes))
+            .annotate("discriminant", Arc::clone(&self.tag_field))?;
         let variants = Arc::new(self.variants);
         let decode_variants = Arc::clone(&variants);
+        let writer_variants = Arc::clone(&variants);
+        let validation_variants = Arc::clone(&variants);
+        let has_validator = variants.iter().all(|variant| variant.validate.is_some());
+        let has_writer = variants.iter().all(|variant| variant.writer.is_some());
+        let writer_tag = Arc::clone(&self.tag_field);
+        let writer_content = Arc::clone(&self.content_field);
         let tag_field = self.tag_field;
         let content_field = self.content_field;
         let decode_tag = Arc::clone(&tag_field);
         let decode_content = Arc::clone(&content_field);
-        Ok(PureCodec::with_ast(
+        let codec = PureCodec::with_context_ast(
             ast,
-            move |encoded| {
+            move |encoded, context| {
+                let mut active = super::parse_context::policy(context, policy);
+                active.unknown_fields = policy.unknown_fields;
+                let policy = active;
                 super::internal::parser::check_limits(encoded, &policy.limits)?;
                 let JsonValue::Object(object) = encoded else {
                     return Err(SchemaIssue::new(SchemaIssueKind::TypeMismatch {
@@ -187,13 +233,22 @@ impl<T: Send + 'static> TaggedEnumBuilder<T> {
                 let content = object.get(decode_content.as_ref()).ok_or_else(|| {
                     SchemaIssue::new(SchemaIssueKind::MissingField(Arc::clone(&decode_content)))
                 })?;
-                (variant.decode)(content).map_err(|issue| {
+                (variant.decode)(
+                    content,
+                    super::parse_context::child(
+                        context,
+                        IssueSegment::Field(Arc::clone(&decode_content)),
+                    )?
+                    .as_ref(),
+                )
+                .map_err(|issue| {
                     issue
                         .at(IssueSegment::Field(Arc::clone(&decode_content)))
                         .at(IssueSegment::Variant(Arc::clone(&variant.tag)))
                 })
             },
-            move |value| {
+            move |value, context| {
+                let policy = super::parse_context::policy(context, policy);
                 let mut selected = None;
                 for variant in variants.iter() {
                     if (variant.matches)(value) {
@@ -205,13 +260,20 @@ impl<T: Send + 'static> TaggedEnumBuilder<T> {
                 }
                 let variant =
                     selected.ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidTag))?;
-                let payload = (variant.encode)(value)
-                    .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?
-                    .map_err(|issue| {
-                        issue
-                            .at(IssueSegment::Field(Arc::clone(&content_field)))
-                            .at(IssueSegment::Variant(Arc::clone(&variant.tag)))
-                    })?;
+                let payload = (variant.encode)(
+                    value,
+                    super::parse_context::child(
+                        context,
+                        IssueSegment::Field(Arc::clone(&content_field)),
+                    )?
+                    .as_ref(),
+                )
+                .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?
+                .map_err(|issue| {
+                    issue
+                        .at(IssueSegment::Field(Arc::clone(&content_field)))
+                        .at(IssueSegment::Variant(Arc::clone(&variant.tag)))
+                })?;
                 let mut object = serde_json::Map::new();
                 object.insert(
                     tag_field.to_string(),
@@ -222,6 +284,55 @@ impl<T: Send + 'static> TaggedEnumBuilder<T> {
                 super::internal::parser::check_limits(&encoded, &policy.limits)?;
                 Ok(encoded)
             },
-        ))
+        );
+        let codec = if has_validator {
+            codec.with_context_type_validator(move |value, context| {
+                let mut matches = validation_variants
+                    .iter()
+                    .filter(|variant| (variant.matches)(value));
+                let variant = matches
+                    .next()
+                    .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidTag))?;
+                if matches.next().is_some() {
+                    return Err(SchemaIssue::new(SchemaIssueKind::InvalidDefinition));
+                }
+                let child = super::parse_context::descend(context)?;
+                variant
+                    .validate
+                    .as_ref()
+                    .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::MissingValidator))?(
+                    value,
+                    child.as_ref(),
+                )
+                .map_err(|issue| issue.at(IssueSegment::Variant(Arc::clone(&variant.tag))))
+            })
+        } else {
+            codec
+        };
+        Ok(if has_writer {
+            codec.with_writer(move |value, writer| {
+                let mut matched = writer_variants
+                    .iter()
+                    .filter(|variant| (variant.matches)(value));
+                let variant = matched
+                    .next()
+                    .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidTag))?;
+                if matched.next().is_some() {
+                    return Err(SchemaIssue::new(SchemaIssueKind::InvalidDefinition));
+                }
+                let write = variant
+                    .writer
+                    .as_ref()
+                    .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?;
+                writer.begin_object()?;
+                writer.property(&writer_tag)?;
+                writer.string(&variant.tag)?;
+                writer.property(&writer_content)?;
+                write(value, writer)?;
+                writer.end_object()
+            })
+        } else {
+            codec
+        })
     }
 }

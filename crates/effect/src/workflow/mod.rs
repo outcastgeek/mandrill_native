@@ -55,3 +55,5 @@ pub use workflow_types::{
     WorkflowRegistration, WorkflowRunId, WorkflowSignalId, WorkflowSnapshot, WorkflowStatus,
     WorkflowVersion, WorkflowWait, WorkflowWakeReason,
 };
+
+pub use workflow_types::WorkflowCheckpoint;

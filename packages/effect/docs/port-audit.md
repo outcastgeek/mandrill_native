@@ -277,3 +277,10 @@ to the installed compiler, target and tested consumer providers above.
 
 Example/test values, workload seed, barrier participant counts and subprocess
 watchdog duration are fixture inputs. They are not production defaults.
+
+
+## Zig 0.17 reference update evidence — 2026-10-06
+
+The historical 0.16 results above remain dated evidence. The current update uses Zig 0.17.0 with caller-owned allocator, I/O and engine providers. Formatting, safe aggregate tests, repaired affected debug targets, 28 intended compile failures, nine complete optimized-body comparisons, both staged independent consumer modes, example and API documentation passed. The first debug aggregate failed only in newly instantiated reference-update paths; those source failures were repaired and the affected proof passed. Later schema metadata repairs received affected debug/safe integration reruns.
+
+See [the current correction ledger](reference-update-2026-10-06.md) for exact command dispositions, source changes, reused evidence and bounded limitations. The consumer additionally proves typed failed-run checkpoint reset with preserved recorded activity replay and checks its actual SafeAllocator after teardown. These results do not relabel the old compiler snapshot or certify every target/provider.

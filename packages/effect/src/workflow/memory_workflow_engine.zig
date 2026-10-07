@@ -34,6 +34,7 @@ pub fn MemoryWorkflowEngine(
             completed: ?Bytes = null,
             owner_id: ?Bytes = null,
             generation: u64 = 0,
+            checkpoint_revision: u64 = 0,
             lease_until: deadlines.Deadline = .never,
             wake_pending: bool = false,
             cancel_requested: bool = false,
@@ -224,15 +225,16 @@ pub fn MemoryWorkflowEngine(
                 },
                 .running => {
                     const observed: types.ExecutionState = if (item.cancel_requested)
-                        .cancellation_requested
+                        .{ .cancellation_requested = item.checkpoint_revision }
                     else
-                        .running;
+                        .{ .running = item.checkpoint_revision };
                     self.mutex.unlock(self.io);
                     return .{ .success = observed };
                 },
                 .suspended => {
+                    const observed = item.checkpoint_revision;
                     self.mutex.unlock(self.io);
-                    return .{ .success = .suspended };
+                    return .{ .success = .{ .suspended = observed } };
                 },
                 .terminal_cancelled => {
                     self.mutex.unlock(self.io);
@@ -244,15 +246,17 @@ pub fn MemoryWorkflowEngine(
                 self.mutex.unlock(self.io);
                 return .{ .die = outcomes.Defect.out_of_memory };
             };
+            const revision = item.checkpoint_revision;
             self.mutex.unlock(self.io);
-            return .{ .success = .{ .completed = copied } };
+            return .{ .success = .{ .completed = .{ .items = copied.items, .allocator = copied.allocator, .revision = revision } } };
         }
 
-        fn resumeEffect(data: ?*anyopaque, env: *const R, execution: types.ExecutionId) Engine.ControlEffect {
+        fn resumeEffect(data: ?*anyopaque, env: *const R, request: types.ResumeRequest) Engine.ControlEffect {
             const owner: *Self = @ptrCast(@alignCast(data.?));
-            return Engine.ControlEffect.fromOwned(env, ExecutionCapture{ .owner = owner, .execution = execution }, struct {
-                fn run(capture: *const ExecutionCapture, _: *const R) outcomes.Exit(types.ControlResult, Failure) {
-                    return capture.owner.controlNow(capture.execution, false);
+            const Capture = struct { owner: *Self, request: types.ResumeRequest };
+            return Engine.ControlEffect.fromOwned(env, Capture{ .owner = owner, .request = request }, struct {
+                fn run(capture: *const Capture, _: *const R) outcomes.Exit(types.ControlResult, Failure) {
+                    return capture.owner.controlNow(capture.request.execution, false, capture.request);
                 }
             }.run);
         }
@@ -261,7 +265,7 @@ pub fn MemoryWorkflowEngine(
             const owner: *Self = @ptrCast(@alignCast(data.?));
             return Engine.ControlEffect.fromOwned(env, ExecutionCapture{ .owner = owner, .execution = execution }, struct {
                 fn run(capture: *const ExecutionCapture, _: *const R) outcomes.Exit(types.ControlResult, Failure) {
-                    return capture.owner.controlNow(capture.execution, true);
+                    return capture.owner.controlNow(capture.execution, true, null);
                 }
             }.run);
         }
@@ -286,7 +290,7 @@ pub fn MemoryWorkflowEngine(
             return .{ .success = .recorded };
         }
 
-        fn controlNow(self: *Self, execution: types.ExecutionId, terminal: bool) outcomes.Exit(types.ControlResult, Failure) {
+        fn controlNow(self: *Self, execution: types.ExecutionId, terminal: bool, request: ?types.ResumeRequest) outcomes.Exit(types.ControlResult, Failure) {
             if (execution.validate() == .err) return .{ .fail = .{ .operation = .malformed_record } };
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
@@ -302,13 +306,28 @@ pub fn MemoryWorkflowEngine(
                 settleCancellation(item);
                 return .{ .success = .recorded };
             }
+            if (request == null or item.checkpoint_revision != request.?.expected_revision) return .{ .success = .stale_revision };
+            if (request.?.expected_terminal_reply) |expected| {
+                if (item.state != .completed or !std.mem.eql(u8, item.completed.?.items, expected)) return .{ .success = .stale_revision };
+                if (item.checkpoint_revision == std.math.maxInt(u64)) return .{ .fail = .{ .operation = .generation_exhausted } };
+                item.completed.?.deinit();
+                item.completed = null;
+                item.checkpoint_revision += 1;
+                item.state = .queued;
+                item.wake_pending = false;
+                return .{ .success = .recorded };
+            }
             switch (item.state) {
                 .running => {
                     if (item.wake_pending) return .{ .success = .already_recorded };
+                    if (item.checkpoint_revision == std.math.maxInt(u64)) return .{ .fail = .{ .operation = .generation_exhausted } };
+                    item.checkpoint_revision += 1;
                     item.wake_pending = true;
                     return .{ .success = .recorded };
                 },
                 .suspended => {
+                    if (item.checkpoint_revision == std.math.maxInt(u64)) return .{ .fail = .{ .operation = .generation_exhausted } };
+                    item.checkpoint_revision += 1;
                     item.state = .queued;
                     return .{ .success = .recorded };
                 },
@@ -339,7 +358,7 @@ pub fn MemoryWorkflowEngine(
                 settleCancellation(item);
                 return .{ .success = .already_terminal };
             }
-            if (item.generation == std.math.maxInt(u64)) return .{ .fail = .{ .operation = .generation_exhausted } };
+            if (item.generation == std.math.maxInt(u64) or item.checkpoint_revision == std.math.maxInt(u64)) return .{ .fail = .{ .operation = .generation_exhausted } };
             var stored_owner = bytes(self.allocator, request.owner_id) catch return .{ .die = outcomes.Defect.out_of_memory };
             var keep_owner = false;
             defer if (!keep_owner) stored_owner.deinit();
@@ -353,6 +372,7 @@ pub fn MemoryWorkflowEngine(
             item.owner_id = stored_owner;
             keep_owner = true;
             item.generation += 1;
+            item.checkpoint_revision += 1;
             item.lease_until = request.policy.lease_until;
             item.state = .running;
             keep_key = true;
@@ -493,10 +513,12 @@ pub fn MemoryWorkflowEngine(
                 settleCancellation(item);
                 return .{ .success = .stale_activation };
             }
+            if (item.checkpoint_revision == std.math.maxInt(u64)) return .{ .fail = .{ .operation = .generation_exhausted } };
             var prepared = bytes(self.allocator, outcome) catch return .{ .die = outcomes.Defect.out_of_memory };
             var keep = false;
             defer if (!keep) prepared.deinit();
             item.completed = prepared;
+            item.checkpoint_revision += 1;
             item.state = .completed;
             item.wake_pending = false;
             keep = true;
@@ -527,6 +549,8 @@ pub fn MemoryWorkflowEngine(
                 settleCancellation(item);
                 return .{ .success = .stale_activation };
             }
+            if (item.checkpoint_revision == std.math.maxInt(u64)) return .{ .fail = .{ .operation = .generation_exhausted } };
+            item.checkpoint_revision += 1;
             if (item.wake_pending) {
                 item.wake_pending = false;
                 item.state = .queued;

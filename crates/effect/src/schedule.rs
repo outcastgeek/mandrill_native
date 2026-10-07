@@ -587,26 +587,7 @@ impl<A, E> Selection<A, E> for Repeat {
         }
     }
 }
-///
-/// # Type parameters
-/// - `A`: Successful application-value type. Additional bound: `Send + 'static`.
-/// - `E`: Expected application-error type. Additional bound: `Send + 'static`.
-/// - `R`: Environment type supplying required capabilities. Additional bound: `HasClock + Send + Sync + 'static`.
-/// - `O`: Output or terminal value type. Additional bound: `Send + 'static`.
-/// - `S`: State or store value type. Additional bound: `ScheduleSampling<R>`.
-/// - `T`: Stored or transferred value type. Additional bound: `Selection<A, E> + Send + 'static`. Additional bound: `:Input: 'static`.
-///
-/// # Parameters
-/// - `program` (`Effect<A, E, R>`): Lazy Effect description executed or transformed here.
-/// - `schedule` (`Schedule<T::Input, O, S>`): The schedule supplied to this operation.
-/// - `started` (`Duration`): The started supplied to this operation.
-/// - `env` (`Arc<R>`): The environment supplying this operation's capabilities.
-/// - `context` (`Context`): Execution context carrying cancellation, scope, and trace state.
-/// - `finish` (`Finish<A, E>`): Continuation receiving the complete terminal outcome.
-///
-/// # Returns
-/// Type: `Step`.
-/// Returns `Step`.
+/// Run one program/schedule step while retaining the previous full outcome; schedule failure is appended without dropping owned primary or cleanup failures.
 fn attempt<A, E, R, O, S, T>(
     program: Effect<A, E, R>,
     schedule: Schedule<T::Input, O, S>,
@@ -644,8 +625,18 @@ where
             }));
             let decision = match decision {
                 Ok(Ok(decision)) => decision,
-                Ok(Err(defect)) => return runtime::finish(finish, Exit::Die(defect)),
-                Err(panic) => return runtime::finish(finish, Exit::Die(Defect::from_panic(panic))),
+                Ok(Err(defect)) => {
+                    return runtime::finish(
+                        finish,
+                        outcome::append_cleanup(previous, Exit::Die(defect)),
+                    );
+                }
+                Err(panic) => {
+                    return runtime::finish(
+                        finish,
+                        outcome::append_cleanup(previous, Exit::Die(Defect::from_panic(panic))),
+                    );
+                }
             };
             match decision {
                 ScheduleDecision::Stop(output) => {
@@ -657,7 +648,9 @@ where
                         ),
                     }
                 }
-                ScheduleDecision::Invalid(defect) => runtime::finish(finish, Exit::Die(defect)),
+                ScheduleDecision::Invalid(defect) => {
+                    runtime::finish(finish, outcome::append_cleanup(previous, Exit::Die(defect)))
+                }
                 ScheduleDecision::Continue {
                     output,
                     delay,
@@ -747,40 +740,23 @@ where
     })
 }
 impl<A: Send + 'static, E: Send + 'static, R: HasClock + Send + Sync + 'static> Effect<A, E, R> {
-    /// Describe another attempt under the supplied retry policy.
+    /// Re-execute typed failures while the supplied schedule permits, using R's clock.
     ///
-    /// # Type parameters
-    /// - `A`: Application value type. Bound: `Send + 'static`.
-    /// - `R`: Environment type. Bound: `HasClock + Send + Sync + 'static`.
-    /// - `O`: Output type. Bounds: `Send + 'static`.
-    /// - `S`: Service or storage type. Bounds: `ScheduleSampling<R>`.
-    /// - `E`: Domain-error type.
-    ///
-    /// # Parameters
-    /// - `schedule` (`Schedule<E, O, S>`): The schedule supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Self`.
+    /// A schedule failure retains the previous primary failure and ordered cleanup
+    /// failures rather than replacing them. Interruption and defects keep their effect
+    /// channels. The underlying program must be reusable or create fresh owned inputs;
+    /// a schedule does not make a consumed one-shot input replayable.
     pub fn retry<O: Send + 'static, S: ScheduleSampling<R>>(
         self,
         schedule: Schedule<E, O, S>,
     ) -> Self {
         iterate::<A, E, R, O, S, Retry>(self, schedule)
     }
-    /// Re-execute a successful Effect while this schedule continues.
+    /// Re-execute successful results while the schedule continues, using R's clock.
     ///
-    /// # Type parameters
-    /// - `E`: Domain-error type. Bound: `Send + 'static`.
-    /// - `R`: Environment type. Bound: `HasClock + Send + Sync + 'static`.
-    /// - `O`: Output type. Bounds: `Send + 'static`.
-    /// - `S`: Service or storage type. Bounds: `ScheduleSampling<R>`.
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Parameters
-    /// - `schedule` (`Schedule<A, O, S>`): The schedule supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Self`.
+    /// Schedule evaluation and waiting remain cancellation-aware. Failure preserves
+    /// existing primary/cleanup information; supply a reusable program because repeat
+    /// does not clone consumed captures or choose an executor.
     pub fn repeat<O: Send + 'static, S: ScheduleSampling<R>>(
         self,
         schedule: Schedule<A, O, S>,

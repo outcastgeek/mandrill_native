@@ -17,7 +17,7 @@ pub fn PriorityQueue(comptime T: type, comptime capacity: usize, comptime compar
     return struct {
         const Self = @This();
         const children_per_node: usize = 2;
-        const State = struct { items: [capacity]?T = [_]?T{null} ** capacity, length: usize = 0 };
+        const State = struct { items: [capacity]?T = @splat(null), length: usize = 0 };
         /// `Offered` cases: `accepted`, `full`.
         pub const Offered = enum { accepted, full };
         /// Priority-queue removal result: selected value or empty queue.

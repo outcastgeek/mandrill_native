@@ -1,5 +1,6 @@
 """Prove that allocator leaks fail the native Zig test runner and build target."""
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -10,7 +11,7 @@ cases = (
     ("leak detector rejects unreleased allocation", True),
 )
 
-for mode in ("Debug", "ReleaseSafe"):
+for mode in ("debug", "safe"):
     for name, should_leak in cases:
         executed = subprocess.run(
             [zig, "build", "--build-file", str(package / "tests" / "leak_detection_build.zig"),
@@ -22,9 +23,12 @@ for mode in ("Debug", "ReleaseSafe"):
         output = executed.stdout + executed.stderr
         # The selected test must pass its own assertions. Compilation errors,
         # traps, launch errors, and assertion failures cannot count as evidence.
-        if "1/1 tests passed" not in output:
+        leak_line = r"^error: 'leak_detection\.test\." + re.escape(name) + r"' leaked 1 allocations:$"
+        detected_leak = re.search(leak_line, output, re.MULTILINE) is not None
+        unexpected = re.sub(leak_line, "", output, flags=re.MULTILINE)
+        if ("fixture assertions completed" not in output or "1 pass (1 total)" not in output
+                or re.search(r"(?:error:|panic:|[1-9][0-9]* (?:fail|crash|timeout) \()", unexpected)):
             sys.exit(f"{mode}: fixture did not finish its assertions\n{output}")
-        detected_leak = f"{name}' leaked 1 allocations:" in output
         if should_leak:
             if executed.returncode == 0 or not detected_leak:
                 sys.exit(f"{mode}: leaked allocation did not fail the build\n{output}")

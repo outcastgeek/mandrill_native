@@ -381,21 +381,12 @@ impl<T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
         }
     }
 
-    /// Acquire, use, invalidate, and await protected release before publication.
-    /// To survive observer loss, execute through a retained owned-run driver.
+    /// Acquire an owned resource lazily, run its body, then execute protected release.
     ///
-    /// # Type parameters
-    /// - `A`: Application value type. Bounds: `Send + 'static`.
-    /// - `E`: Domain-error type.
-    /// - `R`: Environment type.
-    /// - `T`: Value or item type.
-    ///
-    /// # Parameters
-    /// - `use_resource` (`impl Fn(ResourceValue<T>) -> Effect<A, E, R> + Send + Sync + 'static`): The use resource supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Effect<A, E, R>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// `use_resource` receives a checked ResourceValue handle, not the underlying
+    /// payload. Release consumes that payload and receives the body's borrowed primary
+    /// outcome. Construction panics, body interruption and release failures preserve
+    /// primary/cleanup channels; no payload cloning is required.
     pub fn use_with<A: Send + 'static>(
         self,
         use_resource: impl Fn(ResourceValue<T>) -> Effect<A, E, R> + Send + Sync + 'static,
@@ -443,6 +434,7 @@ impl<T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
                             let release_context = context.clone();
                             let after_body = runtime::continuation(move |result| {
                                 let result = runtime::publish(result, &release_context);
+                                let protected = release_context.protected();
                                 let cleanup = catch_unwind(AssertUnwindSafe(|| {
                                     owner.take().map(|value| release(value, result.primary()))
                                 }));
@@ -469,7 +461,6 @@ impl<T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
                                         );
                                     }
                                 };
-                                let protected = release_context.protected();
                                 cleanup.execute(
                                     release_env,
                                     protected,
@@ -505,17 +496,7 @@ impl<T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
         })
     }
 
-    /// # Type parameters
-    /// - `E`: Domain-error type.
-    /// - `R`: Environment type.
-    /// - `T`: Value or item type.
-    ///
-    /// # Parameters
-    /// - `scope` (`Scope<E>`): Owner that joins child work and releases resources at close.
-    ///
-    /// # Returns
-    /// Type: `Effect<ResourceValue<T>, E, R>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// Transfer acquisition into scope ownership before publishing a checked handle; construct and execute release in protected cleanup, preserving defects.
     pub(crate) fn acquire_scoped(self, scope: Scope<E>) -> Effect<ResourceValue<T>, E, R> {
         Effect::new(move |env, context, finish| {
             let scope = scope.clone();
@@ -530,15 +511,14 @@ impl<T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
                         let handle = ResourceValue::new(resource);
                         let owner = ResourceOwner::new(handle.clone());
                         let abandoned = handle.clone();
+                        let context = context.protected();
                         let finalizer = Registered::with_abandon(
                             move |finish| match catch_unwind(AssertUnwindSafe(|| {
                                 owner
                                     .take()
                                     .map(|resource| release(resource, PrimaryOutcomeRef::Succeeded))
                             })) {
-                                Ok(Some(cleanup)) => {
-                                    cleanup.execute(env, context.protected(), finish)
-                                }
+                                Ok(Some(cleanup)) => cleanup.execute(env, context, finish),
                                 Ok(None) => runtime::finish(
                                     finish,
                                     Exit::Die(Defect::from(LibraryDefect::ResourceReleasedTwice)),

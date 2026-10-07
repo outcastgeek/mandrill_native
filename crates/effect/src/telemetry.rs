@@ -11,8 +11,8 @@ use std::time::Duration;
 /// Type alias for annotations in telemetry.
 pub type Annotations = BTreeMap<Arc<str>, Arc<str>>;
 static EMPTY_ANNOTATIONS: Annotations = Annotations::new();
+/// Immutable shared annotations carried through execution context; Debug reports only entry count and never exposes annotation values.
 #[derive(Clone, Default)]
-/// An immutable, shared set of annotations that can cross execution boundaries without copying each entry.
 pub enum SharedAnnotations {
     #[default]
     /// No value is present.
@@ -67,7 +67,9 @@ impl std::fmt::Debug for SharedAnnotations {
     /// Type: `std::fmt::Result`.
     /// Returns `std::fmt::Result`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(self.as_ref(), f)
+        f.debug_struct("SharedAnnotations")
+            .field("entries", &self.len())
+            .finish()
     }
 }
 

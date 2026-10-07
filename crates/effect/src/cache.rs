@@ -20,13 +20,20 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-/// A shared payload, including non-Sync data, without cloning that payload.
-/// Inspection is synchronous and must not reenter this same data gate.
+/// Shared ownership of a payload without requiring `T: Clone`.
 ///
-/// # Type parameters
-/// - `T`: Value or item type. Bound or type: `Send + 'static`.
+/// Cloning shares one protected value. [`Self::with`] borrows it for a synchronous
+/// inspection; [`Self::try_into_owned`] transfers it only when this is the last
+/// owner. Debug output is opaque and does not inspect the application payload.
 pub struct SharedValue<T: Send + 'static> {
     value: Arc<Mutex<T>>,
+}
+impl<T: Send + 'static> std::fmt::Debug for SharedValue<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SharedValue")
+            .finish_non_exhaustive()
+    }
 }
 impl<T: Send + 'static> Clone for SharedValue<T> {
     ///
@@ -114,7 +121,7 @@ pub struct CacheConfig<K, E> {
     pub equal: Equality<K>,
     /// Time for which the stored value remains valid. Type: `Option<Duration>`.
     pub ttl: Option<Duration>,
-    /// The maximum admitted capacity. Type: `CacheCapacity`.
+    /// Settled-entry retention capacity; active producer admission is controlled separately.
     pub capacity: CacheCapacity,
     /// Predicate selecting expected errors that remain cached. Type: `Arc<dyn Fn(&E) -> bool + Send + Sync>`.
     pub cache_failure: Arc<dyn Fn(&E) -> bool + Send + Sync>,
@@ -132,11 +139,96 @@ impl<K, E> Clone for CacheConfig<K, E> {
         }
     }
 }
-/// Type alias for shared outcome in cache.
+/// The lookup path selected atomically when a key is acquired by [`Cache::get_observed`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheObservation {
+    /// A fresh settled value was reused without dispatching a producer.
+    Retained,
+    /// The lookup joined already active producer work for an equivalent key.
+    Shared,
+    /// The lookup admitted new producer work for this key.
+    Loaded,
+}
+/// A shared successful payload and its acquisition classification; no payload clone is required.
+pub struct CacheLookup<A: Send + 'static> {
+    /// Shared ownership of the successful cached payload.
+    pub value: SharedValue<A>,
+    /// How this acquisition found or started work, even if completion races with observation.
+    pub observation: CacheObservation,
+}
+type OutcomeTtl<A, E> = Arc<dyn Fn(&Exit<A, E>) -> Result<Option<Duration>, Defect> + Send + Sync>;
+/// Retention lifetime selected after producer settlement, using the environment clock.
 ///
-/// # Type parameters
-/// - `A`: Application value type.
-/// - `E`: Domain-error type.
+/// Expiry affects retained reuse, not execution cancellation. None means no expiry;
+/// failure retention still depends on [`CacheConfig::cache_failure`].
+pub enum CacheTtl<A, E> {
+    /// Use one optional duration for all retainable outcomes; None retains without time expiry.
+    Fixed(Option<Duration>),
+    /// Compute an optional duration from the full settled outcome outside the cache gate; callback errors remain defects.
+    Outcome(OutcomeTtl<A, E>),
+}
+impl<A, E> Clone for CacheTtl<A, E> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Fixed(ttl) => Self::Fixed(*ttl),
+            Self::Outcome(callback) => Self::Outcome(Arc::clone(callback)),
+        }
+    }
+}
+/// Admission limit for independent active producers, checked before task-provider dispatch.
+pub enum CacheAdmission<E> {
+    /// Allow independent active producers without an explicit admission count bound.
+    Unbounded,
+    /// Reject new independent work at the supplied active bound; waiters joining existing work consume no additional slot.
+    Bounded {
+        /// Maximum admitted independent producer count.
+        maximum: NonZeroUsize,
+        /// Factory producing the typed rejection when active admission is exhausted.
+        capacity_error: Arc<dyn Fn() -> E + Send + Sync>,
+    },
+}
+impl<E> Clone for CacheAdmission<E> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Unbounded => Self::Unbounded,
+            Self::Bounded {
+                maximum,
+                capacity_error,
+            } => Self::Bounded {
+                maximum: *maximum,
+                capacity_error: Arc::clone(capacity_error),
+            },
+        }
+    }
+}
+/// Outcome expiry and active admission settings used by [`Cache::make_with_options`].
+pub struct CacheOptions<A, E> {
+    /// Retention lifetime selection; overrides the legacy fixed TTL in CacheConfig.
+    pub ttl: CacheTtl<A, E>,
+    /// Active producer bound, independent of settled retention capacity.
+    pub admission: CacheAdmission<E>,
+}
+impl<A, E> Clone for CacheOptions<A, E> {
+    fn clone(&self) -> Self {
+        Self {
+            ttl: self.ttl.clone(),
+            admission: self.admission.clone(),
+        }
+    }
+}
+pub(crate) enum CacheSelectionError<E: Send + 'static> {
+    Defect(Defect),
+    Capacity(SharedValue<E>),
+}
+impl<E: Send + 'static> CacheSelectionError<E> {
+    pub(crate) fn exit<A>(self) -> Exit<A, SharedValue<E>> {
+        match self {
+            Self::Defect(defect) => Exit::Die(defect),
+            Self::Capacity(error) => Exit::Fail(error),
+        }
+    }
+}
+
 type SharedOutcome<A, E> = Exit<SharedValue<A>, SharedValue<E>>;
 /// Typed entry state used by cache.
 ///
@@ -218,6 +310,7 @@ struct Inner<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
     changed: Event,
     parent: Cancellation,
     config: CacheConfig<K, E>,
+    options: CacheOptions<A, E>,
     now: Arc<dyn Fn() -> Duration + Send + Sync>,
     start: StartLoad<K, A, E>,
 }
@@ -288,22 +381,37 @@ fn settle<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static>(
             Exit::Die(_) | Exit::Interrupted | Exit::FinalizationFailed(_) => false,
         };
         let expires = match owner.upgrade() {
-            Some(owner) if keep => match owner.config.ttl {
-                Some(ttl) => Some(
+            Some(owner) if keep => {
+                let ttl = match &owner.options.ttl {
+                    CacheTtl::Fixed(ttl) => *ttl,
+                    CacheTtl::Outcome(callback) => callback(&original)?,
+                };
+                ttl.map(|ttl| {
                     (owner.now)()
                         .checked_add(ttl)
-                        .ok_or_else(|| Defect::from(LibraryDefect::ClockDeadlineOverflow))?,
-                ),
-                None => None,
-            },
+                        .ok_or_else(|| Defect::from(LibraryDefect::ClockDeadlineOverflow))
+                })
+                .transpose()?
+            }
             Some(_) | None => None,
         };
-        Ok::<_, Defect>((share(original), keep, expires))
+        Ok::<_, Defect>((keep, expires))
     }));
     let (outcome, keep, expires) = match result {
-        Ok(Ok(result)) => result,
-        Ok(Err(defect)) => (Exit::Die(defect), false, None),
-        Err(panic) => (Exit::Die(Defect::from_panic(panic)), false, None),
+        Ok(Ok((keep, expires))) => (share(original), keep, expires),
+        Ok(Err(defect)) => (
+            share(outcome::append_cleanup(original, Exit::Die(defect))),
+            false,
+            None,
+        ),
+        Err(panic) => (
+            share(outcome::append_cleanup(
+                original,
+                Exit::Die(Defect::from_panic(panic)),
+            )),
+            false,
+            None,
+        ),
     };
     let mut entry_state = entry
         .state
@@ -397,26 +505,33 @@ fn settle<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static>(
     notify_all(&entry.changed);
 }
 impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A, E> {
-    /// Error payloads are shared handles so all waiters and cleanup owners retain
-    /// typed errors without requiring E: Clone or copying application memory.
+    /// Lazily construct a scoped cache with legacy fixed TTL and unbounded active admission.
     ///
-    /// # Type parameters
-    /// - `R`: Environment type. Bounds: `HasClock + HasTaskSpawner + Send + Sync + 'static`.
-    /// - `A`: Success or application-value type.
-    /// - `E`: Domain-error type.
-    /// - `K`: Type supplied by the enclosing impl or trait.
-    ///
-    /// # Parameters
-    /// - `scope` (`Scope<SharedValue<E>>`): Owner that joins child work and releases resources at close.
-    /// - `config` (`CacheConfig<K, E>`): The config supplied to this operation.
-    /// - `load` (`impl Fn(&K) -> Effect<A, E, R> + Send + Sync + 'static`): The load supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Effect<Self, SharedValue<E>, R>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// R supplies clock and task spawner. Retention still follows config.capacity and
+    /// cache_failure. Use make_with_options for explicit active admission and outcome
+    /// TTL. Scope closure cancels and joins owned producers.
     pub fn make<R: HasClock + HasTaskSpawner + Send + Sync + 'static>(
         scope: Scope<SharedValue<E>>,
         config: CacheConfig<K, E>,
+        load: impl Fn(&K) -> Effect<A, E, R> + Send + Sync + 'static,
+    ) -> Effect<Self, SharedValue<E>, R> {
+        let options = CacheOptions {
+            ttl: CacheTtl::Fixed(config.ttl),
+            admission: CacheAdmission::Unbounded,
+        };
+        Self::make_with_options(scope, config, options, load)
+    }
+
+    /// Lazily create a scoped cache with explicit retention, expiry and active admission.
+    ///
+    /// `R` supplies clock and task-spawner capabilities and is retained by the engine.
+    /// Equivalent keys share one producer. Active capacity is checked before dispatch;
+    /// outcome TTL and failure-retention callbacks run outside the state gate. The
+    /// scope owns shutdown and joins producer cleanup, including abandonment.
+    pub fn make_with_options<R: HasClock + HasTaskSpawner + Send + Sync + 'static>(
+        scope: Scope<SharedValue<E>>,
+        config: CacheConfig<K, E>,
+        options: CacheOptions<A, E>,
         load: impl Fn(&K) -> Effect<A, E, R> + Send + Sync + 'static,
     ) -> Effect<Self, SharedValue<E>, R> {
         let load = Arc::new(load);
@@ -438,6 +553,7 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
                     changed: Event::new(),
                     parent: context.cancellation.child(),
                     config: config.clone(),
+                    options: options.clone(),
                     now: Arc::new(move || now_env.clock().now()),
                     start: Arc::new(move |entry, owner, context| {
                         let env = Arc::clone(&load_env);
@@ -586,7 +702,16 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
         &self,
         key: Arc<K>,
         context: &Context,
-    ) -> Result<Option<Arc<Entry<K, A, E>>>, Defect> {
+    ) -> Result<Option<Arc<Entry<K, A, E>>>, CacheSelectionError<E>> {
+        self.select_observed_entry(key, context)
+            .await
+            .map(|entry| entry.map(|(entry, _)| entry))
+    }
+    async fn select_observed_entry(
+        &self,
+        key: Arc<K>,
+        context: &Context,
+    ) -> Result<Option<(Arc<Entry<K, A, E>>, CacheObservation)>, CacheSelectionError<E>> {
         loop {
             if context.cancelled() {
                 return Ok(None);
@@ -598,7 +723,9 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if state.closed {
-                    return Err(Defect::from(LibraryDefect::CacheClosed));
+                    return Err(CacheSelectionError::Defect(Defect::from(
+                        LibraryDefect::CacheClosed,
+                    )));
                 }
                 (
                     Arc::clone(&state.revision),
@@ -609,18 +736,24 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
             let fresh = entries
                 .into_iter()
                 .filter(|entry| {
-                    entry
+                    let state = entry
                         .state
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .expires
-                        .is_none_or(|expires| now < expires)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    !state.invalidated && state.expires.is_none_or(|expires| now < expires)
                 })
                 .collect::<Vec<_>>();
             let found = fresh
                 .iter()
                 .find(|entry| (self.inner.config.equal)(&entry.key, &key))
                 .map(Arc::clone);
+            let admission_error = match &self.inner.options.admission {
+                CacheAdmission::Unbounded => None,
+                CacheAdmission::Bounded {
+                    maximum,
+                    capacity_error,
+                } => Some((*maximum, Arc::clone(capacity_error))),
+            };
             let selection = {
                 let mut state = self
                     .inner
@@ -628,7 +761,9 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if state.closed {
-                    return Err(Defect::from(LibraryDefect::CacheClosed));
+                    return Err(CacheSelectionError::Defect(Defect::from(
+                        LibraryDefect::CacheClosed,
+                    )));
                 }
                 if !Arc::ptr_eq(&state.revision, &revision) {
                     None
@@ -642,6 +777,22 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
                                 .retain(|candidate| !Arc::ptr_eq(candidate, &entry));
                             state.retained.push_back(Arc::clone(&entry));
                             (entry, false)
+                        }
+                        None if admission_error
+                            .as_ref()
+                            .is_some_and(|(maximum, _)| state.active.len() >= maximum.get()) =>
+                        {
+                            // Restore the snapshot; admission cannot evict entries.
+                            state.retained = old;
+                            drop(state);
+                            if let Some((_, error)) = &admission_error {
+                                return Err(CacheSelectionError::Capacity(SharedValue::new(
+                                    error(),
+                                )));
+                            }
+                            return Err(CacheSelectionError::Defect(Defect::from(
+                                LibraryDefect::CacheClosed,
+                            )));
                         }
                         None => {
                             let entry = Arc::new(Entry {
@@ -662,10 +813,23 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
                         }
                     };
                     state.revision = Arc::new(());
-                    Some((entry, start, old))
+                    let observation = if start {
+                        CacheObservation::Loaded
+                    } else if entry
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .outcome
+                        .is_some()
+                    {
+                        CacheObservation::Retained
+                    } else {
+                        CacheObservation::Shared
+                    };
+                    Some((entry, start, old, observation))
                 }
             };
-            if let Some((entry, start, old)) = selection {
+            if let Some((entry, start, old, observation)) = selection {
                 drop(old);
                 if start {
                     (self.inner.start)(
@@ -674,7 +838,7 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
                         context.parallel(entry.cancellation.clone()),
                     );
                 }
-                return Ok(Some(entry));
+                return Ok(Some((entry, observation)));
             }
             cooperative_retry().await;
         }
@@ -771,20 +935,7 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
         }
         result
     }
-    /// Read the current value through the declared storage or state capability.
-    ///
-    /// # Type parameters
-    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
-    /// - `A`: Success or application-value type.
-    /// - `E`: Domain-error type.
-    /// - `K`: Type supplied by the enclosing impl or trait.
-    ///
-    /// # Parameters
-    /// - `key` (`K`): Stable key used to locate or identify the selected value.
-    ///
-    /// # Returns
-    /// Type: `Effect<SharedValue<A>, SharedValue<E>, R>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// Lazily get or load one key, sharing producer work and successful/error ownership for equivalent keys; use get_observed for acquisition classification.
     pub fn get<R: Send + Sync + 'static>(
         &self,
         key: K,
@@ -792,18 +943,126 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
         self.get_shared(Arc::new(key))
     }
 
-    /// # Type parameters
-    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
-    /// - `A`: Success or application-value type.
-    /// - `E`: Domain-error type.
-    /// - `K`: Type supplied by the enclosing impl or trait.
+    /// Lazily acquire a key and report Retained, Shared or Loaded with its shared success.
     ///
-    /// # Parameters
-    /// - `key` (`Arc<K>`): Stable key used to locate or identify the selected value.
+    /// Classification is selected with the cache entry; all equivalent waiters observe
+    /// one producer outcome. Cancelling one observer does not cancel work still owned
+    /// by other observers or retention. Typed loader errors are shared, not cloned.
+    #[doc(alias = "getObserved")]
+    pub fn get_observed<R: Send + Sync + 'static>(
+        &self,
+        key: K,
+    ) -> Effect<CacheLookup<A>, SharedValue<E>, R> {
+        let key = Arc::new(key);
+        let cache = self.clone();
+        Effect::new(move |_, context, finish| {
+            let cache = cache.clone();
+            let key = Arc::clone(&key);
+            Step::Suspended(Box::pin(async move {
+                let work = async {
+                    match cache.select_observed_entry(key, &context).await {
+                        Ok(Some((entry, observation))) => match cache
+                            .observe_value(&entry, context.cancellation.clone())
+                            .await
+                        {
+                            Exit::Success(value) => {
+                                Exit::Success(CacheLookup { value, observation })
+                            }
+                            Exit::Fail(error) => Exit::Fail(error),
+                            Exit::Die(defect) => Exit::Die(defect),
+                            Exit::Interrupted => Exit::Interrupted,
+                            Exit::FinalizationFailed(details) => Exit::FinalizationFailed(details),
+                        },
+                        Ok(None) => Exit::Interrupted,
+                        Err(error) => error.exit(),
+                    }
+                };
+                let result = AssertUnwindSafe(work)
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|panic| Exit::Die(Defect::from_panic(panic)));
+                runtime::finish(finish, result)
+            }))
+        })
+    }
+
+    /// Lazily inspect only a fresh retained success without registering or dispatching work.
     ///
-    /// # Returns
-    /// Type: `Effect<SharedValue<A>, SharedValue<E>, R>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// Returns None for absent, expired, active or failed entries. Payload handles share
+    /// ownership; this call never joins an active producer.
+    pub fn try_get<R: Send + Sync + 'static>(
+        &self,
+        key: K,
+    ) -> Effect<Option<SharedValue<A>>, SharedValue<E>, R> {
+        let cache = self.clone();
+        let key = Arc::new(key);
+        Effect::new(move |_, context, finish| {
+            let cache = cache.clone();
+            let key = Arc::clone(&key);
+            Step::Suspended(Box::pin(async move {
+                let work = async {
+                    loop {
+                        if context.cancelled() {
+                            return Exit::Interrupted;
+                        }
+                        let (revision, entries, closed) = {
+                            let state = cache
+                                .inner
+                                .state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            (
+                                Arc::clone(&state.revision),
+                                state.retained.iter().cloned().collect::<Vec<_>>(),
+                                state.closed,
+                            )
+                        };
+                        if closed {
+                            return Exit::Die(Defect::from(LibraryDefect::CacheClosed));
+                        }
+                        let now = (cache.inner.now)();
+                        let found = entries
+                            .iter()
+                            .find(|entry| (cache.inner.config.equal)(&entry.key, &key));
+                        let value = found.and_then(|entry| {
+                            let state = entry
+                                .state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if state.invalidated
+                                || state.expires.is_some_and(|expires| now >= expires)
+                            {
+                                None
+                            } else {
+                                match &state.outcome {
+                                    Some(Exit::Success(value)) => Some(value.clone()),
+                                    _ => None,
+                                }
+                            }
+                        });
+                        let current = {
+                            let state = cache
+                                .inner
+                                .state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            Arc::ptr_eq(&revision, &state.revision)
+                        };
+                        if current {
+                            return Exit::Success(value);
+                        }
+                        cooperative_retry().await;
+                    }
+                };
+                let result = AssertUnwindSafe(work)
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|panic| Exit::Die(Defect::from_panic(panic)));
+                runtime::finish(finish, result)
+            }))
+        })
+    }
+
     pub(crate) fn get_shared<R: Send + Sync + 'static>(
         &self,
         key: Arc<K>,
@@ -821,7 +1080,7 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
                                 .await
                         }
                         Ok(None) => Exit::Interrupted,
-                        Err(defect) => Exit::Die(defect),
+                        Err(error) => error.exit(),
                     }
                 };
                 let outcome = AssertUnwindSafe(work)
@@ -909,10 +1168,19 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
         &self,
         key: Arc<K>,
     ) -> Effect<(), SharedValue<E>, R> {
+        let equal = Arc::clone(&self.inner.config.equal);
+        self.invalidate_matching(move |candidate, _, _| equal(candidate, &key))
+    }
+
+    pub(crate) fn invalidate_matching<R: Send + Sync + 'static>(
+        &self,
+        predicate: impl Fn(&K, Option<SharedValue<A>>, bool) -> bool + Send + Sync + 'static,
+    ) -> Effect<(), SharedValue<E>, R> {
+        let predicate = Arc::new(predicate);
         let cache = self.clone();
         Effect::new(move |_, _, finish| {
             let cache = cache.clone();
-            let key = Arc::clone(&key);
+            let predicate = Arc::clone(&predicate);
             Step::Suspended(Box::pin(async move {
                 let work = async {
                     loop {
@@ -939,7 +1207,20 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
                         };
                         let mut selected = Vec::new();
                         for entry in entries.into_iter().chain(diagnostics) {
-                            if (cache.inner.config.equal)(&entry.key, &key)
+                            let (value, pending) = {
+                                let state = entry
+                                    .state
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                (
+                                    match &state.outcome {
+                                        Some(Exit::Success(value)) => Some(value.clone()),
+                                        _ => None,
+                                    },
+                                    state.outcome.is_none(),
+                                )
+                            };
+                            if predicate(&entry.key, value, pending)
                                 && !selected
                                     .iter()
                                     .any(|candidate| Arc::ptr_eq(candidate, &entry))
@@ -999,9 +1280,165 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
         })
         .uninterruptible()
     }
+    /// Lazily evict all entries, fence active generations, and join their owned cleanup.
     ///
-    /// # Returns
-    /// Type: `()`.
+    /// Eviction commits before cancellation/destruction outside the gate. Cleanup
+    /// failures remain in the effect outcome; the cache remains open for later loads.
+    pub fn clear<R: Send + Sync + 'static>(&self) -> Effect<(), SharedValue<E>, R> {
+        self.invalidate_matching(|_, _, _| true)
+    }
+
+    /// Lazily replace a key with one owned success, fencing older producer generations.
+    ///
+    /// Publishes the replacement under the gate, then cancels and joins old work
+    /// outside it. A late producer cannot overwrite the new value. Retention/TTL rules
+    /// still apply, and the stored input is consumed once without cloning.
+    pub fn set<R: Send + Sync + 'static>(&self, key: K, value: A) -> Effect<(), SharedValue<E>, R> {
+        let cache = self.clone();
+        let key = Arc::new(key);
+        Effect::from_result_once(Ok(value)).flat_map(move |value| {
+            let cache = cache.clone();
+            let key = Arc::clone(&key);
+            let value = Arc::new(Mutex::new(Some(value)));
+            Effect::new(move |_, _, finish| {
+                let cache = cache.clone();
+                let key = Arc::clone(&key);
+                let value = Arc::clone(&value);
+                Step::Suspended(Box::pin(async move {
+                    let work = async {
+                        let value = value
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take();
+                        let Some(value) = value else {
+                            return Exit::Die(Defect::from(LibraryDefect::CacheClosed));
+                        };
+                        loop {
+                            let (revision, entries, closed) = {
+                                let state = cache
+                                    .inner
+                                    .state
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                (
+                                    Arc::clone(&state.revision),
+                                    state
+                                        .retained
+                                        .iter()
+                                        .chain(&state.active)
+                                        .chain(state.diagnostics.iter().map(|(entry, _)| entry))
+                                        .cloned()
+                                        .collect::<Vec<_>>(),
+                                    state.closed,
+                                )
+                            };
+                            if closed {
+                                return Exit::Die(Defect::from(LibraryDefect::CacheClosed));
+                            }
+                            let mut selected = Vec::new();
+                            for entry in entries {
+                                if (cache.inner.config.equal)(&entry.key, &key)
+                                    && !selected
+                                        .iter()
+                                        .any(|candidate| Arc::ptr_eq(candidate, &entry))
+                                {
+                                    selected.push(entry);
+                                }
+                            }
+                            let installed = {
+                                let mut state = cache
+                                    .inner
+                                    .state
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                if !Arc::ptr_eq(&revision, &state.revision) {
+                                    None
+                                } else {
+                                    for entry in &selected {
+                                        let mut state = entry
+                                            .state
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                        state.invalidated = true;
+                                        state.retiring = true;
+                                    }
+                                    let mut diagnostics = Vec::new();
+                                    let mut index = 0;
+                                    while index < state.diagnostics.len() {
+                                        if selected.iter().any(|entry| {
+                                            state.diagnostics.get(index).is_some_and(
+                                                |(candidate, _)| Arc::ptr_eq(entry, candidate),
+                                            )
+                                        }) {
+                                            diagnostics.push(state.diagnostics.remove(index).1);
+                                        } else {
+                                            index += 1;
+                                        }
+                                    }
+                                    state.retained.retain(|entry| {
+                                        !selected
+                                            .iter()
+                                            .any(|candidate| Arc::ptr_eq(candidate, entry))
+                                    });
+                                    let entry = Arc::new(Entry {
+                                        key: Arc::clone(&key),
+                                        state: Mutex::new(EntryState {
+                                            outcome: None,
+                                            expires: None,
+                                            invalidated: false,
+                                            retiring: false,
+                                            observed: true,
+                                        }),
+                                        changed: Event::new(),
+                                        cancellation: cache.inner.parent.child(),
+                                    });
+                                    state.retained.push_back(Arc::clone(&entry));
+                                    state.active.push(Arc::clone(&entry));
+                                    state.revision = Arc::new(());
+                                    Some((entry, diagnostics))
+                                }
+                            };
+                            if let Some((entry, diagnostics)) = installed {
+                                settle(&entry, &Arc::downgrade(&cache.inner), Exit::Success(value));
+                                let published = entry
+                                    .state
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .outcome
+                                    .clone()
+                                    .unwrap_or_else(|| {
+                                        Exit::Die(Defect::from(
+                                            LibraryDefect::MissingInterpreterOutcome,
+                                        ))
+                                    });
+                                let retired = cache.retire(selected, diagnostics).await;
+                                return outcome::append_cleanup(
+                                    match published {
+                                        Exit::Success(_) => Exit::Success(()),
+                                        Exit::Fail(error) => Exit::Fail(error),
+                                        Exit::Die(defect) => Exit::Die(defect),
+                                        Exit::Interrupted => Exit::Interrupted,
+                                        Exit::FinalizationFailed(details) => {
+                                            Exit::FinalizationFailed(details)
+                                        }
+                                    },
+                                    retired,
+                                );
+                            }
+                            cooperative_retry().await;
+                        }
+                    };
+                    let result = AssertUnwindSafe(work)
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|panic| Exit::Die(Defect::from_panic(panic)));
+                    runtime::finish(finish, result)
+                }))
+            })
+            .uninterruptible()
+        })
+    }
+
     async fn shutdown_start(&self) {
         let selected = {
             let mut state = self

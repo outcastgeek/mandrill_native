@@ -62,23 +62,12 @@ impl ClusterSingleton {
         Self { address }
     }
 
-    /// Execute or describe one run using the supplied environment and inputs.
+    /// Lazily claim this singleton activation until lease_until, then run body with its exact owner.
     ///
-    /// # Type parameters
-    /// - `A`: Application value type. Additional bound: `Send + 'static`.
-    /// - `BodyError`: Error produced by the registered workflow body. Additional bound: `Send + 'static`.
-    /// - `ActivationError`: Error returned by the activation store. Additional bound: `Send + 'static`.
-    /// - `ClockError`: Error returned by the clock capability. Additional bound: `Send + 'static`.
-    /// - `R`: Environment type. Additional bound: `HasClusterActivationStore + HasWallClock + Send + Sync + 'static`. Additional bound: `:Store: ClusterActivationStore<Error = ActivationError>`. Additional bound: `:Clock: WallClock<Error = ClockError>`.
-    ///
-    /// # Parameters
-    /// - `activation` (`ActivationId`): The activation supplied to this operation.
-    /// - `lease_until` (`UtcMillis`): Instant at which the claim or activation lease expires.
-    /// - `body` (`impl Fn(ClusterOwner) -> Effect<A, BodyError, R> + Send + Sync + 'static`): Application callback or effect executed inside the owning scope.
-    ///
-    /// # Returns
-    /// Type: `Effect<SingletonOutcome<A>, SingletonError<BodyError, ActivationError, ClockError>, R>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// R supplies activation storage and wall time. Body construction and execution
+    /// remain within protected ownership cleanup; release failure is retained with
+    /// the primary body outcome, including interruption. This does not start a process
+    /// scheduler or make an in-memory provider physically durable.
     pub fn run<A, BodyError, ActivationError, ClockError, R>(
         &self,
         activation: ActivationId,
@@ -116,7 +105,8 @@ impl ClusterSingleton {
                                     let owner = lease.owner;
                                     let final_store = Arc::clone(&store);
                                     let final_owner = owner.clone();
-                                    body(owner).map_error(SingletonError::Body)
+                                    let body=Arc::clone(&body);
+                                    Effect::defer(move || body(owner.clone())).map_error(SingletonError::Body)
                                         .ensuring_with(move |reason| {
                                             let store = Arc::clone(&final_store);
                                             let owner = final_owner.clone();

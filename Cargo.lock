@@ -1152,6 +1152,8 @@ dependencies = [
  "event-listener 5.4.2",
  "futures-executor",
  "futures-util",
+ "num-bigint",
+ "regex-automata",
  "serde",
  "serde_json",
  "serde_stacker",

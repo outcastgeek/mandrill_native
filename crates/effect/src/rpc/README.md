@@ -8,6 +8,6 @@ Streaming requires an acknowledgement before the server pulls another item. Afte
 
 The caller supplies frame and JSON resource limits in `RpcEnvelopePolicy`. `EntityDispatcher::from_handler` (or `from_addressed_handler`) requires the first typed handler; `entity! { policy: ..., entity_type: ..., handler: ... }` is the macro form, while `entity! { dispatcher: ..., ... }` adds to an existing dispatcher. An addressed registration validates the decoded request against the target entity before calling business logic. Its reply is encoded as a success or domain-error envelope and saved by the Cluster message store only after the runner's completion phase.
 
-The [native dispatcher test](../../tests/rpc_cluster_dispatch.rs) covers a framed request and response, typed domain reply, wrong-address rejection before handler invocation, unknown operation and malformed frame. The [Cluster runner test](../../tests/cluster_runner_bridge.rs) combines accepted-message claim and recorded reply with an encoded workflow cancellation routed through the typed RPC dispatcher and `ClusterWorkflowEngine`.
-
-The external [provider-neutral consumer](../../tests/fixtures/shared/provider_program.rs) builds `rpc_operation!` and `rpc_protocol!` definitions in `rpc_cpu` and `entity_macro`, then executes framed calls with the CPU provider selected through `R`.
+See the [provider-neutral example](../../tests/fixtures/shared/provider_program.rs),
+`rpc_cpu` and `entity_macro`, for `rpc_operation!` and `rpc_protocol!` definitions
+with the CPU provider supplied through `R`.

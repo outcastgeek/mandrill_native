@@ -44,7 +44,7 @@ test "100000 runtime-built bindings execute, rerun, and destroy iteratively" {
 
 test "description and execution allocation failures retain their allocator domains" {
     const Binding = enum { first, second, third };
-    const depth = @typeInfo(Binding).@"enum".fields.len;
+    const depth = @typeInfo(Binding).@"enum".field_names.len;
     var remaining: usize = 0;
     for (0..depth + 1) |fail_index| {
         var construction = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });

@@ -16,7 +16,7 @@ const durable_clock = @import("../workflow/durable_clock.zig");
 pub const Command = union(enum) {
     run: workflow_types.Submission,
     poll: workflow_types.ExecutionId,
-    resume_execution: workflow_types.ExecutionId,
+    resume_execution: workflow_types.ResumeRequest,
     cancel_terminal: workflow_types.ExecutionId,
     interrupt: workflow_types.ExecutionId,
     lookup_activity: struct { execution: workflow_types.ExecutionId, activity: workflow_types.ActivityId },
@@ -41,7 +41,8 @@ pub const Command = union(enum) {
     pub fn execution(self: @This()) workflow_types.ExecutionId {
         return switch (self) {
             .run => |value| value.execution,
-            .poll, .resume_execution, .cancel_terminal, .interrupt => |value| value,
+            .poll, .cancel_terminal, .interrupt => |value| value,
+            .resume_execution => |value| value.execution,
             .lookup_activity => |value| value.execution,
             .record_activity => |value| value.activation.execution,
             .activate => |value| value.execution,

@@ -6,6 +6,7 @@ test "leak detector rejects unreleased allocation" {
     const value = try std.testing.allocator.create(u8);
     value.* = 42;
     try std.testing.expectEqual(@as(u8, 42), value.*);
+    std.debug.print("fixture assertions completed\n", .{});
 }
 
 test "leak detector accepts complete teardown" {
@@ -13,4 +14,5 @@ test "leak detector accepts complete teardown" {
     defer std.testing.allocator.destroy(value);
     value.* = 42;
     try std.testing.expectEqual(@as(u8, 42), value.*);
+    std.debug.print("fixture assertions completed\n", .{});
 }

@@ -22,6 +22,16 @@ pub fn Primitive(comptime primitive: ast.Primitive) type {
         pub const DecodingEnvironment = void;
         /// Environment required to run encoding effects.
         pub const EncodingEnvironment = void;
+        pub const pure_decoding = true;
+        pub const pure_encoding = true;
+        pub const supports_direct_writer = true;
+        pub fn writeJson(_: @This(), value: *const Decoded, writer: *@import("../json_writer.zig").Writer) outcomes.Exit(void, Issue) {
+            return codec.writeJson(value, writer);
+        }
+        pub fn validateDirect(_: @This(), value: *const Decoded) outcomes.Result(void, Issue) {
+            return codec.validateDirect(value);
+        }
+
         /// Structural encoded-node witness for this primitive codec.
         pub const encoded_node: ast.Node = .{ .primitive = primitive };
 
@@ -79,6 +89,22 @@ pub fn Nullable(comptime child: anytype) type {
         pub const DecodingEnvironment = void;
         /// Environment required to run encoding effects.
         pub const EncodingEnvironment = void;
+        pub const pure_decoding = true;
+        pub const pure_encoding = true;
+        pub const supports_direct_writer = @hasDecl(C, "supports_direct_writer") and C.supports_direct_writer;
+        pub fn writeJson(_: @This(), value: *const Decoded, writer: *@import("../json_writer.zig").Writer) outcomes.Exit(void, Issue) {
+            if (!supports_direct_writer) @compileError("nullable child has no writer evidence");
+            if (value.*) |*present| return child.writeJson(present, writer);
+            const absent: std.json.Value = .null;
+            writer.json(&absent) catch |problem| {
+                if (problem == error.OutOfMemory) return .{ .die = outcomes.Defect.out_of_memory };
+                var failure = Issue.pure(.encode, if (problem == error.DepthLimit) .depth_limit else .size_limit);
+                failure.detail = writer.resource_failure;
+                return .{ .fail = failure };
+            };
+            return .{ .success = {} };
+        }
+
         /// Structural encoded-node witness for this primitive codec.
         pub const encoded_node: ast.Node = .{ .nullable = &C.encoded_node };
 
@@ -122,6 +148,9 @@ pub fn nodePointer(comptime child: anytype) *const ast.Node {
     const C = if (@TypeOf(child) == type) child else @TypeOf(child);
     if (@hasDecl(C, "encodedNode")) return C.encodedNode();
     if (@hasDecl(C, "encoded_node")) return &C.encoded_node;
+    if (@TypeOf(child) != type and @hasField(C, "encoded_shape")) {
+        if (child.encoded_shape) |node| return node;
+    }
     @compileError("JSON Schema export needs an encoded-shape witness from every child codec");
 }
 

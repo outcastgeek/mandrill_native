@@ -66,7 +66,7 @@ pub fn Variant(
             @compileError("Variant requires a tagged Zig union");
         if (@typeInfo(@TypeOf(cases)) != .@"struct" or !@typeInfo(@TypeOf(cases)).@"struct".is_tuple)
             @compileError("Variant cases must be a tuple");
-        if (cases.len == 0 or cases.len != info.@"union".fields.len)
+        if (cases.len == 0 or cases.len != info.@"union".field_names.len)
             @compileError("Variant requires exactly one case for each Zig union field");
         if (discriminator.len == 0 or payload_name.len == 0 or
             !std.unicode.utf8ValidateSlice(discriminator) or !std.unicode.utf8ValidateSlice(payload_name) or
@@ -105,6 +105,61 @@ pub fn Variant(
         /// Exact caller environment type required when the description runs.
         pub const Environment = R;
 
+        pub const supports_direct_writer = blk: {
+            for (cases) |item| if (!@import("json_writer.zig").capable(item.codec)) break :blk false;
+            break :blk true;
+        };
+        /// Writes the discriminator and selected payload once under caller bounds.
+        pub fn writeJson(env: *const R, value: *const T, writer: *@import("json_writer.zig").Writer) outcomes.Exit(void, Issue) {
+            if (!supports_direct_writer) @compileError("variant child has no direct JSON writer evidence");
+            const W = @import("json_writer.zig");
+            writer.enter() catch |problem| return outcomes.castFailure(void, W.failureWith(env, .encode, problem, writer));
+            defer writer.leave();
+            const active = @tagName(std.meta.activeTag(value.*));
+            inline for (cases) |item| if (std.mem.eql(u8, active, item.field_name)) {
+                writer.write("{") catch |problem| return outcomes.castFailure(void, W.failureWith(env, .encode, problem, writer));
+                writer.quoted(discriminator) catch |problem| return outcomes.castFailure(void, W.failureWith(env, .encode, problem, writer));
+                writer.write(":") catch |problem| return outcomes.castFailure(void, W.failureWith(env, .encode, problem, writer));
+                writer.string(item.wire_tag) catch |problem| return outcomes.castFailure(void, W.failureWith(env, .encode, problem, writer));
+                writer.write(",") catch |problem| return outcomes.castFailure(void, W.failureWith(env, .encode, problem, writer));
+                writer.quoted(payload_name) catch |problem| return outcomes.castFailure(void, W.failureWith(env, .encode, problem, writer));
+                writer.write(":") catch |problem| return outcomes.castFailure(void, W.failureWith(env, .encode, problem, writer));
+                const input = &@field(value.*, item.field_name);
+                const checked = if (comptime item.nested) item.codec.writeJson(env, input, writer) else item.codec.writeJson(input, writer);
+                if (checked == .fail) {
+                    var issue = checked.fail;
+                    issue.bindAllocator(env);
+                    issue.prependField(payload_name) catch {
+                        issue.deinit();
+                        return .{ .die = outcomes.Defect.out_of_memory };
+                    };
+                    return .{ .fail = issue };
+                }
+                if (checked != .success) return checked;
+                writer.write("}") catch |problem| return outcomes.castFailure(void, W.failureWith(env, .encode, problem, writer));
+                return .{ .success = {} };
+            };
+            return .{ .fail = Issue.init(env, .encode, .invalid_value) };
+        }
+        pub fn encodeBytesWith(env: *const R, value: *const T, limits: @import("json_writer.zig").Limits) outcomes.Exit(outcomes.OwnedSlice(u8), Issue) {
+            const W = @import("json_writer.zig");
+            if (!limits.valid()) return .{ .fail = Issue.init(env, .encode, .invalid_value) };
+            var writer = W.Writer.init(env, limits);
+            defer writer.deinit();
+            if (comptime supports_direct_writer) {
+                const checked = writeJson(env, value, &writer);
+                if (checked != .success) return outcomes.castFailure(outcomes.OwnedSlice(u8), checked);
+            } else {
+                var arena = std.heap.ArenaAllocator.init(env.allocator);
+                defer arena.deinit();
+                var state: structural.EncodeState = .{ .scratch = arena.allocator() };
+                const encoded = encodeWithin(env, value, &state);
+                if (encoded != .success) return outcomes.castFailure(outcomes.OwnedSlice(u8), encoded);
+                writer.json(&encoded.success) catch |problem| return W.failureWith(env, .encode, problem, &writer);
+            }
+            return .{ .success = writer.finish() catch return .{ .die = outcomes.Defect.out_of_memory } };
+        }
+
         fn encodedCases() [cases.len]ast.Case {
             var result: [cases.len]ast.Case = undefined;
             for (cases, 0..) |item, index| {
@@ -135,7 +190,7 @@ pub fn Variant(
         /// Returns (`T`): The typed stored or computed value; ownership follows the enclosing type contract.
         pub fn make(comptime name: []const u8, payload: @FieldType(T, name)) T {
             inline for (cases) |item| {
-                if (std.mem.eql(u8, item.field_name, name)) return @unionInit(T, name, payload);
+                if (comptime std.mem.eql(u8, item.field_name, name)) return @unionInit(T, name, payload);
             }
             @compileError("Zig case is not part of this variant schema");
         }
@@ -149,7 +204,7 @@ pub fn Variant(
         /// Returns (`?*const @FieldType(T, name)`): selected variant payload, or `null` when the tag does not match.
         pub fn project(comptime name: []const u8, value: *const T) ?*const @FieldType(T, name) {
             inline for (cases) |item| {
-                if (std.mem.eql(u8, item.field_name, name)) {
+                if (comptime std.mem.eql(u8, item.field_name, name)) {
                     if (!std.mem.eql(u8, @tagName(std.meta.activeTag(value.*)), name)) return null;
                     return &@field(value.*, name);
                 }
@@ -187,7 +242,7 @@ pub fn Variant(
         /// - `env: *const R`: Borrowed caller environment supplying allocator, I/O, and selected
         ///   capabilities.
         /// - `json: *const std.json.Value`: JSON value or document to decode, encode, or validate.
-        /// Returns (`outcomes.Exit(T, Issue)`): Carries `T` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
+        /// Returns (`outcomes.Exit(T, Issue)`): Carries `T` on `.success` or `Issue` on `.fail`; `.die`, `.interrupted`, and `.finalization_failed` preserve other terminal causes.
         pub fn decodeDirect(env: *const R, json: *const std.json.Value) outcomes.Exit(T, Issue) {
             var state: structural.DecodeState = .{};
             return decodeWithin(env, json, &state);
@@ -199,7 +254,7 @@ pub fn Variant(
         ///   capabilities.
         /// - `json: *const std.json.Value`: JSON value or document to decode, encode, or validate.
         /// - `state: *structural.DecodeState`: Mutable operation state, retained for the duration of this call.
-        /// Returns (`outcomes.Exit(T, Issue)`): Carries `T` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
+        /// Returns (`outcomes.Exit(T, Issue)`): Carries `T` on `.success` or `Issue` on `.fail`; `.die`, `.interrupted`, and `.finalization_failed` preserve other terminal causes.
         pub fn decodeWithin(env: *const R, json: *const std.json.Value, state: *structural.DecodeState) outcomes.Exit(T, Issue) {
             if (json.* != .object) return .{ .fail = Issue.init(env, .decode, .{ .expected = .object }) };
             for (json.object.keys()) |key| {
@@ -252,7 +307,7 @@ pub fn Variant(
         /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
         ///   joined it.
         /// - `temporary: std.mem.Allocator`: Temporary state retained only for the duration of this operation.
-        /// Returns (`outcomes.Exit(std.json.Value, Issue)`): Carries `std.json.Value` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
+        /// Returns (`outcomes.Exit(std.json.Value, Issue)`): Carries `std.json.Value` on `.success` or `Issue` on `.fail`; `.die`, `.interrupted`, and `.finalization_failed` preserve other terminal causes.
         pub fn encodeValueDirect(env: *const R, value: *const T, temporary: std.mem.Allocator) outcomes.Exit(std.json.Value, Issue) {
             var state: structural.EncodeState = .{ .scratch = temporary };
             return encodeWithin(env, value, &state);
@@ -265,7 +320,7 @@ pub fn Variant(
         /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
         ///   joined it.
         /// - `state: *structural.EncodeState`: Mutable operation state, retained for the duration of this call.
-        /// Returns (`outcomes.Exit(std.json.Value, Issue)`): Carries `std.json.Value` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
+        /// Returns (`outcomes.Exit(std.json.Value, Issue)`): Carries `std.json.Value` on `.success` or `Issue` on `.fail`; `.die`, `.interrupted`, and `.finalization_failed` preserve other terminal causes.
         pub fn encodeWithin(env: *const R, value: *const T, state: *structural.EncodeState) outcomes.Exit(std.json.Value, Issue) {
             var object: std.json.ObjectMap = .{};
             const active = @tagName(std.meta.activeTag(value.*));
@@ -301,7 +356,7 @@ pub fn Variant(
         ///   capabilities.
         /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
         ///   joined it.
-        /// Returns (`outcomes.Exit(outcomes.OwnedSlice(u8), Issue)`): Carries `outcomes.OwnedSlice(u8)` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
+        /// Returns (`outcomes.Exit(outcomes.OwnedSlice(u8), Issue)`): Carries `outcomes.OwnedSlice(u8)` on `.success` or `Issue` on `.fail`; `.die`, `.interrupted`, and `.finalization_failed` preserve other terminal causes.
         pub fn encodeBytesDirect(env: *const R, value: *const T) outcomes.Exit(outcomes.OwnedSlice(u8), Issue) {
             var arena = std.heap.ArenaAllocator.init(env.allocator);
             defer arena.deinit();
@@ -322,7 +377,7 @@ pub fn Variant(
         ///   capabilities.
         /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
         ///   joined it.
-        /// Returns (`outcomes.Exit(void, Issue)`): Carries no value on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
+        /// Returns (`outcomes.Exit(void, Issue)`): Carries no value on `.success` or `Issue` on `.fail`; `.die`, `.interrupted`, and `.finalization_failed` preserve other terminal causes.
         pub fn validateDirect(env: *const R, value: *const T) outcomes.Exit(void, Issue) {
             var arena = std.heap.ArenaAllocator.init(env.allocator);
             defer arena.deinit();
@@ -368,7 +423,7 @@ pub fn Variant(
         ///   joined it.
         /// - `limits: @import("schema_builder.zig").ParseLimits`: Caller-selected, validated behavior or resource bounds; no hidden default
         ///   is installed.
-        /// Returns (`outcomes.Exit(legacy.Parsed(T), Issue)`): Carries `legacy.Parsed(T)` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
+        /// Returns (`outcomes.Exit(legacy.Parsed(T), Issue)`): Carries `legacy.Parsed(T)` on `.success` or `Issue` on `.fail`; `.die`, `.interrupted`, and `.finalization_failed` preserve other terminal causes.
         pub fn parseBytesDirect(
             env: *const R,
             bytes: []const u8,

@@ -64,6 +64,7 @@ mod console;
 mod cron;
 mod defect;
 mod deferred;
+mod dependency_cache;
 mod duration;
 pub mod encoding;
 pub mod eventlog;
@@ -110,7 +111,7 @@ pub mod workflow;
 pub use cancellation::Cancellation;
 pub use clock::{Clock, ClockError, ClockFuture, ClockTick, HasClock, TestClock, TestClockAdvance};
 pub use config::{
-    Config, ConfigError, ConfigErrorKind, ConfigPath, ConfigPathError, ConfigSource,
+    Config, ConfigError, ConfigErrorKind, ConfigPath, ConfigPathError, ConfigSource, EffectConfig,
     HasConfigSource, MemoryConfigSource,
 };
 pub use console::{Console, ConsoleChannel, HasConsole, StandardConsole};
@@ -146,15 +147,23 @@ pub use schedule::{
     ScheduleDecision, ScheduleSampling,
 };
 pub use schema::{
-    Codec, Decimal, DecimalError, DuplicateFields, EffectSchema, IssueSegment, JsonSchemaDocument,
-    JsonValue, ParseLimits, ParsePolicy, PrimitiveShape, PureCodec, RecordBuilder, RecordField,
-    RecordFields, RecordNil, RepresentationError, RepresentationLimits, RepresentationPrecision,
-    Schema, SchemaAst, SchemaErrorMode, SchemaIssue, SchemaIssueKind, SchemaProperty,
-    SchemaReference, SchemaResource, SchemaShape, StoredCleanup, StoredDefect, StoredFinalization,
-    StoredOutcome, StoredPrimary, StringLengthUnit, StringPattern, TaggedEnumBuilder,
-    UnknownFields, ValueKind, export_json_schema, json_array, json_bool, json_bytes, json_decimal,
-    json_f64, json_i64, json_literal, json_null, json_nullable, json_option, json_result,
-    json_stable_key, json_string, json_string_pattern, json_tuple2, json_u64, json_utc_millis,
+    AnyOfValue, ArrayConstraints, CheckedPattern, Codec, ConfiguredCodec, Decimal, DecimalError,
+    DomainCodec, DuplicateFields, EffectSchema, IssueBudget, IssueSegment, JsonExactNumber,
+    JsonRepresentation, JsonSchemaDocument, JsonValue, JsonWriter, JsonWriterPolicy,
+    LiteralEnumValue, MultiplePatternPolicy, NativeField, NativeFields, NativeNil,
+    NativeRecordBuilder, NumericConstraint, ObjectConstraints, ObjectRepresentation, ParseContext,
+    ParseLimits, ParsePolicy, PatternPolicy, PatternProperty, PrefixElement, PrefixValue,
+    PrimitiveShape, PureCodec, RecordBuilder, RecordField, RecordFields, RecordNil,
+    RepresentationError, RepresentationLimits, RepresentationPrecision, Schema, SchemaAst,
+    SchemaErrorMode, SchemaIssue, SchemaIssueKind, SchemaPolicy, SchemaProperty, SchemaReference,
+    SchemaResource, SchemaShape, SequenceRepresentation, StoredCleanup, StoredDefect,
+    StoredFinalization, StoredOutcome, StoredPrimary, StringConstraints, StringLengthUnit,
+    StringPattern, TaggedEnumBuilder, UnknownFields, UnknownLiteralPolicy, ValueKind,
+    export_json_schema, json_all_of, json_any_of, json_array, json_array_constraints, json_bool,
+    json_bytes, json_decimal, json_exact_number, json_f64, json_i64, json_literal,
+    json_literal_enum, json_null, json_nullable, json_object_constraints, json_one_of, json_option,
+    json_prefix_rest, json_result, json_stable_key, json_string, json_string_constraints,
+    json_string_pattern, json_tuple2, json_u64, json_utc_millis, native_array, native_map,
     stored_outcome_codec, value_kind,
 };
 pub use scope::{Scope, ScopeCloseStatus};
@@ -197,8 +206,9 @@ pub use partitioned_semaphore::PartitionedSemaphore;
 pub use pool::{Pool, PoolCapacity, PoolEndStatus, PoolLease};
 
 pub use pub_sub::{
-    PubSub, PubSubError, PubSubOptions, PubSubOverflow, PubSubShutdown, PublishReport,
-    ReplayPolicy, Subscription, SubscriptionEvent,
+    CallbackContention, CallbackDrop, CallbackOverflow, CallbackPubSub, CallbackPubSubOptions,
+    CallbackPublish, PubSub, PubSubError, PubSubOptions, PubSubOverflow, PubSubShutdown,
+    PublishReport, ReplayPolicy, Subscription, SubscriptionEvent,
 };
 pub use subscription_ref::{SubscriptionRef, SubscriptionSnapshot};
 pub use synchronized_ref::SynchronizedRef;
@@ -207,6 +217,12 @@ pub use primary_key::{KeyDomain, KeyError, KeyNamespace, KeyParts, KeySegment, S
 pub use request::{Request, RequestGroup, RequestKey};
 pub use request_resolver::{HasRequestScope, RequestResolver, RequestResolverError, RequestScope};
 
-pub use cache::{Cache, CacheCapacity, CacheConfig, SharedValue};
+pub use cache::{
+    Cache, CacheAdmission, CacheCapacity, CacheConfig, CacheLookup, CacheObservation, CacheOptions,
+    CacheTtl, SharedValue,
+};
+pub use dependency_cache::{
+    DependencyCache, DependencyCacheError, DependencyCachePolicy, DependencyValue,
+};
 
 pub use weak_cache::{CachePartition, WeakCache, WeakCacheValue};

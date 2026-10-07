@@ -19,46 +19,35 @@ mod sealed {
 pub trait RecordFields<T>: sealed::Sealed + Send + Sync + 'static {
     /// Typed values accumulated by the record builder.
     type Values: Send + 'static;
-    /// # Type parameters
-    /// - `T`: Value or item type.
+    /// Decode borrowed fields into their owned nested tuple, collecting bounded ordinary issues.
     ///
-    /// # Parameters
-    /// - `object` (`&serde_json::Map<String, JsonValue>`): Encoded object whose fields are validated.
-    /// - `policy` (`ParsePolicy`): The caller-supplied behavior policy.
-    /// - `issues` (`&mut Vec<SchemaIssue>`): The issues supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Option<Self::Values>`.
-    /// Returns the value when present, or `None`.
+    /// Returns None when field decoding fails. Pass the active context through children
+    /// and prepend field paths once; resource exhaustion stops additional callbacks.
     fn decode(
         &self,
         object: &serde_json::Map<String, JsonValue>,
         policy: ParsePolicy,
         issues: &mut Vec<SchemaIssue>,
+        context: Option<&super::ParseContext>,
     ) -> Option<Self::Values>;
-    /// # Type parameters
-    /// - `T`: Value or item type.
-    ///
-    /// # Parameters
-    /// - `value` (`&T`): Value read, transformed, encoded, or stored by this operation.
-    /// - `object` (`&mut serde_json::Map<String, JsonValue>`): Encoded object whose fields are validated.
-    ///
-    /// # Returns
-    /// Type: `Result<(), SchemaIssue>`.
+    /// Borrow fields from T and append their encoded values, forwarding context and omission rules; schema failures retain field paths.
     fn encode(
         &self,
         value: &T,
         object: &mut serde_json::Map<String, JsonValue>,
+        context: Option<&super::ParseContext>,
     ) -> Result<(), SchemaIssue>;
-    /// # Type parameters
-    /// - `T`: Value or item type.
-    ///
-    /// # Parameters
-    /// - `output` (`&mut Vec<SchemaProperty>`): The output supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Result<(), SchemaIssue>`.
+    /// Append checked field metadata used to prepare the record AST.
     fn properties(&self, output: &mut Vec<SchemaProperty>) -> Result<(), SchemaIssue>;
+    /// Whether all fields have independent borrowed validators; encoder fallback does not qualify.
+    fn validator_available(&self) -> bool;
+    /// Validate borrowed fields using independent witnesses and the active context without constructing encoded values.
+    fn validate(&self, value: &T, context: Option<&super::ParseContext>)
+    -> Result<(), SchemaIssue>;
+    /// Whether all fields supply genuine direct JSON writer witnesses.
+    fn writer_available(&self) -> bool;
+    /// Append non-omitted properties to the caller's open object using child writer witnesses; leave the surrounding container open.
+    fn write(&self, value: &T, writer: &mut super::JsonWriter) -> Result<(), SchemaIssue>;
 }
 
 /// The empty tail that terminates a typed record-field list.
@@ -77,6 +66,7 @@ impl<T> RecordFields<T> for RecordNil {
         _: &serde_json::Map<String, JsonValue>,
         _: ParsePolicy,
         _: &mut Vec<SchemaIssue>,
+        _: Option<&super::ParseContext>,
     ) -> Option<()> {
         Some(())
     }
@@ -87,13 +77,31 @@ impl<T> RecordFields<T> for RecordNil {
     ///
     /// # Returns
     /// Type: `Result<(), SchemaIssue>`.
-    fn encode(&self, _: &T, _: &mut serde_json::Map<String, JsonValue>) -> Result<(), SchemaIssue> {
+    fn encode(
+        &self,
+        _: &T,
+        _: &mut serde_json::Map<String, JsonValue>,
+        _: Option<&super::ParseContext>,
+    ) -> Result<(), SchemaIssue> {
         Ok(())
     }
 
     ///
     /// # Returns
     /// Type: `Result<(), SchemaIssue>`.
+    fn validator_available(&self) -> bool {
+        true
+    }
+    fn validate(&self, _: &T, _: Option<&super::ParseContext>) -> Result<(), SchemaIssue> {
+        Ok(())
+    }
+    fn writer_available(&self) -> bool {
+        true
+    }
+    fn write(&self, _: &T, _: &mut super::JsonWriter) -> Result<(), SchemaIssue> {
+        Ok(())
+    }
+
     fn properties(&self, _: &mut Vec<SchemaProperty>) -> Result<(), SchemaIssue> {
         Ok(())
     }
@@ -137,6 +145,26 @@ impl<T: 'static, F: Send + 'static, Rest: RecordFields<T>> RecordFields<T>
 {
     /// Type alias for values in schema schema builder.
     type Values = (F, Rest::Values);
+    fn validator_available(&self) -> bool {
+        self.codec.has_type_validator() && self.rest.validator_available()
+    }
+    fn validate(
+        &self,
+        value: &T,
+        context: Option<&super::ParseContext>,
+    ) -> Result<(), SchemaIssue> {
+        let field = (self.getter)(value);
+        if !self.omit.as_ref().is_some_and(|omit| omit(field)) {
+            let child = super::parse_context::child(
+                context,
+                super::IssueSegment::Field(Arc::clone(&self.name)),
+            )?;
+            self.codec
+                .validate_in_ref(field, child.as_ref())
+                .map_err(|issue| issue.at(super::IssueSegment::Field(Arc::clone(&self.name))))?;
+        }
+        self.rest.validate(value, context)
+    }
 
     ///
     /// # Parameters
@@ -152,11 +180,28 @@ impl<T: 'static, F: Send + 'static, Rest: RecordFields<T>> RecordFields<T>
         object: &serde_json::Map<String, JsonValue>,
         policy: ParsePolicy,
         issues: &mut Vec<SchemaIssue>,
+        context: Option<&super::ParseContext>,
     ) -> Option<Self::Values> {
         let field = match object.get(self.name.as_ref()) {
-            Some(encoded) => self.codec.decode_ref(encoded),
+            Some(encoded) => super::parse_context::child(
+                context,
+                super::IssueSegment::Field(Arc::clone(&self.name)),
+            )
+            .and_then(|child| self.codec.decode_in_ref(encoded, child.as_ref())),
             None => match &self.missing {
-                Some(factory) => Ok(factory()),
+                Some(factory) => {
+                    let value = factory();
+                    if self.pure_default.is_some() {
+                        super::parse_context::child(
+                            context,
+                            super::IssueSegment::Field(Arc::clone(&self.name)),
+                        )
+                        .and_then(|child| self.codec.validate_in_ref(&value, child.as_ref()))
+                        .map(|()| value)
+                    } else {
+                        Ok(value)
+                    }
+                }
                 None => Err(SchemaIssue::new(SchemaIssueKind::MissingField(Arc::clone(
                     &self.name,
                 )))),
@@ -170,10 +215,18 @@ impl<T: 'static, F: Send + 'static, Rest: RecordFields<T>> RecordFields<T>
                 None
             }
         };
-        if !issues.is_empty() && policy.errors == SchemaErrorMode::First {
+        if !issues.is_empty()
+            && (policy.errors == SchemaErrorMode::First
+                || issues
+                    .iter()
+                    .map(super::parse_context::issue_count)
+                    .sum::<usize>()
+                    >= policy.limits.issues.get()
+                || issues.iter().any(super::json_constraints::resource_failure))
+        {
             return None;
         }
-        let rest = self.rest.decode(object, policy, issues);
+        let rest = self.rest.decode(object, policy, issues, context);
         field.zip(rest)
     }
 
@@ -191,16 +244,24 @@ impl<T: 'static, F: Send + 'static, Rest: RecordFields<T>> RecordFields<T>
         &self,
         value: &T,
         object: &mut serde_json::Map<String, JsonValue>,
+        context: Option<&super::ParseContext>,
     ) -> Result<(), SchemaIssue> {
         let field = (self.getter)(value);
         if !self.omit.as_ref().is_some_and(|omit| omit(field)) {
             let encoded = self
                 .codec
-                .encode_ref(field)
+                .encode_in_ref(
+                    field,
+                    super::parse_context::child(
+                        context,
+                        super::IssueSegment::Field(Arc::clone(&self.name)),
+                    )?
+                    .as_ref(),
+                )
                 .map_err(|issue| issue.at(super::IssueSegment::Field(Arc::clone(&self.name))))?;
             object.insert(self.name.to_string(), encoded);
         }
-        self.rest.encode(value, object)
+        self.rest.encode(value, object, context)
     }
 
     ///
@@ -209,12 +270,21 @@ impl<T: 'static, F: Send + 'static, Rest: RecordFields<T>> RecordFields<T>
     ///
     /// # Returns
     /// Type: `Result<(), SchemaIssue>`.
-    fn properties(&self, output: &mut Vec<SchemaProperty>) -> Result<(), SchemaIssue> {
-        if let Some(default) = &self.pure_default {
+    fn writer_available(&self) -> bool {
+        self.codec.has_writer() && self.rest.writer_available()
+    }
+    fn write(&self, value: &T, writer: &mut super::JsonWriter) -> Result<(), SchemaIssue> {
+        let field = (self.getter)(value);
+        if !self.omit.as_ref().is_some_and(|omit| omit(field)) {
+            writer.property(&self.name)?;
             self.codec
-                .decode_ref(default)
+                .write_into(field, writer)
                 .map_err(|issue| issue.at(super::IssueSegment::Field(Arc::clone(&self.name))))?;
         }
+        self.rest.write(value, writer)
+    }
+
+    fn properties(&self, output: &mut Vec<SchemaProperty>) -> Result<(), SchemaIssue> {
         output.push(SchemaProperty::new(
             Arc::clone(&self.name),
             self.codec.ast().clone(),
@@ -378,18 +448,13 @@ impl<T, Fields> RecordBuilder<T, Fields> {
 }
 
 impl<T: Send + 'static, Fields: RecordFields<T>> RecordBuilder<T, Fields> {
-    /// Record the terminal status and release remaining operation ownership.
+    /// Prepare record metadata and build checked borrowed decode/encode directions.
     ///
-    /// # Type parameters
-    /// - `Fields`: Typed list of record fields. Bound: `RecordFields<T>`.
-    /// - `T`: Value or item type.
-    ///
-    /// # Parameters
-    /// - `policy` (`ParsePolicy`): The caller-supplied behavior policy.
-    /// - `construct` (`impl Fn(Fields::Values) -> T + Send + Sync + 'static`): The construct supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Result<PureCodec<T, JsonValue>, SchemaIssue>`.
+    /// `construct` consumes the nested field tuple, most recently added field first.
+    /// Ordinary decode issues follow the explicit first-error or bounded accumulation
+    /// policy and receive one field path; resource exhaustion stops further callbacks.
+    /// Defaults need independent validators. Typed validation and direct writing exist
+    /// only when every field has the corresponding genuine witness.
     pub fn finish(
         self,
         policy: ParsePolicy,
@@ -404,9 +469,16 @@ impl<T: Send + 'static, Fields: RecordFields<T>> RecordBuilder<T, Fields> {
         let ast = SchemaAst::object(properties, policy.unknown_fields)?;
         let fields = Arc::new(self.fields);
         let decode = Arc::clone(&fields);
-        Ok(PureCodec::with_ast(
+        let writer_fields = Arc::clone(&fields);
+        let validation_fields = Arc::clone(&fields);
+        let has_writer = fields.writer_available();
+        let has_validator = fields.validator_available();
+        let codec = PureCodec::with_context_ast(
             ast,
-            move |encoded| {
+            move |encoded, context| {
+                let mut active = super::parse_context::policy(context, policy);
+                active.unknown_fields = policy.unknown_fields;
+                let policy = active;
                 super::internal::parser::check_limits(encoded, &policy.limits)?;
                 let JsonValue::Object(object) = encoded else {
                     return Err(SchemaIssue::new(SchemaIssueKind::TypeMismatch {
@@ -425,16 +497,20 @@ impl<T: Send + 'static, Fields: RecordFields<T>> RecordBuilder<T, Fields> {
                                 ))),
                                 policy,
                             );
-                            if policy.errors == SchemaErrorMode::First {
+                            if policy.errors == SchemaErrorMode::First
+                                || issues.iter().any(super::json_constraints::resource_failure)
+                            {
                                 break;
                             }
                         }
                     }
                 }
-                let values = if policy.errors == SchemaErrorMode::First && !issues.is_empty() {
+                let values = if (policy.errors == SchemaErrorMode::First && !issues.is_empty())
+                    || issues.iter().any(super::json_constraints::resource_failure)
+                {
                     None
                 } else {
-                    decode.decode(object, policy, &mut issues)
+                    decode.decode(object, policy, &mut issues, context)
                 };
                 if issues.is_empty()
                     && let Some(values) = values
@@ -446,14 +522,31 @@ impl<T: Send + 'static, Fields: RecordFields<T>> RecordBuilder<T, Fields> {
                 }
                 Err(SchemaIssue::new(SchemaIssueKind::Multiple).with_children(issues))
             },
-            move |value| {
+            move |value, context| {
+                let policy = super::parse_context::policy(context, policy);
                 let mut object = serde_json::Map::new();
-                fields.encode(value, &mut object)?;
+                fields.encode(value, &mut object, context)?;
                 let encoded = JsonValue::Object(object);
                 super::internal::parser::check_limits(&encoded, &policy.limits)?;
                 Ok(encoded)
             },
-        ))
+        );
+        let codec = if has_validator {
+            codec.with_context_type_validator(move |value, context| {
+                validation_fields.validate(value, context)
+            })
+        } else {
+            codec
+        };
+        Ok(if has_writer {
+            codec.with_writer(move |value, writer| {
+                writer.begin_object()?;
+                writer_fields.write(value, writer)?;
+                writer.end_object()
+            })
+        } else {
+            codec
+        })
     }
 }
 
@@ -466,7 +559,14 @@ impl<T: Send + 'static, Fields: RecordFields<T>> RecordBuilder<T, Fields> {
 /// # Returns
 /// Type: `()`.
 fn record_issue(issues: &mut Vec<SchemaIssue>, issue: SchemaIssue, policy: ParsePolicy) {
-    if issues.len() == policy.limits.issues.get() {
+    if issues
+        .iter()
+        .map(super::parse_context::issue_count)
+        .sum::<usize>()
+        .saturating_add(super::parse_context::issue_count(&issue))
+        .saturating_add(usize::from(!issues.is_empty()))
+        > policy.limits.issues.get()
+    {
         issues.clear();
         issues.push(SchemaIssue::new(SchemaIssueKind::LimitExceeded {
             resource: SchemaResource::Issues,

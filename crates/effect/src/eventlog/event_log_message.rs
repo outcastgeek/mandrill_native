@@ -82,20 +82,22 @@ impl EventLogRpc {
         })
     }
 
-    /// Return the typed handler registered for this definition.
-    ///
-    /// # Type parameters
-    /// - `R`: Environment type. Additional bound: `HasEventJournal + HasReplicaCursorStore + Send + Sync + 'static`.
-    ///
-    /// # Parameters
-    /// - `operation` (`ReplicaRpcOperation<R>`): Typed operation definition or callback selected for execution.
-    ///
-    /// # Returns
-    /// Type: `ReplicaRpcHandler<R>`.
-    pub fn handler<R>(operation: ReplicaRpcOperation<R>) -> ReplicaRpcHandler<R>
+    /// Construct a typed replica RPC handler using the supplied authorization callback; authorization must succeed before import/cursor access.
+    pub fn handler<R>(
+        operation: ReplicaRpcOperation<R>,
+        authorize: impl Fn(&ReplicaBatch) -> Result<super::ReplicaImportPermit, ReplicaMessageError<R>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> ReplicaRpcHandler<R>
     where
         R: HasEventJournal + HasReplicaCursorStore + Send + Sync + 'static,
     {
-        RpcHandler::new(operation, EventReplicator::import_and_ack::<R>)
+        RpcHandler::new(operation, move |batch: ReplicaBatch| {
+            match authorize(&batch) {
+                Ok(permit) => EventReplicator::import_and_ack::<R>(batch, permit),
+                Err(error) => crate::Effect::from_result_once(Err(error)),
+            }
+        })
     }
 }

@@ -1,8 +1,8 @@
 //! Pure and effectful bidirectional codecs.
 
 use super::{
-    IssueSegment, JsonValue, ParsePolicy, Schema, SchemaAst, SchemaIssue, SchemaIssueKind,
-    SchemaReference, SchemaShape,
+    JsonValue, JsonWriter, JsonWriterPolicy, ParseContext, ParsePolicy, Schema, SchemaAst,
+    SchemaIssue, SchemaIssueKind, SchemaReference, SchemaShape,
 };
 use crate::Effect;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -14,18 +14,23 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// # Type parameters
 /// - `A`: Application value type.
 /// - `Encoded`: Encoded representation type.
-type Decoder<A, Encoded> = Arc<dyn Fn(&Encoded) -> Result<A, SchemaIssue> + Send + Sync>;
+type Decoder<A, Encoded> =
+    Arc<dyn Fn(&Encoded, Option<&ParseContext>) -> Result<A, SchemaIssue> + Send + Sync>;
 /// Type alias for encoder in schema codec.
 ///
 /// # Type parameters
 /// - `A`: Application value type.
 /// - `Encoded`: Encoded representation type.
-type Encoder<A, Encoded> = Arc<dyn Fn(&A) -> Result<Encoded, SchemaIssue> + Send + Sync>;
+type Encoder<A, Encoded> =
+    Arc<dyn Fn(&A, Option<&ParseContext>) -> Result<Encoded, SchemaIssue> + Send + Sync>;
 /// Type alias for type validator in schema codec.
 ///
 /// # Type parameters
 /// - `A`: Application value type.
-type TypeValidator<A> = Arc<dyn Fn(&A) -> Result<(), SchemaIssue> + Send + Sync>;
+type DirectWriter<A> = Arc<dyn Fn(&A, &mut JsonWriter) -> Result<(), SchemaIssue> + Send + Sync>;
+type Equivalence<A> = Arc<dyn Fn(&A, &A) -> bool + Send + Sync>;
+type TypeValidator<A> =
+    Arc<dyn Fn(&A, Option<&ParseContext>) -> Result<(), SchemaIssue> + Send + Sync>;
 /// Type alias for effect decoder in schema codec.
 ///
 /// # Type parameters
@@ -33,7 +38,7 @@ type TypeValidator<A> = Arc<dyn Fn(&A) -> Result<(), SchemaIssue> + Send + Sync>
 /// - `Encoded`: Encoded representation type.
 /// - `Env`: Environment type supplying required capabilities.
 type EffectDecoder<A, Encoded, Env> =
-    Arc<dyn Fn(Encoded) -> Effect<A, SchemaIssue, Env> + Send + Sync>;
+    Arc<dyn Fn(Encoded, Option<ParseContext>) -> Effect<A, SchemaIssue, Env> + Send + Sync>;
 /// Type alias for effect encoder in schema codec.
 ///
 /// # Type parameters
@@ -41,25 +46,20 @@ type EffectDecoder<A, Encoded, Env> =
 /// - `Encoded`: Encoded representation type.
 /// - `Env`: Environment type supplying required capabilities.
 type EffectEncoder<A, Encoded, Env> =
-    Arc<dyn Fn(A) -> Effect<Encoded, SchemaIssue, Env> + Send + Sync>;
-/// Type alias for once operation in schema codec.
+    Arc<dyn Fn(A, Option<ParseContext>) -> Effect<Encoded, SchemaIssue, Env> + Send + Sync>;
+/// Borrowed bidirectional conversion with owned results and immutable schema metadata.
 ///
-/// # Type parameters
-/// - `Input`: Input value type.
-/// - `Output`: Output value type.
-type OnceOperation<Input, Output> = dyn Fn(&Input) -> Result<Output, SchemaIssue> + Send + Sync;
-
-/// Pure bidirectional conversion with independently owned results.
-/// The callbacks inspect borrowed inputs; no payload Clone is implied.
-///
-/// # Type parameters
-/// - `A`: Application value type.
-/// - `Encoded`: Encoded representation type.
+/// Clones share callbacks; payloads need no Clone bound. Independent borrowed
+/// validation, direct JSON writing and semantic equality are separate optional
+/// witnesses. Ordinary [`Self::validate_ref`] may encode as a fallback; defaults
+/// and witness-dependent compositions require genuine independent validation.
 pub struct PureCodec<A, Encoded> {
     ast: SchemaAst,
     decode: Decoder<A, Encoded>,
     encode: Encoder<A, Encoded>,
     validate_type: Option<TypeValidator<A>>,
+    writer: Option<DirectWriter<A>>,
+    equivalent: Option<Equivalence<A>>,
 }
 
 impl<A, Encoded> Clone for PureCodec<A, Encoded> {
@@ -72,24 +72,15 @@ impl<A, Encoded> Clone for PureCodec<A, Encoded> {
             decode: Arc::clone(&self.decode),
             encode: Arc::clone(&self.encode),
             validate_type: self.validate_type.as_ref().map(Arc::clone),
+            writer: self.writer.as_ref().map(Arc::clone),
+            equivalent: self.equivalent.as_ref().map(Arc::clone),
         }
     }
 }
 
 impl<A: Send + 'static, Encoded: Send + 'static> PureCodec<A, Encoded> {
+    /// Construct borrowed decode/encode callbacks with opaque metadata and no inferred validation or writer witnesses.
     #[must_use]
-    /// Construct a `PureCodec` from its required inputs and explicit policies.
-    ///
-    /// # Type parameters
-    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Parameters
-    /// - `decode` (`impl Fn(&Encoded) -> Result<A, SchemaIssue> + Send + Sync + 'static`): Callback that validates and reconstructs a typed value.
-    /// - `encode` (`impl Fn(&A) -> Result<Encoded, SchemaIssue> + Send + Sync + 'static`): The encode supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Self`.
     pub fn new(
         decode: impl Fn(&Encoded) -> Result<A, SchemaIssue> + Send + Sync + 'static,
         encode: impl Fn(&A) -> Result<Encoded, SchemaIssue> + Send + Sync + 'static,
@@ -97,20 +88,10 @@ impl<A: Send + 'static, Encoded: Send + 'static> PureCodec<A, Encoded> {
         Self::with_ast(SchemaAst::opaque(), decode, encode)
     }
 
-    /// Construct a codec with an explicit encoded-side description. The
-    /// caller must keep that description consistent with both callbacks.
+    /// Construct borrowed directions with explicit metadata.
     ///
-    /// # Type parameters
-    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Parameters
-    /// - `ast` (`SchemaAst`): Representation tree used for schema inspection or export.
-    /// - `decode` (`impl Fn(&Encoded) -> Result<A, SchemaIssue> + Send + Sync + 'static`): Callback that validates and reconstructs a typed value.
-    /// - `encode` (`impl Fn(&A) -> Result<Encoded, SchemaIssue> + Send + Sync + 'static`): The encode supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Self`.
+    /// The caller must keep the AST consistent with both callbacks. This does not
+    /// synthesize an independent validator or direct JSON writer from the metadata.
     pub fn with_ast(
         ast: SchemaAst,
         decode: impl Fn(&Encoded) -> Result<A, SchemaIssue> + Send + Sync + 'static,
@@ -118,107 +99,152 @@ impl<A: Send + 'static, Encoded: Send + 'static> PureCodec<A, Encoded> {
     ) -> Self {
         Self {
             ast,
-            decode: Arc::new(decode),
-            encode: Arc::new(encode),
+            decode: Arc::new(move |value, _| decode(value)),
+            encode: Arc::new(move |value, _| encode(value)),
             validate_type: None,
+            writer: None,
+            equivalent: None,
         }
     }
 
-    /// Provide a direct type-side check when constructing an encoded value
-    /// solely for validation would be unnecessary. Encoding remains checked
-    /// independently; this callback does not bypass the encoder.
-    #[must_use]
-    /// # Type parameters
-    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Parameters
-    /// - `validate` (`impl Fn(&A) -> Result<(), SchemaIssue> + Send + Sync + 'static`): The validate supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Self`.
-    pub fn with_type_validator(
+    pub(crate) fn with_context_ast(
+        ast: SchemaAst,
+        decode: impl Fn(&Encoded, Option<&ParseContext>) -> Result<A, SchemaIssue>
+        + Send
+        + Sync
+        + 'static,
+        encode: impl Fn(&A, Option<&ParseContext>) -> Result<Encoded, SchemaIssue>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            ast,
+            decode: Arc::new(decode),
+            encode: Arc::new(encode),
+            validate_type: None,
+            writer: None,
+            equivalent: None,
+        }
+    }
+    pub(crate) fn with_context_type_validator(
         mut self,
-        validate: impl Fn(&A) -> Result<(), SchemaIssue> + Send + Sync + 'static,
+        validate: impl Fn(&A, Option<&ParseContext>) -> Result<(), SchemaIssue> + Send + Sync + 'static,
     ) -> Self {
         self.validate_type = Some(Arc::new(validate));
         self
     }
+    pub(crate) fn decode_in_ref(
+        &self,
+        value: &Encoded,
+        context: Option<&ParseContext>,
+    ) -> Result<A, SchemaIssue> {
+        if let Some(context) = context {
+            context.visit()?;
+        }
+        (self.decode)(value, context)
+    }
+    pub(crate) fn encode_in_ref(
+        &self,
+        value: &A,
+        context: Option<&ParseContext>,
+    ) -> Result<Encoded, SchemaIssue> {
+        if let Some(context) = context {
+            context.visit()?;
+        }
+        (self.encode)(value, context)
+    }
+    pub(crate) fn validate_in_ref(
+        &self,
+        value: &A,
+        context: Option<&ParseContext>,
+    ) -> Result<(), SchemaIssue> {
+        if let Some(context) = context {
+            context.visit()?;
+        }
+        self.validate_type
+            .as_ref()
+            .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::MissingValidator))?(
+            value, context
+        )
+    }
+    /// Supply semantic equality for type-side uniqueness without encoding values.
+    ///
+    /// The callback must define stable equality appropriate to this codec's values;
+    /// cloning the codec shares the witness, not the payloads.
+    #[must_use]
+    pub fn with_equivalence(
+        mut self,
+        equivalent: impl Fn(&A, &A) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.equivalent = Some(Arc::new(equivalent));
+        self
+    }
+    pub(crate) fn equivalence(&self) -> Option<Equivalence<A>> {
+        self.equivalent.as_ref().map(Arc::clone)
+    }
+    /// Install an independent borrowed type check that does not construct an encoded value.
+    ///
+    /// The callback must enforce the application's type constraints. It does not
+    /// assert that encoding succeeds, and does not supply a direct-writer witness.
+    #[must_use]
+    pub fn with_type_validator(
+        mut self,
+        validate: impl Fn(&A) -> Result<(), SchemaIssue> + Send + Sync + 'static,
+    ) -> Self {
+        self.validate_type = Some(Arc::new(move |value, _| validate(value)));
+        self
+    }
 
-    /// Check application-side constraints separately from decoding. A custom
-    /// validator does not assert that encoding succeeds; callers storing a
-    /// value still use the checked encoder. Without a custom validator this
-    /// method validates through encoding and discards that encoded value.
+    /// Whether a genuine independent borrowed validator is installed; encode fallback does not count.
+    #[must_use]
+    pub fn has_type_validator(&self) -> bool {
+        self.validate_type.is_some()
+    }
+    /// Check a borrowed default using only its independent validator.
     ///
-    /// # Type parameters
-    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
-    /// - `A`: Success or application-value type.
+    /// Returns `MissingValidator` when absent, rather than encoding or decoding the
+    /// value. This allows defaults to retain ownership and avoid encode capabilities.
+    pub fn validate_default_ref(&self, value: &A) -> Result<(), SchemaIssue> {
+        match &self.validate_type {
+            Some(validate) => validate(value, None),
+            None => Err(SchemaIssue::new(SchemaIssueKind::MissingValidator)),
+        }
+    }
+
+    /// Check application constraints using the borrowed validator when supplied.
     ///
-    /// # Parameters
-    /// - `value` (`&A`): Value read, transformed, encoded, or stored by this operation.
-    ///
-    /// # Returns
-    /// Type: `Result<(), SchemaIssue>`.
+    /// Without that witness, encodes the value and discards the representation. Use
+    /// [`Self::validate_default_ref`] when representation replay is forbidden.
     pub fn validate_ref(&self, value: &A) -> Result<(), SchemaIssue> {
         match &self.validate_type {
-            Some(validate) => validate(value),
+            Some(validate) => validate(value, None),
             None => self.encode_ref(value).map(|_| ()),
         }
     }
 
-    /// Decode from a borrowed representation without taking its ownership.
-    ///
-    /// # Type parameters
-    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Parameters
-    /// - `encoded` (`&Encoded`): The encoded supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Result<A, SchemaIssue>`.
+    /// Inspect a borrowed encoded input and return an owned application value or a typed schema issue.
     pub fn decode_ref(&self, encoded: &Encoded) -> Result<A, SchemaIssue> {
-        (self.decode)(encoded)
+        (self.decode)(encoded, None)
     }
 
-    /// Encode a borrowed application value under this codec’s rules.
-    ///
-    /// # Type parameters
-    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Parameters
-    /// - `value` (`&A`): Value read, transformed, encoded, or stored by this operation.
-    ///
-    /// # Returns
-    /// Type: `Result<Encoded, SchemaIssue>`.
+    /// Inspect a borrowed application value and return an independently owned representation, applying the encoder's checks.
     pub fn encode_ref(&self, value: &A) -> Result<Encoded, SchemaIssue> {
-        (self.encode)(value)
+        (self.encode)(value, None)
     }
 
+    /// Borrow immutable encoded-side metadata for inspection and preparation.
     #[must_use]
-    /// Borrow the representation tree used for schema inspection or export.
-    ///
-    /// # Type parameters
-    /// - `A`: Application value type. Bound: `Send + 'static`.
-    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
-    ///
-    /// # Returns
-    /// Type: `&SchemaAst`.
     pub fn ast(&self) -> &SchemaAst {
         &self.ast
     }
 
-    /// Lift pure directions into independent Effect environments.
-    #[must_use]
-    /// # Type parameters
-    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
-    /// - `DecodeEnv`: Capabilities required while decoding. Additional bound: `Send + Sync + 'static`.
-    /// - `EncodeEnv`: Capabilities required while encoding. Additional bound: `Send + Sync + 'static`.
-    /// - `A`: Success or application-value type.
+    /// Lift borrowed directions to owned lazy effects with separate decode and encode environments.
     ///
-    /// # Returns
-    /// Type: `Codec<A, Encoded, DecodeEnv, EncodeEnv>`.
+    /// Inputs move into one execution without requiring Clone. Existing independent
+    /// validation and writer witnesses propagate; contextual built-in callbacks retain
+    /// configured traversal state. No runtime capability is chosen by this adapter.
+    #[must_use]
     pub fn into_effect<DecodeEnv, EncodeEnv>(&self) -> Codec<A, Encoded, DecodeEnv, EncodeEnv>
     where
         DecodeEnv: Send + Sync + 'static,
@@ -226,45 +252,130 @@ impl<A: Send + 'static, Encoded: Send + 'static> PureCodec<A, Encoded> {
     {
         let decode = Arc::clone(&self.decode);
         let encode = Arc::clone(&self.encode);
-        Codec::with_ast(
+        let validator = self.validate_type.as_ref().map(Arc::clone);
+        let mut lifted = Codec::with_context(
             self.ast.clone(),
-            move |encoded| evaluate_once(encoded, Arc::clone(&decode)),
-            move |value| evaluate_once(value, Arc::clone(&encode)),
-        )
+            move |value, context| {
+                let decode = Arc::clone(&decode);
+                Effect::try_sync_once(
+                    move || decode(&value, context.as_ref()),
+                    std::convert::identity,
+                )
+            },
+            move |value, context| {
+                let encode = Arc::clone(&encode);
+                Effect::try_sync_once(
+                    move || encode(&value, context.as_ref()),
+                    std::convert::identity,
+                )
+            },
+        );
+        lifted.pure_validate = validator.as_ref().map(Arc::clone);
+        if let Some(writer) = self.writer.as_ref().map(Arc::clone) {
+            lifted.writer = Some(Arc::new(move |value, mut output| {
+                let writer = Arc::clone(&writer);
+                Effect::try_sync_once(
+                    move || {
+                        writer(&value, &mut output)?;
+                        Ok(output)
+                    },
+                    std::convert::identity,
+                )
+            }));
+        }
+        match validator {
+            Some(validate) => lifted.with_context_validator(move |value, context| {
+                let validate = Arc::clone(&validate);
+                Effect::try_sync_once(
+                    move || {
+                        validate(&value, context.as_ref())?;
+                        Ok(value)
+                    },
+                    std::convert::identity,
+                )
+            }),
+            None => lifted,
+        }
     }
 }
 
 impl<A: Send + 'static> PureCodec<A, JsonValue> {
-    /// Parse JSON text under the declared limits, then decode its typed value.
+    /// Install an independent direct JSON writer for one borrowed value.
     ///
-    /// # Type parameters
-    /// - `A`: Success or application-value type.
+    /// The callback must validate its own constraints, append exactly one value to the
+    /// supplied writer, and leave caller-owned containers open. It must not replay the
+    /// ordinary encoder; [`Self::write_into`] checks the value boundary and poisons on error.
+    #[must_use]
+    pub fn with_writer(
+        mut self,
+        writer: impl Fn(&A, &mut JsonWriter) -> Result<(), SchemaIssue> + Send + Sync + 'static,
+    ) -> Self {
+        self.writer = Some(Arc::new(writer));
+        self
+    }
+    /// Whether a direct JSON writer witness is installed; an encoder alone is insufficient.
+    #[must_use]
+    pub fn has_writer(&self) -> bool {
+        self.writer.is_some()
+    }
+    /// Append one borrowed value to an existing writer using its genuine witness.
     ///
-    /// # Parameters
-    /// - `text` (`&str`): Input text parsed or emitted by this operation.
-    /// - `policy` (`ParsePolicy`): The caller-supplied behavior policy.
+    /// Returns `UnsupportedRepresentation` when unavailable. Enforces one value in
+    /// the existing root/container and poisons on callback or boundary failure; the
+    /// caller's writer policy and containers remain authoritative.
+    pub fn write_into(&self, value: &A, writer: &mut JsonWriter) -> Result<(), SchemaIssue> {
+        let Some(write) = &self.writer else {
+            return Err(SchemaIssue::new(
+                SchemaIssueKind::UnsupportedRepresentation {
+                    kind: "direct_json_writer".into(),
+                },
+            ));
+        };
+        let boundary = writer.boundary()?;
+        let result = write(value, writer).and_then(|()| writer.complete_value(&boundary));
+        if result.is_err() {
+            writer.poison();
+        }
+        result
+    }
+    /// Write one complete JSON document under `policy`, returning owned UTF-8 bytes.
     ///
-    /// # Returns
-    /// Type: `Result<A, SchemaIssue>`.
+    /// Requires a direct-writer witness and never falls back to ordinary encoding.
+    /// Invalid structure or a resource error returns no partial document.
+    pub fn write(&self, value: &A, policy: JsonWriterPolicy) -> Result<Vec<u8>, SchemaIssue> {
+        if !self.has_writer() {
+            return Err(SchemaIssue::new(
+                SchemaIssueKind::UnsupportedRepresentation {
+                    kind: "direct_json_writer".into(),
+                },
+            ));
+        }
+        let mut writer = JsonWriter::new(policy);
+        self.write_into(value, &mut writer)?;
+        writer.finish()
+    }
+    /// Prepare metadata, strictly parse UTF-8 JSON under `policy`, then decode it.
+    ///
+    /// Invalid UTF-8, syntax, structural bounds or schema constraints return a typed
+    /// issue; bytes are not lossily repaired.
+    pub fn parse_utf8(&self, bytes: &[u8], policy: ParsePolicy) -> Result<A, SchemaIssue> {
+        self.ast.prepare(policy.limits)?;
+        self.decode_ref(&super::internal::parser::parse_json_bytes(bytes, policy)?)
+    }
+
+    /// Prepare metadata, parse JSON under the supplied limits and field policy, then decode the resulting tree.
     pub fn parse_str(&self, text: &str, policy: ParsePolicy) -> Result<A, SchemaIssue> {
         self.ast.prepare(policy.limits)?;
         let encoded = super::internal::parser::parse_json(text, policy)?;
         self.decode_ref(&encoded)
     }
 
-    /// Tie a recursive codec without an owning reference cycle. The body sees
-    /// a typed self-reference, while AST references remain weak and exportable.
+    /// Tie a recursive codec using weak self-references without an ownership cycle.
     ///
-    /// # Type parameters
-    /// - `A`: Application value type. Bound: `Send + 'static`.
-    ///
-    /// # Parameters
-    /// - `name` (`impl Into<Arc<str>>`): Stable name used to register or locate this definition.
-    /// - `shape` (`impl FnOnce(SchemaReference) -> SchemaShape`): Encoded-side structure required by this schema.
-    /// - `build` (`impl FnOnce(Self) -> Result<Self, SchemaIssue>`): The build supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Result<Self, SchemaIssue>`.
+    /// `shape` describes recursive metadata; `build` constructs the directional body
+    /// from a typed reference. Invalid metadata or construction fails eagerly. Nested
+    /// built-in calls retain the active context; independent validation and writing
+    /// are usable only when the body actually provides them.
     pub fn recursive(
         name: impl Into<Arc<str>>,
         shape: impl FnOnce(SchemaReference) -> SchemaShape,
@@ -274,53 +385,94 @@ impl<A: Send + 'static> PureCodec<A, JsonValue> {
         let cell = Arc::new(OnceLock::<Self>::new());
         let decode_cell = Arc::downgrade(&cell);
         let encode_cell = Arc::downgrade(&cell);
-        let reference = Self::with_ast(
+        let writer_cell = Arc::downgrade(&cell);
+        let validate_cell = Arc::downgrade(&cell);
+        let mut reference = Self::with_context_ast(
             ast.clone(),
-            move |encoded| {
+            move |encoded, context| {
                 decode_cell
                     .upgrade()
-                    .and_then(|cell| cell.get().map(|codec| codec.decode_ref(encoded)))
+                    .and_then(|cell| {
+                        cell.get()
+                            .map(|codec| codec.decode_in_ref(encoded, context))
+                    })
                     .unwrap_or_else(|| Err(SchemaIssue::new(SchemaIssueKind::InvalidDefinition)))
             },
-            move |value| {
+            move |value, context| {
                 encode_cell
                     .upgrade()
-                    .and_then(|cell| cell.get().map(|codec| codec.encode_ref(value)))
+                    .and_then(|cell| cell.get().map(|codec| codec.encode_in_ref(value, context)))
                     .unwrap_or_else(|| Err(SchemaIssue::new(SchemaIssueKind::InvalidDefinition)))
             },
         );
+        reference.writer = Some(Arc::new(move |value, writer| {
+            writer_cell
+                .upgrade()
+                .and_then(|cell| {
+                    cell.get().map(|codec| match &codec.writer {
+                        Some(write) => write(value, writer),
+                        None => Err(SchemaIssue::new(SchemaIssueKind::MissingValidator)),
+                    })
+                })
+                .unwrap_or_else(|| Err(SchemaIssue::new(SchemaIssueKind::InvalidDefinition)))
+        }));
+        reference.validate_type = Some(Arc::new(move |value, context| {
+            validate_cell
+                .upgrade()
+                .and_then(|cell| {
+                    cell.get()
+                        .map(|codec| codec.validate_in_ref(value, context))
+                })
+                .unwrap_or_else(|| Err(SchemaIssue::new(SchemaIssueKind::InvalidDefinition)))
+        }));
         let body = build(reference)?;
+        let has_writer = body.writer.is_some();
+        let has_validator = body.validate_type.is_some();
         cell.set(body)
             .map_err(|_| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?;
         let decode = Arc::clone(&cell);
-        Ok(Self::with_ast(
+        let writer_cell = Arc::clone(&cell);
+        let validate_cell = Arc::clone(&cell);
+        let mut recursive = Self::with_context_ast(
             ast,
-            move |encoded| {
+            move |encoded, context| {
                 decode
                     .get()
                     .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?
-                    .decode_ref(encoded)
+                    .decode_in_ref(encoded, context)
             },
-            move |value| {
+            move |value, context| {
                 cell.get()
                     .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?
-                    .encode_ref(value)
+                    .encode_in_ref(value, context)
             },
-        ))
+        );
+        if has_writer {
+            recursive.writer = Some(Arc::new(move |value, writer| {
+                writer_cell
+                    .get()
+                    .and_then(|codec| codec.writer.as_ref())
+                    .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?(
+                    value, writer,
+                )
+            }));
+        }
+        if has_validator {
+            recursive.validate_type = Some(Arc::new(move |value, context| {
+                validate_cell
+                    .get()
+                    .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?
+                    .validate_in_ref(value, context)
+            }));
+        }
+        Ok(recursive)
     }
 
-    /// A caller-named refinement validates both directions. A failed encode
-    /// cannot silently emit a value the decoder would reject.
+    /// Apply a named predicate after decode and before encode or direct writing.
     ///
-    /// # Type parameters
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Parameters
-    /// - `name` (`impl Into<Arc<str>>`): Stable name used to register or locate this definition.
-    /// - `predicate` (`impl Fn(&A) -> bool + Send + Sync + 'static`): The condition used to select or validate values.
-    ///
-    /// # Returns
-    /// Type: `Self`.
+    /// Failure returns `InvalidValue` with `name`. The refined codec retains an
+    /// independent validator or writer only when the source has that witness; the
+    /// predicate does not fabricate missing type validation.
     pub fn refine(
         self,
         name: impl Into<Arc<str>>,
@@ -332,13 +484,20 @@ impl<A: Send + 'static> PureCodec<A, JsonValue> {
             name: Arc::clone(&name),
         });
         let decode = self.clone();
+        let writer_source = self.clone();
+        let validate_source = self.validate_type.as_ref().map(Arc::clone);
+        let has_writer = self.has_writer();
         let predicate = Arc::new(predicate);
         let decode_predicate = Arc::clone(&predicate);
+        let writer_predicate = Arc::clone(&predicate);
+        let validate_predicate = Arc::clone(&predicate);
+        let writer_name = Arc::clone(&name);
+        let validate_name = Arc::clone(&name);
         let decode_name = Arc::clone(&name);
-        Self::with_ast(
+        let refined = Self::with_context_ast(
             ast,
-            move |encoded| {
-                let value = decode.decode_ref(encoded)?;
+            move |encoded, context| {
+                let value = decode.decode_in_ref(encoded, context)?;
                 if decode_predicate(&value) {
                     Ok(value)
                 } else {
@@ -347,30 +506,49 @@ impl<A: Send + 'static> PureCodec<A, JsonValue> {
                     }))
                 }
             },
-            move |value| {
+            move |value, context| {
                 if predicate(value) {
-                    self.encode_ref(value)
+                    self.encode_in_ref(value, context)
                 } else {
                     Err(SchemaIssue::new(SchemaIssueKind::InvalidValue {
                         code: Arc::clone(&name),
                     }))
                 }
             },
-        )
+        );
+        let refined = if let Some(validate_source) = validate_source {
+            refined.with_context_type_validator(move |value, context| {
+                validate_source(value, context)?;
+                if validate_predicate(value) {
+                    Ok(())
+                } else {
+                    Err(SchemaIssue::new(SchemaIssueKind::InvalidValue {
+                        code: Arc::clone(&validate_name),
+                    }))
+                }
+            })
+        } else {
+            refined
+        };
+        if has_writer {
+            refined.with_writer(move |value, writer| {
+                if !writer_predicate(value) {
+                    return Err(SchemaIssue::new(SchemaIssueKind::InvalidValue {
+                        code: Arc::clone(&writer_name),
+                    }));
+                }
+                writer_source.write_into(value, writer)
+            })
+        } else {
+            refined
+        }
     }
 
-    /// Map a codec to a different application type while preserving its encoded representation.
+    /// Map owned decoded values to `B` and project borrowed `B` values back to `A`.
     ///
-    /// # Type parameters
-    /// - `B`: Transformed value type. Bounds: `Send + 'static`.
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Parameters
-    /// - `decode` (`impl Fn(A) -> Result<B, SchemaIssue> + Send + Sync + 'static`): Callback that validates and reconstructs a typed value.
-    /// - `encode` (`impl Fn(&B) -> Result<A, SchemaIssue> + Send + Sync + 'static`): The encode supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `PureCodec<B, JsonValue>`.
+    /// The encoded representation and contextual traversal are retained. Independent
+    /// validation and writing propagate only from genuine source witnesses and apply
+    /// the projection without ordinary representation replay.
     pub fn transform<B: Send + 'static>(
         self,
         decode: impl Fn(A) -> Result<B, SchemaIssue> + Send + Sync + 'static,
@@ -380,25 +558,35 @@ impl<A: Send + 'static> PureCodec<A, JsonValue> {
             .ast()
             .derive(SchemaShape::EncodedView(self.ast().clone()));
         let input = self.clone();
-        PureCodec::with_ast(
+        let writer_source = self.clone();
+        let validation_source = self.clone();
+        let has_validator = self.validate_type.is_some();
+        let has_writer = self.has_writer();
+        let encode = Arc::new(encode);
+        let validation_encode = Arc::clone(&encode);
+        let writer_encode = Arc::clone(&encode);
+        let transformed = PureCodec::with_context_ast(
             ast,
-            move |encoded| decode(input.decode_ref(encoded)?),
-            move |value| self.encode_ref(&encode(value)?),
-        )
+            move |encoded, context| decode(input.decode_in_ref(encoded, context)?),
+            move |value, context| self.encode_in_ref(&encode(value)?, context),
+        );
+        let transformed = if has_validator {
+            transformed.with_context_type_validator(move |value, context| {
+                validation_source.validate_in_ref(&validation_encode(value)?, context)
+            })
+        } else {
+            transformed
+        };
+        if has_writer {
+            transformed.with_writer(move |value, writer| {
+                writer_source.write_into(&writer_encode(value)?, writer)
+            })
+        } else {
+            transformed
+        }
     }
 
-    /// Preserve the existing decoder surface. An encoder is already present in
-    /// this PureCodec; adapting an old one-way Schema in reverse is not inferred.
-    ///
-    /// # Type parameters
-    /// - `E`: Domain-error type. Bounds: `Send + 'static`.
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Parameters
-    /// - `issue` (`impl Fn(SchemaIssue) -> E + Send + Sync + 'static`): The issue supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Schema<A, E>`.
+    /// Expose the pure JSON decoder through the legacy one-way Schema error mapping; no reverse encoder or effectful blocking bridge is inferred.
     pub fn to_schema<E: Send + 'static>(
         &self,
         issue: impl Fn(SchemaIssue) -> E + Send + Sync + 'static,
@@ -408,45 +596,18 @@ impl<A: Send + 'static> PureCodec<A, JsonValue> {
     }
 }
 
-///
-/// # Type parameters
-/// - `Input`: Bounds: `Send + 'static`.
-/// - `Output`: Bounds: `Send + 'static`.
-/// - `Env`: Bounds: `Send + Sync + 'static`.
-///
-/// # Parameters
-/// - `input` (`Input`): Owned input decoded or consumed by this operation.
-/// - `operation` (`Arc<OnceOperation<Input, Output>>`): Typed operation definition or callback selected for execution.
-///
-/// # Returns
-/// Type: `Effect<Output, SchemaIssue, Env>`.
-/// Returns a lazy `Effect` with the declared success, error, and environment types.
-fn evaluate_once<Input: Send + 'static, Output: Send + 'static, Env: Send + Sync + 'static>(
-    input: Input,
-    operation: Arc<OnceOperation<Input, Output>>,
-) -> Effect<Output, SchemaIssue, Env> {
-    let input = Mutex::new(Some(input));
-    Effect::try_sync(
-        move || {
-            let value = input
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-                .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InputConsumed))?;
-            operation(&value)
-        },
-        std::convert::identity,
-    )
-}
+type EffectValidator<A, R> =
+    Arc<dyn Fn(A, Option<ParseContext>) -> Effect<A, SchemaIssue, R> + Send + Sync>;
+type EffectWriter<A, R> =
+    Arc<dyn Fn(A, JsonWriter) -> Effect<JsonWriter, SchemaIssue, R> + Send + Sync>;
 
-/// Effectful codec with independent decode and encode environments.
-/// Directions own their inputs; effectful transformations may suspend safely.
+/// Owned effectful directions with independently selected decode and encode environments.
 ///
-/// # Type parameters
-/// - `A`: Application value type. Bound or type: `Send + 'static`.
-/// - `Encoded`: Encoded representation type. Bound or type: `Send + 'static`.
-/// - `DecodeEnv`: Decoding environment type. Bound or type: `Send + Sync + 'static`.
-/// - `EncodeEnv`: Encoding environment type. Bound or type: `Send + Sync + 'static`.
+/// Decode uses `DecodeEnv`; encode, owned validation and direct writing use
+/// `EncodeEnv`. Callbacks may suspend while retaining owned values and invocation
+/// context. Clones share descriptions, not payloads. One-shot inputs are consumed
+/// once; factory methods provide reusable executions. Validation and writing are
+/// optional capabilities, never inferred from an encoded AST alone.
 pub struct Codec<
     A: Send + 'static,
     Encoded: Send + 'static,
@@ -456,6 +617,9 @@ pub struct Codec<
     ast: SchemaAst,
     decode: EffectDecoder<A, Encoded, DecodeEnv>,
     encode: EffectEncoder<A, Encoded, EncodeEnv>,
+    validate: Option<EffectValidator<A, EncodeEnv>>,
+    pure_validate: Option<TypeValidator<A>>,
+    writer: Option<EffectWriter<A, EncodeEnv>>,
 }
 
 impl<
@@ -473,6 +637,9 @@ impl<
             ast: self.ast.clone(),
             decode: Arc::clone(&self.decode),
             encode: Arc::clone(&self.encode),
+            validate: self.validate.as_ref().map(Arc::clone),
+            pure_validate: self.pure_validate.as_ref().map(Arc::clone),
+            writer: self.writer.as_ref().map(Arc::clone),
         }
     }
 }
@@ -484,21 +651,8 @@ impl<
     EncodeEnv: Send + Sync + 'static,
 > Codec<A, Encoded, DecodeEnv, EncodeEnv>
 {
+    /// Describe owned effectful decode and encode callbacks with opaque metadata; callbacks remain lazy and no witnesses are inferred.
     #[must_use]
-    /// Construct a `Codec` from its required inputs and explicit policies.
-    ///
-    /// # Type parameters
-    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
-    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Parameters
-    /// - `decode` (`impl Fn(Encoded) -> Effect<A, SchemaIssue, DecodeEnv> + Send + Sync + 'static`): Callback that validates and reconstructs a typed value.
-    /// - `encode` (`impl Fn(A) -> Effect<Encoded, SchemaIssue, EncodeEnv> + Send + Sync + 'static`): The encode supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Self`.
     pub fn new(
         decode: impl Fn(Encoded) -> Effect<A, SchemaIssue, DecodeEnv> + Send + Sync + 'static,
         encode: impl Fn(A) -> Effect<Encoded, SchemaIssue, EncodeEnv> + Send + Sync + 'static,
@@ -506,105 +660,384 @@ impl<
         Self::with_ast(SchemaAst::opaque(), decode, encode)
     }
 
-    /// # Type parameters
-    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
-    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Parameters
-    /// - `ast` (`SchemaAst`): Representation tree used for schema inspection or export.
-    /// - `decode` (`impl Fn(Encoded) -> Effect<A, SchemaIssue, DecodeEnv> + Send + Sync + 'static`): Callback that validates and reconstructs a typed value.
-    /// - `encode` (`impl Fn(A) -> Effect<Encoded, SchemaIssue, EncodeEnv> + Send + Sync + 'static`): The encode supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Self`.
-    pub(crate) fn with_ast(
+    /// Describe owned directions with explicit AST metadata; the caller must make the metadata and callbacks agree.
+    pub fn with_ast(
         ast: SchemaAst,
         decode: impl Fn(Encoded) -> Effect<A, SchemaIssue, DecodeEnv> + Send + Sync + 'static,
         encode: impl Fn(A) -> Effect<Encoded, SchemaIssue, EncodeEnv> + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_context(
+            ast,
+            move |value, _| decode(value),
+            move |value, _| encode(value),
+        )
+    }
+
+    /// Construct directional callbacks that explicitly receive invocation state.
+    ///
+    /// Configured calls provide an owned [`ParseContext`]; unconfigured calls supply
+    /// None. Custom composites must forward the context to nested work so suspension
+    /// does not reset counters or paths. The caller keeps metadata and checks consistent.
+    pub fn with_context(
+        ast: SchemaAst,
+        decode: impl Fn(Encoded, Option<ParseContext>) -> Effect<A, SchemaIssue, DecodeEnv>
+        + Send
+        + Sync
+        + 'static,
+        encode: impl Fn(A, Option<ParseContext>) -> Effect<Encoded, SchemaIssue, EncodeEnv>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         Self {
             ast,
             decode: Arc::new(decode),
             encode: Arc::new(encode),
+            validate: None,
+            pure_validate: None,
+            writer: None,
+        }
+    }
+    /// Tie owned effectful directions through weak self-references, retaining context across suspension.
+    ///
+    /// `shape` supplies recursive metadata and `build` constructs the body. Values need
+    /// no Clone bound. Optional validation/writer capabilities propagate only from the
+    /// body's genuine witnesses; invalid preparation or body construction fails eagerly.
+    pub fn recursive(
+        name: impl Into<Arc<str>>,
+        shape: impl FnOnce(SchemaReference) -> SchemaShape,
+        build: impl FnOnce(Self) -> Result<Self, SchemaIssue>,
+    ) -> Result<Self, SchemaIssue> {
+        let ast = SchemaAst::recursive(name, shape)?;
+        let cell = Arc::new(OnceLock::<Self>::new());
+        let decode = Arc::downgrade(&cell);
+        let encode = Arc::downgrade(&cell);
+        let validate = Arc::downgrade(&cell);
+        let writer = Arc::downgrade(&cell);
+        let mut reference = Self::with_context(
+            ast.clone(),
+            move |value, context| match decode
+                .upgrade()
+                .and_then(|cell| cell.get().map(|body| (body.decode)(value, context)))
+            {
+                Some(effect) => effect,
+                None => Effect::fail_with(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition)),
+            },
+            move |value, context| match encode
+                .upgrade()
+                .and_then(|cell| cell.get().map(|body| (body.encode)(value, context)))
+            {
+                Some(effect) => effect,
+                None => Effect::fail_with(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition)),
+            },
+        );
+        reference.validate = Some(Arc::new(move |value, context| {
+            match validate.upgrade().and_then(|cell| {
+                cell.get()
+                    .and_then(|body| body.validate.as_ref())
+                    .map(|validate| validate(value, context))
+            }) {
+                Some(effect) => effect,
+                None => Effect::fail_with(|| SchemaIssue::new(SchemaIssueKind::MissingValidator)),
+            }
+        }));
+        reference.writer = Some(Arc::new(move |value, output| {
+            match writer.upgrade().and_then(|cell| {
+                cell.get()
+                    .and_then(|body| body.writer.as_ref())
+                    .map(|write| write(value, output))
+            }) {
+                Some(effect) => effect,
+                None => Effect::fail_with(|| {
+                    SchemaIssue::new(SchemaIssueKind::UnsupportedRepresentation {
+                        kind: "direct_json_writer".into(),
+                    })
+                }),
+            }
+        }));
+        let body = build(reference)?;
+        let has_validator = body.validate.is_some();
+        let has_writer = body.writer.is_some();
+        let pure_validate = body.pure_validate.clone();
+        cell.set(body)
+            .map_err(|_| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?;
+        let decode = Arc::clone(&cell);
+        let encode = Arc::clone(&cell);
+        let validate = Arc::clone(&cell);
+        let writer = Arc::clone(&cell);
+        let mut result = Self::with_context(
+            ast,
+            move |value, context| match decode.get() {
+                Some(body) => (body.decode)(value, context),
+                None => Effect::fail_with(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition)),
+            },
+            move |value, context| match encode.get() {
+                Some(body) => (body.encode)(value, context),
+                None => Effect::fail_with(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition)),
+            },
+        );
+        if has_validator {
+            result.validate = Some(Arc::new(move |value, context| {
+                match validate.get().and_then(|body| body.validate.as_ref()) {
+                    Some(validate) => validate(value, context),
+                    None => {
+                        Effect::fail_with(|| SchemaIssue::new(SchemaIssueKind::MissingValidator))
+                    }
+                }
+            }));
+        }
+        if has_writer {
+            result.writer = Some(Arc::new(move |value, output| {
+                match writer.get().and_then(|body| body.writer.as_ref()) {
+                    Some(write) => write(value, output),
+                    None => {
+                        Effect::fail_with(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))
+                    }
+                }
+            }));
+        }
+        result.pure_validate = pure_validate;
+        Ok(result)
+    }
+
+    /// Install a lazy owned writer in `EncodeEnv`.
+    ///
+    /// The callback must check its constraints and append exactly one value to the same
+    /// writer, preserving policy and caller containers. It may suspend; checked boundary
+    /// completion rejects writer replacement or an incorrect number of values.
+    #[must_use]
+    pub fn with_writer(
+        mut self,
+        write: impl Fn(A, JsonWriter) -> Effect<JsonWriter, SchemaIssue, EncodeEnv>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.writer = Some(Arc::new(write));
+        self
+    }
+    /// Whether the owned direct-writing direction has an explicit witness.
+    #[must_use]
+    pub fn has_writer(&self) -> bool {
+        self.writer.is_some()
+    }
+    /// Lazily consume `value` and append exactly one JSON value in `EncodeEnv`.
+    ///
+    /// Requires a genuine writer witness. It returns the same owned writer, preserving
+    /// its policy and caller containers even across suspension. Replacing the writer,
+    /// closing caller containers, or producing zero/two values is a schema failure.
+    /// The returned effect owns a one-shot value/writer pair.
+    pub fn write_into_once(
+        &self,
+        value: A,
+        mut writer: JsonWriter,
+    ) -> Effect<JsonWriter, SchemaIssue, EncodeEnv> {
+        match self.writer.as_ref().map(Arc::clone) {
+            Some(write) => {
+                let boundary = match writer.boundary() {
+                    Ok(boundary) => Arc::new(boundary),
+                    Err(issue) => return Effect::from_result_once(Err(issue)),
+                };
+                Effect::from_result_once(Ok((value, writer))).flat_map(move |(value, writer)| {
+                    let boundary = Arc::clone(&boundary);
+                    write(value, writer).flat_map(move |mut writer| {
+                        Effect::from_result_once(writer.complete_value(&boundary).map(|()| writer))
+                    })
+                })
+            }
+            None => Effect::fail_with(|| {
+                SchemaIssue::new(SchemaIssueKind::UnsupportedRepresentation {
+                    kind: "direct_json_writer".into(),
+                })
+            }),
+        }
+    }
+    /// Lazily write a complete document in `EncodeEnv` using the supplied output bounds.
+    ///
+    /// Returns owned bytes only after checked completion; no ordinary-encoder fallback
+    /// exists. The input is consumed once without requiring Clone.
+    pub fn write_once(
+        &self,
+        value: A,
+        policy: JsonWriterPolicy,
+    ) -> Effect<Vec<u8>, SchemaIssue, EncodeEnv> {
+        self.write_into_once(value, JsonWriter::new(policy))
+            .flat_map(|writer| Effect::from_result_once(writer.finish()))
+    }
+
+    /// Add immutable annotation metadata while preserving directional witnesses.
+    pub fn annotate(
+        mut self,
+        name: impl Into<Arc<str>>,
+        value: impl Into<Arc<str>>,
+    ) -> Result<Self, SchemaIssue> {
+        self.ast = self.ast.annotate(name, value)?;
+        Ok(self)
+    }
+
+    /// Install lazy owned type validation in `EncodeEnv`, returning the validated input.
+    ///
+    /// This does not create the borrowed witness needed for defaults decoded in a
+    /// different environment. Use context-aware validation for custom nested traversal.
+    #[must_use]
+    pub fn with_validator(
+        mut self,
+        validate: impl Fn(A) -> Effect<A, SchemaIssue, EncodeEnv> + Send + Sync + 'static,
+    ) -> Self {
+        self.validate = Some(Arc::new(move |value, _| validate(value)));
+        self
+    }
+
+    /// Check a borrowed default without representation replay or encode-environment access.
+    ///
+    /// Requires the independent pure witness, as propagated by [`PureCodec::into_effect`];
+    /// a standalone owned validator is insufficient and yields `MissingValidator`.
+    pub fn validate_default_ref(&self, value: &A) -> Result<(), SchemaIssue> {
+        self.validate_default_in_ref(value, None)
+    }
+    /// Validate a borrowed default with the independent witness and optional active context.
+    ///
+    /// A supplied context charges one schema visit before validation. Returns
+    /// `MissingValidator` when no pure witness exists; never invokes an encoder or
+    /// acquires encode-environment capabilities. Used by generated native defaults.
+    pub fn validate_default_in_ref(
+        &self,
+        value: &A,
+        context: Option<&ParseContext>,
+    ) -> Result<(), SchemaIssue> {
+        if let Some(context) = context {
+            context.visit()?;
+        }
+        match &self.pure_validate {
+            Some(validate) => validate(value, context),
+            None => Err(SchemaIssue::new(SchemaIssueKind::MissingValidator)),
         }
     }
 
-    /// Each evaluation receives a fresh owned input without requiring Clone.
+    /// Install owned validation that explicitly retains the optional invocation context.
     ///
-    /// # Type parameters
-    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
-    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `A`: Success or application-value type.
+    /// Nested checks must reuse this state rather than creating fresh counters. Returns
+    /// the owned validated value in `EncodeEnv`; it supplies no borrowed default witness.
+    #[must_use]
+    pub fn with_context_validator(
+        mut self,
+        validate: impl Fn(A, Option<ParseContext>) -> Effect<A, SchemaIssue, EncodeEnv>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.validate = Some(Arc::new(validate));
+        self
+    }
+
+    /// Lazily validate one owned value in `EncodeEnv`, returning it on success.
     ///
-    /// # Parameters
-    /// - `input` (`impl Fn() -> Encoded + Send + Sync + 'static`): The input value or factory consumed by this operation.
+    /// Returns `MissingValidator` when unavailable. The value is consumed once;
+    /// validation does not fall back to encoding.
+    pub fn validate_once(&self, value: A) -> Effect<A, SchemaIssue, EncodeEnv> {
+        self.validate_in(value, None)
+    }
+
+    pub(crate) fn validate_in(
+        &self,
+        value: A,
+        context: Option<ParseContext>,
+    ) -> Effect<A, SchemaIssue, EncodeEnv> {
+        let validate = self.validate.as_ref().map(Arc::clone);
+        Effect::try_sync_once(
+            move || {
+                if let Some(context) = &context {
+                    context.visit()?;
+                }
+                Ok((value, context))
+            },
+            std::convert::identity,
+        )
+        .flat_map(move |(value, context)| match &validate {
+            Some(validate) => validate(value, context),
+            None => Effect::fail_with(|| SchemaIssue::new(SchemaIssueKind::MissingValidator)),
+        })
+    }
+
+    pub(crate) fn decode_in(
+        &self,
+        value: Encoded,
+        context: Option<ParseContext>,
+    ) -> Effect<A, SchemaIssue, DecodeEnv> {
+        let decode = Arc::clone(&self.decode);
+        Effect::try_sync_once(
+            move || {
+                if let Some(context) = &context {
+                    context.visit()?;
+                    context.check_representation(&value)?;
+                }
+                Ok((value, context))
+            },
+            std::convert::identity,
+        )
+        .flat_map(move |(value, context)| decode(value, context))
+    }
+
+    pub(crate) fn encode_in(
+        &self,
+        value: A,
+        context: Option<ParseContext>,
+    ) -> Effect<Encoded, SchemaIssue, EncodeEnv> {
+        let encode = Arc::clone(&self.encode);
+        Effect::try_sync_once(
+            move || {
+                if let Some(context) = &context {
+                    context.visit()?;
+                }
+                Ok((value, context))
+            },
+            std::convert::identity,
+        )
+        .flat_map(move |(value, context)| {
+            let checked = context.clone();
+            encode(value, context).flat_map(move |value| {
+                let checked = checked.clone();
+                Effect::try_sync_once(
+                    move || {
+                        if let Some(context) = checked {
+                            context.check_representation(&value)?;
+                        }
+                        Ok(value)
+                    },
+                    std::convert::identity,
+                )
+            })
+        })
+    }
+
+    /// Create a reusable lazy decode in `DecodeEnv` from a fresh owned input factory.
     ///
-    /// # Returns
-    /// Type: `Effect<A, SchemaIssue, DecodeEnv>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// The factory runs for each execution; no stored input or decoded payload is cloned.
     pub fn decode_with(
         &self,
         input: impl Fn() -> Encoded + Send + Sync + 'static,
     ) -> Effect<A, SchemaIssue, DecodeEnv> {
-        let decode = Arc::clone(&self.decode);
-        Effect::defer(move || decode(input()))
+        let codec = self.clone();
+        Effect::defer(move || codec.decode_once(input()))
     }
 
-    /// Supply an effectful encoder while retaining this schema’s decode contract.
-    ///
-    /// # Type parameters
-    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
-    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Parameters
-    /// - `input` (`impl Fn() -> A + Send + Sync + 'static`): The input value or factory consumed by this operation.
-    ///
-    /// # Returns
-    /// Type: `Effect<Encoded, SchemaIssue, EncodeEnv>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// Create a reusable lazy encode in `EncodeEnv`; the factory supplies a fresh owned application value per execution.
     pub fn encode_with(
         &self,
         input: impl Fn() -> A + Send + Sync + 'static,
     ) -> Effect<Encoded, SchemaIssue, EncodeEnv> {
         let encode = Arc::clone(&self.encode);
-        Effect::defer(move || encode(input()))
+        Effect::defer(move || encode(input(), None))
     }
 
+    /// Borrow the immutable encoded-side AST without acquiring directional capabilities.
     #[must_use]
-    /// Borrow the representation tree used for schema inspection or export.
-    ///
-    /// # Type parameters
-    /// - `A`: Application value type. Bound: `Send + 'static`.
-    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
-    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
-    ///
-    /// # Returns
-    /// Type: `&SchemaAst`.
     pub fn ast(&self) -> &SchemaAst {
         &self.ast
     }
 
-    /// Adapt only decoding to a larger environment. The original encode
-    /// environment remains unchanged and visible in the returned type.
+    /// Project an outer environment into DecodeEnv while preserving the encode, validation and writer directions.
     #[must_use]
-    /// # Type parameters
-    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
-    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `Outer`: Bounds: `Send + Sync + 'static`.
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Parameters
-    /// - `project` (`impl Fn(&Outer) -> DecodeEnv + Send + Sync + 'static`): The project supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Codec<A, Encoded, Outer, EncodeEnv>`.
     pub fn provide_decode<Outer: Send + Sync + 'static>(
         &self,
         project: impl Fn(&Outer) -> DecodeEnv + Send + Sync + 'static,
@@ -612,30 +1045,22 @@ impl<
         let decode = Arc::clone(&self.decode);
         let encode = Arc::clone(&self.encode);
         let project = Arc::new(project);
-        Codec::with_ast(
+        let mut codec = Codec::with_context(
             self.ast.clone(),
-            move |input| {
+            move |input, context| {
                 let project = Arc::clone(&project);
-                decode(input).provide_some(move |outer| project(outer))
+                decode(input, context).provide_some(move |outer| project(outer))
             },
-            move |input| encode(input),
-        )
+            move |input, context| encode(input, context),
+        );
+        codec.validate = self.validate.as_ref().map(Arc::clone);
+        codec.writer = self.writer.as_ref().map(Arc::clone);
+        codec.pure_validate = self.pure_validate.as_ref().map(Arc::clone);
+        codec
     }
 
-    /// Adapt only encoding without changing decoding's requirements.
+    /// Project an outer environment into EncodeEnv for encode, owned validation and writing; decode remains independent.
     #[must_use]
-    /// # Type parameters
-    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
-    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `Outer`: Bounds: `Send + Sync + 'static`.
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Parameters
-    /// - `project` (`impl Fn(&Outer) -> EncodeEnv + Send + Sync + 'static`): The project supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Codec<A, Encoded, DecodeEnv, Outer>`.
     pub fn provide_encode<Outer: Send + Sync + 'static>(
         &self,
         project: impl Fn(&Outer) -> EncodeEnv + Send + Sync + 'static,
@@ -643,33 +1068,39 @@ impl<
         let decode = Arc::clone(&self.decode);
         let encode = Arc::clone(&self.encode);
         let project = Arc::new(project);
-        Codec::with_ast(
+        let validation_project = Arc::clone(&project);
+        let mut codec = Codec::with_context(
             self.ast.clone(),
-            move |input| decode(input),
-            move |input| {
+            move |input, context| decode(input, context),
+            move |input, context| {
                 let project = Arc::clone(&project);
-                encode(input).provide_some(move |outer| project(outer))
+                encode(input, context).provide_some(move |outer| project(outer))
             },
-        )
+        );
+        if let Some(validate) = self.validate.as_ref().map(Arc::clone) {
+            let validation_project = Arc::clone(&validation_project);
+            codec.validate = Some(Arc::new(move |value, context| {
+                let project = Arc::clone(&validation_project);
+                validate(value, context).provide_some(move |outer| project(outer))
+            }));
+        }
+        codec.pure_validate = self.pure_validate.as_ref().map(Arc::clone);
+        if let Some(write) = self.writer.as_ref().map(Arc::clone) {
+            let project = Arc::clone(&validation_project);
+            codec.writer = Some(Arc::new(move |value, writer| {
+                let project = Arc::clone(&project);
+                write(value, writer).provide_some(move |outer| project(outer))
+            }));
+        }
+        codec
     }
 
-    /// Compose effectful conversion in both directions. Each callback owns
-    /// its value, so suspension does not borrow a temporary or require Clone.
-    /// Decode and encode keep their independently selected environments.
+    /// Compose owned conversion effects after decode and before encode, retaining each environment.
+    ///
+    /// Both callbacks may suspend. A source writer propagates through `before_encode`;
+    /// the transformed type has no inferred independent validator or borrowed default
+    /// witness. Supply explicit validation when the transformed contract needs it.
     #[must_use]
-    /// # Type parameters
-    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
-    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `B`: Transformed value type. Bounds: `Send + 'static`.
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Parameters
-    /// - `after_decode` (`impl Fn(A) -> Effect<B, SchemaIssue, DecodeEnv> + Send + Sync + 'static`): The after decode supplied to this operation.
-    /// - `before_encode` (`impl Fn(B) -> Effect<A, SchemaIssue, EncodeEnv> + Send + Sync + 'static`): The before encode supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Codec<B, Encoded, DecodeEnv, EncodeEnv>`.
     pub fn transform_effectful<B: Send + 'static>(
         self,
         after_decode: impl Fn(A) -> Effect<B, SchemaIssue, DecodeEnv> + Send + Sync + 'static,
@@ -677,44 +1108,56 @@ impl<
     ) -> Codec<B, Encoded, DecodeEnv, EncodeEnv> {
         let after_decode = Arc::new(after_decode);
         let before_encode = Arc::new(before_encode);
+        let writer = self.writer;
+        let writer_before = Arc::clone(&before_encode);
         let ast = self.ast.derive(SchemaShape::EncodedView(self.ast.clone()));
         let decode = self.decode;
         let encode = self.encode;
-        Codec::with_ast(
+        let mut transformed = Codec::with_context(
             ast,
-            move |encoded| {
+            move |encoded, context| {
                 let after_decode = Arc::clone(&after_decode);
-                decode(encoded).flat_map(move |value| after_decode(value))
+                decode(encoded, context).flat_map(move |value| after_decode(value))
             },
-            move |value| {
+            move |value, context| {
                 let encode = Arc::clone(&encode);
-                before_encode(value).flat_map(move |value| encode(value))
+                before_encode(value).flat_map(move |value| encode(value, context.clone()))
             },
-        )
+        );
+        if let Some(write) = writer {
+            transformed.writer = Some(Arc::new(move |value, writer| {
+                let write = Arc::clone(&write);
+                writer_before(value)
+                    .zip(Effect::from_result_once(Ok(writer)))
+                    .flat_map(move |(value, writer)| write(value, writer))
+            }));
+        }
+        transformed
     }
 
-    /// A refinement is a transformation whose application-side type stays A.
+    /// Keep application type `A` while adding named effectful checks in both directions.
+    ///
+    /// Decode and encode checks use their respective environments. If the source has
+    /// owned validation, validation also applies `before_encode`; the refinement does
+    /// not invent a borrowed default witness or ordinary-encoder fallback.
     #[must_use]
-    /// # Type parameters
-    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
-    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Parameters
-    /// - `name` (`impl Into<Arc<str>>`): Stable name used to register or locate this definition.
-    /// - `after_decode` (`impl Fn(A) -> Effect<A, SchemaIssue, DecodeEnv> + Send + Sync + 'static`): The after decode supplied to this operation.
-    /// - `before_encode` (`impl Fn(A) -> Effect<A, SchemaIssue, EncodeEnv> + Send + Sync + 'static`): The before encode supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Self`.
     pub fn refine_effectful(
         self,
         name: impl Into<Arc<str>>,
         after_decode: impl Fn(A) -> Effect<A, SchemaIssue, DecodeEnv> + Send + Sync + 'static,
         before_encode: impl Fn(A) -> Effect<A, SchemaIssue, EncodeEnv> + Send + Sync + 'static,
     ) -> Self {
-        let mut refined = self.transform_effectful(after_decode, before_encode);
+        let validate = self.clone();
+        let before_encode = Arc::new(before_encode);
+        let validation_check = Arc::clone(&before_encode);
+        let mut refined = self.transform_effectful(after_decode, move |value| before_encode(value));
+        if validate.validate.is_some() {
+            refined = refined.with_context_validator(move |value, context| {
+                let validate = validate.clone();
+                validation_check(value)
+                    .flat_map(move |value| validate.validate_in(value, context.clone()))
+            });
+        }
         refined.ast = refined.ast.derive(SchemaShape::Checked {
             source: refined.ast.clone(),
             name: name.into(),
@@ -722,72 +1165,29 @@ impl<
         refined
     }
 
-    /// A single owned input can be evaluated once. Further runs fail as data
-    /// with InputConsumed rather than silently duplicating the original input.
+    /// Lazily consume one encoded input in `DecodeEnv`, without cloning it.
     ///
-    /// # Type parameters
-    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
-    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Parameters
-    /// - `input` (`Encoded`): The input value or factory consumed by this operation.
-    ///
-    /// # Returns
-    /// Type: `Effect<A, SchemaIssue, DecodeEnv>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// The returned effect is single-use. Further execution reaches the consumed
+    /// synchronous-callback defect in [`crate::Exit::Die`]; use [`Self::decode_with`]
+    /// to supply a new input for each run.
     pub fn decode_once(&self, input: Encoded) -> Effect<A, SchemaIssue, DecodeEnv> {
-        let decode = Arc::clone(&self.decode);
-        let input = Mutex::new(Some(input));
-        Effect::defer(move || {
-            match input
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-            {
-                Some(value) => decode(value),
-                None => Effect::fail_with(|| SchemaIssue::new(SchemaIssueKind::InputConsumed)),
-            }
-        })
+        self.decode_in(input, None)
     }
 
-    /// Consume one owned value during a single encoding run.
+    /// Lazily consume one application value in `EncodeEnv`, without cloning it.
     ///
-    /// # Type parameters
-    /// - `Encoded`: Encoded representation type. Bound: `Send + 'static`.
-    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Parameters
-    /// - `input` (`A`): The input value or factory consumed by this operation.
-    ///
-    /// # Returns
-    /// Type: `Effect<Encoded, SchemaIssue, EncodeEnv>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// The returned effect is single-use; repeated execution yields a consumed-input
+    /// defect. Use [`Self::encode_with`] for reusable value factories.
     pub fn encode_once(&self, input: A) -> Effect<Encoded, SchemaIssue, EncodeEnv> {
-        let encode = Arc::clone(&self.encode);
-        let input = Mutex::new(Some(input));
-        Effect::defer(move || {
-            match input
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-            {
-                Some(value) => encode(value),
-                None => Effect::fail_with(|| SchemaIssue::new(SchemaIssueKind::InputConsumed)),
-            }
-        })
+        self.encode_in(input, None)
     }
 }
 
-/// An Effect-returning compatibility view for general JSON codecs. It retains
-/// the decode environment; no blocking conversion to the old pure Schema occurs.
+/// One-way compatibility view of an effectful JSON codec.
 ///
-/// # Type parameters
-/// - `A`: Application value type. Bound or type: `Send + 'static`.
-/// - `DecodeEnv`: Decoding environment type. Bound or type: `Send + Sync + 'static`.
+/// Preserves the decode environment. Owned decode is single-use; parsing shared
+/// text can run repeatedly. It does not convert effectful callbacks into a blocking
+/// pure schema or supply an encoder.
 pub struct EffectSchema<A: Send + 'static, DecodeEnv: Send + Sync + 'static> {
     ast: SchemaAst,
     decode: EffectDecoder<A, JsonValue, DecodeEnv>,
@@ -806,31 +1206,16 @@ impl<A: Send + 'static, DecodeEnv: Send + Sync + 'static> Clone for EffectSchema
 }
 
 impl<A: Send + 'static, DecodeEnv: Send + Sync + 'static> EffectSchema<A, DecodeEnv> {
+    /// Borrow the underlying JSON decode metadata.
     #[must_use]
-    /// Borrow the representation tree used for schema inspection or export.
-    ///
-    /// # Type parameters
-    /// - `A`: Application value type. Bound: `Send + 'static`.
-    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
-    ///
-    /// # Returns
-    /// Type: `&SchemaAst`.
     pub fn ast(&self) -> &SchemaAst {
         &self.ast
     }
 
-    /// Consume one encoded value during a single decoding run.
+    /// Lazily decode one owned JSON value in `DecodeEnv`.
     ///
-    /// # Type parameters
-    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Parameters
-    /// - `input` (`JsonValue`): The input value or factory consumed by this operation.
-    ///
-    /// # Returns
-    /// Type: `Effect<A, SchemaIssue, DecodeEnv>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// This compatibility view reports `SchemaIssueKind::InputConsumed` on further
+    /// executions of the same effect, rather than copying the retained input.
     pub fn decode_once(&self, input: JsonValue) -> Effect<A, SchemaIssue, DecodeEnv> {
         let decode = Arc::clone(&self.decode);
         let input = Mutex::new(Some(input));
@@ -840,26 +1225,17 @@ impl<A: Send + 'static, DecodeEnv: Send + Sync + 'static> EffectSchema<A, Decode
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take()
             {
-                Some(value) => decode(value),
+                Some(value) => decode(value, None),
                 None => Effect::fail_with(|| SchemaIssue::new(SchemaIssueKind::InputConsumed)),
             }
         })
     }
 
-    /// JSON parsing repeats from immutable text; decoding retains DecodeEnv.
-    /// The caller supplies the byte and structural budgets explicitly.
+    /// Lazily parse shared immutable JSON text and decode in DecodeEnv on each execution.
     ///
-    /// # Type parameters
-    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Parameters
-    /// - `text` (`impl Into<Arc<str>>`): Input text parsed or emitted by this operation.
-    /// - `policy` (`ParsePolicy`): The caller-supplied behavior policy.
-    ///
-    /// # Returns
-    /// Type: `Effect<A, SchemaIssue, DecodeEnv>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// Prepares metadata and enforces the supplied parse policy before decoding. Use
+    /// Codec::configured for independent schema/JSON depth and cumulative configured
+    /// pattern budgets; this compatibility surface carries only ParsePolicy.
     pub fn parse(
         &self,
         text: impl Into<Arc<str>>,
@@ -875,122 +1251,15 @@ impl<A: Send + 'static, DecodeEnv: Send + Sync + 'static> EffectSchema<A, Decode
             },
             std::convert::identity,
         )
-        .flat_map(move |json| decode(json))
+        .flat_map(move |json| decode(json, None))
     }
 }
 
 impl<A: Send + 'static, DecodeEnv: Send + Sync + 'static, EncodeEnv: Send + Sync + 'static>
     Codec<A, JsonValue, DecodeEnv, EncodeEnv>
 {
-    /// Supply a typed field default through DecodeEnv only when the encoded
-    /// object omits that field. A present null is never treated as absence.
-    /// The field codec must be the one used by the record declaration; the
-    /// constructor checks their shared schema identity before returning.
-    /// Chained defaults run in reverse adapter order, once each when absent.
-    ///
-    /// # Type parameters
-    /// - `A`: Application value type. Bound: `Send + 'static`.
-    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `F`: Bounds: `Send + 'static`.
-    ///
-    /// # Parameters
-    /// - `name` (`impl Into<Arc<str>>`): Stable name used to register or locate this definition.
-    /// - `field_codec` (`PureCodec<F, JsonValue>`): The field codec supplied to this operation.
-    /// - `default` (`impl Fn() -> Effect<F, SchemaIssue, DecodeEnv> + Send + Sync + 'static`): The default supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Result<Self, SchemaIssue>`.
-    pub fn with_effectful_field_default<F: Send + 'static>(
-        self,
-        name: impl Into<Arc<str>>,
-        field_codec: PureCodec<F, JsonValue>,
-        default: impl Fn() -> Effect<F, SchemaIssue, DecodeEnv> + Send + Sync + 'static,
-    ) -> Result<Self, SchemaIssue> {
-        let name = name.into();
-        let SchemaShape::Object {
-            properties,
-            unknown_fields,
-        } = self.ast.shape()
-        else {
-            return Err(SchemaIssue::new(SchemaIssueKind::InvalidDefinition));
-        };
-        let mut properties = properties.clone();
-        let Some(property) = properties
-            .iter_mut()
-            .find(|property| property.name() == name.as_ref())
-        else {
-            return Err(SchemaIssue::new(SchemaIssueKind::InvalidDefinition));
-        };
-        if !property.required()
-            || property.pure_default().is_some()
-            || !property.schema().shares_shape(field_codec.ast())
-        {
-            return Err(SchemaIssue::new(SchemaIssueKind::InvalidDefinition));
-        }
-        *property = property.with_required(false);
-        let ast = self.ast.derive(SchemaShape::Object {
-            properties,
-            unknown_fields: *unknown_fields,
-        });
-        let decode = self.decode;
-        let encode = self.encode;
-        let field_codec = Arc::new(field_codec);
-        let default = Arc::new(default);
-        Ok(Self::with_ast(
-            ast,
-            move |input| {
-                let JsonValue::Object(object) = input else {
-                    return decode(input);
-                };
-                if object.contains_key(name.as_ref()) {
-                    return decode(JsonValue::Object(object));
-                }
-                let pending = Mutex::new(Some(object));
-                let decode = Arc::clone(&decode);
-                let field_codec = Arc::clone(&field_codec);
-                let field_name = Arc::clone(&name);
-                default()
-                    .map_error({
-                        let field_name = Arc::clone(&field_name);
-                        move |issue| issue.at(IssueSegment::Field(Arc::clone(&field_name)))
-                    })
-                    .flat_map(move |value| {
-                        let object = pending
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take();
-                        let Some(mut object) = object else {
-                            return Effect::fail_with(|| {
-                                SchemaIssue::new(SchemaIssueKind::InputConsumed)
-                            });
-                        };
-                        let encoded = field_codec.encode_ref(&value).map_err(|issue| {
-                            issue.at(IssueSegment::Field(Arc::clone(&field_name)))
-                        });
-                        match encoded {
-                            Ok(encoded) => {
-                                object.insert(field_name.to_string(), encoded);
-                                decode(JsonValue::Object(object))
-                            }
-                            Err(issue) => Effect::from_result_once(Err(issue)),
-                        }
-                    })
-            },
-            move |value| encode(value),
-        ))
-    }
-
+    /// Expose a one-way effectful JSON decode view, preserving DecodeEnv and immutable metadata.
     #[must_use]
-    /// Lift this pure codec into an Effect-compatible schema.
-    ///
-    /// # Type parameters
-    /// - `DecodeEnv`: Decoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `EncodeEnv`: Encoding environment type. Bound: `Send + Sync + 'static`.
-    /// - `A`: Success or application-value type.
-    ///
-    /// # Returns
-    /// Type: `EffectSchema<A, DecodeEnv>`.
     pub fn as_effect_schema(&self) -> EffectSchema<A, DecodeEnv> {
         EffectSchema {
             ast: self.ast.clone(),

@@ -13,7 +13,19 @@ const Cancellation = @import("../../internal/runtime.zig").Cancellation;
 /// Session failure for closure, exhausted capacity, correlation conflict, or unexpected reply.
 pub const Error = enum { closed, capacity_exhausted, correlation_conflict, unexpected_response };
 /// `Delivery` cases: `accepted`, `orphaned`, `duplicate`, `conflict`.
-pub const Delivery = enum { accepted, orphaned, duplicate, conflict };
+/// Receive-driver disposition. Normal EOF is successful and stops further intake.
+pub const Delivery = enum {
+    /// The existing correlation accepted the frame.
+    accepted,
+    /// No current correlation owns the frame.
+    orphaned,
+    /// Already accepted sequence/frame; no duplicate payload is delivered.
+    duplicate,
+    /// Sequence or retained frame conflicts with the current call.
+    conflict,
+    /// Normal EOF: stop the driver and drain frames accepted before intake closed.
+    end_of_input,
+};
 
 /// Specialize the rpc failure variants from their typed channels.
 /// Parameters:
@@ -513,14 +525,22 @@ pub fn StreamRegistry(comptime R: type) type {
             return self.pending.contains(correlation);
         }
 
-        /// Close this scoped resource.
-        /// Parameters:
-        /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
-        /// Returns (`void`): no value.
-        pub fn close(self: *Self) void {
+        /// Stop registrations/intake at normal EOF while allowing accepted per-call frames to drain.
+        /// Queue waiters wake when their accepted sequence ends; ownership remains with their consumers.
+        pub fn stopIntake(self: *Self) void {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             if (self.closed) return;
+            self.closed = true;
+            var iterator = self.pending.valueIterator();
+            while (iterator.next()) |slot| slot.*.queue.shutdown(true);
+        }
+
+        /// Abnormal/scope close: stop intake and release unread owned frames, even after graceful EOF.
+        /// Existing call handles remain responsible for releasing their registrations.
+        pub fn close(self: *Self) void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             self.closed = true;
             var iterator = self.pending.valueIterator();
             while (iterator.next()) |slot| slot.*.queue.shutdown(false);
@@ -578,7 +598,10 @@ pub fn receiveStreamOne(
             return received.flatMapCapturedOwned(env, Delivery, Capture{ .registry = select_registry(env), .policy = policy }, struct {
                 fn dispatch(capture: *const Capture, value: transport.Received, supplied: *const R) Out {
                     return switch (value) {
-                        .closed => Out.fromOwnedOutcome(supplied, .{ .fail = .{ .session = .disconnected } }),
+                        .closed => blk: {
+                            capture.registry.stopIntake();
+                            break :blk Out.fromOwnedSuccess(supplied, .end_of_input);
+                        },
                         .frame => |frame| blk: {
                             var owned = frame;
                             defer owned.deinit();
@@ -665,7 +688,11 @@ pub fn receiveAnyOne(
             return mapped.flatMapCapturedOwned(env, Delivery, capture, struct {
                 fn dispatch(targets: *const Capture, value: transport.Received, supplied: *const R) Out {
                     return switch (value) {
-                        .closed => Out.fromOwnedOutcome(supplied, .{ .fail = .{ .session = .disconnected } }),
+                        .closed => blk: {
+                            targets.stream.stopIntake();
+                            targets.unary.close();
+                            break :blk Out.fromOwnedSuccess(supplied, .end_of_input);
+                        },
                         .frame => |frame| blk: {
                             var owned = frame;
                             defer owned.deinit();

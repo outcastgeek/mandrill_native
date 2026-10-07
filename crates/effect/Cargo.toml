@@ -2,17 +2,20 @@
 name = "effect"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.99"
 
 [features]
 default = []
 
 [dependencies]
-chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+chrono = { workspace = true, default-features = false, features = ["std"] }
 effect-macros = { path = "../effect_macros" }
 event-listener = "5.4.2"
-futures-util = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
+futures-util = { workspace = true, default-features = false, features = ["std", "async-await"] }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["arbitrary_precision"] }
+num-bigint = { version = "0.4.8", default-features = false, features = ["std"] }
+regex-automata = { version = "0.4.18", default-features = false, features = ["std", "syntax", "nfa-thompson", "nfa-pikevm", "unicode"] }
 serde_stacker = { workspace = true }
 
 [dev-dependencies]

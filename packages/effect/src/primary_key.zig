@@ -135,13 +135,13 @@ fn encodeBorrowed(allocator: std.mem.Allocator, key: Key) outcomes.Exit(outcomes
 
     const buffer = allocator.alloc(u8, total) catch return .{ .die = outcomes.Defect.out_of_memory };
     var cursor: usize = 0;
-    buffer[cursor] = @intFromEnum(Version.first);
+    buffer[cursor] = @backingInt(Version.first);
     cursor += @sizeOf(u8);
     writeU64(buffer, &cursor, @intCast(key.namespace.len));
     writeBytes(buffer, &cursor, key.namespace);
     writeU64(buffer, &cursor, @intCast(key.parts.len));
     for (key.parts) |part| {
-        buffer[cursor] = @intFromEnum(std.meta.activeTag(part));
+        buffer[cursor] = @backingInt(std.meta.activeTag(part));
         cursor += @sizeOf(u8);
         switch (part) {
             .text => |value| {
@@ -193,7 +193,7 @@ pub fn equalEncoded(left: []const u8, right: []const u8) bool {
 pub fn inspectEncoded(encoded: []const u8) outcomes.Result([]const u8, Error) {
     var cursor: usize = 0;
     const version = readByte(encoded, &cursor) orelse return .{ .err = .malformed };
-    if (version != @intFromEnum(Version.first)) return .{ .err = .{ .incompatible_version = version } };
+    if (version != @backingInt(Version.first)) return .{ .err = .{ .incompatible_version = version } };
     const namespace_len = readLength(encoded, &cursor) orelse return .{ .err = .malformed };
     const namespace = readBytes(encoded, &cursor, namespace_len) orelse return .{ .err = .malformed };
     if (namespace.len == 0) return .{ .err = .empty_namespace };
@@ -204,9 +204,9 @@ pub fn inspectEncoded(encoded: []const u8) outcomes.Result([]const u8, Error) {
     for (0..count) |_| {
         const tag = readByte(encoded, &cursor) orelse return .{ .err = .malformed };
         const kind: PartKind = switch (tag) {
-            @intFromEnum(PartKind.text) => .text,
-            @intFromEnum(PartKind.bytes) => .bytes,
-            @intFromEnum(PartKind.unsigned) => .unsigned,
+            @backingInt(PartKind.text) => .text,
+            @backingInt(PartKind.bytes) => .bytes,
+            @backingInt(PartKind.unsigned) => .unsigned,
             else => return .{ .err = .malformed },
         };
         const len = readLength(encoded, &cursor) orelse return .{ .err = .malformed };

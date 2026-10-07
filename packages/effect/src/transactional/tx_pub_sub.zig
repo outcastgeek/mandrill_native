@@ -29,7 +29,7 @@ pub fn PubSub(comptime T: type, comptime capacity: usize) type {
         };
         const Entry = struct { sequence: u64, value: T };
         const State = struct {
-            entries: [capacity]?Entry = [_]?Entry{null} ** capacity,
+            entries: [capacity]?Entry = @splat(null),
             oldest: u64 = 0,
             next: u64 = 0,
         };

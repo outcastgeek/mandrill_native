@@ -117,9 +117,9 @@ pub fn WorkflowEngine(comptime R: type, comptime ProviderError: type, comptime g
             /// Parameters (callback order):
             /// - `1: ?*anyopaque`: opaque provider or handle context; keep it live until the hook and any retained work complete.
             /// - `2: *const R`: borrowed generic environment `R`, including caller-supplied runtime services.
-            /// - `3: types.ExecutionId`: stable typed identity for the selected operation.
-            /// Returns (`ControlEffect`): lazy typed Effect; run it with its declared environment to obtain Exit.
-            resume_execution: *const fn (?*anyopaque, *const R, types.ExecutionId) ControlEffect,
+            /// - `3: types.ResumeRequest`: borrowed observed revision and optional terminal reply, compared atomically at storage reset.
+            /// Returns (`ControlEffect`): typed compare-and-set acknowledgement, preserving provider failure/cleanup channels.
+            resume_execution: *const fn (?*anyopaque, *const R, types.ResumeRequest) ControlEffect,
             /// Cancel terminal through this provider.
             /// Parameters (callback order):
             /// - `1: ?*anyopaque`: opaque provider or handle context; keep it live until the hook and any retained work complete.
@@ -238,7 +238,8 @@ pub fn WorkflowEngine(comptime R: type, comptime ProviderError: type, comptime g
             }.start);
         }
 
-        /// Resume a suspended workflow execution.
+        /// Poll and resume the observed running/suspended checkpoint with its revision fence.
+        /// Completed/queued/terminal runs return already_recorded and are not reset or replayed.
         /// Parameters:
         /// - `select_engine: comptime fn (*const R) *const Self`: Compile-time typed selector from the current environment; its result
         ///   must remain valid through use.
@@ -246,7 +247,37 @@ pub fn WorkflowEngine(comptime R: type, comptime ProviderError: type, comptime g
         ///   result must remain valid through use.
         /// Returns (`ControlEffect`): typed acknowledgement of resuming the selected suspended execution.
         pub fn resumeExecution(comptime select_engine: fn (*const R) *const Self, comptime select_execution: fn (*const R) types.ExecutionId) ControlEffect {
-            return control(select_engine, select_execution, false);
+            return ControlEffect.deferEffect(struct {
+                fn start(env: *const R) ControlEffect {
+                    var observed = poll(select_engine, select_execution);
+                    return observed.flatMapOwned(env, struct {
+                        fn resumeObserved(state: types.ExecutionState, current: *const R) ControlEffect {
+                            var owned = state;
+                            defer owned.deinit();
+                            const revision = switch (state) {
+                                .suspended, .running, .cancellation_requested => |value| value,
+                                .absent => return ControlEffect.succeed(.absent),
+                                else => return ControlEffect.succeed(.already_recorded),
+                            };
+                            const engine = select_engine(current);
+                            return engine.vtable.resume_execution(engine.userdata, current, .{ .execution = select_execution(current), .expected_revision = revision });
+                        }
+                    }.resumeObserved);
+                }
+            }.start);
+        }
+        /// Lazily submit the caller’s observed checkpoint revision and optional terminal bytes.
+        /// Borrow request identity/bytes until join; the provider atomically compares them with its reset.
+        /// A stale comparison returns stale_revision without mutation; other provider Exit channels remain intact.
+        pub fn resumeChecked(comptime select_engine: fn (*const R) *const Self, comptime select_request: fn (*const R) types.ResumeRequest) ControlEffect {
+            return ControlEffect.deferEffect(struct {
+                fn start(env: *const R) ControlEffect {
+                    const request = select_request(env);
+                    if (request.execution.validate() == .err) return ControlEffect.fail(.{ .operation = .malformed_record });
+                    const engine = select_engine(env);
+                    return engine.vtable.resume_execution(engine.userdata, env, request);
+                }
+            }.start);
         }
 
         /// Request cooperative terminal cancellation.
@@ -284,10 +315,8 @@ pub fn WorkflowEngine(comptime R: type, comptime ProviderError: type, comptime g
                     const execution = select_execution(env);
                     if (execution.validate() == .err) return ControlEffect.fail(.{ .operation = .malformed_record });
                     const engine = select_engine(env);
-                    return if (terminal)
-                        engine.vtable.cancel_terminal(engine.userdata, env, execution)
-                    else
-                        engine.vtable.resume_execution(engine.userdata, env, execution);
+                    if (!terminal) @compileError("resume requires an expected checkpoint revision");
+                    return engine.vtable.cancel_terminal(engine.userdata, env, execution);
                 }
             }.start);
         }

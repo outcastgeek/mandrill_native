@@ -183,18 +183,11 @@ impl ProtectedReplicaTransfer {
             })
     }
 
-    /// Open, validate and import before advancing the source cursor. A lost
-    /// cursor acknowledgement is safe to retry against event-ID deduplication.
+    /// Lazily open and authenticate a protected replica batch, then import and acknowledge it.
     ///
-    /// # Type parameters
-    /// - `R`: Environment type. Additional bound: `HasReplicaProtection + HasEventJournal + HasReplicaCursorStore + Send + Sync + 'static`.
-    ///
-    /// # Parameters
-    /// - `expected_session` (`ReplicaSessionId`): The expected session supplied to this operation.
-    /// - `payload` (`ProtectedReplicaPayload`): Application data moved into the message or stored record.
-    ///
-    /// # Returns
-    /// Type: `ProtectedImportEffect<R>`.
+    /// Protection and parse policy are applied before creating the source/stream-bound
+    /// import permit. Authentication failure performs no journal or cursor access;
+    /// ordinary authorized import retains its deduplication and cursor-fencing behavior.
     pub fn import_and_ack<R>(
         &self,
         expected_session: ReplicaSessionId,
@@ -206,8 +199,11 @@ impl ProtectedReplicaTransfer {
         self.open::<R>(expected_session, payload)
             .map_error(ProtectedReplicaImportError::Transfer)
             .flat_map(|batch| {
-                EventReplicator::import_and_ack::<R>(batch)
-                    .map_error(ProtectedReplicaImportError::Sync)
+                {
+                    let permit = super::ReplicaImportPermit::authenticated(&batch);
+                    EventReplicator::import_and_ack::<R>(batch, permit)
+                }
+                .map_error(ProtectedReplicaImportError::Sync)
             })
     }
 

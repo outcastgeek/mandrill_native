@@ -421,24 +421,12 @@ where
         }
     }
 
-    /// Open the resource within its declared scope and ownership boundary.
+    /// Lazily encode one owned request, open R's connector session, and register its closure with scope.
     ///
-    /// # Type parameters
-    /// - `Backend`: Backend-specific error or provider type.
-    /// - `R`: Environment type. Additional bound: `HasRpcStreamConnector + Send + Sync + 'static`. Additional bound: `:Connector: RpcStreamConnector<Error = Backend>`.
-    /// - `C`: Type supplied by the enclosing impl or trait.
-    /// - `E`: Domain-error type.
-    /// - `Q`: Request type.
-    /// - `T`: Value or item type.
-    ///
-    /// # Parameters
-    /// - `scope` (`&Scope<RpcStreamError<E, Backend>>`): Owner that joins child work and releases resources at close.
-    /// - `request` (`Q`): The typed request to process.
-    /// - `call` (`RpcCallId`): Identity and contents of the selected RPC call.
-    /// - `metadata` (`BTreeMap<Arc<str>, Arc<str>>`): Version, identity, or protection data associated with the payload.
-    ///
-    /// # Returns
-    /// Type: `RpcOpenStreamEffect<C, T, E, Backend, R>`.
+    /// Call identity, envelope policy and operation codecs validate the stream. The
+    /// request/metadata pair is single-use; no provider is chosen by the operation.
+    /// Once acquired, the session is scope-owned, including cancellation or failed
+    /// reader construction, with close failures retained as cleanup outcomes.
     pub fn open<R>(
         &self,
         scope: &Scope<RpcStreamError<E, Backend>>,
@@ -495,13 +483,21 @@ where
                         .map_error(RpcStreamError::Transport)
                         .provide_some(|_: &R| ())
                 });
+            let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let release_closed = Arc::clone(&closed);
             scope
-                .acquire(connector, |session| {
+                .acquire(connector, move |session| {
+                    let closed = Arc::clone(&release_closed);
                     Release::from_effect(
-                        session
-                            .close()
-                            .map_error(RpcStreamError::Transport)
-                            .provide_some(|_: &R| ()),
+                        Effect::defer(move || {
+                            if closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                                Effect::succeed(())
+                            } else {
+                                session.close()
+                            }
+                        })
+                        .map_error(RpcStreamError::Transport)
+                        .provide_some(|_: &R| ()),
                     )
                 })
                 .flat_map(move |session| {
@@ -509,6 +505,7 @@ where
                     let operation = operation.clone();
                     let call = call.clone();
                     let frame = Arc::clone(&frame);
+                    let closed = Arc::clone(&closed);
                     session.access(Arc::clone).flat_map(move |session| {
                         let frame = frame
                             .lock()
@@ -522,6 +519,7 @@ where
                             operation.clone(),
                             call.clone(),
                             policy,
+                            Arc::clone(&closed),
                         );
                         session
                             .send(frame)
@@ -582,6 +580,7 @@ where
     call: RpcCallId,
     policy: RpcEnvelopePolicy,
     state: Arc<Mutex<ReaderState>>,
+    closed: Arc<std::sync::atomic::AtomicBool>,
     _backend: std::marker::PhantomData<fn() -> Backend>,
 }
 
@@ -607,6 +606,7 @@ where
             call: self.call.clone(),
             policy: self.policy,
             state: Arc::clone(&self.state),
+            closed: Arc::clone(&self.closed),
             _backend: std::marker::PhantomData,
         }
     }
@@ -640,6 +640,7 @@ where
         operation: RpcStreamOperation<Q, C, T, E>,
         call: RpcCallId,
         policy: RpcEnvelopePolicy,
+        closed: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             session,
@@ -650,6 +651,7 @@ where
             limits: operation.limits,
             call,
             policy,
+            closed,
             state: Arc::new(Mutex::new(ReaderState {
                 phase: StreamPhase::Open,
                 expected: Some(NonZeroU64::MIN),
@@ -661,20 +663,12 @@ where
         }
     }
 
-    /// Pull exactly one framed item. A chunk must be acknowledged before the
-    /// following item can be received; this is the backpressure boundary.
+    /// Lazily receive exactly one framed chunk or terminal result.
     ///
-    /// # Type parameters
-    /// - `Backend`: Backend-specific error or provider type.
-    /// - `Session`: Active stream-session provider type.
-    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
-    /// - `C`: Type supplied by the enclosing impl or trait.
-    /// - `E`: Domain-error type.
-    /// - `T`: Value or item type.
-    ///
-    /// # Returns
-    /// Type: `Effect<RpcStreamItem<C, T>, RpcStreamError<E, Backend>, R>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// A chunk must be acknowledged before another pull, and overlapping pulls are
+    /// rejected before acquiring read ownership. Once reading starts, cancellation or
+    /// failure triggers protected close exactly once; close failure is retained with
+    /// the primary outcome. Terminal values use their own codec, never a special chunk.
     pub fn next<R: Send + Sync + 'static>(
         &self,
     ) -> Effect<RpcStreamItem<C, T>, RpcStreamError<E, Backend>, R> {
@@ -705,6 +699,7 @@ where
         .flat_map(move |_| {
             let reader = reader.clone();
             let state = Arc::clone(&reader.state);
+            let close = reader.close_once::<R>();
             reader
                 .session
                 .access(Arc::clone)
@@ -727,6 +722,14 @@ where
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .reading = false;
                 }))
+                .ensuring_with(move |reason| match reason {
+                    crate::PrimaryOutcomeRef::Succeeded => crate::Release::sync(|| ()),
+                    crate::PrimaryOutcomeRef::Failed(_)
+                    | crate::PrimaryOutcomeRef::Defected(_)
+                    | crate::PrimaryOutcomeRef::WasInterrupted => {
+                        crate::Release::from_effect(close.clone())
+                    }
+                })
         })
     }
 
@@ -860,22 +863,11 @@ where
             .phase = StreamPhase::Failed;
     }
 
-    /// Confirm consumption of the current stream item before another pull.
+    /// Lazily acknowledge the outstanding chunk's exact sequence before the next pull.
     ///
-    /// # Type parameters
-    /// - `C`: Stream chunk or item type.
-    /// - `T`: Value or item type.
-    /// - `Backend`: Backend-specific error or provider type.
-    /// - `Session`: Active stream-session provider type.
-    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
-    /// - `E`: Domain-error type.
-    ///
-    /// # Parameters
-    /// - `sequence` (`NonZeroU64`): Ordered stream position used to reject gaps or duplicates.
-    ///
-    /// # Returns
-    /// Type: `Effect<(), RpcStreamError<E, Backend>, R>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// Invalid/concurrent acknowledgement is rejected before taking ownership. Once
+    /// acknowledgement begins, interruption or backend failure triggers protected close
+    /// once and retains any close failure alongside the primary outcome.
     pub fn acknowledge<R: Send + Sync + 'static>(
         &self,
         sequence: NonZeroU64,
@@ -913,6 +905,7 @@ where
         )
         .flat_map(move |_| {
             let reader = reader.clone();
+            let close = reader.close_once::<R>();
             let state = Arc::clone(&reader.state);
             let envelope = RpcEnvelope {
                 operation: reader.spec.id.clone(),
@@ -977,22 +970,44 @@ where
                             .acknowledging = false;
                     }
                 }))
+                .ensuring_with(move |reason| match reason {
+                    crate::PrimaryOutcomeRef::Succeeded => crate::Release::sync(|| ()),
+                    crate::PrimaryOutcomeRef::Failed(_)
+                    | crate::PrimaryOutcomeRef::Defected(_)
+                    | crate::PrimaryOutcomeRef::WasInterrupted => {
+                        crate::Release::from_effect(close.clone())
+                    }
+                })
         })
     }
 
-    /// Request cancellation of the open streaming call.
+    /// Claim this session's close flag before invoking the backend, with interruption
+    /// masked. All reader/acknowledgement/scope paths share the flag; failed attempts
+    /// retain their cleanup outcome rather than retrying an already claimed close.
+    fn close_once<R: Send + Sync + 'static>(&self) -> Effect<(), RpcStreamError<E, Backend>, R> {
+        let closed = Arc::clone(&self.closed);
+        self.session
+            .access(Arc::clone)
+            .flat_map(move |session| {
+                let closed = Arc::clone(&closed);
+                Effect::defer(move || {
+                    if closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                        Effect::succeed(())
+                    } else {
+                        session
+                            .close()
+                            .map_error(RpcStreamError::Transport)
+                            .provide_some(|_: &R| ())
+                    }
+                })
+            })
+            .uninterruptible()
+    }
+
+    /// Lazily mark the stream cancelled and attempt protected session closure once.
     ///
-    /// # Type parameters
-    /// - `C`: Stream chunk or item type.
-    /// - `T`: Value or item type.
-    /// - `Backend`: Backend-specific error or provider type.
-    /// - `Session`: Active stream-session provider type.
-    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
-    /// - `E`: Domain-error type.
-    ///
-    /// # Returns
-    /// Type: `Effect<(), RpcStreamError<E, Backend>, R>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// Shares close ownership with read, acknowledgement and scope cleanup, so a late
+    /// close path does not close a replacement or repeat a previous close attempt.
     pub fn cancel<R: Send + Sync + 'static>(&self) -> Effect<(), RpcStreamError<E, Backend>, R> {
         let reader = self.clone();
         Effect::try_sync(
@@ -1039,6 +1054,8 @@ where
                 })
             }
         })
+        .ensuring(self.close_once::<R>())
+        .uninterruptible()
     }
 }
 

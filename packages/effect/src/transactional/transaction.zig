@@ -20,11 +20,11 @@ pub fn immutableValue(comptime T: type) bool {
         .array => |info| immutableValue(info.child),
         .vector => |info| immutableValue(info.child),
         .@"struct" => |info| blk: {
-            inline for (info.fields) |field| if (!immutableValue(field.type)) break :blk false;
+            inline for (info.field_types) |Field| if (!immutableValue(Field)) break :blk false;
             break :blk true;
         },
         .@"union" => |info| blk: {
-            inline for (info.fields) |field| if (!immutableValue(field.type)) break :blk false;
+            inline for (info.field_types) |Field| if (!immutableValue(Field)) break :blk false;
             break :blk true;
         },
         else => false,

@@ -881,3 +881,136 @@ fn configured_rpc_stream_histories_preserve_acknowledgement_and_scope() {
         }),
     );
 }
+
+#[path = "support/drive.rs"]
+mod correction_drive;
+#[test]
+fn interrupted_rpc_acknowledgement_closes_once_and_preserves_close_failure() {
+    use effect::{Cancellation, CleanupFailure, HasCancellation, PrimaryOutcome};
+    struct Session {
+        inner: ScriptedStreamSession,
+        sends: AtomicUsize,
+        entered: Arc<AtomicUsize>,
+    }
+    impl RpcStreamSession for Session {
+        type Error = ();
+        fn send(&self, frame: effect::encoding::FrameParts) -> Effect<(), ()> {
+            if self.sends.fetch_add(1, Ordering::SeqCst) == 1 {
+                let entered = Arc::clone(&self.entered);
+                Effect::from_future(move |cancel| {
+                    entered.store(1, Ordering::SeqCst);
+                    async move {
+                        cancel.cancelled().await;
+                    }
+                })
+            } else {
+                self.inner.send(frame)
+            }
+        }
+        fn receive_frame(&self) -> Effect<Option<Vec<u8>>, ()> {
+            self.inner.receive_frame()
+        }
+        fn close(&self) -> Effect<(), ()> {
+            let closes = Arc::clone(&self.inner.closes);
+            Effect::sync(move || {
+                closes.fetch_add(1, Ordering::SeqCst);
+            })
+            .flat_map(|_| Effect::fail(()))
+        }
+    }
+    struct Connector(Arc<Session>);
+    impl RpcStreamConnector for Connector {
+        type Error = ();
+        type Session = Session;
+        fn open(&self) -> Effect<Arc<Session>, ()> {
+            let session = Arc::clone(&self.0);
+            Effect::sync(move || Arc::clone(&session))
+        }
+    }
+    struct Env {
+        connector: Arc<Connector>,
+        cancel: Cancellation,
+    }
+    impl HasRpcStreamConnector for Env {
+        type Connector = Connector;
+        fn rpc_stream_connector(&self) -> Arc<Connector> {
+            Arc::clone(&self.connector)
+        }
+    }
+    impl HasCancellation for Env {
+        fn cancellation(&self) -> &Cancellation {
+            &self.cancel
+        }
+    }
+    let limit = NonZeroUsize::new(1024).unwrap();
+    let policy = RpcEnvelopePolicy {
+        frame: FramePolicy {
+            maximum_payload: limit,
+        },
+        json: ParseLimits {
+            bytes: limit,
+            depth: limit,
+            nodes: limit,
+            collection: limit,
+            issues: limit,
+        },
+    };
+    let operation = OperationId::new("interrupted-ack").unwrap();
+    let version = RpcVersion::new(NonZeroU32::MIN);
+    let call = RpcCallId::new("ack").unwrap();
+    let first = NonZeroU64::MIN;
+    let closes = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(AtomicUsize::new(0));
+    let incoming = VecDeque::from([Some(stream_frame(
+        operation.clone(),
+        version,
+        call.clone(),
+        RpcEnvelopeKind::StreamChunk,
+        Some(first),
+        policy,
+    ))]);
+    let session = Arc::new(Session {
+        inner: ScriptedStreamSession {
+            incoming: Arc::new(Mutex::new(incoming)),
+            sent: Arc::new(Mutex::new(Vec::new())),
+            closes: Arc::clone(&closes),
+        },
+        sends: AtomicUsize::new(0),
+        entered: Arc::clone(&entered),
+    });
+    let env = Arc::new(Env {
+        connector: Arc::new(Connector(session)),
+        cancel: Cancellation::new(),
+    });
+    let client = Arc::new(RpcStreamClient::<i64, i64, i64, i64, ()>::new(
+        RpcStreamOperation::new(
+            operation,
+            version,
+            json_i64(),
+            json_i64(),
+            json_i64(),
+            json_i64(),
+            policy.json,
+        ),
+        policy,
+    ));
+    let program: Effect<(), RpcStreamError<i64, ()>, Env> = Scope::scoped(move |scope| {
+        let client = Arc::clone(&client);
+        client
+            .open(&scope, 0, call.clone(), BTreeMap::new())
+            .flat_map(move |reader| {
+                let acknowledge = reader.clone();
+                reader
+                    .next::<Env>()
+                    .flat_map(move |_| acknowledge.acknowledge::<Env>(first))
+            })
+    });
+    let mut future = Box::pin(program.run_cancellable(Arc::clone(&env)));
+    correction_drive::until(future.as_mut(), || entered.load(Ordering::SeqCst) == 1);
+    assert!(env.cancel.request());
+    let outcome = block_on(future);
+    assert!(
+        matches!(outcome,Exit::FinalizationFailed(ref details) if matches!(&details.primary,PrimaryOutcome::WasInterrupted)&&matches!(&details.first,CleanupFailure::ReleaseFailure(RpcStreamError::Transport(()))))
+    );
+    assert_eq!(closes.load(Ordering::SeqCst), 1);
+}

@@ -13,7 +13,7 @@ pub fn Chunk(comptime T: type, comptime capacity: usize) type {
     if (!tx.immutableValue(T)) @compileError("transactional chunk elements must be immutable values");
     return struct {
         const Self = @This();
-        const State = struct { items: [capacity]?T = [_]?T{null} ** capacity, length: usize = 0 };
+        const State = struct { items: [capacity]?T = @splat(null), length: usize = 0 };
         /// `Append` cases: `appended`, `full`.
         pub const Append = enum { appended, full };
         /// Indexed chunk read yielding a value or out-of-range state.

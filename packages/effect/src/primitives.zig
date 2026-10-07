@@ -54,14 +54,15 @@ pub fn Deferred(comptime A: type, comptime E: type) type {
         pub fn completeCopy(self: *Self, value: outcomes.Exit(A, E)) bool {
             var result = value.observe();
             self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
             if (self.value != null) {
+                self.mutex.unlock(self.io);
                 result.exit.deinit();
                 return false;
             }
             self.value = result.exit;
             self.copy_failed = !result.copied;
             Waiter.signalAll(self.waiters);
+            self.mutex.unlock(self.io);
             return true;
         }
 
@@ -71,8 +72,11 @@ pub fn Deferred(comptime A: type, comptime E: type) type {
         /// Returns (`?outcomes.Exit(A, E)`): Carries `A` on `.success` or `E` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
         pub fn poll(self: *Self) ?outcomes.Exit(A, E) {
             self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            return if (self.value) |value| value.clone() else null;
+            const value = self.value;
+            self.mutex.unlock(self.io);
+            // A Deferred is immutable after completion; its owner joins all
+            // borrowers before deinit, so clone callbacks can run outside locks.
+            return if (value) |completed| completed.clone() else null;
         }
 
         /// Wait for completion while observing cancellation.
@@ -107,9 +111,8 @@ pub fn Deferred(comptime A: type, comptime E: type) type {
                 return .{ .exit = .interrupted, .observer_interrupted = true };
             };
             if (self.value) |value| {
-                const result = self.observation(value);
                 self.mutex.unlock(self.io);
-                return result;
+                return self.observation(value);
             }
             waiter.register(&self.waiters, token);
             self.mutex.unlock(self.io);
@@ -119,10 +122,12 @@ pub fn Deferred(comptime A: type, comptime E: type) type {
             };
             waiter.registration.unregister();
             self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
             waiter.remove(&self.waiters);
-            if (interrupted or (if (token) |cancellation| cancellation.isRequested() else false)) return .{ .exit = .interrupted, .observer_interrupted = true };
-            return self.observation(self.value.?);
+            const cancelled = interrupted or (if (token) |cancellation| cancellation.isRequested() else false);
+            const completed = self.value;
+            self.mutex.unlock(self.io);
+            if (cancelled) return .{ .exit = .interrupted, .observer_interrupted = true };
+            return self.observation(completed.?);
         }
 
         /// Waits for settlement without copying an owning result. Controllers
@@ -188,7 +193,7 @@ pub fn modificationResult(comptime T: type, comptime updater: anytype) type {
         .@"fn" => |info| info,
         else => @compileError(diagnostics.ref_modifier_contract),
     };
-    if (info.params.len != 1 or info.params[0].type != T)
+    if (info.param_types.len != 1 or info.param_types[0] != T)
         @compileError(diagnostics.ref_modifier_contract);
     const Change = info.return_type orelse @compileError(diagnostics.ref_modifier_contract);
     if (@typeInfo(Change) != .@"struct" or !@hasField(Change, "result") or !@hasField(Change, "value"))
@@ -505,12 +510,7 @@ pub fn Queue(comptime T: type) type {
         /// Returns (`void`): no value.
         pub fn shutdown(self: *Self, drain: bool) void {
             self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
             self.closed = true;
-            if (!drain) while (self.count != 0) {
-                var discarded = self.popBuffer();
-                outcomes.discardPayload(&discarded);
-            };
             while (self.offers) |offer| {
                 self.removeOffer(offer);
                 offer.result = .{ .fail = .shutdown };
@@ -521,6 +521,17 @@ pub fn Queue(comptime T: type) type {
                 taker.result = .{ .fail = .shutdown };
                 taker.waiter.event.set(self.io);
             }
+            self.mutex.unlock(self.io);
+            if (!drain) while (true) {
+                self.mutex.lockUncancelable(self.io);
+                if (self.count == 0) {
+                    self.mutex.unlock(self.io);
+                    break;
+                }
+                var discarded = self.popBuffer();
+                self.mutex.unlock(self.io);
+                outcomes.discardPayload(&discarded);
+            };
         }
 
         /// Read the current number of elements.

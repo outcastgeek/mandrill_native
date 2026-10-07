@@ -1,3 +1,6 @@
+extern crate effect as fx;
+#[path = "../../shared/reference_update.rs"]
+mod reference_update;
 #[path = "../../shared/provider_program.rs"]
 mod provider_program;
 #[path = "../../shared/cluster_workflow_takeover.rs"]
@@ -302,6 +305,7 @@ fn main() {
         wall_clock: TestWallClock::new(UtcMillis::new(1)),
         monotonic_clock: TokioClock { started: tokio::time::Instant::now() },
     });
+    runtime.block_on(reference_update::exercise(Arc::clone(&environment)));
     let outcome = runtime.block_on(provider_program::run::<MixedEnvironment>()
         .run(Arc::clone(&environment)));
     assert!(matches!(outcome, Exit::Success(42)));

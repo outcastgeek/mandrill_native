@@ -14,7 +14,7 @@ pub fn Queue(comptime T: type, comptime capacity: usize) type {
     if (!tx.immutableValue(T)) @compileError("transactional queue elements must be immutable values");
     return struct {
         const Self = @This();
-        const State = struct { items: [capacity]?T = [_]?T{null} ** capacity, head: usize = 0, length: usize = 0 };
+        const State = struct { items: [capacity]?T = @splat(null), head: usize = 0, length: usize = 0 };
         /// Offer result: `accepted` stages the item in the journal; `full`
         /// leaves the queue unchanged when it has reached `capacity`.
         pub const Offered = enum { accepted, full };

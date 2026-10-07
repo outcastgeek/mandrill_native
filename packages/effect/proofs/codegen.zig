@@ -114,3 +114,39 @@ test "static specialization preserves wrapping arithmetic and typed recovery" {
         try std.testing.expectEqual(handwritten_recovery(input), effect_recovery(input));
     }
 }
+
+export fn handwritten_validate_u8(value: u8) bool {
+    return value < 128;
+}
+const ValidationCodec = fx.PureCodec(u8, u8).init(struct {
+    fn decode(value: *const u8) fx.Result(u8, fx.SchemaIssue.Issue) {
+        return .{ .ok = value.* };
+    }
+}.decode, struct {
+    fn encode(value: *const u8) fx.Result(u8, fx.SchemaIssue.Issue) {
+        if (value.* >= 128) return .{ .err = fx.SchemaIssue.Issue.pure(.encode, .invalid_value) };
+        return .{ .ok = value.* };
+    }
+}.encode);
+export fn pure_validate_u8(value: u8) bool {
+    return fx.requirePure(ValidationCodec).validateDirect(&value) == .ok;
+}
+
+export fn handwritten_write_boolean(value: bool, writer: *fx.JsonWriter.Writer) bool {
+    writer.boolean(value) catch return false;
+    return true;
+}
+export fn pure_write_boolean(value: bool, writer: *fx.JsonWriter.Writer) bool {
+    return fx.JsonCodec.boolean.writeJson(&value, writer) == .success;
+}
+const Tagged = union(enum) { integer: i64, boolean: bool };
+const TaggedEnv = struct { allocator: std.mem.Allocator };
+const TaggedSchema = fx.VariantSchema.Variant(Tagged, TaggedEnv, "kind", "value", .{ fx.VariantSchema.taggedCase("integer", "integer", fx.JsonCodec.signed_integer), fx.VariantSchema.taggedCase("boolean", "boolean", fx.JsonCodec.boolean) });
+export fn handwritten_tagged_integer(value: i64) i64 {
+    const tagged: Tagged = .{ .integer = value };
+    return tagged.integer;
+}
+export fn specialized_tagged_integer(value: i64) i64 {
+    const tagged = TaggedSchema.make("integer", value);
+    return TaggedSchema.project("integer", &tagged).?.*;
+}

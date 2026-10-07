@@ -15,11 +15,26 @@ fn external_compiler_contracts() -> Result<(), Box<dyn std::error::Error>> {
     );
     std::fs::create_dir_all(directory.0.join("src"))?;
     let manifest = format!(
-        "[package]\nname = \"effect-typing-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[workspace]\n[dependencies]\nmandrill_effect = {{ package = \"effect\", path = {:?} }}\n",
+        "[package]\nname = \"effect-typing-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\nrust-version = \"1.99\"\n[workspace]\n[dependencies]\nmandrill_effect = {{ package = \"effect\", path = {:?} }}\n",
         env!("CARGO_MANIFEST_DIR")
     );
     std::fs::write(directory.0.join("Cargo.toml"), manifest)?;
     let cases = [
+        (
+            "native_incomplete",
+            include_str!("ui/native_incomplete.rs"),
+            Some("native schemas require"),
+        ),
+        (
+            "native_representation",
+            include_str!("ui/native_representation.rs"),
+            Some("ObjectRepresentation"),
+        ),
+        (
+            "native_environment",
+            include_str!("ui/native_environment.rs"),
+            Some("E0308"),
+        ),
         ("new_schema", include_str!("ui/new_schema.rs"), None),
         (
             "transaction_rejects_effect",
@@ -34,7 +49,7 @@ fn external_compiler_contracts() -> Result<(), Box<dyn std::error::Error>> {
         (
             "workflow_rejects_future",
             include_str!("ui/workflow_rejects_future.rs"),
-            Some("flat_map"),
+            Some("E0599"),
         ),
         ("services", include_str!("ui/services.rs"), None),
         ("macro_loops", include_str!("ui/macro_loops.rs"), None),
@@ -200,7 +215,7 @@ fn planned_feature_type_pairs() -> Result<(), Box<dyn std::error::Error>> {
     )));
     std::fs::create_dir_all(directory.0.join("src"))?;
     let manifest = format!(
-        "[package]\nname = \"effect-feature-typing-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[workspace]\n[dependencies]\nmandrill_effect = {{ package = \"effect\", path = {:?} }}\n",
+        "[package]\nname = \"effect-feature-typing-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\nrust-version = \"1.99\"\n[workspace]\n[dependencies]\nmandrill_effect = {{ package = \"effect\", path = {:?} }}\n",
         env!("CARGO_MANIFEST_DIR")
     );
     std::fs::write(directory.0.join("Cargo.toml"), manifest)?;

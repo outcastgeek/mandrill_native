@@ -66,6 +66,8 @@ pub enum AtomRegistryError {
     Missing(AtomId),
     /// The referenced atom is not registered as a derived atom.
     NotDerived(AtomId),
+    /// The handle belongs to an earlier registration of this ID; it cannot mutate or read dependency metadata of a replacement.
+    StaleOwner(AtomId),
     /// No further generation can be allocated without exceeding its range. Retains the `AtomId` detail.
     GenerationExhausted(AtomId),
     /// The requested dependency would create a reactive graph cycle.
@@ -79,17 +81,20 @@ pub enum AtomRegistryError {
     Disposed,
 }
 
-/// Typed node used by reactivity atom registry.
+/// Graph metadata only: owner fences replacement handles; version detects dependency changes independently of evaluation generation.
 struct Node {
     kind: AtomKind,
     dependencies: BTreeSet<AtomId>,
     generation: Option<std::num::NonZeroU64>,
     invalidated: bool,
+    owner: Arc<()>,
+    version: Arc<()>,
 }
 
 /// Typed graph used by reactivity atom registry.
 struct Graph {
     disposed: bool,
+    next_generation: Option<std::num::NonZeroU64>,
     nodes: BTreeMap<AtomId, Node>,
     dependents: BTreeMap<AtomId, BTreeSet<AtomId>>,
 }
@@ -126,6 +131,7 @@ impl AtomRegistry {
         Ok(Self {
             graph: Arc::new(Mutex::new(Graph {
                 disposed: false,
+                next_generation: Some(std::num::NonZeroU64::MIN),
                 nodes: BTreeMap::new(),
                 dependents: BTreeMap::new(),
             })),
@@ -154,15 +160,17 @@ impl AtomRegistry {
         Arc::ptr_eq(&self.graph, &other.graph)
     }
 
-    /// Register the supplied definition, rejecting an identity or compatibility conflict.
-    ///
-    /// # Parameters
-    /// - `id` (`AtomId`): Stable identity of the selected record or operation.
-    /// - `kind` (`AtomKind`): The kind supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Result<(), AtomRegistryError>`.
+    /// Register a currently absent source/derived ID with fresh owner and version identities; duplicate or disposed registration fails.
     pub fn register(&self, id: AtomId, kind: AtomKind) -> Result<(), AtomRegistryError> {
+        self.register_owned(id, kind).map(|_| ())
+    }
+
+    pub(crate) fn register_owned(
+        &self,
+        id: AtomId,
+        kind: AtomKind,
+    ) -> Result<Arc<()>, AtomRegistryError> {
+        let owner = Arc::new(());
         let mut graph = self
             .graph
             .lock()
@@ -180,27 +188,56 @@ impl AtomRegistry {
                 dependencies: BTreeSet::new(),
                 generation: None,
                 invalidated: false,
+                owner: Arc::clone(&owner),
+                version: Arc::new(()),
             },
         );
         graph.dependents.entry(id).or_default();
-        Ok(())
+        Ok(owner)
     }
 
-    /// Dynamic dependencies replace the previous set only after all targets
-    /// exist and the resulting graph is proven acyclic. The failed update
-    /// leaves the original edges intact.
+    /// Read a dependency version only when the handle still owns this registration, under the same graph gate.
+    pub(crate) fn dependency_version(
+        &self,
+        id: &AtomId,
+        owner: &Arc<()>,
+    ) -> Result<Arc<()>, AtomRegistryError> {
+        let graph = self
+            .graph
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if graph.disposed {
+            return Err(AtomRegistryError::Disposed);
+        }
+        let node = graph
+            .nodes
+            .get(id)
+            .ok_or_else(|| AtomRegistryError::Missing(id.clone()))?;
+        if !Arc::ptr_eq(&node.owner, owner) {
+            return Err(AtomRegistryError::StaleOwner(id.clone()));
+        }
+        Ok(Arc::clone(&node.version))
+    }
+    /// Replace the current derived ID's dependency set only after existence and cycle checks.
     ///
-    /// # Parameters
-    /// - `id` (`&AtomId`): Stable identity of the selected record or operation.
-    /// - `dependencies` (`impl IntoIterator<Item = AtomId>`): The dependencies supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Result<(), AtomRegistryError>`.
+    /// This registry-authorized operation addresses the current ID. A failed check
+    /// leaves prior edges intact; evaluators use generation/version-checked commit
+    /// instead to prevent stale builds replacing dependencies.
     pub fn replace_dependencies(
         &self,
         id: &AtomId,
         dependencies: impl IntoIterator<Item = AtomId>,
     ) -> Result<(), AtomRegistryError> {
+        self.replace_dependencies_checked(id, None, dependencies, None)
+            .map(|_| ())
+    }
+    fn replace_dependencies_checked(
+        &self,
+        id: &AtomId,
+        generation: Option<std::num::NonZeroU64>,
+        dependencies: impl IntoIterator<Item = AtomId>,
+        observed: Option<&BTreeMap<AtomId, Arc<()>>>,
+    ) -> Result<bool, AtomRegistryError> {
         let proposed = dependencies.into_iter().collect::<BTreeSet<_>>();
         let mut graph = self
             .graph
@@ -214,6 +251,21 @@ impl AtomRegistry {
         };
         if node.kind != AtomKind::Derived {
             return Err(AtomRegistryError::NotDerived(id.clone()));
+        }
+        if generation
+            .is_some_and(|generation| node.invalidated || node.generation != Some(generation))
+        {
+            return Ok(false);
+        }
+        if observed.is_some_and(|observed| {
+            observed.iter().any(|(id, version)| {
+                graph
+                    .nodes
+                    .get(id)
+                    .is_none_or(|node| !Arc::ptr_eq(&node.version, version))
+            })
+        }) {
+            return Ok(false);
         }
         for dependency in &proposed {
             if !graph.nodes.contains_key(dependency) {
@@ -242,18 +294,31 @@ impl AtomRegistry {
                 .or_default()
                 .insert(id.clone());
         }
-        Ok(())
+        Ok(true)
     }
 
-    /// Bump a node generation before starting a refresh. Completion must
-    /// compare this token; disposal or a later refresh makes it obsolete.
-    ///
-    /// # Parameters
-    /// - `id` (`&AtomId`): Stable identity of the selected record or operation.
-    ///
-    /// # Returns
-    /// Type: `Result<std::num::NonZeroU64, AtomRegistryError>`.
-    pub fn begin_evaluation(&self, id: &AtomId) -> Result<std::num::NonZeroU64, AtomRegistryError> {
+    pub(crate) fn owns_evaluation(&self, id: &AtomId, generation: std::num::NonZeroU64) -> bool {
+        let graph = self
+            .graph
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !graph.disposed
+            && graph
+                .nodes
+                .get(id)
+                .is_some_and(|node| node.generation == Some(generation))
+    }
+    // Called by a trusted publication guard after the PubSub capacity decision.
+    // No application callback or await occurs while the graph gate is held.
+    /// Atomically compare generation and observed dependency versions, then install
+    /// observed edges and commit or mark the build invalidated. Returns notification
+    /// keys for publication outside the graph gate; no application callbacks run here.
+    pub(crate) fn commit_evaluation(
+        &self,
+        id: &AtomId,
+        generation: std::num::NonZeroU64,
+        observed: Option<&BTreeMap<AtomId, Arc<()>>>,
+    ) -> Result<(bool, Vec<InvalidationKey>), AtomRegistryError> {
         let mut graph = self
             .graph
             .lock()
@@ -263,19 +328,144 @@ impl AtomRegistry {
         }
         let node = graph
             .nodes
+            .get(id)
+            .ok_or_else(|| AtomRegistryError::Missing(id.clone()))?;
+        if node.generation != Some(generation) || node.invalidated {
+            return Ok((false, Vec::new()));
+        }
+        let current = observed.is_none_or(|observed| {
+            observed.iter().all(|(id, version)| {
+                graph
+                    .nodes
+                    .get(id)
+                    .is_some_and(|node| Arc::ptr_eq(version, &node.version))
+            })
+        });
+        if let Some(observed) = observed {
+            let proposed = observed.keys().cloned().collect::<BTreeSet<_>>();
+            for dependency in &proposed {
+                if !graph.nodes.contains_key(dependency) {
+                    return Err(AtomRegistryError::Missing(dependency.clone()));
+                }
+                if dependency == id || reaches(&graph, dependency, id) {
+                    return Err(AtomRegistryError::DependencyCycle {
+                        atom: id.clone(),
+                        through: dependency.clone(),
+                    });
+                }
+            }
+            let node = graph
+                .nodes
+                .get_mut(id)
+                .ok_or_else(|| AtomRegistryError::Missing(id.clone()))?;
+            let old = std::mem::replace(&mut node.dependencies, proposed.clone());
+            for dependency in old.difference(&proposed) {
+                if let Some(dependents) = graph.dependents.get_mut(dependency) {
+                    dependents.remove(id);
+                }
+            }
+            for dependency in proposed.difference(&old) {
+                graph
+                    .dependents
+                    .entry(dependency.clone())
+                    .or_default()
+                    .insert(id.clone());
+            }
+            if !current {
+                if let Some(node) = graph.nodes.get_mut(id) {
+                    node.invalidated = true;
+                }
+                return Ok((
+                    false,
+                    proposed
+                        .into_iter()
+                        .map(|id| id.invalidation_key())
+                        .collect(),
+                ));
+            }
+        }
+        Ok((true, commit_change(&mut graph, id)?))
+    }
+    /// Check source owner identity and advance its version/invalidation metadata atomically before guarded value publication.
+    pub(crate) fn commit_source(
+        &self,
+        id: &AtomId,
+        owner: &Arc<()>,
+    ) -> Result<Vec<InvalidationKey>, AtomRegistryError> {
+        let mut graph = self
+            .graph
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if graph.disposed {
+            return Err(AtomRegistryError::Disposed);
+        }
+        let node = graph
+            .nodes
+            .get(id)
+            .ok_or_else(|| AtomRegistryError::Missing(id.clone()))?;
+        if !Arc::ptr_eq(&node.owner, owner) {
+            return Err(AtomRegistryError::StaleOwner(id.clone()));
+        }
+        commit_change(&mut graph, id)
+    }
+    pub(crate) fn notify<R: Send + Sync + 'static>(
+        &self,
+        keys: Vec<InvalidationKey>,
+    ) -> Effect<(), AtomRegistryError, R> {
+        self.invalidations
+            .invalidate(keys)
+            .map_error(AtomRegistryError::Invalidation)
+            .map(|_| ())
+    }
+    /// Allocate a globally fresh evaluation generation for a registered derived ID.
+    ///
+    /// This registry-authorized operation addresses the current registration by ID.
+    /// Derived handles additionally check their owner identity. Missing, disposed,
+    /// non-derived or exhausted registrations fail; completion must compare the token
+    /// before publishing state or dependency changes.
+    pub fn begin_evaluation(&self, id: &AtomId) -> Result<std::num::NonZeroU64, AtomRegistryError> {
+        self.begin_evaluation_for(id, None)
+    }
+    pub(crate) fn begin_evaluation_owned(
+        &self,
+        id: &AtomId,
+        owner: &Arc<()>,
+    ) -> Result<std::num::NonZeroU64, AtomRegistryError> {
+        self.begin_evaluation_for(id, Some(owner))
+    }
+    fn begin_evaluation_for(
+        &self,
+        id: &AtomId,
+        owner: Option<&Arc<()>>,
+    ) -> Result<std::num::NonZeroU64, AtomRegistryError> {
+        let mut graph = self
+            .graph
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if graph.disposed {
+            return Err(AtomRegistryError::Disposed);
+        }
+        let node = graph
+            .nodes
+            .get(id)
+            .ok_or_else(|| AtomRegistryError::Missing(id.clone()))?;
+        if owner.is_some_and(|owner| !Arc::ptr_eq(&node.owner, owner)) {
+            return Err(AtomRegistryError::StaleOwner(id.clone()));
+        }
+        let generation = graph
+            .next_generation
+            .ok_or_else(|| AtomRegistryError::GenerationExhausted(id.clone()))?;
+        graph.next_generation = generation
+            .get()
+            .checked_add(1)
+            .and_then(std::num::NonZeroU64::new);
+        let node = graph
+            .nodes
             .get_mut(id)
             .ok_or_else(|| AtomRegistryError::Missing(id.clone()))?;
         if node.kind != AtomKind::Derived {
             return Err(AtomRegistryError::NotDerived(id.clone()));
         }
-        let generation = match node.generation {
-            None => Some(std::num::NonZeroU64::MIN),
-            Some(previous) => previous
-                .get()
-                .checked_add(1)
-                .and_then(std::num::NonZeroU64::new),
-        }
-        .ok_or_else(|| AtomRegistryError::GenerationExhausted(id.clone()))?;
         node.generation = Some(generation);
         node.invalidated = false;
         Ok(generation)
@@ -325,20 +515,11 @@ impl AtomRegistry {
                 .is_some_and(|node| !node.invalidated && node.generation == Some(generation))
     }
 
-    /// A successful source mutation invalidates all transitive dependents in
-    /// one batch. Publication happens after releasing the graph lock. Once
-    /// mutation starts, cancellation cannot split it from publication;
-    /// caller-selected backpressure can still delay completion.
+    /// Lazily advance an ID's version and invalidate its transitive dependents.
     ///
-    /// # Type parameters
-    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
-    ///
-    /// # Parameters
-    /// - `id` (`AtomId`): Stable identity of the selected record or operation.
-    ///
-    /// # Returns
-    /// Type: `Effect<(), AtomRegistryError, R>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// This registry-authorized ID operation addresses the current registration.
+    /// Graph changes commit under the gate; subscriber notification occurs afterward
+    /// and may fail separately from the committed metadata update.
     pub fn changed<R: Send + Sync + 'static>(
         &self,
         id: AtomId,
@@ -353,27 +534,7 @@ impl AtomRegistry {
                 if graph.disposed {
                     return Err(AtomRegistryError::Disposed);
                 }
-                if !graph.nodes.contains_key(&id) {
-                    return Err(AtomRegistryError::Missing(id.clone()));
-                }
-                let mut affected = BTreeSet::new();
-                let mut pending = VecDeque::from([id.clone()]);
-                while let Some(current) = pending.pop_front() {
-                    if affected.insert(current.clone())
-                        && let Some(dependents) = graph.dependents.get(&current)
-                    {
-                        pending.extend(dependents.iter().cloned());
-                    }
-                }
-                for dependent in affected.iter().filter(|candidate| *candidate != &id) {
-                    if let Some(node) = graph.nodes.get_mut(dependent) {
-                        node.invalidated = true;
-                    }
-                }
-                Ok(affected
-                    .into_iter()
-                    .map(|id| id.invalidation_key())
-                    .collect::<Vec<_>>())
+                commit_change(&mut graph, &id)
             },
             std::convert::identity,
         )
@@ -389,21 +550,21 @@ impl AtomRegistry {
         .uninterruptible()
     }
 
-    /// Remove the node and all graph edges. Handles become stale; an obsolete
-    /// evaluation can no longer pass its generation check.
+    /// Lazily remove the current registration by ID and invalidate its dependents.
     ///
-    /// # Type parameters
-    /// - `R`: Environment type. Bounds: `Send + Sync + 'static`.
-    ///
-    /// # Parameters
-    /// - `id` (`AtomId`): Stable identity of the selected record or operation.
-    ///
-    /// # Returns
-    /// Type: `Effect<bool, AtomRegistryError, R>`.
-    /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    /// Handles use separate owner-checked removal so an old disposer cannot remove a
+    /// replacement. Removal may commit before invalidation publication fails; that
+    /// case is reported as RemovalCommittedWithoutInvalidation.
     pub fn remove<R: Send + Sync + 'static>(
         &self,
         id: AtomId,
+    ) -> Effect<bool, AtomRegistryError, R> {
+        self.remove_owned(id, None)
+    }
+    pub(crate) fn remove_owned<R: Send + Sync + 'static>(
+        &self,
+        id: AtomId,
+        owner: Option<Arc<()>>,
     ) -> Effect<bool, AtomRegistryError, R> {
         let registry = self.clone();
         Effect::try_sync(
@@ -414,6 +575,14 @@ impl AtomRegistry {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if graph.disposed {
                     return Err(AtomRegistryError::Disposed);
+                }
+                if owner.as_ref().is_some_and(|owner| {
+                    graph
+                        .nodes
+                        .get(&id)
+                        .is_none_or(|node| !Arc::ptr_eq(owner, &node.owner))
+                }) {
+                    return Ok(None);
                 }
                 let Some(node) = graph.nodes.remove(&id) else {
                     return Ok(None);
@@ -535,4 +704,33 @@ fn reaches(graph: &Graph, from: &AtomId, target: &AtomId) -> bool {
         }
     }
     false
+}
+
+fn commit_change(
+    graph: &mut Graph,
+    id: &AtomId,
+) -> Result<Vec<InvalidationKey>, AtomRegistryError> {
+    let node = graph
+        .nodes
+        .get_mut(id)
+        .ok_or_else(|| AtomRegistryError::Missing(id.clone()))?;
+    node.version = Arc::new(());
+    let mut affected = BTreeSet::new();
+    let mut pending = VecDeque::from([id.clone()]);
+    while let Some(current) = pending.pop_front() {
+        if affected.insert(current.clone())
+            && let Some(dependents) = graph.dependents.get(&current)
+        {
+            pending.extend(dependents.iter().cloned());
+        }
+    }
+    for dependent in affected.iter().filter(|candidate| *candidate != id) {
+        if let Some(node) = graph.nodes.get_mut(dependent) {
+            node.invalidated = true;
+        }
+    }
+    Ok(affected
+        .into_iter()
+        .map(|id| id.invalidation_key())
+        .collect())
 }

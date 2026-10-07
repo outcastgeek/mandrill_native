@@ -516,9 +516,10 @@ where
         .advance(cursor_key, JournalCursor::new(0), ahead)
         .run(Arc::new(()))
         .await;
-    let rejected = EventReplicator::import_and_ack::<ReplicaTarget>(batch.clone())
-        .run(Arc::clone(&out_of_order))
-        .await;
+    let rejected =
+        EventReplicator::import_and_ack::<ReplicaTarget>(batch.clone(), replica_permit(&batch))
+            .run(Arc::clone(&out_of_order))
+            .await;
     let untouched = out_of_order
         .journal
         .cursor(stream.clone())
@@ -539,9 +540,10 @@ where
         cursors: Arc::new(MemoryReplicaCursorStore::new(NonZeroUsize::MIN)),
         projections: Arc::new(MemoryProjectionStore::new(NonZeroUsize::MIN)),
     });
-    let imported = EventReplicator::import_and_ack::<ReplicaTarget>(batch.clone())
-        .run(Arc::clone(&target))
-        .await;
+    let imported =
+        EventReplicator::import_and_ack::<ReplicaTarget>(batch.clone(), replica_permit(&batch))
+            .run(Arc::clone(&target))
+            .await;
     if !matches!(imported, effect::Exit::Success(ReplicaSync::Applied {
         cursor, count: 1,
     }) if cursor.value() == 1)
@@ -632,9 +634,10 @@ where
         .run(Arc::clone(&target))
         .await;
     let notification = subscriber.take().run(Arc::clone(&target)).await;
-    let retry = EventReplicator::import_and_ack::<ReplicaTarget>(batch)
-        .run(Arc::clone(&target))
-        .await;
+    let retry =
+        EventReplicator::import_and_ack::<ReplicaTarget>(batch.clone(), replica_permit(&batch))
+            .run(Arc::clone(&target))
+            .await;
     let journal_cursor = target.journal.cursor(stream).run(Arc::new(())).await;
     let projection_snapshot = target
         .projections
@@ -1261,4 +1264,13 @@ where
     R: HasClock + Send + Sync + 'static,
 {
     Effect::<(), (), R>::sleep(duration).flat_map(|_| Effect::<Duration, (), R>::clock_now())
+}
+
+fn replica_permit(batch: &effect::eventlog::ReplicaBatch) -> effect::eventlog::ReplicaImportPermit {
+    effect::eventlog::ReplicaImportPermit::authorize(
+        batch.source().clone(),
+        batch.stream().clone(),
+        |_, _| Ok::<(), std::convert::Infallible>(()),
+    )
+    .expect("fixture explicitly permits its own replica identity")
 }

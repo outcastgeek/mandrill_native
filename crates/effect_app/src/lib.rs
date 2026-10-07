@@ -191,15 +191,7 @@ pub struct LiveApp {
     pub diagnostics: Diagnostics,
 }
 impl LiveApp {
-    /// Build the Tokio runtime, Rayon pool, diagnostics, and one shared
-    /// environment from the application's explicit configuration.
-    /// A provider construction failure is returned as a `Defect`.
-    ///
-    /// # Parameters
-    /// - `config` (`AppConfig`): The config supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Result<Self, effect::Defect>`.
+    /// Construct the owned application runtime and environment from explicit worker, admission and service policies; invalid runtime construction returns its defect.
     pub fn new(config: AppConfig) -> Result<Self, effect::Defect> {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
@@ -231,7 +223,7 @@ impl LiveApp {
             |annotations| Ok(annotations.clone()),
             move |_| {
                 let ordinal = span_count
-                    .fetch_update(
+                    .try_update(
                         std::sync::atomic::Ordering::Relaxed,
                         std::sync::atomic::Ordering::Relaxed,
                         |count| count.checked_add(NonZeroUsize::MIN.get()),

@@ -31,7 +31,7 @@ pub use entity::{
     HasClusterExecutor,
 };
 pub use entity_proxy::EntityProxy;
-pub use entity_resource::EntityResource;
+pub use entity_resource::{EntityResource, EntityResourceError};
 pub use memory_store::MemoryClusterMessageStore;
 pub use message_store::{
     AcceptancePolicy, AcceptedRequest, ClaimOptions, ClaimToken, ClusterMessageStore,

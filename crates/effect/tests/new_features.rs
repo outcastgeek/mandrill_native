@@ -399,3 +399,100 @@ fn memory_journal_fences_stale_writes_and_deduplicates_stable_event_ids() {
         matches!(execute(different, JournalCursor::new(0)), Exit::Success(AppendReceipt::Decided(AppendDecision::StaleCursor { actual })) if actual.value() == 1)
     );
 }
+
+#[path = "support/drive.rs"]
+mod correction_drive;
+#[test]
+fn cancelled_transactional_permit_and_lock_waits_preserve_interruption_and_ownership() {
+    use effect::transactional::{TxExecutionId, TxReentrantLock, TxSemaphore};
+    use effect::{Cancellation, HasCancellation};
+    struct CancelEnv {
+        domain: Arc<TransactionDomain>,
+        cancel: Cancellation,
+    }
+    impl HasTransactionDomain for CancelEnv {
+        fn transaction_domain(&self) -> Arc<TransactionDomain> {
+            Arc::clone(&self.domain)
+        }
+    }
+    impl HasCancellation for CancelEnv {
+        fn cancellation(&self) -> &Cancellation {
+            &self.cancel
+        }
+    }
+    struct LockDomain;
+    impl KeyDomain for LockDomain {
+        const TAG: &'static str = "cancelled-lock-test";
+    }
+    let domain = Arc::new(TransactionDomain::new(NonZeroUsize::new(4).unwrap()));
+    let policy = TransactionPolicy {
+        max_conflicts: NonZeroUsize::MIN,
+    };
+    let semaphore = TxSemaphore::new(&domain, 0).unwrap();
+    let env = Arc::new(CancelEnv {
+        domain: Arc::clone(&domain),
+        cancel: Cancellation::new(),
+    });
+    let entered = Arc::new(AtomicBool::new(false));
+    let marker = Arc::clone(&entered);
+    let acquire = semaphore.acquire::<()>(NonZeroUsize::MIN);
+    let waiting = Transaction::succeed_with(move || marker.store(true, Ordering::SeqCst))
+        .flat_map(move |_| acquire.clone())
+        .atomically(policy);
+    let mut future = Box::pin(waiting.run_cancellable(Arc::clone(&env)));
+    correction_drive::until(future.as_mut(), || entered.load(Ordering::SeqCst));
+    assert!(env.cancel.request());
+    assert!(matches!(block_on(future), Exit::Interrupted));
+    assert!(matches!(
+        block_on(
+            semaphore
+                .release(NonZeroUsize::MIN)
+                .atomically(policy)
+                .run(Arc::clone(&env))
+        ),
+        Exit::Success(())
+    ));
+    assert!(matches!(
+        block_on(semaphore.available::<()>().atomically(policy).run(env)),
+        Exit::Success(1)
+    ));
+    let lock = TxReentrantLock::new(&domain).unwrap();
+    let namespace = KeyNamespace::<LockDomain>::new("owners").unwrap();
+    let owner = |name: &'static str| {
+        TxExecutionId::from_stable(
+            StableKey::new(&namespace, [KeySegment::Text(name.into())]).unwrap(),
+        )
+    };
+    let first = owner("first");
+    let second = owner("second");
+    let env = Arc::new(CancelEnv {
+        domain,
+        cancel: Cancellation::new(),
+    });
+    assert!(matches!(
+        block_on(
+            lock.acquire(first.clone())
+                .atomically(policy)
+                .run(Arc::clone(&env))
+        ),
+        Exit::Success(())
+    ));
+    let entered = Arc::new(AtomicBool::new(false));
+    let marker = Arc::clone(&entered);
+    let acquire = lock.acquire(second.clone());
+    let waiting = Transaction::succeed_with(move || marker.store(true, Ordering::SeqCst))
+        .flat_map(move |_| acquire.clone())
+        .atomically(policy);
+    let mut future = Box::pin(waiting.run_cancellable(Arc::clone(&env)));
+    correction_drive::until(future.as_mut(), || entered.load(Ordering::SeqCst));
+    assert!(env.cancel.request());
+    assert!(matches!(block_on(future), Exit::Interrupted));
+    assert!(matches!(
+        block_on(lock.release(first).atomically(policy).run(Arc::clone(&env))),
+        Exit::Success(())
+    ));
+    assert!(matches!(
+        block_on(lock.acquire(second).atomically(policy).run(env)),
+        Exit::Success(())
+    ));
+}

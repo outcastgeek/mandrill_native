@@ -6,13 +6,9 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Typed cache failures for reactive computations; atom errors retain shared non-Clone evaluator failures and require Send ownership.
 #[derive(Debug)]
-/// A cache or atom-evaluation failure while refreshing reactive state.
-///
-/// # Type parameters
-/// - `E`: Domain-error type.
-/// - `ClockError`: Error returned by the clock capability.
-pub enum AtomCacheError<E, ClockError> {
+pub enum AtomCacheError<E: Send + 'static, ClockError> {
     /// The selected reactive atom could not be evaluated or updated. Retains the `AtomError<E>` detail.
     Atom(AtomError<E>),
     /// The selected clock could not schedule or observe the requested time. Retains the `ClockError` detail.

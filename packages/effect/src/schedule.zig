@@ -271,7 +271,7 @@ pub fn Intersection(comptime Left: type, comptime Right: type) type {
         /// Input value type accepted by this Schedule.
         pub const Input = Left.Input;
         /// Typed result value produced by this definition.
-        pub const Output = std.meta.Tuple(&.{ Left.Output, Right.Output });
+        pub const Output = @Tuple(&.{ Left.Output, Right.Output });
         /// Compile-time indication that this Schedule consumes the environment’s random source.
         pub const uses_random = Left.uses_random or Right.uses_random;
         left: Left,

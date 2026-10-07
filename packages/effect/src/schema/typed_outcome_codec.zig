@@ -38,14 +38,14 @@ fn unmarkedBorrow(comptime T: type) bool {
         .array => |value| unmarkedBorrow(value.child),
         .vector => |value| unmarkedBorrow(value.child),
         .@"struct" => |value| blk: {
-            inline for (value.fields) |field| {
-                if (unmarkedBorrow(field.type)) break :blk true;
+            inline for (value.field_types) |Field| {
+                if (unmarkedBorrow(Field)) break :blk true;
             }
             break :blk false;
         },
         .@"union" => |value| blk: {
-            inline for (value.fields) |field| {
-                if (unmarkedBorrow(field.type)) break :blk true;
+            inline for (value.field_types) |Field| {
+                if (unmarkedBorrow(Field)) break :blk true;
             }
             break :blk false;
         },

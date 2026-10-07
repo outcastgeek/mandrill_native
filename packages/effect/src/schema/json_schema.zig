@@ -29,15 +29,15 @@ const supported_pattern_dialect = "ecma262";
 const EmitError = error{ OutOfMemory, TooLarge, Unsupported, Invalid, Depth };
 const Shape = enum { integer, number, string, array, object, boolean, null_value, unknown };
 
+const Sink = @import("internal/json_sink.zig").Sink(Emitter, EmitError, Emitter.write);
+
 const Emitter = struct {
-    allocator: std.mem.Allocator,
     output: std.array_list.Managed(u8),
     limits: Limits,
     definitions: []const ast.Definition,
 
     fn init(allocator: std.mem.Allocator, limits: Limits, definitions: []const ast.Definition) Emitter {
         return .{
-            .allocator = allocator,
             .output = std.array_list.Managed(u8).init(allocator),
             .limits = limits,
             .definitions = definitions,
@@ -50,58 +50,18 @@ const Emitter = struct {
         try self.output.appendSlice(value);
     }
 
-    fn byte(self: *Emitter, value: u8) EmitError!void {
-        if (self.output.items.len >= self.limits.max_output_bytes) return error.TooLarge;
-        try self.output.append(value);
-    }
-
-    fn hexNibble(value: u8) u8 {
-        return if (value < 10) '0' + value else 'a' + (value - 10);
-    }
-
-    fn quoted(self: *Emitter, value: []const u8) EmitError!void {
-        if (!std.unicode.utf8ValidateSlice(value)) return error.Invalid;
-        try self.byte('"');
-        for (value) |character| {
-            switch (character) {
-                '"' => try self.write("\\\""),
-                '\\' => try self.write("\\\\"),
-                0...0x1f => {
-                    try self.write("\\u00");
-                    try self.byte(hexNibble(character >> 4));
-                    try self.byte(hexNibble(character & 0x0f));
-                },
-                else => try self.byte(character),
-            }
-        }
-        try self.byte('"');
-    }
-
-    fn unsigned(self: *Emitter, value: usize) EmitError!void {
-        var scratch: [std.fmt.count("{d}", .{std.math.maxInt(usize)})]u8 = undefined;
-        const printed = std.fmt.bufPrint(&scratch, "{d}", .{value}) catch unreachable;
-        try self.write(printed);
-    }
-
-    fn signed(self: *Emitter, value: i128) EmitError!void {
-        var scratch: [std.fmt.count("{d}", .{std.math.minInt(i128)})]u8 = undefined;
-        const printed = std.fmt.bufPrint(&scratch, "{d}", .{value}) catch unreachable;
-        try self.write(printed);
-    }
-
-    fn pointerName(self: *Emitter, name: []const u8) EmitError!void {
+    fn pointerValue(self: *Emitter, name: []const u8) EmitError!void {
+        if (!std.unicode.utf8ValidateSlice(name)) return error.Invalid;
+        var sink: Sink = .{ .target = self };
+        // JSON Pointer escaping is schema-reference semantics. JSON string
+        // escaping is delegated to std, including quotes and control bytes.
+        try self.write("\"#/$defs/");
         for (name) |character| switch (character) {
             '~' => try self.write("~0"),
             '/' => try self.write("~1"),
-            else => try self.byte(character),
+            else => std.json.Stringify.encodeJsonStringChars(&.{character}, .{}, &sink.writer) catch return sink.failure.?,
         };
-    }
-
-    fn reference(self: *Emitter, name: []const u8) EmitError!void {
-        if (self.find(name) == null) return error.Invalid;
-        try self.write("{\"$ref\":\"#/$defs/");
-        try self.pointerName(name);
-        try self.write("\"}");
+        try self.write("\"");
     }
 
     fn find(self: *const Emitter, name: []const u8) ?ast.Definition {
@@ -116,35 +76,6 @@ const Emitter = struct {
         return depth + 1;
     }
 
-    fn primitive(self: *Emitter, value: ast.Primitive, accuracy: ast.Accuracy) EmitError!void {
-        switch (value) {
-            .boolean => try self.write("{\"type\":\"boolean\"}"),
-            .signed_integer => {
-                try self.write("{\"type\":\"integer\",\"minimum\":");
-                try self.signed(std.math.minInt(i64));
-                try self.write(",\"maximum\":");
-                try self.signed(std.math.maxInt(i64));
-                try self.byte('}');
-            },
-            .unsigned_integer => {
-                try self.write("{\"type\":\"integer\",\"minimum\":0,\"maximum\":");
-                try self.signed(std.math.maxInt(u64));
-                try self.byte('}');
-            },
-            .finite_number => {
-                // JSON Schema cannot express exactly which decimal JSON numbers
-                // round to finite f64 values under this codec.
-                if (accuracy == .exact) return error.Unsupported;
-                try self.write("{\"type\":\"number\"}");
-            },
-            .string => try self.write("{\"type\":\"string\"}"),
-            .null_value => try self.write("{\"type\":\"null\"}"),
-            // The byte/decimal/identity/time wire formats require matching
-            // codecs before an honest representation can be exported.
-            .decimal, .bytes, .identifier, .timestamp => return error.Unsupported,
-        }
-    }
-
     fn shape(self: *const Emitter, source: *const ast.Node, depth: usize) Shape {
         if (depth >= self.limits.max_depth) return .unknown;
         return switch (source.*) {
@@ -155,7 +86,11 @@ const Emitter = struct {
                 .string, .decimal, .bytes, .identifier, .timestamp => .string,
                 .null_value => .null_value,
             },
-            .array => .array,
+            .array, .prefix_array => .array,
+            .exact_number => |number| if (number.integer) .integer else .number,
+            .alternatives => .unknown,
+            .enumeration => .string,
+            .object => .object,
             .record, .tagged_union => .object,
             .nullable => .unknown,
             .constrained => |value| self.shape(value.base, depth + 1),
@@ -163,142 +98,302 @@ const Emitter = struct {
         };
     }
 
+    fn child(self: *Emitter, json: *std.json.Stringify, sink: *Sink, source: *const ast.Node, accuracy: ast.Accuracy, depth: usize) EmitError!void {
+        try sink.check(json.beginWriteRaw());
+        try self.node(source, accuracy, depth);
+        json.endWriteRaw();
+    }
+
     fn node(self: *Emitter, source: *const ast.Node, accuracy: ast.Accuracy, depth: usize) EmitError!void {
         const next_depth = try self.level(depth);
         if (ast.validateLocal(source) == .err) return error.Invalid;
+        var sink: Sink = .{ .target = self };
+        // One std grammar state per AST node: recursion is bounded by level(),
+        // while std sees only the local schema clause and its shallow wrappers.
+        var json: std.json.Stringify = .{ .writer = &sink.writer };
+        try sink.check(json.beginObject());
         switch (source.*) {
-            .primitive => |value| try self.primitive(value, accuracy),
+            .primitive => |value| {
+                try sink.check(json.objectField("type"));
+                try sink.check(json.write(switch (value) {
+                    .boolean => "boolean",
+                    .signed_integer, .unsigned_integer => "integer",
+                    .finite_number => if (accuracy == .exact) return error.Unsupported else "number",
+                    .string => "string",
+                    .null_value => "null",
+                    .decimal, .bytes, .identifier, .timestamp => return error.Unsupported,
+                }));
+                if (value == .signed_integer or value == .unsigned_integer) {
+                    try sink.check(json.objectField("minimum"));
+                    try sink.check(json.write(if (value == .signed_integer) @as(i128, std.math.minInt(i64)) else 0));
+                    try sink.check(json.objectField("maximum"));
+                    try sink.check(json.write(if (value == .signed_integer) @as(i128, std.math.maxInt(i64)) else std.math.maxInt(u64)));
+                }
+            },
+            .enumeration => |value| {
+                try sink.check(json.objectField("type"));
+                try sink.check(json.write("string"));
+                if (!value.preserve_unknown) {
+                    try sink.check(json.objectField("enum"));
+                    try sink.check(json.write(value.values));
+                }
+            },
+            .exact_number => |number| {
+                try sink.check(json.objectField("type"));
+                try sink.check(json.write(if (number.integer) "integer" else "number"));
+                inline for (.{ "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf" }, .{ number.minimum, number.maximum, number.exclusive_minimum, number.exclusive_maximum, number.multiple_of }) |name, operand| if (operand) |text| {
+                    try sink.check(json.objectField(name));
+                    try sink.check(json.beginWriteRaw());
+                    // validateLocal checked the exact token; preserve its digits.
+                    try self.write(text);
+                    json.endWriteRaw();
+                };
+            },
+            .alternatives => |value| {
+                try sink.check(json.objectField(switch (value.mode) {
+                    .one => "oneOf",
+                    .any => "anyOf",
+                    .all => "allOf",
+                }));
+                try sink.check(json.beginArray());
+                for (value.branches) |branch| try self.child(&json, &sink, branch, accuracy, next_depth);
+                try sink.check(json.endArray());
+            },
+            .prefix_array => |value| {
+                try sink.check(json.objectField("type"));
+                try sink.check(json.write("array"));
+                try sink.check(json.objectField("prefixItems"));
+                try sink.check(json.beginArray());
+                var required: usize = 0;
+                for (value.elements) |element| {
+                    if (element.required) required += 1;
+                    try self.child(&json, &sink, element.schema, accuracy, next_depth);
+                }
+                try sink.check(json.endArray());
+                try sink.check(json.objectField("items"));
+                if (value.rest) |rest| try self.child(&json, &sink, rest, accuracy, next_depth) else try sink.check(json.write(false));
+                try sink.check(json.objectField("minItems"));
+                try sink.check(json.write(@max(value.minimum, required)));
+                try sink.check(json.objectField("maxItems"));
+                try sink.check(json.write(if (value.rest == null) @min(value.maximum, value.elements.len) else value.maximum));
+                if (value.unique) {
+                    try sink.check(json.objectField("uniqueItems"));
+                    try sink.check(json.write(true));
+                }
+            },
+            .object => |value| {
+                try sink.check(json.objectField("allOf"));
+                try sink.check(json.beginArray());
+                try self.child(&json, &sink, value.base, accuracy, next_depth);
+                try sink.check(json.beginObject());
+                try sink.check(json.objectField("type"));
+                try sink.check(json.write("object"));
+                try sink.check(json.objectField("minProperties"));
+                try sink.check(json.write(value.minimum));
+                try sink.check(json.objectField("maxProperties"));
+                try sink.check(json.write(value.maximum));
+                if (value.property_names) |names| {
+                    try sink.check(json.objectField("propertyNames"));
+                    try self.child(&json, &sink, names, accuracy, next_depth);
+                }
+                try sink.check(json.objectField("properties"));
+                try sink.check(json.beginObject());
+                if (value.base.* != .record and accuracy == .exact) return error.Unsupported;
+                if (value.base.* == .record) for (value.base.record.fields) |field| {
+                    try sink.check(json.objectField(field.name));
+                    try sink.check(json.beginObject());
+                    try sink.check(json.endObject());
+                };
+                try sink.check(json.endObject());
+                try sink.check(json.objectField("patternProperties"));
+                try sink.check(json.beginObject());
+                for (value.patterns) |pattern| {
+                    if (!std.mem.eql(u8, pattern.dialect, supported_pattern_dialect)) {
+                        if (accuracy == .exact) return error.Unsupported;
+                        continue;
+                    }
+                    try sink.check(json.objectField(pattern.source));
+                    try self.child(&json, &sink, pattern.schema, accuracy, next_depth);
+                }
+                try sink.check(json.endObject());
+                try sink.check(json.objectField("additionalProperties"));
+                if (value.additional) |additional| try self.child(&json, &sink, additional, accuracy, next_depth) else {
+                    var unknown_pattern = value.base.* != .record;
+                    for (value.patterns) |pattern| if (!std.mem.eql(u8, pattern.dialect, supported_pattern_dialect)) {
+                        unknown_pattern = true;
+                    };
+                    try sink.check(json.write(unknown_pattern and accuracy == .conservative));
+                }
+                try sink.check(json.endObject());
+                try sink.check(json.endArray());
+            },
             .nullable => |inner| {
-                try self.write("{\"anyOf\":[");
-                try self.node(inner, accuracy, next_depth);
-                try self.write(",{\"type\":\"null\"}]}");
+                try sink.check(json.objectField("anyOf"));
+                try sink.check(json.beginArray());
+                try self.child(&json, &sink, inner, accuracy, next_depth);
+                try sink.check(json.write(.{ .type = "null" }));
+                try sink.check(json.endArray());
             },
             .array => |inner| {
-                try self.write("{\"type\":\"array\",\"items\":");
-                try self.node(inner, accuracy, next_depth);
-                try self.byte('}');
+                try sink.check(json.objectField("type"));
+                try sink.check(json.write("array"));
+                try sink.check(json.objectField("items"));
+                try self.child(&json, &sink, inner, accuracy, next_depth);
             },
             .record => |record| {
-                // A rejecting raw-input duplicate policy cannot be enforced
-                // by JSON Schema over already-parsed object members.
                 if (record.duplicate_fields == .reject and accuracy == .exact) return error.Unsupported;
-                try self.write("{\"type\":\"object\",\"properties\":{");
-                for (record.fields, 0..) |field, index| {
-                    if (field.presence == .defaulted and accuracy == .exact) return error.Unsupported;
-                    if (index != 0) try self.byte(',');
-                    try self.quoted(field.name);
-                    try self.byte(':');
-                    try self.node(field.schema, accuracy, next_depth);
-                }
-                try self.write("},\"required\":[");
-                var first = true;
+                try sink.check(json.objectField("type"));
+                try sink.check(json.write("object"));
+                try sink.check(json.objectField("properties"));
+                try sink.check(json.beginObject());
                 for (record.fields) |field| {
-                    if (field.presence != .required) continue;
-                    if (!first) try self.byte(',');
-                    first = false;
-                    try self.quoted(field.name);
+                    if (field.presence == .defaulted and accuracy == .exact) return error.Unsupported;
+                    try sink.check(json.objectField(field.name));
+                    try self.child(&json, &sink, field.schema, accuracy, next_depth);
                 }
-                try self.write("],\"additionalProperties\":");
-                try self.write(if (record.unknown_fields == .reject) "false}" else "true}");
+                try sink.check(json.endObject());
+                try sink.check(json.objectField("required"));
+                try sink.check(json.beginArray());
+                for (record.fields) |field| if (field.presence == .required) {
+                    try sink.check(json.write(field.name));
+                };
+                try sink.check(json.endArray());
+                try sink.check(json.objectField("additionalProperties"));
+                try sink.check(json.write(record.unknown_fields != .reject));
             },
             .tagged_union => |tagged| {
-                if (tagged.cases.len == 0) return error.Invalid;
-                try self.write("{\"oneOf\":[");
-                for (tagged.cases, 0..) |case, index| {
-                    if (index != 0) try self.byte(',');
-                    try self.write("{\"type\":\"object\",\"properties\":{");
-                    try self.quoted(tagged.discriminator);
-                    try self.write(":{\"const\":");
-                    try self.quoted(case.tag);
-                    try self.byte('}');
+                try sink.check(json.objectField("oneOf"));
+                try sink.check(json.beginArray());
+                for (tagged.cases) |case| {
+                    try sink.check(json.beginObject());
+                    try sink.check(json.objectField("type"));
+                    try sink.check(json.write("object"));
+                    try sink.check(json.objectField("properties"));
+                    try sink.check(json.beginObject());
+                    try sink.check(json.objectField(tagged.discriminator));
+                    try sink.check(json.write(.{ .@"const" = case.tag }));
                     if (case.payload) |payload| {
-                        try self.byte(',');
-                        try self.quoted(tagged.payload_name);
-                        try self.byte(':');
-                        try self.node(payload, accuracy, next_depth);
+                        try sink.check(json.objectField(tagged.payload_name));
+                        try self.child(&json, &sink, payload, accuracy, next_depth);
                     }
-                    try self.write("},\"required\":[");
-                    try self.quoted(tagged.discriminator);
-                    if (case.payload != null) {
-                        try self.byte(',');
-                        try self.quoted(tagged.payload_name);
-                    }
-                    try self.write("],\"additionalProperties\":false}");
+                    try sink.check(json.endObject());
+                    try sink.check(json.objectField("required"));
+                    try sink.check(json.beginArray());
+                    try sink.check(json.write(tagged.discriminator));
+                    if (case.payload != null) try sink.check(json.write(tagged.payload_name));
+                    try sink.check(json.endArray());
+                    try sink.check(json.objectField("additionalProperties"));
+                    try sink.check(json.write(false));
+                    try sink.check(json.endObject());
                 }
-                try self.write("]}");
+                try sink.check(json.endArray());
             },
-            .reference => |name| try self.reference(name),
+            .reference => |name| {
+                if (self.find(name) == null) return error.Invalid;
+                try sink.check(json.objectField("$ref"));
+                try sink.check(json.beginWriteRaw());
+                try self.pointerValue(name);
+                json.endWriteRaw();
+            },
             .constrained => |constrained| {
-                // allOf lets constraints remain separate from a recursive or
-                // compound base; unsupported constraints are only omitted in
-                // the caller's explicit conservative mode.
-                try self.write("{\"allOf\":[");
-                try self.node(constrained.base, accuracy, next_depth);
+                try sink.check(json.objectField("allOf"));
+                try sink.check(json.beginArray());
+                try self.child(&json, &sink, constrained.base, accuracy, next_depth);
                 const base_shape = self.shape(constrained.base, next_depth);
-                for (constrained.rules) |rule| {
-                    switch (rule) {
-                        .integer_bounds => |bounds| {
-                            if (base_shape != .integer) {
-                                if (accuracy == .exact) return error.Unsupported;
-                                continue;
-                            }
-                            try self.write(",{\"type\":\"integer\"");
-                            if (bounds.minimum) |minimum| {
-                                try self.write(",\"minimum\":");
-                                try self.signed(minimum);
-                            }
-                            if (bounds.maximum) |maximum| {
-                                try self.write(",\"maximum\":");
-                                try self.signed(maximum);
-                            }
-                            try self.byte('}');
-                        },
-                        .length => |length| {
-                            const is_string = length.unit == .unicode_scalars and base_shape == .string;
-                            const is_array = length.unit == .elements and base_shape == .array;
-                            if (!is_string and !is_array) {
-                                if (accuracy == .exact) return error.Unsupported;
-                                continue;
-                            }
-                            try self.write(if (is_string) ",{\"type\":\"string\"" else ",{\"type\":\"array\"");
-                            if (length.minimum) |minimum| {
-                                try self.write(if (is_string) ",\"minLength\":" else ",\"minItems\":");
-                                try self.unsigned(minimum);
-                            }
-                            if (length.maximum) |maximum| {
-                                try self.write(if (is_string) ",\"maxLength\":" else ",\"maxItems\":");
-                                try self.unsigned(maximum);
-                            }
-                            try self.byte('}');
-                        },
-                        .pattern => |pattern| {
-                            if (base_shape != .string or !std.mem.eql(u8, pattern.dialect, supported_pattern_dialect)) {
-                                if (accuracy == .exact) return error.Unsupported;
-                                continue;
-                            }
-                            try self.write(",{\"type\":\"string\",\"pattern\":");
-                            try self.quoted(pattern.text);
-                            try self.byte('}');
-                        },
-                    }
-                }
-                try self.write("]}");
+                for (constrained.rules) |rule| switch (rule) {
+                    .integer_bounds => |bounds| {
+                        if (base_shape != .integer) {
+                            if (accuracy == .exact) return error.Unsupported;
+                            continue;
+                        }
+                        try sink.check(json.beginObject());
+                        try sink.check(json.objectField("type"));
+                        try sink.check(json.write("integer"));
+                        if (bounds.minimum) |minimum| {
+                            try sink.check(json.objectField("minimum"));
+                            try sink.check(json.write(minimum));
+                        }
+                        if (bounds.maximum) |maximum| {
+                            try sink.check(json.objectField("maximum"));
+                            try sink.check(json.write(maximum));
+                        }
+                        try sink.check(json.endObject());
+                    },
+                    .length => |length| {
+                        const is_string = length.unit == .unicode_scalars and base_shape == .string;
+                        const is_array = length.unit == .elements and base_shape == .array;
+                        if (!is_string and !is_array) {
+                            if (accuracy == .exact) return error.Unsupported;
+                            continue;
+                        }
+                        try sink.check(json.beginObject());
+                        try sink.check(json.objectField("type"));
+                        try sink.check(json.write(if (is_string) "string" else "array"));
+                        if (length.minimum) |minimum| {
+                            try sink.check(json.objectField(if (is_string) "minLength" else "minItems"));
+                            try sink.check(json.write(minimum));
+                        }
+                        if (length.maximum) |maximum| {
+                            try sink.check(json.objectField(if (is_string) "maxLength" else "maxItems"));
+                            try sink.check(json.write(maximum));
+                        }
+                        try sink.check(json.endObject());
+                    },
+                    .check => {
+                        if (accuracy == .exact) return error.Unsupported;
+                    },
+                    .format => |format| {
+                        if (base_shape != .string) {
+                            if (accuracy == .exact) return error.Unsupported;
+                            continue;
+                        }
+                        if (accuracy == .exact) return error.Unsupported;
+                        try sink.check(json.write(.{ .format = if (format == .uuid_v4) "uuid" else @tagName(format) }));
+                    },
+                    .pattern => |pattern| {
+                        if (base_shape != .string or !std.mem.eql(u8, pattern.dialect, supported_pattern_dialect)) {
+                            if (accuracy == .exact) return error.Unsupported;
+                            continue;
+                        }
+                        try sink.check(json.write(.{ .type = "string", .pattern = pattern.text }));
+                    },
+                };
+                try sink.check(json.endArray());
             },
         }
+        try sink.check(json.endObject());
+    }
+
+    fn document(self: *Emitter, root_name: []const u8) EmitError!void {
+        var sink: Sink = .{ .target = self };
+        var json: std.json.Stringify = .{ .writer = &sink.writer };
+        try sink.check(json.beginObject());
+        try sink.check(json.objectField("$schema"));
+        try sink.check(json.write(draft_2020_12_uri));
+        try sink.check(json.objectField("$ref"));
+        try sink.check(json.beginWriteRaw());
+        try self.pointerValue(root_name);
+        json.endWriteRaw();
+        try sink.check(json.objectField("$defs"));
+        try sink.check(json.beginObject());
+        for (self.definitions) |definition| {
+            try sink.check(json.objectField(definition.name));
+            try self.child(&json, &sink, definition.root, definition.accuracy, 0);
+        }
+        try sink.check(json.endObject());
+        try sink.check(json.endObject());
     }
 };
 
-/// The caller supplies the entire named definition table and resource limits.
-/// References remain references, so recursive names do not recursively emit.
-///
-/// Parameters:
-/// - `env: anytype`: Borrowed caller environment supplying allocator, I/O, and selected capabilities.
-/// - `definitions: []const ast.Definition`: Static definitions to register or validate.
-/// - `root_name: []const u8`: Root schema or operation name used in diagnostics.
-/// - `limits: Limits`: Caller-selected, validated behavior or resource bounds; no hidden default is
-///   installed.
-/// - `dialect: comptime Dialect`: Compile-time encoding dialect selected for this codec.
-/// Returns (`outcomes.Exit(outcomes.OwnedSlice(u8), Issue)`): Carries `outcomes.OwnedSlice(u8)` on `.success` or `Issue` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
+/// Translate immutable encoded-shape definitions into draft-2020-12 JSON Schema.
+/// R supplies the output allocator; success owns its bytes and failures own Issues.
+/// Definitions/names are borrowed for this call. References remain references,
+/// so recursive names do not recursively emit or acquire runtime services.
+/// Caller max_depth bounds AST expansion and max_output_bytes bounds emitted UTF-8.
+/// std.json handles JSON syntax; exact decimal operands are validated raw tokens.
+/// Exact mode rejects unsupported semantics rather than silently weakening them;
+/// conservative mode may over-approximate format/check/pattern behavior.
+/// Allocation failure is .die; invalid/unsupported/bounded representations are .fail.
 pub fn exportSchema(
     env: anytype,
     definitions: []const ast.Definition,
@@ -321,19 +416,8 @@ pub fn exportSchema(
     var emitter = Emitter.init(env.allocator, limits, definitions);
     defer emitter.output.deinit();
     if (emitter.find(root_name) == null) return .{ .fail = Issue.init(env, .representation, .invalid_value) };
-    const generated = blk: {
-        emitter.write("{\"$schema\":") catch |problem| break :blk problem;
-        emitter.quoted(draft_2020_12_uri) catch |problem| break :blk problem;
-        emitter.write(",\"$ref\":\"#/$defs/") catch |problem| break :blk problem;
-        emitter.pointerName(root_name) catch |problem| break :blk problem;
-        emitter.write("\",\"$defs\":{") catch |problem| break :blk problem;
-        for (definitions, 0..) |definition, index| {
-            if (index != 0) emitter.byte(',') catch |problem| break :blk problem;
-            emitter.quoted(definition.name) catch |problem| break :blk problem;
-            emitter.byte(':') catch |problem| break :blk problem;
-            emitter.node(definition.root, definition.accuracy, 0) catch |problem| break :blk problem;
-        }
-        emitter.write("}}") catch |problem| break :blk problem;
+    const generated: ?EmitError = blk: {
+        emitter.document(root_name) catch |problem| break :blk problem;
         break :blk null;
     };
     if (generated) |problem| {

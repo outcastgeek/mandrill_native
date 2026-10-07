@@ -47,13 +47,13 @@ const EventValueCodec = fx.PureCodec(u8, u8).init(struct {
 }.encode);
 const EventErrorCodec = fx.PureCodec(Error, u8).init(struct {
     fn decode(value: *const u8) fx.Result(Error, fx.SchemaIssue.Issue) {
-        if (value.* != @intFromEnum(Error.unexpected))
+        if (value.* != @backingInt(Error.unexpected))
             return .{ .err = fx.SchemaIssue.Issue.pure(.decode, .invalid_value) };
         return .{ .ok = .unexpected };
     }
 }.decode, struct {
     fn encode(value: *const Error) fx.Result(u8, fx.SchemaIssue.Issue) {
-        return .{ .ok = @intFromEnum(value.*) };
+        return .{ .ok = @backingInt(value.*) };
     }
 }.encode);
 const EventFixture = struct {
@@ -201,8 +201,8 @@ const TxFixture = struct {
     }
 };
 
-fn exerciseCommittedStream(init: std.process.Init) void {
-    var tx_env: TxEnv = .{ .allocator = init.gpa, .io = init.io, .domain = undefined, .capture = undefined };
+fn exerciseCommittedStream(allocator: std.mem.Allocator, io: std.Io) void {
+    var tx_env: TxEnv = .{ .allocator = allocator, .io = io, .domain = undefined, .capture = undefined };
     var domain = fx.TransactionDomain.init(&tx_env);
     defer domain.deinit();
     tx_env.domain = &domain;
@@ -410,6 +410,10 @@ fn increment(cell: *const *Cell, journal: *fx.MemoryTransaction(u8).Journal) fx.
 }
 
 pub fn main(init: std.process.Init) void {
+    var checked = std.heap.SafeAllocator.init(init.gpa, .{});
+    // This defer runs after all program, provider and outcome owners below.
+    defer std.debug.assert(checked.deinit() == 0);
+    const allocator = checked.allocator();
     _ = ConsumerRecordSchema.encodedNode();
     const event_resolution = EventGroup.resolve("consumer.created", 1);
     std.debug.assert(event_resolution == .ok and event_resolution.ok == 0);
@@ -417,8 +421,9 @@ pub fn main(init: std.process.Init) void {
     std.debug.assert(entity_resolution == .ok and entity_resolution.ok == 0);
     std.debug.assert(WorkflowRegistry.resolve("consumer.workflow", 1).? == 0);
     std.debug.assert(ActivityRegistry.resolve("consumer.activity", 1).? == 0);
-    exerciseCommittedStream(init);
-    var env: Env = .{ .allocator = init.gpa, .io = init.io, .value = 7, .instant = .{ .unix_nanoseconds = 0 } };
+    exerciseCommittedStream(allocator, init.io);
+    var env: Env = .{ .allocator = allocator, .io = init.io, .value = 7, .instant = .{ .unix_nanoseconds = 0 } };
+    exerciseReferenceUpdate(&env);
     const integer_codec = comptime fx.IntegerCodec(i16);
     const option_codec = comptime fx.OptionCodec.option(integer_codec);
     const optional_value: ?i16 = -12;
@@ -491,7 +496,7 @@ pub fn main(init: std.process.Init) void {
     };
     const grouped_provider = GroupedResolver.fromProvider(null, &.{ .resolve_batch = ResolverFixture.resolve });
     var grouped_calls: usize = 0;
-    const resolver_env: ResolverEnv = .{ .allocator = init.gpa, .io = init.io, .resolver = &grouped_provider, .jobs = &resolver_jobs, .calls = &grouped_calls };
+    const resolver_env: ResolverEnv = .{ .allocator = allocator, .io = init.io, .resolver = &grouped_provider, .jobs = &resolver_jobs, .calls = &grouped_calls };
     const grouped_program = GroupedResolver.resolveGrouped(ResolverFixture.selected, ResolverFixture.jobs, ResolverFixture.group);
     var grouped_result = fx.run(&resolver_env, grouped_program);
     defer grouped_result.deinit();
@@ -703,6 +708,44 @@ pub fn main(init: std.process.Init) void {
     std.debug.assert(replayed_activity == .success and replayed_activity.success.source == .replayed);
     std.debug.assert(replayed_activity.success.exit == .success and replayed_activity.success.exit.success == env.value);
     std.debug.assert(activity_calls == 1);
+    var failed_checkpoint = encodeClusterExit(&.{ .fail = {} }, &env);
+    defer failed_checkpoint.deinit();
+    std.debug.assert(failed_checkpoint == .success);
+    var finish_failed = workflow_capability.vtable.complete(workflow_capability.userdata, &env, env.workflow_activation.?, failed_checkpoint.success.items);
+    defer finish_failed.deinit();
+    var failed_saved = fx.run(&env, finish_failed);
+    defer failed_saved.deinit();
+    std.debug.assert(failed_saved == .success and failed_saved.success == .committed);
+    var failed_observation = fx.run(&env, comptime Workflow.poll(workflowEngine, execution));
+    defer failed_observation.deinit();
+    std.debug.assert(failed_observation == .success and failed_observation.success == .completed);
+    var typed_failure = decodeClusterExit(failed_observation.success.completed.items, &env);
+    defer typed_failure.deinit();
+    std.debug.assert(typed_failure == .success and typed_failure.success == .fail);
+    var plain_resume = fx.run(&env, comptime Workflow.resumeExecution(workflowEngine, execution));
+    defer plain_resume.deinit();
+    std.debug.assert(plain_resume == .success and plain_resume.success == .already_recorded);
+    const observed_failure = failed_observation.success.completed;
+    var wrong_terminal = workflow_capability.vtable.resume_execution(workflow_capability.userdata, &env, .{ .execution = execution(&env), .expected_revision = observed_failure.revision, .expected_terminal_reply = "different" });
+    defer wrong_terminal.deinit();
+    var wrong_result = fx.run(&env, wrong_terminal);
+    defer wrong_result.deinit();
+    std.debug.assert(wrong_result == .success and wrong_result.success == .stale_revision);
+    var reset_failed = workflow_capability.vtable.resume_execution(workflow_capability.userdata, &env, .{ .execution = execution(&env), .expected_revision = observed_failure.revision, .expected_terminal_reply = observed_failure.items });
+    defer reset_failed.deinit();
+    var reset_saved = fx.run(&env, reset_failed);
+    defer reset_saved.deinit();
+    std.debug.assert(reset_saved == .success and reset_saved.success == .recorded);
+    var retry_activation = fx.run(&env, comptime Workflow.activate(workflowEngine, execution, workflowOwner, workflowActivationPolicy));
+    defer retry_activation.deinit();
+    std.debug.assert(retry_activation == .success and retry_activation.success == .activated);
+    env.workflow_activation = retry_activation.success.activated.activation();
+    var replay_after_reset = fx.run(&env, run_activity);
+    defer replay_after_reset.deinit();
+    std.debug.assert(replay_after_reset == .success and replay_after_reset.success.source == .replayed);
+    std.debug.assert(replay_after_reset.success.exit == .success and replay_after_reset.success.exit.success == env.value);
+    std.debug.assert(activity_calls == 1);
+
     var interrupted_identity = fx.PrimaryKey.encodeDirect(&env, "consumer-activity", &.{.{ .text = "interrupted" }});
     defer interrupted_identity.deinit();
     std.debug.assert(interrupted_identity == .success);
@@ -793,4 +836,64 @@ pub fn main(init: std.process.Init) void {
     var released = fx.run(&env, release);
     defer released.deinit();
     std.debug.assert(released == .success and released.success == .released);
+}
+
+fn exerciseReferenceUpdate(env: *const Env) void {
+    const Imported = fx.requireOwnedPayload(@import("owned_fixture.zig").Payload);
+    const imported = Imported.init(env.allocator) catch @panic("imported owner allocation failed");
+    var owning = fx.Effect(Imported, void, Env).fromOwnedSuccess(env, imported);
+    defer owning.deinit();
+    var transferred = fx.run(env, owning);
+    defer transferred.deinit();
+    std.debug.assert(transferred == .success and std.mem.eql(u8, transferred.success.bytes, "imported owner"));
+    const Limits = struct {
+        fn surface(env_: *const Env) fx.JsonSurface.Limits {
+            return .{ .input = .{ .max_document_bytes = 1024, .max_depth = 16, .max_value_bytes = 256 }, .schema = .{ .max_nodes = 32, .max_edges = 32, .max_depth = 16 }, .maximum_issues = 4, .maximum_integer_digits = 32, .output = select(env_) };
+        }
+        fn select(_: *const Env) fx.JsonWriter.Limits {
+            return .{ .max_output_bytes = 1024, .max_json_depth = 16, .max_value_bytes = 256, .max_integer_digits = 32 };
+        }
+    };
+    const Exact = fx.JsonConstraints.withLimits(fx.JsonNumberCodec.exact(Env, .{ .integer = true, .minimum = "0", .maximum_integer_digits = 32, .maximum_value_bytes = 128 }), Limits.surface);
+    var parsed = Exact.parseBytesDirect(env, "9007199254740993", .reject);
+    defer parsed.deinit();
+    std.debug.assert(parsed == .success);
+    const input: std.json.Value = .{ .number_string = "9007199254740993" };
+    var value = Exact.decodeDirect(env, &input);
+    defer value.deinit();
+    std.debug.assert(value == .success);
+    var output = Exact.encodeBytesDirect(env, &value.success);
+    defer output.deinit();
+    std.debug.assert(output == .success and std.mem.eql(u8, output.success.items, input.number_string));
+    const Unicode = fx.JsonConstraints.String(Env, .{ .minimum_scalars = 1, .maximum_scalars = 1, .format = .none }, null);
+    const record: ConsumerRecord = .{ .value = 42 };
+    var record_writer = fx.JsonCodec.requireWriter(ConsumerRecordSchema).writeWith(Env, &record, Limits.select);
+    defer record_writer.deinit();
+    var record_output = fx.run(env, record_writer);
+    defer record_output.deinit();
+    std.debug.assert(record_output == .success and std.mem.eql(u8, record_output.success.items, "{\"value\":42}"));
+    const text: []const u8 = "é";
+    var writer = fx.JsonCodec.requireWriter(Unicode).writeWith(Env, &text, Limits.select);
+    defer writer.deinit();
+    var written = fx.run(env, writer);
+    defer written.deinit();
+    std.debug.assert(written == .success);
+    const mapped = comptime fx.DomainCodec.ofSchema(Error, fx.JsonCodec.signed_integer, struct {
+        fn map(issue: fx.SchemaIssue.Issue) Error {
+            var owned = issue;
+            owned.deinit();
+            return .unexpected;
+        }
+    }.map, struct {
+        fn map(issue: fx.SchemaIssue.Issue) Error {
+            var owned = issue;
+            owned.deinit();
+            return .unexpected;
+        }
+    }.map);
+    const optional = comptime fx.DomainCodec.optional(mapped);
+    const answer: ?i64 = 42;
+    var validated = fx.requirePure(optional).validateDirect(&answer);
+    defer validated.deinit();
+    std.debug.assert(validated == .ok);
 }

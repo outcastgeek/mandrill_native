@@ -160,7 +160,7 @@ test "OOM at resource admission never loses acquired resources or cleanup errors
     // Outer admission failure, inner admission failure with an owned outer
     // resource, and successful admission of both resources are distinct paths.
     const ResourceRole = enum { outer, inner };
-    const bracket_depth = @typeInfo(ResourceRole).@"enum".fields.len;
+    const bracket_depth = @typeInfo(ResourceRole).@"enum".field_names.len;
     for (0..bracket_depth + 1) |fail_index| {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
         var remaining: usize = bracket_depth;

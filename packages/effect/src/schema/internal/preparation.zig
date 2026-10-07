@@ -111,7 +111,39 @@ pub const Definitions = struct {
             }
             const child_depth = std.math.add(usize, frame.depth, 1) catch return .{ .fail = .depth_limit };
             switch (frame.node.*) {
-                .primitive => {},
+                .primitive, .exact_number, .enumeration => {},
+                .alternatives => |value| for (value.branches) |child| {
+                    if (edges >= self.limits.max_edges) return .{ .fail = .edge_limit };
+                    edges += 1;
+                    pending.append(.{ .node = child, .depth = child_depth }) catch return .{ .die = outcomes.Defect.out_of_memory };
+                },
+                .prefix_array => |value| {
+                    for (value.elements) |element| {
+                        if (edges >= self.limits.max_edges) return .{ .fail = .edge_limit };
+                        edges += 1;
+                        pending.append(.{ .node = element.schema, .depth = child_depth }) catch return .{ .die = outcomes.Defect.out_of_memory };
+                    }
+                    if (value.rest) |child| {
+                        if (edges >= self.limits.max_edges) return .{ .fail = .edge_limit };
+                        edges += 1;
+                        pending.append(.{ .node = child, .depth = child_depth }) catch return .{ .die = outcomes.Defect.out_of_memory };
+                    }
+                },
+                .object => |value| {
+                    if (edges >= self.limits.max_edges) return .{ .fail = .edge_limit };
+                    edges += 1;
+                    pending.append(.{ .node = value.base, .depth = child_depth }) catch return .{ .die = outcomes.Defect.out_of_memory };
+                    for (.{ value.property_names, value.additional }) |optional_child| if (optional_child) |child| {
+                        if (edges >= self.limits.max_edges) return .{ .fail = .edge_limit };
+                        edges += 1;
+                        pending.append(.{ .node = child, .depth = child_depth }) catch return .{ .die = outcomes.Defect.out_of_memory };
+                    };
+                    for (value.patterns) |pattern| {
+                        if (edges >= self.limits.max_edges) return .{ .fail = .edge_limit };
+                        edges += 1;
+                        pending.append(.{ .node = pattern.schema, .depth = child_depth }) catch return .{ .die = outcomes.Defect.out_of_memory };
+                    }
+                },
                 .nullable, .array => |child| {
                     if (edges >= self.limits.max_edges) return .{ .fail = .edge_limit };
                     edges += 1;

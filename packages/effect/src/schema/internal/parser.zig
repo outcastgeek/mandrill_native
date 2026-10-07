@@ -10,6 +10,7 @@ pub const Limits = struct {
     max_document_bytes: usize,
     max_depth: usize,
     max_value_bytes: usize,
+    max_integer_digits: ?usize = null,
 };
 
 /// Duplicate policy is applied before field construction. The scanner pass
@@ -33,7 +34,13 @@ pub fn parseWith(
     limits: Limits,
     comptime decode_value: anytype,
 ) outcomes.Exit(legacy.Parsed(T), Issue) {
-    if (bytes.len > limits.max_document_bytes) return .{ .fail = Issue.init(env, .decode, .size_limit) };
+    if (limits.max_document_bytes == 0 or limits.max_depth == 0 or limits.max_value_bytes == 0 or (limits.max_integer_digits != null and limits.max_integer_digits.? == 0)) return .{ .fail = Issue.init(env, .decode, .invalid_value) };
+    if (!std.unicode.utf8ValidateSlice(bytes)) return .{ .fail = Issue.init(env, .decode, .invalid_utf8) };
+    if (bytes.len > limits.max_document_bytes) {
+        var issue = Issue.init(env, .decode, .size_limit);
+        issue.detail = .{ .resource = .{ .resource = .input_bytes, .limit = limits.max_document_bytes, .actual = bytes.len } };
+        return .{ .fail = issue };
+    }
     var scanner = std.json.Scanner.initCompleteInput(env.allocator, bytes);
     defer scanner.deinit();
     while (true) {
@@ -41,8 +48,35 @@ pub fn parseWith(
             if (err == error.OutOfMemory) return .{ .die = outcomes.Defect.out_of_memory };
             return .{ .fail = Issue.init(env, .decode, .invalid_value) };
         };
-        if (scanner.stackHeight() > limits.max_depth)
-            return .{ .fail = Issue.init(env, .decode, .depth_limit) };
+        const scalar = switch (token) {
+            .number, .string, .true, .false, .null => true,
+            else => false,
+        };
+        const depth = scanner.stackHeight() + @as(usize, if (scalar) 1 else 0);
+        if (depth > limits.max_depth) {
+            var issue = Issue.init(env, .decode, .depth_limit);
+            issue.detail = .{ .resource = .{ .resource = .json_depth, .limit = limits.max_depth, .actual = depth } };
+            return .{ .fail = issue };
+        }
+        switch (token) {
+            .number => |text| {
+                if (text.len > limits.max_value_bytes) {
+                    var issue = Issue.init(env, .decode, .size_limit);
+                    issue.detail = .{ .resource = .{ .resource = .value_bytes, .limit = limits.max_value_bytes, .actual = text.len } };
+                    return .{ .fail = issue };
+                }
+                if (limits.max_integer_digits) |limit| {
+                    const number = @import("../json_number_codec.zig").Number.parse(text) catch return .{ .fail = Issue.init(env, .decode, .invalid_number) };
+                    const digits: ?usize = number.integerDigits() catch null;
+                    if (digits == null or digits.? > limit) {
+                        var issue = Issue.init(env, .decode, .integer_digits);
+                        issue.detail = .{ .integer_digits = .{ .limit = limit, .required = digits } };
+                        return .{ .fail = issue };
+                    }
+                }
+            },
+            else => {},
+        }
         if (token == .end_of_document) break;
     }
     var document = std.json.parseFromSlice(std.json.Value, env.allocator, bytes, .{

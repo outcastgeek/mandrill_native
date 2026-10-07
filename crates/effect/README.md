@@ -11,7 +11,7 @@ scopes, fibers and bounded parallel composition, synchronization, injectable
 services, layers/streams, managed transport contracts, pools/caches, optional
 Tokio/Rayon/native/tracing providers, and an integrated application. R carries
 all selected providers together. [PORTING.md](PORTING.md) maps source contracts;
-[RUNTIMES.md](RUNTIMES.md) records ownership, provider limits and measured costs.
+[RUNTIMES.md](RUNTIMES.md) describes ownership, provider limits and execution costs.
 
 
 ## A consumer workflow
@@ -102,8 +102,8 @@ Reusable stored callbacks are `Fn + Send + Sync + 'static`; per-run macro binds
 are `FnOnce`. Share captured services through `Arc` or reproduce owned inputs
 explicitly. `succeed`, `fail`, and stored Result/Option adapters clone their
 payload on execution. `sync`, `fail_with`, and factories create fresh non-Clone
-values. The initial core uses `A/E: Send + 'static` and `R: Send + Sync + 'static`.
-A local, thread-affine variant is not implemented.
+values. The core uses `A/E: Send + 'static` and `R: Send + Sync + 'static`.
+The public API requires sendable execution; it has no local, thread-affine variant.
 
 ## Scoped children and shared outcomes
 
@@ -156,8 +156,7 @@ allocates recipes/continuations and uses dynamic dispatch, and child completion
 uses locks and notifications. No zero-overhead claim is made. Macro syntax and
 type/capability checks happen at compilation; live effects execute lazily at
 runtime. `Defect::library` and `kind` support const contexts for static typed
-conditions. Production allocation/retention and mixed-load measurements remain
-required before a production-readiness claim.
+conditions.
 
 ## Bounded traversal and races
 
@@ -268,8 +267,7 @@ perform a copy; choose them when that ownership is intended. These facilities
 still allocate shared state/recipes, perform ownership atomics and acquire
 gates. Shared Deferred storage is allocated only when requested. Constant
 syntax/types/classification can be resolved at compilation; live state and
-cancellation require runtime work. Quantitative allocation/latency evidence
-remains part of production validation.
+cancellation require runtime work.
 
 ## FIFO queues and shutdown
 
@@ -327,7 +325,7 @@ cannot let an old guard remove a new peer. Insertion may grow storage; waiter
 completion/event allocations exist only for pending operations. Buffer/pending
 storage retains its observed high-water capacity for reuse; shutdown retires
 pending storage and discard retires the buffer. Mutexes, node/queue Arc ownership,
-events, work vectors, boxing and contention remain costs to measure. Typed offer/
+events, work vectors, boxing and contention incur runtime costs. Typed offer/
 take registrations share one node handle, avoiding an additional observation
 clone and runtime role choice. `QueueCapacity::from_limit` supports actual const
 contexts; negative capacity is unrepresentable in its unsigned input.
@@ -532,11 +530,8 @@ the whole execution.
 
 ## Validation
 
-The tests cover lazy reruns, non-Clone payloads, typed environments/errors,
-outcome conversions, cancellation, panic boundaries, macro hygiene, and deep
-execution/destruction, dynamic scopes, registration/close races, protected
-finalization, and branch composition. Isolated consumer packages drive identical workflows
-using `futures-executor` and Tokio. Run:
+To check the core and procedural macro, including external consumer portability,
+run these commands from the workspace root:
 
 ```sh
 cargo test -p effect -p effect-macros --all-targets
@@ -625,8 +620,7 @@ its own diagnostic service.
 HTTP/Fetch and WebSocket workflows obtain transports from R. Native providers
 retain their reactor/client, return owned operations, make aborted operations
 settle, and await disposal. No global HTTP client, socket implementation, or
-transport SDK is selected by core. Neutral lifecycle fixtures verify these
-contracts. [RUNTIMES.md](RUNTIMES.md) describes provider obligations and costs.
+transport SDK is selected by core. [RUNTIMES.md](RUNTIMES.md) describes provider obligations and costs.
 
 `Pool` owns resource slots, validates borrowed idle values, applies explicit
 capacity/idle TTL, populates through the construction environment's task provider,
@@ -646,7 +640,158 @@ while the key lives. This is an explicit Rust adaptation, not tracing-GC ephemer
 semantics. In-flight ownership and unobserved cleanup can retain their graphs
 until settlement/drain.
 
-The [effect-app consumer](../../packages/effect_app/src/lib.rs) combines actual
+The [effect-app consumer](../effect_app/src/lib.rs) combines actual
 async file I/O, validation, bounded retry, scoped cache/children/staging file,
 Rayon CPU work, Tokio blocking work, tracing, cancellation, and complete Exit
 reporting. All deployment counts and timing policy are required configuration.
+
+## Migration
+
+JSON Schema export uses a safe AST approximation. In-memory workflow engines
+remain volatile.
+
+The Effect crates and their native consumers require Rust 1.99.0.
+`Effect<A, E, R>` retains its runtime-independent capability boundary. An
+application can supply asynchronous, CPU and blocking providers in one `R`.
+No executor is selected by schema or procedural-macro expansion.
+
+### Native and effectful schemas
+
+A native record declaration supplies both a representation and an unknown-field
+policy. Each field codec has the same encoded representation and independently
+selected decode and encode environments. Values move into constructors and
+encoders; cloning a codec shares its immutable description.
+
+```rust
+use effect::{schema, json_i64, Codec, JsonRepresentation, JsonValue,
+    ParsePolicy, SchemaIssue, UnknownFields};
+struct Count { count: i64 }
+fn count_schema(policy: ParsePolicy) -> Result<Codec<Count, JsonValue, (), ()>, SchemaIssue> {
+    schema! {
+        struct Count {
+            #[schema(default_with = || effect::Effect::succeed(1i64))]
+            count: json_i64().into_effect::<(), ()>()
+        }
+        policy: policy,
+        representation: JsonRepresentation,
+        unknown_fields: UnknownFields::Reject
+    }
+}
+```
+
+Defaults run only for absent fields; present null is passed to the field codec.
+A default needs an independent borrowed type-validation witness. Missing
+witnesses fail with `MissingValidator`. The former
+`with_effectful_field_default` JSON adapter has been removed: it encoded a
+supplied default and decoded it again. Use `NativeRecordBuilder::default_with`
+or the declaration above to retain the supplied typed value.
+
+`DomainCodec` preserves an application error type and both environments through
+optional/null, sequence and map composition. Representation-boundary failures
+have separate caller-supplied decode and encode mappings. Optional native
+values use explicit absence/omission factories rather than treating null as an
+absent field.
+
+`configured(SchemaPolicy)` supplies independent schema traversal, JSON depth,
+Unicode string and integer digit budgets. Checked patterns obey their explicit
+`PatternPolicy` bounds and share the configured `pattern_steps` budget. Invocation state is fresh
+and owned by that run; immutable AST preparation is shared. Exact decimal JSON
+number constraints use `JsonExactNumber`, whose comparisons never expand a
+large exponent or pass through floating point. Checked regex patterns require
+explicit compilation, syntax and execution budgets and reject unsupported
+syntax. JSON Schema export labels checked/opaque constraints as approximation
+rather than claiming constraints it cannot represent.
+
+### Encoding
+
+A direct writer is an explicit witness. `write_into` writes one value into a
+caller-owned checked container, and `write`/`write_once` finish a document under
+`JsonWriterPolicy`. Effectful writing owns the output across suspension.
+Writing failure never retries through the ordinary encoder. Codecs without a
+writer fail before invoking callbacks; callers can explicitly choose the
+ordinary JSON-tree encoder. UTF-8 parsing is strict and duplicate JSON fields
+follow the declared policy.
+
+The existing SchemaBinary identity and format version are unchanged.
+`SchemaBinary::effect_codec` adapts typed effectful directions to that format.
+Its existing numeric representation rejects exact JSON numbers that cannot be
+represented losslessly; it does not coerce newly supported arbitrary decimal
+numbers into a floating-point value or silently change durable bytes.
+
+### Caching, callbacks and cleanup
+
+`CacheOptions` adds explicit active-load admission and fixed or outcome-based
+TTL. `get_observed` distinguishes retained results, shared in-flight work and
+new loads at selection time. `DependencyCache` reuses that engine, with separate
+retention, active and dependency bounds. Invalidation fences old entries before
+replacement becomes visible, then cancels and awaits retirement. Equality and
+TTL callbacks run outside the cache gate. A cancelled waiter does not cancel a
+still-owned shared producer; producer interruption is abandonment.
+
+`CallbackPubSub` excludes backpressure and uses immediate publication with an
+explicit contention policy. Its subscriptions and streams remain scoped.
+`Stream::from_async_iterable_effect` obtains its source through an effect and
+awaits disposal through the existing resource scope. Finalizer protection is
+established before invoking release factories. `EffectConfig` preserves its
+decode environment and uses defaults only for genuinely missing input.
+
+### Lifecycle migrations
+
+- `WorkflowEngine::transition` and `WorkflowCommand::Transition` now require a
+  `WorkflowCheckpoint`, obtained from the current snapshot's `checkpoint()`.
+  Snapshots include `execution`, initialized to zero on a new run and advanced
+  on each new running body. Recovery retains the acquired checkpoint, so an
+  old body cannot reset a replacement execution. Snapshot providers/restoration
+  code must retain this counter; do not fabricate an old checkpoint from status
+  alone. This volatile engine does not claim physical persistence compatibility.
+- `EntityResource::open` requires activation-store access through `R`, an error
+  scope for `EntityResourceError`, and an explicit effect factory obtaining the
+  current instant. Ownership is checked after construction before live state
+  is published; the scope retains disposal ownership on failure.
+- `EventReplicator::import`/`import_and_ack` require a `ReplicaImportPermit`.
+  Obtain it with the application's typed authorization decision through
+  `ReplicaImportPermit::authorize`. It is bound to a source and journal stream.
+  Denial or a mismatched token precedes cursor/journal access. The unencrypted
+  `EventLogRpc::handler` requires the same checked authorization callback.
+  Authenticated protected transfers retain their existing protection contract.
+- RPC stream readers share an exactly-once close gate with their scope. Failed
+  or interrupted admitted reads/acknowledgements retire the owned session.
+  Reactive cleanup removes a node only when it still owns that registration,
+  and dependency replacement checks the current evaluation generation.
+
+Transaction cancellation remains interruption. Each retry owns a fresh journal
+and rebuilds its iterable factory. Transaction descriptions retain the stronger
+compile-time boundary that excludes arbitrary effects and futures.
+
+### Exhaustive matches and composition migrations
+
+Update exhaustive `IssueSegment` matches for `PropertyName` and `Alternative`.
+Update `SchemaIssueKind` matches for `MissingValidator`, `NoAlternative`,
+`AmbiguousAlternatives`, `Constraint`, `ResourceDemand`, `PatternBudget`, and
+`MergeConflict`; update `SchemaResource` for `JsonDepth`, `IntegerDigits`,
+`StringLength`, and `PatternSteps`. `PubSubError` includes `Contended`.
+
+`AnyOfValue` retains private construction invariants; inspect it with `input()`
+and `matches()`. Type-side unique arrays need a genuine semantic equality
+witness (`with_equivalence`) as well as an independent element validator.
+Custom native field implementations now receive the active `ParsePolicy` and
+shared `IssueBudget` for decode, encode, and validation.
+
+`WorkflowRunError::Recovery` retains `run` and the exact failed reset
+`checkpoint`. A reusable run effect retains that fence and its encoded input
+for typed `Effect::retry` with an application schedule. Cluster callers can
+send `WorkflowCommand::Resume { run, checkpoint: Some(checkpoint) }` to retry
+that fenced reset. Ordinary suspended resumes use `checkpoint: None`.
+Completed runs acknowledge their recorded outcome; a stale reset fence cannot
+reset a replacement execution. The in-memory engine remains volatile.
+
+Reactive error matches also handle `AtomError::RetainedFailure`: a publication
+may already have shared a non-Clone evaluator error before reporting a defect.
+Inspect the retained error with `SharedValue::with`; no error payload is copied.
+`AtomError` and `AtomCacheError` make their existing execution `Send + 'static`
+requirements explicit. Native custom defaults can use `default_with_context`
+to retain the invocation policy; `schema!` uses this contextual witness.
+
+`AtomRegistryError::StaleOwner(AtomId)` rejects old source writes, dependency reads,
+and derived refreshes after an identity is removed and registered again. Update
+exhaustive matches; registration identity is checked under the graph gate.

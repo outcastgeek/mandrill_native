@@ -2,6 +2,7 @@
 name = "effect-native-runtime"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.99"
 [dependencies]
 effect = { path = "../effect" }
 native-async-runtime = { path = "../../native_build/rust_async" }

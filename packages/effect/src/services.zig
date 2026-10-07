@@ -214,7 +214,7 @@ pub const Logger = struct {
     /// - `span: ?SpanId`: Optional parent span identity for trace correlation.
     /// Returns (`void`): no value.
     pub fn write(self: Logger, level: LogLevel, message: []const u8, annotations: []const Annotation, span: ?SpanId) void {
-        if (@intFromEnum(level) < @intFromEnum(self.minimum)) return;
+        if (@backingInt(level) < @backingInt(self.minimum)) return;
         var result = self.write_fn(self.userdata, .{ .level = level, .message = message, .annotations = .{ .values = annotations, .redactor = self.redactor }, .span = span });
         defer result.deinit();
         self.diagnostics.reportExit(result);

@@ -2,6 +2,7 @@
 name = "effect-app"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.99"
 [dependencies]
 effect = { path = "../../crates/effect" }
 effect-tokio = { path = "../../crates/effect_tokio" }

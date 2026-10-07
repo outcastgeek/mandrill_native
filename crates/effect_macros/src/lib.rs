@@ -37,15 +37,25 @@ pub fn effect(input: TokenStream) -> TokenStream {
     }
 }
 
-/// Derive checked JSON record or tagged-enum codecs from typed field codecs
-/// and an explicit parse policy.
-#[proc_macro]
-/// # Parameters
-/// - `input` (`TokenStream`): The input value or factory consumed by this operation.
+/// Build typed pure JSON records/enums or owned native effectful records with explicit policies.
 ///
-/// # Returns
-/// Type: `TokenStream`.
-/// Returns the expanded Rust tokens.
+/// A record form supplies `struct Type { field: codec, ... }` and `policy:`.
+/// Native records additionally supply both `representation:` and `unknown_fields:`;
+/// all field codecs share Encoded, DecodeEnv and EncodeEnv. Generated constructors
+/// move field values; generated destructuring moves the application value without
+/// requiring Clone.
+///
+/// Native field attributes support `#[schema(optional)]` for Option-valued fields
+/// and `#[schema(default_with = factory)]` for an absent-field effect factory. They
+/// are mutually exclusive. A default uses an independent borrowed contextual
+/// validator; present null goes through the field decoder. Pure record fields keep
+/// the existing explicit optional/default form. Missing policies, mixed native
+/// representations or incompatible environments are compile-time errors.
+///
+/// Expansion preserves dependency aliases and never creates a runtime or selects
+/// providers. See the re-exporting effect crate's native record example and
+/// NativeRecordBuilder contract for construction and error behavior.
+#[proc_macro]
 pub fn schema(input: TokenStream) -> TokenStream {
     let definition = parse_macro_input!(input as schema_expand::SchemaInput);
     match schema_expand::expand(definition) {

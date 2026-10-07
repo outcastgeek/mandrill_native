@@ -2,6 +2,7 @@
 name = "effect-rayon"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.99"
 [dependencies]
 effect = { path = "../effect" }
 rayon = "1.12.0"

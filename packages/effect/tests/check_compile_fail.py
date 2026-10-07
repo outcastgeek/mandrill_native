@@ -6,6 +6,12 @@ import sys
 package = Path(__file__).resolve().parents[1]
 zig = sys.argv[1] if len(sys.argv) > 1 else "zig"
 cases = {
+    "private_owned_evidence": "owned payload requires public ownership, clone and deinit evidence",
+    "service_required_pure": "codec requires services and cannot provide pure codec evidence",
+    "contradictory_exact_bounds": "invalid static JSON-number bounds",
+    "missing_writer_evidence": "codec has no direct JSON writer evidence",
+    "empty_alternatives": "alternative definition cannot be empty",
+    "invalid_native_field": "native record requires every named field exactly once",
     "wrong_continuation_environment": "flatMap callback must accept u32 and the current environment as *const",
     "wrong_ref_modifier": "Ref.modify requires a function from the stored type to a struct with result and a value of the stored type",
     "native_missing_io": "Native Effect execution requires environment .io: std.Io",

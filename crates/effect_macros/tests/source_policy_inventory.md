@@ -41,3 +41,45 @@ and requires review.
 Runtime capacities, attempts, leases, parse and representation budgets,
 retention, clock policies, and concurrency limits remain caller-supplied
 typed values or provider capabilities.
+
+## Semantic roles
+
+- `schema/exact_number.rs`: zero/one identities, decimal radix ten, decimal sign,
+  decimal point and exponent grammar. These implement exact arithmetic; digit
+  and expansion limits come from the caller. The constraint strings are JSON
+  Schema vocabulary and the checked-number schema annotation.
+- `schema/json_constraints.rs`: end-of-input adds one simulation position;
+  regex compilation and execution bounds remain caller supplied. UUID lengths,
+  hyphen offsets, hexadecimal radix, version nibble four and variant nibble
+  range eight through eleven follow RFC 9562's textual version-four layout.
+  Alternative indices, empty collections and unique-item comparisons are
+  structural. Constraint names are JSON Schema keywords or typed issue labels.
+- `schema/internal/parser.rs` and `schema/json_writer.rs`: JSON punctuation,
+  whitespace, escapes, control-character boundary U+001F and scalar literals
+  are JSON grammar. Zero/one counters describe empty containers and one emitted
+  value; UTF-8 scratch storage follows `size_of::<char>()`. No literal sets a
+  byte, collection or nesting policy.
+- `schema/parse_context.rs`, `schema/native_codec.rs` and `schema/domain_codec.rs`:
+  traversal starts at one root, counters start at zero, and a single issue is
+  returned directly. Each resource bound is supplied through a typed policy.
+  `direct_json_writer` identifies an unavailable representation witness.
+- `schema/schema_ast.rs` and `schema/enum_builder.rs`: `discriminant` names the
+  immutable tagged-union annotation; it does not choose an encoded wire tag.
+- `workflow/memory_workflow_engine.rs`: execution ownership begins at zero and
+  advances once on acquisition of a new running body. It is a checked identity
+  counter, not a retry policy or a timing quantum.
+- Trace diagnostic labels show only an entry count and never annotation
+  values. Cache settlement uses the existing typed missing-outcome defect
+  identity if an internal outcome is absent.
+- `effect_macros/schema_expand.rs`: option/attribute names are Rust macro
+  grammar; remaining string sites are compile-time type/layout diagnostics.
+  The expansion's empty tuple and tuple positions are structural identities.
+
+Structural zero/one counters account for shared issue trees, schema descent,
+one-value writer boundaries, alternative cardinality, prefix absence, and
+uniqueness. None selects a runtime capacity, retry count, or work quota.
+Constraint strings use JSON Schema keywords or typed issue vocabulary in
+type-side witnesses. `direct_json_writer` names an unsupported representation;
+`SharedValue` is an opaque Debug label that neither inspects nor copies payloads.
+The AST guard covers production files; this rationale does not exempt files or
+authorize hidden runtime policies.

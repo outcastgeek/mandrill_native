@@ -174,20 +174,6 @@ impl SchemaProperty {
     pub fn pure_default(&self) -> Option<&JsonValue> {
         self.pure_default.as_deref()
     }
-
-    /// # Parameters
-    /// - `required` (`bool`): The required supplied to this operation.
-    ///
-    /// # Returns
-    /// Type: `Self`.
-    pub(crate) fn with_required(&self, required: bool) -> Self {
-        Self {
-            name: Arc::clone(&self.name),
-            schema: self.schema.clone(),
-            required,
-            pure_default: self.pure_default.as_ref().map(Arc::clone),
-        }
-    }
 }
 
 /// Metadata describes encoded structure only. It carries no Rust type witness
@@ -443,14 +429,10 @@ impl SchemaAst {
         &self.shape
     }
 
-    /// # Parameters
-    /// - `other` (`&Self`): Second value used for comparison or composition.
-    ///
-    /// # Returns
-    /// Type: `bool`.
-    /// Returns whether the requested condition holds.
-    pub(crate) fn shares_shape(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.shape, &other.shape)
+    /// Borrow tagged-union discriminator annotation when present; this metadata does not rewrite wire tags.
+    #[must_use]
+    pub fn discriminant(&self) -> Option<&str> {
+        self.annotations.get("discriminant").map(AsRef::as_ref)
     }
 
     #[must_use]

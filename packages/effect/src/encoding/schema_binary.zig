@@ -66,7 +66,7 @@ pub fn inspect(frame: []const u8, limits: Limits) outcomes.Result(View, Issue) {
         return .{ .err = Issue.pure(.decode, .size_limit) };
     if (frame.len < header_bytes)
         return .{ .err = Issue.pure(.decode, .invalid_value) };
-    if (frame[0] != @intFromEnum(Version.v1))
+    if (frame[0] != @backingInt(Version.v1))
         return .{ .err = Issue.pure(.decode, .incompatible_version) };
     const version: Version = .v1;
     const schema_length: usize = readLength(frame[@sizeOf(Version)..][0..length_bytes]);
@@ -110,7 +110,7 @@ pub fn encode(env: anytype, comptime schema_name: []const u8, payload: []const u
     if (total > limits.max_frame_bytes)
         return .{ .fail = Issue.init(env, .encode, .size_limit) };
     const frame = env.allocator.alloc(u8, total) catch return .{ .die = outcomes.Defect.out_of_memory };
-    frame[0] = @intFromEnum(Version.v1);
+    frame[0] = @backingInt(Version.v1);
     writeLength(frame[@sizeOf(Version)..][0..length_bytes], @intCast(schema_name.len));
     writeLength(frame[@sizeOf(Version) + length_bytes ..][0..length_bytes], @intCast(payload.len));
     @memcpy(frame[header_bytes..][0..schema_name.len], schema_name);
@@ -136,4 +136,35 @@ pub fn decode(env: anytype, comptime schema_name: []const u8, frame: []const u8,
         return .{ .fail = Issue.init(env, .decode, .incompatible_version) };
     const payload = env.allocator.dupe(u8, view.payload) catch return .{ .die = outcomes.Defect.out_of_memory };
     return .{ .success = .{ .items = payload, .allocator = env.allocator } };
+}
+
+/// Direct adapter retains pure callback execution while framing allocation
+/// remains explicit through R. No Effect frames are created by these methods.
+pub fn Pure(comptime child: anytype, comptime schema_name: []const u8) type {
+    const checked = @import("../schema/codec.zig").requirePure(child);
+    const C = @TypeOf(checked);
+    if (C.Representation != []const u8) @compileError("pure binary adapter requires a borrowed byte representation");
+    return struct {
+        pub const Decoded = C.Decoded;
+        pub const pure_decoding = true;
+        pub const pure_encoding = true;
+        pub fn decodeDirect(env: anytype, input: []const u8, limits: Limits) outcomes.Exit(C.Decoded, Issue) {
+            const viewed = inspect(input, limits);
+            if (viewed == .err) return .{ .fail = viewed.err };
+            if (!std.mem.eql(u8, viewed.ok.schema_name, schema_name)) return .{ .fail = Issue.init(env, .decode, .incompatible_version) };
+            const bytes = viewed.ok.payload;
+            return switch (checked.decodeDirect(&bytes)) {
+                .ok => |value| .{ .success = value },
+                .err => |problem| .{ .fail = problem },
+            };
+        }
+        pub fn encodeDirect(env: anytype, input: *const C.Decoded, limits: Limits) outcomes.Exit(outcomes.OwnedSlice(u8), Issue) {
+            const encoded = checked.encodeDirect(input);
+            if (encoded == .err) return .{ .fail = encoded.err };
+            return encode(env, schema_name, encoded.ok, limits);
+        }
+        pub fn validateDirect(input: *const C.Decoded) outcomes.Result(void, Issue) {
+            return checked.validateDirect(input);
+        }
+    };
 }

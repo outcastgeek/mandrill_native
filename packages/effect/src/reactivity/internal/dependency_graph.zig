@@ -95,6 +95,8 @@ pub const Graph = struct {
     }
 
     fn reaches(self: *Self, start: []const u8, target: []const u8) bool {
+        self.entries.lockPointers();
+        defer self.entries.unlockPointers();
         if (std.mem.eql(u8, start, target)) return true;
         const first = self.indexOf(start) orelse return false;
         @memset(self.visited, false);

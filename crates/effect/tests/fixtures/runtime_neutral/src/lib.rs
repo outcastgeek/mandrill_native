@@ -57,3 +57,15 @@ fn queues_move_payloads_through_scoped_rendezvous_and_buffer_drain() {
 fn cpu_blocking_and_async_operations_share_one_environment() {
     futures_executor::block_on(jobs::job_cases());
 }
+
+#[cfg(test)]
+#[path="../../shared/reference_update.rs"]
+mod reference_update;
+#[test]
+fn reference_update_with_renamed_dependency(){
+    struct Env{tasks:tasks::Threads,clock:fx::TestClock}
+    impl fx::HasTaskSpawner for Env{type Tasks=tasks::Threads;fn task_spawner(&self)->&Self::Tasks{&self.tasks}}
+    impl fx::HasClock for Env{type Clock=fx::TestClock;fn clock(&self)->&Self::Clock{&self.clock}}
+    let env=std::sync::Arc::new(Env{tasks:tasks::Threads::default(),clock:fx::TestClock::default()});
+    futures_executor::block_on(reference_update::exercise(std::sync::Arc::clone(&env)));env.tasks.finish();
+}

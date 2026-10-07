@@ -41,7 +41,7 @@ pub use event_log_message::{EventLogRpc, ReplicaReadRequest};
 pub use event_log_remote::{
     EventReplicator, HasReplicaConflictHandler, ReplicaBatch, ReplicaBatchError, ReplicaConflict,
     ReplicaConflictHandler, ReplicaExport, ReplicaExportError, ReplicaId, ReplicaImport,
-    ReplicaImportError, ReplicaSync, ReplicaSyncError,
+    ReplicaImportError, ReplicaImportPermit, ReplicaSync, ReplicaSyncError,
 };
 pub use event_observation::{EventObservation, EventObservationError, EventObservationReport};
 pub use memory_event_journal::{MemoryEventJournal, MemoryJournalCapacity, MemoryJournalError};

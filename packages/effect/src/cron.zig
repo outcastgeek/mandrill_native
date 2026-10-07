@@ -23,7 +23,7 @@ pub const Error = enum {
 /// - `first: comptime comptime_int`: smallest representable field value.
 /// Returns (`type`): bit-set type supporting `all`, `only`, `has`, and `valid`.
 pub fn FieldSet(comptime count: comptime_int, comptime first: comptime_int) type {
-    const Bits = std.meta.Int(.unsigned, count);
+    const Bits = @Int(.unsigned, count);
     return struct {
         const Self = @This();
         bits: Bits,
