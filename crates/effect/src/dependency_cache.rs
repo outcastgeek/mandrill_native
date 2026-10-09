@@ -92,11 +92,22 @@ impl<K: Send + Sync + 'static, D: Send + Sync + 'static, A: Send + 'static, E: S
         policy: DependencyCachePolicy<K, D, A, E>,
         load: impl Fn(&K) -> Effect<(A, Vec<D>), E, R> + Send + Sync + 'static,
     ) -> Effect<Self, SharedValue<DependencyCacheError<E>>, R> {
+        Self::make_with_shared_key(scope, policy, move |key| load(&key))
+    }
+
+    /// Create the existing dependency cache with a shared owned origin key for deferred
+    /// loader bodies. The same policy, dependency bound and active-load ownership apply;
+    /// the key's Arc handle is shared instead of copying its payload or borrowing a temporary.
+    pub fn make_with_shared_key<R: HasClock + HasTaskSpawner + Send + Sync + 'static>(
+        scope: Scope<SharedValue<DependencyCacheError<E>>>,
+        policy: DependencyCachePolicy<K, D, A, E>,
+        load: impl Fn(Arc<K>) -> Effect<(A, Vec<D>), E, R> + Send + Sync + 'static,
+    ) -> Effect<Self, SharedValue<DependencyCacheError<E>>, R> {
         let maximum_dependencies = policy.maximum_dependencies;
         let maximum_active = policy.maximum_active;
         let failure = Arc::clone(&policy.cache_failure);
         let equal = policy.dependency_equal;
-        Cache::make_with_options(
+        Cache::make_with_shared_key(
             scope,
             CacheConfig {
                 equal: policy.key_equal,

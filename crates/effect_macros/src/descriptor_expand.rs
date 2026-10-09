@@ -7,54 +7,80 @@ use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::{Expr, Ident, Token};
 
-/// Typed field used by descriptor expand.
+/// Descriptor syntax retains source spans and explicitly requested body lowering.
 struct Field {
+    /// Field name carrying its original diagnostic span.
     name: Ident,
+    /// Presence distinguishes typed callback reuse from inline lowering.
     _colon: Option<Token![:]>,
+    /// Original typed expression, never executed during expansion.
     value: Expr,
+    /// Colon-free syntax requests domain-body lowering.
+    inline: bool,
 }
 
 impl Parse for Field {
-    ///
-    /// # Parameters
-    /// - `input` (`ParseStream<'_>`): Owned input decoded or consumed by this operation.
-    ///
-    /// # Returns
-    /// Type: `syn::Result<Self>`.
+    /// Parse one field at its original span, retaining colon-free inline lowering and opaque typed pair-list syntax.
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let name: Ident = input.parse()?;
         let colon = if input.peek(Token![:]) {
             Some(input.parse()?)
-        } else if name == "body" || name == "run" {
+        } else if matches!(
+            name.to_string().as_str(),
+            "body"
+                | "run"
+                | "handler"
+                | "load"
+                | "acquire"
+                | "before"
+                | "after"
+                | "chunk"
+                | "terminal"
+        ) {
             None
         } else {
             return Err(input.error("expected `:` after descriptor field"));
         };
+        let value = if name == "cases" || name == "bindings" {
+            let content;
+            syn::bracketed!(content in input);
+            let tokens: proc_macro2::TokenStream = content.parse()?;
+            Expr::Verbatim(quote!([#tokens]))
+        } else if name == "handlers" && input.peek(syn::token::Bracket) {
+            let content;
+            syn::bracketed!(content in input);
+            let tokens: TokenStream = content.parse()?;
+            syn::parse2::<Expr>(quote!([#tokens]))
+                .unwrap_or_else(|_| Expr::Verbatim(quote!([#tokens])))
+        } else {
+            input.parse()?
+        };
         Ok(Self {
             name,
+            inline: colon.is_none(),
             _colon: colon,
-            value: input.parse()?,
+            value,
         })
     }
 }
 
-/// Typed named fields used by descriptor expand.
+/// Retained descriptor fields with source ordering for richer domain construction.
 pub(crate) struct NamedFields {
+    /// Field lookup supports mandatory/conflicting-field validation without runtime work.
     values: BTreeMap<String, Expr>,
+    /// Original field order and explicit lowering markers.
+    order: Vec<(Ident, bool)>,
 }
 
 impl Parse for NamedFields {
-    ///
-    /// # Parameters
-    /// - `input` (`ParseStream<'_>`): Owned input decoded or consumed by this operation.
-    ///
-    /// # Returns
-    /// Type: `syn::Result<Self>`.
+    /// Reject duplicate names before any runtime evaluation, recording the original field order and inline-body markers.
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let fields = Punctuated::<Field, Token![,]>::parse_terminated(input)?;
         let mut values = BTreeMap::new();
+        let mut order = Vec::new();
         for field in fields {
             let name = field.name.to_string();
+            order.push((field.name.clone(), field.inline));
             if values.insert(name, field.value).is_some() {
                 return Err(syn::Error::new(
                     field.name.span(),
@@ -62,11 +88,27 @@ impl Parse for NamedFields {
                 ));
             }
         }
-        Ok(Self { values })
+        Ok(Self { values, order })
     }
 }
 
 impl NamedFields {
+    /// Preserve written order when a richer descriptor uses the shared domain parser.
+    fn into_ordered(mut self) -> syn::Result<crate::domain_expand::Fields> {
+        let mut tokens = proc_macro2::TokenStream::new();
+        for (name, inline) in self.order {
+            let value = self.values.remove(&name.to_string()).ok_or_else(|| {
+                syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "descriptor field was already consumed",
+                )
+            })?;
+            let colon = (!inline).then(|| quote!(:));
+            tokens.extend(quote!(#name #colon #value,));
+        }
+        syn::parse2(tokens)
+    }
+
     /// # Parameters
     /// - `name` (`&str`): Stable name used to register or locate this definition.
     ///
@@ -139,24 +181,15 @@ impl NamedFields {
     }
 }
 
-///
-/// # Parameters
-/// - `expression` (`Expr`): The expression supplied to this operation.
-/// - `parameters` (`usize`): The parameters supplied to this operation.
-/// - `path` (`&TokenStream`): Location of the field, file, or configuration value being processed.
-///
-/// # Returns
-/// Type: `syn::Result<TokenStream>`.
-fn effect_evaluator(
+/// Lower retained inline callback syntax into a fresh Effect per invocation, or pass a reusable typed function/expression.
+/// Owned request captures use the one-shot path; provider selection remains in R.
+pub(crate) fn effect_evaluator(
     expression: Expr,
     parameters: usize,
     path: &TokenStream,
 ) -> syn::Result<TokenStream> {
     let Expr::Closure(closure) = expression else {
-        return Err(syn::Error::new_spanned(
-            expression,
-            "expected a closure with an Effect body",
-        ));
+        return Ok(quote!(#expression));
     };
     if closure.asyncness.is_some()
         || closure.inputs.len() != parameters
@@ -170,8 +203,13 @@ fn effect_evaluator(
     let inputs = closure.inputs;
     let body = *closure.body;
     if let Expr::Block(block) = body {
-        let statements = block.block.stmts;
-        return Ok(quote!(move |#inputs| #path::effect! { #(#statements)* }));
+        let (prefix, statements) = crate::context_expand::split_prefix(block.block.stmts);
+        let body = crate::expand::expand_once(statements)?;
+        let adapter = Ident::new(
+            &format!("defer_callback{parameters}"),
+            proc_macro2::Span::mixed_site(),
+        );
+        return Ok(quote!(#path::__private::#adapter(move |#inputs| {#(#prefix)* #body})));
     }
     if let Expr::Macro(ref invocation) = body
         && invocation
@@ -184,10 +222,7 @@ fn effect_evaluator(
         let tokens = &invocation.mac.tokens;
         return Ok(quote!(move |#inputs| #path::effect! { #tokens }));
     }
-    Err(syn::Error::new_spanned(
-        body,
-        "expected a braced body or effect! block",
-    ))
+    Ok(quote!(move |#inputs| #body))
 }
 
 /// # Parameters
@@ -208,22 +243,9 @@ pub(crate) fn reactive_source(mut fields: NamedFields) -> syn::Result<TokenStrea
     )))
 }
 
-/// # Parameters
-/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
-///
-/// # Returns
-/// Type: `syn::Result<TokenStream>`.
-pub(crate) fn reactive_derived(mut fields: NamedFields) -> syn::Result<TokenStream> {
-    let path = crate::expand::effect_crate_path()?;
-    let registry = fields.take("registry")?;
-    let id = fields.take("id")?;
-    let capacity = fields.take("capacity")?;
-    let overflow = fields.take("overflow")?;
-    let evaluate = effect_evaluator(fields.take("evaluate")?, 1, &path)?;
-    fields.finish()?;
-    Ok(quote!(#path::reactivity::Atom::new(
-        #registry, #id, #capacity, #overflow, #evaluate,
-    )))
+/// Delegate tracked-program/evaluator construction through ordered fields, requiring exactly one evaluator authority.
+pub(crate) fn reactive_derived(fields: NamedFields) -> syn::Result<TokenStream> {
+    crate::domain_expand::reactive_derived(fields.into_ordered()?)
 }
 
 /// # Parameters
@@ -257,270 +279,54 @@ pub(crate) fn reactive_bridge(mut fields: NamedFields) -> syn::Result<TokenStrea
     )))
 }
 
-/// # Parameters
-/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
-///
-/// # Returns
-/// Type: `syn::Result<TokenStream>`.
-pub(crate) fn rpc_operation(mut fields: NamedFields) -> syn::Result<TokenStream> {
-    let path = crate::expand::effect_crate_path()?;
-    let id = fields.take("id")?;
-    let version = fields.take("version")?;
-    let request = fields.take("request")?;
-    let success = fields.take("success")?;
-    let error = fields.take("error")?;
-    let limits = fields.take("limits")?;
-    let idempotency = fields.optional("idempotency_key");
-    fields.finish()?;
-    let operation = quote!(#path::rpc::RpcOperation::unary(
-        #id, #version, #request, #success, #error, #limits,
-    ));
-    Ok(match idempotency {
-        Some(key) => quote!((#operation).with_idempotency_key(#key)),
-        None => operation,
-    })
+/// Retain descriptor-only declarations and add typed inline/reusable unary handlers while preserving runtime expression order.
+pub(crate) fn rpc_operation(fields: NamedFields) -> syn::Result<TokenStream> {
+    crate::domain_expand::rpc_operation(fields.into_ordered()?)
 }
 
-/// # Parameters
-/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
-///
-/// # Returns
-/// Type: `syn::Result<TokenStream>`.
-pub(crate) fn rpc_stream_operation(mut fields: NamedFields) -> syn::Result<TokenStream> {
-    let path = crate::expand::effect_crate_path()?;
-    let id = fields.take("id")?;
-    let version = fields.take("version")?;
-    let request = fields.take("request")?;
-    let chunk = fields.take("chunk")?;
-    let terminal = fields.take("terminal")?;
-    let error = fields.take("error")?;
-    let limits = fields.take("limits")?;
-    fields.finish()?;
-    Ok(quote!(#path::rpc::RpcStreamOperation::new(
-        #id, #version, #request, #chunk, #terminal, #error, #limits,
-    )))
+/// Keep chunk/terminal typing and optionally attach a request/context handler through ordered construction.
+pub(crate) fn rpc_stream_operation(fields: NamedFields) -> syn::Result<TokenStream> {
+    crate::domain_expand::rpc_stream_operation(fields.into_ordered()?)
 }
 
-/// # Parameters
-/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
-///
-/// # Returns
-/// Type: `syn::Result<TokenStream>`.
-pub(crate) fn rpc_protocol(mut fields: NamedFields) -> syn::Result<TokenStream> {
-    let path = crate::expand::effect_crate_path()?;
-    let policy = fields.take("policy")?;
-    let handlers = fields.take("handlers")?;
-    fields.finish()?;
-    let Expr::Array(handlers) = handlers else {
-        return Err(syn::Error::new_spanned(
-            handlers,
-            "handlers must be a bracketed list of typed handlers",
-        ));
-    };
-    if handlers.elems.is_empty() {
-        return Err(syn::Error::new_spanned(
-            handlers,
-            "protocol requires at least one typed handler",
-        ));
-    }
-    let mut handlers = handlers.elems.into_iter().collect::<Vec<_>>();
-    let first = handlers.remove(0);
-    Ok(
-        quote!((|| -> ::core::result::Result<_, #path::rpc::RpcRegistryError> {
-        let mut protocol = #path::rpc::RpcProtocol::from_handler(#policy, #first)?;
-        #(protocol.register(#handlers)?;)*
-        ::core::result::Result::Ok(protocol)
-    })()),
-    )
+/// Construct checked unary registrations or explicit unary/streaming grouping without erasing serving generics.
+pub(crate) fn rpc_protocol(fields: NamedFields) -> syn::Result<TokenStream> {
+    crate::domain_expand::rpc_protocol(fields.into_ordered()?)
 }
 
-/// # Parameters
-/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
-///
-/// # Returns
-/// Type: `syn::Result<TokenStream>`.
-pub(crate) fn rpc_stream_protocol(mut fields: NamedFields) -> syn::Result<TokenStream> {
-    let path = crate::expand::effect_crate_path()?;
-    let policy = fields.take("policy")?;
-    let handlers = fields.take("handlers")?;
-    fields.finish()?;
-    let Expr::Array(handlers) = handlers else {
-        return Err(syn::Error::new_spanned(
-            handlers,
-            "handlers must be a bracketed list of typed streaming handlers",
-        ));
-    };
-    if handlers.elems.is_empty() {
-        return Err(syn::Error::new_spanned(
-            handlers,
-            "stream protocol requires at least one typed handler",
-        ));
-    }
-    let mut handlers = handlers.elems.into_iter().collect::<Vec<_>>();
-    let first = handlers.remove(0);
-    Ok(
-        quote!((|| -> ::core::result::Result<_, #path::rpc::RpcRegistryError> {
-        let mut protocol = #path::rpc::RpcStreamProtocol::from_handler(#policy, #first)?;
-        #(protocol.register(#handlers)?;)*
-        ::core::result::Result::Ok(protocol)
-    })()),
-    )
+/// Preserve the checked streaming registry and evaluate descriptor inputs once in their written order.
+pub(crate) fn rpc_stream_protocol(fields: NamedFields) -> syn::Result<TokenStream> {
+    crate::domain_expand::rpc_stream_protocol(fields.into_ordered()?)
 }
 
-/// # Parameters
-/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
-///
-/// # Returns
-/// Type: `syn::Result<TokenStream>`.
-pub(crate) fn rpc_middleware(mut fields: NamedFields) -> syn::Result<TokenStream> {
-    let path = crate::expand::effect_crate_path()?;
-    let handler = fields.take("handler")?;
-    let error_codec = fields.take("error_codec")?;
-    let before = fields.take("before")?;
-    let after = fields.take("after")?;
-    fields.finish()?;
-    Ok(quote!(#path::rpc::RpcServerMiddleware::wrap(
-        #handler, #error_codec, #before, #after,
-    )))
+/// Distinguish callback wrappers from actual scoped service acquisition; the latter retains resources through typed application.
+pub(crate) fn rpc_middleware(fields: NamedFields) -> syn::Result<TokenStream> {
+    crate::domain_expand::rpc_middleware(fields.into_ordered()?)
 }
 
-/// # Parameters
-/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
-///
-/// # Returns
-/// Type: `syn::Result<TokenStream>`.
-pub(crate) fn rpc_stream_middleware(mut fields: NamedFields) -> syn::Result<TokenStream> {
-    let path = crate::expand::effect_crate_path()?;
-    let handler = fields.take("handler")?;
-    let error_codec = fields.take("error_codec")?;
-    let before = fields.take("before")?;
-    let chunk = fields.take("chunk")?;
-    let terminal = fields.take("terminal")?;
-    fields.finish()?;
-    Ok(quote!(#path::rpc::RpcStreamMiddleware::wrap(
-        #handler, #error_codec, #before, #chunk, #terminal,
-    )))
+/// Lower requested streaming callbacks without changing chunk acknowledgement or terminal transformation ordering.
+pub(crate) fn rpc_stream_middleware(fields: NamedFields) -> syn::Result<TokenStream> {
+    crate::domain_expand::rpc_stream_middleware(fields.into_ordered()?)
 }
 
-/// # Parameters
-/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
-///
-/// # Returns
-/// Type: `syn::Result<TokenStream>`.
-pub(crate) fn entity(mut fields: NamedFields) -> syn::Result<TokenStream> {
-    let path = crate::expand::effect_crate_path()?;
-    let dispatcher = fields.optional("dispatcher");
-    let policy = fields.optional("policy");
-    let entity_type = fields.take("entity_type")?;
-    let handler = fields.take("handler")?;
-    let accepts = fields.optional("accepts");
-    fields.finish()?;
-    Ok(match (dispatcher, policy, accepts) {
-        (Some(dispatcher), None, Some(accepts)) => quote!((#dispatcher).register_addressed(
-            #entity_type, #handler, #accepts,
-        )),
-        (Some(dispatcher), None, None) => {
-            quote!((#dispatcher).register(#entity_type, #handler))
-        }
-        (None, Some(policy), Some(accepts)) => quote!(
-            #path::cluster::EntityDispatcher::from_addressed_handler(
-                #policy, #entity_type, #handler, #accepts,
-            )
-        ),
-        (None, Some(policy), None) => quote!(
-            #path::cluster::EntityDispatcher::from_handler(
-                #policy, #entity_type, #handler,
-            )
-        ),
-        _ => {
-            return Err(syn::Error::new(
-                proc_macro2::Span::call_site(),
-                "entity requires exactly one of policy or dispatcher",
-            ));
-        }
-    })
+/// Retain single registrations and add inert resource-aware definitions with typed live-state handlers.
+pub(crate) fn entity(fields: NamedFields) -> syn::Result<TokenStream> {
+    crate::domain_expand::entity(fields.into_ordered()?)
 }
 
-/// # Parameters
-/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
-///
-/// # Returns
-/// Type: `syn::Result<TokenStream>`.
-pub(crate) fn event(mut fields: NamedFields) -> syn::Result<TokenStream> {
-    let path = crate::expand::effect_crate_path()?;
-    let group = fields.take("group")?;
-    let tag = fields.take("tag")?;
-    let version = fields.take("version")?;
-    let payload = fields.take("payload")?;
-    let success = fields.take("success")?;
-    let error = fields.take("error")?;
-    let payload_identity = fields.take("payload_identity")?;
-    let success_identity = fields.take("success_identity")?;
-    let error_identity = fields.take("error_identity")?;
-    let limits = fields.take("limits")?;
-    fields.finish()?;
-    Ok(quote!(#path::eventlog::EventDefinition::new(
-        #path::eventlog::EventShape { group: #group, tag: #tag, version: #version },
-        #path::eventlog::EventCodecs {
-            payload: #payload, success: #success, error: #error,
-        },
-        #path::eventlog::EventBinaryFormats {
-            payload: #payload_identity,
-            success: #success_identity,
-            error: #error_identity,
-            limits: #limits,
-        },
-    )))
+/// Retain codecs/binary identities and optionally bind the single typed aggregate-selector authority.
+pub(crate) fn event(fields: NamedFields) -> syn::Result<TokenStream> {
+    crate::domain_expand::event(fields.into_ordered()?)
 }
 
-/// # Parameters
-/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
-///
-/// # Returns
-/// Type: `syn::Result<TokenStream>`.
-pub(crate) fn event_group(mut fields: NamedFields) -> syn::Result<TokenStream> {
-    let path = crate::expand::effect_crate_path()?;
-    let group = fields.take("group")?;
-    let events = fields.take("events")?;
-    fields.finish()?;
-    let Expr::Array(events) = events else {
-        return Err(syn::Error::new_spanned(
-            events,
-            "events must be a bracketed list of typed event definitions",
-        ));
-    };
-    let mut events = events.elems.into_iter();
-    let Some(first) = events.next() else {
-        return Err(syn::Error::new_spanned(
-            group,
-            "event group requires at least one typed event",
-        ));
-    };
-    Ok(
-        quote!((|| -> ::core::result::Result<_, #path::eventlog::EventGroupError> {
-        let mut group = #path::eventlog::EventGroup::from_event(#group, &#first)?;
-        #(group.register(&#events)?;)*
-        ::core::result::Result::<_, #path::eventlog::EventGroupError>::Ok(group)
-    })()),
-    )
+/// Group typed definition views without erasing the original handled definitions or their behavior.
+pub(crate) fn event_group(fields: NamedFields) -> syn::Result<TokenStream> {
+    crate::domain_expand::event_group(fields.into_ordered()?)
 }
 
-/// # Parameters
-/// - `fields` (`NamedFields`): Typed fields composing this record or schema.
-///
-/// # Returns
-/// Type: `syn::Result<TokenStream>`.
-pub(crate) fn projection(mut fields: NamedFields) -> syn::Result<TokenStream> {
-    let path = crate::expand::effect_crate_path()?;
-    let key = fields.take("key")?;
-    let version = fields.take("version")?;
-    let accepted = fields.take("accepted")?;
-    let initial = fields.take("initial")?;
-    let fold = fields.take("fold")?;
-    fields.finish()?;
-    Ok(quote!(#path::eventlog::Projection::new(
-        #key, #version, #accepted, #initial, #fold,
-    )))
+/// Retain raw folds or build typed definition/case dispatch with one acceptance and decoding authority.
+pub(crate) fn projection(fields: NamedFields) -> syn::Result<TokenStream> {
+    crate::domain_expand::projection(fields.into_ordered()?)
 }
 
 /// # Parameters
@@ -569,18 +375,10 @@ pub(crate) fn workflow(mut fields: NamedFields) -> syn::Result<TokenStream> {
     )))
 }
 
-///
-/// # Parameters
-/// - `expression` (`Expr`): The expression supplied to this operation.
-///
-/// # Returns
-/// Type: `syn::Result<TokenStream>`.
+/// Lower a workflow callback at the restricted durable boundary, preserving owned per-evaluation input and reusable helper expressions.
 fn durable_evaluator(expression: Expr) -> syn::Result<TokenStream> {
     let Expr::Closure(closure) = expression else {
-        return Err(syn::Error::new_spanned(
-            expression,
-            "expected a one-argument closure with a durable workflow body",
-        ));
+        return Ok(quote!(#expression));
     };
     if closure.asyncness.is_some()
         || closure.inputs.len() != 1
@@ -594,7 +392,9 @@ fn durable_evaluator(expression: Expr) -> syn::Result<TokenStream> {
     let inputs = closure.inputs;
     let expression = *closure.body;
     let body = if let Expr::Block(block) = expression {
-        crate::durable_expand::expand(block.block.stmts)?
+        let (prefix, statements) = crate::context_expand::split_prefix(block.block.stmts);
+        let body = crate::durable_expand::expand_once(statements)?;
+        quote!({#(#prefix)* #body})
     } else if let Expr::Macro(ref invocation) = expression
         && invocation
             .mac
@@ -605,12 +405,11 @@ fn durable_evaluator(expression: Expr) -> syn::Result<TokenStream> {
     {
         let statements =
             syn::parse::Parser::parse2(syn::Block::parse_within, invocation.mac.tokens.clone())?;
-        crate::durable_expand::expand(statements)?
+        let (prefix, statements) = crate::context_expand::split_prefix(statements);
+        let body = crate::durable_expand::expand_once(statements)?;
+        quote!({#(#prefix)* #body})
     } else {
-        return Err(syn::Error::new_spanned(
-            expression,
-            "expected a braced body or workflow! block",
-        ));
+        quote!(#expression)
     };
     Ok(quote!(move |#inputs| #body))
 }

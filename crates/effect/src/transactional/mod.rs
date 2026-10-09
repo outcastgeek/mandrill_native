@@ -38,3 +38,6 @@ pub use tx_ref::{HasTransactionDomain, TransactionDomain, TransactionDomainError
 pub use tx_semaphore::{TxSemaphore, TxSemaphoreError};
 pub use tx_subscription_ref::{TxSubscription, TxSubscriptionError, TxSubscriptionRef};
 pub use tx_value::TxValue;
+
+#[doc(hidden)]
+pub use transaction::{TransactionContext, TransactionFailure};

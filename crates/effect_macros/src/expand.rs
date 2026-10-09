@@ -9,6 +9,7 @@ use syn::{Expr, Stmt};
 // The package identity from crates/effect/Cargo.toml, required by
 // proc_macro_crate to resolve consumer dependency aliases. The effect crate
 // also declares `extern crate self as effect` for its own expansions.
+/// Cargo package identity used to resolve renamed consumer dependencies.
 const EFFECT_PACKAGE_NAME: &str = "effect";
 
 /// # Parameters
@@ -28,8 +29,7 @@ pub(crate) fn expand(statements: Vec<Stmt>) -> syn::Result<TokenStream> {
     Ok(quote!(#path::reusable(move || { #body })))
 }
 
-/// # Returns
-/// Type: `syn::Result<TokenStream>`.
+/// Resolve the owning Cargo package, retaining a consumer dependency alias and self-use.
 pub(crate) fn effect_crate_path() -> syn::Result<TokenStream> {
     let name = match crate_name(EFFECT_PACKAGE_NAME)
         .map_err(|error| syn::Error::new(Span::call_site(), error))?
@@ -114,14 +114,8 @@ fn is_control_flow(expr: &Expr) -> bool {
             || matches!(expr, Expr::Block(block) if block.label.is_none()))
 }
 
-///
-/// # Parameters
-/// - `expr` (`&Expr`): Rust syntax expression parsed or expanded by this macro.
-/// - `path` (`&TokenStream`): Location of the field, file, or configuration value being processed.
-///
-/// # Returns
-/// Type: `TokenStream`.
-/// Returns the expanded Rust tokens.
+/// Lower an effectful native branch into typed continuations. Patterns retain syn's
+/// complete guard syntax and spans; branch factories remain deferred until selected.
 fn expression(expr: &Expr, path: &TokenStream) -> TokenStream {
     if let Expr::If(expr) = expr {
         let attrs = &expr.attrs;
@@ -139,6 +133,7 @@ fn expression(expr: &Expr, path: &TokenStream) -> TokenStream {
         let arms = expr.arms.iter().map(|arm| {
             let attrs = &arm.attrs;
             let pattern = &arm.pat;
+            // syn 3 retains match guards inside Pat::Guard; emit the complete pattern.
             let body = expression(&arm.body, path);
             quote_spanned!(arm.span()=> #(#attrs)* #pattern => { #body },)
         });
@@ -156,4 +151,16 @@ fn expression(expr: &Expr, path: &TokenStream) -> TokenStream {
         return quote_spanned!(expr.span()=> #path::bind(#program, move |value| #path::success(value)));
     }
     quote_spanned!(expr.span()=> #path::success(#expr))
+}
+
+/// Lower a callback's owned inputs through a one-shot body rather than cloning captures.
+/// The callback itself remains reusable; each invocation returns a fresh execution description.
+pub(crate) fn expand_once(statements: Vec<Stmt>) -> syn::Result<TokenStream> {
+    let path = effect_crate_path()?;
+    let private = quote!(#path::__private);
+    if crate::parse::validate(&statements).is_err() || crate::parse::has_loops(&statements) {
+        return Ok(crate::async_expand::expand_once(statements, &private));
+    }
+    let body = lower(&statements, &private);
+    Ok(quote!(#private::once(move || { #body })))
 }

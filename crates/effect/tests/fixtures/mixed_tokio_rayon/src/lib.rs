@@ -1,10 +1,14 @@
 extern crate effect as fx;
+/// Shared composition scenario used unchanged by both provider consumers.
 #[cfg(test)]
-#[path = "../../shared/reference_update.rs"]
-mod reference_update;
+#[path = "../../shared/macro_composition.rs"]
+mod composition;
 #[cfg(test)]
 #[path = "../../../support/drive.rs"]
 mod drive;
+#[cfg(test)]
+#[path = "../../shared/reference_update.rs"]
+mod reference_update;
 #[cfg(test)]
 mod tests {
     use super::drive;
@@ -101,7 +105,16 @@ mod tests {
         (runtime, env)
     }
     #[test]
-    fn reference_update_paths(){let(runtime,env)=fixture(2,4);runtime.block_on(super::reference_update::exercise(env));}
+    fn reference_update_paths() {
+        let (runtime, env) = fixture(2, 4);
+        runtime.block_on(super::reference_update::exercise(env));
+    }
+    /// Execute the shared macro scenario with Tokio async/blocking and Rayon CPU providers.
+    #[test]
+    fn macro_composition() {
+        let (runtime, env) = fixture(2, 4);
+        runtime.block_on(super::composition::exercise(env));
+    }
     #[derive(Default)]
     struct Gate {
         entered: AtomicUsize,

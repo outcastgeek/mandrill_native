@@ -98,9 +98,9 @@ pub(crate) enum TxStep<A, E> {
     Invalid(TransactionError<E>),
 }
 
-/// An inert, reusable transaction description. Its constructor is private to
-/// this crate; only transactional operations compose inside this closure, so
-/// an Effect/Future cannot be bound as a transaction step.
+/// An inert, reusable transaction description. Native macro bodies use the typed
+/// journal bridge, and combinators admit only transactional operations; an
+/// Effect/Future cannot be bound as a transaction step.
 ///
 /// # Type parameters
 /// - `A`: Application value type. Bound or type: `Send + 'static`.
@@ -136,6 +136,35 @@ impl<A: Send + 'static, E: Send + 'static> Transaction<A, E> {
         Self {
             evaluate: Arc::new(evaluate),
         }
+    }
+
+    /// Build a transaction from a typed journal body, reconstructing locals on each attempt.
+    ///
+    /// This generated-code bridge accepts only transactions in `TransactionContext::bind`.
+    /// It never runs an asynchronous Effect inside a retried journal. Panics are classified
+    /// by the enclosing atomic execution, and cancellation checkpoints stop native loops.
+    #[doc(hidden)]
+    pub fn from_body(
+        body: impl Fn(&mut TransactionContext<'_, E>) -> Result<A, TransactionFailure<E>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self::new(move |journal| {
+            let mut context = TransactionContext {
+                journal,
+                error: std::marker::PhantomData,
+            };
+            match body(&mut context) {
+                Ok(value) => TxStep::Success(value),
+                Err(step) => match step {
+                    TransactionFailure::Domain(error) => TxStep::Failure(error),
+                    TransactionFailure::Retry => TxStep::Retry,
+                    TransactionFailure::Conflict => TxStep::Conflict,
+                    TransactionFailure::Invalid(error) => TxStep::Invalid(error),
+                },
+            }
+        })
     }
 
     /// Produce a fresh successful value when this description is executed.
@@ -290,6 +319,7 @@ impl<A: Send + 'static, E: Send + 'static> Transaction<A, E> {
                             return Err(TransactionError::Cancelled);
                         }
                         let mut journal = TxJournal::new(Arc::clone(&domain.inner));
+                        journal.cancellation = Some(cancellation.clone());
                         match (transaction.evaluate)(&mut journal) {
                             TxStep::Success(value) => {
                                 if cancellation.is_requested() {
@@ -385,5 +415,57 @@ impl<E: Send + 'static> Transaction<(), E> {
             }
             TxStep::Success(())
         })
+    }
+}
+
+/// A non-success journal decision transported by generated native Rust `?`.
+/// It cannot represent success or admit external Effects into the journal.
+#[doc(hidden)]
+pub enum TransactionFailure<E> {
+    /// Expected domain failure from a bound transaction.
+    Domain(E),
+    /// Retry decision preserving the journal read set.
+    Retry,
+    /// Journal conflict requiring reconstruction of the attempt.
+    Conflict,
+    /// Typed invalid/cancelled journal execution.
+    Invalid(TransactionError<E>),
+}
+
+/// Borrow of the journal for one attempt; it cannot escape or select a runtime.
+#[doc(hidden)]
+pub struct TransactionContext<'a, E> {
+    /// Exclusive journal shared by all binds in this attempt.
+    journal: &'a mut TxJournal,
+    /// Carries the typed failure channel without storing an error.
+    error: std::marker::PhantomData<fn() -> E>,
+}
+impl<E: Send + 'static> TransactionContext<'_, E> {
+    /// Evaluate only a typed transaction in the current journal, stopping on any decision.
+    pub fn bind<A: Send + 'static>(
+        &mut self,
+        program: Transaction<A, E>,
+    ) -> Result<A, TransactionFailure<E>> {
+        self.checkpoint()?;
+        match (program.evaluate)(self.journal) {
+            TxStep::Success(value) => Ok(value),
+            TxStep::Failure(error) => Err(TransactionFailure::Domain(error)),
+            TxStep::Retry => Err(TransactionFailure::Retry),
+            TxStep::Conflict => Err(TransactionFailure::Conflict),
+            TxStep::Invalid(error) => Err(TransactionFailure::Invalid(error)),
+        }
+    }
+    /// Observe interruption between loop iterations and transaction operations.
+    pub fn checkpoint(&self) -> Result<(), TransactionFailure<E>> {
+        if self
+            .journal
+            .cancellation
+            .as_ref()
+            .is_some_and(crate::Cancellation::is_requested)
+        {
+            Err(TransactionFailure::Invalid(TransactionError::Cancelled))
+        } else {
+            Ok(())
+        }
     }
 }

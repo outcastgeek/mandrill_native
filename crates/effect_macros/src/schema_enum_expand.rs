@@ -1,6 +1,6 @@
 //! Expansion of tagged-enum schema declarations.
 
-use proc_macro2::{Ident, TokenStream};
+use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote, quote_spanned};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
@@ -139,6 +139,10 @@ fn named_expr(input: ParseStream<'_>, expected: &str) -> syn::Result<Expr> {
     Ok(value)
 }
 
+/// Expand tagged variants, anchoring named encoders in JsonValue::Object before
+/// property insertion so consumers need no map type annotation or serde_json import.
+/// Mixed-site encoder locals remain distinct from every user payload field.
+///
 /// # Parameters
 /// - `input` (`SchemaEnumInput`): The input value or factory consumed by this operation.
 ///
@@ -181,6 +185,8 @@ pub(crate) fn expand(input: SchemaEnumInput) -> syn::Result<TokenStream> {
                 quote!(|inner| #enum_path::#name(inner)),
             ),
             Payload::Named(fields) => {
+                let encoded_value = Ident::new("__effect_variant_encoded", Span::mixed_site());
+                let object_map = Ident::new("__effect_variant_object", Span::mixed_site());
                 let mut seen = std::collections::BTreeSet::new();
                 for field in fields {
                     if !seen.insert(field.name.to_string()) {
@@ -225,7 +231,7 @@ pub(crate) fn expand(input: SchemaEnumInput) -> syn::Result<TokenStream> {
                     )))?;)
                 });
                 let encoded = field_names.iter().zip(&codecs).map(|(field, codec)| {
-                    quote!(object.insert(
+                    quote!(#object_map.insert(
                         stringify!(#field).into(),
                         #codec.encode_ref(#field).map_err(|issue|
                             issue.at(#effect::IssueSegment::Field(
@@ -273,9 +279,13 @@ pub(crate) fn expand(input: SchemaEnumInput) -> syn::Result<TokenStream> {
                                     #effect::SchemaIssueKind::InvalidTag
                                 ));
                             };
-                            let mut object = ::core::default::Default::default();
-                            #(#encoded)*
-                            Ok(#effect::JsonValue::Object(object))
+                            let mut #encoded_value = #effect::JsonValue::Object(
+                                ::core::default::Default::default(),
+                            );
+                            if let #effect::JsonValue::Object(#object_map) = &mut #encoded_value {
+                                #(#encoded)*
+                            }
+                            Ok(#encoded_value)
                         },
                     );
                 };

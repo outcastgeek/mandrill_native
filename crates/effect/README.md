@@ -77,6 +77,119 @@ explicit error/environment/owned variants. Pure per-run prefixes may clone Arc
 or Effect handles explicitly when a reusable recipe needs to move them into
 its next step; application payloads are moved.
 
+## Composable domain blocks
+
+The crate exports 37 procedural macros. Each domain retains a typed execution
+boundary and uses the same `Effect<A, E, R>` kernel and environment capabilities.
+`yield_from!` is a local marker consumed inside `stream!`.
+
+| Domain | Macro surface | Execution boundary |
+| --- | --- | --- |
+| General composition | `effect!`, `span!`, `service!` | Ordinary Effect; tracing uses R, selected services retain R, `project:` explicitly supplies another environment. |
+| Streams and caches | `stream!`, `cache!`, `dependency_cache!` | Pull/consume and scoped cache creation/lookup Effects; policies are explicit. |
+| Schema and persistence | `schema!`, `schema_enum!`, `persistable!`, `persisted_queue!`, `durable_queue!` | Existing encode/decode, record and queue execution APIs. |
+| RPC | `rpc_operation!`, `rpc_stream_operation!`, `rpc_protocol!`, `rpc_stream_protocol!`, `rpc_middleware!`, `rpc_stream_middleware!` | Typed handler calls, protocol handling and full session serving. |
+| Reactivity | `atom!`, `reactive_source!`, `reactive_derived!`, `reactive_query!`, `reactive_bridge!`, `hydration!` | Tracked `AtomProgram::evaluate`, atom refresh and hydration export/import. |
+| Cluster | `entity_resource!`, `entity!`, `cluster!`, `singleton!`, `cluster_schedule!` | Resource acquisition/activation under an explicit owner and scope, existing fenced dispatch and singleton run. |
+| Events | `event!`, `handled_event!`, `event_group!`, `projection!` | EventLog execution and atomic projection advance. |
+| Restricted coordination | `transaction!`, `workflow!`, `activity!`, `workflow_definition!`, `activity_definition!` | Atomic journal execution or recorded durable workflow/activity execution. |
+
+Inline callback fields omit the colon (`handler |request| { ... }`) to request
+Effect lowering. Colon fields (`handler: handle_request`) accept already typed
+callbacks and extracted helpers. Native closure parameters may carry ordinary Rust type annotations when field
+access needs a receiver type before constructor inference. The new domain parsers
+evaluate runtime fields and list entries once in written order. Construction validates descriptions but does
+not execute effectful bodies. Native match guards remain intact.
+
+```rust
+use effect::{Effect, Stream, service, stream};
+use std::sync::Arc;
+
+fn increment<R: Send + Sync + 'static>(value: i64) -> Effect<i64, (), R> {
+    Effect::sync_once(move || value + 1)
+}
+let selected: Effect<i64, (), ()> = service! {
+    select: |_: &()| 4i64,
+    run |service| { increment(*service)? },
+};
+assert_eq!(futures_executor::block_on(selected.run(Arc::new(()))), effect::Exit::Success(5));
+let values: Stream<i64, (), ()> = stream! {
+    for value in 0..2 { yield increment(value)?; }
+    yield_from!(Stream::from_iterable(|| [3].into_iter()));
+};
+assert_eq!(futures_executor::block_on(values.run_collect(Some(3)).run(Arc::new(()))), effect::Exit::Success(vec![1, 2, 3]));
+```
+
+Stream bodies are pull driven. Resource binds survive yields and release at
+lexical completion, loop exits or consumer cleanup. No producer task is started.
+Inline cache loaders receive `Arc<K>` so an owned key handle can enter a deferred
+Effect; colon-form loaders retain the existing borrowed-key constructor contract.
+Consumers explicitly clone shared handles when a reusable body moves a handle.
+
+Extract tracked helpers as `AtomProgram<A, E, R>`, then use `program:` in
+`reactive_derived!`; tracked reads use `AtomProgram::read`/`read_derived`. Extract
+activation helpers as `EntityResourcePlan<A, E, R>` and pass them to the
+resource-aware `entity!` form. `cluster!` returns a checked catalog; activation
+requires the caller's existing owner and scope, and each dispatch rechecks its
+fence. `rpc_middleware! { acquire { ... } }` returns service-producing middleware;
+its typed `apply` or `serve_stream` operation owns acquisition through handler
+completion and cleanup, including session closure.
+
+`handled_event!` joins explicit aggregate/commit metadata to a typed Effect
+handler. `projection!` typed `cases:` derive registered identities and decoders
+from those same definitions; failures use `ProjectionCaseError<F>`. Ordinary
+`accepted:`/`fold:` projection and descriptor-only RPC/event forms remain valid.
+Queue workers retain the existing recorded-result-before-acknowledgement order.
+Transactions admit only Transactions in every bind position; workflows admit
+only Durable descriptions. Put external Effects inside recorded activities,
+and execute transactions through `atomically`. Retry/replay locals are rebuilt
+lazily. Durable coordination supports deterministic `for` iteration; unbounded
+`while`/`loop` remains rejected at that boundary.
+
+## Runnable café stories
+
+Start with a customer or staff task below. Run any story with
+`cargo +1.99.0 run --locked -p effect --example NAME`.
+Each file introduces its own café models and reads as one recipe with direct `?`
+binds and one execution boundary in `main`. Prices use integral cents and are
+printed as dollars. `CoffeeOrder`, `Basket`, `Receipt`, and the other café models
+are application functionality; the explicitly imported Effect types and macros
+provide composition, resource lifetimes, recording, and reactive updates.
+
+| Story | What happens |
+| --- | --- |
+| [browse_cafe_menu](examples/browse_cafe_menu.rs) | Maya compares espresso drinks and dairy choices, sees prices, and gets the refreshed oat-latte price after the menu board changes. |
+| [save_coffee_order](examples/save_coffee_order.rs) | Maya corrects an invalid quantity, selects oat milk, adds a note, and reloads her saved order with the café's defaults. |
+| [live_coffee_basket](examples/live_coffee_basket.rs) | Adding two oat lattes and an americano gives $12.75; removing one latte gives $8.00. Maya reserves both drinks together and restores her saved basket. |
+| [track_coffee_order](examples/track_coffee_order.rs) | Maya places ticket 104, looks it up, and sees accepted, preparing, and ready statuses. Sam's staff session remains acquired through connection cleanup. |
+| [prepare_coffee_orders](examples/prepare_coffee_orders.rs) | Sam prepares Maya's drinks once, retrieves the recorded pickup result, makes Lee's counter order, and takes Nora's queued ticket. |
+| [close_coffee_shop](examples/close_coffee_shop.rs) | Sam opens Maya's pickup pad for its owned activation, inspects the counter, and completes the daily closing sheet under one lease at 17:00 UTC. |
+| [coffee_shop_receipts](examples/coffee_shop_receipts.rs) | Maya and Lee receive receipts. Sam reconstructs the receipt book and daily sales: two receipts, three drinks, $12.75. |
+
+The stories cover all 37 procedural macros and stream delegation. The following
+index points to the story that makes each form useful, rather than introducing
+another set of implementation examples.
+
+| Story | DSL forms used |
+| --- | --- |
+| Menu | `effect!`; `span!` inline/existing recipes and annotations; `service!` selected services, handles, projections and typed errors; `stream!` resource/effect binds, `yield_from!`; `cache!` inline/borrowed helper loaders; `dependency_cache!` loaders and menu invalidation. |
+| Saved order | `schema!` pure/native optional/default fields; `schema_enum!` unit, tuple and named drink variants; `persistable!` typed save/reload. |
+| Basket | `transaction!` and `atomically`; `atom!` extracted tracked helper; `reactive_source!`; `reactive_derived!` program/callback views; `reactive_query!` stock lifecycle; `reactive_bridge!` display snapshot/changes; `hydration!` saved basket export/import. |
+| Tracking | `rpc_operation!`, `rpc_stream_operation!` descriptions and inline/helper handlers; `rpc_protocol!` unary/grouped endpoints; `rpc_stream_protocol!`; `rpc_middleware!` customer checks and staff acquisition/application; `rpc_stream_middleware!` status callbacks and full scoped serving. |
+| Preparation | `workflow!` inline/body/helper coordination; `activity!` inline/description/helper preparation; `workflow_definition!`, `activity_definition!` used in execution; `persisted_queue!`, `durable_queue!` admission, delivery, recorded pickup result and acknowledgement. |
+| Closing | `entity_resource!` extracted pickup-pad helper; `entity!` resource-aware/legacy registration; `cluster!` checked catalog and addressed activation; `singleton!` closing responsibility; `cluster_schedule!` bounded calendar planning. |
+| Receipts | `event!` ordinary/aggregate definitions; `handled_event!` explicit aggregate/context handlers; `event_group!` ordinary/handled definition views; `projection!` raw receipt decoding and typed sales cases. |
+
+[Provider support](examples/cafe_support/mod.rs) contains only runtime and storage
+wiring: bounded in-memory stores, deterministic clocks, tracing, and application
+workers. Task, CPU, and blocking capabilities use distinct concrete provider
+types selected through `R`; the core selects no executor. The stores retain
+recorded values and ownership rules within one process and do not survive a
+restart. The existing `futures-executor` development dependency drives the outer
+boundary. [Transport support](examples/cafe_support/transport.rs) owns finite
+local RPC frame/producer mechanics. None of these stories uses a network,
+collects a payment, or sends a message.
+
 ## Values, captures, and reuse
 
 Construction and cloning execute no user callbacks. Every run creates fresh

@@ -12,6 +12,8 @@ mod async_result;
 mod atom;
 mod atom_cache;
 mod atom_persistence;
+/// Context-carrying tracked programs around the existing Atom evaluator.
+mod atom_program;
 mod atom_ref;
 mod atom_registry;
 mod atom_rpc;
@@ -42,3 +44,7 @@ pub use invalidation::{
 };
 pub use query::{ReactiveQuery, ReactiveQueryError};
 pub use source::{EffectStreamSource, ReactiveStateSource};
+
+pub use atom_program::AtomProgram;
+#[doc(hidden)]
+pub use atom_program::{AtomBindable, AtomProgramContext};

@@ -534,6 +534,19 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
         options: CacheOptions<A, E>,
         load: impl Fn(&K) -> Effect<A, E, R> + Send + Sync + 'static,
     ) -> Effect<Self, SharedValue<E>, R> {
+        Self::make_with_shared_key(scope, config, options, move |key| load(&key))
+    }
+
+    /// Create the same scoped cache using a shared owned key for a deferred loader body.
+    /// Sharing the engine's existing Arc key avoids a hidden key Clone requirement and
+    /// permits the loader to retain it across asynchronous Effect binds. Policies and
+    /// producer ownership are identical to `make_with_options`; no payload is copied.
+    pub fn make_with_shared_key<R: HasClock + HasTaskSpawner + Send + Sync + 'static>(
+        scope: Scope<SharedValue<E>>,
+        config: CacheConfig<K, E>,
+        options: CacheOptions<A, E>,
+        load: impl Fn(Arc<K>) -> Effect<A, E, R> + Send + Sync + 'static,
+    ) -> Effect<Self, SharedValue<E>, R> {
         let load = Arc::new(load);
         Effect::new(move |env: Arc<R>, context, finish| {
             let load_env = Arc::clone(&env);
@@ -569,7 +582,7 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
                             move |settlement| {
                                 Box::pin(async move {
                                     let outcome = AssertUnwindSafe(async {
-                                        let program = load(&completed.key);
+                                        let program = load(Arc::clone(&completed.key));
                                         runtime::evaluate_context(program, env, &context).await
                                     })
                                     .catch_unwind()

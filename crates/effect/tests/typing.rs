@@ -1,13 +1,16 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Temporary external consumer checkout removed after each compiler-contract run.
 struct FixtureDirectory(PathBuf);
 impl Drop for FixtureDirectory {
+    /// Remove the harness-owned temporary checkout after all diagnostics are inspected.
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
+/// Compile existing and composable macro consumers under a renamed dependency, checking targeted errors.
 #[test]
 fn external_compiler_contracts() -> Result<(), Box<dyn std::error::Error>> {
     let directory = FixtureDirectory(
@@ -20,6 +23,51 @@ fn external_compiler_contracts() -> Result<(), Box<dyn std::error::Error>> {
     );
     std::fs::write(directory.0.join("Cargo.toml"), manifest)?;
     let cases = [
+        (
+            "composition_helpers",
+            include_str!("ui/composition_helpers.rs"),
+            None,
+        ),
+        (
+            "transaction_terminal_effect",
+            include_str!("ui/transaction_terminal_effect.rs"),
+            Some("Transaction"),
+        ),
+        (
+            "transaction_nested_effect",
+            include_str!("ui/transaction_nested_effect.rs"),
+            Some("Transaction"),
+        ),
+        (
+            "workflow_terminal_effect",
+            include_str!("ui/workflow_terminal_effect.rs"),
+            Some("Durable"),
+        ),
+        (
+            "workflow_nested_future",
+            include_str!("ui/workflow_nested_future.rs"),
+            Some("Durable"),
+        ),
+        (
+            "span_missing_capability",
+            include_str!("ui/span_missing_capability.rs"),
+            Some("HasTracer"),
+        ),
+        (
+            "composition_conflicting_fields",
+            include_str!("ui/composition_conflicting_fields.rs"),
+            Some("exactly one"),
+        ),
+        (
+            "composition_missing_policy",
+            include_str!("ui/composition_missing_policy.rs"),
+            Some("missing descriptor field: options"),
+        ),
+        (
+            "stream_nonunit_tail",
+            include_str!("ui/stream_nonunit_tail.rs"),
+            Some("E0308"),
+        ),
         (
             "native_incomplete",
             include_str!("ui/native_incomplete.rs"),
@@ -49,7 +97,7 @@ fn external_compiler_contracts() -> Result<(), Box<dyn std::error::Error>> {
         (
             "workflow_rejects_future",
             include_str!("ui/workflow_rejects_future.rs"),
-            Some("E0599"),
+            Some("Durable"),
         ),
         ("services", include_str!("ui/services.rs"), None),
         ("macro_loops", include_str!("ui/macro_loops.rs"), None),

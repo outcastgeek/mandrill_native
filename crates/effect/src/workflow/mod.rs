@@ -57,3 +57,6 @@ pub use workflow_types::{
 };
 
 pub use workflow_types::WorkflowCheckpoint;
+
+#[doc(hidden)]
+pub use durable::DurableContext;

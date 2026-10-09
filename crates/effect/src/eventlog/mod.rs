@@ -67,3 +67,10 @@ pub use retention::{
     CompactionPermit, MemoryRetentionAuthority, ReplayRetention, RetentionConsumerId,
     RetentionError,
 };
+
+/// Typed event metadata, aggregate and handler association.
+mod handled_event;
+/// Checked decoding and pure fold composition over existing projections.
+mod projection_cases;
+pub use handled_event::{AggregateEvent, EventDefinitionView, EventHandlerContext, HandledEvent};
+pub use projection_cases::{ProjectionCaseError, ProjectionCases, ProjectionCasesError};

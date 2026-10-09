@@ -525,3 +525,8 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Stream<A, E
         )
     }
 }
+
+/// Native body suspension and sequential stream composition.
+mod composition;
+#[doc(hidden)]
+pub use composition::StreamContext;

@@ -111,3 +111,21 @@ impl EventGroup {
         self.events.contains_key(&(tag.clone(), version))
     }
 }
+
+impl EventGroup {
+    /// Start a checked group from an ordinary, aggregate-bound or handled definition view.
+    /// Handler access stays on the original typed value; grouping stores only accepted identities.
+    pub fn from_definition<D: super::EventDefinitionView>(
+        group: EventGroupId,
+        definition: &D,
+    ) -> Result<Self, EventGroupError> {
+        Self::from_event(group, definition.definition())
+    }
+    /// Register the authoritative definition view, retaining current duplicate/group validation.
+    pub fn register_definition<D: super::EventDefinitionView>(
+        &mut self,
+        definition: &D,
+    ) -> Result<(), EventGroupError> {
+        self.register(definition.definition())
+    }
+}

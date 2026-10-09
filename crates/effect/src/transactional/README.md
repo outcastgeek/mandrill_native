@@ -8,10 +8,10 @@ A cell occupies domain capacity while a `TxRef`, transaction description, or sub
 
 `TxSubscriptionRef` exposes committed values through the common reactive source contract. Subscription captures its initial version and value together, then registers a waiter before checking for the next version. Rolled-back writes are not published.
 
-Run the [release example](../../examples/transaction_reactivity.rs) with:
+Run the [coffee basket story](../../examples/live_coffee_basket.rs) to reserve all selected drinks together:
 
 ```sh
-cargo run -p effect --example transaction_reactivity --release
+cargo +1.99.0 run --locked -p effect --example live_coffee_basket
 ```
 
 See the [provider-neutral example](../../tests/fixtures/shared/provider_program.rs),

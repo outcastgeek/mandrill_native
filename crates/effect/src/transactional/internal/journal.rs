@@ -71,6 +71,8 @@ pub(crate) enum JournalError {
 pub(crate) struct TxJournal {
     pub domain: Arc<DomainInner>,
     pub snapshot_epoch: u64,
+    /// Atomic execution cancellation observed by native transaction body checkpoints.
+    pub cancellation: Option<crate::Cancellation>,
     reads: BTreeMap<NonZeroU64, ReadRecord>,
     writes: BTreeMap<NonZeroU64, ErasedValue>,
 }
@@ -92,6 +94,7 @@ impl TxJournal {
         Self {
             domain,
             snapshot_epoch,
+            cancellation: None,
             reads: BTreeMap::new(),
             writes: BTreeMap::new(),
         }

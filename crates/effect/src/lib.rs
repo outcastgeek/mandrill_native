@@ -24,7 +24,7 @@
 //!    application dependencies. Tokio tasks and Rayon CPU work may coexist
 //!    in the same `R`; no provider is selected by the core.
 //! 4. Feature modules explain their own authorities and guarantees:
-//!    [`Schema`], [`persistence`], [`rpc`], [`reactivity`], [`cluster`],
+//!    [`Schema`], [`persistence`], [`rpc`], [`reactivity`], [`mod@cluster`],
 //!    [`mod@workflow`], [`eventlog`], and [`transactional`].
 //!
 //! `Effect<A, E, R>` is a reusable recipe: `A` is its success value, `E` its
@@ -48,10 +48,12 @@
 extern crate self as effect;
 
 pub use effect_macros::{
-    activity, activity_definition, entity, event, event_group, projection, reactive_bridge,
-    reactive_derived, reactive_query, reactive_source, rpc_middleware, rpc_operation, rpc_protocol,
-    rpc_stream_middleware, rpc_stream_operation, rpc_stream_protocol, transaction, workflow,
-    workflow_definition,
+    activity, activity_definition, atom, cache, cluster, cluster_schedule, dependency_cache,
+    durable_queue, entity, entity_resource, event, event_group, handled_event, hydration,
+    persisted_queue, projection, reactive_bridge, reactive_derived, reactive_query,
+    reactive_source, rpc_middleware, rpc_operation, rpc_protocol, rpc_stream_middleware,
+    rpc_stream_operation, rpc_stream_protocol, service, singleton, span, stream, transaction,
+    workflow, workflow_definition,
 };
 
 mod admission;
@@ -175,10 +177,13 @@ pub use sink::Sink;
 pub mod __private {
     pub use crate::Exit;
     pub use crate::internal::macro_future::{AsyncBindable, MacroContext, async_workflow};
-    pub use crate::internal::workflow::{Bindable, Workflow, bind, defer, reusable, success};
+    pub use crate::internal::workflow::{
+        Bindable, Workflow, bind, defer, defer_callback0, defer_callback1, defer_callback2, once,
+        reusable, success,
+    };
 }
 
-pub use stream::{Chunk, Stream, StreamBufferOptions, StreamReader};
+pub use stream::{Chunk, Stream, StreamBufferOptions, StreamContext, StreamReader};
 pub use telemetry::{
     Annotations, DiagnosticCapacity, DiagnosticOverflow, Diagnostics, HasLogger, HasTracer,
     LogEvent, LogLevel, Logger, SharedAnnotations, SpanFinish, SpanId, SpanOutcome, SpanStart,
@@ -226,3 +231,9 @@ pub use dependency_cache::{
 };
 
 pub use weak_cache::{CachePartition, WeakCache, WeakCacheValue};
+
+/// Typed native-service operation and resource mapping over the application environment.
+mod service;
+#[doc(hidden)]
+pub use service::{ServiceBindable, ServiceBody, ServiceContext};
+pub use service::{ServiceOperation, ServiceResource};

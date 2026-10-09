@@ -86,6 +86,21 @@ impl<T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Asyn
     }
 }
 impl<E: Send + 'static, R: Send + Sync + 'static> MacroContext<E, R> {
+    /// Construct a bridge borrowing the existing execution authority and an externally owned scope.
+    /// No cleanup is performed here: the caller owns closing that scope.
+    pub(crate) fn with_scope(env: Arc<R>, context: Context, scope: Scope<E>) -> Self {
+        Self {
+            env,
+            context,
+            scope,
+        }
+    }
+
+    /// Share the existing owner scope when a typed domain adapter registers a binding.
+    pub(crate) fn scope(&self) -> Scope<E> {
+        self.scope.clone()
+    }
+
     /// Sequence the next macro-expanded step after a successful Effect result.
     ///
     /// # Type parameters

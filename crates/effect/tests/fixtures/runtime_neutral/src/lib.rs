@@ -59,13 +59,85 @@ fn cpu_blocking_and_async_operations_share_one_environment() {
 }
 
 #[cfg(test)]
-#[path="../../shared/reference_update.rs"]
+#[path = "../../shared/reference_update.rs"]
 mod reference_update;
 #[test]
-fn reference_update_with_renamed_dependency(){
-    struct Env{tasks:tasks::Threads,clock:fx::TestClock}
-    impl fx::HasTaskSpawner for Env{type Tasks=tasks::Threads;fn task_spawner(&self)->&Self::Tasks{&self.tasks}}
-    impl fx::HasClock for Env{type Clock=fx::TestClock;fn clock(&self)->&Self::Clock{&self.clock}}
-    let env=std::sync::Arc::new(Env{tasks:tasks::Threads::default(),clock:fx::TestClock::default()});
-    futures_executor::block_on(reference_update::exercise(std::sync::Arc::clone(&env)));env.tasks.finish();
+fn reference_update_with_renamed_dependency() {
+    struct Env {
+        tasks: tasks::Threads,
+        clock: fx::TestClock,
+    }
+    impl fx::HasTaskSpawner for Env {
+        type Tasks = tasks::Threads;
+        fn task_spawner(&self) -> &Self::Tasks {
+            &self.tasks
+        }
+    }
+    impl fx::HasClock for Env {
+        type Clock = fx::TestClock;
+        fn clock(&self) -> &Self::Clock {
+            &self.clock
+        }
+    }
+    let env = std::sync::Arc::new(Env {
+        tasks: tasks::Threads::default(),
+        clock: fx::TestClock::default(),
+    });
+    futures_executor::block_on(reference_update::exercise(std::sync::Arc::clone(&env)));
+    env.tasks.finish();
+}
+
+/// Shared composition scenario consumes the renamed dependency and independent providers.
+#[cfg(test)]
+#[path = "../../shared/macro_composition.rs"]
+mod composition;
+
+/// Run the same macros with independent async, CPU and blocking thread providers.
+#[test]
+fn macro_composition() {
+    /// One explicit environment selects all fixture runtime capabilities.
+    struct Env {
+        /// Existing thread provider, shared as the async/CPU/blocking authority.
+        tasks: tasks::Threads,
+        /// Existing controllable monotonic clock.
+        clock: fx::TestClock,
+    }
+    impl fx::HasTaskSpawner for Env {
+        /// Existing independent task provider type.
+        type Tasks = tasks::Threads;
+        /// Borrow the same selected provider.
+        fn task_spawner(&self) -> &Self::Tasks {
+            &self.tasks
+        }
+    }
+    impl fx::HasCpuExecutor for Env {
+        /// Existing independent job provider type.
+        type Executor = tasks::Threads;
+        /// Borrow the same selected provider.
+        fn cpu_executor(&self) -> &Self::Executor {
+            &self.tasks
+        }
+    }
+    impl fx::HasBlockingExecutor for Env {
+        /// Existing independent blocking job provider type.
+        type Executor = tasks::Threads;
+        /// Borrow the same selected provider.
+        fn blocking_executor(&self) -> &Self::Executor {
+            &self.tasks
+        }
+    }
+    impl fx::HasClock for Env {
+        /// Existing test clock type.
+        type Clock = fx::TestClock;
+        /// Borrow the explicit clock capability.
+        fn clock(&self) -> &Self::Clock {
+            &self.clock
+        }
+    }
+    let env = std::sync::Arc::new(Env {
+        tasks: tasks::Threads::default(),
+        clock: fx::TestClock::default(),
+    });
+    futures_executor::block_on(composition::exercise(std::sync::Arc::clone(&env)));
+    env.tasks.finish();
 }

@@ -1,185 +1,119 @@
-//! Lowering of restricted durable workflow operations.
+//! Native control flow for restricted durable descriptions, with evaluation-local ownership.
 
-use proc_macro2::TokenStream;
-use quote::{quote, quote_spanned};
-use syn::spanned::Spanned;
+use proc_macro2::{Ident, Span, TokenStream};
+use quote::quote;
+use syn::fold::Fold;
 use syn::{Expr, Stmt};
 
-/// # Parameters
-/// - `statements` (`Vec<Stmt>`): Rust statements parsed and lowered by the procedural macro.
-///
-/// # Returns
-/// Type: `syn::Result<TokenStream>`.
+/// Keeps binds on the durable boundary without traversing nested callbacks or items.
+struct Lower {
+    /// Typed durable context for one evaluation.
+    context: Ident,
+    /// Rejection of unsupported durable looping syntax, if observed.
+    error: Option<syn::Error>,
+}
+impl Fold for Lower {
+    /// Preserve native Rust branches and guards while replacing only domain binds.
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "Other syn expression variants retain native Rust syntax"
+    )]
+    fn fold_expr(&mut self, expr: Expr) -> Expr {
+        match expr {
+            Expr::Closure(_) | Expr::Async(_) => expr,
+            Expr::Try(step) => {
+                let program = self.fold_expr(*step.expr);
+                let context = &self.context;
+                syn::parse_quote_spanned!(step.question_token.span=> match #context.bind(#program).await {
+                    Ok(value) => value, Err(failure) => return Err(failure),
+                })
+            }
+            Expr::Return(step) => {
+                let value = step
+                    .expr
+                    .map(|value| self.fold_expr(*value))
+                    .unwrap_or_else(|| syn::parse_quote!(()));
+                syn::parse_quote!(return ::core::result::Result::Ok(#value))
+            }
+            Expr::While(_) | Expr::Loop(_) => {
+                self.error = Some(syn::Error::new_spanned(
+                    &expr,
+                    "durable coordination supports deterministic for iteration, not while or loop",
+                ));
+                expr
+            }
+            other => syn::fold::fold_expr(self, other),
+        }
+    }
+    /// Item bodies keep their own error and execution boundaries.
+    fn fold_item(&mut self, item: syn::Item) -> syn::Item {
+        item
+    }
+}
+
+/// Build a reusable, deferred durable body; no pre-bind initializer runs at construction.
 pub(crate) fn expand(statements: Vec<Stmt>) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
-    let body = lower(&statements, &path)?;
-    Ok(quote!({ #body }))
-}
-
-///
-/// # Parameters
-/// - `statements` (`&[Stmt]`): Rust statements parsed and lowered by the procedural macro.
-/// - `path` (`&TokenStream`): Location of the field, file, or configuration value being processed.
-///
-/// # Returns
-/// Type: `syn::Result<TokenStream>`.
-fn lower(statements: &[Stmt], path: &TokenStream) -> syn::Result<TokenStream> {
-    let Some((statement, remaining)) = statements.split_first() else {
-        return Ok(quote!(#path::workflow::Durable::succeed_with(|| ())));
+    let context = Ident::new("__durable_context", Span::mixed_site());
+    let mut lower = Lower {
+        context: context.clone(),
+        error: None,
     };
-    match statement {
-        Stmt::Local(local) => {
-            if let Some(init) = &local.init
-                && let Expr::Try(expr) = init.expr.as_ref()
-            {
-                let program = &expr.expr;
-                let pattern = &local.pat;
-                let rest = lower(remaining, path)?;
-                return Ok(quote_spanned!(statement.span()=>
-                    (#program).flat_map(move |#pattern| { #rest })
-                ));
-            }
-            if let Some(init) = &local.init
-                && is_control_flow(&init.expr)
-            {
-                let pattern = &local.pat;
-                let program = expression(&init.expr, path)?;
-                let rest = lower(remaining, path)?;
-                return Ok(quote_spanned!(statement.span()=>
-                    (#program).flat_map(move |#pattern| { #rest })
-                ));
-            }
-            let rest = lower(remaining, path)?;
-            Ok(quote_spanned!(statement.span()=> #local #rest))
-        }
-        Stmt::Expr(Expr::Try(expr), semi) => {
-            let program = &expr.expr;
-            if semi.is_none() && remaining.is_empty() {
-                Ok(quote_spanned!(statement.span()=> #program))
-            } else {
-                let rest = lower(remaining, path)?;
-                Ok(quote_spanned!(statement.span()=>
-                    (#program).flat_map(move |_| { #rest })
-                ))
-            }
-        }
-        Stmt::Expr(Expr::Return(expr), _) => {
-            let value = expr
-                .expr
-                .as_ref()
-                .map_or_else(|| quote!(()), |value| quote!(#value));
-            Ok(quote_spanned!(statement.span()=>
-                #path::workflow::Durable::succeed_once(move || #value)
-            ))
-        }
-        Stmt::Expr(expr, semi) if is_control_flow(expr) => {
-            let program = expression(expr, path)?;
-            if semi.is_none() && remaining.is_empty() {
-                Ok(program)
-            } else {
-                let rest = lower(remaining, path)?;
-                Ok(quote_spanned!(statement.span()=>
-                    (#program).flat_map(move |_| { #rest })
-                ))
-            }
-        }
-        Stmt::Expr(expr, None) if remaining.is_empty() => Ok(quote_spanned!(statement.span()=>
-            #path::workflow::Durable::succeed_once(move || #expr)
-        )),
-        Stmt::Expr(expr, None) => Err(syn::Error::new_spanned(
-            expr,
-            "only the final expression may omit a semicolon",
-        )),
-        Stmt::Expr(expr, Some(_)) => {
-            let rest = lower(remaining, path)?;
-            Ok(quote_spanned!(statement.span()=> #expr; #rest))
-        }
-        Stmt::Item(item) => {
-            let rest = lower(remaining, path)?;
-            Ok(quote_spanned!(statement.span()=> #item #rest))
-        }
-        Stmt::Macro(item) => {
-            let rest = lower(remaining, path)?;
-            Ok(quote_spanned!(statement.span()=> #item #rest))
-        }
+    let (prefix, statements) = crate::context_expand::split_prefix(statements);
+    let body = statements
+        .into_iter()
+        .map(|stmt| lower.fold_stmt(stmt))
+        .collect::<Vec<_>>();
+    if let Some(error) = lower.error {
+        return Err(error);
     }
+    Ok(
+        quote!(#path::workflow::Durable::from_body(move |#context| {#(#prefix)* async move {
+            #[allow(unreachable_code)] { Ok({ #(#body)* }) }
+        } })),
+    )
 }
 
-///
-/// # Parameters
-/// - `expr` (`&Expr`): Rust syntax expression parsed or expanded by this macro.
-///
-/// # Returns
-/// Type: `bool`.
-/// Returns whether the requested condition holds.
-fn is_control_flow(expr: &Expr) -> bool {
-    crate::parse::has_effect_steps(expr)
-        && (matches!(expr, Expr::If(_) | Expr::Match(_) | Expr::ForLoop(_))
-            || matches!(expr, Expr::Block(block) if block.label.is_none()))
+/// Lower a workflow callback's owned input without adding a hidden payload clone.
+/// The workflow executor rebuilds this callback for each durable evaluation/replay.
+pub(crate) fn expand_once(statements: Vec<Stmt>) -> syn::Result<TokenStream> {
+    let tokens = expand(statements)?;
+    let expression: syn::Expr = syn::parse2(tokens)?;
+    let syn::Expr::Call(mut call) = expression else {
+        return Err(syn::Error::new_spanned(
+            expression,
+            "expected durable body constructor",
+        ));
+    };
+    let path = crate::expand::effect_crate_path()?;
+    *call.func = syn::parse_quote!(#path::workflow::Durable::from_body_once);
+    Ok(quote!(#call))
 }
 
-///
-/// # Parameters
-/// - `expr` (`&Expr`): Rust syntax expression parsed or expanded by this macro.
-/// - `path` (`&TokenStream`): Location of the field, file, or configuration value being processed.
-///
-/// # Returns
-/// Type: `syn::Result<TokenStream>`.
-fn expression(expr: &Expr, path: &TokenStream) -> syn::Result<TokenStream> {
-    if let Expr::If(branch) = expr {
-        let attrs = &branch.attrs;
-        let condition = &branch.cond;
-        let then_branch = lower(&branch.then_branch.stmts, path)?;
-        let else_branch = match &branch.else_branch {
-            Some((_, other)) => expression(other, path)?,
-            None => quote!(#path::workflow::Durable::succeed_with(|| ())),
+/// Focused native lowering checks for domain control flow and lexical boundaries.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// Generated binds retain guards and native callback boundaries while enforcing the domain bridge.
+    #[test]
+    fn native_lowering_contract() {
+        let statements = syn::parse::Parser::parse_str(
+            syn::Block::parse_within,
+            "let value=step()?; match value {v if v>0=>v,_=>0}; let callback=||nested()?;",
+        )
+        .expect("Rust statements");
+        let mut lower = Lower {
+            context: Ident::new("durable_context", Span::mixed_site()),
+            error: None,
         };
-        return Ok(quote_spanned!(expr.span()=>
-            #(#attrs)* if #condition { #then_branch } else { #else_branch }
-        ));
+        let statements = statements
+            .into_iter()
+            .map(|stmt| lower.fold_stmt(stmt))
+            .collect::<Vec<_>>();
+        let output = quote!(#(#statements)*).to_string();
+        assert!(output.contains("if v > 0"));
+        assert!(output.contains("return Err (failure)"));
+        assert!(output.contains("nested () ?"));
+        assert!(lower.error.is_none());
     }
-    if let Expr::Match(branch) = expr {
-        let attrs = &branch.attrs;
-        let value = &branch.expr;
-        let arms = branch
-            .arms
-            .iter()
-            .map(|arm| {
-                let attrs = &arm.attrs;
-                let pattern = &arm.pat;
-                let body = expression(&arm.body, path)?;
-                Ok(quote_spanned!(arm.span()=>
-                    #(#attrs)* #pattern => { #body },
-                ))
-            })
-            .collect::<syn::Result<Vec<_>>>()?;
-        return Ok(quote_spanned!(expr.span()=>
-            #(#attrs)* match #value { #(#arms)* }
-        ));
-    }
-    if let Expr::Block(block) = expr
-        && block.label.is_none()
-    {
-        let body = lower(&block.block.stmts, path)?;
-        return Ok(quote_spanned!(expr.span()=> #body));
-    }
-    if let Expr::ForLoop(loop_expr) = expr {
-        crate::parse::pure(&loop_expr.expr)?;
-        let items = &loop_expr.expr;
-        let pattern = &loop_expr.pat;
-        let body = lower(&loop_expr.body.stmts, path)?;
-        return Ok(quote_spanned!(expr.span()=>
-            #path::workflow::Durable::for_each(
-                move || (#items).into_iter(),
-                move |#pattern| { (#body).map(|_| ()) },
-            )
-        ));
-    }
-    if let Expr::Try(step) = expr {
-        let program = &step.expr;
-        return Ok(quote_spanned!(expr.span()=> #program));
-    }
-    Ok(quote_spanned!(expr.span()=>
-        #path::workflow::Durable::succeed_once(move || #expr)
-    ))
 }

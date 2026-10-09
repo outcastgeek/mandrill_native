@@ -44,3 +44,7 @@ pub use streaming_server::{
     RpcProduced, RpcStreamContext, RpcStreamHandler, RpcStreamProducer, RpcStreamServer,
     RpcStreamServerError,
 };
+
+/// Scoped service acquisition and explicit protocol grouping.
+mod service_middleware;
+pub use service_middleware::{RpcProtocolGroup, RpcServiceMiddleware, RpcServiceMiddlewareError};

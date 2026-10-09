@@ -400,6 +400,84 @@ impl<E: Send + 'static> Scope<E> {
         })
     }
 
+    /// Own an existing scope while a differently typed domain body executes, mapping only
+    /// its eventual cleanup channel. The guard is installed before body execution, and
+    /// abandonment follows the same owner path as `scoped`; cleanup is drained exactly once.
+    pub(crate) fn own_mapped<A, F, R>(
+        &self,
+        body: Effect<A, F, R>,
+        map: impl Fn(E) -> F + Send + Sync + 'static,
+    ) -> Effect<A, F, R>
+    where
+        A: Send + 'static,
+        F: Send + 'static,
+        R: Send + Sync + 'static,
+    {
+        let scope = self.clone();
+        let map = Arc::new(map);
+        Effect::new(move |env, context, finish| {
+            let mut owner = OwnerGuard {
+                scope: scope.clone(),
+                settled: false,
+            };
+            let map = Arc::clone(&map);
+            let body_context = context.clone();
+            body.clone().execute(
+                env,
+                body_context,
+                runtime::continuation(move |result| {
+                    let result = runtime::publish(result, &context);
+                    owner.scope.clone().join_close(
+                        Exit::Success(()),
+                        runtime::continuation(move |_| {
+                            let cleanup = owner.scope.take_outcome().map_error(|error| map(error));
+                            owner.settled = true;
+                            drop(owner);
+                            runtime::finish(
+                                finish,
+                                outcome::append_cleanup(
+                                    runtime::publish(result, &context),
+                                    cleanup,
+                                ),
+                            )
+                        }),
+                    )
+                }),
+            )
+        })
+    }
+
+    /// Transfer ownership to one registered finalizer, retaining an abandonment guard
+    /// from construction through protected settlement. Unlike `close`, this drains the
+    /// cleanup outcome rather than returning only an acknowledgement. Cloned settlement
+    /// descriptions coordinate one drain. Later/concurrent calls join actual settlement before
+    /// acknowledging; only the caller holding the owner consumes the non-Clone cleanup outcome.
+    pub(crate) fn close_owned<R: Send + Sync + 'static>(&self) -> Effect<(), E, R> {
+        let scope = self.clone();
+        let owner = Mutex::new(Some(OwnerGuard {
+            scope: self.clone(),
+            settled: false,
+        }));
+        Effect::new(move |_, _, finish| {
+            let guard = owner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            match guard {
+                Some(mut owner) => owner.scope.clone().join_close(
+                    Exit::Success(()),
+                    runtime::continuation(move |_| {
+                        let cleanup = owner.scope.take_outcome();
+                        owner.settled = true;
+                        drop(owner);
+                        runtime::finish(finish, cleanup)
+                    }),
+                ),
+                None => scope.clone().join_close(Exit::Success(()), finish),
+            }
+        })
+    }
+
     /// Observe settlement without taking execution ownership or closing it.
     ///
     /// # Type parameters

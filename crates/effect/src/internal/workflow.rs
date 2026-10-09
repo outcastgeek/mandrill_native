@@ -392,3 +392,86 @@ where
         },
     )
 }
+
+/// One-shot deferred body used when an RPC/activity callback transfers its owned input.
+/// The factory runs on execution, never callback construction. Reusing the resulting Effect
+/// reports the existing consumed-workflow defect instead of cloning the input payload.
+#[doc(hidden)]
+pub fn once<A, E, R>(
+    factory: impl FnOnce() -> Workflow<A, E, R> + Send + 'static,
+) -> Effect<A, E, R>
+where
+    A: Send + 'static,
+    E: Send + 'static,
+    R: Send + Sync + 'static,
+{
+    let factory = std::sync::Mutex::new(Some(factory));
+    Effect::new(move |env, context, finish| {
+        let factory = factory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        match factory {
+            Some(factory) => match catch_unwind(AssertUnwindSafe(factory)) {
+                Ok(body) => body.execute(env, context, finish),
+                Err(panic) => runtime::finish(finish, Exit::Die(Defect::from_panic(panic))),
+            },
+            None => runtime::finish(
+                finish,
+                Exit::Die(Defect::from(LibraryDefect::WorkflowConsumed)),
+            ),
+        }
+    })
+}
+
+/// Adapt a reusable one-input body factory into a lazy callback. The owned input
+/// enters the existing one-shot Effect adapter; user initializers run only at execution.
+/// Cloning descriptions shares only the factory handle and never copies input payloads.
+#[doc(hidden)]
+pub fn defer_callback1<I, A, E, R>(
+    factory: impl Fn(I) -> Effect<A, E, R> + Send + Sync + 'static,
+) -> impl Fn(I) -> Effect<A, E, R> + Send + Sync + 'static
+where
+    I: Send + 'static,
+    A: Send + 'static,
+    E: Send + 'static,
+    R: Send + Sync + 'static,
+{
+    let factory = std::sync::Arc::new(factory);
+    move |input| {
+        let factory = std::sync::Arc::clone(&factory);
+        Effect::sync_once(move || input).flat_map(move |input| factory(input))
+    }
+}
+/// Adapt a zero-input body factory without invoking it when its Effect is constructed.
+#[doc(hidden)]
+pub fn defer_callback0<A, E, R>(
+    factory: impl Fn() -> Effect<A, E, R> + Send + Sync + 'static,
+) -> impl Fn() -> Effect<A, E, R> + Send + Sync + 'static
+where
+    A: Send + 'static,
+    E: Send + 'static,
+    R: Send + Sync + 'static,
+{
+    let factory = std::sync::Arc::new(factory);
+    move || {
+        let factory = std::sync::Arc::clone(&factory);
+        Effect::defer(move || factory())
+    }
+}
+/// Adapt a typed two-input body factory while moving both invocation values once.
+/// The pair is an internal ownership carrier, never an erased runtime message.
+#[doc(hidden)]
+pub fn defer_callback2<I, J, A, E, R>(
+    factory: impl Fn(I, J) -> Effect<A, E, R> + Send + Sync + 'static,
+) -> impl Fn(I, J) -> Effect<A, E, R> + Send + Sync + 'static
+where
+    I: Send + 'static,
+    J: Send + 'static,
+    A: Send + 'static,
+    E: Send + 'static,
+    R: Send + Sync + 'static,
+{
+    let invoke = defer_callback1(move |(left, right)| factory(left, right));
+    move |left, right| invoke((left, right))
+}

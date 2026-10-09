@@ -270,3 +270,21 @@ pub(crate) fn expand(statements: Vec<Stmt>, path: &TokenStream) -> TokenStream {
         .collect::<Vec<_>>();
     quote_spanned!(Span::call_site()=> #path::reusable(move || { #(#prefix)* #path::async_workflow(move |#context| async move { #[allow(unreachable_code)] { #path::Exit::Success({ #(#statements)* }) } }) }))
 }
+
+/// Native control flow for one callback invocation whose captures may be non-Clone.
+pub(crate) fn expand_once(statements: Vec<Stmt>, path: &TokenStream) -> TokenStream {
+    let context = Ident::new("__effect_context", Span::mixed_site());
+    let mut lower = Lower {
+        path: path.clone(),
+        context: context.clone(),
+        targets: Vec::new(),
+        checkpoints: 0,
+    };
+    let body = statements
+        .into_iter()
+        .map(|stmt| lower.fold_stmt(stmt))
+        .collect::<Vec<_>>();
+    quote!(#path::once(move || #path::async_workflow(move |#context| async move {
+        #[allow(unreachable_code)] { #path::Exit::Success({ #(#body)* }) }
+    })))
+}

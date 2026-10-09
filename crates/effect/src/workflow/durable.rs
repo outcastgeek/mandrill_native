@@ -77,6 +77,53 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Durable<A, 
         self.effect
     }
 
+    /// Reconstruct a restricted durable description on each evaluation, including pre-bind locals.
+    /// The factory must return Durable; this does not admit external Effects into replay.
+    pub fn defer(factory: impl Fn() -> Self + Send + Sync + 'static) -> Self {
+        Self::from_effect(Effect::defer(move || factory().effect))
+    }
+
+    /// Construct a durable body whose Rust locals are fresh per evaluation.
+    ///
+    /// The supplied context accepts only Durable operations. Ordinary Effects remain
+    /// confined to recorded activity bodies; this is not an unrestricted lift operation.
+    #[doc(hidden)]
+    pub fn from_body<F>(factory: impl Fn(DurableContext<E, R>) -> F + Send + Sync + 'static) -> Self
+    where
+        F: std::future::Future<Output = Result<A, crate::Exit<A, E>>> + Send + 'static,
+    {
+        let factory = std::sync::Arc::new(factory);
+        Self::from_effect(crate::internal::workflow::reusable(move || {
+            let factory = std::sync::Arc::clone(&factory);
+            crate::internal::macro_future::async_workflow(move |context| async move {
+                match factory(DurableContext { context }).await {
+                    Ok(value) => crate::Exit::Success(value),
+                    Err(failure) => failure,
+                }
+            })
+        }))
+    }
+
+    /// Construct one callback invocation's durable body with owned, non-Clone inputs.
+    /// Workflow replay reconstructs the callback; executing this same description twice
+    /// reports the existing consumed-workflow defect instead of copying its input.
+    #[doc(hidden)]
+    pub fn from_body_once<F>(
+        factory: impl FnOnce(DurableContext<E, R>) -> F + Send + 'static,
+    ) -> Self
+    where
+        F: std::future::Future<Output = Result<A, crate::Exit<A, E>>> + Send + 'static,
+    {
+        Self::from_effect(crate::internal::workflow::once(move || {
+            crate::internal::macro_future::async_workflow(move |context| async move {
+                match factory(DurableContext { context }).await {
+                    Ok(value) => crate::Exit::Success(value),
+                    Err(failure) => failure,
+                }
+            })
+        }))
+    }
+
     /// Produce a fresh successful value when this description is executed.
     ///
     /// # Type parameters
@@ -456,4 +503,20 @@ where
     R: HasWorkflowEngine + Send + Sync + 'static,
 {
     Durable::from_effect(description.run(run, attempt, body))
+}
+
+/// Evaluation-local generated-code bridge enforcing the durable bind boundary.
+#[doc(hidden)]
+pub struct DurableContext<E: Send + 'static, R: Send + Sync + 'static> {
+    /// Shares the existing Effect runtime context; never a second interpreter.
+    context: crate::internal::macro_future::MacroContext<E, R>,
+}
+impl<E: Send + 'static, R: Send + Sync + 'static> DurableContext<E, R> {
+    /// Evaluate a supported durable description under the current runtime and tracing context.
+    pub async fn bind<A: Send + 'static, B: Send + 'static>(
+        &self,
+        program: Durable<A, E, R>,
+    ) -> Result<A, crate::Exit<B, E>> {
+        self.context.bind(program.effect).await
+    }
 }

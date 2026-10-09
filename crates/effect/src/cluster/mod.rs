@@ -51,3 +51,16 @@ pub use types::{
     ActivationId, ClusterAddress, ClusterEntityId, ClusterEntityType, ClusterIdentityError,
     ClusterObserverId, ClusterOwner, ClusterRequestId, ClusterShardId, OwnershipGeneration,
 };
+
+pub use entity_resource::EntityResourcePlan;
+#[doc(hidden)]
+pub use entity_resource::{EntityPlanBindable, EntityPlanContext};
+
+/// Resource-aware typed definitions and checked activation catalogs.
+mod entity_definition;
+pub use entity_definition::{
+    ClusterDefinition, ClusterDefinitionError, ClusterEntry, EntityDefinition,
+    EntityDefinitionError,
+};
+
+pub use entity_definition::{ActivatedEntity, EntityActivationEffect, EntityActivationError};
