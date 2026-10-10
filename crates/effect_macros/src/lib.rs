@@ -532,3 +532,232 @@ pub fn cluster(input: TokenStream) -> TokenStream {
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
+
+/// Native Identity capability, workflow and route DSL lowering.
+mod extension_identity;
+/// OTel convenience lowering over the existing Effect span/context path.
+mod extension_otel;
+/// HTTP description and owned endpoint/body DSL lowering.
+mod extension_server;
+/// SQL statement and selected session DSL lowering; no SQL runs at expansion time.
+mod extension_sql;
+/// Common hygienic lowering support for optional native extension descriptions.
+mod extension_support;
+/// Web policy, localization, cache and application DSL lowering.
+mod extension_web;
+
+/// Compose typed SQL syntax with `text`, `identifier`, `fragment`, `where` and `param` operations. Native parameters remain bound values, distinct from trusted syntax.
+#[proc_macro]
+pub fn sql(input: TokenStream) -> TokenStream {
+    extension_sql::expand("sql", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Describe a nonempty insert with `table:` and repeated `value(column, value)` entries. Construction validates shape; execution owns and binds each value.
+#[proc_macro]
+pub fn sql_insert(input: TokenStream) -> TokenStream {
+    extension_sql::expand("sql_insert", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Describe nonempty `set(column, value)` assignments for `table:` and one guarded `where(predicate)`. Duplicate guards and empty assignments are rejected during expansion.
+#[proc_macro]
+pub fn sql_update(input: TokenStream) -> TokenStream {
+    extension_sql::expand("sql_update", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Describe named or ordinal `column` reads, optional cells, refinements and scoped Effect validation. The row remains owned by its native query scope and cannot escape borrowed access.
+#[proc_macro]
+pub fn row(input: TokenStream) -> TokenStream {
+    extension_sql::expand("row", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Select a SQL service using `select:`, an explicit handle or projection, and `on_error:`. Inline `run |sql| { ... }` and extracted `run: helper` compose Effects without selecting a second runtime.
+#[proc_macro]
+pub fn sql_with(input: TokenStream) -> TokenStream {
+    extension_sql::expand("sql_with", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Describe an inert host with explicit `policy:`, `environment:`, `listen:`, `protocols:` and `routes:` plus native builder, application, middleware and WebSocket hooks. Serving starts only through the returned description’s run/use-host Effect.
+#[proc_macro]
+pub fn server(input: TokenStream) -> TokenStream {
+    extension_server::expand("server", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Describe a request Effect ending in a typed reply. Inline body, extracted Effect, preconditions, pipeline and scoped error handling execute per request; metadata and body ownership remain distinct.
+#[proc_macro]
+pub fn endpoint(input: TokenStream) -> TokenStream {
+    extension_server::expand("endpoint", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Attach registration-time name, tags, summary, description, metadata/filter/configure, accepts/produces/hosts and authorization policy to an endpoint. Registration does not consume a request or execute endpoint Effects.
+#[proc_macro]
+pub fn registered(input: TokenStream) -> TokenStream {
+    extension_server::expand("registered", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Build a typed reply with status, headers, cookies, trailers, validators and one terminal body. Text, HTML, JSON/direct codec, problem, bytes, stream/SSE, negotiation, native, redirect, file, no-content and empty forms preserve body lifetime and commitment.
+#[proc_macro]
+pub fn reply(input: TokenStream) -> TokenStream {
+    extension_server::expand("reply", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Describe checked media/language alternatives using text, HTML, JSON/direct codec, stream or general variants. Negotiation selects a renderer lazily before producing its body.
+#[proc_macro]
+pub fn representations(input: TokenStream) -> TokenStream {
+    extension_server::expand("representations", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Describe literals/prefix, name/tags/configure and typed capture, constrained, optional, default or catch-all segments. Link generation uses the same codecs and escaping as request matching.
+#[proc_macro]
+pub fn route(input: TokenStream) -> TokenStream {
+    extension_server::expand("route", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Assemble method routes, WebSocket routes, groups/configured groups, native services and fallback with scoped errors and middleware. Dynamic method and route descriptions retain typed validation.
+#[proc_macro]
+pub fn router(input: TokenStream) -> TokenStream {
+    extension_server::expand("router", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Compose reusable ordered route sets using includes, conditional or iterated sets and extracted modules. Route registration stays separate from per-request Effect execution.
+#[proc_macro]
+pub fn routes(input: TokenStream) -> TokenStream {
+    extension_server::expand("routes", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Compose ordered before/after/guard/on-exit/respond/set-header stages with inline or extracted Effect callbacks. Short-circuiting retains ownership of the awaited continuation and request cleanup.
+#[proc_macro]
+pub fn pipeline(input: TokenStream) -> TokenStream {
+    extension_server::expand("pipeline", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Construct a server body program with the shared stream lowering, scoped Effect/resource binds, incremental writes/framing/flush and delegation. Re-exported as `effect_server::stream!`; response completion owns finalization.
+#[proc_macro]
+pub fn server_stream(input: TokenStream) -> TokenStream {
+    extension_server::expand("server_stream", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Select typed accounts, sessions, keys, roles, permissions, challenges, queries, audit, consent, delivery, notifications, jobs, personal-data and native query capabilities. Selecting handles performs no persistence and grants no authority by itself.
+#[proc_macro]
+pub fn identity_store(input: TokenStream) -> TokenStream {
+    extension_identity::expand("identity_store", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Describe native Identity storage, typed errors, password/authenticator/external/passkey/email-confirmation policies, clock, components, admission and browser mode. Construction is inert; selected persistence has no implicit fallback.
+#[proc_macro]
+pub fn identity(input: TokenStream) -> TokenStream {
+    extension_identity::expand("identity", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Describe prefixed registration/login/recovery/authenticator/passkey/external/management/logout/refresh/antiforgery groups and custom GET/POST routes. Handlers and renderers compose through typed Effects and selected grants.
+#[proc_macro]
+pub fn identity_endpoints(input: TokenStream) -> TokenStream {
+    extension_identity::expand("identity_endpoints", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Assemble an inert application with root/native errors, startup, localization, environment, native hooks, security, observation, availability, output cache, protocols/listen and routes. The selected host owns initialization and cleanup.
+#[proc_macro]
+pub fn web(input: TokenStream) -> TokenStream {
+    extension_web::expand("web", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Compose explicit browser, CSP/nonce, trusted-forwarding, CORS/header/CSRF/authentication/authorization, compression/static-file, body-bound, method-override and HSTS policies. Nonces are bound per response and forwarding requires selected trust.
+#[proc_macro]
+pub fn security(input: TokenStream) -> TokenStream {
+    extension_web::expand("security", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Describe typed CSP directives and append operations with incompatible-source diagnostics. Per-response nonce sources remain distinct from static policy configuration.
+#[proc_macro]
+pub fn csp(input: TokenStream) -> TokenStream {
+    extension_web::expand("csp", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Acquire/project a scoped core cache with explicit loader, keys, retention, admission and failure-caching policy. Inline `loader |key| { ... }` and extracted loaders use the existing cache engine.
+#[proc_macro]
+pub fn read_through(input: TokenStream) -> TokenStream {
+    extension_web::expand("read_through", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Acquire/project the core dependency cache with explicit key and dependency capture/selection policies. Active-load invalidation delegates to the existing engine and does not create a second cache runtime.
+#[proc_macro]
+pub fn dependent_read_through(input: TokenStream) -> TokenStream {
+    extension_web::expand("dependent_read_through", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Describe service/error policy, readiness/health/liveness/process-liveness probes, deadlines, parallelism, traffic readiness and an optional dashboard. Probe outcomes remain classified rather than being reduced to booleans.
+#[proc_macro]
+pub fn availability(input: TokenStream) -> TokenStream {
+    extension_web::expand("availability", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Describe typed named `field(name, value)` arguments checked against the selected `message:` contract. Construction does not use raw string interpolation or erase argument types.
+#[proc_macro]
+pub fn message_arguments(input: TokenStream) -> TokenStream {
+    extension_web::expand("message_arguments", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Select catalogs, cultures, request selection, missing/fallback policy and scoped reload configuration. Catalog generations and reload failures remain explicit; selection performs no hidden global lookup.
+#[proc_macro]
+pub fn localization(input: TokenStream) -> TokenStream {
+    extension_web::expand("localization", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Run a named Effect through the existing span/context path with optional typed attributes and links. Inline `body { ... }` or extracted `effect:` supports lazy tags, events, count, log, status and link operations; construction exports nothing.
+#[proc_macro]
+pub fn otel(input: TokenStream) -> TokenStream {
+    extension_otel::expand("otel", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}

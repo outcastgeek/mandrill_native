@@ -52,6 +52,21 @@ pub struct DependencyCachePolicy<K, D, A: Send + 'static, E> {
     /// Optional or outcome-dependent retention lifetime, measured using the environment clock.
     pub ttl: CacheTtl<DependencyValue<A, D>, DependencyCacheError<E>>,
 }
+/// Explicit admission and dependency policies for active-load coalescing only.
+///
+/// Completed successes and failures are never retained. No retention capacity,
+/// TTL approximation or failure-caching setting is needed. Equality callbacks
+/// remain stable while keys/dependencies belong to active loads.
+pub struct DependencyCacheCoalescingPolicy<K, D> {
+    /// Maximum independent active producers; joining an existing producer uses no slot.
+    pub maximum_active: NonZeroUsize,
+    /// Maximum dependency identities accepted from a load or explicit replacement.
+    pub maximum_dependencies: NonZeroUsize,
+    /// Stable application equality used to join and locate active keys.
+    pub key_equal: Equal<K>,
+    /// Stable application equality used to fence dependency changes.
+    pub dependency_equal: Equal<D>,
+}
 /// A scoped [`Cache`] with dependency-driven invalidation and owned payloads.
 ///
 /// Clones share one engine. Active loads whose dependencies are not yet known, and
@@ -103,11 +118,9 @@ impl<K: Send + Sync + 'static, D: Send + Sync + 'static, A: Send + 'static, E: S
         policy: DependencyCachePolicy<K, D, A, E>,
         load: impl Fn(Arc<K>) -> Effect<(A, Vec<D>), E, R> + Send + Sync + 'static,
     ) -> Effect<Self, SharedValue<DependencyCacheError<E>>, R> {
-        let maximum_dependencies = policy.maximum_dependencies;
         let maximum_active = policy.maximum_active;
         let failure = Arc::clone(&policy.cache_failure);
-        let equal = policy.dependency_equal;
-        Cache::make_with_shared_key(
+        Self::make_configured_with_shared_key(
             scope,
             CacheConfig {
                 equal: policy.key_equal,
@@ -128,26 +141,85 @@ impl<K: Send + Sync + 'static, D: Send + Sync + 'static, A: Send + 'static, E: S
                     }),
                 },
             },
-            move |key| {
-                load(key).map_error(DependencyCacheError::Load).flat_map(
-                    move |(value, dependencies)| {
-                        if dependencies.len() > maximum_dependencies.get() {
-                            Effect::from_result_once(Err(
-                                DependencyCacheError::DependencyCapacity {
-                                    maximum: maximum_dependencies.get(),
-                                    observed: dependencies.len(),
-                                },
-                            ))
-                        } else {
-                            Effect::from_result_once(Ok(DependencyValue {
-                                value: SharedValue::new(value),
-                                dependencies: dependencies.into(),
-                            }))
-                        }
-                    },
-                )
-            },
+            policy.maximum_dependencies,
+            policy.dependency_equal,
+            load,
         )
+    }
+
+    /// Lazily acquire a dependency cache sharing active loads without retaining results.
+    /// The borrowed-key callback follows the same lifetime as [`Self::make`]; scope
+    /// closure, cancellation, dependency-width checks and invalidation use the same
+    /// core engine as the bounded retained configuration.
+    pub fn make_coalescing<R: HasClock + HasTaskSpawner + Send + Sync + 'static>(
+        scope: Scope<SharedValue<DependencyCacheError<E>>>,
+        policy: DependencyCacheCoalescingPolicy<K, D>,
+        load: impl Fn(&K) -> Effect<(A, Vec<D>), E, R> + Send + Sync + 'static,
+    ) -> Effect<Self, SharedValue<DependencyCacheError<E>>, R> {
+        Self::make_coalescing_with_shared_key(scope, policy, move |key| load(&key))
+    }
+
+    /// Lazily acquire active-load coalescing with an owned shared key for deferred loaders.
+    /// Native producers and waiters retain the same admission, dependency fencing,
+    /// ordered shutdown and non-Clone payload ownership as retained caches. A later
+    /// lookup starts a fresh load after the previous producer settles; completed
+    /// successes and errors are never retained, regardless of wall-clock time.
+    pub fn make_coalescing_with_shared_key<R: HasClock + HasTaskSpawner + Send + Sync + 'static>(
+        scope: Scope<SharedValue<DependencyCacheError<E>>>,
+        policy: DependencyCacheCoalescingPolicy<K, D>,
+        load: impl Fn(Arc<K>) -> Effect<(A, Vec<D>), E, R> + Send + Sync + 'static,
+    ) -> Effect<Self, SharedValue<DependencyCacheError<E>>, R> {
+        let maximum_active = policy.maximum_active;
+        Self::make_configured_with_shared_key(
+            scope,
+            CacheConfig {
+                equal: policy.key_equal,
+                ttl: None,
+                capacity: CacheCapacity::NoRetention,
+                cache_failure: Arc::new(|_| false),
+            },
+            CacheOptions {
+                ttl: CacheTtl::Fixed(None),
+                admission: CacheAdmission::Bounded {
+                    maximum: maximum_active,
+                    capacity_error: Arc::new(move || DependencyCacheError::ActiveCapacity {
+                        maximum: maximum_active.get(),
+                    }),
+                },
+            },
+            policy.maximum_dependencies,
+            policy.dependency_equal,
+            load,
+        )
+    }
+
+    /// Build either retention mode over one scoped cache implementation, preserving
+    /// common loader validation, active admission and dependency indexing behavior.
+    fn make_configured_with_shared_key<R: HasClock + HasTaskSpawner + Send + Sync + 'static>(
+        scope: Scope<SharedValue<DependencyCacheError<E>>>,
+        config: CacheConfig<K, DependencyCacheError<E>>,
+        options: CacheOptions<DependencyValue<A, D>, DependencyCacheError<E>>,
+        maximum_dependencies: NonZeroUsize,
+        equal: Equal<D>,
+        load: impl Fn(Arc<K>) -> Effect<(A, Vec<D>), E, R> + Send + Sync + 'static,
+    ) -> Effect<Self, SharedValue<DependencyCacheError<E>>, R> {
+        Cache::make_with_shared_key(scope, config, options, move |key| {
+            load(key).map_error(DependencyCacheError::Load).flat_map(
+                move |(value, dependencies)| {
+                    if dependencies.len() > maximum_dependencies.get() {
+                        Effect::from_result_once(Err(DependencyCacheError::DependencyCapacity {
+                            maximum: maximum_dependencies.get(),
+                            observed: dependencies.len(),
+                        }))
+                    } else {
+                        Effect::from_result_once(Ok(DependencyValue {
+                            value: SharedValue::new(value),
+                            dependencies: dependencies.into(),
+                        }))
+                    }
+                },
+            )
+        })
         .map(move |cache| Self {
             cache,
             equal: Arc::clone(&equal),

@@ -358,6 +358,10 @@ where
     // Accepted jobs retain their provider environment even if their awaiting
     // interpreter is abandoned. No second provider configuration is introduced.
     let job_env = Arc::clone(&env);
+    // Re-enter native context on the provider worker, rather than carrying a
+    // thread-local guard across submission or awaiting the completion future.
+    let instrumentation = context.instrumentation.clone();
+    let native_trace = context.trace.clone();
     let mut owner = Owner {
         cancellation: context.cancellation.child(),
         settled: false,
@@ -371,10 +375,13 @@ where
                     JobAction::Run(cancellation) if cancellation.is_requested() => {
                         discarded(callback, Exit::Interrupted)
                     }
-                    JobAction::Run(cancellation) => {
-                        catch_unwind(AssertUnwindSafe(|| callback(cancellation)))
-                            .unwrap_or_else(|panic| Exit::Die(Defect::from_panic(panic)))
-                    }
+                    JobAction::Run(cancellation) => catch_unwind(AssertUnwindSafe(|| {
+                        let _guard = instrumentation
+                            .as_ref()
+                            .map(|hook| hook.enter(&native_trace));
+                        callback(cancellation)
+                    }))
+                    .unwrap_or_else(|panic| Exit::Die(Defect::from_panic(panic))),
                     JobAction::Lost => discarded(
                         callback,
                         Exit::Die(Defect::from(LibraryDefect::ScheduledJobDropped)),

@@ -60,7 +60,7 @@ pub use json_schema::{
     JsonSchemaDocument, RepresentationError, RepresentationLimits, RepresentationPrecision,
     export_json_schema,
 };
-pub use json_writer::{JsonWriter, JsonWriterPolicy};
+pub use json_writer::{JsonWriter, JsonWriterPolicy, JsonWriterSink};
 pub use native_codec::{
     JsonRepresentation, NativeField, NativeFields, NativeNil, NativeRecordBuilder,
     ObjectRepresentation, SequenceRepresentation, native_array, native_map,

@@ -79,8 +79,12 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
     ///
     /// # Returns
     /// Type: `Step`.
+    /// Tag this transition with its selected native context and restore that
+    /// context before the caller continuation, without retaining thread guards.
     pub(crate) fn execute(self, env: Arc<R>, context: Context, finish: Finish<A, E>) -> Step {
-        runtime::more(move || {
+        let instrumentation_context = context.clone();
+        let finish = runtime::instrument_finish(finish, context.clone());
+        let step = runtime::more(move || {
             context.begin_operation();
             if context.cancelled() {
                 return runtime::finish(finish, Exit::Interrupted);
@@ -92,7 +96,8 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
                     Exit::Die(Defect::from(LibraryDefect::MissingEffectRecipe)),
                 ),
             }
-        })
+        });
+        runtime::instrument_step(step, instrumentation_context)
     }
 
     /// # Type parameters

@@ -39,17 +39,17 @@ impl Session {
 impl RpcStreamSession for Session {
     /// Transport failures are distinct from the café's typed business errors.
     type Error = ();
-    /// Defer consuming the next accepted frame until the Effect executes.
-    fn receive_frame(&self) -> Effect<Option<Vec<u8>>, ()> {
-        let input = self.input.clone();
-        Effect::sync_once(move || input.lock().expect("input").pop_front())
-    }
     /// Transfer ownership of a produced frame into the transport output.
     fn send(&self, frame: FrameParts) -> Effect<(), ()> {
         let output = self.output.clone();
         Effect::sync_once(move || {
             output.lock().expect("output").push(frame);
         })
+    }
+    /// Defer consuming the next accepted frame until the Effect executes.
+    fn receive_frame(&self) -> Effect<Option<Vec<u8>>, ()> {
+        let input = self.input.clone();
+        Effect::sync_once(move || input.lock().expect("input").pop_front())
     }
     /// Mark the accepted session closed during protected cleanup.
     fn close(&self) -> Effect<(), ()> {

@@ -1,0 +1,53 @@
+[package]
+name = "effect-server-web"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+
+[features]
+default = []
+identity = ["dep:effect-server-identity"]
+otel = ["dep:effect-otel", "effect-otel/server"]
+maud = ["dep:maud", "effect-server-identity?/maud"]
+# Safe database observation uses only the existing local SQLx/Turso family.
+sqlx-turso = ["dep:effect-sql", "effect-sql/sync", "effect-server-identity?/sqlx-turso"]
+# A supplied registry is encoded by the official Prometheus client.
+prometheus = ["dep:prometheus"]
+
+[dependencies]
+effect = { path = "../effect" }
+effect-macros = { path = "../effect_macros" }
+effect-server = { path = "../effect_server" }
+effect-server-identity = { path = "../effect_server_identity", optional = true }
+effect-otel = { path = "../effect_otel", optional = true }
+effect-sql = { path = "../effect_sql", optional = true, default-features = false }
+prometheus = { version = "0.14.0", optional = true, default-features = false }
+maud = { workspace = true, optional = true }
+axum = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tower-http = { workspace = true, features = ["cors", "compression-full", "set-header", "fs", "limit", "trace"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+futures-util = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "fs"] }
+
+[target.'cfg(unix)'.dependencies]
+# POSIX getrusage backs the native process diagnostic capability.
+libc = "0.2.189"
+
+[dev-dependencies]
+effect-tokio = { path = "../effect_tokio" }
+opentelemetry = { workspace = true, features = ["trace", "metrics", "logs"] }
+opentelemetry_sdk = { workspace = true, features = ["trace", "metrics", "logs", "testing"] }
+time = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+tokio = { workspace = true, features = ["signal"] }
+
+[[example]]
+name = "cafe_application"
+required-features = ["identity", "otel", "sqlx-turso"]
+
+[lints]
+workspace = true

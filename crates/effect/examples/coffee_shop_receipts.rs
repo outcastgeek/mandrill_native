@@ -95,18 +95,25 @@ pub enum SalesProblem {
 type CoffeeShop = Cafe<(), SalesBook>;
 /// Real order payload shared by mobile and counter receipt events.
 fn order_schema() -> PureCodec<CoffeeOrder, JsonValue> {
-    schema! { struct CoffeeOrder { number: json_string(), customer: json_string(), drink: json_string(), quantity: json_i64(), unit_cents: json_i64() }
-        policy: parse_policy() }.expect("receipt order schema")
+    schema! {
+        struct CoffeeOrder { number: json_string(), customer: json_string(), drink: json_string(), quantity: json_i64(), unit_cents: json_i64() }
+        policy: parse_policy()
+    }.expect("receipt order schema")
 }
 /// Receipt success values include explicit money units and customer details.
 fn receipt_schema() -> PureCodec<Receipt, JsonValue> {
-    schema! { struct Receipt { number: json_string(), customer: json_string(), drink: json_string(), cups: json_i64(), total_cents: json_i64() }
-        policy: parse_policy() }.expect("receipt schema")
+    schema! {
+        struct Receipt { number: json_string(), customer: json_string(), drink: json_string(), cups: json_i64(), total_cents: json_i64() }
+        policy: parse_policy()
+    }.expect("receipt schema")
 }
 /// Receipt business errors are recorded with their actual variant.
 fn problem_schema() -> PureCodec<ReceiptProblem, JsonValue> {
-    schema_enum! { enum ReceiptProblem { InvalidQuantity => "invalid-quantity", InvalidPrice => "invalid-price" }
-        tag_field: "problem", content_field: "details", policy: parse_policy() }.expect("receipt problem schema")
+    schema_enum! {
+        enum ReceiptProblem { InvalidQuantity => "invalid-quantity", InvalidPrice => "invalid-price" }
+        tag_field: "problem", content_field: "details", policy: parse_policy()
+    }
+    .expect("receipt problem schema")
 }
 /// Application calculation produces a receipt, without an executor or journal façade.
 fn issue_receipt(order: &CoffeeOrder) -> Result<Receipt, ReceiptProblem> {
@@ -164,19 +171,23 @@ fn show_receipt(receipt: &Receipt) {
 fn receipt_book() -> Effect<(), SalesProblem, CoffeeShop> {
     effect! {
         let group = EventGroupId::new("coffee-shop-receipts").expect("receipt group");
-        let mobile = event! { group: group.clone(), tag: EventTag::new("mobile-receipt").expect("event tag"), version: EventVersion::new(NonZeroU32::MIN),
+        let mobile = event! {
+            group: group.clone(), tag: EventTag::new("mobile-receipt").expect("event tag"), version: EventVersion::new(NonZeroU32::MIN),
             payload: order_schema(), success: receipt_schema(), error: problem_schema(), payload_identity: binary("receipt-order"),
             success_identity: binary("customer-receipt"), error_identity: binary("receipt-problem"), limits: binary_limits() };
-        let mobile_receipt = handled_event! { definition: mobile.clone(), aggregate: |_: &CoffeeOrder| sales_day(), commit: EventCommitPolicy::SuccessOnly,
-            handler |order: Arc<CoffeeOrder>| { Effect::<Result<Receipt, ReceiptProblem>, Infallible, CoffeeShop>::sync_once(move || issue_receipt(&order))? }
+        let mobile_receipt = handled_event! {
+            definition: mobile.clone(), aggregate: |_: &CoffeeOrder| sales_day(), commit: EventCommitPolicy::SuccessOnly,
+            handler |order: Arc<CoffeeOrder>| { issue_receipt(&order) }
         };
-        let counter = event! { group: group.clone(), tag: EventTag::new("counter-receipt").expect("event tag"), version: EventVersion::new(NonZeroU32::MIN),
+        let counter = event! {
+            group: group.clone(), tag: EventTag::new("counter-receipt").expect("event tag"), version: EventVersion::new(NonZeroU32::MIN),
             payload: order_schema(), success: receipt_schema(), error: problem_schema(), payload_identity: binary("receipt-order"),
             success_identity: binary("customer-receipt"), error_identity: binary("receipt-problem"), limits: binary_limits(), aggregate: |_: &CoffeeOrder| sales_day() };
-        let counter_receipt = handled_event! { definition: counter, commit: EventCommitPolicy::SuccessOnly,
+        let counter_receipt = handled_event! {
+            definition: counter, commit: EventCommitPolicy::SuccessOnly,
             handler |context: EventHandlerContext, order: Arc<CoffeeOrder>| {
                 println!("Sam files counter ticket {} after {} earlier sale(s).", order.number, context.expected.value());
-                Effect::<Result<Receipt, ReceiptProblem>, Infallible, CoffeeShop>::sync_once(move || issue_receipt(&order))?
+                issue_receipt(&order)
             }
         };
         let channels = event_group! { group: group.clone(), events: [&mobile, &counter_receipt] }.expect("receipt channels");
@@ -200,7 +211,8 @@ fn receipt_book() -> Effect<(), SalesProblem, CoffeeShop> {
             ((group, EventTag::new("counter-receipt").expect("tag")), EventVersion::new(NonZeroU32::MIN)),
         ]);
         let stream = JournalStream { journal, aggregate: sales_day() };
-        let register_book = projection! { key: ProjectionKey { id: ProjectionId::from_stable(key("register-receipt-book")), stream: stream.clone() },
+        let register_book = projection! {
+            key: ProjectionKey { id: ProjectionId::from_stable(key("register-receipt-book")), stream: stream.clone() },
             version: ProjectionVersion::new(NonZeroU32::MIN), accepted: accepted, initial: SalesBook::default,
             fold: move |book: &SalesBook, entry: &JournalEntry| {
                 let definition = if entry.event.tag.as_str() == "mobile-receipt" { &raw_mobile } else { &raw_counter };
@@ -208,7 +220,8 @@ fn receipt_book() -> Effect<(), SalesProblem, CoffeeShop> {
                 add_receipt(book, receipt)
             }
         };
-        let daily_sales = projection! { key: ProjectionKey { id: ProjectionId::from_stable(key("daily-drink-sales")), stream: stream },
+        let daily_sales = projection! {
+            key: ProjectionKey { id: ProjectionId::from_stable(key("daily-drink-sales")), stream: stream },
             version: ProjectionVersion::new(NonZeroU32::MIN), initial: SalesBook::default,
             cases: [mobile => count_sale, counter_definition => |book: &SalesBook, _order: CoffeeOrder, receipt: Result<Receipt, ReceiptProblem>| add_receipt(book, receipt)]
         }.expect("daily sales cases");

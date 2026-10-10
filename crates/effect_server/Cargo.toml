@@ -1,0 +1,43 @@
+[package]
+name = "effect-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+
+[features]
+default = ["http1", "http2", "websocket"]
+http1 = ["axum/http1", "hyper/http1", "hyper-util/http1"]
+http2 = ["axum/http2", "hyper/http2", "hyper-util/http2"]
+websocket = ["axum/ws"]
+
+[dependencies]
+effect = { path = "../effect" }
+effect-macros = { path = "../effect_macros" }
+axum = { workspace = true, features = ["tokio", "matched-path", "original-uri", "query", "form", "multipart", "json", "tracing"] }
+bytes = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+# Native connection builders honor the selected per-host protocol policy.
+hyper = { workspace = true, features = ["server"] }
+hyper-util = { workspace = true, features = ["server", "server-auto", "server-graceful", "service", "tokio"] }
+tower = { workspace = true, features = ["util", "make"] }
+headers = { workspace = true }
+cookie = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
+tokio = { workspace = true, features = ["net", "sync", "time", "fs", "io-util"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+percent-encoding = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+hyper = { workspace = true, features = ["client"] }
+effect-otel = { path = "../effect_otel", features = ["server"] }
+effect-tokio = { path = "../effect_tokio" }
+opentelemetry = { workspace = true, features = ["trace", "metrics", "logs"] }
+opentelemetry_sdk = { workspace = true, features = ["trace", "metrics", "logs", "testing"] }
+
+[lints]
+workspace = true

@@ -21,6 +21,9 @@ use crate::{Turso, TursoStatement, driver::TursoDriverConnection, options::Turso
 #[cfg(feature = "migrate")]
 use crate::TursoDatabaseTarget;
 
+/// Native SQLx result stream whose caller retains exclusive connection ownership.
+type OwnedCursorItems = futures_core::stream::BoxStream<'static, Result<either::Either<crate::TursoQueryResult, crate::TursoRow>, Error>>;
+
 /// SQLx connection handle for Turso databases
 pub struct TursoConnection {
     options: TursoConnectOptions,
@@ -108,6 +111,36 @@ impl TransactionState {
 }
 
 impl TursoConnection {
+    /// Open an owned native cursor while the caller retains exclusive connection authority.
+    ///
+    /// The cursor owns native statement/row state, but does not own this SQLx
+    /// lease. The caller must keep this connection unavailable to other work
+    /// until the cursor is dropped. This is the execution kernel's scoped
+    /// streaming boundary; unrestricted native handle clones remain private.
+    pub async fn owned_cursor(
+        &mut self,
+        sql: sqlx_core::sql_str::SqlStr,
+        arguments: Option<crate::TursoArguments>,
+    ) -> Result<OwnedCursorItems, Error> {
+        self.fetch_many_sql(sql, true, arguments).await
+    }
+
+    /// Resolve every transaction before disposing an exclusively transferred owner.
+    ///
+    /// This drains SQLx's pending rollback first, then awaits native rollback for
+    /// any remaining transaction, including an adopted native outer transaction.
+    /// Only a connection's disposing owner may call this: lifetime-bound borrowed
+    /// native transactions retain their caller's outer commit/rollback authority.
+    /// A failure means state is unresolved and the owner must not return to a pool.
+    pub async fn settle_owned(&mut self) -> Result<(), Error> {
+        self.clear_pending_rollback().await?;
+        if !self.raw.is_autocommit().map_err(crate::executor::map_turso_error)? {
+            self.raw.execute("ROLLBACK", ()).await.map_err(crate::executor::map_turso_error)?;
+        }
+        self.transaction_state = TransactionState::default();
+        Ok(())
+    }
+
     pub(crate) fn new(options: TursoConnectOptions, connection: TursoDriverConnection) -> Self {
         Self::new_with_transaction_state(options, connection, TransactionState::default())
     }

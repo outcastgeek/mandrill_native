@@ -13,7 +13,7 @@ use effect::persistence::{
 use effect::{
     Codec, Effect, Exit, JsonRepresentation, JsonValue, KeyNamespace, PureCodec, SchemaIssue,
     StoredOutcome, UnknownFields, effect, json_i64, json_nullable, json_string, persistable,
-    schema, schema_enum,
+    schema, schema_enum, service,
 };
 use std::sync::Arc;
 
@@ -93,29 +93,37 @@ pub enum DraftProblem {
 type CoffeeShop = Cafe<CounterDefaults>;
 /// Explicit milk tags make the wire model independent of Rust type names.
 fn milk_schema() -> PureCodec<Milk, JsonValue> {
-    schema_enum! { enum Milk { Dairy => "dairy", Oat => "oat" }
-    tag_field: "kind", content_field: "details", policy: parse_policy() }
+    schema_enum! {
+        enum Milk { Dairy => "dairy", Oat => "oat" }
+        tag_field: "kind", content_field: "details", policy: parse_policy()
+    }
     .expect("milk schema")
 }
 /// Unit, named-field, and tuple variants describe actual drink choices.
 fn drink_schema() -> PureCodec<Drink, JsonValue> {
-    schema_enum! { enum Drink {
-        Americano => "americano", Latte { milk: milk_schema() } => "latte", Cappuccino(milk_schema()) => "cappuccino"
-    } tag_field: "drink", content_field: "options", policy: parse_policy() }.expect("drink schema")
+    schema_enum! {
+        enum Drink {
+            Americano => "americano", Latte { milk: milk_schema() } => "latte", Cappuccino(milk_schema()) => "cappuccino"
+        } tag_field: "drink", content_field: "options", policy: parse_policy()
+    }.expect("drink schema")
 }
 /// Named cup sizes have explicit stable wire tags.
 fn size_schema() -> PureCodec<Size, JsonValue> {
-    schema_enum! { enum Size { Regular => "regular", Large => "large" }
-    tag_field: "kind", content_field: "details", policy: parse_policy() }
+    schema_enum! {
+        enum Size { Regular => "regular", Large => "large" }
+        tag_field: "kind", content_field: "details", policy: parse_policy()
+    }
     .expect("size schema")
 }
 /// Pure record codec is used to store and later borrow/decode a complete draft.
 fn order_schema() -> PureCodec<CoffeeOrder, JsonValue> {
-    schema! { struct CoffeeOrder {
-        customer: json_string(), drink: drink_schema(), size: size_schema(),
-        quantity: json_i64() => (|| 1, |quantity: &i64| *quantity == 1, Arc::new(JsonValue::from(1))),
-        note: json_nullable(json_string()) => (|| None, Option::is_none)
-    } policy: parse_policy() }.expect("stored order schema")
+    schema! {
+        struct CoffeeOrder {
+            customer: json_string(), drink: drink_schema(), size: size_schema(),
+            quantity: json_i64() => (|| 1, |quantity: &i64| *quantity == 1, Arc::new(JsonValue::from(1))),
+            note: json_nullable(json_string()) => (|| None, Option::is_none)
+        } policy: parse_policy()
+    }.expect("stored order schema")
 }
 /// Share an immutable saved draft while decoding a fresh owned model from each stored record.
 fn saved_draft_schema() -> PureCodec<Arc<CoffeeOrder>, JsonValue> {
@@ -126,20 +134,28 @@ fn saved_draft_schema() -> PureCodec<Arc<CoffeeOrder>, JsonValue> {
 }
 /// The online editor defaults size through the café service and quantity to one.
 fn order_form() -> Codec<CoffeeOrder, JsonValue, CoffeeShop, CoffeeShop> {
-    schema! { struct CoffeeOrder {
-        customer: json_string().into_effect::<CoffeeShop, CoffeeShop>(),
-        drink: drink_schema().into_effect::<CoffeeShop, CoffeeShop>(),
-        #[schema(default_with = || Effect::service(|cafe: &CoffeeShop| cafe.services.size.clone()))]
-        size: size_schema().into_effect::<CoffeeShop, CoffeeShop>(),
-        #[schema(default_with = || Effect::succeed(1i64))]
-        quantity: json_i64().into_effect::<CoffeeShop, CoffeeShop>(),
-        #[schema(optional)] note: json_nullable(json_string()).into_effect::<CoffeeShop, CoffeeShop>()
-    } policy: parse_policy(), representation: JsonRepresentation, unknown_fields: UnknownFields::Reject }.expect("online order form")
+    schema! {
+        struct CoffeeOrder {
+            customer: json_string().into_effect::<CoffeeShop, CoffeeShop>(),
+            drink: drink_schema().into_effect::<CoffeeShop, CoffeeShop>(),
+            #[schema(default_with = || service! {
+                select: |cafe: &CoffeeShop| cafe.services.clone(),
+                on_error: |problem: SchemaIssue| problem,
+                run |defaults: &Arc<CounterDefaults>| { defaults.size.clone() }
+            })]
+            size: size_schema().into_effect::<CoffeeShop, CoffeeShop>(),
+            #[schema(default_with = || effect! { 1i64 })]
+            quantity: json_i64().into_effect::<CoffeeShop, CoffeeShop>(),
+            #[schema(optional)] note: json_nullable(json_string()).into_effect::<CoffeeShop, CoffeeShop>()
+        } policy: parse_policy(), representation: JsonRepresentation, unknown_fields: UnknownFields::Reject
+    }.expect("online order form")
 }
 /// Typed order failures can also be stored without reducing them to strings.
 fn problem_schema() -> PureCodec<OrderProblem, JsonValue> {
-    schema_enum! { enum OrderProblem { MissingName => "missing-name", InvalidQuantity { maximum: json_i64() } => "quantity" }
-        tag_field: "problem", content_field: "details", policy: parse_policy() }.expect("order feedback schema")
+    schema_enum! {
+        enum OrderProblem { MissingName => "missing-name", InvalidQuantity { maximum: json_i64() } => "quantity" }
+        tag_field: "problem", content_field: "details", policy: parse_policy()
+    }.expect("order feedback schema")
 }
 /// Keep stable draft identity separate from the order's mutable contents.
 fn draft_identity(identity: &String) -> &str {

@@ -18,8 +18,9 @@ use effect::rpc::{OperationId, RpcVersion};
 use effect::{
     CalendarTimeError, CalendarTransitionPolicy, Cron, CronSearchBudget, DayMatch, Effect, Exit,
     FixedOffsetZone, GapPolicy, JsonValue, MissedOccurrencePolicy, OverlapPolicy, PureCodec,
-    Release, ResourceBinding, ResourceValue, Scope, UtcMillis, cluster, cluster_schedule, effect,
-    entity, entity_resource, json_i64, json_string, rpc_operation, schema, schema_enum, singleton,
+    Release, ResourceBinding, ResourceValue, Scope, TestWallClock, UtcMillis, cluster,
+    cluster_schedule, effect, entity, entity_resource, json_i64, json_string, rpc_operation,
+    schema, schema_enum, service, singleton,
 };
 use std::convert::Infallible;
 use std::num::NonZeroU32;
@@ -85,8 +86,10 @@ fn status_schema() -> PureCodec<OrderStatus, JsonValue> {
 }
 /// Customer error codec preserves the ticket mismatch as business feedback.
 fn problem_schema() -> PureCodec<CounterProblem, JsonValue> {
-    schema_enum! { enum CounterProblem { UnknownTicket => "unknown-ticket" }
-    tag_field: "problem", content_field: "details", policy: parse_policy() }
+    schema_enum! {
+        enum CounterProblem { UnknownTicket => "unknown-ticket" }
+        tag_field: "problem", content_field: "details", policy: parse_policy()
+    }
     .expect("counter problem")
 }
 /// Reusable activation resource helper opens and releases the barista's ticket pad.
@@ -120,12 +123,14 @@ fn check_pickup_pad() -> Effect<(), ClosingProblem, CoffeeShop> {
         effect! {
             let scope = scope.clone();
             let ticket_type = ClusterEntityType::new("coffee-pickup-ticket").expect("ticket type");
-            let status = rpc_operation! { id: OperationId::new("pickup-status").expect("operation"), version: RpcVersion::new(NonZeroU32::MIN),
+            let status = rpc_operation! {
+                id: OperationId::new("pickup-status").expect("operation"), version: RpcVersion::new(NonZeroU32::MIN),
                 request: json_string(), success: status_schema(), error: problem_schema(), limits: limits() };
             let wire_request = request(&status, "maya-pickup", &String::from("104"));
             let pad = entity! { entity_type: ticket_type.clone(), resources: pickup_pad(), handlers: [status => pickup_status] };
             let counter_type = ClusterEntityType::new("coffee-counter").expect("counter type");
-            let cups = rpc_operation! { id: OperationId::new("waiting-cups").expect("operation"), version: RpcVersion::new(NonZeroU32::MIN),
+            let cups = rpc_operation! {
+                id: OperationId::new("waiting-cups").expect("operation"), version: RpcVersion::new(NonZeroU32::MIN),
                 request: json_string(), success: json_i64(), error: problem_schema(), limits: limits(), handler |_barista: String| {
                     println!("Counter inspection: two oat-latte cups await Maya."); 2i64
                 }
@@ -146,7 +151,11 @@ fn check_pickup_pad() -> Effect<(), ClosingProblem, CoffeeShop> {
             counter.execute(counter_address, Arc::from(notice_request)).map_error(ClosingProblem::Counter)?;
             let catalog: ClusterDefinition<ClosingProblem, CoffeeShop> = cluster! { policy: rpc_policy(), entities: [pad, (counter_type, counter)] }.expect("café catalog");
             let address = ClusterAddress { entity_type: ticket_type, entity: ClusterEntityId::from_stable(key("order-104")), shard: ClusterShardId::from_stable(key("cafe")) };
-            let store = Effect::service(|cafe: &CoffeeShop| cafe.activation.clone())?;
+            let store = service! {
+                select: |cafe: &CoffeeShop| cafe.activation.clone(),
+                on_error: |problem: ClosingProblem| problem,
+                run |store| { Arc::clone(store) }
+            }?;
             let ownership = store.activate(address.clone(), ActivationId::from_stable(key("sam-order-104")), UtcMillis::new(0), UtcMillis::new(100))
                 .provide_some(|_: &CoffeeShop| ()).map_error(ClosingProblem::Store)?;
             let owner = match ownership {
@@ -163,9 +172,13 @@ fn closing_shift() -> Effect<(), ClosingProblem, CoffeeShop> {
     effect! {
         check_pickup_pad()?;
         let closing_time = UtcMillis::new(17 * 60 * 60 * 1000);
-        let cafe = Effect::service(|cafe: &CoffeeShop| cafe.wall.clone())?;
-        cafe.set(closing_time);
-        let schedule = cluster_schedule! { id: ClusterScheduleId::from_stable(key("daily-counter-close")),
+        service! {
+            select: |cafe: &CoffeeShop| cafe.wall.clone(),
+            on_error: |problem: ClosingProblem| problem,
+            run |clock: &TestWallClock| { clock.set(closing_time); }
+        }?;
+        let schedule = cluster_schedule! {
+            id: ClusterScheduleId::from_stable(key("daily-counter-close")),
             cron: Cron::parse("0 0 17 * * *", DayMatch::Both).expect("daily closing time"),
             transitions: CalendarTransitionPolicy { gap: GapPolicy::Skip, overlap: OverlapPolicy::Earlier },
             catch_up: MissedOccurrencePolicy::Latest, concurrent: ConcurrentOccurrencePolicy::Skip, deadline_after: Duration::from_secs(60) };
@@ -173,8 +186,10 @@ fn closing_shift() -> Effect<(), ClosingProblem, CoffeeShop> {
             &FixedOffsetZone::east_seconds(0).expect("UTC café clock"), CronSearchBudget { days: nz(3), candidates: nz(4) }, false)).map_error(ClosingProblem::Calendar)?;
         for occurrence in due {
             println!("The daily 17:00 UTC closing task is due ({:?}).", occurrence.disposition);
-            let closed = singleton! { singleton: ClusterSingleton::new(ClusterAddress { entity_type: ClusterEntityType::new("cafe-closing-shift").expect("closing type"),
-                entity: ClusterEntityId::from_stable(key("front-counter-close")), shard: ClusterShardId::from_stable(key("cafe")) }),
+            let closed = singleton! {
+                singleton: ClusterSingleton::new(ClusterAddress {
+                    entity_type: ClusterEntityType::new("cafe-closing-shift").expect("closing type"),
+                    entity: ClusterEntityId::from_stable(key("front-counter-close")), shard: ClusterShardId::from_stable(key("cafe")) }),
                 activation: ActivationId::from_stable(key("sam-closing-shift")), lease_until: UtcMillis::new(17 * 60 * 60 * 1000 + 100), run |_owner: ClusterOwner| {
                     Effect::<ClosingSummary, CounterProblem, CoffeeShop>::cpu_once(|_| ClosingSummary { barista: "Sam".into(), waiting_cups: 2 })?
                 }

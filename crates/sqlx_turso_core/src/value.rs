@@ -184,11 +184,15 @@ impl<'r> TursoValueRef<'r> {
     }
 
     #[cfg(any(feature = "chrono", feature = "time"))]
+    /// Preserve temporal storage classes; only chrono consumes a REAL's Julian-day value.
     fn text_or_integer_or_real(&self) -> Result<TursoTemporalValue<'r>, BoxDynError> {
         match &self.value.kind {
             TursoValueKind::Text(value) => Ok(TursoTemporalValue::Text(value)),
             TursoValueKind::Integer(value) => Ok(TursoTemporalValue::Integer(*value)),
-            TursoValueKind::Real(value) => Ok(TursoTemporalValue::Real(*value)),
+            TursoValueKind::Real(_value) => Ok(TursoTemporalValue::Real {
+                #[cfg(feature = "chrono")]
+                value: *_value,
+            }),
             TursoValueKind::Null | TursoValueKind::Blob(_) => Err(Box::new(
                 TursoAdapterError::unsupported("decoding non-temporal Turso value as temporal"),
             )),
@@ -197,10 +201,18 @@ impl<'r> TursoValueRef<'r> {
 }
 
 #[cfg(any(feature = "chrono", feature = "time"))]
+/// Native temporal storage classes without carrying unsupported conversion payloads.
 enum TursoTemporalValue<'r> {
+    /// Borrowed temporal text.
     Text(&'r str),
+    /// Integer Unix timestamp.
     Integer(i64),
-    Real(f64),
+    /// REAL remains distinct from integer even when the selected decoder rejects it.
+    Real {
+        /// Julian-day value consumed by chrono's existing conversion.
+        #[cfg(feature = "chrono")]
+        value: f64,
+    },
 }
 
 impl<'r> ValueRef<'r> for TursoValueRef<'r> {
@@ -930,13 +942,14 @@ impl<'r> Decode<'r, Turso> for chrono::NaiveTime {
 }
 
 #[cfg(feature = "chrono")]
+/// Decode native temporal storage using chrono's existing text, Unix and Julian-day paths.
 fn decode_chrono_datetime(
     value: TursoValueRef<'_>,
 ) -> Result<chrono::DateTime<chrono::FixedOffset>, BoxDynError> {
     let datetime = match value.text_or_integer_or_real()? {
         TursoTemporalValue::Text(value) => decode_chrono_datetime_from_text(value),
         TursoTemporalValue::Integer(value) => decode_chrono_datetime_from_int(value),
-        TursoTemporalValue::Real(value) => decode_chrono_datetime_from_real(value),
+        TursoTemporalValue::Real { value } => decode_chrono_datetime_from_real(value),
     };
 
     if let Some(datetime) = datetime {
@@ -1145,6 +1158,7 @@ impl<'r> Decode<'r, Turso> for time::Time {
 }
 
 #[cfg(feature = "time")]
+/// Decode text or integer instants while preserving sqlx time's rejection of REAL values.
 fn decode_time_offset_datetime(
     value: TursoValueRef<'_>,
 ) -> Result<time::OffsetDateTime, BoxDynError> {
@@ -1154,13 +1168,14 @@ fn decode_time_offset_datetime(
         TursoTemporalValue::Text(value) => time::OffsetDateTime::parse(value, &Rfc3339)
             .or_else(|_| decode_time_primitive_datetime_from_text(value).map(|dt| dt.assume_utc())),
         TursoTemporalValue::Integer(value) => Ok(time::OffsetDateTime::from_unix_timestamp(value)?),
-        TursoTemporalValue::Real(_) => Err("REAL datetimes are not supported by sqlx time".into()),
+        TursoTemporalValue::Real { .. } => Err("REAL datetimes are not supported by sqlx time".into()),
     }?;
 
     Ok(datetime)
 }
 
 #[cfg(feature = "time")]
+/// Decode text or integer timestamps while preserving sqlx time's rejection of REAL values.
 fn decode_time_primitive_datetime(
     value: TursoValueRef<'_>,
 ) -> Result<time::PrimitiveDateTime, BoxDynError> {
@@ -1170,7 +1185,7 @@ fn decode_time_primitive_datetime(
             let parsed = time::OffsetDateTime::from_unix_timestamp(value)?;
             Ok(time::PrimitiveDateTime::new(parsed.date(), parsed.time()))
         }
-        TursoTemporalValue::Real(_) => Err("REAL datetimes are not supported by sqlx time".into()),
+        TursoTemporalValue::Real { .. } => Err("REAL datetimes are not supported by sqlx time".into()),
     }?;
 
     Ok(datetime)

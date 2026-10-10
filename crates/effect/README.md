@@ -155,6 +155,20 @@ binds and one execution boundary in `main`. Prices use integral cents and are
 printed as dollars. `CoffeeOrder`, `Basket`, `Receipt`, and the other café models
 are application functionality; the explicitly imported Effect types and macros
 provide composition, resource lifetimes, recording, and reactive updates.
+Inside `effect!`, `service!`, and inline domain callbacks, ordinary statements
+and return values already belong to the deferred recipe. Ticket construction,
+request cleanup, status values, and receipt calculations use those bodies
+directly. Explicit constructors remain at required resource, typed Result,
+CPU/blocking, codec, and provider boundaries.
+
+Macro layout is enforced by a source test: if a braced group spans multiple
+source lines, its first code token must start after the opening brace's line.
+This includes nested groups inside macro inputs. One-line groups are allowed;
+normal comments are omitted, doc-comment attributes are skipped, and literal
+interiors are not traversed. Run the focused check with
+`cargo +1.99.0 test --locked -p effect-macros --test macro_layout -j 2`.
+The same check runs with `cargo test -p effect-macros`; stable rustfmt does not
+currently enforce this custom macro-input rule.
 
 | Story | What happens |
 | --- | --- |
@@ -908,3 +922,40 @@ to retain the invocation policy; `schema!` uses this contextual witness.
 `AtomRegistryError::StaleOwner(AtomId)` rejects old source writes, dependency reads,
 and derived refreshes after an identity is removed and registered again. Update
 exhaustive matches; registration identity is checked under the graph gate.
+
+### Native extension café consumers
+
+These stories keep application identities and caller policies visible. SQL,
+Server and Identity finish their demonstrated workflow and exit. Web and OTel
+serve until Ctrl-C; their outer owners then join host/resource and provider
+shutdown. Run from the workspace root on Rust 1.99:
+
+| Consumer | DSL families and demonstrated forms |
+| --- | --- |
+| [Save/load an order](../effect_sql/examples/cafe_orders.rs) | D02 `sql!`: identifier and bound parameter; D03 `sql_insert!`: moved order fields; D04 `sql_update!`: assignments with a typed guard; D05 `row!`: native columns, refinement and strict boolean decoding; D06 `sql_with!`: inline select/handle bodies, extracted `run` helper and `effect` with `project`. |
+| [Serve café orders](../effect_server/examples/serve_cafe_orders.rs) | D07 `server!`: policy, typed request binding, listener and protocols; D08 `endpoint!`: inline authorized/traced body, extracted Effect and explicit R/error projection; D09 `registered!`: health metadata/anonymous policy; D10 `reply!`: status, validators and negotiated body; D11 `representations!`: direct JSON codec and HTML renderer; D12 `route!`: typed order capture and reverse link; D13 `router!`: method mounting; D14 `routes!`: extracted route inclusion; D15 `pipeline!`: inline traced `before`, extracted `on_exit` and response header. |
+| [Customer account](../effect_server_identity/examples/customer_account.rs) | D17 `identity_store!`: selected SQLx and auxiliary stores; D18 `identity!`: native components, policies and typed errors; D19 `identity_endpoints!`: ten semantic groups, custom routes and extracted handlers, consumed by a finite `server!` cookie-login/account-view exchange. |
+| [Café application](../effect_server_web/examples/cafe_application.rs) | D20 `web!`: inline startup and extracted request projection; D21 `security!`: native authentication/authorization and response policy; D22 `csp!`: typed directives and response nonce; D23 `read_through!`: inline menu loader; D24 `dependent_read_through!`: extracted seasonal loader and dependency equality; D25 `availability!`: database readiness and process liveness; D26 `message_arguments!`: typed customer argument; D27 `localization!`: catalogue, culture selection and reload. |
+| [Watch order progress](../effect_otel/examples/watch_order_progress.rs) | D01 `otel!`: inline update body and extracted preparation/ready Effects; D16 Server `stream!`: core source with inline/extracted writers or an owned body Effect, awaiting SSE write/flush (exported by the shared registry as `server_stream!`). |
+
+```sh
+DATABASE_URL=turso::memory: cargo +1.99.0 run -p effect-sql --features turso,macros --example cafe_orders
+CAFE_CHUNK_BYTES=4096 CAFE_JSON_BYTES=1024 CAFE_DRAIN_MS=3000 CAFE_TELEMETRY_CAPACITY=32 cargo +1.99.0 run -p effect-server --example serve_cafe_orders
+cargo +1.99.0 run -p effect-server-identity --features sqlx-turso --example customer_account
+cargo +1.99.0 run -p effect-server-web --features identity,otel,sqlx-turso --example cafe_application
+cargo +1.99.0 run -p effect-otel --features server --example watch_order_progress -- 127.0.0.1:8080 400 256 32 32 16 8 5000
+```
+
+Identity requires the environment inputs listed in its linked source, including
+the selected database and native key XML. Web's inputs and catalogue/key file
+selection are documented in [cafe_host](../effect_server_web/examples/cafe_host/mod.rs).
+Set those inputs and supply the selected native XML/catalogue files before
+running. Web serves `/menu`, cookie-authorized `/pickup` and availability
+on `CAFE_LISTEN`. OTel's positional inputs are listener address, preparation
+milliseconds, SSE frame/cursor bytes, active span slots, metric descriptors,
+label sets per descriptor and shared drain/SDK-shutdown milliseconds. Capacities
+and the drain/shutdown duration must be positive. Server's positive
+`CAFE_TELEMETRY_CAPACITY` supplies its three telemetry bounds. OTel streams updates with
+`curl -N http://127.0.0.1:8080/orders/104/events`; disconnecting closes that
+subscription while the listener remains active. Press Ctrl-C in either hosting
+example's terminal to stop the listener and await its owned cleanup.

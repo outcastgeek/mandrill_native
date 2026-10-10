@@ -16,7 +16,7 @@ use effect::rpc::{
 use effect::{
     Effect, Exit, JsonValue, PureCodec, Release, ResourceBinding, ResourceValue, effect, json_i64,
     json_string, rpc_middleware, rpc_operation, rpc_protocol, rpc_stream_middleware,
-    rpc_stream_operation, rpc_stream_protocol, schema, schema_enum,
+    rpc_stream_operation, rpc_stream_protocol, schema, schema_enum, service,
 };
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
@@ -117,20 +117,27 @@ pub enum TrackingProblem {
 type CoffeeShop = Cafe<OrderDesk>;
 /// Explicit drink names define the wire vocabulary.
 fn drink_schema() -> PureCodec<Drink, JsonValue> {
-    schema_enum! { enum Drink { OatLatte => "oat-latte", Americano => "americano" }
-    tag_field: "drink", content_field: "options", policy: parse_policy() }
+    schema_enum! {
+        enum Drink { OatLatte => "oat-latte", Americano => "americano" }
+        tag_field: "drink", content_field: "options", policy: parse_policy()
+    }
     .expect("drink schema")
 }
 /// Customer request shape, separate from its business validation.
 fn order_schema() -> PureCodec<CoffeeOrder, JsonValue> {
-    schema! { struct CoffeeOrder { customer: json_string(), drink: drink_schema(), quantity: json_i64() }
-    policy: parse_policy() }.expect("order schema")
+    schema! {
+        struct CoffeeOrder { customer: json_string(), drink: drink_schema(), quantity: json_i64() }
+        policy: parse_policy()
+    }
+    .expect("order schema")
 }
 /// Accepted ticket shape shared by placement and lookup handlers.
 fn ticket_schema() -> PureCodec<OrderTicket, JsonValue> {
-    schema! { struct OrderTicket {
-        number: json_string(), customer: json_string(), drink: drink_schema(), quantity: json_i64()
-    } policy: parse_policy() }
+    schema! {
+        struct OrderTicket {
+            number: json_string(), customer: json_string(), drink: drink_schema(), quantity: json_i64()
+        } policy: parse_policy()
+    }
     .expect("ticket schema")
 }
 /// Typed identity for both lookup and watch operations.
@@ -140,22 +147,33 @@ fn find_schema() -> PureCodec<FindOrder, JsonValue> {
 }
 /// Lifecycle chunks and the terminal ready message use the same model.
 fn status_schema() -> PureCodec<OrderStatus, JsonValue> {
-    schema_enum! { enum OrderStatus {
-    Accepted => "accepted", Preparing => "preparing", Ready { customer: json_string() } => "ready"
-} tag_field: "status", content_field: "details", policy: parse_policy() }.expect("status schema")
+    schema_enum! {
+        enum OrderStatus {
+            Accepted => "accepted", Preparing => "preparing", Ready { customer: json_string() } => "ready"
+        } tag_field: "status", content_field: "details", policy: parse_policy()
+    }.expect("status schema")
 }
 /// Preserve typed customer feedback in protocol error replies.
 fn problem_schema() -> PureCodec<OrderProblem, JsonValue> {
-    schema_enum! { enum OrderProblem {
-    UnknownTicket => "unknown-ticket", InvalidQuantity => "invalid-quantity", CounterClosed => "counter-closed"
-} tag_field: "problem", content_field: "details", policy: parse_policy() }.expect("problem schema")
+    schema_enum! {
+        enum OrderProblem {
+            UnknownTicket => "unknown-ticket", InvalidQuantity => "invalid-quantity", CounterClosed => "counter-closed"
+        } tag_field: "problem", content_field: "details", policy: parse_policy()
+    }.expect("problem schema")
 }
-/// Reusable lookup helper reads the selected café's business service when executed.
+/// Select the café desk with service! and look up the ticket when the recipe executes.
 fn lookup_order(request: FindOrder) -> Effect<OrderTicket, OrderProblem, CoffeeShop> {
-    effect! {
-        let number = request.number.clone();
-        let desk = Effect::service(|cafe: &CoffeeShop| cafe.services.clone())?;
-        Effect::try_sync_once(move || desk.tickets.lock().expect("order desk").get(&number).cloned().ok_or(OrderProblem::UnknownTicket), |problem| problem)?
+    service! {
+        select: |cafe: &CoffeeShop| cafe.services.clone(),
+        on_error: |problem: OrderProblem| problem,
+        run |desk: &Arc<OrderDesk>| {
+            let number = request.number.clone();
+            let found = desk.tickets.lock().expect("order desk").get(&number).cloned();
+            match found {
+                Some(ticket) => ticket,
+                None => Effect::fail_with(|| OrderProblem::UnknownTicket)?,
+            }
+        }
     }
 }
 /// A reusable final-status helper also serves the counter's small ready-only endpoint.
@@ -170,7 +188,7 @@ fn ready_order(
     effect! {
         let request = FindOrder { number: request.number.clone() };
         let ticket = lookup_order(request)?;
-        Effect::sync_once(move || sequence(Vec::<OrderStatus>::new(), OrderStatus::Ready { customer: ticket.customer }))?
+        sequence(Vec::<OrderStatus>::new(), OrderStatus::Ready { customer: ticket.customer })
     }
 }
 /// Customers and staff can follow this recipe without reading transport internals.
@@ -180,40 +198,49 @@ fn follow_mayas_order() -> Effect<(), TrackingProblem, CoffeeShop> {
             id: OperationId::new("place-coffee-order").expect("operation"), version: RpcVersion::new(NonZeroU32::MIN),
             request: order_schema(), success: ticket_schema(), error: problem_schema(), limits: limits(), handler |order: CoffeeOrder| {
                 if !(1..=4).contains(&order.quantity) { Effect::<(), OrderProblem, CoffeeShop>::fail_with(|| OrderProblem::InvalidQuantity)?; }
-                let desk = Effect::service(|cafe: &CoffeeShop| cafe.services.clone())?;
-                Effect::sync_once(move || {
-                    let ticket = OrderTicket { number: "104".into(), customer: order.customer, drink: order.drink, quantity: order.quantity };
-                    desk.tickets.lock().expect("order desk").insert(ticket.number.clone(), ticket.clone()); ticket
-                })?
+                let desk = service! {
+                    select: |cafe: &CoffeeShop| cafe.services.clone(),
+                    on_error: |problem: OrderProblem| problem,
+                    run |desk| { Arc::clone(desk) }
+                }?;
+                let ticket = OrderTicket { number: "104".into(), customer: order.customer, drink: order.drink, quantity: order.quantity };
+                desk.tickets.lock().expect("order desk").insert(ticket.number.clone(), ticket.clone());
+                ticket
             }
         };
         let checked = rpc_middleware! {
-            handler: placed, error_codec: schema_enum! { enum CustomerChecks {
-                Before(problem_schema()) => "before", Domain(problem_schema()) => "order", After(problem_schema()) => "after"
-            } tag_field: "phase", content_field: "problem", policy: parse_policy() }.expect("customer checks"),
-            before |order: CoffeeOrder| { Effect::<CoffeeOrder, OrderProblem, CoffeeShop>::sync_once(move || CoffeeOrder { customer: order.customer.trim().to_owned(), ..order })? },
-            after |ticket: OrderTicket| { println!("Counter accepted ticket {} for {}.", ticket.number, ticket.customer); Effect::<OrderTicket, OrderProblem, CoffeeShop>::sync_once(move || ticket)? }
+            handler: placed, error_codec: schema_enum! {
+                enum CustomerChecks {
+                    Before(problem_schema()) => "before", Domain(problem_schema()) => "order", After(problem_schema()) => "after"
+                } tag_field: "phase", content_field: "problem", policy: parse_policy() }.expect("customer checks"),
+            before |order: CoffeeOrder| { CoffeeOrder { customer: order.customer.trim().to_owned(), ..order } },
+            after |ticket: OrderTicket| { println!("Counter accepted ticket {} for {}.", ticket.number, ticket.customer); ticket }
         };
         let ticket = checked.call(CoffeeOrder { customer: " Maya ".into(), drink: Drink::OatLatte, quantity: 2 }).map_error(TrackingProblem::Customer)?;
         println!("Maya receives ticket {} for {} {:?} cups.", ticket.number, ticket.quantity, ticket.drink);
-        let lookup = rpc_operation! { id: OperationId::new("find-coffee-order").expect("operation"), version: RpcVersion::new(NonZeroU32::MIN),
+        let lookup = rpc_operation! {
+            id: OperationId::new("find-coffee-order").expect("operation"), version: RpcVersion::new(NonZeroU32::MIN),
             request: find_schema(), success: ticket_schema(), error: problem_schema(), limits: limits(), handler: lookup_order };
         let found = lookup.call(FindOrder { number: ticket.number.clone() }).map_error(TrackingProblem::Order)?;
         println!("Lookup finds {}'s order {}.", found.customer, found.number);
-        let ready = rpc_stream_operation! { id: OperationId::new("ready-coffee-order").expect("operation"), version: RpcVersion::new(NonZeroU32::MIN),
+        let ready = rpc_stream_operation! {
+            id: OperationId::new("ready-coffee-order").expect("operation"), version: RpcVersion::new(NonZeroU32::MIN),
             request: find_schema(), chunk: status_schema(), terminal: status_schema(), error: problem_schema(), limits: limits(), handler: ready_order };
-        let watch = rpc_stream_operation! { id: OperationId::new("follow-coffee-order").expect("operation"), version: RpcVersion::new(NonZeroU32::MIN),
+        let watch = rpc_stream_operation! {
+            id: OperationId::new("follow-coffee-order").expect("operation"), version: RpcVersion::new(NonZeroU32::MIN),
             request: find_schema(), chunk: status_schema(), terminal: status_schema(), error: problem_schema(), limits: limits(), handler |request: FindOrder, _context| {
                 let ticket = lookup_order(request)?;
-                Effect::sync_once(move || sequence(vec![OrderStatus::Accepted, OrderStatus::Preparing], OrderStatus::Ready { customer: ticket.customer }))?
+                sequence(vec![OrderStatus::Accepted, OrderStatus::Preparing], OrderStatus::Ready { customer: ticket.customer })
             }
         };
-        let watch = rpc_stream_middleware! { handler: watch, error_codec: schema_enum! { enum StatusChecks {
-            Before(problem_schema()) => "before", Domain(problem_schema()) => "order", Chunk(problem_schema()) => "status", Terminal(problem_schema()) => "ready"
-        } tag_field: "phase", content_field: "problem", policy: parse_policy() }.expect("status checks"),
-            before |request: FindOrder| { Effect::<FindOrder, OrderProblem, CoffeeShop>::sync_once(move || request)? },
-            chunk |status: OrderStatus| { Effect::<OrderStatus, OrderProblem, CoffeeShop>::sync_once(move || status)? },
-            terminal |status: OrderStatus| { println!("Pickup counter: Maya, your drinks are ready!"); Effect::<OrderStatus, OrderProblem, CoffeeShop>::sync_once(move || status)? }
+        let watch = rpc_stream_middleware! {
+            handler: watch, error_codec: schema_enum! {
+                enum StatusChecks {
+                    Before(problem_schema()) => "before", Domain(problem_schema()) => "order", Chunk(problem_schema()) => "status", Terminal(problem_schema()) => "ready"
+                } tag_field: "phase", content_field: "problem", policy: parse_policy() }.expect("status checks"),
+            before |request: FindOrder| { request },
+            chunk |status: OrderStatus| { status },
+            terminal |status: OrderStatus| { println!("Pickup counter: Maya, your drinks are ready!"); status }
         };
         let statuses = watch.call(FindOrder { number: ticket.number.clone() }, RpcStreamContext { call: RpcCallId::new("maya-phone").expect("call"), metadata: Default::default() }).map_error(TrackingProblem::Status)?;
         loop {
@@ -222,7 +249,8 @@ fn follow_mayas_order() -> Effect<(), TrackingProblem, CoffeeShop> {
                 RpcProduced::Terminal(status) => { println!("Maya's phone: {status:?}"); break; }
             }
         }
-        let kiosk_description = rpc_operation! { id: OperationId::new("find-coffee-order").expect("operation"), version: RpcVersion::new(NonZeroU32::MIN),
+        let kiosk_description = rpc_operation! {
+            id: OperationId::new("find-coffee-order").expect("operation"), version: RpcVersion::new(NonZeroU32::MIN),
             request: find_schema(), success: ticket_schema(), error: problem_schema(), limits: limits() };
         let local_request = request(&kiosk_description, "maya-kiosk", &FindOrder { number: ticket.number.clone() });
         let watch_request = stream_request(ready.operation(), "maya-counter", &FindOrder { number: ticket.number.clone() });
@@ -243,29 +271,43 @@ fn follow_mayas_order() -> Effect<(), TrackingProblem, CoffeeShop> {
 fn staff_counter_session(customer: String) -> Effect<(), TrackingProblem, CoffeeShop> {
     effect! {
         let customer = customer.clone();
-        let staff: RpcServiceMiddleware<ResourceValue<CounterSession>, OrderProblem, CoffeeShop> = rpc_middleware! { acquire {
-            ResourceBinding::new(Effect::sync(|| CounterSession { barista: "Sam".into() }), |_, _| Release::sync(|| println!("Sam closes the counter session")))?
-        } };
+        let staff: RpcServiceMiddleware<ResourceValue<CounterSession>, OrderProblem, CoffeeShop> = rpc_middleware! {
+            acquire {
+                ResourceBinding::new(Effect::sync(|| CounterSession { barista: "Sam".into() }), |_, _| Release::sync(|| println!("Sam closes the counter session")))?
+            } };
         let greeting = staff.apply(|session, _: &CoffeeShop| session, |customer: String| effect! {
             let customer = customer.clone();
-            let barista = Effect::<String, OrderProblem, Arc<ResourceValue<CounterSession>>>::service(|session| session.with(|session| session.barista.clone()).expect("open counter"))?;
+            let barista = service! {
+                select: |session: &Arc<ResourceValue<CounterSession>>| session.clone(),
+                on_error: |problem: OrderProblem| problem,
+                run |session: &Arc<ResourceValue<CounterSession>>| { session.with(|session| session.barista.clone()).expect("open counter") }
+            }?;
             format!("{barista} hands {customer} the pickup ticket")
         }, customer.clone()).map_error(TrackingProblem::Counter)?;
         println!("{greeting}.");
-        let accepted = Session::new(stream_request(&rpc_stream_operation! { id: OperationId::new("staff-ready-status").expect("operation"), version: RpcVersion::new(NonZeroU32::MIN),
+        let accepted = Session::new(stream_request(&rpc_stream_operation! {
+            id: OperationId::new("staff-ready-status").expect("operation"), version: RpcVersion::new(NonZeroU32::MIN),
             request: find_schema(), chunk: status_schema(), terminal: status_schema(), error: problem_schema(), limits: limits() }, "staff-counter", &FindOrder { number: "104".into() }));
         let closing = accepted.clone();
-        let staff: RpcServiceMiddleware<ResourceValue<CounterSession>, OrderProblem, CoffeeShop> = rpc_middleware! { acquire {
-            let closing = closing.clone();
-            ResourceBinding::new(Effect::sync(|| CounterSession { barista: "Sam".into() }), move |_, _| {
-                let closing = closing.clone(); Release::sync(move || { if closing.is_closed() { println!("Sam's staff access is released after the customer connection closes."); } })
-            })?
-        } };
-        rpc_stream_middleware! { middleware: staff, connect: |session, _: &CoffeeShop| session, policy: rpc_policy(), accepted: accepted,
-            handler: rpc_stream_operation! { id: OperationId::new("staff-ready-status").expect("operation"), version: RpcVersion::new(NonZeroU32::MIN),
+        let staff: RpcServiceMiddleware<ResourceValue<CounterSession>, OrderProblem, CoffeeShop> = rpc_middleware! {
+            acquire {
+                let closing = closing.clone();
+                ResourceBinding::new(Effect::sync(|| CounterSession { barista: "Sam".into() }), move |_, _| {
+                    let closing = closing.clone(); Release::sync(move || { if closing.is_closed() { println!("Sam's staff access is released after the customer connection closes."); } })
+                })?
+            } };
+        rpc_stream_middleware! {
+            middleware: staff, connect: |session, _: &CoffeeShop| session, policy: rpc_policy(), accepted: accepted,
+            handler: rpc_stream_operation! {
+                id: OperationId::new("staff-ready-status").expect("operation"), version: RpcVersion::new(NonZeroU32::MIN),
                 request: find_schema(), chunk: status_schema(), terminal: status_schema(), error: problem_schema(), limits: limits(), handler |_request, _context| {
-                    let barista = Effect::<String, OrderProblem, Arc<ResourceValue<CounterSession>>>::service(|session| session.with(|session| session.barista.clone()).expect("open staff service"))?;
-                    Effect::sync_once(move || { println!("{barista} confirms pickup readiness."); sequence(Vec::<OrderStatus>::new(), OrderStatus::Ready { customer: "Maya".into() }) })?
+                    let barista = service! {
+                        select: |session: &Arc<ResourceValue<CounterSession>>| session.clone(),
+                        on_error: |problem: OrderProblem| problem,
+                        run |session: &Arc<ResourceValue<CounterSession>>| { session.with(|session| session.barista.clone()).expect("open staff service") }
+                    }?;
+                    println!("{barista} confirms pickup readiness.");
+                    sequence(Vec::<OrderStatus>::new(), OrderStatus::Ready { customer: "Maya".into() })
                 }
             }
         }.map_error(TrackingProblem::Serving)?;

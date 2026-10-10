@@ -1,0 +1,38 @@
+[package]
+name = "effect-otel"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+
+[features]
+default = []
+server = ["dep:effect-server", "dep:http"]
+
+[dependencies]
+effect = { path = "../effect" }
+effect-macros = { path = "../effect_macros" }
+effect-tracing = { path = "../effect_tracing" }
+effect-server = { path = "../effect_server", optional = true }
+http = { workspace = true, optional = true }
+opentelemetry = { workspace = true, features = ["trace", "metrics", "logs"] }
+opentelemetry_sdk = { workspace = true, features = ["trace", "metrics", "logs"] }
+tracing-opentelemetry = { workspace = true, features = ["tracing-log", "metrics"] }
+opentelemetry-appender-tracing = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["registry", "std"] }
+futures-util = { workspace = true }
+
+[dev-dependencies]
+effect-tokio = { path = "../effect_tokio" }
+tokio = { workspace = true, features = ["signal"] }
+http-body-util = { workspace = true }
+axum = { workspace = true }
+bytes = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+
+[[example]]
+name = "watch_order_progress"
+required-features = ["server"]
+
+[lints]
+workspace = true

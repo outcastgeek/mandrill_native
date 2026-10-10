@@ -17,6 +17,12 @@ pub struct TursoArguments {
 }
 
 impl TursoArguments {
+    /// Move another ordered binding buffer into this one without copying payloads.
+    /// Anonymous placeholders must be used when composing independently built fragments.
+    pub fn append(&mut self, mut other: Self) {
+        self.values.append(&mut other.values);
+    }
+
     /// Returns the buffered argument values
     #[must_use]
     pub fn values(&self) -> &[TursoValue] {

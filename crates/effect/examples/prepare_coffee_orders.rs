@@ -11,14 +11,14 @@ use effect::persistence::{
     QueueDecodeFailure, QueueMessagePolicy, QueueOwner,
 };
 use effect::workflow::{
-    ActivityRunError, Durable, DurableDeferred, DurableQueue, DurableQueueError,
-    DurableQueueWorkerError, DurableSignalError, DurableSignalWait, WorkflowCodecError,
-    WorkflowDefinition, WorkflowDefinitionId, WorkflowEngine, WorkflowEngineError, WorkflowHandle,
-    WorkflowRunError, WorkflowRunId, WorkflowRunResult, WorkflowSignalId, WorkflowVersion,
+    ActivityRunError, Durable, DurableDeferred, DurableQueueError, DurableQueueWorkerError,
+    DurableSignalError, DurableSignalWait, WorkflowCodecError, WorkflowDefinition,
+    WorkflowDefinitionId, WorkflowEngine, WorkflowEngineError, WorkflowHandle, WorkflowRunError,
+    WorkflowRunId, WorkflowRunResult, WorkflowSignalId, WorkflowVersion,
 };
 use effect::{
     Effect, Exit, JsonValue, PureCodec, UtcMillis, activity, activity_definition, durable_queue,
-    effect, json_i64, json_string, persisted_queue, schema, schema_enum, workflow,
+    effect, json_i64, json_string, persisted_queue, schema, schema_enum, service, workflow,
     workflow_definition,
 };
 use std::num::NonZeroU32;
@@ -90,24 +90,33 @@ pub enum StaffProblem {
 type CoffeeShop = Cafe<Kitchen>;
 /// Stable drink vocabulary used by activity and queue codecs.
 fn drink_schema() -> PureCodec<Drink, JsonValue> {
-    schema_enum! { enum Drink { OatLatte => "oat-latte", Americano => "americano" }
-    tag_field: "drink", content_field: "details", policy: parse_policy() }
+    schema_enum! {
+        enum Drink { OatLatte => "oat-latte", Americano => "americano" }
+        tag_field: "drink", content_field: "details", policy: parse_policy()
+    }
     .expect("drink schema")
 }
 /// Ticket codec carries customer functionality through every recording boundary.
 fn order_schema() -> PureCodec<CoffeeOrder, JsonValue> {
-    schema! { struct CoffeeOrder { number: json_string(), customer: json_string(), drink: drink_schema(), quantity: json_i64() }
-        policy: parse_policy() }.expect("coffee order schema")
+    schema! {
+        struct CoffeeOrder { number: json_string(), customer: json_string(), drink: drink_schema(), quantity: json_i64() }
+        policy: parse_policy()
+    }.expect("coffee order schema")
 }
 /// Completed drinks are recorded as a typed application result.
 fn prepared_schema() -> PureCodec<PreparedOrder, JsonValue> {
-    schema! { struct PreparedOrder { number: json_string(), customer: json_string(), cups: json_i64() }
-        policy: parse_policy() }.expect("prepared order schema")
+    schema! {
+        struct PreparedOrder { number: json_string(), customer: json_string(), cups: json_i64() }
+        policy: parse_policy()
+    }
+    .expect("prepared order schema")
 }
 /// Persist business feedback alongside successful preparation.
 fn problem_schema() -> PureCodec<PreparationProblem, JsonValue> {
-    schema_enum! { enum PreparationProblem { InvalidQuantity => "invalid-quantity" }
-    tag_field: "problem", content_field: "details", policy: parse_policy() }
+    schema_enum! {
+        enum PreparationProblem { InvalidQuantity => "invalid-quantity" }
+        tag_field: "problem", content_field: "details", policy: parse_policy()
+    }
     .expect("preparation problem schema")
 }
 /// The actual kitchen work runs on the blocking provider selected through R.
@@ -119,7 +128,11 @@ fn prepare_drinks(
         if !(1..=4).contains(&order.quantity) {
             Effect::<(), PreparationProblem, CoffeeShop>::fail_with(|| PreparationProblem::InvalidQuantity)?;
         }
-        let kitchen = Effect::service(|cafe: &CoffeeShop| cafe.services.clone())?;
+        let kitchen = service! {
+            select: |cafe: &CoffeeShop| cafe.services.clone(),
+            on_error: |problem: PreparationProblem| problem,
+            run |kitchen| { Arc::clone(kitchen) }
+        }?;
         Effect::blocking_once(move |_| {
             println!("Sam prepares {} {:?} cup(s) for {} (ticket {}).", order.quantity, order.drink, order.customer, order.number);
             kitchen.prepared.lock().expect("kitchen log").push(order.number.clone());
@@ -142,7 +155,8 @@ fn prepare_ticket(
     workflow! {
         let run = run.clone(); let order = order.clone();
         activity! {
-            description: activity_definition! { id: effect::workflow::WorkflowActivityId::from_stable(key("prepare-counter-ticket")),
+            description: activity_definition! {
+                id: effect::workflow::WorkflowActivityId::from_stable(key("prepare-counter-ticket")),
                 success: prepared_schema(), error: problem_schema(), limits: limits() },
             run: run, attempt: NonZeroU32::MIN, body: move || preparation_body(order.clone())
         }?
@@ -150,9 +164,11 @@ fn prepare_ticket(
 }
 /// Workflow metadata is used to execute counter orders and register queued preparation.
 fn counter_workflow() -> WorkflowDefinition<CoffeeOrder, PreparedOrder, PreparationProblem> {
-    workflow_definition! { id: WorkflowDefinitionId::new("prepare-counter-order").expect("workflow"),
-    version: WorkflowVersion::new(NonZeroU32::MIN), input: order_schema(), success: prepared_schema(), error: problem_schema(),
-    compatibility: Arc::from(&b"coffee-preparation-v1"[..]), limits: limits() }
+    workflow_definition! {
+        id: WorkflowDefinitionId::new("prepare-counter-order").expect("workflow"),
+        version: WorkflowVersion::new(NonZeroU32::MIN), input: order_schema(), success: prepared_schema(), error: problem_schema(),
+        compatibility: Arc::from(&b"coffee-preparation-v1"[..]), limits: limits()
+    }
 }
 /// Print only customer/staff outcomes; workflow statuses remain typed.
 fn show_prepared(outcome: WorkflowRunResult<PreparedOrder, PreparationProblem>) {
@@ -172,12 +188,14 @@ fn sams_shift() -> Effect<(), StaffProblem, CoffeeShop> {
     effect! {
         let run = WorkflowRunId::from_stable(key("prepare-order-104"));
         let activity_run = run.clone();
-        let brew = activity! { name: effect::workflow::WorkflowActivityId::from_stable(key("prepare-mobile-ticket")),
+        let brew = activity! {
+            name: effect::workflow::WorkflowActivityId::from_stable(key("prepare-mobile-ticket")),
             input: order_schema(), success: prepared_schema(), error: problem_schema(), limits: limits(), body |order: Arc<CoffeeOrder>| {
                 prepare_drinks(order).either()?
             }
         };
-        let mobile = workflow! { name: WorkflowDefinitionId::new("prepare-mobile-order").expect("workflow"),
+        let mobile = workflow! {
+            name: WorkflowDefinitionId::new("prepare-mobile-order").expect("workflow"),
             version: WorkflowVersion::new(NonZeroU32::MIN), payload: order_schema(), success: prepared_schema(), error: problem_schema(),
             compatibility: Arc::from(&b"mobile-coffee-v1"[..]), limits: limits(), run |order: CoffeeOrder| {
                 let brew = brew.clone(); let run = activity_run.clone();
@@ -194,14 +212,20 @@ fn sams_shift() -> Effect<(), StaffProblem, CoffeeShop> {
             move |order| prepare_ticket(helper_run.clone(), order)).map_error(StaffProblem::Workflow)?);
         let queued_order = CoffeeOrder { number: "106".into(), customer: "Nora".into(), drink: Drink::OatLatte, quantity: 1 };
         let queued_run = WorkflowRunId::from_stable(key("prepare-order-106"));
-        let engine = Effect::service(|cafe: &CoffeeShop| cafe.workflow.clone())?;
+        let engine = service! {
+            select: |cafe: &CoffeeShop| cafe.workflow.clone(),
+            on_error: |problem: StaffProblem| problem,
+            run |engine| { Arc::clone(engine) }
+        }?;
         engine.register(counter.registration()).provide_some(|_: &CoffeeShop| ()).map_error(StaffProblem::Engine)?;
         let input = Effect::from_result_once(counter.encode_input_bytes(&queued_order)).map_error(StaffProblem::Codec)?;
         engine.start(WorkflowHandle { run: queued_run.clone(), definition: counter.id.clone(), version: counter.version }, input)
             .provide_some(|_: &CoffeeShop| ()).map_error(StaffProblem::Engine)?;
-        let pickup = DurableDeferred { run: queued_run, signal: WorkflowSignalId::from_stable(key("order-106-ready")),
+        let pickup = DurableDeferred {
+            run: queued_run, signal: WorkflowSignalId::from_stable(key("order-106-ready")),
             version: counter.version, codec: prepared_schema(), limits: limits() };
-        let tickets: PersistedQueue<CoffeeOrder, CafeKeys> = persisted_queue! { name: PersistedQueueName::new("barista-tickets").expect("queue"),
+        let tickets: PersistedQueue<CoffeeOrder, CafeKeys> = persisted_queue! {
+            name: PersistedQueueName::new("barista-tickets").expect("queue"),
             payload: order_schema(), identity: binary("queued-coffee-order"), limits: binary_limits(),
             policy: QueueMessagePolicy { maximum_attempts: NonZeroU32::MIN, acknowledged_retention: Duration::from_secs(60) } };
         let tickets = durable_queue! { queue: tickets };
@@ -209,15 +233,21 @@ fn sams_shift() -> Effect<(), StaffProblem, CoffeeShop> {
         println!("Nora's ticket waits in the barista queue.");
         let mut claims = tickets.claim(QueueClaimOptions::new(QueueOwner::new("Sam").expect("barista"), UtcMillis::new(0), UtcMillis::new(100), nz(1)).expect("ticket claim")).map_error(StaffProblem::Queue)?;
         let delivery = Effect::from_result_once(tickets.decode_claim(claims.pop().expect("Nora's queued ticket"))).map_error(StaffProblem::Ticket)?;
-        durable_queue! { queue: DurableQueue::new(tickets.queue().clone()), delivery: delivery, deferred: pickup.clone(), acknowledged_at: UtcMillis::new(1),
+        durable_queue! {
+            queue: tickets, delivery: delivery, deferred: pickup.clone(), acknowledged_at: UtcMillis::new(1),
             handler |order: CoffeeOrder| { prepare_drinks(Arc::new(order))? }
         }.map_error(StaffProblem::Worker)?;
         match pickup.wait().map_error(StaffProblem::Pickup)? {
             DurableSignalWait::Ready(order) => println!("Recorded before acknowledgement: {} cup for {}, ticket {}.", order.cups, order.customer, order.number),
             DurableSignalWait::Waiting => println!("Nora's order is still waiting."),
         }
-        let kitchen = Effect::service(|cafe: &CoffeeShop| cafe.services.clone())?;
-        println!("Sam's preparation log contains tickets {}.", kitchen.prepared.lock().expect("kitchen log").join(", "));
+        service! {
+            select: |cafe: &CoffeeShop| cafe.services.clone(),
+            on_error: |problem: StaffProblem| problem,
+            run |kitchen: &Arc<Kitchen>| {
+                println!("Sam's preparation log contains tickets {}.", kitchen.prepared.lock().expect("kitchen log").join(", "));
+            }
+        }?;
     }
 }
 /// Supply the local kitchen and execute one complete barista shift.

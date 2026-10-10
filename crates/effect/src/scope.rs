@@ -105,6 +105,8 @@ struct State<E: Send + 'static> {
     phase: Phase,
     finalizers: Vec<Registered<E>>,
     outcome: Option<Exit<(), E>>,
+    /// Explicit native early-close transfer awaiting its enclosing scoped owner.
+    scoped_outcome_transferred: bool,
     status: ScopeCloseStatus,
 }
 
@@ -158,6 +160,7 @@ impl<E: Send + 'static> Scope<E> {
             inner: Arc::new(Inner {
                 state: Mutex::new(State {
                     phase: Phase::Open,
+                    scoped_outcome_transferred: false,
                     finalizers: Vec::new(),
                     outcome: None,
                     status: ScopeCloseStatus::Clean,
@@ -201,7 +204,7 @@ impl<E: Send + 'static> Scope<E> {
                 owner.scope.clone().join_close(
                     result,
                     runtime::continuation(move |result| {
-                        let cleanup = owner.scope.take_outcome();
+                        let cleanup = owner.scope.take_scoped_outcome();
                         owner.settled = true;
                         drop(owner);
                         let result = runtime::publish(result, &join_context);
@@ -453,6 +456,21 @@ impl<E: Send + 'static> Scope<E> {
     /// descriptions coordinate one drain. Later/concurrent calls join actual settlement before
     /// acknowledging; only the caller holding the owner consumes the non-Clone cleanup outcome.
     pub(crate) fn close_owned<R: Send + Sync + 'static>(&self) -> Effect<(), E, R> {
+        self.close_owned_with_transfer(false)
+    }
+
+    /// Move cleanup to a native scoped body before its observer runs. That body
+    /// must retain the full exit; its enclosing scoped owner acknowledges this
+    /// explicit transfer instead of attempting to consume the same errors again.
+    pub(crate) fn close_scoped_owned<R: Send + Sync + 'static>(&self) -> Effect<(), E, R> {
+        self.close_owned_with_transfer(true)
+    }
+
+    /// Reuse the canonical drain/abandonment guard for both ownership contracts.
+    fn close_owned_with_transfer<R: Send + Sync + 'static>(
+        &self,
+        transfer: bool,
+    ) -> Effect<(), E, R> {
         let scope = self.clone();
         let owner = Mutex::new(Some(OwnerGuard {
             scope: self.clone(),
@@ -467,7 +485,7 @@ impl<E: Send + 'static> Scope<E> {
                 Some(mut owner) => owner.scope.clone().join_close(
                     Exit::Success(()),
                     runtime::continuation(move |_| {
-                        let cleanup = owner.scope.take_outcome();
+                        let cleanup = owner.scope.take_outcome_transferring(transfer);
                         owner.settled = true;
                         drop(owner);
                         runtime::finish(finish, cleanup)
@@ -648,13 +666,42 @@ impl<E: Send + 'static> Scope<E> {
     /// Type: `Exit<(), E>`.
     /// Returns `Exit<(), E>`.
     fn take_outcome(&self) -> Exit<(), E> {
-        self.inner
+        self.take_outcome_transferring(false)
+    }
+
+    /// Consume an explicit early-transfer acknowledgement once; an absent ordinary
+    /// outcome still reports the original consumed-outcome defect.
+    fn take_scoped_outcome(&self) -> Exit<(), E> {
+        let mut state = self
+            .inner
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .outcome
-            .take()
-            .unwrap_or_else(|| Exit::Die(Defect::from(LibraryDefect::ScopeOutcomeConsumed)))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if std::mem::take(&mut state.scoped_outcome_transferred) {
+            Exit::Success(())
+        } else {
+            state
+                .outcome
+                .take()
+                .unwrap_or_else(|| Exit::Die(Defect::from(LibraryDefect::ScopeOutcomeConsumed)))
+        }
+    }
+
+    /// Mark transfer only when this owner actually moves a settled cleanup exit.
+    /// A failed second take never creates a scoped acknowledgement.
+    fn take_outcome_transferring(&self, transfer: bool) -> Exit<(), E> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match state.outcome.take() {
+            Some(outcome) => {
+                state.scoped_outcome_transferred |= transfer;
+                outcome
+            }
+            None => Exit::Die(Defect::from(LibraryDefect::ScopeOutcomeConsumed)),
+        }
     }
 
     ///

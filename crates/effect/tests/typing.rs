@@ -2,7 +2,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 /// Temporary external consumer checkout removed after each compiler-contract run.
-struct FixtureDirectory(PathBuf);
+struct FixtureDirectory(
+    /// Temporary consumer sources owned exclusively by this harness invocation.
+    PathBuf,
+);
 impl Drop for FixtureDirectory {
     /// Remove the harness-owned temporary checkout after all diagnostics are inspected.
     fn drop(&mut self) {
@@ -18,7 +21,7 @@ fn external_compiler_contracts() -> Result<(), Box<dyn std::error::Error>> {
     );
     std::fs::create_dir_all(directory.0.join("src"))?;
     let manifest = format!(
-        "[package]\nname = \"effect-typing-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\nrust-version = \"1.99\"\n[workspace]\n[dependencies]\nmandrill_effect = {{ package = \"effect\", path = {:?} }}\n",
+        "[package]\nname = \"effect-typing-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\nrust-version = \"1.99\"\n[workspace]\n[profile.dev]\ndebug = 0\nincremental = false\n[dependencies]\nmandrill_effect = {{ package = \"effect\", path = {:?} }}\n",
         env!("CARGO_MANIFEST_DIR")
     );
     std::fs::write(directory.0.join("Cargo.toml"), manifest)?;
@@ -237,11 +240,20 @@ fn external_compiler_contracts() -> Result<(), Box<dyn std::error::Error>> {
         ("refutable", include_str!("ui/refutable.rs"), Some("E0005")),
     ];
     for (name, source, expected) in cases {
+        if std::env::var("EFFECT_TYPING_CASE")
+            .ok()
+            .is_some_and(|selected| !selected.split(',').any(|case| case == name))
+        {
+            continue;
+        }
         std::fs::write(directory.0.join("src/main.rs"), source)?;
         let output = Command::new(env!("CARGO"))
             .args(["check", "--quiet", "--offline", "--manifest-path"])
             .arg(directory.0.join("Cargo.toml"))
-            .env("CARGO_TARGET_DIR", directory.0.join("target"))
+            .env(
+                "CARGO_TARGET_DIR",
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target"),
+            )
             .output()?;
         let diagnostics = String::from_utf8(output.stderr)?;
         match expected {
@@ -255,6 +267,7 @@ fn external_compiler_contracts() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Check existing typed feature contracts using paired accepted/rejected consumers.
 #[test]
 fn planned_feature_type_pairs() -> Result<(), Box<dyn std::error::Error>> {
     let directory = FixtureDirectory(std::env::temp_dir().join(format!(
@@ -263,7 +276,7 @@ fn planned_feature_type_pairs() -> Result<(), Box<dyn std::error::Error>> {
     )));
     std::fs::create_dir_all(directory.0.join("src"))?;
     let manifest = format!(
-        "[package]\nname = \"effect-feature-typing-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\nrust-version = \"1.99\"\n[workspace]\n[dependencies]\nmandrill_effect = {{ package = \"effect\", path = {:?} }}\n",
+        "[package]\nname = \"effect-feature-typing-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\nrust-version = \"1.99\"\n[workspace]\n[profile.dev]\ndebug = 0\nincremental = false\n[dependencies]\nmandrill_effect = {{ package = \"effect\", path = {:?} }}\n",
         env!("CARGO_MANIFEST_DIR")
     );
     std::fs::write(directory.0.join("Cargo.toml"), manifest)?;
@@ -939,7 +952,10 @@ fn main() {}
             let output = Command::new(env!("CARGO"))
                 .args(["check", "--quiet", "--offline", "--manifest-path"])
                 .arg(directory.0.join("Cargo.toml"))
-                .env("CARGO_TARGET_DIR", directory.0.join("target"))
+                .env(
+                    "CARGO_TARGET_DIR",
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target"),
+                )
                 .output()?;
             let diagnostics = String::from_utf8(output.stderr)?;
             match expected_failure {
@@ -949,6 +965,297 @@ fn main() {}
                 ),
                 None => assert!(output.status.success(), "{name}_{suffix}: {diagnostics}"),
             }
+        }
+    }
+    Ok(())
+}
+
+/// Compile the five real extension consumers through renamed dependencies, then
+/// diagnose a finite set of distinct domain syntax/phase misuse contracts.
+#[test]
+fn extension_compiler_contracts() -> Result<(), Box<dyn std::error::Error>> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let directory = FixtureDirectory(
+        std::env::temp_dir().join(format!("mandrill-extension-typing-{}", std::process::id())),
+    );
+    std::fs::create_dir_all(directory.0.join("src"))?;
+    let mut manifest = String::from(
+        "[package]\nname = \"extension-typing-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\nrust-version = \"1.99\"\n[workspace]\n[profile.dev]\ndebug = 0\nincremental = false\n[features]\ndefault = [\"sqlx-turso\"]\nsqlx-turso = []\n[dependencies]\n",
+    );
+    for (alias, package, folder, features) in [
+        ("mandrill_effect", "effect", "effect", ""),
+        ("database", "effect-sql", "effect_sql", "macros,sync"),
+        ("http_server", "effect-server", "effect_server", ""),
+        (
+            "accounts",
+            "effect-server-identity",
+            "effect_server_identity",
+            "sqlx-turso",
+        ),
+        (
+            "application",
+            "effect-server-web",
+            "effect_server_web",
+            "identity,otel,sqlx-turso",
+        ),
+        ("telemetry", "effect-otel", "effect_otel", "server"),
+        ("effect_tokio", "effect-tokio", "effect_tokio", ""),
+        ("sqlx", "sqlx-turso-sqlx", "sqlx", "derive,runtime-tokio"),
+    ] {
+        let features = features
+            .split(',')
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("{value:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        manifest.push_str(&format!(
+            "{alias} = {{ package = {package:?}, path = {:?}, features = [{features}] }}\n",
+            root.join("crates").join(folder)
+        ));
+    }
+    manifest.push_str("tokio = { version = \"1.53.1\", features = [\"macros\", \"rt-multi-thread\", \"net\", \"io-util\", \"sync\", \"time\", \"signal\"] }\naxum = { version = \"0.8.9\", default-features = false }\nhttp = \"1.5.0\"\nbytes = \"1.12.1\"\nhttp-body-util = \"0.1.5\"\nopentelemetry = { version = \"0.32.0\", features = [\"trace\", \"metrics\", \"logs\"] }\nopentelemetry_sdk = { version = \"0.32.1\", features = [\"trace\", \"metrics\", \"logs\", \"testing\"] }\ntracing = \"0.1.44\"\nserde_json = \"1.0.151\"\n");
+    manifest.push_str("serde = { version = \"1.0.229\", features = [\"derive\"] }\ntime = { version = \"0.3.55\", features = [\"serde\", \"formatting\", \"parsing\"] }\nuuid = { version = \"1.26.1\", features = [\"v4\", \"v7\"] }\n");
+    let workspace = std::fs::read_to_string(root.join("Cargo.toml"))?;
+    let identity = workspace
+        .lines()
+        .find(|line| line.starts_with("identity_rs = "))
+        .ok_or("workspace Identity dependency is missing")?;
+    manifest.push_str(identity);
+    manifest.push('\n');
+    std::fs::write(directory.0.join("Cargo.toml"), manifest)?;
+
+    // Server/Web reuse this existing provider module across their example trees.
+    copy_renamed_consumer(
+        &root.join("crates/effect_otel/examples/cafe_telemetry"),
+        &directory.0.join("src/cafe_telemetry"),
+    )?;
+    // Credit completed consumers when retrying a later failed or unrun case.
+    let skipped_consumers = std::env::var("EFFECT_EXTENSION_SKIP_CONSUMERS").unwrap_or_default();
+    for (folder, example) in [
+        ("effect_sql", "cafe_orders"),
+        ("effect_server", "serve_cafe_orders"),
+        ("effect_server_identity", "customer_account"),
+        ("effect_server_web", "cafe_application"),
+        ("effect_otel", "watch_order_progress"),
+    ] {
+        if skipped_consumers.split(',').any(|name| name == example) {
+            continue;
+        }
+        copy_renamed_consumer(
+            &root.join("crates").join(folder).join("examples"),
+            &directory.0.join("src"),
+        )?;
+        let source =
+            std::fs::read_to_string(directory.0.join("src").join(format!("{example}.rs")))?;
+        std::fs::write(directory.0.join("src/main.rs"), source)?;
+        let output = extension_check(&directory.0, &root)?;
+        assert!(
+            output.status.success(),
+            "{example} renamed consumer: {}",
+            String::from_utf8(output.stderr)?
+        );
+    }
+
+    for (name, source, reason) in [
+        (
+            "sql_identifier",
+            "database::sql! { identifier(\"a..b\"); }",
+            "identifier parts must be nonempty",
+        ),
+        (
+            "sql_assignment",
+            "database::sql_insert! { table: \"orders\", value(\"id\", 1); value(\"id\", 2); }",
+            "duplicate mutation column",
+        ),
+        (
+            "sql_guard",
+            "database::sql_update! { table: \"orders\", set(\"ready\", true); }",
+            "exactly one WHERE",
+        ),
+        (
+            "sql_projection",
+            "database::sql_with! { select: (), effect: (), run: () }",
+            "requires exactly one",
+        ),
+        (
+            "endpoint_forms",
+            "http_server::endpoint! { body { () } effect: () }",
+            "mutually exclusive",
+        ),
+        (
+            "reply_terminal",
+            "http_server::reply! { text(\"a\"); text(\"b\"); }",
+            "exactly one terminal body",
+        ),
+        (
+            "reply_status",
+            "http_server::reply! { status(()); no_content(); }",
+            "bodyless terminal controls its own status",
+        ),
+        (
+            "route_shape",
+            "http_server::route! { literal(\"/{id}\"); }",
+            "without captures",
+        ),
+        (
+            "route_phase",
+            "http_server::route! { capture(\"id\", ()); }",
+            "before captures",
+        ),
+        (
+            "registration",
+            "http_server::registered! { endpoint: (), authorize(\"customer\"); allow_anonymous(true); }",
+            "conflicts with authorize",
+        ),
+        (
+            "representation",
+            "http_server::representations! {}",
+            "requires an alternative",
+        ),
+        (
+            "router_arity",
+            "http_server::router! { get(()); }",
+            "requires 2 arguments",
+        ),
+        (
+            "routes_arity",
+            "http_server::routes! { methods((), ()); }",
+            "requires 3 arguments",
+        ),
+        (
+            "pipeline_callback",
+            "http_server::pipeline! { before |a,b| { () } }",
+            "wrong inline callback parameter count",
+        ),
+        (
+            "server_required",
+            "http_server::server! {}",
+            "server requires policy",
+        ),
+        (
+            "stream_forms",
+            "http_server::stream! { source: (), body |writer| { () } }",
+            "mutually exclusive",
+        ),
+        (
+            "identity_duplicate",
+            "accounts::identity_store! { backend: (), backend: () }",
+            "duplicate Identity field",
+        ),
+        (
+            "identity_required",
+            "accounts::identity! {}",
+            "missing Identity field: storage",
+        ),
+        (
+            "identity_endpoint",
+            "accounts::identity_endpoints! {}",
+            "missing Identity endpoint field: identity",
+        ),
+        (
+            "web_required",
+            "application::web! {}",
+            "missing required Web field",
+        ),
+        (
+            "security_duplicate",
+            "application::security! { body_limit: (), body_limit: () }",
+            "duplicate Web descriptor field",
+        ),
+        (
+            "csp_duplicate",
+            "application::csp! { directive(\"default-src\", ()); directive(\"default-src\", ()); }",
+            "duplicate CSP directive",
+        ),
+        (
+            "cache_required",
+            "application::read_through! {}",
+            "missing required Web field `scope`",
+        ),
+        (
+            "dependency_required",
+            "application::dependent_read_through! {}",
+            "missing required Web field `scope`",
+        ),
+        (
+            "availability_required",
+            "application::availability! {}",
+            "missing required Web field `service`",
+        ),
+        (
+            "message_duplicate",
+            "application::message_arguments! { message: (), field(\"drink\", 1); field(\"drink\", 2); }",
+            "empty/duplicate message field",
+        ),
+        (
+            "localization_required",
+            "application::localization! {}",
+            "missing required Web field `catalogue`",
+        ),
+        (
+            "otel_forms",
+            "telemetry::otel! { name: \"order\", body { () }, effect: () }",
+            "requires exactly one",
+        ),
+    ] {
+        std::fs::write(
+            directory.0.join("src/main.rs"),
+            format!(
+                "/// Exercise one rejected domain description at the ordinary consumer entry point.\nfn main() {{ let _ = {source}; }}"
+            ),
+        )?;
+        let output = extension_check(&directory.0, &root)?;
+        let diagnostics = String::from_utf8(output.stderr)?;
+        assert!(
+            !output.status.success() && diagnostics.contains(reason),
+            "{name}: expected {reason}; got {diagnostics}"
+        );
+    }
+    Ok(())
+}
+
+/// Reuse the coordinator's compilation target and offline dependency resolution.
+fn extension_check(
+    directory: &std::path::Path,
+    root: &std::path::Path,
+) -> std::io::Result<std::process::Output> {
+    Command::new(env!("CARGO"))
+        .args(["check", "--quiet", "--offline", "--manifest-path"])
+        .arg(directory.join("Cargo.toml"))
+        .env("DATABASE_URL", "turso::memory:")
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .output()
+}
+
+/// Copy real consumers with renamed dependencies and relocate their one shared
+/// telemetry support path into the temporary fixture's source tree.
+fn copy_renamed_consumer(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(destination)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let path = entry.path();
+        let target = destination.join(entry.file_name());
+        if path.is_dir() {
+            copy_renamed_consumer(&path, &target)?;
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            let mut text = std::fs::read_to_string(path)?.replace(
+                "../../effect_otel/examples/cafe_telemetry/mod.rs",
+                "cafe_telemetry/mod.rs",
+            );
+            for (original, renamed) in [
+                ("effect_server_identity", "accounts"),
+                ("effect_server_web", "application"),
+                ("effect_server", "http_server"),
+                ("effect_sql", "database"),
+                ("effect_otel", "telemetry"),
+                ("effect::", "mandrill_effect::"),
+            ] {
+                text = text.replace(original, renamed);
+            }
+            std::fs::write(target, text)?;
         }
     }
     Ok(())

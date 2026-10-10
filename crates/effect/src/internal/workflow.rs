@@ -74,8 +74,12 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Workflow<A,
     ///
     /// # Returns
     /// Type: `Step`.
+    /// Preserve native instrumentation across this one-shot transition and restore
+    /// its entry context before continuing through the shared trampoline.
     pub(crate) fn execute(self, env: Arc<R>, context: Context, finish: Finish<A, E>) -> Step {
-        runtime::more(move || {
+        let instrumentation_context = context.clone();
+        let finish = runtime::instrument_finish(finish, context.clone());
+        let step = runtime::more(move || {
             if self.check_cancellation && context.cancelled() {
                 return runtime::finish(finish, Exit::Interrupted);
             }
@@ -86,7 +90,8 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Workflow<A,
                     Exit::Die(Defect::from(LibraryDefect::WorkflowConsumed)),
                 ),
             }
-        })
+        });
+        runtime::instrument_step(step, instrumentation_context)
     }
 }
 

@@ -1,3 +1,4 @@
+use sqlx_core::sql_str::SqlSafeStr;
 use sqlx_core::{
     error::Error,
     sql_str::SqlStr,
@@ -15,6 +16,25 @@ pub type TursoTransaction<'c> = sqlx_core::transaction::Transaction<'c, Turso>;
 /// SQLx transaction manager for Turso connections
 #[derive(Debug)]
 pub struct TursoTransactionManager;
+
+impl TursoTransactionManager {
+    /// Begin an operation-owned transaction through the existing SQLx manager.
+    /// Callers must retain exclusive connection ownership until explicit settlement.
+    pub async fn begin_owned(connection: &mut TursoConnection, immediate: bool) -> Result<(), Error> {
+        <Self as TransactionManager>::begin(connection, immediate.then(|| sqlx_core::sql_str::AssertSqlSafe("BEGIN IMMEDIATE").into_sql_str())).await
+    }
+
+    /// Await commit and publish the existing driver's depth update together.
+    /// A caller losing acknowledgment must quarantine its connection rather than retry.
+    pub async fn commit_owned(connection: &mut TursoConnection) -> Result<(), Error> {
+        <Self as TransactionManager>::commit(connection).await
+    }
+
+    /// Await rollback using SQLx's existing frame accounting, rather than drop fallback.
+    pub async fn rollback_owned(connection: &mut TursoConnection) -> Result<(), Error> {
+        <Self as TransactionManager>::rollback(connection).await
+    }
+}
 
 impl TransactionManager for TursoTransactionManager {
     type Database = Turso;

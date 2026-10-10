@@ -18,9 +18,18 @@ const EFFECT_PACKAGE_NAME: &str = "effect";
 /// # Returns
 /// Type: `syn::Result<TokenStream>`.
 pub(crate) fn expand(statements: Vec<Stmt>) -> syn::Result<TokenStream> {
+    expand_with_path(statements, effect_crate_path()?)
+}
+
+/// Lower the existing Effect grammar using an already hygienically resolved path.
+/// Optional extensions may supply their sealed Effect re-export without changing
+/// core grammar, resource binding, control flow or owned payload behavior.
+pub(crate) fn expand_with_path(
+    statements: Vec<Stmt>,
+    path: TokenStream,
+) -> syn::Result<TokenStream> {
     let needs_native_control =
         crate::parse::validate(&statements).is_err() || crate::parse::has_loops(&statements);
-    let path = effect_crate_path()?;
     let path = quote!(#path::__private);
     if needs_native_control {
         return Ok(crate::async_expand::expand(statements, &path));

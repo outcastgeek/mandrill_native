@@ -1,9 +1,28 @@
-//! Checked incremental JSON writing. Failure poisons this writer; only a
-//! complete successful document yields owned bytes. A caller can write a
-//! codec value into an already-open container with write_into.
+//! Checked incremental JSON writing to owned bytes or an explicit native sink.
+//! Failure poisons this writer. Buffered output is exposed only after complete
+//! validation; native bytes already delivered remain committed on later failure.
+//! A caller can append a witnessed codec value with write_into.
 use super::{JsonValue, SchemaIssue, SchemaIssueKind, SchemaResource};
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
+
+/// Owned destination for direct JSON bytes without a DOM or full-document buffer.
+///
+/// Methods are synchronous because existing direct codec witnesses are synchronous.
+/// A native destination that waits for backpressure must be driven on the selected
+/// blocking provider, rather than blocking an async reactor. The adapter owns that
+/// scheduling, its bounded transport and its typed failure mapping. Bytes already
+/// delivered cannot be retracted if a later codec operation fails.
+pub trait JsonWriterSink: Send + Sync + 'static {
+    /// Deliver this borrowed UTF-8 byte fragment before returning success.
+    /// No reference to the fragment may escape the call; ownership conversion into
+    /// a native frame is the destination's explicit transport responsibility.
+    fn write(&mut self, bytes: &[u8]) -> Result<(), SchemaIssue>;
+
+    /// Complete the finite document after structural validation succeeds.
+    /// This is not response-body cleanup; the native body owner joins that separately.
+    fn finish(&mut self) -> Result<(), SchemaIssue>;
+}
 /// Caller-supplied output bounds for an incremental JSON document.
 #[derive(Clone, Copy, Debug)]
 pub struct JsonWriterPolicy {
@@ -45,6 +64,8 @@ enum Container {
 /// Write one root value, pair every opened container with its closing method, and
 /// supply a value immediately after each property name. State or resource errors
 /// poison the writer: [`Self::finish`] then refuses to expose partial output.
+/// [`Self::with_sink`] delivers fragments directly; its synchronous destination
+/// requires explicit native scheduling and [`Self::finish_sink`] completion.
 /// [`super::Codec::write_into_once`] can append one value to this same writer.
 ///
 /// ```
@@ -62,7 +83,12 @@ enum Container {
 /// # Ok::<(), effect::SchemaIssue>(())
 /// ```
 pub struct JsonWriter {
+    /// Buffered destination retained for the original owned-byte API.
     output: Vec<u8>,
+    /// Optional native destination; when present, output bytes are never collected.
+    sink: Option<Box<dyn JsonWriterSink>>,
+    /// Total successfully emitted bytes, independent of destination buffering.
+    emitted: usize,
     identity: Option<std::sync::Arc<()>>,
     policy: JsonWriterPolicy,
     containers: Vec<Container>,
@@ -75,11 +101,24 @@ impl JsonWriter {
     pub const fn new(policy: JsonWriterPolicy) -> Self {
         Self {
             output: Vec::new(),
+            sink: None,
+            emitted: 0,
             identity: None,
             policy,
             containers: Vec::new(),
             root: false,
             failed: false,
+        }
+    }
+    /// Create a checked direct writer sending each fragment to an owned native sink.
+    /// Output limits count the entire document, even when the destination drains
+    /// each fragment immediately. A codec must retain its direct-writer witness;
+    /// use [`Self::finish_sink`] to validate and complete this destination.
+    #[must_use]
+    pub fn with_sink(policy: JsonWriterPolicy, sink: impl JsonWriterSink) -> Self {
+        Self {
+            sink: Some(Box::new(sink)),
+            ..Self::new(policy)
         }
     }
     pub(crate) fn boundary(&mut self) -> Result<WriterBoundary, SchemaIssue> {
@@ -195,8 +234,7 @@ impl JsonWriter {
             return Err(SchemaIssue::new(SchemaIssueKind::InvalidDefinition));
         }
         if self
-            .output
-            .len()
+            .emitted
             .checked_add(bytes.len())
             .is_none_or(|len| len > self.policy.bytes.get())
         {
@@ -204,7 +242,14 @@ impl JsonWriter {
                 resource: SchemaResource::Bytes,
             })));
         }
-        self.output.extend_from_slice(bytes);
+        if let Some(sink) = &mut self.sink {
+            if let Err(issue) = sink.write(bytes) {
+                return Err(self.fail(issue));
+            }
+        } else {
+            self.output.extend_from_slice(bytes);
+        }
+        self.emitted += bytes.len();
         Ok(())
     }
     fn value(&mut self) -> Result<(), SchemaIssue> {
@@ -424,10 +469,23 @@ impl JsonWriter {
     /// An empty document, open container or prior failure returns `InvalidDefinition`;
     /// no partial output is returned.
     pub fn finish(self) -> Result<Vec<u8>, SchemaIssue> {
-        if self.failed || !self.root || !self.containers.is_empty() {
+        if self.failed || !self.root || !self.containers.is_empty() || self.sink.is_some() {
             Err(SchemaIssue::new(SchemaIssueKind::InvalidDefinition))
         } else {
             Ok(self.output)
+        }
+    }
+    /// Consume a native-sink writer after exactly one complete successful root.
+    /// Structural or earlier sink failure prevents the destination's finish call;
+    /// already delivered bytes remain committed and the native owner reports or
+    /// terminates its response according to the selected server policy.
+    pub fn finish_sink(mut self) -> Result<(), SchemaIssue> {
+        if self.failed || !self.root || !self.containers.is_empty() {
+            return Err(SchemaIssue::new(SchemaIssueKind::InvalidDefinition));
+        }
+        match self.sink.as_mut() {
+            Some(sink) => sink.finish(),
+            None => Err(SchemaIssue::new(SchemaIssueKind::InvalidDefinition)),
         }
     }
     pub(crate) fn poison(&mut self) {

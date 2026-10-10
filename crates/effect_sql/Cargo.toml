@@ -1,0 +1,28 @@
+[package]
+name = "effect-sql"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+
+[features]
+default = ["turso"]
+turso = ["dep:sqlx"]
+# Static checked queries use the local SQLx macro facade and its coupled driver.
+macros = ["turso", "sqlx/macros"]
+# Native sync statistics remain an explicitly selected local-driver capability.
+sync = ["turso", "sqlx/sync"]
+
+[dependencies]
+effect = { path = "../effect" }
+effect-macros = { path = "../effect_macros" }
+sqlx = { workspace = true, optional = true, features = ["migrate", "json", "uuid", "time"] }
+futures-util = { workspace = true }
+either = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "fs"] }
+
+[[example]]
+name = "cafe_orders"
+required-features = ["turso", "macros"]
+
+[lints]
+workspace = true

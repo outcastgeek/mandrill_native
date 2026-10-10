@@ -28,15 +28,14 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Clone for S
 }
 impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> ScopedBody<A, E, R> {
     /// Lift a reusable Effect into the existing owner's execution boundary.
-    pub(crate) fn from_effect(effect: Effect<A, E, R>) -> Self {
+    #[must_use]
+    pub fn from_effect(effect: Effect<A, E, R>) -> Self {
         Self {
             run: Arc::new(move |_| effect.clone()),
         }
     }
     /// Describe a native body, reconstructing its future and locals on each execution.
-    pub(crate) fn from_body<F>(
-        factory: impl Fn(MacroContext<E, R>) -> F + Send + Sync + 'static,
-    ) -> Self
+    pub fn from_body<F>(factory: impl Fn(MacroContext<E, R>) -> F + Send + Sync + 'static) -> Self
     where
         F: Future<Output = Result<A, Exit<A, E>>> + Send + 'static,
     {
@@ -65,7 +64,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> ScopedBody<
         }
     }
     /// Execute under the supplied scope without closing or replacing its resource owner.
-    pub(crate) fn evaluate(&self, scope: Scope<E>) -> Effect<A, E, R> {
+    pub fn evaluate(&self, scope: Scope<E>) -> Effect<A, E, R> {
         let run = Arc::clone(&self.run);
         Effect::defer(move || run(scope.clone()))
     }

@@ -16,9 +16,13 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone)]
 /// Adapter that emits Effect telemetry through the `tracing` subscriber.
 pub struct TracingBackend {
+    /// Live native spans keyed by local Effect identity, never by OTel wire IDs.
     spans: Arc<Mutex<HashMap<SpanId, tracing::Span>>>,
+    /// Caller-owned dispatch; this backend never installs a global subscriber.
     dispatch: tracing::Dispatch,
+    /// Explicit maximum live span ownership retained by this adapter.
     capacity: NonZeroUsize,
+    /// Best-effort telemetry failures stay separate from business outcomes.
     diagnostics: Diagnostics,
 }
 impl TracingBackend {
@@ -64,17 +68,61 @@ impl TracingBackend {
         &self,
         redact: impl Fn(&Annotations) -> Result<Annotations, Defect> + Send + Sync + 'static,
     ) -> Tracer {
+        self.tracer_with_hooks(redact, |_, _| Ok(()), |_, _| Ok(()))
+    }
+
+    /// Decorate the same native spans used by ordinary `span!`.
+    ///
+    /// `start_native` runs before the span is entered or exposed, allowing a
+    /// distributed parent to be attached before SDK span construction. The end
+    /// callback observes the full Effect outcome before the last retained handle
+    /// is released. Hook failures enter diagnostics through the core tracer.
+    /// Neither callback may retain ambient guards across asynchronous work.
+    #[must_use]
+    pub fn tracer_with_hooks(
+        &self,
+        redact: impl Fn(&Annotations) -> Result<Annotations, Defect> + Send + Sync + 'static,
+        start_native: impl Fn(&tracing::Span, &SpanStart) -> Result<(), Defect> + Send + Sync + 'static,
+        finish_native: impl Fn(&tracing::Span, &SpanFinish) -> Result<(), Defect>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Tracer {
         let start = self.clone();
         let finish = self.clone();
         Tracer::new(
             self.diagnostics.clone(),
             redact,
-            move |info| start.start(info),
-            move |info| {
-                finish.finish(info);
-                Ok(())
-            },
+            move |info| start.start(info, &start_native),
+            move |info| finish.finish(info, &finish_native),
         )
+    }
+
+    /// Borrow a live native span for one checked synchronous operation.
+    ///
+    /// The map lock is released before the callback. A missing/closed identity
+    /// returns `None`; this does not construct a replacement span or reinterpret
+    /// local Effect IDs as distributed identities.
+    pub fn with_native<T>(
+        &self,
+        id: &SpanId,
+        action: impl FnOnce(&tracing::Span) -> T,
+    ) -> Option<T> {
+        let span = self
+            .spans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .cloned()?;
+        Some(tracing::dispatcher::with_default(&self.dispatch, || {
+            action(&span)
+        }))
+    }
+
+    /// Borrow the selected dispatch for native subscriber composition.
+    #[must_use]
+    pub fn dispatch(&self) -> &tracing::Dispatch {
+        &self.dispatch
     }
     #[must_use]
     /// Build a level-filtered logger that redacts annotations before emission.
@@ -122,7 +170,11 @@ impl TracingBackend {
     ///
     /// # Returns
     /// Type: `Result<Option<SpanId>, Defect>`.
-    fn start(&self, info: &SpanStart) -> Result<Option<SpanId>, Defect> {
+    fn start(
+        &self,
+        info: &SpanStart,
+        decorate: &impl Fn(&tracing::Span, &SpanStart) -> Result<(), Defect>,
+    ) -> Result<Option<SpanId>, Defect> {
         let parent = info.parent.as_ref().and_then(|id| {
             self.spans
                 .lock()
@@ -132,8 +184,9 @@ impl TracingBackend {
         });
         let span = tracing::dispatcher::with_default(
             &self.dispatch,
-            || tracing::span!(parent: parent.as_ref().and_then(tracing::Span::id), tracing::Level::INFO, stringify!(EffectSpan), name = %info.name, annotations = ?info.annotations, started = ?info.time, outcome = tracing::field::Empty, cleanup_failed = tracing::field::Empty, finished = tracing::field::Empty),
+            || tracing::span!(parent: parent.as_ref().and_then(tracing::Span::id), tracing::Level::INFO, stringify!(EffectSpan), name = %info.name, annotations = ?info.annotations, started = ?info.time, outcome = tracing::field::Empty, cleanup_failed = tracing::field::Empty, finished = tracing::field::Empty, otel.name = tracing::field::Empty, otel.kind = tracing::field::Empty),
         );
+        tracing::dispatcher::with_default(&self.dispatch, || decorate(&span, info))?;
         let Some(id) = span.id().map(|id| SpanId::new(id.into_u64().to_string())) else {
             return Ok(None);
         };
@@ -154,8 +207,12 @@ impl TracingBackend {
     /// - `info` (`&SpanFinish`): The info supplied to this operation.
     ///
     /// # Returns
-    /// Type: `()`.
-    fn finish(&self, info: &SpanFinish) {
+    /// Type: `Result<(), Defect>`.
+    fn finish(
+        &self,
+        info: &SpanFinish,
+        decorate: &impl Fn(&tracing::Span, &SpanFinish) -> Result<(), Defect>,
+    ) -> Result<(), Defect> {
         let span = self
             .spans
             .lock()
@@ -165,6 +222,37 @@ impl TracingBackend {
             span.record(stringify!(outcome), tracing::field::debug(info.outcome));
             span.record(stringify!(cleanup_failed), info.cleanup_failed);
             span.record(stringify!(finished), tracing::field::debug(info.time));
+            tracing::dispatcher::with_default(&self.dispatch, || decorate(&span, info))?;
         }
+        Ok(())
+    }
+}
+
+/// Thread-local native guards retained only for the duration of one poll.
+struct NativePollScope {
+    /// Entered span drops before the selected dispatcher is restored.
+    _span: Option<tracing::span::EnteredSpan>,
+    /// Previous thread dispatcher is restored after the span exits.
+    _dispatch: tracing::dispatcher::DefaultGuard,
+}
+
+impl effect::PollScope for NativePollScope {}
+
+impl effect::PollInstrumentation for TracingBackend {
+    /// Enter the selected dispatch and this execution's native span on this thread.
+    /// Owned guards avoid borrowing a map entry and cannot survive a poll boundary.
+    fn enter(&self, trace: &effect::TraceContext) -> Box<dyn effect::PollScope> {
+        let dispatch = tracing::dispatcher::set_default(&self.dispatch);
+        let span = trace.span.as_ref().and_then(|id| {
+            self.spans
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(id)
+                .cloned()
+        });
+        Box::new(NativePollScope {
+            _span: span.map(tracing::Span::entered),
+            _dispatch: dispatch,
+        })
     }
 }

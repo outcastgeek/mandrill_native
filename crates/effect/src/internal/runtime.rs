@@ -22,6 +22,22 @@ pub(crate) enum Step {
     More(FlatDrop<Box<dyn FnOnce() -> Step + Send>>),
     Suspended(Pin<Box<dyn Future<Output = Step> + Send>>),
     Composed(Pin<Box<dyn Future<Output = Step> + Send>>),
+    /// Select native context for the next transition without wrapping its callback.
+    Contextual(
+        /// Next executable transition; consumed iteratively before polling it.
+        Box<Step>,
+        /// Native context to select for that transition and its current wait.
+        PollContext,
+    ),
+}
+
+/// Native state of the current trampoline transition, independent of its owner.
+/// Replaced at context tags; it never accumulates prior transition callbacks.
+pub(crate) struct PollContext {
+    /// The trace snapshot belonging to this transition or native wait.
+    trace: crate::TraceContext,
+    /// Environment-selected native hook, absent for ordinary core execution.
+    instrumentation: Option<Arc<dyn crate::PollInstrumentation>>,
 }
 
 #[derive(Clone)]
@@ -30,6 +46,8 @@ pub(crate) struct Context {
     pub(crate) cancellation: Cancellation,
     origin: Arc<FailureOrigin>,
     pub(crate) trace: crate::TraceContext,
+    /// Optional native poll context chosen through the application environment.
+    pub(crate) instrumentation: Option<Arc<dyn crate::PollInstrumentation>>,
     clock_frontier: ClockFrontier,
 }
 
@@ -80,6 +98,7 @@ impl Context {
         Self {
             cancellation: Cancellation::new(),
             trace: self.trace.clone(),
+            instrumentation: self.instrumentation.clone(),
             origin: Arc::new(const { FailureOrigin::root() }),
             clock_frontier: ClockFrontier::Parent(Arc::clone(self.clock_origin())),
         }
@@ -91,6 +110,7 @@ impl Context {
         Self {
             cancellation: self.cancellation.child(),
             trace: self.trace.clone(),
+            instrumentation: self.instrumentation.clone(),
             origin: Arc::new(FailureOrigin {
                 protected: AtomicBool::new(false),
                 fiber: true,
@@ -112,6 +132,7 @@ impl Context {
         Self {
             cancellation,
             trace: self.trace.clone(),
+            instrumentation: self.instrumentation.clone(),
             origin: Arc::new(FailureOrigin {
                 protected: AtomicBool::new(false),
                 fiber: self.origin.fiber,
@@ -184,6 +205,33 @@ impl Context {
 /// Type: `Step`.
 pub(crate) fn more(next: impl FnOnce() -> Step + Send + 'static) -> Step {
     Step::More(FlatDrop::new(Box::new(next)))
+}
+
+/// Tag the next transition with its native context. A more specific tag already
+/// returned by a nested execution wins; no closure calls another tagged closure.
+/// The interpreter consumes tags iteratively and keeps only its current context.
+pub(crate) fn instrument_step(step: Step, context: Context) -> Step {
+    match step {
+        Step::Done | Step::Contextual(_, _) => step,
+        Step::More(_) | Step::Suspended(_) | Step::Composed(_) => Step::Contextual(
+            Box::new(step),
+            PollContext {
+                trace: context.trace,
+                instrumentation: context.instrumentation,
+            },
+        ),
+    }
+}
+
+/// Restore the entry context before invoking an operation's caller continuation.
+/// The extra boundary is a trampoline transition, not a recursive callback call.
+/// This makes a completed child span restore its parent's context and can clear
+/// a locally selected hook when its enclosing caller had no instrumentation.
+pub(crate) fn instrument_finish<A: Send + 'static, E: Send + 'static>(
+    callback: Finish<A, E>,
+    context: Context,
+) -> Finish<A, E> {
+    continuation(move |outcome| instrument_step(finish(callback, outcome), context))
 }
 
 /// # Type parameters
@@ -274,6 +322,7 @@ where
     let context = Context {
         cancellation,
         trace: crate::TraceContext::default(),
+        instrumentation: None,
         origin: Arc::new(const { FailureOrigin::root() }),
         clock_frontier: ClockFrontier::Own,
     };
@@ -388,13 +437,33 @@ async fn evaluate_inner<A: Send + 'static, E: Send + 'static, R: Send + Sync + '
             Step::Done
         }),
     );
+    let mut poll_context = PollContext {
+        trace: context.trace.clone(),
+        instrumentation: context.instrumentation.clone(),
+    };
     poll_fn(move |cx| {
         // Advance the current typed transition, then return control to the
         // host before executing its successor. No arbitrary batching quantum
         // configures scheduling outside R. A native wait keeps its own waker.
-        let current = std::mem::replace(&mut step, Step::Done);
+        let mut current = std::mem::replace(&mut step, Step::Done);
+        // Context tags are data, consumed iteratively before one real transition.
+        // No historical wrapper/guard survives after its transition returns.
+        while let Step::Contextual(inner, selected) = current {
+            poll_context = selected;
+            current = *inner;
+        }
+        let _guard = poll_context
+            .instrumentation
+            .as_ref()
+            .map(|hook| hook.enter(&poll_context.trace));
         match current {
             Step::Done => {}
+            Step::Contextual(inner, selected) => {
+                // The loop above consumes every tag; retaining this exhaustive
+                // arm also preserves trampoline behavior if tag handling evolves.
+                poll_context = selected;
+                step = *inner;
+            }
             Step::More(next) => {
                 step = match next.take() {
                     Some(next) => next(),

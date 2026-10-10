@@ -116,21 +116,28 @@ fn browse_menu() -> Effect<(), BrowsingProblem, CoffeeShop> {
     effect! {
         let customer = service! {
             handle: CounterTicket { customer: "Maya" }, run |ticket: &CounterTicket| {
-                Effect::<String, MenuProblem, CoffeeShop>::sync_once({ let name = ticket.customer; move || name.to_owned() })?
+                ticket.customer.to_owned()
             }
         }.map_error(BrowsingProblem::Menu)?;
         let drinks = menu_choices().run_collect(Some(3)).map_error(BrowsingProblem::Menu)?;
         println!("{customer} reads today's menu:");
         for drink in drinks {
             let label = drink.label(); let contains_dairy = drink == Drink::Cappuccino;
-            let cents = span! { name: "read-menu-price", annotations: BTreeMap::from([(Arc::from("customer"), Arc::from("Maya"))]),
+            let cents = span! {
+                name: "read-menu-price", annotations: BTreeMap::from([(Arc::from("customer"), Arc::from("Maya"))]),
                 body { let drink = drink.clone(); span! { name: "menu-board", effect: menu_price(drink) }? }
             }.map_error(BrowsingProblem::Menu)?;
             println!("  {}: ${}.{:02}", label, cents / 100, cents % 100);
             if contains_dairy { println!("    Maya skips dairy today."); }
         }
         let pickup_name = service! {
-            project: |_: &CoffeeShop| "Maya".to_owned(), effect: Effect::<String, MenuProblem, String>::service(Clone::clone)
+            project: |_: &CoffeeShop| CounterTicket { customer: "Maya" }, body {
+                service! {
+                    select: |ticket: &CounterTicket| ticket.customer.to_owned(),
+                    on_error: |problem: MenuProblem| problem,
+                    run |name: &String| { name.clone() }
+                }?
+            }
         }.map_error(BrowsingProblem::Menu)?;
         cached_menu().map_error(BrowsingProblem::Cache)?;
         refreshed_special().map_error(BrowsingProblem::Refresh)?;
@@ -142,11 +149,14 @@ fn cached_menu() -> Effect<(), SharedValue<MenuProblem>, CoffeeShop> {
     Scope::scoped(|scope| {
         effect! {
             let scope = scope.clone();
-            let config = CacheConfig { equal: Arc::new(|left: &Drink, right| left == right), ttl: None,
+            let config = CacheConfig {
+                equal: Arc::new(|left: &Drink, right| left == right), ttl: None,
                 capacity: CacheCapacity::Bounded(nz(3)), cache_failure: Arc::new(|_: &MenuProblem| false) };
-            let options = CacheOptions { ttl: CacheTtl::Fixed(None), admission: CacheAdmission::Bounded {
-                maximum: nz(4), capacity_error: Arc::new(|| MenuProblem::Busy) } };
-            let prices = cache! { scope: scope.clone(), config: config.clone(), options: options.clone(),
+            let options = CacheOptions {
+                ttl: CacheTtl::Fixed(None), admission: CacheAdmission::Bounded {
+                    maximum: nz(4), capacity_error: Arc::new(|| MenuProblem::Busy) } };
+            let prices = cache! {
+                scope: scope.clone(), config: config.clone(), options: options.clone(),
                 load |drink: Arc<Drink>| { menu_price((*drink).clone())? } }?;
             let familiar_prices = cache! { scope: scope.clone(), config: config, options: options, load: borrowed_menu_price }?;
             let first = prices.get(Drink::OatLatte)?;
@@ -178,10 +188,15 @@ fn refreshed_special() -> Effect<(), SharedValue<DependencyCacheError<MenuProble
     Scope::scoped(|scope| {
         effect! {
             let scope = scope.clone();
-            let specials = dependency_cache! { scope: scope.clone(), policy: menu_retention(),
+            let specials = dependency_cache! {
+                scope: scope.clone(), policy: menu_retention(),
                 load |drink: Arc<Drink>| { price_with_board(&drink)? } }?;
             let _ = specials.get(Drink::OatLatte)?;
-            Effect::service(|cafe: &CoffeeShop| cafe.services.oat_latte_cents.store(500, Ordering::SeqCst))?;
+            service! {
+                select: |cafe: &CoffeeShop| cafe.services.clone(),
+                on_error: |problem: SharedValue<DependencyCacheError<MenuProblem>>| problem,
+                run |board: &Arc<MenuBoard>| { board.oat_latte_cents.store(500, Ordering::SeqCst); }
+            }?;
             specials.invalidate_dependency(MenuDependency::PriceBoard)?;
             let changed = specials.get(Drink::OatLatte)?;
             let cents = changed.with(|cents| *cents).expect("refreshed special");

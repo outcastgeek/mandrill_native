@@ -79,6 +79,7 @@ mod job;
 mod latch;
 mod layer;
 mod metric;
+mod native_context;
 mod owned_run;
 mod parallel;
 mod partitioned_semaphore;
@@ -138,6 +139,7 @@ pub use metric::{
     MetricDescriptor, MetricDomain, MetricError, MetricKind, MetricLabels, MetricName,
     MetricRecorder, MetricSample, MetricSeries, MetricValue,
 };
+pub use native_context::{NativeContext, PollInstrumentation, PollScope};
 pub use owned_run::{RunDriver, RunObserver};
 pub use program::Effect;
 pub use queue::{AsyncQueue, QueueCapacity, QueueError, QueueShutdown};
@@ -152,7 +154,7 @@ pub use schema::{
     AnyOfValue, ArrayConstraints, CheckedPattern, Codec, ConfiguredCodec, Decimal, DecimalError,
     DomainCodec, DuplicateFields, EffectSchema, IssueBudget, IssueSegment, JsonExactNumber,
     JsonRepresentation, JsonSchemaDocument, JsonValue, JsonWriter, JsonWriterPolicy,
-    LiteralEnumValue, MultiplePatternPolicy, NativeField, NativeFields, NativeNil,
+    JsonWriterSink, LiteralEnumValue, MultiplePatternPolicy, NativeField, NativeFields, NativeNil,
     NativeRecordBuilder, NumericConstraint, ObjectConstraints, ObjectRepresentation, ParseContext,
     ParseLimits, ParsePolicy, PatternPolicy, PatternProperty, PrefixElement, PrefixValue,
     PrimitiveShape, PureCodec, RecordBuilder, RecordField, RecordFields, RecordNil,
@@ -177,10 +179,28 @@ pub use sink::Sink;
 pub mod __private {
     pub use crate::Exit;
     pub use crate::internal::macro_future::{AsyncBindable, MacroContext, async_workflow};
+    pub use crate::internal::scoped_body::ScopedBody;
     pub use crate::internal::workflow::{
         Bindable, Workflow, bind, defer, defer_callback0, defer_callback1, defer_callback2, once,
         reusable, success,
     };
+
+    /// Transfer a scoped body's cleanup to its canonical owned cleanup Effect.
+    ///
+    /// The first owner drains the complete non-Clone cleanup outcome after ordered
+    /// protected settlement. The enclosing `Scope::scoped` acknowledges this explicit
+    /// transfer; the native body must preserve that outcome in its returned exit.
+    /// Native adapters use this boundary to finish request resources before their
+    /// surrounding trace or completion observer ends. Construction retains the
+    /// existing abandonment guard and creates no new scope or execution engine.
+    #[doc(hidden)]
+    pub fn close_scope_owned<E, R>(scope: crate::Scope<E>) -> crate::Effect<(), E, R>
+    where
+        E: Send + 'static,
+        R: Send + Sync + 'static,
+    {
+        scope.close_scoped_owned()
+    }
 }
 
 pub use stream::{Chunk, Stream, StreamBufferOptions, StreamContext, StreamReader};
@@ -227,7 +247,8 @@ pub use cache::{
     CacheTtl, SharedValue,
 };
 pub use dependency_cache::{
-    DependencyCache, DependencyCacheError, DependencyCachePolicy, DependencyValue,
+    DependencyCache, DependencyCacheCoalescingPolicy, DependencyCacheError, DependencyCachePolicy,
+    DependencyValue,
 };
 
 pub use weak_cache::{CachePartition, WeakCache, WeakCacheValue};

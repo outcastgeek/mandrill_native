@@ -1,0 +1,36 @@
+[package]
+name = "effect-server-identity"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+
+[features]
+default = []
+sqlx-turso = ["dep:effect-sql", "dep:sqlx"]
+maud = ["identity_rs/maud", "dep:maud"]
+
+[dependencies]
+effect = { path = "../effect" }
+effect-macros = { path = "../effect_macros" }
+effect-server = { path = "../effect_server" }
+effect-sql = { path = "../effect_sql", optional = true }
+sqlx = { workspace = true, optional = true, features = ["migrate", "json", "uuid", "time"] }
+identity_rs = { workspace = true }
+maud = { workspace = true, optional = true }
+axum = { workspace = true }
+http = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+uuid = { workspace = true, features = ["serde", "v4", "v7"] }
+time = { workspace = true, features = ["serde", "formatting", "parsing"] }
+
+[dev-dependencies]
+effect-tokio = { path = "../effect_tokio" }
+
+[[example]]
+name = "customer_account"
+required-features = ["sqlx-turso"]
+
+[lints]
+workspace = true

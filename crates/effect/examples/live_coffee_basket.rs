@@ -13,11 +13,13 @@ use effect::reactivity::{
     ReactiveStateSource,
 };
 use effect::transaction;
-use effect::transactional::{Transaction, TransactionError, TransactionPolicy, TxRef, TxValue};
+use effect::transactional::{
+    Transaction, TransactionDomain, TransactionError, TransactionPolicy, TxRef, TxValue,
+};
 use effect::{
     Chunk, Effect, Exit, PubSubError, PubSubOptions, PubSubOverflow, PubSubShutdown, ReplayPolicy,
     Scope, atom, effect, hydration, json_i64, json_string, reactive_bridge, reactive_derived,
-    reactive_query, reactive_source, schema, stream,
+    reactive_query, reactive_source, schema, service, stream,
 };
 use std::sync::Arc;
 
@@ -86,7 +88,8 @@ fn total_for(basket: AtomRef<Basket>) -> AtomProgram<BasketTotal, AtomRefError, 
     atom! {
         let basket = basket.clone();
         let selected = AtomProgram::read(basket)?;
-        BasketTotal { drinks: selected.americanos + selected.oat_lattes,
+        BasketTotal {
+            drinks: selected.americanos + selected.oat_lattes,
             cents: selected.americanos * 325 + selected.oat_lattes * 475 }
     }
 }
@@ -98,7 +101,8 @@ fn reserve_stock(stock: TxRef<Stock>, basket: Arc<Basket>) -> Transaction<Stock,
         if basket.americanos > available.americanos || basket.oat_lattes > available.oat_lattes {
             Transaction::<(), StockProblem>::fail_with(|| StockProblem::SoldOut)?;
         }
-        let remaining = Stock { americanos: available.americanos - basket.americanos,
+        let remaining = Stock {
+            americanos: available.americanos - basket.americanos,
             oat_lattes: available.oat_lattes - basket.oat_lattes };
         stock.write(Arc::new(remaining.clone()))?;
         remaining
@@ -180,8 +184,13 @@ fn fill_basket() -> Effect<(), BasketProblem, CoffeeShop> {
                 schema! { struct Basket { customer: json_string(), americanos: json_i64(), oat_lattes: json_i64() } policy: parse_policy() }.expect("basket schema"), limits())]
         }.expect("saved basket binding");
         let snapshot = saved.export_all().map_error(BasketProblem::Saved)?;
-        let journal = Effect::service(|cafe: &CoffeeShop| cafe.transactions.clone())?;
-        let stock = journal.reference(Stock { americanos: 4, oat_lattes: 3 }).expect("counter stock");
+        let stock = service! {
+            select: |cafe: &CoffeeShop| cafe.transactions.clone(),
+            on_error: |problem: BasketProblem| problem,
+            run |journal: &Arc<TransactionDomain>| {
+                journal.reference(Stock { americanos: 4, oat_lattes: 3 }).expect("counter stock")
+            }
+        }?;
         let observed_stock = stock.clone();
         let availability: ReactiveQuery<Stock, TransactionError<StockProblem>, CoffeeShop> = reactive_query! {
             registry: InvalidationRegistry::new(basket_updates()).expect("stock registry"), dependencies: [InvalidationKey::from_stable(key("counter-stock"))],

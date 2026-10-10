@@ -25,8 +25,12 @@ pub use sqlx_upstream::{
 #[doc(hidden)]
 pub use sqlx_upstream::{
     __query_scalar_with_result, __query_with_result, __rt, _unstable, sqlx_macros, test_block_on,
-    ty_match,
 };
+
+/// SQLx checked-query type matching, available with the native macro feature.
+#[doc(hidden)]
+#[cfg(feature = "macros")]
+pub use sqlx_upstream::ty_match;
 
 #[cfg(feature = "_unstable-docs")]
 pub use sqlx_upstream::_config;
