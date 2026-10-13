@@ -1,6 +1,7 @@
 //! Transactional ordered chunks.
 
 use super::{Transaction, TransactionDomain, TransactionDomainError, TxRef, TxValue};
+use crate::transaction;
 use std::sync::Arc;
 
 /// An ordered collection updated atomically as part of a transaction.
@@ -49,11 +50,13 @@ impl<T: TxValue> TxChunk<T> {
     /// # Returns
     /// Type: `Transaction<(), E>`.
     pub fn append<E: Send + 'static>(&self, value: Arc<T>) -> Transaction<(), E> {
-        self.cell.update(move |chunk| {
-            let mut next = chunk.clone();
-            next.push(Arc::clone(&value));
-            Ok((next, ()))
-        })
+        transaction! {
+        modify; reference: self.cell, modify: move |chunk| {
+                    let mut next = chunk.clone();
+                    next.push(Arc::clone(&value));
+                    Ok((next, ()))
+                },
+        }
     }
 
     #[must_use]
@@ -66,11 +69,13 @@ impl<T: TxValue> TxChunk<T> {
     /// # Returns
     /// Type: `Transaction<Option<Arc<T>>, E>`.
     pub fn pop<E: Send + 'static>(&self) -> Transaction<Option<Arc<T>>, E> {
-        self.cell.update(|chunk| {
-            let mut next = chunk.clone();
-            let value = next.pop();
-            Ok((next, value))
-        })
+        transaction! {
+        modify; reference: self.cell, modify: |chunk| {
+                    let mut next = chunk.clone();
+                    let value = next.pop();
+                    Ok((next, value))
+                },
+        }
     }
 
     #[must_use]

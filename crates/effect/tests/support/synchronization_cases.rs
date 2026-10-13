@@ -1,4 +1,4 @@
-use fx::{AtomicRef, Deferred, Effect, Exit, Latch, Scope};
+use fx::{AtomicRef, Deferred, Effect, Exit, Latch, effect, effect_ref, effect_scope};
 use std::cell::Cell;
 use std::sync::Arc;
 
@@ -13,11 +13,11 @@ enum Marker {
 struct Payload(Cell<Marker>); // Neither Clone nor Sync.
 
 pub async fn synchronization_cases() {
-    let references: Effect<(Marker, Marker), Payload> = fx::effect! {
+    let references: Effect<(Marker, Marker), Payload> = effect! {
         let reference = AtomicRef::make_with(|| Payload(Cell::new(Marker::Initial)))?;
-        let previous = reference.modify(|current| {
+        let previous = effect_ref! { modify; reference: reference, modify: |current| {
             (current.0.get(), Payload(Cell::new(Marker::Changed)))
-        })?;
+        }, }?;
         let current = reference.with(|current| current.0.get())?;
         (previous, current)
     };
@@ -57,19 +57,21 @@ pub async fn synchronization_cases() {
     );
 
     let env = Arc::new(super::tasks::Environment::default());
-    let workflow: Effect<(), Payload, super::tasks::Environment> = Scope::scoped(|scope| {
-        fx::effect! {
-            let scope = scope.clone(); // Per-run ownership handle for the continuation.
-            let latch = Latch::make()?;
-            let waiter = scope.fork(latch.await_open())?;
-            let first = latch.open()?;
-            assert!(first);
-            waiter.join()?;
-            let again = latch.open()?;
-            assert!(!again);
-            latch.await_open()?;
-        }
-    });
+    let workflow: Effect<(), Payload, super::tasks::Environment> = effect_scope! {
+    body: |scope| {
+            effect! {
+                let scope = scope.clone(); // Per-run ownership handle for the continuation.
+                let latch = Latch::make()?;
+                let waiter = scope.fork(latch.await_open())?;
+                let first = latch.open()?;
+                assert!(first);
+                waiter.join()?;
+                let again = latch.open()?;
+                assert!(!again);
+                latch.await_open()?;
+            }
+        },
+    };
     assert_eq!(workflow.run(Arc::clone(&env)).await, Exit::Success(()));
     assert_eq!(env.tasks.submitted(), 1); // Exactly the one latch waiter owned above.
     env.tasks.finish();

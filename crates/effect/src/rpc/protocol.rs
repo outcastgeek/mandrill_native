@@ -6,6 +6,7 @@ use super::{
 };
 use crate::Effect;
 use crate::encoding::{FrameDecodeFailure, FrameDecoder, FrameParts};
+use crate::{effect, effect_provided, effect_try_sync};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -139,8 +140,8 @@ impl<E: Send + 'static, R: Send + Sync + 'static> RpcProtocol<E, R> {
         let policy = self.policy;
         let handlers = Arc::clone(&self.handlers);
         let bytes = Mutex::new(Some(bytes));
-        Effect::try_sync(
-            move || {
+        {
+            let __dsl_program = effect_try_sync! { body: move || {
                 let bytes = bytes
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -164,16 +165,15 @@ impl<E: Send + 'static, R: Send + Sync + 'static> RpcProtocol<E, R> {
                 let envelope =
                     RpcEnvelope::decode(&first, policy).map_err(RpcProtocolError::Wire)?;
                 Ok(((envelope.operation.clone(), envelope.version), envelope))
-            },
-            std::convert::identity,
-        )
-        .flat_map(move |(key, envelope)| match handlers.get(&key) {
-            Some(handler) => handler(envelope),
-            None => Effect::from_result_once(Err(RpcProtocolError::UnknownOperation {
-                id: key.0,
-                version: key.1,
-            })),
-        })
+            }, on_error: std::convert::identity, };
+            effect! { let handlers = handlers.clone(); let (key , envelope) = __dsl_program.clone()?; match handlers.get(&key) {
+                Some(handler) => handler(envelope),
+                None => effect_try_sync! { once; body: { let __dsl_result = Err(RpcProtocolError::UnknownOperation {
+                    id: key.0,
+                    version: key.1,
+                }); move || __dsl_result }, on_error: ::core::convert::identity, },
+            }? }
+        }
     }
 }
 
@@ -224,13 +224,12 @@ impl<E: Send + 'static, R: Send + Sync + 'static> RpcChannel for InProcessRpcPro
         let bytes = match request.into_bytes() {
             Ok(bytes) => bytes,
             Err(error) => {
-                return Effect::from_result_once(Err(RpcProtocolError::Wire(RpcWireError::Frame(
+                return effect_try_sync! { once; body: { let __dsl_result = Err(RpcProtocolError::Wire(RpcWireError::Frame(
                     error,
-                ))));
+                ))); move || __dsl_result }, on_error: ::core::convert::identity, };
             }
         };
-        self.protocol
-            .handle(bytes)
-            .provide(Arc::clone(&self.environment))
+        effect_provided! { program: self.protocol
+        .handle(bytes), environment: Arc::clone(&self.environment), }
     }
 }

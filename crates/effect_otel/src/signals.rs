@@ -3,7 +3,8 @@
 use crate::{BorrowedProviders, OtelContext, OtelMetricRecorder};
 use effect::{
     Annotations, Defect, Diagnostics, Effect, HasClock, HasTracer, LogLevel, Logger,
-    PollInstrumentation, PollScope, SpanId, SpanOutcome, TraceContext, Tracer,
+    PollInstrumentation, PollScope, SpanId, SpanOutcome, TraceContext, Tracer, effect,
+    effect_try_sync, service,
 };
 use effect_tracing::TracingBackend;
 use opentelemetry::baggage::BaggageExt;
@@ -12,6 +13,7 @@ use opentelemetry::{KeyValue, Value};
 use std::num::NonZeroUsize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use tracing::event;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::prelude::*;
 
@@ -303,16 +305,16 @@ impl OtelBackend {
                 let _guard = backend.enter_event(&event.context);
                 match event.level {
                     LogLevel::Debug => {
-                        tracing::event!(target: "effect::log", tracing::Level::DEBUG, message = %message, annotations = ?event.context.annotations.as_ref())
+                        event!(target: "effect::log", tracing::Level::DEBUG, message = %message, annotations = ?event.context.annotations.as_ref())
                     }
                     LogLevel::Info => {
-                        tracing::event!(target: "effect::log", tracing::Level::INFO, message = %message, annotations = ?event.context.annotations.as_ref())
+                        event!(target: "effect::log", tracing::Level::INFO, message = %message, annotations = ?event.context.annotations.as_ref())
                     }
                     LogLevel::Warn => {
-                        tracing::event!(target: "effect::log", tracing::Level::WARN, message = %message, annotations = ?event.context.annotations.as_ref())
+                        event!(target: "effect::log", tracing::Level::WARN, message = %message, annotations = ?event.context.annotations.as_ref())
                     }
                     LogLevel::Error => {
-                        tracing::event!(target: "effect::log", tracing::Level::ERROR, message = %message, annotations = ?event.context.annotations.as_ref())
+                        event!(target: "effect::log", tracing::Level::ERROR, message = %message, annotations = ?event.context.annotations.as_ref())
                     }
                 }
                 Ok(())
@@ -547,25 +549,28 @@ impl Otel {
         E: Send + 'static,
         R: HasOtel + Send + Sync + 'static,
     {
-        Effect::<TraceContext, E, R>::trace_context().flat_map(|trace| {
-            Effect::service(move |env: &R| {
-                let backend = env.otel();
-                match catch_unwind(AssertUnwindSafe(|| {
-                    let current = opentelemetry::Context::current();
-                    if current.get::<BridgeAttachment>().is_some() {
-                        OtelContext::from_native(&current)
-                    } else {
-                        OtelContext::from_native(&backend.native_context(&trace))
+        effect! {
+            let trace = Effect::<TraceContext, E, R>::trace_context()?;
+            service! {
+                env |env: &R| {
+                    let backend = env.otel();
+                    match catch_unwind(AssertUnwindSafe(|| {
+                        let current = opentelemetry::Context::current();
+                        if current.get::<BridgeAttachment>().is_some() {
+                            OtelContext::from_native(&current)
+                        } else {
+                            OtelContext::from_native(&backend.native_context(&trace))
+                        }
+                    })) {
+                        Ok(context) => context,
+                        Err(panic) => {
+                            backend.diagnostics.record(Defect::from_panic(panic));
+                            backend.context.clone()
+                        }
                     }
-                })) {
-                    Ok(context) => context,
-                    Err(panic) => {
-                        backend.diagnostics.record(Defect::from_panic(panic));
-                        backend.context.clone()
-                    }
-                }
-            })
-        })
+                },
+            }?
+        }
     }
 
     /// Attach a detached context for a lexical boundary without changing `R`.
@@ -577,16 +582,20 @@ impl Otel {
         E: Send + 'static,
         R: HasOtel + Send + Sync + 'static,
     {
-        Effect::<TraceContext, E, R>::trace_context().flat_map(move |mut trace| {
-            trace.span = None;
-            let context = context.clone();
-            program
-                .clone()
-                .with_poll_instrumentation(move |env| {
-                    Arc::new(env.otel().with_context(context.clone()))
-                })
-                .with_trace_context(trace)
-        })
+        effect! {
+        bind;
+        program: Effect::<TraceContext, E, R>::trace_context(),
+        body: move |mut trace| {
+                   trace.span = None;
+                   let context = context.clone();
+                   program
+                       .clone()
+                       .with_poll_instrumentation(move |env| {
+                           Arc::new(env.otel().with_context(context.clone()))
+                       })
+                       .with_trace_context(trace)
+               },
+        }
     }
 
     /// Scope baggage updates while retaining the same live local span.
@@ -602,12 +611,16 @@ impl Otel {
         R: HasOtel + Send + Sync + 'static,
     {
         let entries = Arc::new(entries);
-        Self::current_context().flat_map(move |context| {
-            let next = context.with_baggage(entries.iter().cloned());
-            program.clone().with_poll_instrumentation(move |env| {
-                Arc::new(env.otel().with_context(next.clone()))
-            })
-        })
+        effect! {
+        bind;
+        program: Self::current_context(),
+        body: move |context| {
+                   let next = context.with_baggage(entries.iter().cloned());
+                   program.clone().with_poll_instrumentation(move |env| {
+                       Arc::new(env.otel().with_context(next.clone()))
+                   })
+               },
+        }
     }
 
     /// Run a checked native callback; missing layers/live spans are typed errors.
@@ -619,17 +632,14 @@ impl Otel {
         R: HasOtel + Send + Sync + 'static,
     {
         let action = Arc::new(action);
-        Effect::<TraceContext, NativeError, R>::trace_context().flat_map(move |trace| {
+        effect! {
             let action = Arc::clone(&action);
-            Effect::service(|env: &R| env.otel().clone()).flat_map(move |backend| {
-                let action = Arc::clone(&action);
-                let trace = trace.clone();
-                Effect::try_sync(
-                    move || backend.with_native(&trace, |span| action(span)),
-                    std::convert::identity,
-                )
-            })
-        })
+            let trace = Effect::<TraceContext, NativeError, R>::trace_context()?;
+            let backend = service! { env |env: &R| { env.otel().clone() }, }?;
+            effect_try_sync! {
+                body { backend.with_native(&trace, |span| action(span)) },
+            }?
+        }
     }
 
     /// Perform native provider access as a checked lazy Effect.
@@ -642,17 +652,17 @@ impl Otel {
         R: HasOtel + Send + Sync + 'static,
     {
         let action = Arc::new(action);
-        Effect::service(|env: &R| env.otel().providers.clone()).flat_map(move |providers| {
+        effect! {
             let action = Arc::clone(&action);
-            Effect::try_sync(
-                move || {
+            let providers = service! { env |env: &R| { env.otel().providers.clone() }, }?;
+            effect_try_sync! {
+                body {
                     let _permit = providers.admit()?;
                     catch_unwind(AssertUnwindSafe(|| action(&providers)))
                         .map_err(|panic| NativeError::Native(Defect::from_panic(panic)))?
                 },
-                std::convert::identity,
-            )
-        })
+            }?
+        }
     }
 
     /// Add a typed string/bool/i64/f64 attribute when this statement is reached.
@@ -872,13 +882,16 @@ where
     R: HasOtel + Send + Sync + 'static,
 {
     let action = Arc::new(action);
-    Effect::<TraceContext, E, R>::trace_context().flat_map(move |trace| {
+    effect! {
         let action = Arc::clone(&action);
-        Effect::service(move |env: &R| {
-            let backend = env.otel();
-            backend.diagnose(|| action(backend, &trace));
-        })
-    })
+        let trace = Effect::<TraceContext, E, R>::trace_context()?;
+        service! {
+            env |env: &R| {
+                let backend = env.otel();
+                backend.diagnose(|| action(backend, &trace));
+            },
+        }?
+    }
 }
 
 /// OTel protocol spellings recognized by tracing-opentelemetry's special field.

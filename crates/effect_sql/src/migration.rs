@@ -4,6 +4,7 @@
 //! and schema/history changes. Nontransactional steps require a caller-selected
 //! exclusive-maintenance provider; a filesystem lock is never distributed authority.
 
+use crate::effect_future;
 use crate::{Identifier, MigrationPhase, SqlError, SqlKernel};
 use effect::{Defect, Effect, Exit};
 use futures_util::FutureExt;
@@ -494,7 +495,8 @@ impl SqlMigrator {
     /// Lift initialization lazily, restoring complete native invocation failures.
     pub fn initialize_effect<R: Send + Sync + 'static>(&self) -> Effect<(), SqlError, R> {
         let this = self.clone();
-        Effect::from_exit_future_with_context(move |_, context| {
+        effect_future! {
+            exit_with_context; body: move |_, context| {
             let this = this.clone();
             async move {
                 if context.cancellation().is_requested() {
@@ -502,12 +504,13 @@ impl SqlMigrator {
                 }
                 native_exit(this.initialize().await)
             }
-        })
+        }, }
     }
     /// Preflight pending versions lazily in the caller's environment without a nested runtime.
     pub fn plan_up_effect<R: Send + Sync + 'static>(&self) -> Effect<Vec<i64>, SqlError, R> {
         let this = self.clone();
-        Effect::from_exit_future_with_context(move |_, context| {
+        effect_future! {
+            exit_with_context; body: move |_, context| {
             let this = this.clone();
             async move {
                 if context.cancellation().is_requested() {
@@ -515,7 +518,7 @@ impl SqlMigrator {
                 }
                 native_exit(this.plan_up().await)
             }
-        })
+        }, }
     }
     /// Capture a reversible plan lazily, preserving native failure and cleanup channels.
     pub fn plan_down_effect<R: Send + Sync + 'static>(
@@ -523,7 +526,8 @@ impl SqlMigrator {
         count: usize,
     ) -> Effect<DownPlan, SqlError, R> {
         let this = self.clone();
-        Effect::from_exit_future_with_context(move |_, context| {
+        effect_future! {
+            exit_with_context; body: move |_, context| {
             let this = this.clone();
             async move {
                 if context.cancellation().is_requested() {
@@ -531,13 +535,14 @@ impl SqlMigrator {
                 }
                 native_exit(this.plan_down(count).await)
             }
-        })
+        }, }
     }
     /// Lift native up lazily into any selected Effect environment without a nested runtime.
     /// Once started, migration settlement is awaited; a dropped future is not acknowledgment.
     pub fn up_effect<R: Send + Sync + 'static>(&self) -> Effect<usize, SqlError, R> {
         let this = self.clone();
-        Effect::from_exit_future_with_context(move |_, context| {
+        effect_future! {
+            exit_with_context; body: move |_, context| {
             let this = this.clone();
             async move {
                 if context.cancellation().is_requested() {
@@ -545,7 +550,7 @@ impl SqlMigrator {
                 }
                 native_exit(this.up().await)
             }
-        })
+        }, }
     }
     /// Apply one transferred opaque plan; subsequent executions report consumption.
     pub fn down_effect<R: Send + Sync + 'static>(
@@ -554,7 +559,8 @@ impl SqlMigrator {
     ) -> Effect<usize, SqlError, R> {
         let this = self.clone();
         let plan = Arc::new(std::sync::Mutex::new(Some(plan)));
-        Effect::from_exit_future_with_context(move |_, context| {
+        effect_future! {
+            exit_with_context; body: move |_, context| {
             let this = this.clone();
             let plan = plan.clone();
             async move {
@@ -570,14 +576,15 @@ impl SqlMigrator {
                     None => Exit::Fail(SqlError::Consumed),
                 }
             }
-        })
+        }, }
     }
     /// Lift dirty inspection while preserving the caller's typed environment and full exit.
     pub fn inspect_dirty_effect<R: Send + Sync + 'static>(
         &self,
     ) -> Effect<Option<DirtyMigration>, SqlError, R> {
         let this = self.clone();
-        Effect::from_exit_future_with_context(move |_, context| {
+        effect_future! {
+            exit_with_context; body: move |_, context| {
             let this = this.clone();
             async move {
                 if context.cancellation().is_requested() {
@@ -585,7 +592,7 @@ impl SqlMigrator {
                 }
                 native_exit(this.inspect_dirty().await)
             }
-        })
+        }, }
     }
     /// Effectful recovery evaluates the selected assessment through the current interpreter context.
     pub fn recover_effect<R: Send + Sync + 'static>(
@@ -597,7 +604,8 @@ impl SqlMigrator {
     ) -> Effect<(), SqlError, R> {
         let this = self.clone();
         let assess = Arc::new(assess);
-        Effect::from_exit_future_with_context(move |env, context| {
+        effect_future! {
+            exit_with_context; body: move |env, context| {
             let this = this.clone();
             let assess = assess.clone();
             async move {
@@ -679,7 +687,7 @@ impl SqlMigrator {
                 .unwrap_or_else(|panic| Exit::Die(Defect::from_panic(panic)));
                 crate::client::append_cleanup(outcome, session.close().await)
             }
-        })
+        }, }
     }
     /// Acquire external maintenance once and retain it across nontransactional schema execution.
     async fn up_with_maintenance(&self) -> Result<usize, SqlError> {

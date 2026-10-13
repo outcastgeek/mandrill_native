@@ -12,6 +12,7 @@ use futures_util::{SinkExt, StreamExt};
 use http::{HeaderValue, Method};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
+use tokio::select;
 use tokio::sync::oneshot;
 
 /// Explicit native buffer/handshake configuration; axum owns protocol validation.
@@ -114,7 +115,7 @@ impl WebSocket for AxumSocket {
                     Message::Binary(bytes::Bytes::copy_from_slice(&bytes))
                 }
             };
-            tokio::select! { () = cancellation.cancelled() => Err(Defect::new("WebSocket send cancelled")), () = abort.cancelled() => Err(Defect::new("WebSocket aborted")), result = async { let mut send = send.lock().await; let sender = send.as_mut().ok_or_else(|| Defect::new("WebSocket send owner closed"))?; sender.send(message).await.map_err(|error| Defect::new(error.to_string())) } => result }
+            select! { () = cancellation.cancelled() => Err(Defect::new("WebSocket send cancelled")), () = abort.cancelled() => Err(Defect::new("WebSocket aborted")), result = async { let mut send = send.lock().await; let sender = send.as_mut().ok_or_else(|| Defect::new("WebSocket send owner closed"))?; sender.send(message).await.map_err(|error| Defect::new(error.to_string())) } => result }
         })
     }
     /// Pull native complete frames; axum handles control frames and core handles message limits.
@@ -129,7 +130,7 @@ impl WebSocket for AxumSocket {
         let abort = self.abort.clone();
         Box::pin(async move {
             loop {
-                let next = tokio::select! { () = cancellation.cancelled() => return Err(Defect::new("WebSocket receive cancelled")), () = abort.cancelled() => return Err(Defect::new("WebSocket aborted")), result = async { let mut receive = receive.lock().await; match receive.as_mut() { Some(stream) => stream.next().await, None => None } } => result };
+                let next = select! { () = cancellation.cancelled() => return Err(Defect::new("WebSocket receive cancelled")), () = abort.cancelled() => return Err(Defect::new("WebSocket aborted")), result = async { let mut receive = receive.lock().await; match receive.as_mut() { Some(stream) => stream.next().await, None => None } } => result };
                 match next {
                     Some(Ok(Message::Text(text))) => {
                         return Ok(WebSocketFrame::Data {
@@ -146,7 +147,7 @@ impl WebSocket for AxumSocket {
                         });
                     }
                     Some(Ok(Message::Close(frame))) => {
-                        tokio::select! {
+                        select! {
                             ()=cancellation.cancelled()=>return Err(Defect::new("WebSocket receive cancelled")),
                             ()=abort.cancelled()=>return Err(Defect::new("WebSocket aborted")),
                             result=async {let mut send=send.lock().await;let sender=send.as_mut().ok_or_else(||Defect::new("WebSocket send owner closed"))?;sender.flush().await.map_err(|error|Defect::new(error.to_string()))}=>result?,
@@ -173,7 +174,7 @@ impl WebSocket for AxumSocket {
         let send = self.send.clone();
         let abort = self.abort.clone();
         Box::pin(async move {
-            tokio::select! { () = cancellation.cancelled() => Err(Defect::new("WebSocket close cancelled")), () = abort.cancelled() => Err(Defect::new("WebSocket aborted")), result = async { let mut send = send.lock().await; match send.as_mut() { Some(send) => send.send(Message::Close(None)).await.map_err(|error| Defect::new(error.to_string())), None => Ok(()) } } => result }
+            select! { () = cancellation.cancelled() => Err(Defect::new("WebSocket close cancelled")), () = abort.cancelled() => Err(Defect::new("WebSocket aborted")), result = async { let mut send = send.lock().await; match send.as_mut() { Some(send) => send.send(Message::Close(None)).await.map_err(|error| Defect::new(error.to_string())), None => Ok(()) } } => result }
         })
     }
     /// Signal pending I/O cancellation; disposal below awaits ownership before dropping halves.

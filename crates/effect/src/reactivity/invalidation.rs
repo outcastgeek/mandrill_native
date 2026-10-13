@@ -3,8 +3,10 @@
 use crate::pub_sub::{
     PubSub, PubSubError, PubSubOptions, PubSubShutdown, PublishReport, Subscription,
 };
+use crate::{Effect, KeyDomain, ResourceValue, Scope, Semaphore, SemaphoreError, StableKey};
 use crate::{
-    Effect, KeyDomain, Release, ResourceValue, Scope, Semaphore, SemaphoreError, StableKey,
+    effect, effect_map, effect_map_error, effect_resource, effect_scope_acquire, effect_sync,
+    effect_try_sync,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
@@ -119,7 +121,7 @@ impl InvalidationRegistry {
     pub fn subscribe<R: Send + Sync + 'static>(
         &self,
     ) -> Effect<Subscription<InvalidationBatch>, InvalidationError, R> {
-        self.hub.subscribe().map_error(InvalidationError::PubSub)
+        effect_map_error! { program: self.hub.subscribe(), map: InvalidationError::PubSub, }
     }
 
     /// Register a subscriber owned by the supplied scope.
@@ -137,11 +139,13 @@ impl InvalidationRegistry {
         &self,
         scope: &Scope<InvalidationError>,
     ) -> Effect<ResourceValue<Subscription<InvalidationBatch>>, InvalidationError, R> {
-        scope.acquire(self.subscribe(), |subscription| {
-            Release::sync(move || {
-                subscription.close_now();
-            })
-        })
+        effect_scope_acquire! {
+        scope: scope, acquire: self.subscribe(), release: |subscription| {
+                    crate::Release::sync(move || {
+                        subscription.close_now();
+                    })
+                },
+        }
     }
 
     /// An empty batch is a no-op and consumes no revision. Duplicate keys are
@@ -162,76 +166,80 @@ impl InvalidationRegistry {
     ) -> Effect<Option<PublishReport>, InvalidationError, R> {
         let registry = self.clone();
         let keys = Mutex::new(Some(keys));
-        Effect::try_sync(
-            move || {
+        {
+            let __dsl_program = effect_try_sync! {
+            body: move || {
                 let keys = keys
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take()
                     .ok_or(InvalidationError::InputConsumed)?;
                 Ok(keys.into_iter().collect::<BTreeSet<_>>())
-            },
-            std::convert::identity,
-        )
-        .flat_map(move |keys| {
-            if keys.is_empty() {
-                return Effect::sync(|| None);
+            }, on_error: std::convert::identity, };
+            effect! {
+                           let __dsl_program = __dsl_program.clone(); let registry = registry.clone(); let keys = __dsl_program.clone()?; (move || {
+                       if keys.is_empty() {
+                           return effect_sync! { body: || None, };
+                       }
+                       let registry = registry.clone();
+                       let keys = Mutex::new(Some(keys));
+                       effect! {
+            bind;
+            program: effect_map_error! {
+                program: registry
+                           .order
+                           .acquire(std::num::NonZeroUsize::MIN), map: InvalidationError::Admission, },
+            body: move |permit| {
+                               let keys = keys
+                                   .lock()
+                                   .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                   .take();
+                               let Some(keys) = keys else {
+                                   return effect_try_sync! { once; body: { let __dsl_result = Err(InvalidationError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, };
+                               };
+                               let registry = registry.clone();
+                               let revision = {
+                                   let mut state = registry
+                                       .state
+                                       .lock()
+                                       .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                   match state.next_revision {
+                                       Some(revision) => {
+                                           state.next_revision =
+                                               revision.get().checked_add(1).and_then(NonZeroU64::new);
+                                           Ok(revision)
+                                       }
+                                       None => Err(InvalidationError::RevisionExhausted),
+                                   }
+                               };
+                               let publication = match revision {
+                                   Ok(revision) => {
+                                       let keys: Arc<[InvalidationKey]> =
+                                           Arc::from(keys.into_iter().collect::<Vec<_>>());
+                                       let state = Arc::clone(&registry.state);
+                                       effect_map! {
+                                           program: effect_map_error! {
+                                           program: registry
+                                           .hub
+                                           .publish_with_commit(
+                                               InvalidationBatch { revision, keys },
+                                               move |batch| {
+                                                   let mut state = state
+                                                       .lock()
+                                                       .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                                   for key in batch.keys.iter() {
+                                                       state.per_key.insert(key.clone(), batch.revision);
+                                                   }
+                                               },
+                                           ), map: InvalidationError::PubSub, }, map: Some, }
+                                   }
+                                   Err(error) => effect_try_sync! { once; body: { let __dsl_result = Err(error); move || __dsl_result }, on_error: ::core::convert::identity, },
+                               };
+                               { let __dsl_program = publication; let __dsl_cleanup = effect_sync! { once; body: move || drop(permit), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } }
+                           },
             }
-            let registry = registry.clone();
-            let keys = Mutex::new(Some(keys));
-            registry
-                .order
-                .acquire(std::num::NonZeroUsize::MIN)
-                .map_error(InvalidationError::Admission)
-                .flat_map(move |permit| {
-                    let keys = keys
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take();
-                    let Some(keys) = keys else {
-                        return Effect::from_result_once(Err(InvalidationError::InputConsumed));
-                    };
-                    let registry = registry.clone();
-                    let revision = {
-                        let mut state = registry
-                            .state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match state.next_revision {
-                            Some(revision) => {
-                                state.next_revision =
-                                    revision.get().checked_add(1).and_then(NonZeroU64::new);
-                                Ok(revision)
-                            }
-                            None => Err(InvalidationError::RevisionExhausted),
-                        }
-                    };
-                    let publication = match revision {
-                        Ok(revision) => {
-                            let keys: Arc<[InvalidationKey]> =
-                                Arc::from(keys.into_iter().collect::<Vec<_>>());
-                            let state = Arc::clone(&registry.state);
-                            registry
-                                .hub
-                                .publish_with_commit(
-                                    InvalidationBatch { revision, keys },
-                                    move |batch| {
-                                        let mut state = state
-                                            .lock()
-                                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                        for key in batch.keys.iter() {
-                                            state.per_key.insert(key.clone(), batch.revision);
-                                        }
-                                    },
-                                )
-                                .map_error(InvalidationError::PubSub)
-                                .map(Some)
-                        }
-                        Err(error) => Effect::from_result_once(Err(error)),
-                    };
-                    publication.ensuring(Effect::sync_once(move || drop(permit)))
-                })
-        })
+                   })()? }
+        }
     }
 
     /// Snapshot a dependency set at one registry-state boundary. Query code
@@ -252,14 +260,15 @@ impl InvalidationRegistry {
         keys: Arc<[InvalidationKey]>,
     ) -> Effect<Option<NonZeroU64>, InvalidationError, R> {
         let state = Arc::clone(&self.state);
-        Effect::sync(move || {
+        effect_sync! {
+            body: move || {
             let state = state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             keys.iter()
                 .filter_map(|key| state.per_key.get(key).copied())
                 .max()
-        })
+        }, }
     }
 
     /// Stop accepting new work and describe the settlement of owned work.
@@ -277,7 +286,7 @@ impl InvalidationRegistry {
         &self,
         mode: PubSubShutdown,
     ) -> Effect<bool, InvalidationError, R> {
-        self.hub.shutdown(mode).map_error(InvalidationError::PubSub)
+        effect_map_error! { program: self.hub.shutdown(mode), map: InvalidationError::PubSub, }
     }
 }
 

@@ -1,3 +1,5 @@
+
+use effect::transaction;
 use effect::transactional::{
     HasTransactionDomain, Transaction, TransactionPolicy, TxChunk, TxDeferred, TxExecutionId,
     TxHashMap, TxHashSet, TxPriorityQueue, TxPubSub, TxPubSubOverflow, TxQueue, TxReentrantLock,
@@ -62,8 +64,12 @@ where
             move || {
                 vec![
                     chunk.append::<()>(Arc::new(41)),
-                    map.insert::<()>(Arc::new(41), Arc::new(42)).map(|_| ()),
-                    set.insert::<()>(Arc::new(42)).map(|_| ()),
+                    { let __dsl_transaction = map.insert::<()>(Arc::new(41), Arc::new(42)); transaction! {
+let _ = __dsl_transaction.clone()?; ()
+} },
+                    { let __dsl_transaction = set.insert::<()>(Arc::new(42)); transaction! {
+let _ = __dsl_transaction.clone()?; ()
+} },
                     queue.offer::<()>(Arc::new(42)),
                     priority.offer::<()>(Arc::new(1), Arc::new(42)),
                 ]
@@ -174,11 +180,13 @@ where
         return false;
     }
 
-    let namespace = KeyNamespace::<Domain>::new("locks").expect("valid lock namespace");
-    let owner = TxExecutionId::from_stable(
-        StableKey::new(&namespace, [KeySegment::Text("execution".into())])
-            .expect("valid logical execution identity"),
-    );
+    let Ok(namespace) = KeyNamespace::<Domain>::new("locks") else {
+        return false;
+    };
+    let Ok(identity) = StableKey::new(&namespace, [KeySegment::Text("execution".into())]) else {
+        return false;
+    };
+    let owner = TxExecutionId::from_stable(identity);
     let acquired = lock
         .acquire(owner.clone())
         .atomically(policy)

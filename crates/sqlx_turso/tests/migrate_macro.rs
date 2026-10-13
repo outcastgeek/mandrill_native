@@ -1,7 +1,8 @@
+use sqlx::migrate;
 use sqlx::{Executor, Row};
 use sqlx_turso::{TursoConnectOptions, TursoPoolOptions};
 
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("tests/migrations");
+static MIGRATOR: sqlx::migrate::Migrator = migrate!("tests/migrations");
 
 #[tokio::test]
 async fn ordinary_sqlx_migrate_macro_runs_on_turso() -> sqlx::Result<()> {

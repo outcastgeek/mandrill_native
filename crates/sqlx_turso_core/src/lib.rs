@@ -5,6 +5,7 @@
 //! support, and macro metadata hooks. Most applications should depend on the `sqlx-turso`
 //! facade instead of this crate directly.
 
+use sqlx_core::impl_acquire;
 #[cfg(feature = "any")]
 mod any;
 mod arguments;
@@ -54,4 +55,4 @@ pub use value::{TursoValue, TursoValueRef};
 #[cfg(feature = "migrate")]
 pub use sqlx_core::migrate::{Migrate, MigrateDatabase, Migration, MigrationType};
 
-sqlx_core::impl_acquire!(Turso, TursoConnection);
+impl_acquire!(Turso, TursoConnection);

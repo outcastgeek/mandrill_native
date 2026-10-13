@@ -5,6 +5,7 @@ use super::super::rate_limiter::{
     MemoryRateLimitError, RateLimitDecision, RateLimitPolicy, RateLimitStore,
     RateLimitStoreCapacity,
 };
+use crate::effect_try_sync;
 use crate::{Effect, Layer, UtcMillis};
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
@@ -425,33 +426,30 @@ impl RateLimitStore for MemoryRateLimitStore {
         cost: NonZeroU64,
     ) -> Effect<RateLimitDecision, Self::Error> {
         let state = Arc::clone(&self.state);
-        Effect::try_sync_once(
-            move || {
-                if cost > policy.maximum() {
-                    return Ok(RateLimitDecision::ImpossibleCost {
-                        requested: cost,
-                        maximum: policy.maximum(),
-                    });
+        effect_try_sync! { once; body: move || {
+            if cost > policy.maximum() {
+                return Ok(RateLimitDecision::ImpossibleCost {
+                    requested: cost,
+                    maximum: policy.maximum(),
+                });
+            }
+            let mut state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entry) = state.entries.get_mut(&key) {
+                if entry.policy != policy {
+                    return Err(MemoryRateLimitError::PolicyConflict);
                 }
-                let mut state = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some(entry) = state.entries.get_mut(&key) {
-                    if entry.policy != policy {
-                        return Err(MemoryRateLimitError::PolicyConflict);
-                    }
-                    return entry.acquire(now, cost);
-                }
-                if !Self::has_room(&state) {
-                    return Err(MemoryRateLimitError::CapacityExceeded);
-                }
-                let mut entry = Entry::new(policy, now);
-                let decision = entry.acquire(now, cost)?;
-                state.entries.insert(key, entry);
-                Ok(decision)
-            },
-            std::convert::identity,
-        )
+                return entry.acquire(now, cost);
+            }
+            if !Self::has_room(&state) {
+                return Err(MemoryRateLimitError::CapacityExceeded);
+            }
+            let mut entry = Entry::new(policy, now);
+            let decision = entry.acquire(now, cost)?;
+            state.entries.insert(key, entry);
+            Ok(decision)
+        }, on_error: std::convert::identity, }
     }
 
     ///
@@ -470,27 +468,24 @@ impl RateLimitStore for MemoryRateLimitStore {
         report: AdaptiveFeedback,
     ) -> Effect<FeedbackOutcome, Self::Error> {
         let state = Arc::clone(&self.state);
-        Effect::try_sync_once(
-            move || {
-                let mut state = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let expected = RateLimitPolicy::AdaptiveWindow(policy);
-                if let Some(entry) = state.entries.get_mut(&key) {
-                    if entry.policy != expected {
-                        return Err(MemoryRateLimitError::PolicyConflict);
-                    }
-                    return entry.feedback(report);
+        effect_try_sync! { once; body: move || {
+            let mut state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let expected = RateLimitPolicy::AdaptiveWindow(policy);
+            if let Some(entry) = state.entries.get_mut(&key) {
+                if entry.policy != expected {
+                    return Err(MemoryRateLimitError::PolicyConflict);
                 }
-                if !Self::has_room(&state) {
-                    return Err(MemoryRateLimitError::CapacityExceeded);
-                }
-                let mut entry = Entry::new(expected, report.instant);
-                let outcome = entry.feedback(report)?;
-                state.entries.insert(key, entry);
-                Ok(outcome)
-            },
-            std::convert::identity,
-        )
+                return entry.feedback(report);
+            }
+            if !Self::has_room(&state) {
+                return Err(MemoryRateLimitError::CapacityExceeded);
+            }
+            let mut entry = Entry::new(expected, report.instant);
+            let outcome = entry.feedback(report)?;
+            state.entries.insert(key, entry);
+            Ok(outcome)
+        }, on_error: std::convert::identity, }
     }
 }

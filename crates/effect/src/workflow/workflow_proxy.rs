@@ -13,6 +13,7 @@ use crate::cluster::{
 };
 use crate::rpc::RpcCallId;
 use crate::{Effect, UtcMillis};
+use crate::{effect_map_error, effect_try_sync};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
@@ -348,11 +349,10 @@ where
         R::Store: ClusterMessageStore<Error = Backend>,
     {
         if self.entity.address().entity.as_bytes() != command.run().as_bytes() {
-            return Effect::fail_with(|| WorkflowProxyError::EntityIdentityMismatch);
+            return effect_try_sync! { body: { let __dsl_error = || WorkflowProxyError::EntityIdentityMismatch; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
         }
-        self.entity
-            .submit(request, command, call, accepted_at, acceptance)
-            .map_error(WorkflowProxyError::Cluster)
+        effect_map_error! { program: self.entity
+        .submit(request, command, call, accepted_at, acceptance), map: WorkflowProxyError::Cluster, }
     }
 
     /// Inspect the current state without waiting for a later change.
@@ -380,9 +380,8 @@ where
         R: HasClusterMessageStore + Send + Sync + 'static,
         R::Store: ClusterMessageStore<Error = Backend>,
     {
-        self.entity
-            .poll(request, observer, call)
-            .map_error(WorkflowProxyError::Cluster)
+        effect_map_error! { program: self.entity
+        .poll(request, observer, call), map: WorkflowProxyError::Cluster, }
     }
 
     /// Record that the selected observer has consumed the reply.
@@ -408,8 +407,7 @@ where
         R: HasClusterMessageStore + Send + Sync + 'static,
         R::Store: ClusterMessageStore<Error = Backend>,
     {
-        self.entity
-            .acknowledge_reply(request, observer)
-            .map_error(WorkflowProxyError::Cluster)
+        effect_map_error! { program: self.entity
+        .acknowledge_reply(request, observer), map: WorkflowProxyError::Cluster, }
     }
 }

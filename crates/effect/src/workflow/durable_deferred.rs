@@ -6,6 +6,7 @@ use super::{
     WorkflowRunId, WorkflowSignalId, WorkflowVersion,
 };
 use crate::{Effect, JsonValue, ParseLimits, PureCodec};
+use crate::{effect, effect_map_error, effect_provide_some, effect_sync, effect_try_sync, service};
 
 #[derive(Debug)]
 /// A typed failure while recording or waiting for a durable signal.
@@ -135,34 +136,41 @@ impl<A: Send + 'static> DurableDeferred<A> {
     {
         let token = self.clone();
         let value = std::sync::Mutex::new(Some(value));
-        Effect::service(|env: &R| env.workflow_engine()).flat_map(move |engine| {
-            let value = value
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            let Some(value) = value else {
-                return Effect::from_result_once(Err(DurableSignalError::InputConsumed));
-            };
-            match token.encode(&value) {
-                Ok(signal) => {
-                    let expected = signal.clone();
-                    engine
-                        .deliver_signal(token.run.clone(), signal)
-                        .map_error(DurableSignalError::Engine)
-                        .provide_some(|_: &R| ())
-                        .flat_map(move |recorded| {
-                            if recorded == expected {
-                                Effect::sync_once(move || recorded)
-                            } else {
-                                Effect::from_result_once(Err(
-                                    DurableSignalError::RecordedSignalMismatch,
-                                ))
-                            }
-                        })
-                }
-                Err(error) => Effect::from_result_once(Err(DurableSignalError::Codec(error))),
-            }
-        })
+        effect! {
+        bind;
+        program: service! { env: |env: &R| env.workflow_engine(), },
+        body: move |engine| {
+                   let value = value
+                       .lock()
+                       .unwrap_or_else(std::sync::PoisonError::into_inner)
+                       .take();
+                   let Some(value) = value else {
+                       return effect_try_sync! { once; body: { let __dsl_result = Err(DurableSignalError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, };
+                   };
+                   match token.encode(&value) {
+                       Ok(signal) => {
+                           let expected = signal.clone();
+                           {
+                               let __dsl_program = effect_provide_some! {
+                               program: effect_map_error! {
+                               program: engine
+                               .deliver_signal(token.run.clone(), signal), map: DurableSignalError::Engine, }, project: |_: &R| (), }; effect! {
+                                   let expected = expected.clone(); let recorded = __dsl_program.clone()?; {
+                                   if recorded == expected {
+                                       effect_sync! { once; body: move || recorded, }
+                                   } else {
+                                       effect_try_sync! {
+                                           once; body: {
+                                           let __dsl_result = Err(
+                                           DurableSignalError::RecordedSignalMismatch,
+                                       ); move || __dsl_result }, on_error: ::core::convert::identity, }
+                                   }
+                               }? } }
+                       }
+                       Err(error) => effect_try_sync! { once; body: { let __dsl_result = Err(DurableSignalError::Codec(error)); move || __dsl_result }, on_error: ::core::convert::identity, },
+                   }
+               },
+        }
     }
 
     /// Wait for the represented condition or owned work to settle.
@@ -181,22 +189,27 @@ impl<A: Send + 'static> DurableDeferred<A> {
         R: HasWorkflowEngine + Send + Sync + 'static,
     {
         let token = self.clone();
-        Effect::service(|env: &R| env.workflow_engine()).flat_map(move |engine| {
-            let token = token.clone();
-            engine
-                .wait_signal(token.run.clone(), token.signal.clone(), token.version)
-                .map_error(DurableSignalError::Engine)
-                .provide_some(|_: &R| ())
-                .flat_map(move |state| match state {
-                    SignalWait::Ready(recorded) => Effect::from_result_once(
-                        token
-                            .decode(&recorded)
-                            .map(DurableSignalWait::Ready)
-                            .map_err(DurableSignalError::Codec),
-                    ),
-                    SignalWait::Waiting => Effect::sync(|| DurableSignalWait::Waiting),
-                })
-        })
+        {
+            let __dsl_program = service! { env: |env: &R| env.workflow_engine(), };
+            effect! {
+                let __dsl_program = __dsl_program.clone(); let token = token.clone(); let engine = __dsl_program?; {
+                let token = token.clone();
+                {
+                    let __dsl_program = effect_provide_some! {
+                    program: effect_map_error! {
+                    program: engine
+                    .wait_signal(token.run.clone(), token.signal.clone(), token.version), map: DurableSignalError::Engine, }, project: |_: &R| (), }; effect! {
+                        let __dsl_program = __dsl_program.clone(); let token = token.clone(); let state = __dsl_program?; match state {
+                        SignalWait::Ready(recorded) => effect_try_sync! {
+                            once; body: {
+                            let __dsl_result = token
+                                .decode(&recorded)
+                                .map(DurableSignalWait::Ready)
+                                .map_err(DurableSignalError::Codec); move || __dsl_result }, on_error: ::core::convert::identity, },
+                        SignalWait::Waiting => effect_sync! { body: || DurableSignalWait::Waiting, },
+                    }? } }
+            }? }
+        }
     }
 
     /// Observe a recorded result without installing a workflow waiter. This
@@ -216,20 +229,25 @@ impl<A: Send + 'static> DurableDeferred<A> {
         R: HasWorkflowEngine + Send + Sync + 'static,
     {
         let token = self.clone();
-        Effect::service(|env: &R| env.workflow_engine()).flat_map(move |engine| {
-            let token = token.clone();
-            engine
-                .inspect_signal(token.run.clone(), token.signal.clone(), token.version)
-                .map_error(DurableSignalError::Engine)
-                .provide_some(|_: &R| ())
-                .flat_map(move |recorded| {
-                    Effect::from_result_once(
-                        recorded
-                            .map(|signal| token.decode(&signal))
-                            .transpose()
-                            .map_err(DurableSignalError::Codec),
-                    )
-                })
-        })
+        {
+            let __dsl_program = service! { env: |env: &R| env.workflow_engine(), };
+            effect! {
+                let __dsl_program = __dsl_program.clone(); let token = token.clone(); let engine = __dsl_program?; {
+                let token = token.clone();
+                {
+                    let __dsl_program = effect_provide_some! {
+                    program: effect_map_error! {
+                    program: engine
+                    .inspect_signal(token.run.clone(), token.signal.clone(), token.version), map: DurableSignalError::Engine, }, project: |_: &R| (), }; effect! {
+                        let __dsl_program = __dsl_program.clone(); let token = token.clone(); let recorded = __dsl_program?; {
+                        effect_try_sync! {
+                            once; body: {
+                            let __dsl_result = recorded
+                                .map(|signal| token.decode(&signal))
+                                .transpose()
+                                .map_err(DurableSignalError::Codec); move || __dsl_result }, on_error: ::core::convert::identity, }
+                    }? } }
+            }? }
+        }
     }
 }

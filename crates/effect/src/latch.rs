@@ -1,10 +1,12 @@
 //! A one-way synchronization signal with cancellation-aware waiting.
 
+use crate::effect_sync;
 use crate::internal::notification::notify_all;
 use crate::internal::runtime::{self, Step};
 use crate::{Effect, Exit};
 use event_listener::Event;
 use futures_util::future::select;
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -43,7 +45,7 @@ impl Latch {
     /// Type: `Effect<Self, E, R>`.
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn make<E: Send + 'static, R: Send + Sync + 'static>() -> Effect<Self, E, R> {
-        Effect::sync(Self::new)
+        effect_sync! { body: Self::new, }
     }
 
     /// True only for the first opening. All current/future waits can proceed.
@@ -57,13 +59,13 @@ impl Latch {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn open<E: Send + 'static, R: Send + Sync + 'static>(&self) -> Effect<bool, E, R> {
         let latch = self.clone();
-        Effect::sync(move || {
+        effect_sync! { body: move || {
             let first = !latch.state.opened.swap(true, Ordering::AcqRel);
             if first {
                 notify_all(&latch.state.changed);
             }
             first
-        })
+        }, }
     }
 
     /// Wait cooperatively until the latch opens.
@@ -88,8 +90,8 @@ impl Latch {
                     if latch.state.opened.load(Ordering::Acquire) {
                         return runtime::finish(finish, Exit::Success(()));
                     }
-                    let changed = std::pin::pin!(changed);
-                    let cancelled = std::pin::pin!(context.cancellation.cancelled());
+                    let changed = pin!(changed);
+                    let cancelled = pin!(context.cancellation.cancelled());
                     let _ = select(changed, cancelled).await;
                 }
             }))

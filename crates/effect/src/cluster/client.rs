@@ -10,6 +10,7 @@ use crate::rpc::{
     RpcCallId, RpcEnvelope, RpcEnvelopeKind, RpcEnvelopePolicy, RpcOperation, RpcWireError,
 };
 use crate::{Effect, SchemaIssue, UtcMillis};
+use crate::{effect, effect_map_error, effect_provide_some, effect_try_sync, service};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
@@ -191,40 +192,41 @@ where
         let operation = self.operation.clone();
         let policy = self.policy;
         let request = Mutex::new(Some(request));
-        Effect::try_sync(
-            move || {
-                let request = request
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-                    .ok_or(ClusterClientError::InputConsumed)?;
-                let idempotency_key = operation
-                    .idempotency_key(&request)
-                    .map_err(ClusterClientError::RequestSchema)?;
-                let payload = operation
-                    .request_codec()
-                    .encode_ref(&request)
-                    .map_err(ClusterClientError::RequestSchema)?;
-                crate::schema::internal::parser::check_limits(&payload, &operation.limits())
-                    .map_err(ClusterClientError::RequestSchema)?;
-                let bytes = RpcEnvelope {
-                    operation: operation.spec().id.clone(),
-                    version: operation.spec().version,
-                    call: call.clone(),
-                    kind: RpcEnvelopeKind::Request,
-                    sequence: None,
-                    payload,
-                    metadata: Default::default(),
-                }
-                .encode(policy)
-                .map_err(ClusterClientError::Wire)?
-                .into_bytes()
-                .map_err(|error| ClusterClientError::Wire(RpcWireError::Frame(error)))?;
-                Ok((Arc::<[u8]>::from(bytes), idempotency_key))
-            },
-            std::convert::identity,
-        )
-        .flat_map(move |(payload, idempotency_key)| {
+        let encoded = effect_try_sync! { body: move || {
+            let request = request
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .ok_or(ClusterClientError::InputConsumed)?;
+            let idempotency_key = operation
+                .idempotency_key(&request)
+                .map_err(ClusterClientError::RequestSchema)?;
+            let payload = operation
+                .request_codec()
+                .encode_ref(&request)
+                .map_err(ClusterClientError::RequestSchema)?;
+            crate::schema::internal::parser::check_limits(&payload, &operation.limits())
+                .map_err(ClusterClientError::RequestSchema)?;
+            let bytes = RpcEnvelope {
+                operation: operation.spec().id.clone(),
+                version: operation.spec().version,
+                call: call.clone(),
+                kind: RpcEnvelopeKind::Request,
+                sequence: None,
+                payload,
+                metadata: Default::default(),
+            }
+            .encode(policy)
+            .map_err(ClusterClientError::Wire)?
+            .into_bytes()
+            .map_err(|error| ClusterClientError::Wire(RpcWireError::Frame(error)))?;
+            Ok((Arc::<[u8]>::from(bytes), idempotency_key))
+        }, on_error: std::convert::identity, };
+        effect! {
+            let encoded = encoded.clone();
+            let address = address.clone();
+            let request_id = request_id.clone();
+            let (payload, idempotency_key) = encoded?;
             let request = AcceptedRequest {
                 address: address.clone(),
                 id: request_id.clone(),
@@ -235,26 +237,23 @@ where
             };
             let request = Mutex::new(Some(request));
             let error_request = request_id.clone();
-            Effect::service(|env: &R| env.cluster_message_store()).flat_map(move |store| {
+            let store = service! { env: |env: &R| env.cluster_message_store(), }?;
                 let request = request
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take();
                 match request {
-                    Some(request) => store
-                        .accept(request)
-                        .map_error({
+                    Some(request) => effect_provide_some! { program: effect_map_error! { program: store
+                        .accept(request), map: {
                             let error_request = error_request.clone();
                             move |source| ClusterClientError::UncertainAcceptance {
                                 request: error_request.clone(),
                                 source,
                             }
-                        })
-                        .provide_some(|_: &R| ()),
-                    None => Effect::from_result_once(Err(ClusterClientError::InputConsumed)),
+                        }, }, project: |_: &R| (), }?,
+                    None => effect_try_sync! { once; body: { let __dsl_result = Err(ClusterClientError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, }?,
                 }
-            })
-        })
+        }
     }
 
     /// Inspect the current state without waiting for a later change.
@@ -288,15 +287,20 @@ where
     {
         let operation = self.operation.clone();
         let policy = self.policy;
-        Effect::service(|env: &R| env.cluster_message_store()).flat_map(move |store| {
-            store
-                .observe(address.clone(), request.clone(), observer.clone(), None)
-                .map_error(ClusterClientError::Store)
-                .provide_some(|_: &R| ())
-                .flat_map({
-                    let operation = operation.clone();
-                    let call = call.clone();
-                    move |observed| {
+        effect! {
+            let address = address.clone();
+            let request = request.clone();
+            let observer = observer.clone();
+            let operation = operation.clone();
+            let call = call.clone();
+            let store = service! { env: |env: &R| env.cluster_message_store(), }?;
+            let observed = effect_provide_some! {
+                program: effect_map_error! {
+                    program: store.observe(address, request, observer, None),
+                    map: ClusterClientError::Store,
+                },
+                project: |_: &R| (),
+            }?;
                         let result = if !observed.chunks.is_empty() {
                             Err(ClusterClientError::UnexpectedChunks)
                         } else {
@@ -308,10 +312,8 @@ where
                                 }),
                             }
                         };
-                        Effect::from_result_once(result)
-                    }
-                })
-        })
+            effect_try_sync! { once; body: move || result, on_error: ::core::convert::identity, }?
+        }
     }
 
     /// Record that the selected observer has consumed the reply.
@@ -341,12 +343,14 @@ where
         R: HasClusterMessageStore + Send + Sync + 'static,
         R::Store: ClusterMessageStore<Error = Backend>,
     {
-        Effect::service(|env: &R| env.cluster_message_store()).flat_map(move |store| {
-            store
-                .acknowledge_reply(address.clone(), request.clone(), observer.clone())
-                .map_error(ClusterClientError::Store)
-                .provide_some(|_: &R| ())
-        })
+        effect! {
+            let address = address.clone();
+            let request = request.clone();
+            let observer = observer.clone();
+            let store = service! { env: |env: &R| env.cluster_message_store(), }?;
+            effect_provide_some! { program: effect_map_error! { program: store
+                .acknowledge_reply(address, request, observer), map: ClusterClientError::Store, }, project: |_: &R| (), }?
+        }
     }
 
     /// Remove an observer without discarding authoritative work.
@@ -376,12 +380,14 @@ where
         R: HasClusterMessageStore + Send + Sync + 'static,
         R::Store: ClusterMessageStore<Error = Backend>,
     {
-        Effect::service(|env: &R| env.cluster_message_store()).flat_map(move |store| {
-            store
-                .detach_observer(address.clone(), request.clone(), observer.clone())
-                .map_error(ClusterClientError::Store)
-                .provide_some(|_: &R| ())
-        })
+        effect! {
+            let address = address.clone();
+            let request = request.clone();
+            let observer = observer.clone();
+            let store = service! { env: |env: &R| env.cluster_message_store(), }?;
+            effect_provide_some! { program: effect_map_error! { program: store
+                .detach_observer(address, request, observer), map: ClusterClientError::Store, }, project: |_: &R| (), }?
+        }
     }
 }
 

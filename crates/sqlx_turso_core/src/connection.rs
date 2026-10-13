@@ -22,7 +22,10 @@ use crate::{Turso, TursoStatement, driver::TursoDriverConnection, options::Turso
 use crate::TursoDatabaseTarget;
 
 /// Native SQLx result stream whose caller retains exclusive connection ownership.
-type OwnedCursorItems = futures_core::stream::BoxStream<'static, Result<either::Either<crate::TursoQueryResult, crate::TursoRow>, Error>>;
+type OwnedCursorItems = futures_core::stream::BoxStream<
+    'static,
+    Result<either::Either<crate::TursoQueryResult, crate::TursoRow>, Error>,
+>;
 
 /// SQLx connection handle for Turso databases
 pub struct TursoConnection {
@@ -134,8 +137,15 @@ impl TursoConnection {
     /// A failure means state is unresolved and the owner must not return to a pool.
     pub async fn settle_owned(&mut self) -> Result<(), Error> {
         self.clear_pending_rollback().await?;
-        if !self.raw.is_autocommit().map_err(crate::executor::map_turso_error)? {
-            self.raw.execute("ROLLBACK", ()).await.map_err(crate::executor::map_turso_error)?;
+        if !self
+            .raw
+            .is_autocommit()
+            .map_err(crate::executor::map_turso_error)?
+        {
+            self.raw
+                .execute("ROLLBACK", ())
+                .await
+                .map_err(crate::executor::map_turso_error)?;
         }
         self.transaction_state = TransactionState::default();
         Ok(())

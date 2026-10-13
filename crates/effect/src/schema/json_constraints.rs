@@ -1,8 +1,10 @@
 //! Prepared JSON constraints with caller-owned policies.
+
 use super::{
     IssueSegment, JsonValue, ParsePolicy, PureCodec, SchemaAst, SchemaIssue, SchemaIssueKind,
     SchemaResource, SchemaShape, StringLengthUnit, ValueKind, value_kind,
 };
+use crate::codec;
 use regex_automata::nfa::thompson::{self, pikevm::PikeVM};
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -323,34 +325,30 @@ pub fn json_literal_enum(
     let validate_kind = kind.clone();
     let writer_literals = Arc::clone(&literals);
     let writer_kind = kind.clone();
-    Ok(PureCodec::with_ast(
-        ast,
-        move |value| {
-            if let Some(index) = decode
-                .iter()
-                .position(|literal| literal_equal(literal, value))
-            {
-                Ok(LiteralEnumValue::Known(index))
-            } else if unknown == UnknownLiteralPolicy::Preserve
-                && literal_kind(value) == decode_kind
-            {
-                Ok(LiteralEnumValue::Unknown(value.clone()))
-            } else {
-                Err(SchemaIssue::new(SchemaIssueKind::LiteralMismatch))
-            }
-        },
-        move |value| match value {
-            LiteralEnumValue::Known(index) => literals.get(*index).cloned().ok_or_else(invalid),
-            LiteralEnumValue::Unknown(value)
-                if unknown == UnknownLiteralPolicy::Preserve
-                    && literal_kind(value) == kind
-                    && !literals.iter().any(|literal| literal_equal(literal, value)) =>
-            {
-                Ok(value.clone())
-            }
-            LiteralEnumValue::Unknown(_) => Err(SchemaIssue::new(SchemaIssueKind::LiteralMismatch)),
-        },
-    )
+    Ok(codec! { pure; ast: ast, decode: move |value| {
+        if let Some(index) = decode
+            .iter()
+            .position(|literal| literal_equal(literal, value))
+        {
+            Ok(LiteralEnumValue::Known(index))
+        } else if unknown == UnknownLiteralPolicy::Preserve
+            && literal_kind(value) == decode_kind
+        {
+            Ok(LiteralEnumValue::Unknown(value.clone()))
+        } else {
+            Err(SchemaIssue::new(SchemaIssueKind::LiteralMismatch))
+        }
+    }, encode: move |value| match value {
+        LiteralEnumValue::Known(index) => literals.get(*index).cloned().ok_or_else(invalid),
+        LiteralEnumValue::Unknown(value)
+            if unknown == UnknownLiteralPolicy::Preserve
+                && literal_kind(value) == kind
+                && !literals.iter().any(|literal| literal_equal(literal, value)) =>
+        {
+            Ok(value.clone())
+        }
+        LiteralEnumValue::Unknown(_) => Err(SchemaIssue::new(SchemaIssueKind::LiteralMismatch)),
+    }, }
     .with_type_validator(move |value| {
         enum_value(value, &validate_literals, unknown, &validate_kind).map(|_| ())
     })

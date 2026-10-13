@@ -1,3 +1,5 @@
+use effect::persistable;
+use serde_json::json;
 #[path = "support/campaign_report.rs"]
 mod campaign_report;
 
@@ -11,6 +13,7 @@ use effect::{
     UtcMillis, json_i64,
 };
 use futures_executor::block_on;
+use std::io::Write;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
@@ -35,10 +38,15 @@ fn next(state: &mut u64) -> u64 {
     *state
 }
 
-fn success<A: Send + 'static, E: Send + 'static>(effect: Effect<A, E>) -> A {
+fn success<A: Send + 'static, E: std::fmt::Debug + Send + 'static>(
+    effect: Effect<A, E>,
+) -> Result<A, String> {
     match block_on(effect.run(Arc::new(()))) {
-        Exit::Success(value) => value,
-        _ => panic!("memory record operation must succeed"),
+        Exit::Success(value) => Ok(value),
+        Exit::Fail(error) => Err(format!("record failure: {error:?}")),
+        Exit::Die(defect) => Err(format!("record defect: {defect:?}")),
+        Exit::Interrupted => Err("record interrupted".into()),
+        Exit::FinalizationFailed(error) => Err(format!("record finalization: {error:?}")),
     }
 }
 
@@ -75,18 +83,17 @@ fn verify_typed_batch(
     definition: &Persistable<usize, i64, i64, Domain>,
     model: &[Option<ModelEntry>],
     now: UtcMillis,
-) {
+) -> Result<(), String> {
     let count = model.len();
-    let actual = match block_on(
+    let Exit::Success(actual) = block_on(
         read_many::<Environment, usize, i64, i64, Domain>(
             definition.clone(),
             move || (0..count).collect(),
             now,
         )
         .run(environment),
-    ) {
-        Exit::Success(actual) => actual,
-        _ => panic!("typed batch availability failure is not injected in this model"),
+    ) else {
+        return Err("typed batch availability failure is not injected in this model".into());
     };
     assert_eq!(actual.len(), model.len());
     for (expected, result) in model.iter().zip(actual) {
@@ -111,70 +118,65 @@ fn verify_typed_batch(
                     (Some(Err(expected)), StoredOutcome::Failure(actual)) => {
                         assert_eq!(actual, expected)
                     }
-                    _ => panic!("typed outcome differs from independent record model"),
+                    _ => return Err("typed outcome differs from independent record model".into()),
                 }
             }
             (Some(entry), Err(PersistenceError::Corrupt(_)))
                 if entry.decoded.is_none() && entry.expires_at.is_none_or(|at| now < at) => {}
-            _ => panic!("typed batch outcome differs from independent record model"),
+            _ => return Err("typed batch outcome differs from independent record model".into()),
         }
     }
+    Ok(())
 }
 
 #[test]
-fn configured_record_histories_match_expiry_and_batch_model() {
+fn configured_record_histories_match_expiry_and_batch_model()
+-> Result<(), Box<dyn std::error::Error>> {
     let configured = std::env::var_os("EFFECT_CAMPAIGN_CONFIG")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/feature_campaigns.json")
         });
-    let config: JsonValue = std::fs::read_to_string(configured)
-        .expect("campaign configuration is readable")
-        .parse()
-        .expect("campaign configuration is JSON");
-    let number = |path: &[&str]| -> u64 {
+    let config: JsonValue = std::fs::read_to_string(configured)?.parse()?;
+    let number = |path: &[&str]| -> Result<u64, String> {
         path.iter()
-            .fold(&config, |value, field| {
+            .try_fold(&config, |value, field| {
                 value
                     .get(*field)
-                    .unwrap_or_else(|| panic!("missing campaign field {field}"))
-            })
+                    .ok_or_else(|| format!("missing campaign field {field}"))
+            })?
             .as_u64()
-            .expect("campaign field is a nonnegative integer")
+            .ok_or_else(|| format!("campaign integer: {path:?}"))
     };
-    let seeds = number(&["campaigns", "persistence", "seeds"]);
-    let transitions = number(&["campaigns", "persistence", "transitions"]);
-    let keys_count = usize::try_from(number(&["campaigns", "persistence", "records", "keys"]))
-        .expect("key count fits usize");
+    let seeds = number(&["campaigns", "persistence", "seeds"])?;
+    let transitions = number(&["campaigns", "persistence", "transitions"])?;
+    let keys_count = usize::try_from(number(&["campaigns", "persistence", "records", "keys"])?)?;
     let ttl = i64::try_from(number(&[
         "campaigns",
         "persistence",
         "records",
         "ttl_millis",
-    ]))
-    .expect("TTL fits clock");
-    let seconds = number(&["budgets", "seconds"]);
+    ])?)?;
+    let seconds = number(&["budgets", "seconds"])?;
     assert!(seeds >= 1_000 && transitions >= 100 && keys_count >= 2 && ttl > 0);
-    let nonzero = |value| NonZeroUsize::new(value).expect("positive campaign budget");
-    let limits = ParseLimits {
-        bytes: nonzero(number(&["budgets", "bytes"]) as usize),
-        depth: nonzero(number(&["budgets", "depth"]) as usize),
-        nodes: nonzero(number(&["budgets", "steps"]) as usize),
-        collection: nonzero(number(&["budgets", "width"]) as usize),
-        issues: nonzero(number(&["budgets", "width"]) as usize),
+    let nonzero = |value| {
+        assert!(value > 0, "zero campaign budget");
+        NonZeroUsize::MIN.saturating_add(value - 1)
     };
-    let namespace = KeyNamespace::<Domain>::new("campaign").expect("campaign namespace");
-    let definition = Persistable::<usize, i64, i64, Domain>::new(
-        namespace,
-        RecordVersion::new("campaign-v1").expect("record version"),
-        |index| Ok(vec![KeySegment::Text(Arc::from(index.to_string()))]),
-        json_i64(),
-        json_i64(),
-        limits,
-    );
+    let limits = ParseLimits {
+        bytes: nonzero(number(&["budgets", "bytes"])? as usize),
+        depth: nonzero(number(&["budgets", "depth"])? as usize),
+        nodes: nonzero(number(&["budgets", "steps"])? as usize),
+        collection: nonzero(number(&["budgets", "width"])? as usize),
+        issues: nonzero(number(&["budgets", "width"])? as usize),
+    };
+    let namespace =
+        KeyNamespace::<Domain>::new("campaign").map_err(|error| format!("namespace: {error:?}"))?;
+    let definition = persistable! { native; namespace: namespace, request: usize, version: RecordVersion::new("campaign-v1").map_err(|error| format!("record version: {error:?}"))?, key: |index| Ok(vec![KeySegment::Text(Arc::from(index.to_string()))]), success: json_i64(), error: json_i64(), limits: limits, };
     let keys: Vec<Arc<[u8]>> = (0..keys_count)
-        .map(|index| definition.key(&index).expect("record key").into_bytes())
-        .collect();
+        .map(|index| definition.key(&index).map(effect::StableKey::into_bytes))
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("record key: {error:?}"))?;
     let started = Instant::now();
     let mut operations = [0_u64; 6];
     let mut corrupt = 0_u64;
@@ -183,12 +185,15 @@ fn configured_record_histories_match_expiry_and_batch_model() {
         let environment = Arc::new(Environment(Arc::clone(&store)));
         let mut model = vec![None::<ModelEntry>; keys_count];
         let mut revision = 0_u64;
-        let mut generator = number(&["seed"]).wrapping_add(seed).max(1);
+        let mut generator = number(&["seed"])?.wrapping_add(seed).max(1);
         let mut now = 0_i64;
         for _ in 0..transitions {
             let choice = (next(&mut generator) % operations.len() as u64) as usize;
             let slot = (next(&mut generator) % keys_count as u64) as usize;
-            operations[choice] += 1;
+            *operations
+                .get_mut(choice)
+                .ok_or("invalid operation index")? += 1;
+            let key = keys.get(slot).ok_or("invalid key slot")?;
             match choice {
                 0 => {
                     let value = next(&mut generator) as i64;
@@ -203,10 +208,10 @@ fn configured_record_histories_match_expiry_and_batch_model() {
                     let bytes = match decoded {
                         Some(Ok(value)) => definition
                             .encode(&StoredOutcome::Success(value))
-                            .expect("valid success outcome"),
+                            .map_err(|error| format!("success encoding: {error:?}"))?,
                         Some(Err(value)) => definition
                             .encode(&StoredOutcome::Failure(value))
-                            .expect("valid error outcome"),
+                            .map_err(|error| format!("error encoding: {error:?}"))?,
                         None => {
                             corrupt += 1;
                             Arc::from(&b"{"[..])
@@ -218,15 +223,15 @@ fn configured_record_histories_match_expiry_and_batch_model() {
                         None
                     };
                     let actual = success(store.put(
-                        Arc::clone(&keys[slot]),
+                        Arc::clone(key),
                         StoredValue {
                             bytes: Arc::clone(&bytes),
                             expires_at,
                         },
-                    ));
+                    ))?;
                     revision += 1;
                     assert_eq!(actual.value(), revision);
-                    model[slot] = Some(ModelEntry {
+                    *model.get_mut(slot).ok_or("invalid model slot")? = Some(ModelEntry {
                         bytes,
                         expires_at,
                         revision: actual,
@@ -234,32 +239,42 @@ fn configured_record_histories_match_expiry_and_batch_model() {
                     });
                 }
                 1 => {
-                    let actual = success(store.get(Arc::clone(&keys[slot]), UtcMillis::new(now)));
-                    let expected = model[slot]
+                    let actual = success(store.get(Arc::clone(key), UtcMillis::new(now)))?;
+                    let expected = model
+                        .get(slot)
+                        .ok_or("invalid model slot")?
                         .as_ref()
                         .map_or(StoreRead::Missing, |entry| entry.read(UtcMillis::new(now)));
                     assert_eq!(actual, expected);
                 }
                 2 => {
-                    let actual = success(store.get_many(keys.clone(), UtcMillis::new(now)));
+                    let actual = success(store.get_many(keys.clone(), UtcMillis::new(now)))?;
                     assert_eq!(actual.len(), keys_count);
-                    for (index, item) in actual.into_iter().enumerate() {
-                        assert_eq!(item.key, keys[index]);
-                        let expected = model[index]
+                    for ((item, key), model_entry) in actual.into_iter().zip(&keys).zip(&model) {
+                        assert_eq!(&item.key, key);
+                        let expected = model_entry
                             .as_ref()
                             .map_or(StoreRead::Missing, |entry| entry.read(UtcMillis::new(now)));
-                        assert_eq!(item.result.expect("memory batch item"), expected);
+                        assert_eq!(
+                            item.result
+                                .map_err(|error| format!("memory batch item: {error:?}"))?,
+                            expected
+                        );
                     }
                     verify_typed_batch(
                         Arc::clone(&environment),
                         &definition,
                         &model,
                         UtcMillis::new(now),
-                    );
+                    )?;
                 }
                 3 => {
                     let expected = if next(&mut generator) & 1 == 0 {
-                        model[slot].as_ref().map(|entry| entry.revision)
+                        model
+                            .get(slot)
+                            .ok_or("invalid model slot")?
+                            .as_ref()
+                            .map(|entry| entry.revision)
                     } else {
                         None
                     };
@@ -267,39 +282,45 @@ fn configured_record_histories_match_expiry_and_batch_model() {
                     let value = next(&mut generator) as i64;
                     let bytes = definition
                         .encode(&StoredOutcome::Success(value))
-                        .expect("valid CAS value");
+                        .map_err(|error| format!("CAS encoding: {error:?}"))?;
                     let replacement = replace.then(|| StoredValue {
                         bytes: Arc::clone(&bytes),
                         expires_at: Some(UtcMillis::new(now + ttl)),
                     });
-                    let actual = success(store.compare_exchange(
-                        Arc::clone(&keys[slot]),
-                        expected,
-                        replacement,
-                    ));
-                    let current = model[slot].as_ref().map(|entry| entry.revision);
+                    let actual =
+                        success(store.compare_exchange(Arc::clone(key), expected, replacement))?;
+                    let current = model
+                        .get(slot)
+                        .ok_or("invalid model slot")?
+                        .as_ref()
+                        .map(|entry| entry.revision);
                     if expected != current {
                         assert_eq!(actual, CompareExchange::Conflict { actual: current });
                     } else {
                         revision += 1;
                         let next_revision = StoreRevision::from_recorded(revision)
-                            .expect("positive model revision");
+                            .map_err(|error| format!("model revision: {error:?}"))?;
                         assert_eq!(actual, CompareExchange::Written(next_revision));
-                        model[slot] = replace.then_some(ModelEntry {
-                            bytes,
-                            expires_at: Some(UtcMillis::new(now + ttl)),
-                            revision: next_revision,
-                            decoded: Some(Ok(value)),
-                        });
+                        *model.get_mut(slot).ok_or("invalid model slot")? =
+                            replace.then_some(ModelEntry {
+                                bytes,
+                                expires_at: Some(UtcMillis::new(now + ttl)),
+                                revision: next_revision,
+                                decoded: Some(Ok(value)),
+                            });
                     }
                 }
                 4 => {
-                    let actual = success(store.remove(Arc::clone(&keys[slot])));
-                    let expected = model[slot].take().map(|entry| entry.stored());
+                    let actual = success(store.remove(Arc::clone(key)))?;
+                    let expected = model
+                        .get_mut(slot)
+                        .ok_or("invalid model slot")?
+                        .take()
+                        .map(|entry| entry.stored());
                     assert_eq!(actual, expected);
                 }
                 5 => {
-                    let actual = success(store.cleanup_expired(UtcMillis::new(now)));
+                    let actual = success(store.cleanup_expired(UtcMillis::new(now)))?;
                     let mut removed = 0;
                     for entry in &mut model {
                         if entry.as_ref().is_some_and(|value| {
@@ -311,15 +332,16 @@ fn configured_record_histories_match_expiry_and_batch_model() {
                     }
                     assert_eq!(actual, removed);
                 }
-                _ => unreachable!("operation index is reduced modulo operation count"),
+                _ => return Err("invalid operation index".into()),
             }
-            let actual = success(store.get(Arc::clone(&keys[slot]), UtcMillis::new(now)));
-            let expected = model[slot]
+            let actual = success(store.get(Arc::clone(key), UtcMillis::new(now)))?;
+            let expected = model
+                .get(slot)
+                .ok_or("invalid model slot")?
                 .as_ref()
                 .map_or(StoreRead::Missing, |entry| entry.read(UtcMillis::new(now)));
             assert_eq!(actual, expected);
-            now += i64::try_from(next(&mut generator) % (ttl as u64 + 2))
-                .expect("bounded model clock step");
+            now += i64::try_from(next(&mut generator) % (ttl as u64 + 2))?;
             assert!(
                 started.elapsed().as_secs() <= seconds,
                 "record campaign timed out"
@@ -329,37 +351,39 @@ fn configured_record_histories_match_expiry_and_batch_model() {
     assert!(operations.into_iter().all(|count| count > 0));
     assert!(corrupt > 0);
     let boundary_store = MemoryKeyValueStore::new(StoreCapacity::Unbounded);
-    let boundary_key = Arc::clone(&keys[0]);
+    let boundary_key = Arc::clone(keys.first().ok_or("missing boundary key")?);
     let boundary_bytes = definition
         .encode(&StoredOutcome::Success(1))
-        .expect("valid boundary record");
+        .map_err(|error| format!("boundary record: {error:?}"))?;
     success(boundary_store.put(
         Arc::clone(&boundary_key),
         StoredValue {
             bytes: boundary_bytes,
             expires_at: Some(UtcMillis::new(ttl)),
         },
-    ));
+    ))?;
     assert!(matches!(
-        success(boundary_store.get(Arc::clone(&boundary_key), UtcMillis::new(ttl - 1))),
+        success(boundary_store.get(Arc::clone(&boundary_key), UtcMillis::new(ttl - 1)))?,
         StoreRead::Found(_)
     ));
     assert!(matches!(
-        success(boundary_store.get(Arc::clone(&boundary_key), UtcMillis::new(ttl))),
+        success(boundary_store.get(Arc::clone(&boundary_key), UtcMillis::new(ttl)))?,
         StoreRead::Expired(_)
     ));
     assert!(matches!(
-        success(boundary_store.get(boundary_key, UtcMillis::new(ttl + 1))),
+        success(boundary_store.get(boundary_key, UtcMillis::new(ttl + 1)))?,
         StoreRead::Expired(_)
     ));
     campaign_report::completed(
         "persistence_record",
-        serde_json::json!({
+        json!({
             "seeds": seeds, "transitions": transitions,
             "operations": operations, "corrupt": corrupt,
         }),
-    );
-    eprintln!(
+    )?;
+    writeln!(
+        std::io::stderr().lock(),
         "record model completed {seeds} seeds x {transitions} transitions; operations={operations:?}; corrupt={corrupt}"
-    );
+    )?;
+    Ok(())
 }

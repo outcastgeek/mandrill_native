@@ -1,15 +1,15 @@
 use effect::encoding::{BinaryIdentity, BinaryLimits};
 use effect::persistence::{
-    HasPersistedQueueStore, MemoryPersistedQueueStore, PersistedQueue, PersistedQueueName,
-    QueueClaimOptions, QueueMessagePolicy, QueueOwner, QueueRecordState, QueueSettlement,
-    QueueStoreCapacity,
+    HasPersistedQueueStore, MemoryPersistedQueueStore, PersistedQueueName, QueueClaimOptions,
+    QueueMessagePolicy, QueueOwner, QueueRecordState, QueueSettlement, QueueStoreCapacity,
 };
 use effect::workflow::{
-    DurableDeferred, DurableQueue, DurableSignalWait, HasWorkflowEngine, MemoryWorkflowEngine,
+    DurableDeferred, DurableSignalWait, HasWorkflowEngine, MemoryWorkflowEngine,
     WorkflowDefinitionId, WorkflowEngine, WorkflowHandle, WorkflowRegistration, WorkflowRunId,
     WorkflowSignalId, WorkflowVersion,
 };
 use effect::{Effect, Exit, KeyDomain, KeyNamespace, KeySegment, StableKey, UtcMillis, json_i64};
+use effect::{durable_queue, effect_sync, effect_try_sync, persisted_queue};
 use futures_executor::block_on;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
@@ -40,8 +40,8 @@ impl HasWorkflowEngine for Environment {
 }
 
 #[test]
-fn queue_handler_records_deferred_result_then_acknowledges_claim() {
-    let limit = NonZeroUsize::new(128).unwrap();
+fn queue_handler_records_deferred_result_then_acknowledges_claim() -> Result<(), String> {
+    let limit = NonZeroUsize::MIN.saturating_add(127);
     let binary_limits = BinaryLimits {
         bytes: limit,
         depth: limit,
@@ -55,14 +55,17 @@ fn queue_handler_records_deferred_result_then_acknowledges_claim() {
         ))),
         engine: Arc::new(MemoryWorkflowEngine::new()),
     });
-    let namespace = KeyNamespace::<Domain>::new("jobs").unwrap();
+    let namespace =
+        KeyNamespace::<Domain>::new("jobs").map_err(|error| format!("job namespace: {error:?}"))?;
     let key = |name: &'static str| {
-        StableKey::new(&namespace, [KeySegment::Text(Arc::from(name))]).unwrap()
+        StableKey::new(&namespace, [KeySegment::Text(Arc::from(name))])
+            .map_err(|error| format!("{name} identity: {error:?}"))
     };
-    let identity = key("run");
+    let identity = key("run")?;
     let run = WorkflowRunId::from_stable(identity.clone());
-    let version = WorkflowVersion::new(NonZeroU32::new(1).unwrap());
-    let definition = WorkflowDefinitionId::new("job-workflow").unwrap();
+    let version = WorkflowVersion::new(NonZeroU32::MIN);
+    let definition = WorkflowDefinitionId::new("job-workflow")
+        .map_err(|error| format!("job workflow: {error:?}"))?;
     let registration = WorkflowRegistration {
         id: definition.clone(),
         version,
@@ -89,7 +92,7 @@ fn queue_handler_records_deferred_result_then_acknowledges_claim() {
 
     let deferred = DurableDeferred {
         run,
-        signal: WorkflowSignalId::from_stable(key("result")),
+        signal: WorkflowSignalId::from_stable(key("result")?),
         version,
         codec: json_i64(),
         limits: effect::ParseLimits {
@@ -100,16 +103,11 @@ fn queue_handler_records_deferred_result_then_acknowledges_claim() {
             issues: limit,
         },
     };
-    let queue = DurableQueue::new(PersistedQueue::new(
-        PersistedQueueName::new("jobs").unwrap(),
-        json_i64(),
-        BinaryIdentity::new("job-payload", NonZeroU64::new(1).unwrap()).unwrap(),
-        binary_limits,
-        QueueMessagePolicy {
-            maximum_attempts: NonZeroU32::new(2).unwrap(),
-            acknowledged_retention: Duration::ZERO,
-        },
-    ));
+    let queue = durable_queue! { queue: persisted_queue! { name: PersistedQueueName::new("jobs").map_err(|error| format!("job queue: {error:?}"))?, payload: json_i64(), identity: BinaryIdentity::new("job-payload", NonZeroU64::MIN)
+        .map_err(|error| format!("job payload: {error:?}"))?, limits: binary_limits, policy: QueueMessagePolicy {
+        maximum_attempts: NonZeroU32::MIN.saturating_add(1),
+        acknowledged_retention: Duration::ZERO,
+    },  }, };
     let offered = queue.enqueue(
         identity.clone(),
         || 41,
@@ -122,18 +120,18 @@ fn queue_handler_records_deferred_result_then_acknowledges_claim() {
         Exit::Success(_)
     ));
     let options = QueueClaimOptions::new(
-        QueueOwner::new("worker").unwrap(),
+        QueueOwner::new("worker").map_err(|error| format!("queue owner: {error:?}"))?,
         UtcMillis::new(0),
         UtcMillis::new(10),
         limit,
     )
-    .unwrap();
-    let claimed = match block_on(queue.claim(options).run(Arc::clone(&environment))) {
-        Exit::Success(claimed) => claimed,
-        _ => panic!("claim failed"),
+    .map_err(|error| format!("queue claim options: {error:?}"))?;
+    let Exit::Success(claimed) = block_on(queue.claim(options).run(Arc::clone(&environment)))
+    else {
+        return Err(String::from("queue claim must succeed"));
     };
     assert_eq!(claimed.len(), 1);
-    let claim = claimed.into_iter().next().unwrap();
+    let claim = claimed.into_iter().next().ok_or("missing queue claim")?;
     let failed_claim = effect::persistence::QueueClaim {
         token: claim.token.clone(),
         payload: Arc::clone(&claim.payload),
@@ -146,7 +144,7 @@ fn queue_handler_records_deferred_result_then_acknowledges_claim() {
     let failed = queue.handle_claim(
         failed_claim,
         deferred.clone(),
-        |_| Effect::<i64, &'static str, Environment>::fail_with(|| "handler failed"),
+        |_| { let __dsl_program: Effect < i64 , & 'static str , Environment > = effect_try_sync! { body: { let __dsl_error = || "handler failed"; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }; __dsl_program },
         UtcMillis::new(1),
     );
     assert!(matches!(
@@ -168,7 +166,11 @@ fn queue_handler_records_deferred_result_then_acknowledges_claim() {
         claim.token.queue().clone(),
         claim.token.id().clone(),
         claim.token.owner().clone(),
-        NonZeroU64::new(claim.token.generation().get() + 1).unwrap(),
+        claim
+            .token
+            .generation()
+            .checked_add(1)
+            .ok_or("claim generation overflow")?,
     );
     let stale_claim = effect::persistence::QueueClaim {
         token: stale_token,
@@ -182,7 +184,11 @@ fn queue_handler_records_deferred_result_then_acknowledges_claim() {
     let handled = queue.handle_claim(
         stale_claim,
         deferred.clone(),
-        |value| Effect::<i64, (), Environment>::sync_once(move || value + 1),
+        |value| {
+            let __dsl_program: Effect<i64, (), Environment> =
+                effect_sync! { once; body: move || value + 1, };
+            __dsl_program
+        },
         UtcMillis::new(1),
     );
     assert!(matches!(
@@ -209,4 +215,5 @@ fn queue_handler_records_deferred_result_then_acknowledges_claim() {
     assert!(
         matches!(block_on(queue.inspect(identity).run(environment)), Exit::Success(Some(record)) if matches!(record.state, QueueRecordState::Acknowledged { .. }))
     );
+    Ok(())
 }

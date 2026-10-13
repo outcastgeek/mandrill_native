@@ -375,6 +375,8 @@ pub(crate) fn map_turso_error_with_options(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use std::sync::Mutex;
 
     use either::Either;
@@ -984,7 +986,7 @@ mod tests {
     #[tokio::test]
     async fn round_trips_json_values() -> sqlx_core::Result<()> {
         let mut connection = TursoConnectOptions::new().connect().await?;
-        let value = serde_json::json!({"name": "alice", "count": 2});
+        let value = json!({"name": "alice", "count": 2});
 
         let row = sqlx_core::query::query::<crate::Turso>("SELECT ? AS value")
             .bind(sqlx_core::types::Json(value.clone()))

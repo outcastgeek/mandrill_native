@@ -1,3 +1,4 @@
+use serde_json::json;
 #[path = "support/campaign_report.rs"]
 mod campaign_report;
 
@@ -16,27 +17,35 @@ impl KeyDomain for CampaignDomain {
     const TAG: &'static str = "workflow-campaign";
 }
 
-fn key(namespace: &KeyNamespace<CampaignDomain>, segment: u64) -> StableKey<CampaignDomain> {
-    StableKey::new(namespace, [KeySegment::Unsigned(segment)]).expect("stable identity")
+fn key(
+    namespace: &KeyNamespace<CampaignDomain>,
+    segment: u64,
+) -> Result<StableKey<CampaignDomain>, String> {
+    StableKey::new(namespace, [KeySegment::Unsigned(segment)])
+        .map_err(|error| format!("stable identity: {error:?}"))
 }
 
-fn run<A: Send + 'static, E: Send + 'static>(program: Effect<A, E>) -> Result<A, E> {
+fn run<A: Send + 'static, E: Send + 'static>(
+    program: Effect<A, E>,
+) -> Result<Result<A, E>, String> {
     match block_on(program.run(Arc::new(()))) {
-        Exit::Success(value) => Ok(value),
-        Exit::Fail(error) => Err(error),
-        Exit::Die(defect) => panic!("workflow defect: {defect:?}"),
-        Exit::Interrupted => panic!("workflow interrupted"),
-        Exit::FinalizationFailed(_) => panic!("workflow finalization failed"),
+        Exit::Success(value) => Ok(Ok(value)),
+        Exit::Fail(error) => Ok(Err(error)),
+        Exit::Die(defect) => Err(format!("workflow defect: {defect:?}")),
+        Exit::Interrupted => Err("workflow interrupted".into()),
+        Exit::FinalizationFailed(_) => Err("workflow finalization failed".into()),
     }
 }
 
-fn number(config: &JsonValue, path: &[&str]) -> u64 {
+fn number(config: &JsonValue, path: &[&str]) -> Result<u64, String> {
     path.iter()
-        .fold(config, |value, field| {
-            value.get(*field).expect("campaign field")
-        })
+        .try_fold(config, |value, field| {
+            value
+                .get(*field)
+                .ok_or_else(|| format!("campaign field: {field}"))
+        })?
         .as_u64()
-        .expect("campaign integer")
+        .ok_or_else(|| format!("campaign integer: {path:?}"))
 }
 
 fn next(state: &mut u64) -> u64 {
@@ -47,16 +56,21 @@ fn next(state: &mut u64) -> u64 {
 }
 
 #[test]
-fn configured_workflow_histories_match_replay_and_transition_model() {
+fn configured_workflow_histories_match_replay_and_transition_model() -> Result<(), String> {
     let configured = std::env::var_os("EFFECT_CAMPAIGN_CONFIG")
-        .map(|path| std::fs::read_to_string(path).expect("campaign configuration"))
+        .map(std::fs::read_to_string)
+        .transpose()
+        .map_err(|error| format!("campaign configuration: {error}"))?
         .unwrap_or_else(|| include_str!("feature_campaigns.json").to_owned());
-    let config: JsonValue = serde_json::from_str(&configured).expect("campaign JSON");
-    let seeds = number(&config, &["campaigns", "workflow", "seeds"]);
-    let transitions = number(&config, &["campaigns", "workflow", "transitions"]);
-    let namespace = KeyNamespace::<CampaignDomain>::new("workflow").expect("namespace");
-    let definition = WorkflowDefinitionId::new("campaign").expect("definition");
-    let version = WorkflowVersion::new(NonZeroU32::new(1).expect("version"));
+    let config: JsonValue =
+        serde_json::from_str(&configured).map_err(|error| format!("campaign JSON: {error}"))?;
+    let seeds = number(&config, &["campaigns", "workflow", "seeds"])?;
+    let transitions = number(&config, &["campaigns", "workflow", "transitions"])?;
+    let namespace = KeyNamespace::<CampaignDomain>::new("workflow")
+        .map_err(|error| format!("namespace: {error:?}"))?;
+    let definition =
+        WorkflowDefinitionId::new("campaign").map_err(|error| format!("definition: {error:?}"))?;
+    let version = WorkflowVersion::new(NonZeroU32::MIN);
     let input: Arc<[u8]> = Arc::from(&b"workflow-input"[..]);
     let outcome = EncodedWorkflowOutcome {
         kind: WorkflowOutcomeKind::Succeeded,
@@ -70,18 +84,19 @@ fn configured_workflow_histories_match_replay_and_transition_model() {
             id: definition.clone(),
             version,
             compatibility: Arc::from(&b"campaign-compatible"[..]),
-        }))
-        .expect("register definition");
+        }))?
+        .map_err(|error| format!("register definition: {error:?}"))?;
         let handle = WorkflowHandle {
-            run: WorkflowRunId::from_stable(key(&namespace, seed)),
+            run: WorkflowRunId::from_stable(key(&namespace, seed)?),
             definition: definition.clone(),
             version,
         };
-        let first = run(engine.start(handle.clone(), Arc::clone(&input))).expect("start run");
+        let first = run(engine.start(handle.clone(), Arc::clone(&input)))?
+            .map_err(|error| format!("start run: {error:?}"))?;
         assert_eq!(first.status, WorkflowStatus::Ready);
         let mut expected_status = WorkflowStatus::Ready;
         let mut activity_count = 0_usize;
-        let mut generator = number(&config, &["seed"]).wrapping_add(seed).max(1);
+        let mut generator = number(&config, &["seed"])?.wrapping_add(seed).max(1);
 
         for step in 0..transitions {
             match next(&mut generator) % operations.len() as u64 {
@@ -90,89 +105,93 @@ fn configured_workflow_histories_match_replay_and_transition_model() {
                         WorkflowStatus::Ready => WorkflowStatus::Running,
                         WorkflowStatus::Running => WorkflowStatus::Suspended,
                         WorkflowStatus::Suspended => WorkflowStatus::Ready,
-                        _ => unreachable!("terminal status before completion"),
+                        WorkflowStatus::Completed(_)
+                        | WorkflowStatus::Cancelled
+                        | WorkflowStatus::Abandoned => {
+                            return Err("terminal status before completion".into());
+                        }
                     };
                     let snapshot = run(engine.transition(
                         handle.run.clone(),
-                        run(engine.inspect(handle.run.clone()))
-                            .expect("inspect")
-                            .expect("run")
+                        run(engine.inspect(handle.run.clone()))?
+                            .map_err(|error| format!("inspect: {error:?}"))?
+                            .ok_or("missing run")?
                             .checkpoint(),
                         next_status.clone(),
-                    ))
-                    .expect("valid transition");
+                    ))?
+                    .map_err(|error| format!("transition: {error:?}"))?;
                     assert_eq!(snapshot.status, next_status);
                     expected_status = next_status;
                     operations[0] += 1;
                 }
                 1 => {
-                    let replay = run(engine.start(handle.clone(), Arc::clone(&input)))
-                        .expect("same-input start replay");
+                    let replay = run(engine.start(handle.clone(), Arc::clone(&input)))?
+                        .map_err(|error| format!("start replay: {error:?}"))?;
                     assert_eq!(replay.status, expected_status);
                     assert_eq!(replay.activities.len(), activity_count);
                     operations[1] += 1;
                 }
                 2 => {
-                    let conflict = run(engine.start(handle.clone(), Arc::from(&b"other"[..])));
+                    let conflict = run(engine.start(handle.clone(), Arc::from(&b"other"[..])))?;
                     assert!(matches!(conflict, Err(WorkflowEngineError::RunConflict)));
                     operations[2] += 1;
                 }
                 3 => {
-                    let activity = WorkflowActivityId::from_stable(key(&namespace, step));
-                    let attempt = NonZeroU32::new(1).expect("attempt");
+                    let activity = WorkflowActivityId::from_stable(key(&namespace, step)?);
+                    let attempt = NonZeroU32::MIN;
                     let record = run(engine.record_activity(
                         handle.run.clone(),
                         activity.clone(),
                         attempt,
                         Arc::clone(&input),
                         outcome.clone(),
-                    ))
-                    .expect("record activity");
+                    ))?
+                    .map_err(|error| format!("record activity: {error:?}"))?;
                     assert_eq!(record.identity, activity);
                     activity_count += 1;
                     operations[3] += 1;
                 }
                 4 => {
-                    let activity = WorkflowActivityId::from_stable(key(&namespace, step));
-                    let attempt = NonZeroU32::new(1).expect("attempt");
+                    let activity = WorkflowActivityId::from_stable(key(&namespace, step)?);
+                    let attempt = NonZeroU32::MIN;
                     let record = run(engine.record_activity(
                         handle.run.clone(),
                         activity.clone(),
                         attempt,
                         Arc::clone(&input),
                         outcome.clone(),
-                    ))
-                    .expect("record activity");
+                    ))?
+                    .map_err(|error| format!("record activity: {error:?}"))?;
                     let replay = run(engine.record_activity(
                         handle.run.clone(),
                         activity,
                         attempt,
                         Arc::clone(&input),
                         outcome.clone(),
-                    ))
-                    .expect("exact activity replay");
+                    ))?
+                    .map_err(|error| format!("activity replay: {error:?}"))?;
                     assert_eq!(record, replay);
                     activity_count += 1;
                     operations[4] += 1;
                 }
                 5 => {
-                    let activity = WorkflowActivityId::from_stable(key(&namespace, step));
-                    let attempt = NonZeroU32::new(1).expect("attempt");
+                    let activity = WorkflowActivityId::from_stable(key(&namespace, step)?);
+                    let attempt = NonZeroU32::MIN;
                     run(engine.record_activity(
                         handle.run.clone(),
                         activity.clone(),
                         attempt,
                         Arc::clone(&input),
                         outcome.clone(),
-                    ))
-                    .expect("record activity");
+                    ))?
+                    .map_err(|error| format!("record activity: {error:?}"))?;
                     let conflict = run(engine.record_activity(
                         handle.run.clone(),
                         activity,
                         attempt,
                         Arc::from(&b"other"[..]),
                         outcome.clone(),
-                    ));
+                    ))?;
                     assert!(matches!(
                         conflict,
                         Err(WorkflowEngineError::ActivityConflict)
@@ -180,29 +199,31 @@ fn configured_workflow_histories_match_replay_and_transition_model() {
                     activity_count += 1;
                     operations[5] += 1;
                 }
-                _ => unreachable!(),
+                _ => return Err("operation outside configured set".into()),
             }
-            let snapshot = run(engine.inspect(handle.run.clone()))
-                .expect("inspect run")
-                .expect("run remains present");
+            let snapshot = run(engine.inspect(handle.run.clone()))?
+                .map_err(|error| format!("inspect run: {error:?}"))?
+                .ok_or("run no longer present")?;
             assert_eq!(snapshot.status, expected_status);
             assert_eq!(snapshot.activities.len(), activity_count);
         }
-        let completed =
-            run(engine.complete(handle.run.clone(), outcome.clone())).expect("complete run");
+        let completed = run(engine.complete(handle.run.clone(), outcome.clone()))?
+            .map_err(|error| format!("complete run: {error:?}"))?;
         assert_eq!(completed.status, WorkflowStatus::Completed(outcome.clone()));
         assert_eq!(completed.activities.len(), activity_count);
-        let replay = run(engine.complete(handle.run, outcome.clone())).expect("completion replay");
+        let replay = run(engine.complete(handle.run, outcome.clone()))?
+            .map_err(|error| format!("completion replay: {error:?}"))?;
         assert_eq!(replay, completed);
     }
 
     assert!(operations.iter().all(|count| *count > 0));
     campaign_report::completed(
         "workflow",
-        serde_json::json!({
+        json!({
             "seeds": seeds,
             "transitions": transitions,
             "operations": operations,
         }),
-    );
+    )?;
+    Ok(())
 }

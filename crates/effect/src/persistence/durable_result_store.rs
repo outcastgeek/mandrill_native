@@ -5,6 +5,7 @@ use super::{
     HasKeyValueStore, KeyValueStore, Persistable, PersistenceError, StoreRevision, StoredLookup,
     StoredValue, result_store,
 };
+use crate::effect_provide_some;
 use crate::{Effect, KeyDomain, StoredOutcome, UtcMillis};
 use std::sync::Arc;
 
@@ -65,8 +66,7 @@ where
     E: Send + 'static,
     D: KeyDomain,
 {
-    result_store::read::<DurableStoreView<R::Store>, I, A, E, D>(definition, input, now)
-        .provide_some(|environment: &R| DurableStoreView(environment.durable_key_value_store()))
+    effect_provide_some! { program: result_store::read::<DurableStoreView<R::Store>, I, A, E, D>(definition, input, now), project: |environment: &R| DurableStoreView(environment.durable_key_value_store()), }
 }
 
 type DurableBatch<A, E, R> = Effect<
@@ -93,8 +93,7 @@ where
     E: Send + 'static,
     D: KeyDomain,
 {
-    result_store::read_many::<DurableStoreView<R::Store>, I, A, E, D>(definition, inputs, now)
-        .provide_some(|environment: &R| DurableStoreView(environment.durable_key_value_store()))
+    effect_provide_some! { program: result_store::read_many::<DurableStoreView<R::Store>, I, A, E, D>(definition, inputs, now), project: |environment: &R| DurableStoreView(environment.durable_key_value_store()), }
 }
 
 /// Provider acknowledgement is still classified as uncertain when a write
@@ -129,10 +128,9 @@ where
     E: Send + 'static,
     D: KeyDomain,
 {
-    result_store::write::<DurableStoreView<R::Store>, I, A, E, D>(
+    effect_provide_some! { program: result_store::write::<DurableStoreView<R::Store>, I, A, E, D>(
         definition, input, outcome, expires_at,
-    )
-    .provide_some(|environment: &R| DurableStoreView(environment.durable_key_value_store()))
+    ), project: |environment: &R| DurableStoreView(environment.durable_key_value_store()), }
 }
 
 /// Remove a recorded result through the durable store contract.
@@ -162,8 +160,7 @@ where
     E: Send + 'static,
     D: KeyDomain,
 {
-    result_store::remove::<DurableStoreView<R::Store>, I, A, E, D>(definition, input)
-        .provide_some(|environment: &R| DurableStoreView(environment.durable_key_value_store()))
+    effect_provide_some! { program: result_store::remove::<DurableStoreView<R::Store>, I, A, E, D>(definition, input), project: |environment: &R| DurableStoreView(environment.durable_key_value_store()), }
 }
 
 /// Atomic per-key mutation requires the provider to warrant both durability
@@ -189,6 +186,5 @@ where
     R: HasDurableKeyValueStore + Send + Sync + 'static,
     R::Store: ConditionalKeyValueStore,
 {
-    result_store::compare_exchange::<DurableStoreView<R::Store>>(key, expected, replacement)
-        .provide_some(|environment: &R| DurableStoreView(environment.durable_key_value_store()))
+    effect_provide_some! { program: result_store::compare_exchange::<DurableStoreView<R::Store>>(key, expected, replacement), project: |environment: &R| DurableStoreView(environment.durable_key_value_store()), }
 }

@@ -39,7 +39,15 @@ pub(crate) fn expand(name: &str, input: TokenStream) -> syn::Result<TokenStream>
     } else {
         quote!(#path::SpanKind::Internal)
     };
-    let parent = if fields.contains("parent") {
+    if fields.contains("parent") && fields.contains("parent_option") {
+        return Err(syn::Error::new(
+            Span::call_site(),
+            "parent conflicts with parent_option",
+        ));
+    }
+    let parent = if fields.contains("parent_option") {
+        fields.take("parent_option")?
+    } else if fields.contains("parent") {
         let parent = fields.take("parent")?;
         quote!(::core::option::Option::Some(#parent))
     } else {

@@ -2,6 +2,7 @@
 
 use super::macro_future::MacroContext;
 use super::runtime::{self, Step};
+use crate::effect;
 use crate::{Defect, Effect, Exit, Scope};
 use futures_util::FutureExt;
 use std::future::Future;
@@ -66,6 +67,9 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> ScopedBody<
     /// Execute under the supplied scope without closing or replacing its resource owner.
     pub fn evaluate(&self, scope: Scope<E>) -> Effect<A, E, R> {
         let run = Arc::clone(&self.run);
-        Effect::defer(move || run(scope.clone()))
+        {
+            let __dsl_factory = move || run(scope.clone());
+            effect! { __dsl_factory()? }
+        }
     }
 }

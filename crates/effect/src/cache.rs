@@ -9,6 +9,7 @@ use crate::{
     Cancellation, Clock, Defect, Effect, Exit, HasClock, HasTaskSpawner, LibraryDefect,
     ScheduledTask, Scope, TaskSpawner,
 };
+use crate::{cache, effect, effect_sync, effect_uninterruptible};
 use event_listener::Event;
 use futures_util::{
     FutureExt,
@@ -519,7 +520,12 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
             ttl: CacheTtl::Fixed(config.ttl),
             admission: CacheAdmission::Unbounded,
         };
-        Self::make_with_options(scope, config, options, load)
+        cache! {
+            scope: scope,
+            config: config,
+            options: options,
+            load: load,
+        }
     }
 
     /// Lazily create a scoped cache with explicit retention, expiry and active admission.
@@ -1191,7 +1197,7 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
     ) -> Effect<(), SharedValue<E>, R> {
         let predicate = Arc::new(predicate);
         let cache = self.clone();
-        Effect::new(move |_, _, finish| {
+        let program = Effect::new(move |_, _, finish| {
             let cache = cache.clone();
             let predicate = Arc::clone(&predicate);
             Step::Suspended(Box::pin(async move {
@@ -1290,8 +1296,8 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
                     .unwrap_or_else(|panic| Exit::Die(Defect::from_panic(panic)));
                 runtime::finish(finish, outcome)
             }))
-        })
-        .uninterruptible()
+        });
+        effect_uninterruptible! { program: program, }
     }
     /// Lazily evict all entries, fence active generations, and join their owned cleanup.
     ///
@@ -1309,11 +1315,14 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
     pub fn set<R: Send + Sync + 'static>(&self, key: K, value: A) -> Effect<(), SharedValue<E>, R> {
         let cache = self.clone();
         let key = Arc::new(key);
-        Effect::from_result_once(Ok(value)).flat_map(move |value| {
+        let input = effect_sync! { once; body: move || value, };
+        effect! {
             let cache = cache.clone();
             let key = Arc::clone(&key);
+            let input = input.clone();
+            let value = input?;
             let value = Arc::new(Mutex::new(Some(value)));
-            Effect::new(move |_, _, finish| {
+            let replacement = Effect::new(move |_, _, finish| {
                 let cache = cache.clone();
                 let key = Arc::clone(&key);
                 let value = Arc::clone(&value);
@@ -1447,9 +1456,9 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
                         .unwrap_or_else(|panic| Exit::Die(Defect::from_panic(panic)));
                     runtime::finish(finish, result)
                 }))
-            })
-            .uninterruptible()
-        })
+            });
+            effect_uninterruptible! { program: replacement, }?
+        }
     }
 
     async fn shutdown_start(&self) {
@@ -1568,7 +1577,7 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
         &self,
     ) -> Effect<crate::PoolEndStatus, SharedValue<E>, R> {
         let cache = self.clone();
-        Effect::new(move |_, _, finish| {
+        effect_uninterruptible! { program: Effect::new(move |_, _, finish| {
             let cache = cache.clone();
             Step::Suspended(Box::pin(async move {
                 cache.shutdown_start().await;
@@ -1593,8 +1602,7 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
                 };
                 runtime::finish(finish, Exit::Success(status))
             }))
-        })
-        .uninterruptible()
+        }), }
     }
 }
 /// Typed cache shutdown driver used by cache.

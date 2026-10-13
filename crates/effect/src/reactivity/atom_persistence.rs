@@ -7,7 +7,9 @@ use crate::persistence::{
     CompareExchange, ConditionalKeyValueStore, HasKeyValueStore, KeyValueStore, StoreRead,
     StoreRevision, StoredValue,
 };
-use crate::{Effect, UtcMillis};
+use crate::{
+    Effect, UtcMillis, effect, effect_from_option, effect_map_error, effect_provide_some, service,
+};
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -136,35 +138,39 @@ impl<A: Send + Sync + 'static> PersistedAtom<A> {
         Backend: Send + 'static,
     {
         let atom = self.clone();
-        Effect::service(|env: &R| env.key_value_store()).flat_map(move |store| {
+        effect! {
             let atom = atom.clone();
-            store
-                .get(Arc::clone(&atom.key), now)
-                .map_error(PersistedAtomError::Read)
-                .provide_some(|_: &R| ())
-                .flat_map(move |read| match read {
-                    StoreRead::Missing => Effect::sync(|| PersistedAtomLoad::Missing),
-                    StoreRead::Expired(entry) => match entry.value.expires_at {
-                        Some(expires_at) => Effect::sync_once(move || PersistedAtomLoad::Expired {
+            let store = service! { env |env: &R| { env.key_value_store() }, }?;
+            let read = effect_provide_some! {
+                program: effect_map_error! {
+                    program: store.get(Arc::clone(&atom.key), now),
+                    map: PersistedAtomError::Read,
+                },
+                project |_: &R| { () },
+            }?;
+            match read {
+                    StoreRead::Missing => PersistedAtomLoad::Missing,
+                    StoreRead::Expired(entry) => {
+                        let expires_at = effect_from_option! {
+                            once;
+                            value: entry.value.expires_at,
+                            missing { PersistedAtomError::Hydration(HydrationError::InvalidRecord) },
+                        }?;
+                        PersistedAtomLoad::Expired {
                             store_revision: entry.revision,
                             expires_at,
-                        }),
-                        None => Effect::from_result_once(Err(PersistedAtomError::Hydration(
-                            HydrationError::InvalidRecord,
-                        ))),
+                        }
                     },
                     StoreRead::Found(entry) => {
                         let revision = entry.revision;
-                        atom.source
-                            .import(atom.schema.clone(), entry.value.bytes, policy)
-                            .map_error(PersistedAtomError::Hydration)
-                            .map(move |source| PersistedAtomLoad::Imported {
-                                store_revision: revision,
-                                source,
-                            })
+                        let source = effect_map_error! {
+                            program: atom.source.import(atom.schema.clone(), entry.value.bytes, policy),
+                            map: PersistedAtomError::Hydration,
+                        }?;
+                        PersistedAtomLoad::Imported { store_revision: revision, source }
                     }
-                })
-        })
+            }
+        }
     }
 
     /// The caller supplies the observed backing revision. A provider with only
@@ -193,38 +199,35 @@ impl<A: Send + Sync + 'static> PersistedAtom<A> {
         Backend: Send + 'static,
     {
         let atom = self.clone();
-        self.source
-            .export(self.schema.clone())
-            .map_error(PersistedAtomError::Hydration)
-            .flat_map(move |bytes| {
+        let exported = self.source.export(self.schema.clone());
+        effect! {
                 let atom = atom.clone();
+                let exported = exported.clone();
+                let bytes = effect_map_error! { program: exported, map: PersistedAtomError::Hydration, }?;
                 let value = std::sync::Mutex::new(Some(StoredValue { bytes, expires_at }));
-                Effect::service(|env: &R| env.key_value_store()).flat_map(move |store| {
+                let store = service! { env |env: &R| { env.key_value_store() }, }?;
                     let value = value
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .take();
-                    let Some(value) = value else {
-                        return Effect::from_result_once(Err(PersistedAtomError::InputConsumed));
-                    };
+                    let value = effect_from_option! { once; value: value, missing { PersistedAtomError::InputConsumed }, }?;
                     let key = Arc::clone(&atom.key);
                     let error_key = Arc::clone(&atom.key);
-                    store
-                        .compare_exchange(key, expected, Some(value))
-                        .map_error(move |source| PersistedAtomError::UncertainWrite {
-                            key: Arc::clone(&error_key),
-                            source,
-                        })
-                        .provide_some(|_: &R| ())
-                        .map(|result| match result {
+                    let result = effect_provide_some! {
+                        program: effect_map_error! {
+                            program: store.compare_exchange(key, expected, Some(value)),
+                            map |source| { PersistedAtomError::UncertainWrite { key: Arc::clone(&error_key), source } },
+                        },
+                        project |_: &R| { () },
+                    }?;
+                    match result {
                             CompareExchange::Written(revision) => {
                                 PersistedAtomSave::Written(revision)
                             }
                             CompareExchange::Conflict { actual } => {
                                 PersistedAtomSave::Conflict { actual }
                             }
-                        })
-                })
-            })
+                    }
+        }
     }
 }

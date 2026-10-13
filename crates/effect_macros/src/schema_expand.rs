@@ -214,7 +214,7 @@ fn expand_record(input: RecordSchemaInput) -> syn::Result<TokenStream> {
         .collect();
     let definitions = input.fields.iter().zip(&codec_vars).map(|(field, var)| {
         let codec = &field.codec;
-        quote_spanned!(codec.span()=> let #var = #codec;)
+        quote_spanned!(codec.span().resolved_at(proc_macro2::Span::mixed_site())=> let #var = #codec;)
     });
     if let Some(representation) = &input.representation {
         let unknown = input
@@ -225,18 +225,18 @@ fn expand_record(input: RecordSchemaInput) -> syn::Result<TokenStream> {
         for (field, var) in input.fields.iter().zip(&codec_vars).rev() {
             let name = &field.name;
             builder = if let Some(default) = &field.default_with {
-                quote_spanned!(name.span()=> #builder.default_with_context(stringify!(#name), #var.clone(), #default, { let codec = #var; move |value, context| codec.validate_default_in_ref(value, context) }))
+                quote_spanned!(name.span().resolved_at(proc_macro2::Span::mixed_site())=> #builder.default_with_context(stringify!(#name), #var.clone(), #default, { let codec = #var; move |value, context| codec.validate_default_in_ref(value, context) }))
             } else if field.optional_attribute {
-                quote_spanned!(name.span()=> #builder.optional(stringify!(#name), #var, || None, |value| value.is_none()))
+                quote_spanned!(name.span().resolved_at(proc_macro2::Span::mixed_site())=> #builder.optional(stringify!(#name), #var, || None, |value| value.is_none()))
             } else if let Some((missing, omit, None)) = &field.optional {
-                quote_spanned!(name.span()=> #builder.optional(stringify!(#name), #var, #missing, #omit))
+                quote_spanned!(name.span().resolved_at(proc_macro2::Span::mixed_site())=> #builder.optional(stringify!(#name), #var, #missing, #omit))
             } else if field.optional.is_some() {
                 return Err(syn::Error::new(
                     name.span(),
                     "native defaults use #[schema(default_with = factory)]",
                 ));
             } else {
-                quote_spanned!(name.span()=> #builder.field(stringify!(#name), #var))
+                quote_spanned!(name.span().resolved_at(proc_macro2::Span::mixed_site())=> #builder.field(stringify!(#name), #var))
             };
         }
         let names: Vec<_> = input.fields.iter().map(|field| &field.name).collect();
@@ -264,19 +264,23 @@ fn expand_record(input: RecordSchemaInput) -> syn::Result<TokenStream> {
     for (field, var) in input.fields.iter().zip(&codec_vars).rev() {
         let name = &field.name;
         builder = match &field.optional {
-            Some((missing, omit, Some(default))) => quote_spanned!(name.span()=>
-                #builder.optional_with_default(
-                    stringify!(#name), |value: &#record| &value.#name,
-                    #var, #missing, #omit, #default,
+            Some((missing, omit, Some(default))) => {
+                quote_spanned!(name.span().resolved_at(proc_macro2::Span::mixed_site())=>
+                    #builder.optional_with_default(
+                        stringify!(#name), |value: &#record| &value.#name,
+                        #var, #missing, #omit, #default,
+                    )
                 )
-            ),
-            Some((missing, omit, None)) => quote_spanned!(name.span()=>
-                #builder.optional(
-                    stringify!(#name), |value: &#record| &value.#name,
-                    #var, #missing, #omit,
+            }
+            Some((missing, omit, None)) => {
+                quote_spanned!(name.span().resolved_at(proc_macro2::Span::mixed_site())=>
+                    #builder.optional(
+                        stringify!(#name), |value: &#record| &value.#name,
+                        #var, #missing, #omit,
+                    )
                 )
-            ),
-            None => quote_spanned!(name.span()=>
+            }
+            None => quote_spanned!(name.span().resolved_at(proc_macro2::Span::mixed_site())=>
                 #builder.field(stringify!(#name), |value: &#record| &value.#name, #var)
             ),
         };

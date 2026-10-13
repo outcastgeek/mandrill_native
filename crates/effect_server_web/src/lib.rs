@@ -7,6 +7,19 @@
 
 extern crate self as effect_server_web;
 
+/// Typed callback blocks using this facade's existing Effect dependency.
+pub use effect::{
+    codec, effect_all, effect_all_concurrent, effect_blocking, effect_cpu, effect_die,
+    effect_finalizer, effect_for_each, effect_for_each_concurrent, effect_from_option,
+    effect_future, effect_map, effect_map_error, effect_on_interrupt, effect_permit,
+    effect_provide_some, effect_provided, effect_race, effect_recover, effect_ref, effect_repeat,
+    effect_resource, effect_retry, effect_sandbox, effect_schema_parse, effect_scope,
+    effect_scope_acquire, effect_socket, effect_stream_for_each, effect_sync, effect_timeout,
+    effect_try_blocking, effect_try_cpu, effect_try_future, effect_try_sync,
+    effect_uninterruptible, effect_using, effect_with_layer, layer, pool, request_resolver,
+    schedule, sink, weak_cache,
+};
+
 #[cfg(test)]
 mod contract_tests;
 
@@ -132,7 +145,8 @@ pub(crate) fn restore_exit<A: Send + 'static, E: Send + 'static, R: Send + Sync 
     exit: effect::Exit<A, E>,
 ) -> effect::Effect<A, E, R> {
     let exit = std::sync::Mutex::new(Some(exit));
-    effect::Effect::from_exit_future_with_context(move |_, _| {
+    effect_future! {
+        exit_with_context; body: move |_, _| {
         let exit = exit
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -145,5 +159,5 @@ pub(crate) fn restore_exit<A: Send + 'static, E: Send + 'static, R: Send + Sync 
                 )),
             }
         }
-    })
+    }, }
 }

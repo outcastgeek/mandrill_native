@@ -5,6 +5,10 @@ use crate::{
     Defect, Effect, Exit, Finalization, PubSubError, PubSubOverflow, PubSubShutdown, PublishReport,
     Semaphore, SemaphoreError, SharedValue, SubscriptionRef,
 };
+use crate::{
+    effect, effect_map, effect_map_error, effect_resource, effect_sync, effect_try_sync,
+    effect_uninterruptible,
+};
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
@@ -114,7 +118,7 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
 
     /// Lazily borrow the current source value through a shared Arc; this direct read does not register a derived dependency.
     pub fn read<R: Send + Sync + 'static>(&self) -> Effect<Arc<A>, AtomRefError, R> {
-        self.value.read().map_error(AtomRefError::Publication)
+        effect_map_error! { program: self.value.read(), map: AtomRefError::Publication, }
     }
 
     /// Return the revision assigned to the current atom value.
@@ -130,11 +134,12 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
         &self,
     ) -> Effect<std::num::NonZeroU64, AtomRefError, R> {
         let revision = Arc::clone(&self.revision);
-        Effect::sync(move || {
+        effect_sync! {
+            body: move || {
             *revision
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-        })
+        }, }
     }
 
     /// Lazily replace one owned source value after acquiring its mutation permit.
@@ -146,89 +151,92 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
     pub fn set<R: Send + Sync + 'static>(&self, next: A) -> Effect<PublishReport, AtomRefError, R> {
         let source = self.clone();
         let next = Mutex::new(Some(next));
-        self.mutation
-            .acquire(NonZeroUsize::MIN)
-            .map_error(AtomRefError::Admission)
-            .flat_map(move |permit| {
-                let source = source.clone();
-                let next = next
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
-                let mutation = match next {
-                    Some(next) => {
-                        let upcoming = source
-                            .revision
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .get()
-                            .checked_add(1)
-                            .and_then(std::num::NonZeroU64::new);
-                        match upcoming {
-                            Some(upcoming) => {
-                                let revision = Arc::clone(&source.revision);
-                                let registry = source.registry.clone();
-                                let id = source.id.clone();
-                                let committed = Arc::new(Mutex::new(None));
-                                let captured = Arc::clone(&committed);
-                                let commit_registry = registry.clone();
-                                let commit_id = id.clone();
-                                let commit_owner = Arc::clone(&source.owner);
-                                source
-                                    .value
-                                    .set_with_guard(next, move |_| {
-                                        let result = commit_registry
-                                            .commit_source(&commit_id, &commit_owner);
-                                        let accepted = result.is_ok();
-                                        if accepted {
-                                            *revision.lock().unwrap_or_else(
-                                                std::sync::PoisonError::into_inner,
-                                            ) = upcoming;
-                                        }
-                                        *captured
-                                            .lock()
-                                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                            Some(result);
-                                        accepted
-                                    })
-                                    .map_error(AtomRefError::Publication)
-                                    .materialize_exit()
-                                    .map_error(|never: std::convert::Infallible| match never {})
-                                    .flat_map(move |publication| {
-                                        let decision = committed
-                                            .lock()
-                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                            .take();
-                                        match decision {
-                                            Some(Ok(keys)) => Effect::from_exit_once(publication)
-                                                .ensuring(registry.notify(keys).map_error(
-                                                    AtomRefError::CommittedWithoutInvalidation,
-                                                )),
-                                            Some(Err(error)) => Effect::from_result_once(Err(
-                                                AtomRefError::Registry(error),
-                                            ))
-                                            .ensuring(
-                                                Effect::from_exit_once(publication).map(|_| ()),
-                                            ),
-                                            None => {
-                                                Effect::from_exit_once(publication).flat_map(|_| {
-                                                    Effect::from_result_once(Err(
-                                                        AtomRefError::InputConsumed,
-                                                    ))
-                                                })
-                                            }
-                                        }
-                                    })
-                            }
-                            None => Effect::from_result_once(Err(AtomRefError::RevisionExhausted)),
-                        }
-                    }
-                    None => Effect::from_result_once(Err(AtomRefError::InputConsumed)),
-                };
-                mutation
-                    .uninterruptible()
-                    .ensuring(Effect::sync_once(move || drop(permit)))
-            })
+        effect! {
+        bind;
+        program: effect_map_error! {
+            program: self.mutation
+                   .acquire(NonZeroUsize::MIN), map: AtomRefError::Admission, },
+        body: move |permit| {
+                       let source = source.clone();
+                       let next = next
+                           .lock()
+                           .unwrap_or_else(std::sync::PoisonError::into_inner)
+                           .take();
+                       let mutation = match next {
+                           Some(next) => {
+                               let upcoming = source
+                                   .revision
+                                   .lock()
+                                   .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                   .get()
+                                   .checked_add(1)
+                                   .and_then(std::num::NonZeroU64::new);
+                               match upcoming {
+                                   Some(upcoming) => {
+                                       let revision = Arc::clone(&source.revision);
+                                       let registry = source.registry.clone();
+                                       let id = source.id.clone();
+                                       let committed = Arc::new(Mutex::new(None));
+                                       let captured = Arc::clone(&committed);
+                                       let commit_registry = registry.clone();
+                                       let commit_id = id.clone();
+                                       let commit_owner = Arc::clone(&source.owner);
+                                       {
+                                           let __dsl_program = effect_map_error! {
+                                           program: effect_map_error! {
+                                           program: source
+                                           .value
+                                           .set_with_guard(next, move |_| {
+                                               let result = commit_registry
+                                                   .commit_source(&commit_id, &commit_owner);
+                                               let accepted = result.is_ok();
+                                               if accepted {
+                                                   *revision.lock().unwrap_or_else(
+                                                       std::sync::PoisonError::into_inner,
+                                                   ) = upcoming;
+                                               }
+                                               *captured
+                                                   .lock()
+                                                   .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                                   Some(result);
+                                               accepted
+                                           }), map: AtomRefError::Publication, }
+                                           .materialize_exit(), map: |never: std::convert::Infallible| match never {}, }; effect! {
+                                               let committed = committed.clone(); let registry = registry.clone(); let publication = __dsl_program.clone()?; {
+                                               let decision = committed
+                                                   .lock()
+                                                   .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                   .take();
+                                               match decision {
+                                                   Some(Ok(keys)) => { let __dsl_program = Effect::from_exit_once(publication); let __dsl_cleanup = effect_map_error! { program: registry.notify(keys), map: AtomRefError::CommittedWithoutInvalidation, }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } },
+                                                   Some(Err(error)) => {
+                                                       let __dsl_program = effect_try_sync! {
+                                                       once; body: {
+                                                       let __dsl_result = Err(
+                                                       AtomRefError::Registry(error),
+                                                   ); move || __dsl_result }, on_error: ::core::convert::identity, }; let __dsl_cleanup = effect_map! { program: Effect::from_exit_once(publication), map: |_| (), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } },
+                                                   None => {
+                                                       {
+                                                           let __dsl_program = Effect::from_exit_once(publication); effect! {
+                                                           let _ = __dsl_program.clone()?; {
+                                                           effect_try_sync! {
+                                                               once; body: {
+                                                               let __dsl_result = Err(
+                                                               AtomRefError::InputConsumed,
+                                                           ); move || __dsl_result }, on_error: ::core::convert::identity, }
+                                                       }? } }
+                                                   }
+                                               }
+                                           }? } }
+                                   }
+                                   None => effect_try_sync! { once; body: { let __dsl_result = Err(AtomRefError::RevisionExhausted); move || __dsl_result }, on_error: ::core::convert::identity, },
+                               }
+                           }
+                           None => effect_try_sync! { once; body: { let __dsl_result = Err(AtomRefError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, },
+                       };
+                       { let __dsl_program = effect_uninterruptible! { program: mutation, }; let __dsl_cleanup = effect_sync! { once; body: move || drop(permit), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } }
+                   },
+        }
     }
 
     #[must_use]
@@ -253,25 +261,35 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
         mode: PubSubShutdown,
     ) -> Effect<(), AtomRefError, R> {
         let source = self.clone();
-        self.mutation
-            .acquire(NonZeroUsize::MIN)
-            .map_error(AtomRefError::Admission)
-            .flat_map(move |permit| {
+        let admission = effect_map_error! {
+            program: self.mutation.acquire(NonZeroUsize::MIN),
+            map: AtomRefError::Admission,
+        };
+        effect! {
+            let source = source.clone();
+            let permit = admission.clone()?;
+            let shutdown = effect_map_error! {
+                program: source.value.shutdown(mode),
+                map: AtomRefError::Publication,
+            };
+            let mutation = effect! {
                 let source = source.clone();
-                source
-                    .value
-                    .shutdown(mode)
-                    .map_error(AtomRefError::Publication)
-                    .flat_map(move |_| {
-                        source
-                            .registry
-                            .remove_owned(source.id.clone(), Some(Arc::clone(&source.owner)))
-                            .map_error(AtomRefError::Registry)
-                            .map(|_| ())
-                    })
-                    .uninterruptible()
-                    .ensuring(Effect::sync_once(move || drop(permit)))
-            })
+                shutdown.clone()?;
+                effect_map_error! {
+                    program: source.registry.remove_owned(
+                        source.id.clone(), Some(Arc::clone(&source.owner)),
+                    ),
+                    map: AtomRefError::Registry,
+                }?;
+            };
+            let mutation = effect_uninterruptible! { program: mutation, };
+            let cleanup = effect_sync! { once; body: move || drop(permit), };
+            effect_resource! {
+                acquire: effect_sync! { body: || (), },
+                release: move |(), _| cleanup.clone(),
+                body: move |_| mutation.clone(),
+            }?
+        }
     }
 }
 
@@ -305,19 +323,22 @@ impl AtomReadContext {
         source: &AtomRef<A>,
     ) -> Effect<Arc<A>, AtomRefError, R> {
         if !self.registry.same_instance(&source.registry) {
-            return Effect::from_result_once(Err(AtomRefError::ForeignRegistry));
+            return effect_try_sync! { once; body: { let __dsl_result = Err(AtomRefError::ForeignRegistry); move || __dsl_result }, on_error: ::core::convert::identity, };
         }
         let dependencies = Arc::clone(&self.dependencies);
         let source = source.clone();
-        source
+        {
+            let __dsl_program = effect_map_error! {
+            program: source
             .mutation
-            .acquire(NonZeroUsize::MIN)
-            .map_error(AtomRefError::Admission)
-            .flat_map(move |permit| {
+            .acquire(NonZeroUsize::MIN), map: AtomRefError::Admission, };
+            effect! {
+                let dependencies = dependencies.clone(); let source = source.clone(); let permit = __dsl_program.clone()?; {
                 let source = source.clone();
                 let dependencies = Arc::clone(&dependencies);
-                let read = Effect::try_sync(
-                    {
+                let read = {
+                    let __dsl_program = effect_try_sync! {
+                    body: {
                         let source = source.clone();
                         move || {
                             source
@@ -325,23 +346,23 @@ impl AtomReadContext {
                                 .dependency_version(&source.id, &source.owner)
                                 .map_err(AtomRefError::Registry)
                         }
-                    },
-                    std::convert::identity,
-                )
-                .flat_map(move |version| {
+                    }, on_error: std::convert::identity, }; effect! {
+                        let dependencies = dependencies.clone(); let source = source.clone(); let version = __dsl_program.clone()?; {
                     let dependencies = Arc::clone(&dependencies);
                     let id = source.id.clone();
-                    source.read().map(move |value| {
+                    effect_map! {
+                        program: source.read(), map: move |value| {
                         dependencies
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .entry(id.clone())
                             .or_insert_with(|| Arc::clone(&version));
                         value
-                    })
-                });
-                read.ensuring(Effect::sync_once(move || drop(permit)))
-            })
+                    }, }
+                }? } };
+                { let __dsl_program = read; let __dsl_cleanup = effect_sync! { once; body: move || drop(permit), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } }
+            }? }
+        }
     }
 
     /// # Returns
@@ -368,33 +389,33 @@ impl AtomReadContext {
         R: Send + Sync + 'static,
     {
         if !self.registry.same_instance(derived.registry()) {
-            return Effect::from_result_once(Err(AtomDependencyError::ForeignRegistry));
+            return effect_try_sync! { once; body: { let __dsl_result = Err(AtomDependencyError::ForeignRegistry); move || __dsl_result }, on_error: ::core::convert::identity, };
         }
         let dependencies = Arc::clone(&self.dependencies);
         let id = derived.id().clone();
         let owner = derived.registration_owner();
         let derived = derived.clone();
         let registry = self.registry.clone();
-        Effect::try_sync(
-            move || {
-                registry
-                    .dependency_version(&id, &owner)
-                    .map(|version| (id.clone(), version))
-                    .map_err(|_| AtomDependencyError::Unavailable)
-            },
-            std::convert::identity,
-        )
-        .flat_map(move |(id, version)| {
+        let version = effect_try_sync! {
+        body: move || {
+            registry
+                .dependency_version(&id, &owner)
+                .map(|version| (id.clone(), version))
+                .map_err(|_| AtomDependencyError::Unavailable)
+        }, on_error: std::convert::identity, };
+        effect! {
             let dependencies = Arc::clone(&dependencies);
+            let derived = derived.clone();
+            let (id, version) = version.clone()?;
             dependencies
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .entry(id)
                 .or_insert(version);
-            derived
-                .read()
-                .map_error(AtomDependencyError::Read)
-                .flat_map(|status| {
+            let status = effect_map_error! {
+                program: derived.read(),
+                map: AtomDependencyError::Read,
+            }?;
                     let result = match status.outcome() {
                         Some(Exit::Success(value)) => Ok(value.clone()),
                         Some(Exit::Fail(error)) => Err(AtomDependencyError::Failed(error.clone())),
@@ -405,8 +426,11 @@ impl AtomReadContext {
                         }
                         None => Err(AtomDependencyError::Unavailable),
                     };
-                    Effect::from_result_once(result)
-                })
-        })
+            effect_try_sync! {
+                once;
+                body: move || result,
+                on_error: std::convert::identity,
+            }?
+        }
     }
 }

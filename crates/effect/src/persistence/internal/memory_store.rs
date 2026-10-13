@@ -4,6 +4,7 @@ use super::super::{
     BatchReadItem, CompareExchange, ConditionalKeyValueStore, KeyValueStore, MemoryStoreError,
     StoreCapacity, StoreEntry, StoreRead, StoreRevision, StoredValue, UtcMillis,
 };
+use crate::effect_sync;
 use crate::{Effect, Exit};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -134,7 +135,7 @@ impl KeyValueStore for MemoryKeyValueStore {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn get(&self, key: Arc<[u8]>, now: UtcMillis) -> Effect<StoreRead, Self::Error> {
         let store = self.clone();
-        Effect::sync(move || {
+        effect_sync! { body: move || {
             let state = store
                 .state
                 .lock()
@@ -144,7 +145,7 @@ impl KeyValueStore for MemoryKeyValueStore {
                 Some(entry) if Self::expired(entry, now) => StoreRead::Expired(entry.clone()),
                 Some(entry) => StoreRead::Found(entry.clone()),
             }
-        })
+        }, }
     }
 
     ///
@@ -161,7 +162,7 @@ impl KeyValueStore for MemoryKeyValueStore {
         now: UtcMillis,
     ) -> Effect<Vec<BatchReadItem<Self::Error>>, Self::Error> {
         let store = self.clone();
-        Effect::sync_once(move || {
+        effect_sync! { once; body: move || {
             let state = store
                 .state
                 .lock()
@@ -181,7 +182,7 @@ impl KeyValueStore for MemoryKeyValueStore {
                     }
                 })
                 .collect()
-        })
+        }, }
     }
 
     ///
@@ -241,14 +242,14 @@ impl KeyValueStore for MemoryKeyValueStore {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn remove(&self, key: Arc<[u8]>) -> Effect<Option<StoreEntry>, Self::Error> {
         let store = self.clone();
-        Effect::sync(move || {
+        effect_sync! { body: move || {
             store
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .entries
                 .remove(&key)
-        })
+        }, }
     }
 
     ///
@@ -260,7 +261,7 @@ impl KeyValueStore for MemoryKeyValueStore {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn cleanup_expired(&self, now: UtcMillis) -> Effect<usize, Self::Error> {
         let store = self.clone();
-        Effect::sync(move || {
+        effect_sync! { body: move || {
             let removed = {
                 let mut state = store
                     .state
@@ -271,7 +272,7 @@ impl KeyValueStore for MemoryKeyValueStore {
             let count = removed.len();
             drop(removed);
             count
-        })
+        }, }
     }
 }
 

@@ -1,6 +1,11 @@
 use effect::{Cancellation, Defect, Effect, Exit};
+use effect::{
+    effect, effect_die, effect_future, effect_map_error, effect_provide_some, effect_recover,
+    effect_sandbox, effect_sync, effect_try_future, effect_try_sync,
+};
 use futures_executor::block_on;
 use futures_util::future::{join_all, poll_fn};
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
@@ -9,16 +14,17 @@ use std::task::Poll;
 fn fresh_futures_per_run_and_inline_execution() {
     let calls = Arc::new(AtomicUsize::new(0));
     let witness = Arc::clone(&calls);
-    let program: Effect<usize, ()> = Effect::from_future(move |_| {
+    let program: Effect<usize, ()> = effect_future! { body: move |_| {
         let value = witness.fetch_add(1, Ordering::SeqCst);
         async move { value }
-    });
+    }, };
     let pending = program.run(Arc::new(()));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(block_on(pending), Exit::Success(0));
     assert_eq!(block_on(program.run(Arc::new(()))), Exit::Success(1));
     let thread = std::thread::current().id();
-    let inline: Effect<std::thread::ThreadId, ()> = Effect::sync(|| std::thread::current().id());
+    let inline: Effect<std::thread::ThreadId, ()> =
+        effect_sync! { body: || std::thread::current().id(), };
     assert_eq!(block_on(inline.run(Arc::new(()))), Exit::Success(thread));
 }
 
@@ -64,7 +70,7 @@ fn concurrent_request_and_registration_cannot_lose_a_wakeup() {
         let witness = Arc::new(Witness(AtomicUsize::new(0)));
         let waker = Waker::from(Arc::clone(&witness));
         let mut context = Context::from_waker(&waker);
-        let mut wait = std::pin::pin!(token.cancelled());
+        let mut wait = pin!(token.cancelled());
         start.wait();
         let first = wait.as_mut().poll(&mut context);
         assert!(worker.join().is_ok());
@@ -83,17 +89,16 @@ fn cooperative_async_cancellation_waits_for_settlement() {
     let witness = Arc::clone(&settled);
     let entered = Cancellation::new();
     let entered_witness = entered.clone();
-    let program: Effect<(), ()> = Effect::from_future(move |token| {
+    let program: Effect<(), ()> = effect_future! { body: move |token| {
         let _ = entered_witness.request();
         let witness = Arc::clone(&witness);
         async move {
             token.cancelled().await;
             let _ = witness.fetch_add(1, Ordering::SeqCst);
         }
-    });
+    }, };
     let (outcome, ()) = block_on(futures_util::future::join(
-        program
-            .provide_some(|_: &Cancellation| ())
+        effect_provide_some! { program: program, project: |_: &Cancellation| (), }
             .run_cancellable(Arc::new(token)),
         async move {
             entered.cancelled().await;
@@ -105,38 +110,39 @@ fn cooperative_async_cancellation_waits_for_settlement() {
 }
 
 #[test]
-#[allow(clippy::panic)] // Deliberate user-code defects exercise creation and polling boundaries.
 fn unwinding_panics_are_defects_at_each_user_boundary() {
-    let factory: Effect<(), ()> = Effect::from_future(|_| {
-        panic!("factory");
-        #[allow(unreachable_code)]
-        async {}
-    });
+    let factory: Effect<(), ()> = effect_future! { body: |_| -> futures_util::future::Ready<()> {
+        std::panic::resume_unwind(Box::new("factory"))
+    }, };
     assert_eq!(
         block_on(factory.run(Arc::new(()))),
         Exit::Die(Defect::from_panic(Box::new("factory")))
     );
-    let polling: Effect<(), ()> =
-        Effect::from_future(|_| poll_fn(|_| -> Poll<()> { panic!("poll") }));
+    let polling: Effect<(), ()> = effect_future! { body: |_| {
+        poll_fn(|_| -> Poll<()> { std::panic::resume_unwind(Box::new("poll")) })
+    }, };
     assert_eq!(
         block_on(polling.run(Arc::new(()))),
         Exit::Die(Defect::from_panic(Box::new("poll")))
     );
-    let mapping: Effect<(), ()> = Effect::succeed(()).flat_map(|()| panic!("next"));
+    let mapping: Effect<(), ()> = effect! {
+    bind;
+    program: effect_sync! { body: { let __dsl_value = (); move || __dsl_value }, },
+    body: |()| std::panic::resume_unwind(Box::new("next")),
+    };
     assert_eq!(
         block_on(mapping.run(Arc::new(()))),
         Exit::Die(Defect::from_panic(Box::new("next")))
     );
     let token = Cancellation::new();
     let requester = token.clone();
-    let panicking: Effect<(), ()> = Effect::sync(move || {
+    let panicking: Effect<(), ()> = effect_sync! { body: move || {
         let _ = requester.request();
-        panic!("cancel and panic")
-    });
+        std::panic::resume_unwind(Box::new("cancel and panic"))
+    }, };
     assert_eq!(
         block_on(
-            panicking
-                .provide_some(|_: &Cancellation| ())
+            effect_provide_some! { program: panicking, project: |_: &Cancellation| (), }
                 .run_cancellable(Arc::new(token))
         ),
         Exit::Die(Defect::from_panic(Box::new("cancel and panic")))
@@ -144,34 +150,28 @@ fn unwinding_panics_are_defects_at_each_user_boundary() {
 }
 
 #[test]
-#[allow(clippy::panic)] // Recovery and mapping callbacks are separate user-code boundaries.
 fn mapped_native_result_and_recovery_mapper_defects() {
-    let program: Effect<usize, String> = Effect::try_future(
-        |_| async { Err::<usize, _>(7) },
-        |value| format!("error-{value}"),
-    );
+    let program: Effect<usize, String> = effect_try_future! { body: |_| async { Err::<usize, _>(7) }, on_error: |value| format!("error-{value}"), };
     assert_eq!(
         block_on(program.run(Arc::new(()))),
         Exit::Fail(String::from("error-7"))
     );
-    let sync: Effect<usize, String> =
-        Effect::try_sync(|| Err::<usize, _>(8), |value| format!("error-{value}"));
+    let sync: Effect<usize, String> = effect_try_sync! { body: || Err::<usize, _>(8), on_error: |value| format!("error-{value}"), };
     assert_eq!(
         block_on(sync.run(Arc::new(()))),
         Exit::Fail(String::from("error-8"))
     );
-    let recover: Effect<(), ()> = Effect::fail(()).catch_all(|_| panic!("recover"));
+    let recover: Effect<(), ()> = effect_recover! { program: effect_try_sync! { body: move || Err(()), on_error: ::core::convert::identity, }, recover: |_| std::panic::resume_unwind(Box::new("recover")), };
     assert_eq!(
         block_on(recover.run(Arc::new(()))),
         Exit::Die(Defect::from_panic(Box::new("recover")))
     );
-    let mapped: Effect<(), ()> = Effect::<(), ()>::fail(()).map_error(|_| panic!("map error"));
+    let mapped: Effect<(), ()> = effect_map_error! { program: { let __dsl_program: Effect < () , () > = effect_try_sync! { body: move || Err(()), on_error: ::core::convert::identity, }; __dsl_program }, map: |_| std::panic::resume_unwind(Box::new("map error")), };
     assert_eq!(
         block_on(mapped.run(Arc::new(()))),
         Exit::Die(Defect::from_panic(Box::new("map error")))
     );
-    let sandbox: Effect<(), ()> =
-        Effect::die(Defect::new("original")).sandbox(|_| panic!("sandbox"));
+    let sandbox: Effect<(), ()> = effect_sandbox! { program: effect_die! { defect: Defect::new("original"), }, defect: |_| std::panic::resume_unwind(Box::new("sandbox")), };
     assert_eq!(
         block_on(sandbox.run(Arc::new(()))),
         Exit::Die(Defect::from_panic(Box::new("sandbox")))

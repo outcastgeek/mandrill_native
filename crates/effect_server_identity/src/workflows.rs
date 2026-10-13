@@ -28,6 +28,7 @@ use crate::{
         PasskeySelection, PrincipalSelection, TicketSelection, TokenSelection,
     },
 };
+use crate::{effect_map, identity};
 use effect::Effect;
 use identity_rs::identity::{
     IdentityResult,
@@ -382,14 +383,16 @@ where
         C::Native: SignInService,
         Users<C::Native>: UserPasswordManager,
     {
-        self.invoke_once(input, |native, input, _, _| async move {
-            let user = native
-                .user_manager()
-                .create_with_password(input.user, &input.password)
-                .await
-                .map_err(IdentityError::Native)?;
-            Ok(AccountView::from_user(&user))
-        })
+        identity! {
+        identity: self, invoke_once(input), native: |native, input, _, _| async move {
+                    let user = native
+                        .user_manager()
+                        .create_with_password(input.user, &input.password)
+                        .await
+                        .map_err(IdentityError::Native)?;
+                    Ok(AccountView::from_user(&user))
+                },
+        }
     }
     /// Resolve selected normalization, verify password, enforce admission/lockout
     /// and preserve rejected/pending/completed native outcomes without bypassing MFA.
@@ -400,18 +403,20 @@ where
         M: Fn(IdentityError) -> E,
         C::Native: PasswordSignInManager,
     {
-        self.invoke_once(input, |native, input, authority, _| async move {
-            let session = native
-                .password_sign_in_session_by_name(
-                    &input.user_name,
-                    &input.password,
-                    input.persistent,
-                    input.lockout_on_failure,
-                )
-                .await
-                .map_err(IdentityError::Native)?;
-            complete_login(&authority, session).await
-        })
+        identity! {
+        identity: self, invoke_once(input), native: |native, input, authority, _| async move {
+                    let session = native
+                        .password_sign_in_session_by_name(
+                            &input.user_name,
+                            &input.password,
+                            input.persistent,
+                            input.lockout_on_failure,
+                        )
+                        .await
+                        .map_err(IdentityError::Native)?;
+                    complete_login(&authority, session).await
+                },
+        }
     }
     /// Reload current version-bound self state immediately before emitting its safe view.
     pub fn account<E, R>(&self, grant: SelfGrant) -> Effect<AccountView, E, R>
@@ -422,11 +427,13 @@ where
         C::Native: SignInService,
         Users<C::Native>: UserLifecycleManager,
     {
-        self.invoke_once(grant, |native, grant, authority, _| async move {
-            let user =
-                current_user(native.user_manager(), authority.revalidate(&grant).await?).await?;
-            Ok(AccountView::from_user(&user))
-        })
+        identity! {
+        identity: self, invoke_once(grant), native: |native, grant, authority, _| async move {
+                    let user =
+                        current_user(native.user_manager(), authority.revalidate(&grant).await?).await?;
+                    Ok(AccountView::from_user(&user))
+                },
+        }
     }
     /// Change a password after recent verification, with native old-secret validation
     /// and expected-version mutation. The returned acknowledgment invalidates old grants.
@@ -438,19 +445,21 @@ where
         C::Native: SignInService,
         Users<C::Native>: UserPasswordManager,
     {
-        self.invoke_once(input, |native, input, authority, _| async move {
-            let user = current_user(
-                native.user_manager(),
-                authority.revalidate_recent(&input.grant).await?,
-            )
-            .await?;
-            let user = native
-                .user_manager()
-                .change_password(user, &input.current_password, &input.new_password)
-                .await
-                .map_err(IdentityError::Native)?;
-            Ok(AccountView::from_user(&user))
-        })
+        identity! {
+        identity: self, invoke_once(input), native: |native, input, authority, _| async move {
+                    let user = current_user(
+                        native.user_manager(),
+                        authority.revalidate_recent(&input.grant).await?,
+                    )
+                    .await?;
+                    let user = native
+                        .user_manager()
+                        .change_password(user, &input.current_password, &input.new_password)
+                        .await
+                        .map_err(IdentityError::Native)?;
+                    Ok(AccountView::from_user(&user))
+                },
+        }
     }
     /// Remove the password only with recent self proof; native expected-version
     /// security invalidation remains authoritative.
@@ -462,19 +471,21 @@ where
         C::Native: SignInService,
         Users<C::Native>: UserPasswordManager,
     {
-        self.invoke_once(grant, |native, grant, authority, _| async move {
-            let user = current_user(
-                native.user_manager(),
-                authority.revalidate_recent(&grant).await?,
-            )
-            .await?;
-            let user = native
-                .user_manager()
-                .remove_password(user)
-                .await
-                .map_err(IdentityError::Native)?;
-            Ok(AccountView::from_user(&user))
-        })
+        identity! {
+        identity: self, invoke_once(grant), native: |native, grant, authority, _| async move {
+                    let user = current_user(
+                        native.user_manager(),
+                        authority.revalidate_recent(&grant).await?,
+                    )
+                    .await?;
+                    let user = native
+                        .user_manager()
+                        .remove_password(user)
+                        .await
+                        .map_err(IdentityError::Native)?;
+                    Ok(AccountView::from_user(&user))
+                },
+        }
     }
     /// Generate reset-purpose evidence through the selected D18 token provider.
     /// Trusted delivery adapters consume this secret result; HTTP renderers must
@@ -489,23 +500,25 @@ where
         P: TokenSelection,
         P::Provider: UserTokenProvider<IdentityUser>,
     {
-        self.invoke_once(user_id, |native, id, _, policies| async move {
-            let provider = policies.token_provider()?;
-            let Some(user) = native
-                .user_manager()
-                .find_by_id(&id)
-                .await
-                .map_err(IdentityError::Native)?
-            else {
-                return Ok(None);
-            };
-            native
-                .user_manager()
-                .generate_password_reset_token(&user, provider)
-                .await
-                .map(Some)
-                .map_err(IdentityError::Native)
-        })
+        identity! {
+        identity: self, invoke_once(user_id), native: |native, id, _, policies| async move {
+                    let provider = policies.token_provider()?;
+                    let Some(user) = native
+                        .user_manager()
+                        .find_by_id(&id)
+                        .await
+                        .map_err(IdentityError::Native)?
+                    else {
+                        return Ok(None);
+                    };
+                    native
+                        .user_manager()
+                        .generate_password_reset_token(&user, provider)
+                        .await
+                        .map(Some)
+                        .map_err(IdentityError::Native)
+                },
+        }
     }
     /// Verify the selected native reset purpose before changing persisted credentials.
     pub fn recover_password<E, R>(&self, input: PasswordRecovery) -> Effect<AccountView, E, R>
@@ -518,21 +531,23 @@ where
         P: TokenSelection,
         P::Provider: UserTokenProvider<IdentityUser>,
     {
-        self.invoke_once(input, |native, input, _, policies| async move {
-            let provider = policies.token_provider()?;
-            let user = native
-                .user_manager()
-                .find_by_id(&input.user_id)
-                .await
-                .map_err(IdentityError::Native)?
-                .ok_or(IdentityError::Unauthorized)?;
-            let user = native
-                .user_manager()
-                .reset_password(user, provider, &input.token, &input.new_password)
-                .await
-                .map_err(IdentityError::Native)?;
-            Ok(AccountView::from_user(&user))
-        })
+        identity! {
+        identity: self, invoke_once(input), native: |native, input, _, policies| async move {
+                    let provider = policies.token_provider()?;
+                    let user = native
+                        .user_manager()
+                        .find_by_id(&input.user_id)
+                        .await
+                        .map_err(IdentityError::Native)?
+                        .ok_or(IdentityError::Unauthorized)?;
+                    let user = native
+                        .user_manager()
+                        .reset_password(user, provider, &input.token, &input.new_password)
+                        .await
+                        .map_err(IdentityError::Native)?;
+                    Ok(AccountView::from_user(&user))
+                },
+        }
     }
     /// Complete MFA with current owner/version-bound primary evidence and the
     /// authenticator provider retained in the selected native composition.
@@ -546,23 +561,25 @@ where
         M: Fn(IdentityError) -> E,
         C::Native: TwoFactorAuthenticatorSignInManager,
     {
-        self.invoke_once(input, |native, input, authority, _| async move {
-            authority.validate_pending(&input.pending).await?;
-            if input.pending.external.is_some() {
-                return Err(IdentityError::Configuration(
-                    "external factor completion requires its token acknowledgment workflow",
-                ));
-            }
-            let session = native
-                .two_factor_authenticator_sign_in_session(
-                    input.pending.native()?,
-                    &input.code,
-                    input.persistent,
-                )
-                .await
-                .map_err(IdentityError::Native)?;
-            complete_login(&authority, session).await
-        })
+        identity! {
+        identity: self, invoke_once(input), native: |native, input, authority, _| async move {
+                    authority.validate_pending(&input.pending).await?;
+                    if input.pending.external.is_some() {
+                        return Err(IdentityError::Configuration(
+                            "external factor completion requires its token acknowledgment workflow",
+                        ));
+                    }
+                    let session = native
+                        .two_factor_authenticator_sign_in_session(
+                            input.pending.native()?,
+                            &input.code,
+                            input.persistent,
+                        )
+                        .await
+                        .map_err(IdentityError::Native)?;
+                    complete_login(&authority, session).await
+                },
+        }
     }
     /// Redeem one native recovery hash before completing authentication. No cloned
     /// pending receipt can establish database one-use semantics.
@@ -576,23 +593,25 @@ where
         M: Fn(IdentityError) -> E,
         C::Native: TwoFactorRecoveryCodeSignInManager,
     {
-        self.invoke_once(input, |native, input, authority, _| async move {
-            authority.validate_pending(&input.pending).await?;
-            if input.pending.external.is_some() {
-                return Err(IdentityError::Configuration(
-                    "external factor completion requires its token acknowledgment workflow",
-                ));
-            }
-            let session = native
-                .two_factor_recovery_code_sign_in_session(
-                    input.pending.native()?,
-                    input.code.as_str(),
-                    input.persistent,
-                )
-                .await
-                .map_err(IdentityError::Native)?;
-            complete_login(&authority, session).await
-        })
+        identity! {
+        identity: self, invoke_once(input), native: |native, input, authority, _| async move {
+                    authority.validate_pending(&input.pending).await?;
+                    if input.pending.external.is_some() {
+                        return Err(IdentityError::Configuration(
+                            "external factor completion requires its token acknowledgment workflow",
+                        ));
+                    }
+                    let session = native
+                        .two_factor_recovery_code_sign_in_session(
+                            input.pending.native()?,
+                            input.code.as_str(),
+                            input.persistent,
+                        )
+                        .await
+                        .map_err(IdentityError::Native)?;
+                    complete_login(&authority, session).await
+                },
+        }
     }
     /// Complete an external primary proof with the selected native authenticator;
     /// acknowledge the original verified provider tokens only after actual completion.
@@ -606,31 +625,33 @@ where
         M: Fn(IdentityError) -> E,
         C::Native: TwoFactorAuthenticatorSignInManager + ExternalLoginSignInManager,
     {
-        self.invoke_once(input, |native, mut input, authority, _| async move {
-            authority.validate_pending(&input.pending).await?;
-            let external = input
-                .pending
-                .external
-                .take()
-                .ok_or(IdentityError::Unauthorized)?;
-            authority.validate_external(&external)?;
-            let session = native
-                .two_factor_authenticator_sign_in_session(
-                    input.pending.native()?,
-                    &input.code,
-                    input.persistent,
-                )
-                .await
-                .map_err(IdentityError::Native)?;
-            if session.completed().is_some() {
-                acknowledged(
-                    native
-                        .update_external_authentication_tokens(external.evidence.info())
-                        .await,
-                )?
-            }
-            complete_login(&authority, session).await
-        })
+        identity! {
+        identity: self, invoke_once(input), native: |native, mut input, authority, _| async move {
+                    authority.validate_pending(&input.pending).await?;
+                    let external = input
+                        .pending
+                        .external
+                        .take()
+                        .ok_or(IdentityError::Unauthorized)?;
+                    authority.validate_external(&external)?;
+                    let session = native
+                        .two_factor_authenticator_sign_in_session(
+                            input.pending.native()?,
+                            &input.code,
+                            input.persistent,
+                        )
+                        .await
+                        .map_err(IdentityError::Native)?;
+                    if session.completed().is_some() {
+                        acknowledged(
+                            native
+                                .update_external_authentication_tokens(external.evidence.info())
+                                .await,
+                        )?
+                    }
+                    complete_login(&authority, session).await
+                },
+        }
     }
     /// Consume a native one-use recovery code for external primary evidence and
     /// acknowledge its original provider tokens only on completed authentication.
@@ -644,31 +665,33 @@ where
         M: Fn(IdentityError) -> E,
         C::Native: TwoFactorRecoveryCodeSignInManager + ExternalLoginSignInManager,
     {
-        self.invoke_once(input, |native, mut input, authority, _| async move {
-            authority.validate_pending(&input.pending).await?;
-            let external = input
-                .pending
-                .external
-                .take()
-                .ok_or(IdentityError::Unauthorized)?;
-            authority.validate_external(&external)?;
-            let session = native
-                .two_factor_recovery_code_sign_in_session(
-                    input.pending.native()?,
-                    input.code.as_str(),
-                    input.persistent,
-                )
-                .await
-                .map_err(IdentityError::Native)?;
-            if session.completed().is_some() {
-                acknowledged(
-                    native
-                        .update_external_authentication_tokens(external.evidence.info())
-                        .await,
-                )?
-            }
-            complete_login(&authority, session).await
-        })
+        identity! {
+        identity: self, invoke_once(input), native: |native, mut input, authority, _| async move {
+                    authority.validate_pending(&input.pending).await?;
+                    let external = input
+                        .pending
+                        .external
+                        .take()
+                        .ok_or(IdentityError::Unauthorized)?;
+                    authority.validate_external(&external)?;
+                    let session = native
+                        .two_factor_recovery_code_sign_in_session(
+                            input.pending.native()?,
+                            input.code.as_str(),
+                            input.persistent,
+                        )
+                        .await
+                        .map_err(IdentityError::Native)?;
+                    if session.completed().is_some() {
+                        acknowledged(
+                            native
+                                .update_external_authentication_tokens(external.evidence.info())
+                                .await,
+                        )?
+                    }
+                    complete_login(&authority, session).await
+                },
+        }
     }
     /// Verify the exact named provider from the retained native registry, then
     /// reapply current native admission/factor policy before returning completion.
@@ -684,25 +707,27 @@ where
         P: TokenSelection,
         P::Provider: UserTokenProviderRegistry<IdentityUser>,
     {
-        self.invoke_once(input, |native, input, authority, policies| async move {
-            authority.validate_pending(&input.pending).await?;
-            if input.pending.external.is_some() {
-                return Err(IdentityError::Configuration(
-                    "external factor completion requires its token acknowledgment workflow",
-                ));
-            }
-            let session = native
-                .two_factor_sign_in_session_from_registry(
-                    input.pending.native()?,
-                    policies.token_provider()?,
-                    &input.provider,
-                    &input.code,
-                    input.persistent,
-                )
-                .await
-                .map_err(IdentityError::Native)?;
-            complete_login(&authority, session).await
-        })
+        identity! {
+        identity: self, invoke_once(input), native: |native, input, authority, policies| async move {
+                    authority.validate_pending(&input.pending).await?;
+                    if input.pending.external.is_some() {
+                        return Err(IdentityError::Configuration(
+                            "external factor completion requires its token acknowledgment workflow",
+                        ));
+                    }
+                    let session = native
+                        .two_factor_sign_in_session_from_registry(
+                            input.pending.native()?,
+                            policies.token_provider()?,
+                            &input.provider,
+                            &input.code,
+                            input.persistent,
+                        )
+                        .await
+                        .map_err(IdentityError::Native)?;
+                    complete_login(&authority, session).await
+                },
+        }
     }
     /// Complete externally verified primary evidence with the selected named native
     /// factor, acknowledging original provider tokens after actual completion.
@@ -718,33 +743,35 @@ where
         P: TokenSelection,
         P::Provider: UserTokenProviderRegistry<IdentityUser>,
     {
-        self.invoke_once(input, |native, mut input, authority, policies| async move {
-            authority.validate_pending(&input.pending).await?;
-            let external = input
-                .pending
-                .external
-                .take()
-                .ok_or(IdentityError::Unauthorized)?;
-            authority.validate_external(&external)?;
-            let session = native
-                .two_factor_sign_in_session_from_registry(
-                    input.pending.native()?,
-                    policies.token_provider()?,
-                    &input.provider,
-                    &input.code,
-                    input.persistent,
-                )
-                .await
-                .map_err(IdentityError::Native)?;
-            if session.completed().is_some() {
-                acknowledged(
-                    native
-                        .update_external_authentication_tokens(external.evidence.info())
-                        .await,
-                )?
-            }
-            complete_login(&authority, session).await
-        })
+        identity! {
+        identity: self, invoke_once(input), native: |native, mut input, authority, policies| async move {
+                    authority.validate_pending(&input.pending).await?;
+                    let external = input
+                        .pending
+                        .external
+                        .take()
+                        .ok_or(IdentityError::Unauthorized)?;
+                    authority.validate_external(&external)?;
+                    let session = native
+                        .two_factor_sign_in_session_from_registry(
+                            input.pending.native()?,
+                            policies.token_provider()?,
+                            &input.provider,
+                            &input.code,
+                            input.persistent,
+                        )
+                        .await
+                        .map_err(IdentityError::Native)?;
+                    if session.completed().is_some() {
+                        acknowledged(
+                            native
+                                .update_external_authentication_tokens(external.evidence.info())
+                                .await,
+                        )?
+                    }
+                    complete_login(&authority, session).await
+                },
+        }
     }
     /// Enumerate currently eligible native registry providers under real primary
     /// evidence; this does not issue session or recent-self authentication.
@@ -761,19 +788,21 @@ where
         P: TokenSelection,
         P::Provider: UserTokenProviderRegistry<IdentityUser>,
     {
-        self.invoke_once(pending, |native, pending, authority, policies| async move {
-            authority.validate_pending(&pending).await?;
-            let providers = native
-                .user_manager()
-                .get_valid_two_factor_providers_from_registry(
-                    pending.native()?.user(),
-                    policies.token_provider()?,
-                )
-                .await
-                .map_err(IdentityError::Native)?;
-            authority.validate_pending(&pending).await?;
-            Ok((pending, providers))
-        })
+        identity! {
+        identity: self, invoke_once(pending), native: |native, pending, authority, policies| async move {
+                    authority.validate_pending(&pending).await?;
+                    let providers = native
+                        .user_manager()
+                        .get_valid_two_factor_providers_from_registry(
+                            pending.native()?.user(),
+                            policies.token_provider()?,
+                        )
+                        .await
+                        .map_err(IdentityError::Native)?;
+                    authority.validate_pending(&pending).await?;
+                    Ok((pending, providers))
+                },
+        }
     }
     /// Generate only an eligible selected native factor token after real primary
     /// verification. Return the owned receipt with the secret for a trusted delivery
@@ -792,23 +821,22 @@ where
         P: TokenSelection,
         P::Provider: UserTokenProviderRegistry<IdentityUser>,
     {
-        self.invoke_once(
-            (pending, provider),
-            |native, (pending, provider), authority, policies| async move {
-                authority.validate_pending(&pending).await?;
-                let token = native
-                    .user_manager()
-                    .generate_two_factor_token_from_registry(
-                        pending.native()?.user(),
-                        policies.token_provider()?,
-                        &provider,
-                    )
-                    .await
-                    .map_err(IdentityError::Native)?;
-                authority.validate_pending(&pending).await?;
-                Ok((pending, token))
-            },
-        )
+        identity! {
+        identity: self, invoke_once((pending, provider)), native: |native, (pending, provider), authority, policies| async move {
+                        authority.validate_pending(&pending).await?;
+                        let token = native
+                            .user_manager()
+                            .generate_two_factor_token_from_registry(
+                                pending.native()?.user(),
+                                policies.token_provider()?,
+                                &provider,
+                            )
+                            .await
+                            .map_err(IdentityError::Native)?;
+                        authority.validate_pending(&pending).await?;
+                        Ok((pending, token))
+                    },
+        }
     }
     /// Generate/install a selected native authenticator key after recent verification.
     /// The secret result is intended for an authorized enrollment renderer only.
@@ -823,39 +851,41 @@ where
         C::Native: SignInService,
         Users<C::Native>: UserAuthenticatorKeyManager,
     {
-        self.invoke_once(grant, |native, grant, authority, _| async move {
-            let user = current_user(
-                native.user_manager(),
-                authority.revalidate_recent(&grant).await?,
-            )
-            .await?;
-            let id = user.id();
-            acknowledged(native.user_manager().reset_authenticator_key(user).await)?;
-            let current = native
-                .user_manager()
-                .find_by_id(&id)
-                .await
-                .map_err(IdentityError::Native)?
-                .ok_or(IdentityError::Unauthorized)?;
-            let key = native
-                .user_manager()
-                .generate_new_authenticator_key()
-                .map_err(IdentityError::Native)?;
-            acknowledged(
-                native
-                    .user_manager()
-                    .set_authenticator_key(&current, key)
-                    .await,
-            )?;
-            native
-                .user_manager()
-                .get_authenticator_key(&current)
-                .await
-                .map_err(IdentityError::Native)?
-                .ok_or(IdentityError::Configuration(
-                    "native reset did not install an authenticator key",
-                ))
-        })
+        identity! {
+        identity: self, invoke_once(grant), native: |native, grant, authority, _| async move {
+                    let user = current_user(
+                        native.user_manager(),
+                        authority.revalidate_recent(&grant).await?,
+                    )
+                    .await?;
+                    let id = user.id();
+                    acknowledged(native.user_manager().reset_authenticator_key(user).await)?;
+                    let current = native
+                        .user_manager()
+                        .find_by_id(&id)
+                        .await
+                        .map_err(IdentityError::Native)?
+                        .ok_or(IdentityError::Unauthorized)?;
+                    let key = native
+                        .user_manager()
+                        .generate_new_authenticator_key()
+                        .map_err(IdentityError::Native)?;
+                    acknowledged(
+                        native
+                            .user_manager()
+                            .set_authenticator_key(&current, key)
+                            .await,
+                    )?;
+                    native
+                        .user_manager()
+                        .get_authenticator_key(&current)
+                        .await
+                        .map_err(IdentityError::Native)?
+                        .ok_or(IdentityError::Configuration(
+                            "native reset did not install an authenticator key",
+                        ))
+                },
+        }
     }
     /// Disable MFA after recent self proof. Enabling requires a verified factor
     /// completion workflow rather than trusting an HTTP boolean.
@@ -867,19 +897,21 @@ where
         C::Native: SignInService,
         Users<C::Native>: UserTwoFactorManager,
     {
-        self.invoke_once(grant, |native, grant, authority, _| async move {
-            let user = current_user(
-                native.user_manager(),
-                authority.revalidate_recent(&grant).await?,
-            )
-            .await?;
-            acknowledged(
-                native
-                    .user_manager()
-                    .set_two_factor_enabled(&user, false)
-                    .await,
-            )
-        })
+        identity! {
+        identity: self, invoke_once(grant), native: |native, grant, authority, _| async move {
+                    let user = current_user(
+                        native.user_manager(),
+                        authority.revalidate_recent(&grant).await?,
+                    )
+                    .await?;
+                    acknowledged(
+                        native
+                            .user_manager()
+                            .set_two_factor_enabled(&user, false)
+                            .await,
+                    )
+                },
+        }
     }
     /// Verify possession of the current persisted key through the selected native
     /// factor provider before enabling MFA. A caller boolean cannot enable it.
@@ -898,42 +930,41 @@ where
         P::Provider:
             for<'a> UserTokenProvider<identity_rs::identity::tokens::AuthenticatorTokenContext<'a>>,
     {
-        self.invoke_once(
-            (grant, code),
-            |native, (grant, code), authority, policies| async move {
-                let user = current_user(
-                    native.user_manager(),
-                    authority.revalidate_recent(&grant).await?,
-                )
-                .await?;
-                let key = native
-                    .user_manager()
-                    .get_authenticator_key(&user)
-                    .await
-                    .map_err(IdentityError::Native)?
-                    .ok_or(IdentityError::Unauthorized)?;
-                let context =
-                    identity_rs::identity::tokens::AuthenticatorTokenContext::new(&user, &key);
-                if !policies
-                    .authenticator_provider()?
-                    .validate(
-                        identity_rs::identity::tokens::Purpose::TWO_FACTOR,
-                        &code,
-                        &context,
-                    )
-                    .await
-                    .map_err(IdentityError::Token)?
-                {
-                    return Err(IdentityError::Unauthorized);
-                }
-                acknowledged(
-                    native
-                        .user_manager()
-                        .set_two_factor_enabled(&user, true)
-                        .await,
-                )
-            },
-        )
+        identity! {
+        identity: self, invoke_once((grant, code)), native: |native, (grant, code), authority, policies| async move {
+                        let user = current_user(
+                            native.user_manager(),
+                            authority.revalidate_recent(&grant).await?,
+                        )
+                        .await?;
+                        let key = native
+                            .user_manager()
+                            .get_authenticator_key(&user)
+                            .await
+                            .map_err(IdentityError::Native)?
+                            .ok_or(IdentityError::Unauthorized)?;
+                        let context =
+                            identity_rs::identity::tokens::AuthenticatorTokenContext::new(&user, &key);
+                        if !policies
+                            .authenticator_provider()?
+                            .validate(
+                                identity_rs::identity::tokens::Purpose::TWO_FACTOR,
+                                &code,
+                                &context,
+                            )
+                            .await
+                            .map_err(IdentityError::Token)?
+                        {
+                            return Err(IdentityError::Unauthorized);
+                        }
+                        acknowledged(
+                            native
+                                .user_manager()
+                                .set_two_factor_enabled(&user, true)
+                                .await,
+                        )
+                    },
+        }
     }
     /// Replace recovery hashes through the native bounded generator/store and return
     /// plaintext only after its acknowledgment to an authorized enrollment renderer.
@@ -949,21 +980,20 @@ where
         C::Native: SignInService,
         Users<C::Native>: UserTwoFactorRecoveryCodeManager,
     {
-        self.invoke_once(
-            (grant, count),
-            |native, (grant, count), authority, _| async move {
-                let user = current_user(
-                    native.user_manager(),
-                    authority.revalidate_recent(&grant).await?,
-                )
-                .await?;
-                native
-                    .user_manager()
-                    .generate_new_two_factor_recovery_codes(&user, count.get())
-                    .await
-                    .map_err(IdentityError::Native)
-            },
-        )
+        identity! {
+        identity: self, invoke_once((grant, count)), native: |native, (grant, count), authority, _| async move {
+                        let user = current_user(
+                            native.user_manager(),
+                            authority.revalidate_recent(&grant).await?,
+                        )
+                        .await?;
+                        native
+                            .user_manager()
+                            .generate_new_two_factor_recovery_codes(&user, count.get())
+                            .await
+                            .map_err(IdentityError::Native)
+                    },
+        }
     }
     /// Select trusted RP/origin/UV settings, then store a native expiring registration
     /// challenge bound to recent self proof. The original options are Arc-retained.
@@ -981,32 +1011,31 @@ where
         P: PasskeySelection,
         P::Policy: PasskeyPolicy,
     {
-        self.invoke_once(
-            (grant, origin),
-            |native, (grant, origin), authority, policies| async move {
-                let user = current_user(
-                    native.user_manager(),
-                    authority.revalidate_recent(&grant).await?,
-                )
-                .await?;
-                let request = policies
-                    .passkey_policy()?
-                    .resolve(origin.as_deref())
-                    .map_err(|_| IdentityError::Policy(http::StatusCode::FORBIDDEN))?;
-                request
-                    .validate()
-                    .map_err(|_| IdentityError::Configuration("selected passkey settings"))?;
-                let options = Arc::new(
-                    native
-                        .user_manager()
-                        .generate_passkey_registration_options(&user, &request)
-                        .await
-                        .map_err(IdentityError::Native)?,
-                );
-                let grant = authority.enrollment(grant, options.clone());
-                Ok((grant, options))
-            },
-        )
+        identity! {
+        identity: self, invoke_once((grant, origin)), native: |native, (grant, origin), authority, policies| async move {
+                        let user = current_user(
+                            native.user_manager(),
+                            authority.revalidate_recent(&grant).await?,
+                        )
+                        .await?;
+                        let request = policies
+                            .passkey_policy()?
+                            .resolve(origin.as_deref())
+                            .map_err(|_| IdentityError::Policy(http::StatusCode::FORBIDDEN))?;
+                        request
+                            .validate()
+                            .map_err(|_| IdentityError::Configuration("selected passkey settings"))?;
+                        let options = Arc::new(
+                            native
+                                .user_manager()
+                                .generate_passkey_registration_options(&user, &request)
+                                .await
+                                .map_err(IdentityError::Native)?,
+                        );
+                        let grant = authority.enrollment(grant, options.clone());
+                        Ok((grant, options))
+                    },
+        }
     }
     /// Revalidate recent owner/ceremony binding, then let native policy validation
     /// consume the one-use challenge and verify attestation before persistence.
@@ -1020,29 +1049,31 @@ where
         P: PasskeySelection,
         P::Policy: PasskeyPolicy,
     {
-        self.invoke_once(input, |native, input, authority, policies| async move {
-            let user = current_user(
-                native.user_manager(),
-                authority.validate_enrollment(&input.grant).await?,
-            )
-            .await?;
-            let client = CollectedClientData::parse(input.response.client_data_json())
-                .map_err(|_| IdentityError::Unauthorized)?;
-            if client.challenge() != input.grant.options.challenge().as_bytes() {
-                return Err(IdentityError::Unauthorized);
-            }
-            acknowledged(
-                native
-                    .user_manager()
-                    .add_passkey_from_registration_challenge(
-                        &user,
-                        &input.response,
-                        policies.passkey_policy()?,
-                        input.name,
+        identity! {
+        identity: self, invoke_once(input), native: |native, input, authority, policies| async move {
+                    let user = current_user(
+                        native.user_manager(),
+                        authority.validate_enrollment(&input.grant).await?,
                     )
-                    .await,
-            )
-        })
+                    .await?;
+                    let client = CollectedClientData::parse(input.response.client_data_json())
+                        .map_err(|_| IdentityError::Unauthorized)?;
+                    if client.challenge() != input.grant.options.challenge().as_bytes() {
+                        return Err(IdentityError::Unauthorized);
+                    }
+                    acknowledged(
+                        native
+                            .user_manager()
+                            .add_passkey_from_registration_challenge(
+                                &user,
+                                &input.response,
+                                policies.passkey_policy()?,
+                                input.name,
+                            )
+                            .await,
+                    )
+                },
+        }
     }
     /// Begin a native discoverable assertion ceremony using retained trusted policy.
     pub fn passkey_login_options<E, R>(
@@ -1058,20 +1089,22 @@ where
         P: PasskeySelection,
         P::Policy: PasskeyPolicy,
     {
-        self.invoke_once(origin, |native, origin, _, policies| async move {
-            let request = policies
-                .passkey_policy()?
-                .resolve(origin.as_deref())
-                .map_err(|_| IdentityError::Policy(http::StatusCode::FORBIDDEN))?;
-            request
-                .validate()
-                .map_err(|_| IdentityError::Configuration("selected passkey settings"))?;
-            native
-                .user_manager()
-                .generate_passkey_assertion_options(None, &request)
-                .await
-                .map_err(IdentityError::Native)
-        })
+        identity! {
+        identity: self, invoke_once(origin), native: |native, origin, _, policies| async move {
+                    let request = policies
+                        .passkey_policy()?
+                        .resolve(origin.as_deref())
+                        .map_err(|_| IdentityError::Policy(http::StatusCode::FORBIDDEN))?;
+                    request
+                        .validate()
+                        .map_err(|_| IdentityError::Configuration("selected passkey settings"))?;
+                    native
+                        .user_manager()
+                        .generate_passkey_assertion_options(None, &request)
+                        .await
+                        .map_err(IdentityError::Native)
+                },
+        }
     }
     /// Complete native one-use assertion/counter handling and admission before grants.
     pub fn passkey_login<E, R>(
@@ -1086,16 +1119,15 @@ where
         P: PasskeySelection,
         P::Policy: PasskeyPolicy,
     {
-        self.invoke_once(
-            response,
-            |native, response, authority, policies| async move {
-                let session = native
-                    .passkey_sign_in(&response, policies.passkey_policy()?)
-                    .await
-                    .map_err(IdentityError::Native)?;
-                complete_login(&authority, session).await
-            },
-        )
+        identity! {
+        identity: self, invoke_once(response), native: |native, response, authority, policies| async move {
+                        let session = native
+                            .passkey_sign_in(&response, policies.passkey_policy()?)
+                            .await
+                            .map_err(IdentityError::Native)?;
+                        complete_login(&authority, session).await
+                    },
+        }
     }
     /// Remove an owned credential only after recent verification; native atomic
     /// ownership/security invalidation governs the acknowledged result.
@@ -1111,17 +1143,16 @@ where
         C::Native: SignInService,
         Users<C::Native>: UserPasskeyManager,
     {
-        self.invoke_once(
-            (grant, id),
-            |native, (grant, id), authority, _| async move {
-                let user = current_user(
-                    native.user_manager(),
-                    authority.revalidate_recent(&grant).await?,
-                )
-                .await?;
-                acknowledged(native.user_manager().remove_passkey(&user, &id).await)
-            },
-        )
+        identity! {
+        identity: self, invoke_once((grant, id)), native: |native, (grant, id), authority, _| async move {
+                        let user = current_user(
+                            native.user_manager(),
+                            authority.revalidate_recent(&grant).await?,
+                        )
+                        .await?;
+                        acknowledged(native.user_manager().remove_passkey(&user, &id).await)
+                    },
+        }
     }
     /// Verify application-owned external protocol evidence using the retained D18
     /// verifier. Unknown/invalid evidence yields no private external receipt.
@@ -1137,11 +1168,13 @@ where
         P: ExternalSelection,
         P::Verifier: identity_rs::identity::external::ExternalIdentityVerifier<I>,
     {
-        self.invoke_once(evidence, |_, evidence, authority, policies| async move {
-            authority
-                .external(&evidence, policies.external_verifier()?)
-                .await
-        })
+        identity! {
+        identity: self, invoke_once(evidence), native: |_, evidence, authority, policies| async move {
+                    authority
+                        .external(&evidence, policies.external_verifier()?)
+                        .await
+                },
+        }
     }
     /// Apply current native external admission/MFA policy to trusted evidence.
     /// External token persistence happens only on an actual completed outcome.
@@ -1156,28 +1189,27 @@ where
         M: Fn(IdentityError) -> E,
         C::Native: ExternalLoginSignInManager,
     {
-        self.invoke_once(
-            (grant, persistent),
-            |native, (grant, persistent), authority, _| async move {
-                authority.validate_external(&grant)?;
-                let session = native
-                    .external_login_sign_in_session(&grant.evidence, persistent)
-                    .await
-                    .map_err(IdentityError::Native)?;
-                if session.completed().is_some() {
-                    acknowledged(
-                        native
-                            .update_external_authentication_tokens(grant.evidence.info())
-                            .await,
-                    )?
-                }
-                let mut outcome = complete_login(&authority, session).await?;
-                if let LoginOutcome::Pending(pending) = &mut outcome {
-                    pending.external = Some(grant)
-                }
-                Ok(outcome)
-            },
-        )
+        identity! {
+        identity: self, invoke_once((grant, persistent)), native: |native, (grant, persistent), authority, _| async move {
+                        authority.validate_external(&grant)?;
+                        let session = native
+                            .external_login_sign_in_session(&grant.evidence, persistent)
+                            .await
+                            .map_err(IdentityError::Native)?;
+                        if session.completed().is_some() {
+                            acknowledged(
+                                native
+                                    .update_external_authentication_tokens(grant.evidence.info())
+                                    .await,
+                            )?
+                        }
+                        let mut outcome = complete_login(&authority, session).await?;
+                        if let LoginOutcome::Pending(pending) = &mut outcome {
+                            pending.external = Some(grant)
+                        }
+                        Ok(outcome)
+                    },
+        }
     }
     /// Link a provider association only after recent self and trusted external
     /// verification; the native store enforces unique provider/key ownership.
@@ -1193,23 +1225,22 @@ where
         C::Native: SignInService,
         Users<C::Native>: UserLoginManager,
     {
-        self.invoke_once(
-            (recent, external),
-            |native, (recent, external), authority, _| async move {
-                let user = current_user(
-                    native.user_manager(),
-                    authority.revalidate_recent(&recent).await?,
-                )
-                .await?;
-                authority.validate_external(&external)?;
-                acknowledged(
-                    native
-                        .user_manager()
-                        .add_login(&user, external.evidence.info().user_login_info())
-                        .await,
-                )
-            },
-        )
+        identity! {
+        identity: self, invoke_once((recent, external)), native: |native, (recent, external), authority, _| async move {
+                        let user = current_user(
+                            native.user_manager(),
+                            authority.revalidate_recent(&recent).await?,
+                        )
+                        .await?;
+                        authority.validate_external(&external)?;
+                        acknowledged(
+                            native
+                                .user_manager()
+                                .add_login(&user, external.evidence.info().user_login_info())
+                                .await,
+                        )
+                    },
+        }
     }
     /// Remove an owned association with recent proof and native security invalidation.
     pub fn unlink_external<E, R>(
@@ -1225,22 +1256,21 @@ where
         C::Native: SignInService,
         Users<C::Native>: UserLoginManager,
     {
-        self.invoke_once(
-            (grant, provider, key),
-            |native, (grant, provider, key), authority, _| async move {
-                let user = current_user(
-                    native.user_manager(),
-                    authority.revalidate_recent(&grant).await?,
-                )
-                .await?;
-                acknowledged(
-                    native
-                        .user_manager()
-                        .remove_login(&user, &provider, &key)
-                        .await,
-                )
-            },
-        )
+        identity! {
+        identity: self, invoke_once((grant, provider, key)), native: |native, (grant, provider, key), authority, _| async move {
+                        let user = current_user(
+                            native.user_manager(),
+                            authority.revalidate_recent(&grant).await?,
+                        )
+                        .await?;
+                        acknowledged(
+                            native
+                                .user_manager()
+                                .remove_login(&user, &provider, &key)
+                                .await,
+                        )
+                    },
+        }
     }
     /// Generate native email-confirmation evidence for current authorized self state.
     pub fn email_confirmation_token<E, R>(&self, grant: SelfGrant) -> Effect<String, E, R>
@@ -1253,15 +1283,17 @@ where
         P: EmailSelection,
         P::Provider: UserTokenProvider<IdentityUser>,
     {
-        self.invoke_once(grant, |native, grant, authority, policies| async move {
-            let user =
-                current_user(native.user_manager(), authority.revalidate(&grant).await?).await?;
-            native
-                .user_manager()
-                .generate_email_confirmation_token(&user, policies.email_provider()?)
-                .await
-                .map_err(IdentityError::Native)
-        })
+        identity! {
+        identity: self, invoke_once(grant), native: |native, grant, authority, policies| async move {
+                    let user =
+                        current_user(native.user_manager(), authority.revalidate(&grant).await?).await?;
+                    native
+                        .user_manager()
+                        .generate_email_confirmation_token(&user, policies.email_provider()?)
+                        .await
+                        .map_err(IdentityError::Native)
+                },
+        }
     }
     /// Confirm the native purpose-bound token; lookup identity alone grants nothing.
     pub fn confirm_email<E, R>(&self, id: UserId, token: String) -> Effect<(), E, R>
@@ -1274,20 +1306,22 @@ where
         P: EmailSelection,
         P::Provider: UserTokenProvider<IdentityUser>,
     {
-        self.invoke_once((id, token), |native, (id, token), _, policies| async move {
-            let user = native
-                .user_manager()
-                .find_by_id(&id)
-                .await
-                .map_err(IdentityError::Native)?
-                .ok_or(IdentityError::Unauthorized)?;
-            native
-                .user_manager()
-                .confirm_email(user, policies.email_provider()?, &token)
-                .await
-                .map(|_| ())
-                .map_err(IdentityError::Native)
-        })
+        identity! {
+        identity: self, invoke_once((id, token)), native: |native, (id, token), _, policies| async move {
+                    let user = native
+                        .user_manager()
+                        .find_by_id(&id)
+                        .await
+                        .map_err(IdentityError::Native)?
+                        .ok_or(IdentityError::Unauthorized)?;
+                    native
+                        .user_manager()
+                        .confirm_email(user, policies.email_provider()?, &token)
+                        .await
+                        .map(|_| ())
+                        .map_err(IdentityError::Native)
+                },
+        }
     }
     /// Change an unconfirmed contact through native normalization/uniqueness after
     /// recent verification; callers cannot claim confirmation by supplying a flag.
@@ -1303,22 +1337,21 @@ where
         C::Native: SignInService,
         Users<C::Native>: UserEmailManager,
     {
-        self.invoke_once(
-            (grant, email),
-            |native, (grant, email), authority, _| async move {
-                let user = current_user(
-                    native.user_manager(),
-                    authority.revalidate_recent(&grant).await?,
-                )
-                .await?;
-                let user = native
-                    .user_manager()
-                    .set_email(user, email.as_ref().map(EmailAddress::as_str))
-                    .await
-                    .map_err(IdentityError::Native)?;
-                Ok(AccountView::from_user(&user))
-            },
-        )
+        identity! {
+        identity: self, invoke_once((grant, email)), native: |native, (grant, email), authority, _| async move {
+                        let user = current_user(
+                            native.user_manager(),
+                            authority.revalidate_recent(&grant).await?,
+                        )
+                        .await?;
+                        let user = native
+                            .user_manager()
+                            .set_email(user, email.as_ref().map(EmailAddress::as_str))
+                            .await
+                            .map_err(IdentityError::Native)?;
+                        Ok(AccountView::from_user(&user))
+                    },
+        }
     }
     /// Change an unconfirmed phone contact using the selected native manager.
     pub fn set_phone_number<E, R>(
@@ -1333,22 +1366,21 @@ where
         C::Native: SignInService,
         Users<C::Native>: UserPhoneNumberManager,
     {
-        self.invoke_once(
-            (grant, phone),
-            |native, (grant, phone), authority, _| async move {
-                let user = current_user(
-                    native.user_manager(),
-                    authority.revalidate_recent(&grant).await?,
-                )
-                .await?;
-                let user = native
-                    .user_manager()
-                    .set_phone_number(user, phone.as_ref().map(PhoneNumber::as_str))
-                    .await
-                    .map_err(IdentityError::Native)?;
-                Ok(AccountView::from_user(&user))
-            },
-        )
+        identity! {
+        identity: self, invoke_once((grant, phone)), native: |native, (grant, phone), authority, _| async move {
+                        let user = current_user(
+                            native.user_manager(),
+                            authority.revalidate_recent(&grant).await?,
+                        )
+                        .await?;
+                        let user = native
+                            .user_manager()
+                            .set_phone_number(user, phone.as_ref().map(PhoneNumber::as_str))
+                            .await
+                            .map_err(IdentityError::Native)?;
+                        Ok(AccountView::from_user(&user))
+                    },
+        }
     }
     /// Read one finite native page, then revalidate scope and per-account application
     /// policy for each emitted view. No database transaction spans client rendering.
@@ -1796,29 +1828,31 @@ where
         P::Service: CookieSessionService + SessionIssuance,
         P::Principal: PrincipalComponents<Users<C::Native>>,
     {
-        self.invoke_once(outcome, |native, outcome, authority, policies| async move {
-            let LoginOutcome::Completed { session, actor, .. } = outcome else {
-                return Err(IdentityError::Unauthorized);
-            };
-            let user =
-                current_user(native.user_manager(), authority.revalidate(&actor).await?).await?;
-            let service = policies.ticket_service()?;
-            let original = session.ticket().ok_or(IdentityError::Unauthorized)?;
-            let ticket = session_ticket(
-                native.user_manager(),
-                &user,
-                original,
-                policies.principal_policy()?,
-                service,
-                authority.clock(),
-            )
-            .await?;
-            authority.revalidate(&actor).await?;
-            service
-                .sign_in_cookie(&ticket)
-                .await
-                .map_err(IdentityError::Ticket)
-        })
+        identity! {
+        identity: self, invoke_once(outcome), native: |native, outcome, authority, policies| async move {
+                    let LoginOutcome::Completed { session, actor, .. } = outcome else {
+                        return Err(IdentityError::Unauthorized);
+                    };
+                    let user =
+                        current_user(native.user_manager(), authority.revalidate(&actor).await?).await?;
+                    let service = policies.ticket_service()?;
+                    let original = session.ticket().ok_or(IdentityError::Unauthorized)?;
+                    let ticket = session_ticket(
+                        native.user_manager(),
+                        &user,
+                        original,
+                        policies.principal_policy()?,
+                        service,
+                        authority.clock(),
+                    )
+                    .await?;
+                    authority.revalidate(&actor).await?;
+                    service
+                        .sign_in_cookie(&ticket)
+                        .await
+                        .map_err(IdentityError::Ticket)
+                },
+        }
     }
     /// Authenticate native-cookie mode using native format, explicit expiry,
     /// unconditional native current-stamp validation and selected claim mapping.
@@ -1838,54 +1872,56 @@ where
         P::Service: CookieSessionService,
         P::Principal: PrincipalComponents<Users<C::Native>>,
     {
-        self.invoke_once(headers, |native, headers, authority, policies| async move {
-            use identity_rs::identity::principal::security_stamp::SecurityStampUserAccessor;
-            use identity_rs::identity::ticket::CookieSessionResult;
-            let principal = policies.principal_policy()?;
-            let validator = CurrentTicketValidator {
-                users: native.user_manager(),
-                policy: principal,
-                clock: authority.clock(),
-            };
-            match policies
-                .ticket_service()?
-                .authenticate_with_validator(&headers, &validator)
-                .await
-                .map_err(IdentityError::Ticket)?
-            {
-                CookieSessionResult::Missing => Ok(CookieAuthentication::Missing),
-                CookieSessionResult::Rejected { removal } => {
-                    Ok(CookieAuthentication::Rejected { removal })
-                }
-                CookieSessionResult::Authenticated { ticket, renewal } => {
-                    let user = native
-                        .user_manager()
-                        .find_user_by_principal(ticket.principal(), principal.claims_options())
+        identity! {
+        identity: self, invoke_once(headers), native: |native, headers, authority, policies| async move {
+                    use identity_rs::identity::principal::security_stamp::SecurityStampUserAccessor;
+                    use identity_rs::identity::ticket::CookieSessionResult;
+                    let principal = policies.principal_policy()?;
+                    let validator = CurrentTicketValidator {
+                        users: native.user_manager(),
+                        policy: principal,
+                        clock: authority.clock(),
+                    };
+                    match policies
+                        .ticket_service()?
+                        .authenticate_with_validator(&headers, &validator)
                         .await
-                        .map_err(IdentityError::Native)?
-                        .ok_or(IdentityError::Unauthorized)?;
-                    if !native
-                        .user_manager()
-                        .validate_security_stamp(
-                            &user,
-                            ticket.principal().find_first_value(
-                                &principal.claims_options().security_stamp_claim_type,
-                            ),
-                        )
-                        .await
-                        .map_err(IdentityError::Native)?
+                        .map_err(IdentityError::Ticket)?
                     {
-                        return Err(IdentityError::StaleGrant);
+                        CookieSessionResult::Missing => Ok(CookieAuthentication::Missing),
+                        CookieSessionResult::Rejected { removal } => {
+                            Ok(CookieAuthentication::Rejected { removal })
+                        }
+                        CookieSessionResult::Authenticated { ticket, renewal } => {
+                            let user = native
+                                .user_manager()
+                                .find_user_by_principal(ticket.principal(), principal.claims_options())
+                                .await
+                                .map_err(IdentityError::Native)?
+                                .ok_or(IdentityError::Unauthorized)?;
+                            if !native
+                                .user_manager()
+                                .validate_security_stamp(
+                                    &user,
+                                    ticket.principal().find_first_value(
+                                        &principal.claims_options().security_stamp_claim_type,
+                                    ),
+                                )
+                                .await
+                                .map_err(IdentityError::Native)?
+                            {
+                                return Err(IdentityError::StaleGrant);
+                            }
+                            let actor = authority.verify_user_grant(&user).await?;
+                            Ok(CookieAuthentication::Authenticated {
+                                ticket: Arc::new(ticket),
+                                actor,
+                                renewal,
+                            })
+                        }
                     }
-                    let actor = authority.verify_user_grant(&user).await?;
-                    Ok(CookieAuthentication::Authenticated {
-                        ticket: Arc::new(ticket),
-                        actor,
-                        renewal,
-                    })
-                }
-            }
-        })
+                },
+        }
     }
     /// Issue bearer mode only from trusted completion and exact current user state.
     /// Persist the native refresh digest before returning any secret credentials.
@@ -1899,35 +1935,37 @@ where
         P: TokenSelection,
         P::Provider: UserTokenProvider<IdentityUser> + BearerIssuance,
     {
-        self.invoke_once(outcome, |native, outcome, authority, policies| async move {
-            let LoginOutcome::Completed { actor, .. } = outcome else {
-                return Err(IdentityError::Unauthorized);
-            };
-            let user =
-                current_user(native.user_manager(), authority.revalidate(&actor).await?).await?;
-            let provider = policies.token_provider()?;
-            let tokens = identity_rs::identity::tokens::issue_bearer_tokens(provider, &user)
-                .await
-                .map_err(IdentityError::Bearer)?;
-            let hash = identity_rs::identity::tokens::refresh_token_hash(tokens.refresh_token())
-                .map_err(IdentityError::Bearer)?;
-            authority.revalidate(&actor).await?;
-            acknowledged(
-                native
-                    .user_manager()
-                    .set_authentication_token(
-                        &user,
-                        identity_rs::identity::tokens::bearer_login_provider(),
-                        identity_rs::identity::tokens::refresh_token_name(),
-                        Some(hash),
-                    )
-                    .await,
-            )?;
-            Ok(IssuedBearer {
-                tokens,
-                lifetime: provider.access_lifetime_seconds(),
-            })
-        })
+        identity! {
+        identity: self, invoke_once(outcome), native: |native, outcome, authority, policies| async move {
+                    let LoginOutcome::Completed { actor, .. } = outcome else {
+                        return Err(IdentityError::Unauthorized);
+                    };
+                    let user =
+                        current_user(native.user_manager(), authority.revalidate(&actor).await?).await?;
+                    let provider = policies.token_provider()?;
+                    let tokens = identity_rs::identity::tokens::issue_bearer_tokens(provider, &user)
+                        .await
+                        .map_err(IdentityError::Bearer)?;
+                    let hash = identity_rs::identity::tokens::refresh_token_hash(tokens.refresh_token())
+                        .map_err(IdentityError::Bearer)?;
+                    authority.revalidate(&actor).await?;
+                    acknowledged(
+                        native
+                            .user_manager()
+                            .set_authentication_token(
+                                &user,
+                                identity_rs::identity::tokens::bearer_login_provider(),
+                                identity_rs::identity::tokens::refresh_token_name(),
+                                Some(hash),
+                            )
+                            .await,
+                    )?;
+                    Ok(IssuedBearer {
+                        tokens,
+                        lifetime: provider.access_lifetime_seconds(),
+                    })
+                },
+        }
     }
     /// Verify native refresh evidence and atomically rotate exactly its current
     /// stored digest before returning replacements. Refresh never yields recent proof.
@@ -1941,48 +1979,50 @@ where
         P: TokenSelection,
         P::Provider: UserTokenProvider<IdentityUser> + BearerIssuance,
     {
-        self.invoke_once(token, |native, token, authority, policies| async move {
-            let provider = policies.token_provider()?;
-            let (completed, expected) =
-                identity_rs::identity::CompletedAuthentication::verify_refresh(
-                    native.user_manager(),
-                    provider,
-                    &token,
-                )
-                .await
-                .map_err(IdentityError::Native)?
-                .ok_or(IdentityError::Unauthorized)?;
-            let actor = authority.from_completed(&completed).await?;
-            let tokens =
-                identity_rs::identity::tokens::issue_bearer_tokens(provider, completed.user())
-                    .await
-                    .map_err(IdentityError::Bearer)?;
-            let replacement =
-                identity_rs::identity::tokens::refresh_token_hash(tokens.refresh_token())
-                    .map_err(IdentityError::Bearer)?;
-            authority.revalidate(&actor).await?;
-            if !native
-                .user_manager()
-                .replace_authentication_token_if_matches(
-                    completed.user(),
-                    &identity_rs::identity::tokens::bearer_login_provider(),
-                    &identity_rs::identity::tokens::refresh_token_name(),
-                    &expected,
-                    replacement,
-                )
-                .await
-                .map_err(IdentityError::Native)?
-            {
-                return Err(IdentityError::Unauthorized);
-            }
-            Ok((
-                IssuedBearer {
-                    tokens,
-                    lifetime: provider.access_lifetime_seconds(),
+        identity! {
+        identity: self, invoke_once(token), native: |native, token, authority, policies| async move {
+                    let provider = policies.token_provider()?;
+                    let (completed, expected) =
+                        identity_rs::identity::CompletedAuthentication::verify_refresh(
+                            native.user_manager(),
+                            provider,
+                            &token,
+                        )
+                        .await
+                        .map_err(IdentityError::Native)?
+                        .ok_or(IdentityError::Unauthorized)?;
+                    let actor = authority.from_completed(&completed).await?;
+                    let tokens =
+                        identity_rs::identity::tokens::issue_bearer_tokens(provider, completed.user())
+                            .await
+                            .map_err(IdentityError::Bearer)?;
+                    let replacement =
+                        identity_rs::identity::tokens::refresh_token_hash(tokens.refresh_token())
+                            .map_err(IdentityError::Bearer)?;
+                    authority.revalidate(&actor).await?;
+                    if !native
+                        .user_manager()
+                        .replace_authentication_token_if_matches(
+                            completed.user(),
+                            &identity_rs::identity::tokens::bearer_login_provider(),
+                            &identity_rs::identity::tokens::refresh_token_name(),
+                            &expected,
+                            replacement,
+                        )
+                        .await
+                        .map_err(IdentityError::Native)?
+                    {
+                        return Err(IdentityError::Unauthorized);
+                    }
+                    Ok((
+                        IssuedBearer {
+                            tokens,
+                            lifetime: provider.access_lifetime_seconds(),
+                        },
+                        actor,
+                    ))
                 },
-                actor,
-            ))
-        })
+        }
     }
     /// Acknowledge bearer refresh revocation for current self; no browser cookie
     /// or CSRF behavior is invented for bearer-only mode.
@@ -1994,20 +2034,22 @@ where
         C::Native: SignInService,
         Users<C::Native>: UserAuthenticationTokenManager,
     {
-        self.invoke_once(grant, |native, grant, authority, _| async move {
-            let user =
-                current_user(native.user_manager(), authority.revalidate(&grant).await?).await?;
-            acknowledged(
-                native
-                    .user_manager()
-                    .remove_authentication_token(
-                        &user,
-                        &identity_rs::identity::tokens::bearer_login_provider(),
-                        &identity_rs::identity::tokens::refresh_token_name(),
+        identity! {
+        identity: self, invoke_once(grant), native: |native, grant, authority, _| async move {
+                    let user =
+                        current_user(native.user_manager(), authority.revalidate(&grant).await?).await?;
+                    acknowledged(
+                        native
+                            .user_manager()
+                            .remove_authentication_token(
+                                &user,
+                                &identity_rs::identity::tokens::bearer_login_provider(),
+                                &identity_rs::identity::tokens::refresh_token_name(),
+                            )
+                            .await,
                     )
-                    .await,
-            )
-        })
+                },
+        }
     }
     /// Persist selected stored mode only after native completion and selected
     /// principal/UTC session policy. The receipt is acknowledged storage state.
@@ -2028,42 +2070,41 @@ where
         P::Principal: PrincipalComponents<Users<C::Native>>,
     {
         let storage = self.retained_storage();
-        self.invoke_once(
-            (outcome, id),
-            move |native, (outcome, id), authority, policies| {
-                let storage = storage.clone();
-                async move {
-                    let LoginOutcome::Completed { session, actor, .. } = outcome else {
-                        return Err(IdentityError::Unauthorized);
-                    };
-                    let user =
-                        current_user(native.user_manager(), authority.revalidate(&actor).await?)
+        identity! {
+        identity: self, invoke_once((outcome, id)), native: move |native, (outcome, id), authority, policies| {
+                        let storage = storage.clone();
+                        async move {
+                            let LoginOutcome::Completed { session, actor, .. } = outcome else {
+                                return Err(IdentityError::Unauthorized);
+                            };
+                            let user =
+                                current_user(native.user_manager(), authority.revalidate(&actor).await?)
+                                    .await?;
+                            let ticket = session_ticket(
+                                native.user_manager(),
+                                &user,
+                                session.ticket().ok_or(IdentityError::Unauthorized)?,
+                                policies.principal_policy()?,
+                                policies.ticket_service()?,
+                                authority.clock(),
+                            )
                             .await?;
-                    let ticket = session_ticket(
-                        native.user_manager(),
-                        &user,
-                        session.ticket().ok_or(IdentityError::Unauthorized)?,
-                        policies.principal_policy()?,
-                        policies.ticket_service()?,
-                        authority.clock(),
-                    )
-                    .await?;
-                    authority.revalidate(&actor).await?;
-                    storage
-                        .sessions_store()?
-                        .store(
-                            user.id(),
-                            id,
-                            ticket
-                                .properties()
-                                .expires_utc()
-                                .ok_or(IdentityError::Configuration("stored session expiry"))?,
-                            &ticket,
-                        )
-                        .await
-                }
-            },
-        )
+                            authority.revalidate(&actor).await?;
+                            storage
+                                .sessions_store()?
+                                .store(
+                                    user.id(),
+                                    id,
+                                    ticket
+                                        .properties()
+                                        .expires_utc()
+                                        .ok_or(IdentityError::Configuration("stored session expiry"))?,
+                                    &ticket,
+                                )
+                                .await
+                        }
+                    },
+        }
     }
     /// Authenticate actual stored mode by native protected-ticket verification and
     /// current native stamp checks. A stored record alone cannot mint authority.
@@ -2084,52 +2125,51 @@ where
         P::Principal: PrincipalComponents<Users<C::Native>>,
     {
         let storage = self.retained_storage();
-        self.invoke_once(
-            (owner, id),
-            move |native, (owner, id), authority, policies| {
-                let storage = storage.clone();
-                async move {
-                    use identity_rs::identity::principal::security_stamp::SecurityStampUserAccessor;
-                    use identity_rs::identity::ticket::{
-                        AuthenticationTicketValidator, TicketValidationOutcome,
-                    };
-                    let Some(ticket) = storage
-                        .sessions_store()?
-                        .load(owner, id, authority.clock().now())
-                        .await?
-                    else {
-                        return Ok(None);
-                    };
-                    let principal = policies.principal_policy()?;
-                    let validator = CurrentTicketValidator {
-                        users: native.user_manager(),
-                        policy: principal,
-                        clock: authority.clock(),
-                    };
-                    let ticket = match validator
-                        .validate_ticket(ticket)
-                        .await
-                        .map_err(IdentityError::Ticket)?
-                    {
-                        TicketValidationOutcome::Accepted(ticket)
-                        | TicketValidationOutcome::Renewed(ticket) => ticket,
-                        TicketValidationOutcome::Rejected => return Ok(None),
-                    };
-                    let Some(user) = native
-                        .user_manager()
-                        .find_user_by_principal(ticket.principal(), principal.claims_options())
-                        .await
-                        .map_err(IdentityError::Native)?
-                    else {
-                        return Ok(None);
-                    };
-                    if user.id() != owner {
-                        return Err(IdentityError::Unauthorized);
-                    }
-                    authority.verify_user_grant(&user).await.map(Some)
-                }
-            },
-        )
+        identity! {
+        identity: self, invoke_once((owner, id)), native: move |native, (owner, id), authority, policies| {
+                        let storage = storage.clone();
+                        async move {
+                            use identity_rs::identity::principal::security_stamp::SecurityStampUserAccessor;
+                            use identity_rs::identity::ticket::{
+                                AuthenticationTicketValidator, TicketValidationOutcome,
+                            };
+                            let Some(ticket) = storage
+                                .sessions_store()?
+                                .load(owner, id, authority.clock().now())
+                                .await?
+                            else {
+                                return Ok(None);
+                            };
+                            let principal = policies.principal_policy()?;
+                            let validator = CurrentTicketValidator {
+                                users: native.user_manager(),
+                                policy: principal,
+                                clock: authority.clock(),
+                            };
+                            let ticket = match validator
+                                .validate_ticket(ticket)
+                                .await
+                                .map_err(IdentityError::Ticket)?
+                            {
+                                TicketValidationOutcome::Accepted(ticket)
+                                | TicketValidationOutcome::Renewed(ticket) => ticket,
+                                TicketValidationOutcome::Rejected => return Ok(None),
+                            };
+                            let Some(user) = native
+                                .user_manager()
+                                .find_user_by_principal(ticket.principal(), principal.claims_options())
+                                .await
+                                .map_err(IdentityError::Native)?
+                            else {
+                                return Ok(None);
+                            };
+                            if user.id() != owner {
+                                return Err(IdentityError::Unauthorized);
+                            }
+                            authority.verify_user_grant(&user).await.map(Some)
+                        }
+                    },
+        }
     }
     /// Revoke exactly an owned stored revision and await acknowledgment before logout.
     pub fn revoke_session<E, R>(
@@ -2145,19 +2185,18 @@ where
         S: SessionSelection,
     {
         let storage = self.retained_storage();
-        self.invoke_once(
-            (grant, id, expected),
-            move |_, (grant, id, expected), authority, _| {
-                let storage = storage.clone();
-                async move {
-                    let user = authority.revalidate(&grant).await?;
-                    storage
-                        .sessions_store()?
-                        .revoke(user.id(), id, expected)
-                        .await
-                }
-            },
-        )
+        identity! {
+        identity: self, invoke_once((grant, id, expected)), native: move |_, (grant, id, expected), authority, _| {
+                        let storage = storage.clone();
+                        async move {
+                            let user = authority.revalidate(&grant).await?;
+                            storage
+                                .sessions_store()?
+                                .revoke(user.id(), id, expected)
+                                .await
+                        }
+                    },
+        }
     }
     /// Read selected consent/preferences after current self verification, then
     /// recheck authority immediately before emitting the application-owned document.
@@ -2173,18 +2212,20 @@ where
         S: ConsentSelection,
     {
         let storage = self.retained_storage();
-        self.invoke_once((grant, key), move |_, (grant, key), authority, _| {
-            let storage = storage.clone();
-            async move {
-                let user = authority.revalidate(&grant).await?;
-                let value = storage
-                    .consent_store()?
-                    .read(user.id(), key, authority.clock().now())
-                    .await?;
-                authority.revalidate(&grant).await?;
-                Ok(value)
-            }
-        })
+        identity! {
+        identity: self, invoke_once((grant, key)), native: move |_, (grant, key), authority, _| {
+                    let storage = storage.clone();
+                    async move {
+                        let user = authority.revalidate(&grant).await?;
+                        let value = storage
+                            .consent_store()?
+                            .read(user.id(), key, authority.clock().now())
+                            .await?;
+                        authority.revalidate(&grant).await?;
+                        Ok(value)
+                    }
+                },
+        }
     }
     /// Persist one selected consent/preferences representation under exact self
     /// ownership and optional expected revision; no default preference is invented.
@@ -2203,19 +2244,18 @@ where
         S: ConsentSelection,
     {
         let storage = self.retained_storage();
-        self.invoke_once(
-            (grant, key, expected, expires_at, document),
-            move |_, (grant, key, expected, expires_at, document), authority, _| {
-                let storage = storage.clone();
-                async move {
-                    let user = authority.revalidate(&grant).await?;
-                    storage
-                        .consent_store()?
-                        .write(user.id(), key, expected, expires_at, document)
-                        .await
-                }
-            },
-        )
+        identity! {
+        identity: self, invoke_once((grant, key, expected, expires_at, document)), native: move |_, (grant, key, expected, expires_at, document), authority, _| {
+                        let storage = storage.clone();
+                        async move {
+                            let user = authority.revalidate(&grant).await?;
+                            storage
+                                .consent_store()?
+                                .write(user.id(), key, expected, expires_at, document)
+                                .await
+                        }
+                    },
+        }
     }
     /// Obtain this owner's selected complete security aggregate for trusted
     /// application workflows. It has no automatic HTTP serialization/view policy.
@@ -2229,21 +2269,23 @@ where
         M: Fn(IdentityError) -> E,
         S: AccountSelection,
     {
-        self.invoke_capability_once(grant, |storage, _, grant, authority, _| async move {
-            let user = authority.revalidate(&grant).await?;
-            let snapshot = storage.accounts_store()?.load(user.id()).await?;
-            if let Some(value) = &snapshot {
-                let metadata = value.snapshot.metadata();
-                if metadata.id() != user.id()
-                    || metadata.concurrency_stamp() != user.concurrency_stamp()
-                    || metadata.security_stamp() != user.security_stamp()
-                {
-                    return Err(IdentityError::StaleGrant);
-                }
-            }
-            authority.revalidate(&grant).await?;
-            Ok(snapshot)
-        })
+        identity! {
+        identity: self, invoke_capability_once(grant), native: |storage, _, grant, authority, _| async move {
+                    let user = authority.revalidate(&grant).await?;
+                    let snapshot = storage.accounts_store()?.load(user.id()).await?;
+                    if let Some(value) = &snapshot {
+                        let metadata = value.snapshot.metadata();
+                        if metadata.id() != user.id()
+                            || metadata.concurrency_stamp() != user.concurrency_stamp()
+                            || metadata.security_stamp() != user.security_stamp()
+                        {
+                            return Err(IdentityError::StaleGrant);
+                        }
+                    }
+                    authority.revalidate(&grant).await?;
+                    Ok(snapshot)
+                },
+        }
     }
     /// Apply an application-owned native aggregate transform to the current
     /// recent-authorized owner and replace exactly its aggregate revision.
@@ -2309,19 +2351,21 @@ where
         M: Fn(IdentityError) -> E,
         S: AccountSelection,
     {
-        self.invoke_capability_once(grant, |storage, _, grant, authority, _| async move {
-            let user = authority.revalidate_recent(&grant).await?;
-            let value = storage
-                .accounts_store()?
-                .load(user.id())
-                .await?
-                .ok_or(IdentityError::Unauthorized)?;
-            authority.revalidate_recent(&grant).await?;
-            storage
-                .accounts_store()?
-                .delete(user.id(), value.revision)
-                .await
-        })
+        identity! {
+        identity: self, invoke_capability_once(grant), native: |storage, _, grant, authority, _| async move {
+                    let user = authority.revalidate_recent(&grant).await?;
+                    let value = storage
+                        .accounts_store()?
+                        .load(user.id())
+                        .await?
+                        .ok_or(IdentityError::Unauthorized)?;
+                    authority.revalidate_recent(&grant).await?;
+                    storage
+                        .accounts_store()?
+                        .delete(user.id(), value.revision)
+                        .await
+                },
+        }
     }
     /// Acknowledge selected durable delivery acceptance before handing the
     /// original request to its application-owned transport callback. Callback
@@ -2461,21 +2505,78 @@ where
         M: Fn(IdentityError) -> E,
         S: JobSelection,
     {
-        self.invoke_capability_once(
-            (grant, id),
-            |storage, _, (grant, id), authority, _| async move {
-                let user = authority.revalidate(&grant).await?;
-                let repository = storage.job_store()?;
-                if repository.domain() != RequestDomain::Job {
-                    return Err(IdentityError::Configuration("job request domain"));
+        identity! {
+        identity: self, invoke_capability_once((grant, id)), native: |storage, _, (grant, id), authority, _| async move {
+                        let user = authority.revalidate(&grant).await?;
+                        let repository = storage.job_store()?;
+                        if repository.domain() != RequestDomain::Job {
+                            return Err(IdentityError::Configuration("job request domain"));
+                        }
+                        let state = repository
+                            .find(user.id(), id, authority.clock().now())
+                            .await?;
+                        authority.revalidate(&grant).await?;
+                        Ok(state)
+                    },
+        }
+    }
+    /// Apply a selected native authorization policy before a route or route collection.
+    /// Only this definition's privately verified grant supplies identity. Principal claims
+    /// are generated from current native account/role sources, never request extensions.
+    /// Native challenges remain 401 and insufficient roles/claims/permissions remain 403.
+    pub fn authorization_stage<E, R, A>(
+        &self,
+        policy: A,
+    ) -> impl Fn(effect_server::Request) -> Effect<(), E, R> + Send + Sync + 'static
+    where
+        E: Send + 'static,
+        R: Send + Sync + 'static,
+        M: Fn(IdentityError) -> E,
+        C::Native: SignInService,
+        Users<C::Native>: UserLifecycleManager,
+        P: PrincipalSelection,
+        P::Principal: PrincipalComponents<Users<C::Native>>,
+        A: identity_rs::identity::axum::AuthorizationPolicy + 'static,
+    {
+        let definition = self.clone();
+        let policy = Arc::new(policy);
+        move |request| {
+            let policy = policy.clone();
+            definition.invoke_once(request, move |native, request, authority, policies| {
+                let policy = policy.clone();
+                async move {
+                    use identity_rs::identity::axum::AuthorizationDecision;
+                    let actor = request
+                        .with_extensions(|extensions| extensions.get::<SelfGrant>().cloned());
+                    let principal = if let Some(actor) = &actor {
+                        let verified = authority.revalidate(actor).await?;
+                        let user = current_user(native.user_manager(), verified).await?;
+                        Some(
+                            policies
+                                .principal_policy()?
+                                .create(native.user_manager(), &user)
+                                .await
+                                .map_err(IdentityError::Native)?,
+                        )
+                    } else {
+                        None
+                    };
+                    let decision = policy.authorize(principal.as_ref()).await;
+                    if let Some(actor) = &actor {
+                        authority.revalidate(actor).await?;
+                    }
+                    match decision {
+                        AuthorizationDecision::Allowed => Ok(()),
+                        AuthorizationDecision::Challenged => {
+                            Err(IdentityError::Policy(http::StatusCode::UNAUTHORIZED))
+                        }
+                        AuthorizationDecision::Forbidden => {
+                            Err(IdentityError::Policy(http::StatusCode::FORBIDDEN))
+                        }
+                    }
                 }
-                let state = repository
-                    .find(user.id(), id, authority.clock().now())
-                    .await?;
-                authority.revalidate(&grant).await?;
-                Ok(state)
-            },
-        )
+            })
+        }
     }
     /// Trusted cookie authentication stage for Web/Server policy composition.
     /// Current private authority and native renewal/removal stay in the request scope.
@@ -2495,32 +2596,32 @@ where
     {
         let definition = self.clone();
         move |request: effect_server::Request| {
-            definition
-                .authenticate_cookie(request.headers().clone())
-                .map(move |outcome| {
-                    let (authenticated, header) = match outcome {
-                        CookieAuthentication::Missing => (false, None),
-                        CookieAuthentication::Rejected { removal } => (false, Some(removal)),
-                        CookieAuthentication::Authenticated { actor, renewal, .. } => {
-                            request.insert_extension(actor);
-                            (true, renewal)
-                        }
-                    };
-                    if let Some(header) = header {
-                        request.with_extensions(|extensions| {
-                            if let Some(headers) =
-                                extensions.get::<effect_server::ResponseHeaders>()
-                            {
-                                headers
-                                    .0
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .append(http::header::SET_COOKIE, header);
-                            }
-                        });
+            effect_map! {
+            program: definition
+            .authenticate_cookie(request.headers().clone()), map: move |outcome| {
+                let (authenticated, header) = match outcome {
+                    CookieAuthentication::Missing => (false, None),
+                    CookieAuthentication::Rejected { removal } => (false, Some(removal)),
+                    CookieAuthentication::Authenticated { actor, renewal, .. } => {
+                        request.insert_extension(actor);
+                        (true, renewal)
                     }
-                    authenticated
-                })
+                };
+                if let Some(header) = header {
+                    request.with_extensions(|extensions| {
+                        if let Some(headers) =
+                            extensions.get::<effect_server::ResponseHeaders>()
+                        {
+                            headers
+                                .0
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .append(http::header::SET_COOKIE, header);
+                        }
+                    });
+                }
+                authenticated
+            }, }
         }
     }
     /// Authenticate access credentials with the selected D18 provider and the actual
@@ -2540,57 +2641,59 @@ where
     {
         let definition = self.clone();
         move |request: effect_server::Request| {
-            definition.invoke_once(request, |native, request, authority, policies| async move {
-                let values = request.headers().get_all(http::header::AUTHORIZATION);
-                if values.iter().count() > 1 {
-                    return Err(IdentityError::Policy(http::StatusCode::BAD_REQUEST));
-                }
-                let Some(header) = values.iter().next() else {
-                    return Ok(false);
-                };
-                let Ok(text) = header.to_str() else {
-                    return Ok(false);
-                };
-                let Some((scheme, token)) = text.split_once(' ') else {
-                    return Ok(false);
-                };
-                if !scheme.eq_ignore_ascii_case("Bearer") {
-                    return Ok(false);
-                }
-                let parsed = match identity_rs::identity::tokens::parse_bearer_token(token) {
-                    Ok(parsed) => parsed,
-                    Err(identity_rs::identity::tokens::BearerTokenError::InvalidToken) => {
-                        return Ok(false);
-                    }
-                    Err(error) => return Err(IdentityError::Bearer(error)),
-                };
-                let Some(user) = native
-                    .user_manager()
-                    .find_by_id(&parsed.user_id())
-                    .await
-                    .map_err(IdentityError::Native)?
-                else {
-                    return Ok(false);
-                };
-                match identity_rs::identity::tokens::validate_user_access_token(
-                    policies.token_provider()?,
-                    token,
-                    &user,
-                )
-                .await
-                {
-                    Ok(true) => {
-                        let actor = authority.verify_user_grant(&user).await?;
-                        request.insert_extension(actor);
-                        Ok(true)
-                    }
-                    Ok(false)
-                    | Err(identity_rs::identity::tokens::BearerTokenError::InvalidToken) => {
-                        Ok(false)
-                    }
-                    Err(error) => Err(IdentityError::Bearer(error)),
-                }
-            })
+            identity! {
+            identity: definition, invoke_once(request), native: |native, request, authority, policies| async move {
+                            let values = request.headers().get_all(http::header::AUTHORIZATION);
+                            if values.iter().count() > 1 {
+                                return Err(IdentityError::Policy(http::StatusCode::BAD_REQUEST));
+                            }
+                            let Some(header) = values.iter().next() else {
+                                return Ok(false);
+                            };
+                            let Ok(text) = header.to_str() else {
+                                return Ok(false);
+                            };
+                            let Some((scheme, token)) = text.split_once(' ') else {
+                                return Ok(false);
+                            };
+                            if !scheme.eq_ignore_ascii_case("Bearer") {
+                                return Ok(false);
+                            }
+                            let parsed = match identity_rs::identity::tokens::parse_bearer_token(token) {
+                                Ok(parsed) => parsed,
+                                Err(identity_rs::identity::tokens::BearerTokenError::InvalidToken) => {
+                                    return Ok(false);
+                                }
+                                Err(error) => return Err(IdentityError::Bearer(error)),
+                            };
+                            let Some(user) = native
+                                .user_manager()
+                                .find_by_id(&parsed.user_id())
+                                .await
+                                .map_err(IdentityError::Native)?
+                            else {
+                                return Ok(false);
+                            };
+                            match identity_rs::identity::tokens::validate_user_access_token(
+                                policies.token_provider()?,
+                                token,
+                                &user,
+                            )
+                            .await
+                            {
+                                Ok(true) => {
+                                    let actor = authority.verify_user_grant(&user).await?;
+                                    request.insert_extension(actor);
+                                    Ok(true)
+                                }
+                                Ok(false)
+                                | Err(identity_rs::identity::tokens::BearerTokenError::InvalidToken) => {
+                                    Ok(false)
+                                }
+                                Err(error) => Err(IdentityError::Bearer(error)),
+                            }
+                        },
+            }
         }
     }
     /// Seal genuine native primary proof into the selected browser context. Storage
@@ -2610,37 +2713,36 @@ where
         P::Browser: BrowserComponents<S::Backend>,
         P::Provider: UserTokenProvider<IdentityUser>,
     {
-        self.invoke_once(
-            (pending, headers),
-            |_, (pending, headers), authority, policies| async move {
-                authority.validate_pending(&pending).await?;
-                if pending.external.is_some() {
-                    return Err(IdentityError::Configuration(
-                        "external pending metadata requires its native external transport",
-                    ));
-                }
-                let browser = policies
-                    .browser_security()?
-                    .bind_browser(authority.backend().clone(), authority.clock())?;
-                browser
-                    .authorize(&headers)
-                    .await
-                    .map_err(IdentityError::Policy)?;
-                let binding = browser
-                    .pending_binding(&headers)
-                    .await
-                    .map_err(IdentityError::Policy)?;
-                let proof = pending
-                    .native()?
-                    .protect_external_pending(policies.token_provider()?, &binding)
-                    .await
-                    .map_err(IdentityError::Bearer)?;
-                browser
-                    .retain_pending(&headers, proof)
-                    .await
-                    .map_err(IdentityError::Policy)
-            },
-        )
+        identity! {
+        identity: self, invoke_once((pending, headers)), native: |_, (pending, headers), authority, policies| async move {
+                        authority.validate_pending(&pending).await?;
+                        if pending.external.is_some() {
+                            return Err(IdentityError::Configuration(
+                                "external pending metadata requires its native external transport",
+                            ));
+                        }
+                        let browser = policies
+                            .browser_security()?
+                            .bind_browser(authority.backend().clone(), authority.clock())?;
+                        browser
+                            .authorize(&headers)
+                            .await
+                            .map_err(IdentityError::Policy)?;
+                        let binding = browser
+                            .pending_binding(&headers)
+                            .await
+                            .map_err(IdentityError::Policy)?;
+                        let proof = pending
+                            .native()?
+                            .protect_external_pending(policies.token_provider()?, &binding)
+                            .await
+                            .map_err(IdentityError::Bearer)?;
+                        browser
+                            .retain_pending(&headers, proof)
+                            .await
+                            .map_err(IdentityError::Policy)
+                    },
+        }
     }
     /// Atomically consume one native browser-bound primary proof and invoke native
     /// purpose/current-account/admission verification before minting pending authority.
@@ -2658,33 +2760,35 @@ where
         P::Browser: BrowserComponents<S::Backend>,
         P::Provider: UserTokenProvider<IdentityUser>,
     {
-        self.invoke_once(headers, |native, headers, authority, policies| async move {
-            let browser = policies
-                .browser_security()?
-                .bind_browser(authority.backend().clone(), authority.clock())?;
-            browser
-                .authorize(&headers)
-                .await
-                .map_err(IdentityError::Policy)?;
-            let Some((binding, proof)) = browser
-                .take_pending(&headers)
-                .await
-                .map_err(IdentityError::Policy)?
-            else {
-                return Ok(None);
-            };
-            let Some(pending) = native
-                .resume_external_pending(policies.token_provider()?, &proof, &binding)
-                .await
-                .map_err(IdentityError::Native)?
-            else {
-                return Ok(None);
-            };
-            let session = identity_rs::identity::SignInSession::from_verified(
-                identity_rs::identity::AuthenticationOutcome::AdditionalFactorRequired(pending),
-            );
-            Ok(Some(authority.pending(Arc::new(session))?))
-        })
+        identity! {
+        identity: self, invoke_once(headers), native: |native, headers, authority, policies| async move {
+                    let browser = policies
+                        .browser_security()?
+                        .bind_browser(authority.backend().clone(), authority.clock())?;
+                    browser
+                        .authorize(&headers)
+                        .await
+                        .map_err(IdentityError::Policy)?;
+                    let Some((binding, proof)) = browser
+                        .take_pending(&headers)
+                        .await
+                        .map_err(IdentityError::Policy)?
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(pending) = native
+                        .resume_external_pending(policies.token_provider()?, &proof, &binding)
+                        .await
+                        .map_err(IdentityError::Native)?
+                    else {
+                        return Ok(None);
+                    };
+                    let session = identity_rs::identity::SignInSession::from_verified(
+                        identity_rs::identity::AuthenticationOutcome::AdditionalFactorRequired(pending),
+                    );
+                    Ok(Some(authority.pending(Arc::new(session))?))
+                },
+        }
     }
     /// Issue the selected native server-backed browser context and synchronizer
     /// material. Native response/body ownership and narrowed SQL outcomes survive
@@ -2701,17 +2805,19 @@ where
         P::Browser: BrowserComponents<S::Backend>,
         P::Service: CookieSessionService,
     {
-        self.invoke_once(headers, |_, headers, authority, policies| async move {
-            let browser = policies
-                .browser_security()?
-                .bind_browser(authority.backend().clone(), authority.clock())?;
-            if browser.auth_cookie_name() != policies.ticket_service()?.cookie_name() {
-                return Err(IdentityError::Configuration(
-                    "browser authentication cookie mismatch",
-                ));
-            }
-            Ok(browser.issue(&headers).await)
-        })
+        identity! {
+        identity: self, invoke_once(headers), native: |_, headers, authority, policies| async move {
+                    let browser = policies
+                        .browser_security()?
+                        .bind_browser(authority.backend().clone(), authority.clock())?;
+                    if browser.auth_cookie_name() != policies.ticket_service()?.cookie_name() {
+                        return Err(IdentityError::Configuration(
+                            "browser authentication cookie mismatch",
+                        ));
+                    }
+                    Ok(browser.issue(&headers).await)
+                },
+        }
     }
     /// Selected native CSRF factory retains the same original SQL failure carrier
     /// as the whole workflow, including browser context errors narrowed to status.
@@ -2727,25 +2833,27 @@ where
     {
         let definition = self.clone();
         move |request: effect_server::Request| {
-            definition.invoke_once(request, |_, request, authority, policies| async move {
-                if request.method() == http::Method::GET
-                    || request.method() == http::Method::HEAD
-                    || request.method() == http::Method::OPTIONS
-                {
-                    return Ok(true);
-                }
-                let actor = request
-                    .with_extensions(|extensions| extensions.get::<SelfGrant>().cloned())
-                    .ok_or(IdentityError::Unauthorized)?;
-                let browser = policies
-                    .browser_security()?
-                    .bind_browser(authority.backend().clone(), authority.clock())?;
-                let grant = authority
-                    .protect_request(&actor, &request, &browser)
-                    .await?;
-                request.insert_extension(grant);
-                Ok(true)
-            })
+            identity! {
+            identity: definition, invoke_once(request), native: |_, request, authority, policies| async move {
+                            if request.method() == http::Method::GET
+                                || request.method() == http::Method::HEAD
+                                || request.method() == http::Method::OPTIONS
+                            {
+                                return Ok(true);
+                            }
+                            let actor = request
+                                .with_extensions(|extensions| extensions.get::<SelfGrant>().cloned())
+                                .ok_or(IdentityError::Unauthorized)?;
+                            let browser = policies
+                                .browser_security()?
+                                .bind_browser(authority.backend().clone(), authority.clock())?;
+                            let grant = authority
+                                .protect_request(&actor, &request, &browser)
+                                .await?;
+                            request.insert_extension(grant);
+                            Ok(true)
+                        },
+            }
         }
     }
     /// Remove the exact selected cookie and native browser context after current
@@ -2765,42 +2873,41 @@ where
         P::Service: CookieSessionService,
         P::Browser: BrowserComponents<S::Backend>,
     {
-        self.invoke_once(
-            (grant, headers),
-            |native, (grant, headers), authority, policies| async move {
-                let user = current_user(native.user_manager(), authority.revalidate(&grant).await?)
-                    .await?;
-                let browser = policies
-                    .browser_security()?
-                    .bind_browser(authority.backend().clone(), authority.clock())?;
-                if browser.auth_cookie_name() != policies.ticket_service()?.cookie_name() {
-                    return Err(IdentityError::Configuration(
-                        "browser authentication cookie mismatch",
-                    ));
-                }
-                browser
-                    .authorize(&headers)
-                    .await
-                    .map_err(IdentityError::Policy)?;
-                acknowledged(
-                    native
-                        .user_manager()
-                        .remove_authentication_token(
-                            &user,
-                            &identity_rs::identity::tokens::bearer_login_provider(),
-                            &identity_rs::identity::tokens::refresh_token_name(),
-                        )
-                        .await,
-                )?;
-                browser
-                    .invalidate(&headers)
-                    .await
-                    .map_err(IdentityError::Policy)?;
-                policies
-                    .ticket_service()?
-                    .sign_out_cookie()
-                    .map_err(IdentityError::Ticket)
-            },
-        )
+        identity! {
+        identity: self, invoke_once((grant, headers)), native: |native, (grant, headers), authority, policies| async move {
+                        let user = current_user(native.user_manager(), authority.revalidate(&grant).await?)
+                            .await?;
+                        let browser = policies
+                            .browser_security()?
+                            .bind_browser(authority.backend().clone(), authority.clock())?;
+                        if browser.auth_cookie_name() != policies.ticket_service()?.cookie_name() {
+                            return Err(IdentityError::Configuration(
+                                "browser authentication cookie mismatch",
+                            ));
+                        }
+                        browser
+                            .authorize(&headers)
+                            .await
+                            .map_err(IdentityError::Policy)?;
+                        acknowledged(
+                            native
+                                .user_manager()
+                                .remove_authentication_token(
+                                    &user,
+                                    &identity_rs::identity::tokens::bearer_login_provider(),
+                                    &identity_rs::identity::tokens::refresh_token_name(),
+                                )
+                                .await,
+                        )?;
+                        browser
+                            .invalidate(&headers)
+                            .await
+                            .map_err(IdentityError::Policy)?;
+                        policies
+                            .ticket_service()?
+                            .sign_out_cookie()
+                            .map_err(IdentityError::Ticket)
+                    },
+        }
     }
 }

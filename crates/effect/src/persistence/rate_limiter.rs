@@ -2,6 +2,7 @@
 
 use super::UtcMillis;
 use crate::{Effect, KeyDomain, StableKey};
+use crate::{effect, effect_map_error, effect_provide_some, effect_try_sync, service};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -392,12 +393,13 @@ impl<D: KeyDomain> RateLimiter<D> {
         R: HasRateLimitStore + Send + Sync + 'static,
     {
         let policy = self.policy;
-        Effect::service(|env: &R| env.rate_limit_store()).flat_map(move |store| {
-            store
-                .acquire(key.clone().into_bytes(), policy, now, cost)
-                .map_error(RateLimitError::Uncertain)
-                .provide_some(|_: &R| ())
-        })
+        {
+            let __dsl_program = service! { env: |env: &R| env.rate_limit_store(), };
+            effect! { let key = key.clone(); let store = __dsl_program.clone()?; {
+                effect_provide_some! { program: effect_map_error! { program: store
+                    .acquire(key.clone().into_bytes(), policy, now, cost), map: RateLimitError::Uncertain, }, project: |_: &R| (), }
+            }? }
+        }
     }
 
     /// Apply observed operation feedback to an adaptive rate-limit decision.
@@ -426,14 +428,15 @@ impl<D: KeyDomain> RateLimiter<D> {
         R: HasRateLimitStore + Send + Sync + 'static,
     {
         let RateLimitPolicy::AdaptiveWindow(policy) = self.policy else {
-            return Effect::fail_with(|| RateLimitError::UnsupportedFeedback);
+            return effect_try_sync! { body: { let __dsl_error = || RateLimitError::UnsupportedFeedback; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
         };
-        Effect::service(|env: &R| env.rate_limit_store()).flat_map(move |store| {
-            store
-                .feedback(key.clone().into_bytes(), policy, feedback)
-                .map_error(RateLimitError::Uncertain)
-                .provide_some(|_: &R| ())
-        })
+        {
+            let __dsl_program = service! { env: |env: &R| env.rate_limit_store(), };
+            effect! { let key = key.clone(); let store = __dsl_program.clone()?; {
+                effect_provide_some! { program: effect_map_error! { program: store
+                    .feedback(key.clone().into_bytes(), policy, feedback), map: RateLimitError::Uncertain, }, project: |_: &R| (), }
+            }? }
+        }
     }
 }
 

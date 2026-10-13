@@ -1,5 +1,6 @@
 //! Safe provider-neutral SQL completion observation selected through R.
 
+use crate::effect_future;
 use effect::{Clock, Defect, Effect, Exit, HasClock};
 use std::{sync::Arc, time::Duration};
 
@@ -66,7 +67,8 @@ where
 {
     let select = Arc::new(select);
     let count = Arc::new(count);
-    Effect::from_exit_future_with_context(move |env, context| {
+    effect_future! {
+        exit_with_context; body: move |env, context| {
         let program = program.clone();
         let select = select.clone();
         let count = count.clone();
@@ -127,7 +129,7 @@ where
 
             outcome
         }
-    })
+    }, }
 }
 
 /// Isolate observer diagnostic failures as best effort; neither channel may replace the business exit.

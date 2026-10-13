@@ -512,6 +512,8 @@ fn invalid_identifier(value: &str) -> MigrateError {
 
 #[cfg(test)]
 mod tests {
+    use tokio::join;
+
     use std::{borrow::Cow, process};
 
     use sqlx_core::{
@@ -765,7 +767,7 @@ mod tests {
             MigrationType::Simple,
             "CREATE TABLE locked_widgets (id INTEGER PRIMARY KEY)",
         )]);
-        let (first_result, second_result) = tokio::join!(first.run(&pool), second.run(&pool));
+        let (first_result, second_result) = join!(first.run(&pool), second.run(&pool));
         first_result?;
         second_result?;
 

@@ -2,7 +2,9 @@
 
 use crate::internal::workflow::{self, bind, success};
 use crate::{Defect, Effect, Exit, LibraryDefect, Release, Scope};
+use crate::{effect, effect_scope};
 use futures_util::future::{Either, select};
+use std::pin::pin;
 use std::sync::{Arc, Mutex};
 
 mod internal;
@@ -133,8 +135,64 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Stream<A, E
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn open(&self, scope: Scope<E>) -> Effect<StreamReader<A, E, R>, E, R> {
         let open = Arc::clone(&self.open);
-        Effect::defer(move || open(scope.clone()))
+        {
+            let __dsl_factory = move || open(scope.clone());
+            effect! { __dsl_factory()? }
+        }
     }
+    /// Project this stream's environment at opening and each pull, using the
+    /// existing Effect provision boundary. Registered releases retain the inner
+    /// environment captured at acquisition; no stream task or nested run is added.
+    pub fn provide_some<Outer: Send + Sync + 'static>(
+        self,
+        project: impl Fn(&Outer) -> R + Send + Sync + 'static,
+    ) -> Stream<A, E, Outer> {
+        let project = Arc::new(project);
+        Stream::new(move |scope| {
+            let for_pull = Arc::clone(&project);
+            let for_open = Arc::clone(&project);
+            self.open(scope)
+                .map(move |reader| {
+                    let project = Arc::clone(&for_pull);
+                    StreamReader::new(reader.pull().provide_some(move |outer| project(outer)))
+                })
+                .provide_some(move |outer| for_open(outer))
+        })
+    }
+
+    /// Map opening, pull and owned cleanup errors without changing demand or
+    /// payload ownership. The outer scope registers the original scope's protected
+    /// close before opening; close drains and maps retained failures exactly once.
+    /// Defects/interruption remain their original channels and values need no Clone.
+    pub fn map_error<F: Send + 'static>(
+        self,
+        map: impl Fn(E) -> F + Send + Sync + 'static,
+    ) -> Stream<A, F, R> {
+        let map = Arc::new(map);
+        Stream::new(move |outer| {
+            let source = self.clone();
+            let map = Arc::clone(&map);
+            Effect::defer(move || {
+                let inner = Scope::new();
+                let cleanup_map = Arc::clone(&map);
+                let open_map = Arc::clone(&map);
+                let pull_map = Arc::clone(&map);
+                let opened = source
+                    .open(inner.clone())
+                    .map_error(move |error| open_map(error))
+                    .map(move |reader| {
+                        let map = Arc::clone(&pull_map);
+                        StreamReader::new(reader.pull().map_error(move |error| map(error)))
+                    });
+                outer
+                    .add_finalizer(
+                        inner.own_mapped(Effect::sync(|| ()), move |error| cleanup_map(error)),
+                    )
+                    .flat_map(move |_| opened.clone())
+            })
+        })
+    }
+
     #[must_use]
     /// Build a stream from a callback that produces scoped chunks.
     ///
@@ -253,14 +311,16 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Stream<A, E
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn run_collect(&self, limit: Option<usize>) -> Effect<Vec<A>, E, R> {
         let stream = self.clone();
-        Scope::scoped(move |scope| {
+        effect_scope! {
+            body: move |scope| {
             let open = stream.open(scope);
             workflow::reusable(move || {
                 bind(open.clone(), move |reader| {
                     collect(reader, Vec::new(), limit)
                 })
             })
-        })
+            },
+        }
     }
     /// Consume stream items with the supplied Effect callback.
     ///
@@ -485,15 +545,15 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Stream<A, E
                     let on_error = Arc::clone(&on_error);
                     crate::internal::runtime::Step::Suspended(Box::pin(async move {
                         let work = async {
-                            let lock = std::pin::pin!(stream.lock());
-                            let cancelled = std::pin::pin!(context.cancellation.cancelled());
+                            let lock = pin!(stream.lock());
+                            let cancelled = pin!(context.cancellation.cancelled());
                             let mut stream = match select(lock, cancelled).await {
                                 Either::Left((stream, _)) => stream,
                                 Either::Right(_) => return Exit::Interrupted,
                             };
                             use futures_util::StreamExt;
-                            let next = std::pin::pin!(stream.next());
-                            let cancelled = std::pin::pin!(context.cancellation.cancelled());
+                            let next = pin!(stream.next());
+                            let cancelled = pin!(context.cancellation.cancelled());
                             match select(next, cancelled).await {
                                 Either::Left((Some(Ok(value)), _)) => {
                                     Exit::Success(Chunk::Values(vec![value]))

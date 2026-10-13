@@ -1,9 +1,11 @@
 //! Checked scalar inputs and single-owner native request bodies.
 
+use crate::{effect_provide_some, effect_try_future, effect_try_sync};
 use axum::body::Body;
 use axum::extract::{FromRequest, Multipart};
 use bytes::Bytes;
 use effect::{Cancellation, Effect, HasCancellation, HasTaskSpawner};
+use effect::{effect, service};
 use headers::{Header, HeaderMapExt};
 use http::{Extensions, HeaderMap, HeaderValue, Method, Uri, Version};
 use http_body_util::{BodyExt, Limited};
@@ -723,7 +725,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> RequestInpu
         &self,
         project: impl Fn(&L) -> R + Send + Sync + 'static,
     ) -> RequestInput<A, E, L> {
-        RequestInput::new(self.effect.clone().provide_some(project))
+        RequestInput::new(effect_provide_some! { program: self.effect.clone(), project: project, })
     }
 }
 /// Incremental multipart policy with separate body/part/header/field resource bounds.
@@ -946,38 +948,44 @@ where
     ) -> Self {
         let read = Arc::new(read);
         let on_error = Arc::new(on_error);
-        let effect = Effect::service(|env: &R| env.request().clone()).flat_map(move |request| {
-            let read = read.clone();
-            let map = on_error.clone();
-            let expected = media.to_str().ok().map(|value| {
-                value
-                    .split(';')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_ascii_lowercase()
-            });
-            let actual = request
-                .singleton_header::<headers::ContentType>()
-                .map(|value| {
-                    value.map(|value| {
-                        value
-                            .to_string()
-                            .split(';')
-                            .next()
-                            .unwrap_or("")
-                            .trim()
-                            .to_ascii_lowercase()
-                    })
-                });
-            match (expected, actual) {
-                (Some(expected), Ok(Some(actual))) if expected == actual => read(request),
-                (_, Err(error)) => Effect::from_result_once(Err(map(error))),
-                _ => Effect::from_result_once(Err(map(ServerError::Invalid(
-                    "unsupported content type".into(),
-                )))),
-            }
-        });
+        let effect = effect! {
+        bind;
+        program: service! { env: |env: &R| env.request().clone(), },
+        body: move |request| {
+                   let read = read.clone();
+                   let map = on_error.clone();
+                   let expected = media.to_str().ok().map(|value| {
+                       value
+                           .split(';')
+                           .next()
+                           .unwrap_or("")
+                           .trim()
+                           .to_ascii_lowercase()
+                   });
+                   let actual = request
+                       .singleton_header::<headers::ContentType>()
+                       .map(|value| {
+                           value.map(|value| {
+                               value
+                                   .to_string()
+                                   .split(';')
+                                   .next()
+                                   .unwrap_or("")
+                                   .trim()
+                                   .to_ascii_lowercase()
+                           })
+                       });
+                   match (expected, actual) {
+                       (Some(expected), Ok(Some(actual))) if expected == actual => read(request),
+                       (_, Err(error)) => effect_try_sync! { once; body: { let __dsl_result = Err(map(error)); move || __dsl_result }, on_error: ::core::convert::identity, },
+                       _ => effect_try_sync! {
+                           once; body: {
+                           let __dsl_result = Err(map(ServerError::Invalid(
+                           "unsupported content type".into(),
+                       ))); move || __dsl_result }, on_error: ::core::convert::identity, },
+                   }
+               },
+        };
         Self::new(effect)
     }
 }
@@ -998,10 +1006,7 @@ where
             media,
             move |request| {
                 let map = read_map.clone();
-                Effect::try_future_once(
-                    move |_| async move { request.read_bytes(limit).await },
-                    move |error| map(error),
-                )
+                effect_try_future! { once; body: move |_| async move { request.read_bytes(limit).await }, on_error: move |error| map(error), }
             },
             move |error| map(error),
         )
@@ -1024,10 +1029,7 @@ where
             media,
             move |request| {
                 let map = read_map.clone();
-                Effect::try_future_once(
-                    move |_| async move { request.read_text(limit).await },
-                    move |error| map(error),
-                )
+                effect_try_future! { once; body: move |_| async move { request.read_text(limit).await }, on_error: move |error| map(error), }
             },
             move |error| map(error),
         )
@@ -1053,10 +1055,7 @@ where
             move |request| {
                 let codec = codec.clone();
                 let map = read_map.clone();
-                Effect::try_future_once(
-                    move |_| async move { request.read_json(limit, policy, &codec).await },
-                    move |error| map(error),
-                )
+                effect_try_future! { once; body: move |_| async move { request.read_json(limit, policy, &codec).await }, on_error: move |error| map(error), }
             },
             move |error| map(error),
         )
@@ -1071,36 +1070,36 @@ where
     ) -> Self {
         let map = Arc::new(on_error);
         let empty = Arc::new(empty);
-        Self::new(
-            Effect::service(|env: &R| env.request().clone()).flat_map(move |request| {
-                let codec = codec.clone();
-                let map = map.clone();
-                let empty = empty.clone();
-                Effect::try_future_once(
-                    move |_| async move {
-                        let bytes = request.read_bytes(limit).await?;
-                        if bytes.is_empty() {
-                            Ok(empty())
-                        } else {
-                            let media = request
-                                .singleton_header::<headers::ContentType>()?
-                                .ok_or_else(|| ServerError::Missing("Content-Type".into()))?;
-                            if !media.to_string().split(';').next().is_some_and(|base| {
-                                base.trim().eq_ignore_ascii_case("application/json")
-                            }) {
-                                return Err(ServerError::Invalid(
-                                    "unsupported content type".into(),
-                                ));
-                            }
-                            codec
-                                .parse_utf8(&bytes, policy)
-                                .map_err(ServerError::Schema)
-                        }
-                    },
-                    move |error| map(error),
-                )
-            }),
-        )
+        Self::new(effect! {
+        bind;
+        program: service! { env: |env: &R| env.request().clone(), },
+        body: move |request| {
+                       let codec = codec.clone();
+                       let map = map.clone();
+                       let empty = empty.clone();
+                       effect_try_future! {
+                           once; body: move |_| async move {
+                               let bytes = request.read_bytes(limit).await?;
+                               if bytes.is_empty() {
+                                   Ok(empty())
+                               } else {
+                                   let media = request
+                                       .singleton_header::<headers::ContentType>()?
+                                       .ok_or_else(|| ServerError::Missing("Content-Type".into()))?;
+                                   if !media.to_string().split(';').next().is_some_and(|base| {
+                                       base.trim().eq_ignore_ascii_case("application/json")
+                                   }) {
+                                       return Err(ServerError::Invalid(
+                                           "unsupported content type".into(),
+                                       ));
+                                   }
+                                   codec
+                                       .parse_utf8(&bytes, policy)
+                                       .map_err(ServerError::Schema)
+                               }
+                           }, on_error: move |error| map(error), }
+                   },
+        })
     }
 }
 impl<E, R> RequestInput<Arc<FormData>, E, R>
@@ -1119,10 +1118,7 @@ where
             HeaderValue::from_static("application/x-www-form-urlencoded"),
             move |request| {
                 let map = read_map.clone();
-                Effect::try_future_once(
-                    move |_| async move { request.read_form(policy).await },
-                    move |error| map(error),
-                )
+                effect_try_future! { once; body: move |_| async move { request.read_form(policy).await }, on_error: move |error| map(error), }
             },
             move |error| map(error),
         )

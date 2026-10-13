@@ -11,11 +11,14 @@ use crate::{
     localization::{IntoLocalization, PinnedCatalog},
     security::Security,
 };
-use effect::{Effect, Exit, HasCancellation, HasClock, HasTaskSpawner, Scope};
+use crate::{effect_die, effect_future, effect_map, effect_sync, effect_try_sync};
+use effect::effect;
+use effect::{Effect, Exit, HasCancellation, HasClock, HasTaskSpawner, Scope, effect_scope};
 use effect_server::{
     HasRequest, HasTokio, HttpProtocols, Pipeline, Request, RequestBinding, RequestCompletion,
     RequestHook, Router, Server, ServerError, ServerHost, ServerPolicy,
 };
+use effect_server::{pipeline, router, server};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -169,7 +172,7 @@ impl<C: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Web<
             apps: Vec::new(),
             observer: None,
             availability: None,
-            middleware: Pipeline::new(),
+            middleware: pipeline! {},
             installers: Vec::new(),
             configuration: Vec::new(),
             output_definition: None,
@@ -323,107 +326,136 @@ impl<C: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Web<
         let definition = self.clone();
         let startup = self.startup.clone();
         let startup_scope = scope.clone();
-        Effect::defer(move || startup(startup_scope.clone())).flat_map(move |capabilities| {
-            let capabilities = Arc::new(capabilities);
-            let definition = definition.clone();
-            let scope = scope.clone();
-            Effect::from_exit_future_with_context(move |env: Arc<R>, context| {
-                let capabilities = capabilities.clone();
-                let definition = definition.clone();
-                let scope = scope.clone();
-                async move {
-                    if let Some(error) = definition.configuration.first() {
-                        return Exit::Fail((definition.errors)(error.clone()));
-                    }
-                    let mut policy = definition.policy.clone();
-                    if let Some(observe) = &definition.observer {
-                        let observe = observe.clone();
-                        policy = policy.on_exit(move |env, request, completion| {
-                            observe(env, request, completion)
-                        });
-                    }
-                    let mut routes = (definition.routes)(capabilities.clone());
-                    if let Some(availability) = &definition.availability {
-                        let operational = match availability.routes() {
-                            Ok(routes) => routes,
-                            Err(error) => {
-                                return Exit::Fail((definition.errors)(WebError::Configuration(
-                                    error.to_string(),
-                                )));
-                            }
-                        };
-                        routes = routes.include(operational);
-                    }
-                    let resolve = definition.environment.clone();
-                    let request_capabilities = capabilities.clone();
-                    let mut server = Server::new(
-                        policy,
-                        RequestBinding::new(move |request| {
-                            resolve(request_capabilities.clone(), request)
-                        }),
-                        definition.listen,
-                        definition.protocols,
-                        routes,
-                    );
-                    // First transport/security metadata, then native auth/culture hooks;
-                    // selected environment precedes scoped authorization/CSRF/cache.
-                    if let Some(security) = &definition.security {
-                        let security = match security {
-                            Ok(security) => security.clone(),
-                            Err(error) => return Exit::Fail((definition.errors)(error.clone())),
-                        };
-                        server = install_security(server, security, definition.errors.clone());
-                    }
-                    for feature in &definition.features {
-                        let hooks = match context
-                            .run(feature(capabilities.clone(), scope.clone()), env.clone())
-                            .await
-                        {
-                            Exit::Success(hooks) => hooks,
-                            Exit::Fail(error) => return Exit::Fail(error),
-                            Exit::Die(defect) => return Exit::Die(defect),
-                            Exit::Interrupted => return Exit::Interrupted,
-                            Exit::FinalizationFailed(failure) => {
-                                return Exit::FinalizationFailed(failure);
-                            }
-                        };
-                        for hook in hooks {
-                            server = server.before_environment(move |request| hook(request));
-                        }
-                    }
-                    if let Some(output) = &definition.output_definition {
-                        let definition = output.clone();
-                        server = server.before_environment(move |request| {
-                            let definition = definition.clone();
-                            Effect::sync(move || {
-                                request.insert_extension(crate::output_cache::RootOutputCache {
-                                    definition: definition.clone(),
-                                })
-                            })
-                        });
-                    }
-                    server = server.middleware(definition.middleware.clone());
-                    for configure in &definition.builders {
-                        let configure = configure.clone();
-                        let cap = capabilities.clone();
-                        server =
-                            server.configure_builder(move |router| configure(cap.clone(), router));
-                    }
-                    for configure in &definition.apps {
-                        let configure = configure.clone();
-                        let cap = capabilities.clone();
-                        server = server.configure_app(move |router| configure(cap.clone(), router));
-                    }
-                    for install in &definition.installers {
-                        server = match install(capabilities.clone(), server) {
-                            Ok(server) => server,
-                            Err(error) => return Exit::Fail(error),
-                        };
-                    }
-                    Exit::Success(server)
-                }
-            })
-        })
+        effect! {
+        bind;
+        program: { let __dsl_factory = move || startup(startup_scope.clone()); effect! { __dsl_factory()? } },
+        body: move |capabilities| {
+                   let capabilities = Arc::new(capabilities);
+                   let definition = definition.clone();
+                   let scope = scope.clone();
+                   effect_future! {
+                       exit_with_context; body: move |env: Arc<R>, context| {
+                       let capabilities = capabilities.clone();
+                       let definition = definition.clone();
+                       let scope = scope.clone();
+                       async move {
+                           if let Some(error) = definition.configuration.first() {
+                               return Exit::Fail((definition.errors)(error.clone()));
+                           }
+                           let mut policy = definition.policy.clone();
+                           if let Some(observe) = &definition.observer {
+                               let observe = observe.clone();
+                               policy = policy.on_exit(move |env, request, completion| {
+                                   observe(env, request, completion)
+                               });
+                           }
+                           let mut routes = (definition.routes)(capabilities.clone());
+                           if let Some(availability) = &definition.availability {
+                               let operational = match availability.routes() {
+                                   Ok(routes) => routes,
+                                   Err(error) => {
+                                       return Exit::Fail((definition.errors)(WebError::Configuration(
+                                           error.to_string(),
+                                       )));
+                                   }
+                               };
+                               routes = match router! {
+                                   source: routes,
+                                   include(operational),
+                               } {
+                                   Ok(routes) => routes,
+                                   Err(error) => return Exit::Fail((definition.errors)(WebError::Configuration(error.to_string()))),
+                               };
+                           }
+                           let resolve = definition.environment.clone();
+                           let request_capabilities = capabilities.clone();
+                           let mut server = match server! {
+                               policy: policy,
+                               environment: RequestBinding::new(move |request| {
+                                   resolve(request_capabilities.clone(), request)
+                               }),
+                               listen: definition.listen,
+                               protocols: definition.protocols,
+                               routes: routes,
+                           } {
+                               Ok(server) => server,
+                               Err(error) => return Exit::Fail((definition.errors)(WebError::Configuration(error.to_string()))),
+                           };
+                           // First transport/security metadata, then native auth/culture hooks;
+                           // selected environment precedes scoped authorization/CSRF/cache.
+                           if let Some(security) = &definition.security {
+                               let security = match security {
+                                   Ok(security) => security.clone(),
+                                   Err(error) => return Exit::Fail((definition.errors)(error.clone())),
+                               };
+                               server = install_security(server, security, definition.errors.clone());
+                           }
+                           for feature in &definition.features {
+                               let hooks = match context
+                                   .run(feature(capabilities.clone(), scope.clone()), env.clone())
+                                   .await
+                               {
+                                   Exit::Success(hooks) => hooks,
+                                   Exit::Fail(error) => return Exit::Fail(error),
+                                   Exit::Die(defect) => return Exit::Die(defect),
+                                   Exit::Interrupted => return Exit::Interrupted,
+                                   Exit::FinalizationFailed(failure) => {
+                                       return Exit::FinalizationFailed(failure);
+                                   }
+                               };
+                               for hook in hooks {
+                                   server = server! {
+                                       source: server,
+                                       before_environment(move |request| hook(request)),
+                                   };
+                               }
+                           }
+                           if let Some(output) = &definition.output_definition {
+                               let definition = output.clone();
+                               server = server! {
+                                   source: server,
+                                   before_environment(move |request| {
+                                   let definition = definition.clone();
+                                   effect_sync! {
+                                       body: move || {
+                                       request.insert_extension(crate::output_cache::RootOutputCache {
+                                           definition: definition.clone(),
+                                       })
+                                   }, }
+                                   }),
+                               };
+                           }
+                           server = server! {
+                               source: server,
+                               middleware(definition.middleware.clone()),
+                           };
+                           for configure in &definition.builders {
+                               let configure = configure.clone();
+                               let cap = capabilities.clone();
+                               server = server! {
+                                   source: server,
+                                   configure_builder(move |router| configure(cap.clone(), router)),
+                               };
+                           }
+                           for configure in &definition.apps {
+                               let configure = configure.clone();
+                               let cap = capabilities.clone();
+                               server = server! {
+                                   source: server,
+                                   configure_app(move |router| configure(cap.clone(), router)),
+                               };
+                           }
+                           for install in &definition.installers {
+                               server = match install(capabilities.clone(), server) {
+                                   Ok(server) => server,
+                                   Err(error) => return Exit::Fail(error),
+                               };
+                           }
+                           Exit::Success(server)
+                       }
+                   }, }
+               },
+        }
     }
     /// Acquire/start/use/drain through the existing Server host; the outer scope
     /// retains startup caches/catalogue workers until native requests finish cleanup.
@@ -436,13 +468,14 @@ impl<C: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Web<
     {
         let definition = self.clone();
         let use_host = Arc::new(use_host);
-        Scope::scoped(move |scope| {
-            let use_host = use_host.clone();
-            definition.prepare(scope).flat_map(move |server| {
+        effect_scope! {
+            body |scope: Scope<E>| {
+                let definition = definition.clone();
                 let use_host = use_host.clone();
-                server.with_host(move |host| use_host(host))
-            })
-        })
+                let server = definition.prepare(scope)?;
+                server.with_host(move |host| use_host(host))?
+            },
+        }
     }
     /// Serve until the selected root cancellation capability requests shutdown,
     /// then drain and join request/startup cleanup under the same interpreter.
@@ -451,9 +484,10 @@ impl<C: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Web<
         R: HasRequest + HasClock + HasTaskSpawner + HasCancellation + HasTokio,
     {
         self.with_host(|_| {
-            Effect::from_future_with_env(|environment: Arc<R>, _| async move {
+            effect_future! {
+                with_env; body: |environment: Arc<R>, _| async move {
                 environment.cancellation().cancelled().await
-            })
+            }, }
         })
     }
 }
@@ -465,7 +499,9 @@ fn install_security<E: Send + 'static, R: HasRequest + Send + Sync + 'static>(
     errors: Arc<dyn Fn(WebError) -> E + Send + Sync>,
 ) -> Server<E, R> {
     let native_security = security.clone();
-    server = server.configure_builder(move |mut router| {
+    server = server! {
+        source: server,
+        configure_builder(move |mut router| {
         if let Some(assets) = &native_security.static_files {
             router = router.nest_service(&assets.prefix, assets.native());
         }
@@ -479,16 +515,20 @@ fn install_security<E: Send + 'static, R: HasRequest + Send + Sync + 'static>(
             router = router.layer(tower_http::limit::RequestBodyLimitLayer::new(limit.bytes()));
         }
         Ok(router)
-    });
+        }),
+    };
     let routing_security = security.clone();
     let routing_errors = errors.clone();
-    server = server.before_routing(move |routing, _| {
+    server = server! {
+        source: server,
+        before_routing(move |routing, _| {
         // Mutable head and encoded body move once into the native stage. The Server
         // supplies the original interpreter, socket peer, cancellation and reactor.
         let routing = std::sync::Mutex::new(Some(routing));
         let security = routing_security.clone();
         let errors = routing_errors.clone();
-        Effect::from_exit_future_with_context(move |env, context| {
+        effect_future! {
+            exit_with_context; body: move |env, context| {
             let routing = routing
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -542,86 +582,108 @@ fn install_security<E: Send + 'static, R: HasRequest + Send + Sync + 'static>(
                 }
                 Exit::Success(routing)
             }
-        })
-    });
+        }, }
+        }),
+    };
     let response_security = security.clone();
     let response_errors = errors.clone();
-    server = server.after_response(move |request, response| {
-        let security = response_security.clone();
-        let errors = response_errors.clone();
-        let present = request
-            .with_extensions(|extensions| extensions.get::<crate::csp::ResponseNonce>().cloned());
-        let nonce = match present {
-            Some(nonce) => Effect::from_result_once(Ok(Some(nonce))),
-            None => match &security.nonce {
-                Some(generate) => generate().map(Some),
-                None => Effect::succeed(None),
-            },
-        };
-        let response = std::sync::Mutex::new(Some(response));
-        nonce.flat_map(move |nonce| {
-            if let Some(nonce) = &nonce {
-                request.insert_extension(nonce.clone());
-            }
-            let secure = request.with_extensions(|extensions| {
-                extensions
-                    .get::<crate::security::ForwardedTransport>()
-                    .is_some_and(|transport| transport.scheme.as_deref() == Some("https"))
-            }) || request.uri().scheme_str() == Some("https");
-            let response = response
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            let Some(mut response) = response else {
-                return Effect::die(effect::Defect::new("web response wrapper already consumed"));
-            };
-            match security.wrap_headers(response.headers_mut(), nonce.as_ref(), secure) {
-                Ok(()) => Effect::from_result_once(Ok(response)),
-                Err(error) => Effect::from_result_once(Err(errors(error))),
-            }
-        })
-    });
+    server = server! {
+           source: server,
+           after_response(move |request, response| {
+           let security = response_security.clone();
+           let errors = response_errors.clone();
+           let present = request
+               .with_extensions(|extensions| extensions.get::<crate::csp::ResponseNonce>().cloned());
+           let nonce = match present {
+               Some(nonce) => effect_try_sync! { once; body: { let __dsl_result = Ok(Some(nonce)); move || __dsl_result }, on_error: ::core::convert::identity, },
+               None => match &security.nonce {
+                   Some(generate) => effect_map! { program: generate(), map: Some, },
+                   None => effect_sync! { body: { let __dsl_value = None; move || __dsl_value.clone() }, },
+               },
+           };
+           let response = std::sync::Mutex::new(Some(response));
+           effect! {
+    bind;
+    program: nonce,
+    body: move |nonce| {
+               if let Some(nonce) = &nonce {
+                   request.insert_extension(nonce.clone());
+               }
+               let secure = request.with_extensions(|extensions| {
+                   extensions
+                       .get::<crate::security::ForwardedTransport>()
+                       .is_some_and(|transport| transport.scheme.as_deref() == Some("https"))
+               }) || request.uri().scheme_str() == Some("https");
+               let response = response
+                   .lock()
+                   .unwrap_or_else(std::sync::PoisonError::into_inner)
+                   .take();
+               let Some(mut response) = response else {
+                   return effect_die! { defect: effect::Defect::new("web response wrapper already consumed"), };
+               };
+               match security.wrap_headers(response.headers_mut(), nonce.as_ref(), secure) {
+                   Ok(()) => effect_try_sync! { once; body: { let __dsl_result = Ok(response); move || __dsl_result }, on_error: ::core::convert::identity, },
+                   Err(error) => effect_try_sync! { once; body: { let __dsl_result = Err(errors(error)); move || __dsl_result }, on_error: ::core::convert::identity, },
+               }
+           },
+    }
+           }),
+       };
     if let Some(authenticate) = &security.authentication {
         let authenticate = authenticate.clone();
         let errors = errors.clone();
-        server = server.before_environment(move |request| {
-            let errors = errors.clone();
-            match request
-                .with_extensions(|extensions| extensions.get::<effect_server::RouteKind>().copied())
-            {
-                Some(effect_server::RouteKind::Native) => Effect::succeed(()),
-                Some(effect_server::RouteKind::Endpoint) => {
-                    authenticate(request).flat_map(move |accepted| {
-                        if accepted {
-                            Effect::succeed(())
-                        } else {
-                            Effect::fail_with({
-                                let errors = errors.clone();
-                                move || errors(WebError::Rejected("authentication"))
-                            })
-                        }
-                    })
-                }
-                None => Effect::fail_with(move || {
-                    errors(WebError::Metadata("native route classification".into()))
-                }),
-            }
-        });
+        server = server! {
+                   source: server,
+                   before_environment(move |request| {
+                   let errors = errors.clone();
+                   match request
+                       .with_extensions(|extensions| extensions.get::<effect_server::RouteKind>().copied())
+                   {
+                       Some(effect_server::RouteKind::Native) => effect_sync! { body { () }, },
+                       Some(effect_server::RouteKind::Endpoint) => {
+                           effect! {
+        bind;
+        program: authenticate(request),
+        body: move |accepted| {
+                               if accepted {
+                                   effect_sync! { body { () }, }
+                               } else {
+                                   effect_try_sync! {
+                                       body: {
+                                       let __dsl_error = {
+                                       let errors = errors.clone();
+                                       move || errors(WebError::Rejected("authentication"))
+                                   }; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }
+                               }
+                           },
+        }
+                       }
+                       None => effect_try_sync! {
+                           body: {
+                           let __dsl_error = move || {
+                           errors(WebError::Metadata("native route classification".into()))
+                       }; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, },
+                   }
+                   }),
+               };
     }
-    let mut guards = Pipeline::new();
+    let mut guards = pipeline! {};
     for (name, guard) in [
         ("authorization", security.authorization.clone()),
         ("antiforgery", security.antiforgery.clone()),
     ] {
         if let Some(guard) = guard {
             let errors = errors.clone();
-            guards = guards.guard(
-                move |request| guard(request),
-                move || errors(WebError::Rejected(name)),
-            );
+            guards = pipeline! {
+                source: guards,
+                guard(move |request| guard(request), move || errors(WebError::Rejected(name))),
+            };
         }
     }
-    server.middleware(guards)
+    server! {
+        source: server,
+        middleware(guards),
+    }
 }
 
 /// Apply only verified forwarding to the actual native routing head. Header/URI

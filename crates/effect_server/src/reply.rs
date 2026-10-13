@@ -4,8 +4,10 @@ use crate::{
     BodyCompletion, BodyPolicy, BodyProgram, BodyStatus, ConditionalOutcome, Request,
     ResourceValidators, ServerError,
 };
+use crate::{effect_future, effect_resource, effect_sync, effect_try_future, stream};
 use axum::body::Body;
 use bytes::Bytes;
+use effect::effect;
 use effect::{Effect, Exit, Scope};
 use headers::HeaderMapExt;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
@@ -434,341 +436,358 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Reply<E, R> {
         map_error: Arc<dyn Fn(ServerError) -> E + Send + Sync>,
     ) -> Effect<PreparedReply<E, R>, E, R> {
         let owned = Arc::new(std::sync::Mutex::new(Some(self)));
-        Effect::from_exit_future_with_context(move |env: Arc<R>, context| {
-            let reply = owned
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            let request = request.clone();
-            let scope = scope.clone();
-            let map_error = map_error.clone();
-            async move {
-                let Some(mut reply) = reply else {
-                    return Exit::Die(effect::Defect::new("reply already consumed"));
-                };
-                loop {
-                    if !matches!(&reply.body, ReplyBody::Render(_) | ReplyBody::Choose(_)) {
-                        apply_fields(std::mem::take(&mut reply.fields), &mut reply.headers);
-                    }
-                    if let Some(validators) = &reply.validators {
-                        validators.write(&mut reply.headers);
-                        match validators.evaluate(&request) {
-                            Ok(ConditionalOutcome::Proceed) => {}
-                            Ok(ConditionalOutcome::NotModified) => {
-                                reply.status = StatusCode::NOT_MODIFIED;
-                                reply.body = ReplyBody::Finite(Bytes::new());
-                            }
-                            Ok(ConditionalOutcome::PreconditionFailed) => {
-                                reply.status = StatusCode::PRECONDITION_FAILED;
-                                reply.body = ReplyBody::Finite(Bytes::new());
-                            }
-                            Err(error) => return Exit::Fail(map_error(error)),
-                        }
-                    }
-                    let upgrade = reply.status == StatusCode::SWITCHING_PROTOCOLS
-                        && matches!(&reply.body, ReplyBody::NativeOwned(_, _));
-                    if reply.status.is_informational() && !upgrade {
-                        return Exit::Fail(map_error(ServerError::Invalid(
-                            "informational status is not a terminal reply".into(),
-                        )));
-                    }
-                    let body_forbidden = upgrade
-                        || matches!(
-                            reply.status,
-                            StatusCode::NO_CONTENT
-                                | StatusCode::RESET_CONTENT
-                                | StatusCode::NOT_MODIFIED
-                        );
-                    if body_forbidden {
-                        reply.body = match reply.body {
-                            ReplyBody::NativeOwned(_, work) => {
-                                ReplyBody::NativeOwned(Body::empty(), work)
-                            }
-                            ReplyBody::Finite(_)
-                            | ReplyBody::Native(_)
-                            | ReplyBody::Program(_)
-                            | ReplyBody::Choose(_)
-                            | ReplyBody::Render(_)
-                            | ReplyBody::File(_) => ReplyBody::Finite(Bytes::new()),
-                        };
-                        reply.trailers.clear();
-                        reply.headers.remove(http::header::TRANSFER_ENCODING);
-                        if reply.status == StatusCode::NO_CONTENT {
-                            reply.headers.remove(http::header::CONTENT_LENGTH);
-                        }
-                    }
-                    if !body_forbidden
-                        && request.method() == Method::HEAD
-                        && !matches!(&reply.body, ReplyBody::Choose(_) | ReplyBody::File(_))
-                    {
-                        if let ReplyBody::Finite(bytes) = &reply.body
-                            && let Ok(length) = HeaderValue::from_str(&bytes.len().to_string())
-                        {
-                            reply.headers.insert(http::header::CONTENT_LENGTH, length);
-                        }
-                        reply.body = ReplyBody::Finite(Bytes::new());
-                    }
-                    if !matches!(&reply.body, ReplyBody::Render(_) | ReplyBody::Choose(_)) {
-                        apply_fields(std::mem::take(&mut reply.fields), &mut reply.headers);
-                    }
-                    match reply.body {
-                        ReplyBody::Render(render) => match context.run(render, env.clone()).await {
-                            Exit::Success(mut selected) => {
-                                for name in reply.headers.keys() {
-                                    selected.headers.remove(name);
-                                    for value in reply.headers.get_all(name) {
-                                        selected.headers.append(name.clone(), value.clone());
-                                    }
-                                }
-                                for (name, value) in &reply.trailers {
-                                    selected.trailers.append(name.clone(), value.clone());
-                                }
-                                selected.fields.extend(reply.fields);
-                                if reply.status_override {
-                                    selected.status = reply.status;
-                                    selected.status_override = true;
-                                }
-                                reply = selected;
-                            }
-                            Exit::Fail(error) => return Exit::Fail(error),
-                            Exit::Die(defect) => return Exit::Die(defect),
-                            Exit::Interrupted => return Exit::Interrupted,
-                            Exit::FinalizationFailed(failure) => {
-                                return Exit::FinalizationFailed(failure);
-                            }
-                        },
-                        ReplyBody::Choose(select) => {
-                            reply.headers.append(
-                                http::header::VARY,
-                                HeaderValue::from_static("Accept, Accept-Language"),
-                            );
-                            match select(&request) {
-                                Ok(Some(selected)) => {
-                                    reply
-                                        .headers
-                                        .insert(http::header::CONTENT_TYPE, selected.media);
-                                    if let Some(language) = selected.language {
-                                        reply
-                                            .headers
-                                            .insert(http::header::CONTENT_LANGUAGE, language);
-                                    }
-                                    reply.body = if request.method() == Method::HEAD {
-                                        ReplyBody::Native(Body::empty())
-                                    } else {
-                                        ReplyBody::Render(selected.render)
-                                    };
-                                }
-                                Ok(None) => {
-                                    reply.status = StatusCode::NOT_ACCEPTABLE;
-                                    reply.body = ReplyBody::Finite(Bytes::new());
-                                }
-                                Err(error) => return Exit::Fail(map_error(error)),
-                            }
-                        }
-                        ReplyBody::Program(program) => {
-                            let (body, writer, completion) =
-                                crate::body::channel(&request, policy, map_error.clone());
-                            let trailers = reply.trailers;
-                            let trailer_writer = writer.clone();
-                            let production = program
-                                .execute(writer.clone(), scope.clone())
-                                .flat_map(move |()| trailer_writer.trailers(trailers.clone()));
-                            let close_writer = writer.clone();
-                            let close_completion = completion.clone();
-                            let finish = production.ensuring_with(move |outcome| {
-                                if !matches!(outcome, effect::PrimaryOutcomeRef::Succeeded) {
-                                    close_completion.fail();
-                                }
-                                let writer = close_writer.clone();
-                                effect::Release::from_effect(Effect::sync(move || writer.finish()))
-                            });
-                            let gate = completion.clone();
-                            let map = map_error.clone();
-                            let finish = finish.flat_map(move |()| {
-                                let gate = gate.clone();
-                                let map = map.clone();
-                                Effect::try_future(
-                                    move |_| {
-                                        let gate = gate.clone();
-                                        async move {
-                                            match gate.wait().await {
-                                                crate::BodyOutcome::Completed => Ok(()),
-                                                crate::BodyOutcome::Open
-                                                | crate::BodyOutcome::Disconnected
-                                                | crate::BodyOutcome::Failed => {
-                                                    Err(ServerError::Disconnected)
-                                                }
-                                            }
-                                        }
-                                    },
-                                    move |error| map(error),
-                                )
-                            });
-                            let mut response = http::Response::new(body);
-                            *response.status_mut() = reply.status;
-                            *response.headers_mut() = reply.headers;
-                            return Exit::Success(PreparedReply {
-                                response,
-                                finish,
-                                completion,
-                            });
-                        }
-                        ReplyBody::File(path) => {
-                            let file = match tokio::fs::File::open(path).await {
-                                Ok(file) => file,
-                                Err(error) => return Exit::Fail(map_error(ServerError::Io(error))),
-                            };
-                            let length = match file.metadata().await {
-                                Ok(metadata) => metadata.len(),
-                                Err(error) => return Exit::Fail(map_error(ServerError::Io(error))),
-                            };
-                            let (start, end, partial) =
-                                match file_range(&request, &reply.headers, length) {
-                                    Ok(Some(range)) => range,
-                                    Ok(None) => {
-                                        reply.status = StatusCode::RANGE_NOT_SATISFIABLE;
-                                        if let Ok(value) =
-                                            HeaderValue::from_str(&format!("bytes */{length}"))
-                                        {
-                                            reply
-                                                .headers
-                                                .insert(http::header::CONTENT_RANGE, value);
-                                        }
-                                        return Exit::Success(native_prepared(
-                                            Body::empty(),
-                                            reply.status,
-                                            reply.headers,
-                                            request,
-                                            map_error,
-                                        ));
-                                    }
-                                    Err(error) => return Exit::Fail(map_error(error)),
-                                };
-                            let remaining = end.saturating_sub(start);
-                            if partial {
-                                reply.status = StatusCode::PARTIAL_CONTENT;
-                                if let Ok(range) = HeaderValue::from_str(&format!(
-                                    "bytes {start}-{}/{length}",
-                                    end.saturating_sub(1)
-                                )) {
-                                    reply.headers.insert(http::header::CONTENT_RANGE, range);
-                                }
-                            }
-                            reply.headers.insert(
-                                http::header::ACCEPT_RANGES,
-                                HeaderValue::from_static("bytes"),
-                            );
-                            if let Ok(length) = HeaderValue::from_str(&remaining.to_string()) {
-                                reply.headers.insert(http::header::CONTENT_LENGTH, length);
-                            }
-                            if request.method() == Method::HEAD {
-                                return Exit::Success(native_prepared(
-                                    Body::empty(),
-                                    reply.status,
-                                    reply.headers,
-                                    request,
-                                    map_error,
-                                ));
-                            }
-                            let file = Arc::new(std::sync::Mutex::new(Some(file)));
-                            let map = map_error.clone();
-                            reply.body = ReplyBody::Program(BodyProgram::new(move |writer| {
-                                let file = file.clone();
-                                let map = map.clone();
-                                Effect::from_exit_future_with_context(
-                                    move |env: Arc<R>, context| {
-                                        let file = file.clone();
-                                        let writer = writer.clone();
-                                        let map = map.clone();
-                                        async move {
-                                            let Some(mut file) = file
-                                                .lock()
-                                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                                .take()
-                                            else {
-                                                return Exit::Die(effect::Defect::new(
-                                                    "file reply already consumed",
-                                                ));
-                                            };
-                                            if let Err(error) =
-                                                file.seek(std::io::SeekFrom::Start(start)).await
-                                            {
-                                                return Exit::Fail(map(ServerError::Io(error)));
-                                            }
-                                            let mut remaining = remaining;
-                                            while remaining > 0 {
-                                                let size = usize::try_from(remaining)
-                                                    .unwrap_or(usize::MAX)
-                                                    .min(policy.chunk_bytes.get());
-                                                let mut bytes = vec![0; size];
-                                                let read =
-                                                    match file.read(&mut bytes).await {
-                                                        Ok(0) => return Exit::Fail(map(
-                                                            ServerError::Invalid(
-                                                                "file truncated during delivery"
-                                                                    .into(),
-                                                            ),
-                                                        )),
-                                                        Ok(read) => read,
-                                                        Err(error) => {
-                                                            return Exit::Fail(map(
-                                                                ServerError::Io(error),
-                                                            ));
-                                                        }
-                                                    };
-                                                bytes.truncate(read);
-                                                remaining = remaining.saturating_sub(read as u64);
-                                                let result = context
-                                                    .run(
-                                                        writer.write(Bytes::from(bytes)),
-                                                        env.clone(),
-                                                    )
-                                                    .await;
-                                                if !matches!(result, Exit::Success(())) {
-                                                    return result;
-                                                }
-                                            }
-                                            Exit::Success(())
-                                        }
-                                    },
-                                )
-                            }));
-                        }
-                        ReplyBody::Finite(bytes) => {
-                            let body =
-                                crate::body::with_trailers(Body::from(bytes), reply.trailers);
-                            return Exit::Success(native_prepared(
-                                body,
-                                reply.status,
-                                reply.headers,
-                                request,
-                                map_error,
-                            ));
-                        }
-                        ReplyBody::Native(body) => {
-                            return Exit::Success(native_prepared(
-                                crate::body::with_trailers(body, reply.trailers),
-                                reply.status,
-                                reply.headers,
-                                request,
-                                map_error,
-                            ));
-                        }
-                        ReplyBody::NativeOwned(body, work) => {
-                            let mut prepared = native_prepared(
-                                crate::body::with_trailers(body, reply.trailers),
-                                reply.status,
-                                reply.headers,
-                                request,
-                                map_error,
-                            );
-                            prepared.finish = prepared.finish.flat_map(move |()| work.clone());
-                            return Exit::Success(prepared);
-                        }
-                    }
-                }
-            }
-        })
+        effect_future! {
+                   exit_with_context; body: move |env: Arc<R>, context| {
+                   let reply = owned
+                       .lock()
+                       .unwrap_or_else(std::sync::PoisonError::into_inner)
+                       .take();
+                   let request = request.clone();
+                   let scope = scope.clone();
+                   let map_error = map_error.clone();
+                   async move {
+                       let Some(mut reply) = reply else {
+                           return Exit::Die(effect::Defect::new("reply already consumed"));
+                       };
+                       loop {
+                           if !matches!(&reply.body, ReplyBody::Render(_) | ReplyBody::Choose(_)) {
+                               apply_fields(std::mem::take(&mut reply.fields), &mut reply.headers);
+                           }
+                           if let Some(validators) = &reply.validators {
+                               validators.write(&mut reply.headers);
+                               match validators.evaluate(&request) {
+                                   Ok(ConditionalOutcome::Proceed) => {}
+                                   Ok(ConditionalOutcome::NotModified) => {
+                                       reply.status = StatusCode::NOT_MODIFIED;
+                                       reply.body = ReplyBody::Finite(Bytes::new());
+                                   }
+                                   Ok(ConditionalOutcome::PreconditionFailed) => {
+                                       reply.status = StatusCode::PRECONDITION_FAILED;
+                                       reply.body = ReplyBody::Finite(Bytes::new());
+                                   }
+                                   Err(error) => return Exit::Fail(map_error(error)),
+                               }
+                           }
+                           let upgrade = reply.status == StatusCode::SWITCHING_PROTOCOLS
+                               && matches!(&reply.body, ReplyBody::NativeOwned(_, _));
+                           if reply.status.is_informational() && !upgrade {
+                               return Exit::Fail(map_error(ServerError::Invalid(
+                                   "informational status is not a terminal reply".into(),
+                               )));
+                           }
+                           let body_forbidden = upgrade
+                               || matches!(
+                                   reply.status,
+                                   StatusCode::NO_CONTENT
+                                       | StatusCode::RESET_CONTENT
+                                       | StatusCode::NOT_MODIFIED
+                               );
+                           if body_forbidden {
+                               reply.body = match reply.body {
+                                   ReplyBody::NativeOwned(_, work) => {
+                                       ReplyBody::NativeOwned(Body::empty(), work)
+                                   }
+                                   ReplyBody::Finite(_)
+                                   | ReplyBody::Native(_)
+                                   | ReplyBody::Program(_)
+                                   | ReplyBody::Choose(_)
+                                   | ReplyBody::Render(_)
+                                   | ReplyBody::File(_) => ReplyBody::Finite(Bytes::new()),
+                               };
+                               reply.trailers.clear();
+                               reply.headers.remove(http::header::TRANSFER_ENCODING);
+                               if reply.status == StatusCode::NO_CONTENT {
+                                   reply.headers.remove(http::header::CONTENT_LENGTH);
+                               }
+                           }
+                           if !body_forbidden
+                               && request.method() == Method::HEAD
+                               && !matches!(&reply.body, ReplyBody::Choose(_) | ReplyBody::File(_))
+                           {
+                               if let ReplyBody::Finite(bytes) = &reply.body
+                                   && let Ok(length) = HeaderValue::from_str(&bytes.len().to_string())
+                               {
+                                   reply.headers.insert(http::header::CONTENT_LENGTH, length);
+                               }
+                               reply.body = ReplyBody::Finite(Bytes::new());
+                           }
+                           if !matches!(&reply.body, ReplyBody::Render(_) | ReplyBody::Choose(_)) {
+                               apply_fields(std::mem::take(&mut reply.fields), &mut reply.headers);
+                           }
+                           match reply.body {
+                               ReplyBody::Render(render) => match context.run(render, env.clone()).await {
+                                   Exit::Success(mut selected) => {
+                                       for name in reply.headers.keys() {
+                                           selected.headers.remove(name);
+                                           for value in reply.headers.get_all(name) {
+                                               selected.headers.append(name.clone(), value.clone());
+                                           }
+                                       }
+                                       for (name, value) in &reply.trailers {
+                                           selected.trailers.append(name.clone(), value.clone());
+                                       }
+                                       selected.fields.extend(reply.fields);
+                                       if reply.status_override {
+                                           selected.status = reply.status;
+                                           selected.status_override = true;
+                                       }
+                                       reply = selected;
+                                   }
+                                   Exit::Fail(error) => return Exit::Fail(error),
+                                   Exit::Die(defect) => return Exit::Die(defect),
+                                   Exit::Interrupted => return Exit::Interrupted,
+                                   Exit::FinalizationFailed(failure) => {
+                                       return Exit::FinalizationFailed(failure);
+                                   }
+                               },
+                               ReplyBody::Choose(select) => {
+                                   reply.headers.append(
+                                       http::header::VARY,
+                                       HeaderValue::from_static("Accept, Accept-Language"),
+                                   );
+                                   match select(&request) {
+                                       Ok(Some(selected)) => {
+                                           reply
+                                               .headers
+                                               .insert(http::header::CONTENT_TYPE, selected.media);
+                                           if let Some(language) = selected.language {
+                                               reply
+                                                   .headers
+                                                   .insert(http::header::CONTENT_LANGUAGE, language);
+                                           }
+                                           reply.body = if request.method() == Method::HEAD {
+                                               ReplyBody::Native(Body::empty())
+                                           } else {
+                                               ReplyBody::Render(selected.render)
+                                           };
+                                       }
+                                       Ok(None) => {
+                                           reply.status = StatusCode::NOT_ACCEPTABLE;
+                                           reply.body = ReplyBody::Finite(Bytes::new());
+                                       }
+                                       Err(error) => return Exit::Fail(map_error(error)),
+                                   }
+                               }
+                               ReplyBody::Program(program) => {
+                                   let (body, writer, completion) =
+                                       crate::body::channel(&request, policy, map_error.clone());
+                                   let trailers = reply.trailers;
+                                   let trailer_writer = writer.clone();
+                                   let production = effect! {
+        bind;
+        program: program
+                                       .execute(writer.clone(), scope.clone()),
+        body: move |()| trailer_writer.trailers(trailers.clone()),
+        };
+                                   let close_writer = writer.clone();
+                                   let close_completion = completion.clone();
+                                   let finish = effect_resource! {
+                                       ensuring;
+                                       program: production,
+                                       release: move |outcome| {
+                                       if !matches!(outcome, effect::PrimaryOutcomeRef::Succeeded) {
+                                           close_completion.fail();
+                                       }
+                                       let writer = close_writer.clone();
+                                           effect_sync! {
+                                               body: move || writer.finish(),
+                                           }
+                                       },
+                                   };
+                                   let gate = completion.clone();
+                                   let map = map_error.clone();
+                                   let finish = effect! {
+        bind;
+        program: finish,
+        body: move |()| {
+                                       let gate = gate.clone();
+                                       let map = map.clone();
+                                       effect_try_future! {
+                                           body: move |_| {
+                                               let gate = gate.clone();
+                                               async move {
+                                                   match gate.wait().await {
+                                                       crate::BodyOutcome::Completed => Ok(()),
+                                                       crate::BodyOutcome::Open
+                                                       | crate::BodyOutcome::Disconnected
+                                                       | crate::BodyOutcome::Failed => {
+                                                           Err(ServerError::Disconnected)
+                                                       }
+                                                   }
+                                               }
+                                           }, on_error: move |error| map(error), }
+                                   },
+        };
+                                   let mut response = http::Response::new(body);
+                                   *response.status_mut() = reply.status;
+                                   *response.headers_mut() = reply.headers;
+                                   return Exit::Success(PreparedReply {
+                                       response,
+                                       finish,
+                                       completion,
+                                   });
+                               }
+                               ReplyBody::File(path) => {
+                                   let file = match tokio::fs::File::open(path).await {
+                                       Ok(file) => file,
+                                       Err(error) => return Exit::Fail(map_error(ServerError::Io(error))),
+                                   };
+                                   let length = match file.metadata().await {
+                                       Ok(metadata) => metadata.len(),
+                                       Err(error) => return Exit::Fail(map_error(ServerError::Io(error))),
+                                   };
+                                   let (start, end, partial) =
+                                       match file_range(&request, &reply.headers, length) {
+                                           Ok(Some(range)) => range,
+                                           Ok(None) => {
+                                               reply.status = StatusCode::RANGE_NOT_SATISFIABLE;
+                                               if let Ok(value) =
+                                                   HeaderValue::from_str(&format!("bytes */{length}"))
+                                               {
+                                                   reply
+                                                       .headers
+                                                       .insert(http::header::CONTENT_RANGE, value);
+                                               }
+                                               return Exit::Success(native_prepared(
+                                                   Body::empty(),
+                                                   reply.status,
+                                                   reply.headers,
+                                                   request,
+                                                   map_error,
+                                               ));
+                                           }
+                                           Err(error) => return Exit::Fail(map_error(error)),
+                                       };
+                                   let remaining = end.saturating_sub(start);
+                                   if partial {
+                                       reply.status = StatusCode::PARTIAL_CONTENT;
+                                       if let Ok(range) = HeaderValue::from_str(&format!(
+                                           "bytes {start}-{}/{length}",
+                                           end.saturating_sub(1)
+                                       )) {
+                                           reply.headers.insert(http::header::CONTENT_RANGE, range);
+                                       }
+                                   }
+                                   reply.headers.insert(
+                                       http::header::ACCEPT_RANGES,
+                                       HeaderValue::from_static("bytes"),
+                                   );
+                                   if let Ok(length) = HeaderValue::from_str(&remaining.to_string()) {
+                                       reply.headers.insert(http::header::CONTENT_LENGTH, length);
+                                   }
+                                   if request.method() == Method::HEAD {
+                                       return Exit::Success(native_prepared(
+                                           Body::empty(),
+                                           reply.status,
+                                           reply.headers,
+                                           request,
+                                           map_error,
+                                       ));
+                                   }
+                                   let file = Arc::new(std::sync::Mutex::new(Some(file)));
+                                   let map = map_error.clone();
+                                   reply.body = ReplyBody::Program(stream! {
+                                       body: move |writer| {
+                                       let file = file.clone();
+                                       let map = map.clone();
+                                       effect_future! {
+                                           exit_with_context; body: move |env: Arc<R>, context| {
+                                               let file = file.clone();
+                                               let writer = writer.clone();
+                                               let map = map.clone();
+                                               async move {
+                                                   let Some(mut file) = file
+                                                       .lock()
+                                                       .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                       .take()
+                                                   else {
+                                                       return Exit::Die(effect::Defect::new(
+                                                           "file reply already consumed",
+                                                       ));
+                                                   };
+                                                   if let Err(error) =
+                                                       file.seek(std::io::SeekFrom::Start(start)).await
+                                                   {
+                                                       return Exit::Fail(map(ServerError::Io(error)));
+                                                   }
+                                                   let mut remaining = remaining;
+                                                   while remaining > 0 {
+                                                       let size = usize::try_from(remaining)
+                                                           .unwrap_or(usize::MAX)
+                                                           .min(policy.chunk_bytes.get());
+                                                       let mut bytes = vec![0; size];
+                                                       let read =
+                                                           match file.read(&mut bytes).await {
+                                                               Ok(0) => return Exit::Fail(map(
+                                                                   ServerError::Invalid(
+                                                                       "file truncated during delivery"
+                                                                           .into(),
+                                                                   ),
+                                                               )),
+                                                               Ok(read) => read,
+                                                               Err(error) => {
+                                                                   return Exit::Fail(map(
+                                                                       ServerError::Io(error),
+                                                                   ));
+                                                               }
+                                                           };
+                                                       bytes.truncate(read);
+                                                       remaining = remaining.saturating_sub(read as u64);
+                                                       let result = context
+                                                           .run(
+                                                               writer.write(Bytes::from(bytes)),
+                                                               env.clone(),
+                                                           )
+                                                           .await;
+                                                       if !matches!(result, Exit::Success(())) {
+                                                           return result;
+                                                       }
+                                                   }
+                                                   Exit::Success(())
+                                               }
+                                           }, }
+                                       },
+                                   });
+                               }
+                               ReplyBody::Finite(bytes) => {
+                                   let body =
+                                       crate::body::with_trailers(Body::from(bytes), reply.trailers);
+                                   return Exit::Success(native_prepared(
+                                       body,
+                                       reply.status,
+                                       reply.headers,
+                                       request,
+                                       map_error,
+                                   ));
+                               }
+                               ReplyBody::Native(body) => {
+                                   return Exit::Success(native_prepared(
+                                       crate::body::with_trailers(body, reply.trailers),
+                                       reply.status,
+                                       reply.headers,
+                                       request,
+                                       map_error,
+                                   ));
+                               }
+                               ReplyBody::NativeOwned(body, work) => {
+                                   let mut prepared = native_prepared(
+                                       crate::body::with_trailers(body, reply.trailers),
+                                       reply.status,
+                                       reply.headers,
+                                       request,
+                                       map_error,
+                                   );
+                                   prepared.finish = effect! {
+        bind;
+        program: prepared.finish,
+        body: move |()| work.clone(),
+        };
+                                   return Exit::Success(prepared);
+                               }
+                           }
+                       }
+                   }
+               }, }
     }
 }
 /// Redirect codes are selected explicitly and validated separately from body statuses.
@@ -1163,20 +1182,18 @@ fn native_prepared<E: Send + 'static, R: Send + Sync + 'static>(
     *response.status_mut() = status;
     *response.headers_mut() = headers;
     let gate = completion.clone();
-    let finish = Effect::try_future(
-        move |_| {
-            let gate = gate.clone();
-            async move {
-                match gate.wait().await {
-                    crate::BodyOutcome::Completed => Ok(()),
-                    crate::BodyOutcome::Open
-                    | crate::BodyOutcome::Failed
-                    | crate::BodyOutcome::Disconnected => Err(ServerError::Disconnected),
-                }
+    let finish = effect_try_future! {
+    body: move |_| {
+        let gate = gate.clone();
+        async move {
+            match gate.wait().await {
+                crate::BodyOutcome::Completed => Ok(()),
+                crate::BodyOutcome::Open
+                | crate::BodyOutcome::Failed
+                | crate::BodyOutcome::Disconnected => Err(ServerError::Disconnected),
             }
-        },
-        move |error| map(error),
-    );
+        }
+    }, on_error: move |error| map(error), };
     PreparedReply {
         response,
         finish,

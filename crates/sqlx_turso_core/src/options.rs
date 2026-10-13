@@ -906,18 +906,21 @@ impl TursoConnectOptions {
         Ok(self)
     }
 
-    #[expect(
-        clippy::expect_used,
-        reason = "a URL assembled from a fixed registered scheme is an infallible invariant"
-    )]
     fn build_url(&self) -> Url {
         let path = match &self.0.target {
             TursoDatabaseTarget::Memory { .. } => ":memory:".to_owned(),
             TursoDatabaseTarget::File(path) => path.to_string_lossy().into_owned(),
         };
 
-        let mut url = Url::parse(&format!("turso://{}", path.trim_start_matches('/')))
-            .expect("fixed Turso scheme must produce a URL");
+        // ConnectOptions::to_url_lossy must return Url, while Url construction
+        // is fallible. Keep valid serialization unchanged and retain the existing
+        // unwind on parse failure; resume_unwind skips the panic hook.
+        let mut url = match Url::parse(&format!("turso://{}", path.trim_start_matches('/'))) {
+            Ok(url) => url,
+            Err(error) => std::panic::resume_unwind(Box::new(format!(
+                "fixed Turso scheme must produce a URL: {error:?}"
+            ))),
+        };
 
         if matches!(&self.0.target, TursoDatabaseTarget::File(path) if path.is_absolute()) {
             url.set_path(&path);

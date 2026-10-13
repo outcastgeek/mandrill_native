@@ -2,6 +2,7 @@
 
 use super::{JournalCursor, JournalStream, ReplicaId};
 use crate::Effect;
+use crate::{effect_sync, effect_try_sync};
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
@@ -108,14 +109,14 @@ impl ReplicaCursorStore for MemoryReplicaCursorStore {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn load(&self, key: ReplicaCursorKey) -> Effect<JournalCursor, Self::Error> {
         let state = Arc::clone(&self.state);
-        Effect::sync(move || {
+        effect_sync! { body: move || {
             state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&key)
                 .copied()
                 .unwrap_or(JournalCursor::new(0))
-        })
+        }, }
     }
 
     ///
@@ -135,28 +136,25 @@ impl ReplicaCursorStore for MemoryReplicaCursorStore {
     ) -> Effect<ReplicaCursorAdvance, Self::Error> {
         let state = Arc::clone(&self.state);
         let capacity = self.capacity;
-        Effect::try_sync(
-            move || {
-                if next.value() < expected.value() {
-                    return Err(MemoryReplicaCursorError::Regression);
-                }
-                let mut state = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let current = state.get(&key).copied().unwrap_or(JournalCursor::new(0));
-                if current == next {
-                    return Ok(ReplicaCursorAdvance::AlreadyAdvanced(current));
-                }
-                if current != expected {
-                    return Ok(ReplicaCursorAdvance::Conflict(current));
-                }
-                if !state.contains_key(&key) && state.len() >= capacity.get() {
-                    return Err(MemoryReplicaCursorError::Capacity);
-                }
-                state.insert(key.clone(), next);
-                Ok(ReplicaCursorAdvance::Advanced(next))
-            },
-            std::convert::identity,
-        )
+        effect_try_sync! { body: move || {
+            if next.value() < expected.value() {
+                return Err(MemoryReplicaCursorError::Regression);
+            }
+            let mut state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let current = state.get(&key).copied().unwrap_or(JournalCursor::new(0));
+            if current == next {
+                return Ok(ReplicaCursorAdvance::AlreadyAdvanced(current));
+            }
+            if current != expected {
+                return Ok(ReplicaCursorAdvance::Conflict(current));
+            }
+            if !state.contains_key(&key) && state.len() >= capacity.get() {
+                return Err(MemoryReplicaCursorError::Capacity);
+            }
+            state.insert(key.clone(), next);
+            Ok(ReplicaCursorAdvance::Advanced(next))
+        }, on_error: std::convert::identity, }
     }
 }

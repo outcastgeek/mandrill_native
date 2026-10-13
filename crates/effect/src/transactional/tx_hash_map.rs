@@ -1,6 +1,7 @@
 //! Transactional keyed values.
 
 use super::{Transaction, TransactionDomain, TransactionDomainError, TxRef, TxValue};
+use crate::transaction;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
@@ -55,9 +56,12 @@ impl<K: TxValue + Eq + Hash, V: TxValue> TxHashMap<K, V> {
     /// # Returns
     /// Type: `Transaction<Option<Arc<V>>, E>`.
     pub fn get<E: Send + 'static>(&self, key: Arc<K>) -> Transaction<Option<Arc<V>>, E> {
-        self.cell
-            .read()
-            .map(move |map| map.get(key.as_ref()).cloned())
+        {
+            let __dsl_transaction = self.cell.read();
+            transaction! {
+            let map = __dsl_transaction.clone()?; map.get(key.as_ref()).cloned()
+            }
+        }
     }
 
     /// Insert the selected value under the collection’s identity rules.
@@ -78,11 +82,13 @@ impl<K: TxValue + Eq + Hash, V: TxValue> TxHashMap<K, V> {
         key: Arc<K>,
         value: Arc<V>,
     ) -> Transaction<Option<Arc<V>>, E> {
-        self.cell.update(move |map| {
-            let mut next = map.clone();
-            let previous = next.insert(Arc::clone(&key), Arc::clone(&value));
-            Ok((next, previous))
-        })
+        transaction! {
+        modify; reference: self.cell, modify: move |map| {
+                    let mut next = map.clone();
+                    let previous = next.insert(Arc::clone(&key), Arc::clone(&value));
+                    Ok((next, previous))
+                },
+        }
     }
 
     /// Remove the selected entry through this collection or store contract.
@@ -98,11 +104,13 @@ impl<K: TxValue + Eq + Hash, V: TxValue> TxHashMap<K, V> {
     /// # Returns
     /// Type: `Transaction<Option<Arc<V>>, E>`.
     pub fn remove<E: Send + 'static>(&self, key: Arc<K>) -> Transaction<Option<Arc<V>>, E> {
-        self.cell.update(move |map| {
-            let mut next = map.clone();
-            let previous = next.remove(key.as_ref());
-            Ok((next, previous))
-        })
+        transaction! {
+        modify; reference: self.cell, modify: move |map| {
+                    let mut next = map.clone();
+                    let previous = next.remove(key.as_ref());
+                    Ok((next, previous))
+                },
+        }
     }
 
     #[must_use]
@@ -116,6 +124,11 @@ impl<K: TxValue + Eq + Hash, V: TxValue> TxHashMap<K, V> {
     /// # Returns
     /// Type: `Transaction<usize, E>`.
     pub fn len<E: Send + 'static>(&self) -> Transaction<usize, E> {
-        self.cell.read().map(|map| map.len())
+        {
+            let __dsl_transaction = self.cell.read();
+            transaction! {
+            let map = __dsl_transaction.clone()?; map.len()
+            }
+        }
     }
 }

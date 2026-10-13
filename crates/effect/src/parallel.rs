@@ -1,5 +1,6 @@
 //! Bounded parallel traversal and race coordination.
 
+use crate::effect_scope;
 use crate::fiber::JoinedOrigin;
 use crate::internal::notification::notify_all;
 use crate::internal::outcome;
@@ -14,6 +15,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::iter::{Enumerate, RepeatN};
 use std::num::NonZeroUsize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::pin::pin;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy)]
@@ -317,10 +319,10 @@ async fn settle_race<A: Send + 'static, E: Send + 'static>(
 ) -> Exit<A, E> {
     // A lost driver never reaches contender's completion continuation. Guarded
     // terminal status also wakes selection, so loss cannot strand the race.
-    let left_status = std::pin::pin!(left.settled());
-    let right_status = std::pin::pin!(right.settled());
-    let statuses = std::pin::pin!(select(left_status, right_status));
-    let selected = std::pin::pin!(selection.winner());
+    let left_status = pin!(left.settled());
+    let right_status = pin!(right.settled());
+    let statuses = pin!(select(left_status, right_status));
+    let selected = pin!(selection.winner());
     let winner = match select(selected, statuses).await {
         Either::Left((winner, _)) => winner,
         Either::Right((Either::Left(_), _)) => {
@@ -743,7 +745,8 @@ where
     S: Source<A, E, R>,
 {
     let factory = Arc::new(factory);
-    Scope::scoped(move |scope| {
+    effect_scope! {
+        body: move |scope| {
         let factory = Arc::clone(&factory);
         Effect::new(move |env, context, finish| {
             let source = match catch_unwind(AssertUnwindSafe(|| factory())) {
@@ -776,7 +779,8 @@ where
                 finish,
             )
         })
-    })
+        },
+    }
 }
 
 ///

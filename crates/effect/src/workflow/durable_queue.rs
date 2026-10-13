@@ -11,6 +11,7 @@ use crate::persistence::{
     QueueRequeueOutcome, QueueRetry, QueueScan, QueueSettlement, QueueSettlementAction,
 };
 use crate::{Effect, KeyDomain, StableKey, UtcMillis};
+use crate::{durable_queue, effect, effect_map_error, effect_sync, effect_try_sync};
 use std::marker::PhantomData;
 
 #[derive(Debug)]
@@ -160,9 +161,9 @@ impl<P: Send + 'static, D: KeyDomain> DurableQueue<P, D> {
     where
         R: HasPersistedQueueStore + HasWorkflowEngine + Send + Sync + 'static,
     {
-        self.queue
-            .claim(options)
-            .map_error(DurableQueueError::Queue)
+        effect_map_error! {
+        program: self.queue
+        .claim(options), map: DurableQueueError::Queue, }
     }
 
     /// Decode a claimed payload while retaining its settlement token.
@@ -199,7 +200,7 @@ impl<P: Send + 'static, D: KeyDomain> DurableQueue<P, D> {
     where
         R: HasPersistedQueueStore + HasWorkflowEngine + Send + Sync + 'static,
     {
-        self.queue.inspect(id).map_error(DurableQueueError::Queue)
+        effect_map_error! { program: self.queue.inspect(id), map: DurableQueueError::Queue, }
     }
 
     /// Inspect messages retained after ordinary delivery was exhausted.
@@ -218,9 +219,9 @@ impl<P: Send + 'static, D: KeyDomain> DurableQueue<P, D> {
     where
         R: HasPersistedQueueStore + HasWorkflowEngine + Send + Sync + 'static,
     {
-        self.queue
-            .dead_letters(scan)
-            .map_error(DurableQueueError::Queue)
+        effect_map_error! {
+        program: self.queue
+        .dead_letters(scan), map: DurableQueueError::Queue, }
     }
 
     /// Make a retained message eligible for delivery again under the supplied policy.
@@ -244,9 +245,9 @@ impl<P: Send + 'static, D: KeyDomain> DurableQueue<P, D> {
     where
         R: HasPersistedQueueStore + HasWorkflowEngine + Send + Sync + 'static,
     {
-        self.queue
-            .requeue(id, request)
-            .map_error(DurableQueueError::Queue)
+        effect_map_error! {
+        program: self.queue
+        .requeue(id, request), map: DurableQueueError::Queue, }
     }
 
     /// Describe another attempt under the supplied retry policy.
@@ -270,9 +271,9 @@ impl<P: Send + 'static, D: KeyDomain> DurableQueue<P, D> {
     where
         R: HasPersistedQueueStore + HasWorkflowEngine + Send + Sync + 'static,
     {
-        self.queue
-            .settle(claim, QueueSettlementAction::Retry(retry))
-            .map_error(DurableQueueError::Queue)
+        effect_map_error! {
+        program: self.queue
+        .settle(claim, QueueSettlementAction::Retry(retry)), map: DurableQueueError::Queue, }
     }
 
     /// Retain the selected message outside ordinary delivery with a recorded reason.
@@ -298,9 +299,9 @@ impl<P: Send + 'static, D: KeyDomain> DurableQueue<P, D> {
     where
         R: HasPersistedQueueStore + HasWorkflowEngine + Send + Sync + 'static,
     {
-        self.queue
-            .settle(claim, QueueSettlementAction::DeadLetter { at, reason })
-            .map_error(DurableQueueError::Queue)
+        effect_map_error! {
+        program: self.queue
+        .settle(claim, QueueSettlementAction::DeadLetter { at, reason }), map: DurableQueueError::Queue, }
     }
 
     /// Execute one decoded delivery. A handler failure leaves the fenced
@@ -393,8 +394,13 @@ impl<P: Send + 'static, D: KeyDomain> DurableQueue<P, D> {
         R: HasPersistedQueueStore + HasWorkflowEngine + Send + Sync + 'static,
     {
         match self.decode_claim(claim) {
-            Ok(delivery) => self.handle(delivery, deferred, handler, acknowledged_at),
-            Err(failure) => Effect::from_result_once(Err(DurableQueueWorkerError::Decode(failure))),
+            Ok(delivery) => durable_queue! {
+                queue: self, delivery: delivery, deferred: deferred,
+                handler: handler, acknowledged_at: acknowledged_at,
+            },
+            Err(failure) => {
+                effect_try_sync! { once; body: { let __dsl_result = Err(DurableQueueWorkerError::Decode(failure)); move || __dsl_result }, on_error: ::core::convert::identity, }
+            }
         }
     }
 
@@ -428,11 +434,11 @@ impl<P: Send + 'static, D: KeyDomain> DurableQueue<P, D> {
         R: HasPersistedQueueStore + HasWorkflowEngine + Send + Sync + 'static,
     {
         if deferred.run != WorkflowRunId::from_stable(id.clone()) {
-            return Effect::fail_with(|| DurableQueueError::RunIdentityMismatch);
+            return effect_try_sync! { body: { let __dsl_error = || DurableQueueError::RunIdentityMismatch; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
         }
-        self.queue
-            .offer(id, payload, offered_at, available_at)
-            .map_error(DurableQueueError::Queue)
+        effect_map_error! {
+        program: self.queue
+        .offer(id, payload, offered_at, available_at), map: DurableQueueError::Queue, }
     }
 
     /// Record the workflow result before acknowledging the queue delivery.
@@ -464,34 +470,38 @@ impl<P: Send + 'static, D: KeyDomain> DurableQueue<P, D> {
         R: HasPersistedQueueStore + HasWorkflowEngine + Send + Sync + 'static,
     {
         if claim.queue() != self.queue.name() {
-            return Effect::fail_with(|| DurableQueueError::WrongQueue);
+            return effect_try_sync! { body: { let __dsl_error = || DurableQueueError::WrongQueue; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
         }
         if claim.id().as_bytes() != deferred.run.as_bytes() {
-            return Effect::fail_with(|| DurableQueueError::RunIdentityMismatch);
+            return effect_try_sync! { body: { let __dsl_error = || DurableQueueError::RunIdentityMismatch; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
         }
         let queue = self.queue.clone();
-        deferred
-            .complete(result)
-            .map_error(DurableQueueError::Signal)
-            .flat_map(move |_| {
-                queue
+        {
+            let __dsl_program = effect_map_error! {
+            program: deferred
+            .complete(result), map: DurableQueueError::Signal, };
+            effect! {
+                let __dsl_program = __dsl_program.clone(); let claim = claim.clone(); let queue = queue.clone(); let _ = __dsl_program?; {
+                {
+                    let __dsl_program = effect_map_error! {
+                    program: queue
                     .settle(
                         claim.clone(),
                         QueueSettlementAction::Acknowledge {
                             at: acknowledged_at,
                         },
-                    )
-                    .map_error(DurableQueueError::Queue)
-                    .flat_map(|settlement| match settlement {
-                        QueueSettlement::Applied => Effect::sync(|| QueueSettlement::Applied),
+                    ), map: DurableQueueError::Queue, }; effect! {
+                        let settlement = __dsl_program.clone()?; match settlement {
+                        QueueSettlement::Applied => effect_sync! { body: || QueueSettlement::Applied, },
                         QueueSettlement::StaleClaim => {
-                            Effect::fail_with(|| DurableQueueError::StaleClaim)
+                            effect_try_sync! { body: { let __dsl_error = || DurableQueueError::StaleClaim; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }
                         }
                         QueueSettlement::Missing => {
-                            Effect::fail_with(|| DurableQueueError::MissingClaim)
+                            effect_try_sync! { body: { let __dsl_error = || DurableQueueError::MissingClaim; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }
                         }
-                    })
-            })
+                    }? } }
+            }? }
+        }
     }
 
     /// On redelivery after an uncertain acknowledgement, inspect the
@@ -520,35 +530,39 @@ impl<P: Send + 'static, D: KeyDomain> DurableQueue<P, D> {
         R: HasPersistedQueueStore + HasWorkflowEngine + Send + Sync + 'static,
     {
         if claim.queue() != self.queue.name() {
-            return Effect::fail_with(|| DurableQueueError::WrongQueue);
+            return effect_try_sync! { body: { let __dsl_error = || DurableQueueError::WrongQueue; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
         }
         if claim.id().as_bytes() != deferred.run.as_bytes() {
-            return Effect::fail_with(|| DurableQueueError::RunIdentityMismatch);
+            return effect_try_sync! { body: { let __dsl_error = || DurableQueueError::RunIdentityMismatch; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
         }
         let queue = self.queue.clone();
-        deferred
-            .inspect::<R>()
-            .map_error(DurableQueueError::Signal)
-            .flat_map(move |recorded| match recorded {
-                Some(_) => queue
+        {
+            let __dsl_program = effect_map_error! {
+            program: deferred
+            .inspect::<R>(), map: DurableQueueError::Signal, };
+            effect! {
+                let __dsl_program = __dsl_program.clone(); let claim = claim.clone(); let queue = queue.clone(); let recorded = __dsl_program?; match recorded {
+                Some(_) => {
+                    let __dsl_program = effect_map_error! {
+                    program: queue
                     .settle(
                         claim.clone(),
                         QueueSettlementAction::Acknowledge {
                             at: acknowledged_at,
                         },
-                    )
-                    .map_error(DurableQueueError::Queue)
-                    .flat_map(|settlement| match settlement {
-                        QueueSettlement::Applied => Effect::sync(|| QueueSettlement::Applied),
+                    ), map: DurableQueueError::Queue, }; effect! {
+                        let settlement = __dsl_program.clone()?; match settlement {
+                        QueueSettlement::Applied => effect_sync! { body: || QueueSettlement::Applied, },
                         QueueSettlement::StaleClaim => {
-                            Effect::fail_with(|| DurableQueueError::StaleClaim)
+                            effect_try_sync! { body: { let __dsl_error = || DurableQueueError::StaleClaim; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }
                         }
                         QueueSettlement::Missing => {
-                            Effect::fail_with(|| DurableQueueError::MissingClaim)
+                            effect_try_sync! { body: { let __dsl_error = || DurableQueueError::MissingClaim; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }
                         }
-                    }),
-                None => Effect::fail_with(|| DurableQueueError::ResultNotRecorded),
-            })
+                    }? } },
+                None => effect_try_sync! { body: { let __dsl_error = || DurableQueueError::ResultNotRecorded; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, },
+            }? }
+        }
     }
 }
 
@@ -731,8 +745,10 @@ where
         T: Send + 'static,
         HandlerError: Send + 'static,
     {
-        self.inner
-            .handle(delivery, deferred, handler, acknowledged_at)
+        durable_queue! {
+            queue: &self.inner, delivery: delivery, deferred: deferred,
+            handler: handler, acknowledged_at: acknowledged_at,
+        }
     }
 
     /// Run a claimed queue payload and record its workflow result before acknowledgement.

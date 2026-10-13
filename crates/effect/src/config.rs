@@ -1,7 +1,11 @@
 //! Schema-backed configuration lookup and typed source failures.
 
+use crate::effect_sync;
 use crate::internal::runtime;
-use crate::{Defect, Effect, Exit, JsonValue, PureCodec, SchemaIssue};
+use crate::{
+    Defect, Effect, Exit, JsonValue, PureCodec, SchemaIssue, effect, effect_map_error,
+    effect_provide_some, effect_try_sync, service,
+};
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, RwLock};
@@ -411,13 +415,13 @@ impl ConfigSource for MemoryConfigSource {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn load(&self, path: ConfigPath) -> Effect<Option<Arc<JsonValue>>, Self::Error> {
         let values = Arc::clone(&self.values);
-        Effect::sync(move || {
+        effect_sync! { body: move || {
             values
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&path)
                 .map(Arc::clone)
-        })
+        }, }
     }
 }
 
@@ -494,59 +498,58 @@ impl<A: Send + 'static, D: HasConfigSource + Send + Sync + 'static, E: Send + Sy
     /// On absence, run the configured factory and independently validate its borrowed
     /// result; otherwise report Missing. Defaults do not require encode capabilities.
     /// Defects, interruption and cleanup failures retain their effect outcome channels.
+    /// Lookup, failure mapping and default validation compose through the DSL.
     pub fn load(&self) -> Effect<A, ConfigError<<D::Source as ConfigSource>::Error>, D> {
         let config = self.clone();
-        Effect::<_, ConfigError<<D::Source as ConfigSource>::Error>, D>::service(move |env: &D| {
+        effect! {
+            let config = config.clone();
             let path = config.path.clone();
-            env.config_source()
-                .load(path.clone())
-                .map_error(move |error| ConfigError::Source {
-                    path: path.clone(),
-                    error,
-                })
-                .provide_some(|_: &D| ())
-        })
-        .flat_map(std::convert::identity)
-        .flat_map({
-            let config = self.clone();
-            move |value| {
-                let path = config.path.clone();
-                match value {
-                    Some(value) => config
-                        .codec
-                        .decode_once(
-                            Arc::try_unwrap(value).unwrap_or_else(|shared| shared.as_ref().clone()),
-                        )
-                        .map_error(move |issue| ConfigError::Invalid {
-                            path: path.clone(),
-                            issue,
-                        }),
-                    None => match &config.default {
-                        Some(default) => {
-                            let default = Arc::clone(default);
-                            let codec = config.codec.clone();
-                            Effect::defer(move || default())
-                                .flat_map(move |value| {
-                                    let codec = codec.clone();
-                                    Effect::try_sync_once(
-                                        move || {
-                                            codec.validate_default_ref(&value)?;
-                                            Ok(value)
-                                        },
-                                        std::convert::identity,
-                                    )
-                                })
-                                .map_error(move |issue| ConfigError::Invalid {
-                                    path: path.clone(),
-                                    issue,
-                                })
-                        }
-                        None => {
-                            Effect::fail_with(move || ConfigError::Missing { path: path.clone() })
-                        }
-                    },
-                }
+            let lookup_path = path.clone();
+            let lookup = service! {
+                env |env: &D| {
+                    let path = lookup_path.clone();
+                    effect_provide_some! {
+                        program: effect_map_error! {
+                            program: env.config_source().load(path.clone()),
+                            map |error| { ConfigError::Source { path: path.clone(), error } },
+                        },
+                        project |_: &D| { () },
+                    }
+                },
+            }?;
+            let value = lookup?;
+            match value {
+                Some(value) => effect_map_error! {
+                    program: config.codec.decode_once(
+                        Arc::try_unwrap(value).unwrap_or_else(|shared| shared.as_ref().clone()),
+                    ),
+                    map |issue| { ConfigError::Invalid { path: path.clone(), issue } },
+                }?,
+                None => match config.default {
+                    Some(default) => {
+                        let codec = config.codec.clone();
+                        let validated = effect! {
+                            let default = default.clone();
+                            let codec = codec.clone();
+                            let value = effect! { default()? }?;
+                            effect_try_sync! {
+                                once;
+                                body {
+                                    codec.validate_default_ref(&value)?;
+                                    Ok(value)
+                                },
+                            }?
+                        };
+                        effect_map_error! {
+                            program: validated,
+                            map |issue| { ConfigError::Invalid { path: path.clone(), issue } },
+                        }?
+                    }
+                    None => effect_try_sync! {
+                        body { Err::<A, _>(ConfigError::Missing { path: path.clone() }) },
+                    }?,
+                },
             }
-        })
+        }
     }
 }

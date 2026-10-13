@@ -1,27 +1,26 @@
 use effect::StoredOutcome;
 use effect::cluster::{
     AcceptancePolicy, AcceptedRequest, ActivationId, ActivationOutcome, ClaimOptions,
-    ClusterActivationStore, ClusterAddress, ClusterEntityId, ClusterEntityType, ClusterExecutor,
-    ClusterMessageStore, ClusterRequestId, ClusterRunOutcome, ClusterRunner, ClusterRunnerError,
-    ClusterShardId, ClusterStoreError, EntityDispatcher, HasClusterExecutor,
-    HasClusterMessageStore, MemoryClusterMessageStore, MessageStoreCapacity, PayloadConflictPolicy,
-    ReplyKind, SavedReply, StoreCompletion,
+    ClusterActivationStore, ClusterAddress, ClusterDefinition, ClusterEntityId, ClusterEntityType,
+    ClusterExecutor, ClusterMessageStore, ClusterRequestId, ClusterRunOutcome, ClusterRunner,
+    ClusterRunnerError, ClusterShardId, ClusterStoreError, HasClusterActivationStore,
+    HasClusterExecutor, HasClusterMessageStore, MemoryClusterMessageStore, MessageStoreCapacity,
+    PayloadConflictPolicy, ReplyKind, SavedReply, StoreCompletion,
 };
 use effect::encoding::{BinaryIdentity, BinaryLimits, FrameDecoder, FrameParts, FramePolicy};
 use effect::eventlog::{
-    AggregateId, AtomicProjectionStore, EventBinaryFormats, EventCodecs, EventCommitPolicy,
-    EventDefinition, EventEnvelope, EventGroupId, EventId, EventInvocation, EventJournal,
-    EventJournalId, EventLog, EventObservation, EventObservationError, EventReplicator,
-    EventRunError, EventRunOutcome, EventShape, EventTag, EventVersion, HasAtomicProjectionStore,
-    HasEventJournal, HasReplicaCursorStore, JournalCursor, JournalStream, MemoryEventJournal,
-    MemoryJournalCapacity, MemoryProjectionStore, MemoryReplicaCursorStore, ProjectionAdvance,
-    ProjectionId, ProjectionKey, ProjectionVersion, ReplicaCursorKey, ReplicaCursorStore,
-    ReplicaExport, ReplicaId, ReplicaSync,
+    AggregateId, AtomicProjectionStore, EventCommitPolicy, EventEnvelope, EventGroupId, EventId,
+    EventInvocation, EventJournal, EventJournalId, EventLog, EventObservation,
+    EventObservationError, EventReplicator, EventRunError, EventRunOutcome, EventTag, EventVersion,
+    HasAtomicProjectionStore, HasEventJournal, HasReplicaCursorStore, JournalCursor, JournalStream,
+    MemoryEventJournal, MemoryJournalCapacity, MemoryProjectionStore, MemoryReplicaCursorStore,
+    ProjectionAdvance, ProjectionId, ProjectionKey, ProjectionVersion, ReplicaCursorKey,
+    ReplicaCursorStore, ReplicaExport, ReplicaId, ReplicaSync,
 };
 use effect::persistence::{
     HasKeyValueStore, HasPersistedQueueStore, KeyValueStore, MemoryPersistedQueueStore,
-    PersistedQueue, PersistedQueueName, PersistenceError, QueueClaimOptions, QueueMessagePolicy,
-    QueueOwner, QueueRecordState, QueueSettlement, RecordPolicy, RecordVersion, StoredLookup,
+    PersistedQueueName, PersistenceError, QueueClaimOptions, QueueMessagePolicy, QueueOwner,
+    QueueRecordState, QueueSettlement, RecordPolicy, RecordVersion, StoredLookup,
 };
 use effect::reactivity::{
     AtomError, AtomId, AtomRegistry, InvalidationError, InvalidationKey, InvalidationRegistry,
@@ -29,26 +28,32 @@ use effect::reactivity::{
 };
 use effect::rpc::{
     InProcessRpcChannel, OperationId, RpcCallId, RpcClient, RpcEnvelope, RpcEnvelopeKind,
-    RpcEnvelopePolicy, RpcHandler, RpcOperation, RpcServerError, RpcUnaryServer, RpcVersion,
+    RpcEnvelopePolicy, RpcServerError, RpcUnaryServer, RpcVersion,
 };
 use effect::transactional::{
     HasTransactionDomain, Transaction, TransactionError, TransactionPolicy, TxRef,
     TxSubscriptionError, TxSubscriptionRef,
 };
 use effect::workflow::{
-    ActivityRunError, DurableDeferred, DurableQueue, DurableQueueError, DurableQueueWorkerError,
+    ActivityRunError, DurableDeferred, DurableQueueError, DurableQueueWorkerError,
     DurableSignalWait, HasWorkflowEngine, MemoryWorkflowEngine, WorkflowActivityId,
     WorkflowDefinitionId, WorkflowEngine, WorkflowHandle, WorkflowRegistration, WorkflowRunError,
     WorkflowRunId, WorkflowRunResult, WorkflowSignalId, WorkflowVersion,
 };
 use effect::{
-    Cancellation, Codec, DuplicateFields, Effect, HasBlockingExecutor, HasCpuExecutor,
+    Cancellation, Codec, Defect, DuplicateFields, Effect, HasBlockingExecutor, HasCpuExecutor,
     HasTaskSpawner, JsonValue, OutcomeStatus, ParseLimits, ParsePolicy, PubSubOptions,
     PubSubOverflow, PubSubShutdown, ReplayPolicy, SchemaErrorMode, SchemaIssue, Scope,
     SubscriptionEvent, UnknownFields, json_i64,
 };
-use effect::{HasClock, HasWallClock, TestWallClock};
+use effect::{HasClock, HasWallClock, TestWallClock, WallClock};
 use effect::{KeyDomain, KeyNamespace, KeySegment, StableKey, UtcMillis};
+use effect::{
+    activity, cluster, codec, durable_queue, effect, effect_all_concurrent, effect_blocking,
+    effect_cpu, effect_die, effect_future, effect_map, effect_map_error, effect_scope, effect_sync,
+    effect_try_sync, entity, entity_resource, event, persistable, persisted_queue, projection,
+    reactive_derived, rpc_operation, rpc_protocol, schema, transaction, workflow,
+};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
@@ -67,50 +72,64 @@ where
 {
     let overlap = Arc::new(Barrier::new(2));
     let task_overlap = Arc::clone(&overlap);
-    let task = Effect::<usize, (), R>::sync_once(move || {
-        task_overlap.wait();
-        20
-    });
-    let cpu = Effect::<usize, (), R>::cpu_once(move |_| {
-        overlap.wait();
-        21
-    });
-    Effect::all_concurrent(
-        NonZeroUsize::new(2).expect("two independent branches"),
-        vec![task, cpu],
-    )
-    .flat_map(|values| {
-        Effect::<usize, (), R>::blocking_once(move |_| values.into_iter().sum::<usize>() + 1)
-    })
+    let task = {
+        let __dsl_program: Effect<usize, (), R> = effect_sync! { once; body: move || {
+            task_overlap.wait();
+            20
+        }, };
+        __dsl_program
+    };
+    let cpu = {
+        let __dsl_program: Effect<usize, (), R> = effect_cpu! { once; body: move |_| {
+            overlap.wait();
+            21
+        }, };
+        __dsl_program
+    };
+    effect! {
+    bind;
+    program: effect_all_concurrent! { concurrency: NonZeroUsize::MIN.saturating_add(1), items: vec![task, cpu], },
+    body: |values| {
+               { let __dsl_program: Effect < usize , () , R > = effect_blocking! { once; body: move |_| values.into_iter().sum::<usize>() + 1, }; __dsl_program }
+           },
+    }
 }
 
 pub fn cancel_and_join<R>() -> Effect<bool, (), R>
 where
     R: HasTaskSpawner + Send + Sync + 'static,
 {
-    Scope::scoped(|scope| {
-        let entered = Cancellation::new();
-        let witness = entered.clone();
-        let child = Effect::<(), (), R>::from_future(move |token| {
-            let witness = witness.clone();
-            async move {
-                let _ = witness.request();
-                token.cancelled().await;
-            }
-        });
-        scope.fork(child).flat_map(move |fiber| {
-            let entered = entered.clone();
-            Effect::<(), (), R>::from_future(move |_| {
+    effect_scope! {
+    body: |scope| {
+            let entered = Cancellation::new();
+            let witness = entered.clone();
+            let child = { let __dsl_program: Effect < () , () , R > = effect_future! { body: move |token| {
+                let witness = witness.clone();
+                async move {
+                    let _ = witness.request();
+                    token.cancelled().await;
+                }
+            }, }; __dsl_program };
+            effect! {
+     bind;
+     program: scope.fork(child),
+     body: move |fiber| {
                 let entered = entered.clone();
-                async move { entered.cancelled().await }
-            })
-            .flat_map(move |_| {
-                fiber
-                    .interrupt_shared()
-                    .map(|exit| exit.status() == OutcomeStatus::Interrupted)
-            })
-        })
-    })
+                effect! {
+     bind;
+     program: { let __dsl_program: Effect < () , () , R > = effect_future! { body: move |_| {
+                    let entered = entered.clone();
+                    async move { entered.cancelled().await }
+                }, }; __dsl_program },
+     body: move |_| {
+                    effect_map! { program: fiber
+                        .interrupt_shared(), map: |exit| exit.status() == OutcomeStatus::Interrupted, }
+                },
+     }
+            },
+     }
+        },
+    }
 }
 
 pub fn rpc_cpu<R>(
@@ -120,79 +139,101 @@ pub fn rpc_cpu<R>(
 where
     R: HasCpuExecutor + Send + Sync + 'static,
 {
-    let operation = effect::rpc_operation! {
-        id: OperationId::new("provider-rpc-increment").expect("stable operation identity"),
-        version: RpcVersion::new(NonZeroU32::MIN),
-        request: json_i64(), success: json_i64(), error: json_i64(), limits: limits,
-    };
-    let policy = RpcEnvelopePolicy {
-        frame,
-        json: limits,
-    };
-    let handler = RpcHandler::new(operation.clone(), |request| {
-        Effect::<i64, i64, R>::cpu_once(move |_| request + 1)
-    });
-    let envelope = RpcEnvelope {
-        operation: operation.spec().id.clone(),
-        version: operation.spec().version,
-        call: RpcCallId::new("provider-rpc-call").expect("stable call identity"),
-        kind: RpcEnvelopeKind::Request,
-        sequence: None,
-        payload: JsonValue::from(41),
-        metadata: Default::default(),
-    };
-    let request = envelope
-        .encode(policy)
-        .expect("valid fixture envelope")
-        .into_bytes()
-        .expect("valid fixture frame");
-    RpcUnaryServer::new(handler, policy).handle(request)
+    let program = (|| -> Result<_, String> {
+        let operation_id = OperationId::new("provider-rpc-increment")
+            .map_err(|error| format!("operation: {error:?}"))?;
+        let operation = rpc_operation! {
+            id: operation_id,
+            version: RpcVersion::new(NonZeroU32::MIN),
+            request: json_i64(), success: json_i64(), error: json_i64(), limits: limits,
+        };
+        let policy = RpcEnvelopePolicy {
+            frame,
+            json: limits,
+        };
+        let handler = rpc_operation! { operation: operation.clone(), handler: |request| {
+            { let __dsl_program: Effect < i64 , i64 , R > = effect_cpu! { once; body: move |_| request + 1, }; __dsl_program }
+        }, };
+        let envelope = RpcEnvelope {
+            operation: operation.spec().id.clone(),
+            version: operation.spec().version,
+            call: RpcCallId::new("provider-rpc-call")
+                .map_err(|error| format!("call: {error:?}"))?,
+            kind: RpcEnvelopeKind::Request,
+            sequence: None,
+            payload: JsonValue::from(41),
+            metadata: Default::default(),
+        };
+        let request = envelope
+            .encode(policy)
+            .map_err(|error| format!("envelope: {error:?}"))?
+            .into_bytes()
+            .map_err(|error| format!("frame: {error:?}"))?;
+        Ok(RpcUnaryServer::new(handler, policy).handle(request))
+    })();
+    match program {
+        Ok(program) => program,
+        Err(error) => effect_die! { defect: Defect::new(error), },
+    }
 }
 
 pub fn schema_cpu<R>() -> Effect<i64, SchemaIssue, R>
 where
     R: HasCpuExecutor + Send + Sync + 'static,
 {
-    struct Record {
-        value: i64,
+    let program = (|| -> Result<_, String> {
+        struct Record {
+            value: i64,
+        }
+        let policy = ParsePolicy {
+            limits: rpc_limits(),
+            errors: SchemaErrorMode::First,
+            unknown_fields: UnknownFields::Reject,
+            duplicate_fields: DuplicateFields::Reject,
+        };
+        let record = schema! {
+            struct Record { value: json_i64() } policy: policy
+        }
+        .map_err(|error| format!("schema definition: {error:?}"))?;
+        let encoded = record
+            .encode_ref(&Record { value: 42 })
+            .map_err(|error| format!("schema encoding: {error:?}"))?;
+        assert_eq!(
+            record
+                .decode_ref(&encoded)
+                .map_err(|error| format!("schema decoding: {error:?}"))?
+                .value,
+            42
+        );
+        let codec = {
+            let __dsl_program: Codec<i64, JsonValue, R, R> = codec! { decode: |encoded| {
+                           effect! {
+            bind;
+            program: { let __dsl_program: Effect < Result < i64 , SchemaIssue > , SchemaIssue , R > = effect_cpu! { once; body: move |_| {
+                               json_i64().decode_ref(&encoded)
+                           }, }; __dsl_program },
+            body: |value| effect_try_sync! { once; body: move || value, on_error: ::core::convert::identity, },
+            }
+                       }, encode: |value| {
+                           effect! {
+            bind;
+            program: { let __dsl_program: Effect < Result < JsonValue , SchemaIssue > , SchemaIssue , R > = effect_cpu! { once; body: move |_| {
+                               json_i64().encode_ref(&value)
+                           }, }; __dsl_program },
+            body: |value| effect_try_sync! { once; body: move || value, on_error: ::core::convert::identity, },
+            }
+                       }, };
+            __dsl_program
+        };
+        Ok(codec.as_effect_schema().decode_once(JsonValue::from(42)))
+    })();
+    match program {
+        Ok(program) => program,
+        Err(error) => effect_die! { defect: Defect::new(error), },
     }
-    let policy = ParsePolicy {
-        limits: rpc_limits(),
-        errors: SchemaErrorMode::First,
-        unknown_fields: UnknownFields::Reject,
-        duplicate_fields: DuplicateFields::Reject,
-    };
-    let record = effect::schema! {
-        struct Record { value: json_i64() } policy: policy
-    }
-    .expect("valid external schema macro definition");
-    let encoded = record
-        .encode_ref(&Record { value: 42 })
-        .expect("valid external schema encoding");
-    assert_eq!(
-        record
-            .decode_ref(&encoded)
-            .expect("valid external schema decoding")
-            .value,
-        42
-    );
-    let codec = Codec::<i64, JsonValue, R, R>::new(
-        |encoded| {
-            Effect::<Result<i64, SchemaIssue>, SchemaIssue, R>::cpu_once(move |_| {
-                json_i64().decode_ref(&encoded)
-            })
-            .flat_map(Effect::from_result_once)
-        },
-        |value| {
-            Effect::<Result<JsonValue, SchemaIssue>, SchemaIssue, R>::cpu_once(move |_| {
-                json_i64().encode_ref(&value)
-            })
-            .flat_map(Effect::from_result_once)
-        },
-    );
-    codec.as_effect_schema().decode_once(JsonValue::from(42))
 }
 
+#[must_use]
 pub fn rpc_limits() -> ParseLimits {
     ParseLimits {
         bytes: NonZeroUsize::MAX,
@@ -203,25 +244,39 @@ pub fn rpc_limits() -> ParseLimits {
     }
 }
 
+#[must_use]
 pub fn rpc_frame() -> FramePolicy {
     FramePolicy {
         maximum_payload: NonZeroUsize::MAX,
     }
 }
 
-pub fn assert_rpc_response(response: FrameParts, limits: ParseLimits, frame: FramePolicy) {
+pub fn assert_rpc_response(
+    response: FrameParts,
+    limits: ParseLimits,
+    frame: FramePolicy,
+) -> Result<(), String> {
     let policy = RpcEnvelopePolicy {
         frame,
         json: limits,
     };
-    let bytes = response.into_bytes().expect("valid response frame");
+    let bytes = response
+        .into_bytes()
+        .map_err(|error| format!("response bytes: {error:?}"))?;
     let mut decoder = FrameDecoder::new(frame);
-    let frames = decoder.push(&bytes).expect("response frame decodes");
-    decoder.finish().expect("response frame complete");
+    let frames = decoder
+        .push(&bytes)
+        .map_err(|error| format!("response frame: {error:?}"))?;
+    decoder
+        .finish()
+        .map_err(|error| format!("response completion: {error:?}"))?;
     assert_eq!(frames.len(), 1);
-    let envelope = RpcEnvelope::decode(&frames[0], policy).expect("response envelope decodes");
+    let frame = frames.first().ok_or("missing response frame")?;
+    let envelope = RpcEnvelope::decode(frame, policy)
+        .map_err(|error| format!("response envelope: {error:?}"))?;
     assert_eq!(envelope.kind, RpcEnvelopeKind::Success);
     assert_eq!(envelope.payload, JsonValue::from(42));
+    Ok(())
 }
 
 struct ProviderDomain;
@@ -233,8 +288,9 @@ impl KeyDomain for ProviderDomain {
 fn event_key(
     namespace: &KeyNamespace<ProviderDomain>,
     value: &'static str,
-) -> StableKey<ProviderDomain> {
-    StableKey::new(namespace, [KeySegment::Text(value.into())]).expect("valid event fixture key")
+) -> Result<StableKey<ProviderDomain>, String> {
+    StableKey::new(namespace, [KeySegment::Text(value.into())])
+        .map_err(|error| format!("{value} key: {error:?}"))
 }
 
 type EventCpuError<R> = EventRunError<<<R as HasEventJournal>::Journal as EventJournal>::Error, ()>;
@@ -243,32 +299,53 @@ pub fn event_cpu<R>(limits: BinaryLimits) -> Effect<EventRunOutcome<i64, i64>, E
 where
     R: HasEventJournal + HasCpuExecutor + Send + Sync + 'static,
 {
-    let namespace =
-        KeyNamespace::<ProviderDomain>::new("events").expect("valid event fixture namespace");
-    let identity =
-        |name| BinaryIdentity::new(name, NonZeroU64::MIN).expect("valid binary identity");
-    let definition = effect::event! {
-        group: EventGroupId::new("provider-events").expect("valid group"),
-        tag: EventTag::new("incremented").expect("valid tag"),
-        version: EventVersion::new(NonZeroU32::MIN),
-        payload: json_i64(), success: json_i64(), error: json_i64(),
-        payload_identity: identity("provider-payload"),
-        success_identity: identity("provider-success"),
-        error_identity: identity("provider-error"), limits: limits,
-    };
-    EventLog::new(definition, EventCommitPolicy::SuccessOnly).execute(
-        EventInvocation {
-            journal: EventJournalId::from_stable(event_key(&namespace, "journal")),
-            aggregate: AggregateId::from_stable(event_key(&namespace, "aggregate")),
-            event: EventId::from_stable(event_key(&namespace, "event")),
-            expected: JournalCursor::new(0),
-            occurred_at: UtcMillis::new(0),
-            payload: Arc::new(41),
-        },
-        |payload| Effect::<Result<i64, i64>, (), R>::cpu_once(move |_| Ok(*payload + 1)),
-    )
+    let program = (|| -> Result<_, String> {
+        let namespace = KeyNamespace::<ProviderDomain>::new("events")
+            .map_err(|error| format!("event namespace: {error:?}"))?;
+        let identity = |name| {
+            BinaryIdentity::new(name, NonZeroU64::MIN)
+                .map_err(|error| format!("binary identity: {error:?}"))
+        };
+        let group =
+            EventGroupId::new("provider-events").map_err(|error| format!("group: {error:?}"))?;
+        let tag = EventTag::new("incremented").map_err(|error| format!("tag: {error:?}"))?;
+        let payload_identity = identity("provider-payload")?;
+        let success_identity = identity("provider-success")?;
+        let error_identity = identity("provider-error")?;
+        let definition = event! {
+            group: group,
+            tag: tag,
+            version: EventVersion::new(NonZeroU32::MIN),
+            payload: json_i64(), success: json_i64(), error: json_i64(),
+            payload_identity: payload_identity,
+            success_identity: success_identity,
+            error_identity: error_identity, limits: limits,
+        };
+        Ok(
+            EventLog::new(definition, EventCommitPolicy::SuccessOnly).execute(
+                EventInvocation {
+                    journal: EventJournalId::from_stable(event_key(&namespace, "journal")?),
+                    aggregate: AggregateId::from_stable(event_key(&namespace, "aggregate")?),
+                    event: EventId::from_stable(event_key(&namespace, "event")?),
+                    expected: JournalCursor::new(0),
+                    occurred_at: UtcMillis::new(0),
+                    payload: Arc::new(41),
+                },
+                |payload| {
+                    let __dsl_program: Effect<Result<i64, i64>, (), R> =
+                        effect_cpu! { once; body: move |_| Ok(*payload + 1), };
+                    __dsl_program
+                },
+            ),
+        )
+    })();
+    match program {
+        Ok(program) => program,
+        Err(error) => effect_die! { defect: Defect::new(error), },
+    }
 }
 
+#[must_use]
 pub fn event_limits() -> BinaryLimits {
     BinaryLimits {
         bytes: NonZeroUsize::MAX,
@@ -286,93 +363,99 @@ pub async fn rpc_event_notification_loss<R>(environment: Arc<R>) -> bool
 where
     R: HasEventJournal<Journal = MemoryEventJournal> + HasCpuExecutor + Send + Sync + 'static,
 {
-    let namespace = KeyNamespace::<ProviderDomain>::new("rpc-event-notification")
-        .expect("valid RPC event namespace");
-    let journal_id = EventJournalId::from_stable(event_key(&namespace, "journal"));
-    let aggregate = AggregateId::from_stable(event_key(&namespace, "aggregate"));
-    let event_id = EventId::from_stable(event_key(&namespace, "event"));
-    let stream = JournalStream {
-        journal: journal_id.clone(),
-        aggregate: aggregate.clone(),
-    };
-    let identity =
-        |name| BinaryIdentity::new(name, NonZeroU64::MIN).expect("valid binary identity");
-    let definition = EventDefinition::new(
-        EventShape {
-            group: EventGroupId::new("provider-rpc-events").expect("valid group"),
-            tag: EventTag::new("mutated").expect("valid tag"),
-            version: EventVersion::new(NonZeroU32::MIN),
-        },
-        EventCodecs {
-            payload: json_i64(),
-            success: json_i64(),
-            error: json_i64(),
-        },
-        EventBinaryFormats {
-            payload: identity("rpc-event-payload"),
-            success: identity("rpc-event-success"),
-            error: identity("rpc-event-error"),
-            limits: event_limits(),
-        },
-    );
-    let log = EventLog::new(definition, EventCommitPolicy::SuccessOnly);
-    let executions = Arc::new(AtomicUsize::new(0));
-    let handler_executions = Arc::clone(&executions);
-    let operation = RpcOperation::unary(
-        OperationId::new("provider-event-mutation").expect("valid operation"),
-        RpcVersion::new(NonZeroU32::MIN),
-        json_i64(),
-        json_i64(),
-        json_i64(),
-        rpc_limits(),
-    );
-    let handler = RpcHandler::new(operation.clone(), move |request| {
-        let executions = Arc::clone(&handler_executions);
-        log.execute(
-            EventInvocation {
-                journal: journal_id.clone(),
-                aggregate: aggregate.clone(),
-                event: event_id.clone(),
-                expected: JournalCursor::new(0),
-                occurred_at: UtcMillis::new(0),
-                payload: Arc::new(request),
-            },
-            move |_| {
-                let executions = Arc::clone(&executions);
-                Effect::<Result<i64, i64>, (), R>::cpu_once(move |_| {
-                    executions.fetch_add(1, Ordering::AcqRel);
-                    Ok(request + 1)
-                })
-            },
-        )
-        .map_error(|_| -2)
-        .flat_map(|outcome| match outcome {
-            EventRunOutcome::Committed {
-                result: Ok(value), ..
-            }
-            | EventRunOutcome::Duplicate {
-                result: Ok(value), ..
-            } => Effect::sync_once(move || value),
-            _ => Effect::fail_with(|| -3),
+    let fixture = (|| -> Result<_, String> {
+        let namespace = KeyNamespace::<ProviderDomain>::new("rpc-event-notification")
+            .map_err(|error| format!("RPC event namespace: {error:?}"))?;
+        let journal_id = EventJournalId::from_stable(event_key(&namespace, "journal")?);
+        let aggregate = AggregateId::from_stable(event_key(&namespace, "aggregate")?);
+        let event_id = EventId::from_stable(event_key(&namespace, "event")?);
+        let stream = JournalStream {
+            journal: journal_id.clone(),
+            aggregate: aggregate.clone(),
+        };
+        let identity = |name| {
+            BinaryIdentity::new(name, NonZeroU64::MIN)
+                .map_err(|error| format!("identity: {error:?}"))
+        };
+        let definition = event! { group: EventGroupId::new("provider-rpc-events")
+        .map_err(|error| format!("group: {error:?}"))?, tag: EventTag::new("mutated").map_err(|error| format!("tag: {error:?}"))?, version: EventVersion::new(NonZeroU32::MIN), payload: json_i64(), success: json_i64(), error: json_i64(), payload_identity: identity("rpc-event-payload")?, success_identity: identity("rpc-event-success")?, error_identity: identity("rpc-event-error")?, limits: event_limits(), };
+        let log = EventLog::new(definition, EventCommitPolicy::SuccessOnly);
+        let executions = Arc::new(AtomicUsize::new(0));
+        let handler_executions = Arc::clone(&executions);
+        let operation = rpc_operation! { id: OperationId::new("provider-event-mutation")
+        .map_err(|error| format!("operation: {error:?}"))?, version: RpcVersion::new(NonZeroU32::MIN), request: json_i64(), success: json_i64(), error: json_i64(), limits: rpc_limits(),  };
+        let handler = rpc_operation! { operation: operation.clone(), handler: move |request| {
+                   let executions = Arc::clone(&handler_executions);
+                   effect! {
+        bind;
+        program: effect_map_error! { program: log.execute(
+                       EventInvocation {
+                           journal: journal_id.clone(),
+                           aggregate: aggregate.clone(),
+                           event: event_id.clone(),
+                           expected: JournalCursor::new(0),
+                           occurred_at: UtcMillis::new(0),
+                           payload: Arc::new(request),
+                       },
+                       move |_| {
+                           let executions = Arc::clone(&executions);
+                           { let __dsl_program: Effect < Result < i64 , i64 > , () , R > = effect_cpu! { once; body: move |_| {
+                               executions.fetch_add(1, Ordering::AcqRel);
+                               Ok(request + 1)
+                           }, }; __dsl_program }
+                       },
+                   ), map: |_| -2, },
+        body: |outcome| match outcome {
+                       EventRunOutcome::Committed {
+                           result: Ok(value), ..
+                       }
+                       | EventRunOutcome::Duplicate {
+                           result: Ok(value), ..
+                       } => effect_sync! { once; body: move || value, },
+                       EventRunOutcome::Committed { result: Err(_), .. }
+                       | EventRunOutcome::Duplicate { result: Err(_), .. }
+                       | EventRunOutcome::Accepted
+                       | EventRunOutcome::Rejected(_)
+                       | EventRunOutcome::ConflictingEventId
+                       | EventRunOutcome::CompactedEventId
+                       | EventRunOutcome::StaleCursor { .. } => effect_try_sync! { body: { let __dsl_error = || -3; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, },
+                   },
+        }
+               }, };
+        let policy = RpcEnvelopePolicy {
+            frame: rpc_frame(),
+            json: rpc_limits(),
+        };
+        let server = RpcUnaryServer::new(handler, policy);
+        let channel = Arc::new(InProcessRpcChannel::new(server, environment.clone()));
+        let client = RpcClient::<i64, i64, i64, RpcServerError<i64>>::new(
+            operation,
+            policy,
+            NonZeroUsize::MIN,
+        );
+        let registry = InvalidationRegistry::new(PubSubOptions {
+            capacity: NonZeroUsize::MIN,
+            overflow: PubSubOverflow::Backpressure,
+            replay: ReplayPolicy::None,
         })
-    });
-    let policy = RpcEnvelopePolicy {
-        frame: rpc_frame(),
-        json: rpc_limits(),
+        .map_err(|error| format!("invalidation registry: {error:?}"))?;
+        let key = InvalidationKey::from_stable(event_key(&namespace, "query")?);
+        let mutation = RpcMutationAtom::new(client, registry.clone(), [key]);
+        let client_environment = Arc::new(channel);
+        let call =
+            RpcCallId::new("provider-event-call").map_err(|error| format!("call: {error:?}"))?;
+        Ok((
+            stream,
+            executions,
+            registry,
+            mutation,
+            client_environment,
+            call,
+        ))
+    })();
+    let Ok((stream, executions, registry, mutation, client_environment, call)) = fixture else {
+        return false;
     };
-    let server = RpcUnaryServer::new(handler, policy);
-    let channel = Arc::new(InProcessRpcChannel::new(server, environment.clone()));
-    let client =
-        RpcClient::<i64, i64, i64, RpcServerError<i64>>::new(operation, policy, NonZeroUsize::MIN);
-    let registry = InvalidationRegistry::new(PubSubOptions {
-        capacity: NonZeroUsize::MIN,
-        overflow: PubSubOverflow::Backpressure,
-        replay: ReplayPolicy::None,
-    })
-    .expect("valid invalidation registry");
-    let key = InvalidationKey::from_stable(event_key(&namespace, "query"));
-    let mutation = RpcMutationAtom::new(client, registry.clone(), [key]);
-    let client_environment = Arc::new(channel);
     let shutdown = registry
         .shutdown(PubSubShutdown::Discard)
         .run(Arc::clone(&client_environment))
@@ -381,11 +464,7 @@ where
         return false;
     }
     let result = mutation
-        .execute(
-            41,
-            RpcCallId::new("provider-event-call").expect("valid call"),
-            Default::default(),
-        )
+        .execute(41, call, Default::default())
         .run(client_environment)
         .await;
     let cursor = environment
@@ -436,25 +515,40 @@ pub async fn replica_observer_restart<R>(environment: Arc<R>) -> bool
 where
     R: HasEventJournal<Journal = MemoryEventJournal> + HasCpuExecutor + Send + Sync + 'static,
 {
-    let namespace = KeyNamespace::<ProviderDomain>::new("replica-observation")
-        .expect("valid replica namespace");
-    let stream = JournalStream {
-        journal: EventJournalId::from_stable(event_key(&namespace, "journal")),
-        aggregate: AggregateId::from_stable(event_key(&namespace, "aggregate")),
+    let fixture = (|| -> Result<_, String> {
+        let namespace = KeyNamespace::<ProviderDomain>::new("replica-observation")
+            .map_err(|error| format!("replica namespace: {error:?}"))?;
+        let stream = JournalStream {
+            journal: EventJournalId::from_stable(event_key(&namespace, "journal")?),
+            aggregate: AggregateId::from_stable(event_key(&namespace, "aggregate")?),
+        };
+        let group = EventGroupId::new("provider-replica-events")
+            .map_err(|error| format!("group: {error:?}"))?;
+        let tag = EventTag::new("changed").map_err(|error| format!("tag: {error:?}"))?;
+        let event_id = EventId::from_stable(event_key(&namespace, "event")?);
+        let source = ReplicaId::from_stable(event_key(&namespace, "source")?);
+        let projection_id = ProjectionId::from_stable(event_key(&namespace, "projection")?);
+        let key = InvalidationKey::from_stable(event_key(&namespace, "query")?);
+        Ok((stream, group, tag, event_id, source, projection_id, key))
+    })();
+    let Ok((stream, group, tag, event_id, source, projection_id, key)) = fixture else {
+        return false;
     };
-    let group = EventGroupId::new("provider-replica-events").expect("valid event group");
-    let tag = EventTag::new("changed").expect("valid event tag");
     let version = EventVersion::new(NonZeroU32::MIN);
-    let payload = Effect::<Arc<[u8]>, (), R>::cpu_once(|_| Arc::from(&b"change"[..]))
-        .run(Arc::clone(&environment))
-        .await;
+    let payload = {
+        let __dsl_program: Effect<Arc<[u8]>, (), R> =
+            effect_cpu! { once; body: |_| Arc::from(&b"change"[..]), };
+        __dsl_program
+    }
+    .run(Arc::clone(&environment))
+    .await;
     let effect::Exit::Success(payload) = payload else {
         return false;
     };
     let event = EventEnvelope {
         journal: stream.journal.clone(),
         aggregate: stream.aggregate.clone(),
-        id: EventId::from_stable(event_key(&namespace, "event")),
+        id: event_id,
         group: group.clone(),
         tag: tag.clone(),
         version,
@@ -475,7 +569,6 @@ where
     ) {
         return false;
     }
-    let source = ReplicaId::from_stable(event_key(&namespace, "source"));
     let exported = EventReplicator::export::<R>(
         source.clone(),
         stream.clone(),
@@ -500,13 +593,13 @@ where
         cursors: Arc::new(MemoryReplicaCursorStore::new(NonZeroUsize::MIN)),
         projections: Arc::new(MemoryProjectionStore::new(NonZeroUsize::MIN)),
     });
-    let ahead = JournalCursor::new(
-        batch.entries()[0]
-            .sequence
-            .get()
-            .checked_add(1)
-            .expect("fixture cursor has a successor"),
-    );
+    let Some(first) = batch.entries().first() else {
+        return false;
+    };
+    let Some(ahead) = first.sequence.get().checked_add(1) else {
+        return false;
+    };
+    let ahead = JournalCursor::new(ahead);
     let cursor_key = ReplicaCursorKey {
         source: source.clone(),
         stream: stream.clone(),
@@ -550,15 +643,15 @@ where
     {
         return false;
     }
-    let projection = effect::projection! {
+    let projection = projection! {
         key: ProjectionKey {
-            id: ProjectionId::from_stable(event_key(&namespace, "projection")),
+            id: projection_id,
             stream: stream.clone(),
         },
         version: ProjectionVersion::new(NonZeroU32::MIN),
         accepted: BTreeMap::from([((group, tag), version)]),
         initial: || 0usize,
-        fold: |count, _| Ok::<usize, ()>(count + 1),
+        fold: |count: &usize, _: &effect::eventlog::JournalEntry| Ok::<usize, ()>(count + 1),
     };
     let advanced = projection
         .advance(NonZeroUsize::MIN)
@@ -570,13 +663,13 @@ where
     {
         return false;
     }
-    let key = InvalidationKey::from_stable(event_key(&namespace, "query"));
-    let registry = InvalidationRegistry::new(PubSubOptions {
+    let Ok(registry) = InvalidationRegistry::new(PubSubOptions {
         capacity: NonZeroUsize::MIN,
         overflow: PubSubOverflow::Backpressure,
         replay: ReplayPolicy::None,
-    })
-    .expect("valid invalidation registry");
+    }) else {
+        return false;
+    };
     let observation = EventObservation::new(registry.clone(), {
         let key = key.clone();
         move |_| vec![key.clone()]
@@ -612,12 +705,13 @@ where
     if !matches!(checkpoint, effect::Exit::Success(cursor) if cursor.value() == 1) {
         return false;
     }
-    let restarted = InvalidationRegistry::new(PubSubOptions {
+    let Ok(restarted) = InvalidationRegistry::new(PubSubOptions {
         capacity: NonZeroUsize::MIN,
         overflow: PubSubOverflow::Backpressure,
         replay: ReplayPolicy::None,
-    })
-    .expect("valid restarted registry");
+    }) else {
+        return false;
+    };
     let subscriber = restarted
         .subscribe::<ReplicaTarget>()
         .run(Arc::clone(&target))
@@ -661,60 +755,81 @@ pub fn workflow_cpu<R>() -> Effect<WorkflowRunResult<i64, i64>, WorkflowCpuError
 where
     R: HasWorkflowEngine + HasCpuExecutor + Send + Sync + 'static,
 {
-    let namespace =
-        KeyNamespace::<ProviderDomain>::new("workflow").expect("valid workflow fixture namespace");
-    let run = WorkflowRunId::from_stable(event_key(&namespace, "run"));
-    let activity = effect::activity! {
-        name: WorkflowActivityId::from_stable(event_key(&namespace, "activity")),
-        input: json_i64(),
-        success: json_i64(), error: json_i64(), limits: rpc_limits(),
-        body |value| {
-            let observed = *value;
-            Effect::<Result<i64, i64>, (), R>::cpu_once(move |_| Ok(observed + 1))?
-        },
-    };
-    let execution_run = run.clone();
-    let definition = effect::workflow! {
-        name: WorkflowDefinitionId::new("provider-workflow").expect("valid definition"),
-        version: WorkflowVersion::new(NonZeroU32::MIN),
-        payload: json_i64(), success: json_i64(), error: json_i64(),
-        compatibility: Arc::from(&b"provider-v1"[..]),
-        limits: rpc_limits(),
-        run |value| {
-            activity.call(execution_run.clone(), NonZeroU32::MIN, value)?
-        },
-    };
-    definition.run(run, 41)
+    let program = (|| -> Result<_, String> {
+        let namespace = KeyNamespace::<ProviderDomain>::new("workflow")
+            .map_err(|error| format!("workflow namespace: {error:?}"))?;
+        let run = WorkflowRunId::from_stable(event_key(&namespace, "run")?);
+        let activity_id = WorkflowActivityId::from_stable(event_key(&namespace, "activity")?);
+        let definition_id = WorkflowDefinitionId::new("provider-workflow")
+            .map_err(|error| format!("workflow definition: {error:?}"))?;
+        let activity = activity! {
+            name: activity_id,
+            input: json_i64(),
+            success: json_i64(), error: json_i64(), limits: rpc_limits(),
+            body |value: Arc<i64>| {
+                let observed = *value;
+                { let __dsl_program: Effect < Result < i64 , i64 > , () , R > = effect_cpu! { once; body: move |_| Ok(observed + 1), }; __dsl_program }?
+            },
+        };
+        let execution_run = run.clone();
+        let definition = workflow! {
+            name: definition_id,
+            version: WorkflowVersion::new(NonZeroU32::MIN),
+            payload: json_i64(), success: json_i64(), error: json_i64(),
+            compatibility: Arc::from(&b"provider-v1"[..]),
+            limits: rpc_limits(),
+            run |value: i64| {
+                let activity = activity.clone(); let execution_run = execution_run.clone();
+                activity.call(execution_run, NonZeroU32::MIN, value)?
+            },
+        };
+        Ok(definition.run(run, 41))
+    })();
+    match program {
+        Ok(program) => program,
+        Err(error) => effect_die! { defect: Defect::new(error), },
+    }
 }
 
 pub fn reactivity_cpu<R>() -> Effect<bool, AtomError<()>, R>
 where
     R: HasCpuExecutor + Send + Sync + 'static,
 {
-    let namespace = KeyNamespace::<ProviderDomain>::new("reactivity")
-        .expect("valid reactive fixture namespace");
-    let registry = AtomRegistry::new(PubSubOptions {
-        capacity: NonZeroUsize::MIN,
-        overflow: PubSubOverflow::Backpressure,
-        replay: ReplayPolicy::None,
-    })
-    .expect("valid atom registry");
-    let atom = effect::reactive_derived! {
-        registry: registry,
-        id: AtomId::from_stable(event_key(&namespace, "derived")),
-        capacity: NonZeroUsize::MIN,
-        overflow: PubSubOverflow::Backpressure,
-        evaluate: |_| { Effect::<i64, (), R>::cpu_once(|_| 42)? },
-    }
-    .expect("valid derived atom");
-    let read = atom.clone();
-    atom.refresh().flat_map(move |_| {
-        read.read().map(|state| {
-            state
-                .current_success()
-                .is_some_and(|value| value.with(|number| *number == 42).unwrap_or(false))
+    let program = (|| -> Result<_, String> {
+        let namespace = KeyNamespace::<ProviderDomain>::new("reactivity")
+            .map_err(|error| format!("reactivity namespace: {error:?}"))?;
+        let registry = AtomRegistry::new(PubSubOptions {
+            capacity: NonZeroUsize::MIN,
+            overflow: PubSubOverflow::Backpressure,
+            replay: ReplayPolicy::None,
         })
-    })
+        .map_err(|error| format!("atom registry: {error:?}"))?;
+        let id = AtomId::from_stable(event_key(&namespace, "derived")?);
+        let atom = reactive_derived! {
+            registry: registry,
+            id: id,
+            capacity: NonZeroUsize::MIN,
+            overflow: PubSubOverflow::Backpressure,
+            evaluate |_| { { let __dsl_program: Effect < i64 , () , R > = effect_cpu! { once; body: |_| 42, }; __dsl_program }? },
+        }
+        .map_err(|error| format!("derived atom: {error:?}"))?;
+        let read = atom.clone();
+        Ok(effect! {
+        bind;
+        program: atom.refresh(),
+        body: move |_| {
+                   effect_map! { program: read.read(), map: |state| {
+                       state
+                           .current_success()
+                           .is_some_and(|value| value.with(|number| *number == 42).unwrap_or(false))
+                   }, }
+               },
+        })
+    })();
+    match program {
+        Ok(program) => program,
+        Err(error) => effect_die! { defect: Defect::new(error), },
+    }
 }
 
 type StoreError<R> = <<R as HasKeyValueStore>::Store as KeyValueStore>::Error;
@@ -724,30 +839,45 @@ pub fn persistence_cpu<R>() -> Effect<StoredLookup<i64, i64>, PersistenceCpuErro
 where
     R: HasKeyValueStore + HasCpuExecutor + Send + Sync + 'static,
 {
-    let namespace = KeyNamespace::<ProviderDomain>::new("persistence")
-        .expect("valid persistence fixture namespace");
-    let definition = effect::persistable! {
-        namespace: namespace,
-        request: i64,
-        key: |_: &i64| -> &'static str { "entry" },
-        success: json_i64(), error: json_i64(),
-        version: RecordPolicy::new(
-            RecordVersion::new("provider-v1").expect("valid record version"),
-            rpc_limits(),
-        ),
-    };
-    Effect::<i64, PersistenceCpuError<R>, R>::cpu_once(|_| 42).flat_map(move |value| {
-        let read_definition = definition.clone();
-        effect::persistence::write(
-            definition.clone(),
-            || 41_i64,
-            move || StoredOutcome::Success(value),
-            None,
-        )
-        .flat_map(move |_| {
-            effect::persistence::read(read_definition.clone(), || 41_i64, UtcMillis::new(0))
+    let program = (|| -> Result<_, String> {
+        let namespace = KeyNamespace::<ProviderDomain>::new("persistence")
+            .map_err(|error| format!("persistence namespace: {error:?}"))?;
+        let version = RecordVersion::new("provider-v1")
+            .map_err(|error| format!("record version: {error:?}"))?;
+        let definition = persistable! {
+            namespace: namespace,
+            request: i64,
+            key: |_: &i64| -> &'static str { "entry" },
+            success: json_i64(), error: json_i64(),
+            version: RecordPolicy::new(
+                version,
+                rpc_limits(),
+            ),
+        };
+        Ok(effect! {
+        bind;
+        program: { let __dsl_program: Effect < i64 , PersistenceCpuError < R > , R > = effect_cpu! { once; body: |_| 42, }; __dsl_program },
+        body: move |value| {
+                       let read_definition = definition.clone();
+                       effect! {
+        bind;
+        program: effect::persistence::write(
+                           definition.clone(),
+                           || 41_i64,
+                           move || StoredOutcome::Success(value),
+                           None,
+                       ),
+        body: move |_| {
+                           effect::persistence::read(read_definition.clone(), || 41_i64, UtcMillis::new(0))
+                       },
+        }
+                   },
         })
-    })
+    })();
+    match program {
+        Ok(program) => program,
+        Err(error) => effect_die! { defect: Defect::new(error), },
+    }
 }
 
 /// A stale queue settlement can occur after the workflow result is recorded.
@@ -762,13 +892,48 @@ where
         + Sync
         + 'static,
 {
-    let namespace = KeyNamespace::<ProviderDomain>::new("queue-workflow")
-        .expect("valid queue workflow namespace");
-    let identity = event_key(&namespace, "run");
+    let fixture = (|| -> Result<_, String> {
+        let namespace = KeyNamespace::<ProviderDomain>::new("queue-workflow")
+            .map_err(|error| format!("queue workflow namespace: {error:?}"))?;
+        let identity = event_key(&namespace, "run")?;
+        let signal = WorkflowSignalId::from_stable(event_key(&namespace, "result")?);
+        let definition = WorkflowDefinitionId::new("provider-queue-workflow")
+            .map_err(|error| format!("workflow definition: {error:?}"))?;
+        let queue = durable_queue! { queue: persisted_queue! { name: PersistedQueueName::new("provider-jobs")
+            .map_err(|error| format!("queue name: {error:?}"))?, payload: json_i64(), identity: BinaryIdentity::new("provider-job-payload", NonZeroU64::MIN)
+            .map_err(|error| format!("queue format: {error:?}"))?, limits: event_limits(), policy: QueueMessagePolicy {
+            maximum_attempts: NonZeroU32::MIN.saturating_add(1),
+            acknowledged_retention: Duration::ZERO,
+        },  }, };
+        let options = QueueClaimOptions::new(
+            QueueOwner::new("provider-worker").map_err(|error| format!("worker: {error:?}"))?,
+            UtcMillis::new(0),
+            UtcMillis::new(1),
+            NonZeroUsize::MIN,
+        )
+        .map_err(|error| format!("claim window: {error:?}"))?;
+        let replacement_options = QueueClaimOptions::new(
+            QueueOwner::new("replacement-worker")
+                .map_err(|error| format!("replacement worker: {error:?}"))?,
+            UtcMillis::new(1),
+            UtcMillis::new(2),
+            NonZeroUsize::MIN,
+        )
+        .map_err(|error| format!("replacement window: {error:?}"))?;
+        Ok((
+            identity,
+            signal,
+            definition,
+            queue,
+            options,
+            replacement_options,
+        ))
+    })();
+    let Ok((identity, signal, definition, queue, options, replacement_options)) = fixture else {
+        return false;
+    };
     let run = WorkflowRunId::from_stable(identity.clone());
     let version = WorkflowVersion::new(NonZeroU32::MIN);
-    let definition =
-        WorkflowDefinitionId::new("provider-queue-workflow").expect("valid workflow definition");
     let registration = WorkflowRegistration {
         id: definition.clone(),
         version,
@@ -801,22 +966,11 @@ where
     }
     let deferred = DurableDeferred {
         run,
-        signal: WorkflowSignalId::from_stable(event_key(&namespace, "result")),
+        signal,
         version,
         codec: json_i64(),
         limits: rpc_limits(),
     };
-    let queue = DurableQueue::new(PersistedQueue::new(
-        PersistedQueueName::new("provider-jobs").expect("valid queue name"),
-        json_i64(),
-        BinaryIdentity::new("provider-job-payload", NonZeroU64::MIN)
-            .expect("valid queue payload format"),
-        event_limits(),
-        QueueMessagePolicy {
-            maximum_attempts: NonZeroU32::new(2).expect("stale and valid attempts"),
-            acknowledged_retention: Duration::ZERO,
-        },
-    ));
     if !matches!(
         queue
             .enqueue(
@@ -832,13 +986,6 @@ where
     ) {
         return false;
     }
-    let options = QueueClaimOptions::new(
-        QueueOwner::new("provider-worker").expect("valid worker"),
-        UtcMillis::new(0),
-        UtcMillis::new(1),
-        NonZeroUsize::MIN,
-    )
-    .expect("valid claim window");
     let claimed = queue.claim(options).run(Arc::clone(&environment)).await;
     let effect::Exit::Success(mut claims) = claimed else {
         return false;
@@ -846,14 +993,9 @@ where
     if claims.len() != 1 {
         return false;
     }
-    let stale_claim = claims.pop().expect("one claim");
-    let replacement_options = QueueClaimOptions::new(
-        QueueOwner::new("replacement-worker").expect("valid replacement worker"),
-        UtcMillis::new(1),
-        UtcMillis::new(2),
-        NonZeroUsize::MIN,
-    )
-    .expect("valid replacement claim window");
+    let Some(stale_claim) = claims.pop() else {
+        return false;
+    };
     let replacement = queue
         .claim(replacement_options)
         .run(Arc::clone(&environment))
@@ -864,10 +1006,10 @@ where
     if replacement_claims.len() != 1 {
         return false;
     }
-    let valid_token = replacement_claims
-        .pop()
-        .expect("one replacement claim")
-        .token;
+    let Some(replacement_claim) = replacement_claims.pop() else {
+        return false;
+    };
+    let valid_token = replacement_claim.token;
     let executions = Arc::new(AtomicUsize::new(0));
     let handler_executions = Arc::clone(&executions);
     let stale = queue
@@ -876,10 +1018,13 @@ where
             deferred.clone(),
             move |value| {
                 let executions = Arc::clone(&handler_executions);
-                Effect::<i64, (), R>::cpu_once(move |_| {
-                    executions.fetch_add(1, Ordering::AcqRel);
-                    value + 1
-                })
+                {
+                    let __dsl_program: Effect<i64, (), R> = effect_cpu! { once; body: move |_| {
+                        executions.fetch_add(1, Ordering::AcqRel);
+                        value + 1
+                    }, };
+                    __dsl_program
+                }
             },
             UtcMillis::new(0),
         )
@@ -924,16 +1069,20 @@ where
     let policy = TransactionPolicy {
         max_conflicts: NonZeroUsize::MIN,
     };
-    Effect::<i64, TransactionError<()>, R>::cpu_once(|_| 42).flat_map(move |value| {
-        let read = reference.clone();
-        let write = reference.clone();
-        let transaction: Transaction<i64, ()> = effect::transaction! {
-            write.write(Arc::new(value))?;
-            let stored = read.read()?;
-            *stored
-        };
-        transaction.atomically(policy)
-    })
+    effect! {
+    bind;
+    program: { let __dsl_program: Effect < i64 , TransactionError < () > , R > = effect_cpu! { once; body: |_| 42, }; __dsl_program },
+    body: move |value| {
+           let read = reference.clone();
+           let write = reference.clone();
+           let transaction: Transaction<i64, ()> = transaction! {
+               write.write(Arc::new(value))?;
+               let stored = read.read()?;
+               *stored
+           };
+           transaction.atomically(policy)
+       },
+    }
 }
 
 #[derive(Debug)]
@@ -968,60 +1117,69 @@ where
     let policy = TransactionPolicy {
         max_conflicts: NonZeroUsize::MIN,
     };
-    source
-        .subscribe()
-        .map_error(TransactionReactiveError::Subscription)
-        .flat_map(move |(initial, subscription)| {
-            let source = source.clone();
-            source
-                .set::<()>(Arc::new(0))
-                .flat_map(|_| Transaction::<(), ()>::fail_with(|| ()))
-                .atomically(policy)
-                .either()
-                .map_error(TransactionReactiveError::Transaction)
-                .flat_map(move |aborted| {
-                    if !matches!(aborted, Err(TransactionError::Domain(()))) {
-                        return Effect::fail_with(|| TransactionReactiveError::AbortInvariant);
-                    }
-                    let source = source.clone();
-                    let subscription = subscription.clone();
-                    let initial = Arc::clone(&initial);
-                    source
-                        .read_committed::<R>()
-                        .map_error(TransactionReactiveError::Subscription)
-                        .flat_map(move |before| {
-                            if *before != 41 {
-                                return Effect::fail_with(|| {
-                                    TransactionReactiveError::AbortInvariant
-                                });
-                            }
-                            let source = source.clone();
-                            let subscription = subscription.clone();
-                            let initial = Arc::clone(&initial);
-                            Effect::<i64, TransactionReactiveError, R>::cpu_once(|_| 42).flat_map(
-                                move |value| {
-                                    let subscription = subscription.clone();
-                                    let initial = Arc::clone(&initial);
-                                    source
-                                        .set::<()>(Arc::new(value))
-                                        .atomically(policy)
-                                        .map_error(TransactionReactiveError::Transaction)
-                                        .flat_map(move |_| {
-                                            let disposal = subscription.clone();
-                                            let initial = Arc::clone(&initial);
-                                            subscription
-                                                .next()
-                                                .map_error(TransactionReactiveError::Subscription)
-                                                .map(move |committed| {
-                                                    let _ = disposal.dispose();
-                                                    *initial == 41 && *committed == 42
-                                                })
-                                        })
-                                },
-                            )
-                        })
-                })
-        })
+    effect! {
+     bind;
+     program: effect_map_error! { program: source
+            .subscribe(), map: TransactionReactiveError::Subscription, },
+     body: move |(initial, subscription)| {
+                let source = source.clone();
+                effect! {
+     bind;
+     program: effect_map_error! { program: { let __dsl_transaction = source
+                    .set::<()>(Arc::new(0)); transaction! {
+    __dsl_transaction.clone()?; Transaction::<(), ()>::fail_with(|| ())?
+    } }
+                    .atomically(policy)
+                    .either(), map: TransactionReactiveError::Transaction, },
+     body: move |aborted| {
+                        if !matches!(aborted, Err(TransactionError::Domain(()))) {
+                            return effect_try_sync! { body: { let __dsl_error = || TransactionReactiveError::AbortInvariant; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
+                        }
+                        let source = source.clone();
+                        let subscription = subscription.clone();
+                        let initial = Arc::clone(&initial);
+                        effect! {
+     bind;
+     program: effect_map_error! { program: source
+                            .read_committed::<R>(), map: TransactionReactiveError::Subscription, },
+     body: move |before| {
+                                if *before != 41 {
+                                    return effect_try_sync! { body: { let __dsl_error = || {
+                                        TransactionReactiveError::AbortInvariant
+                                    }; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
+                                }
+                                let source = source.clone();
+                                let subscription = subscription.clone();
+                                let initial = Arc::clone(&initial);
+                                effect! {
+     bind;
+     program: { let __dsl_program: Effect < i64 , TransactionReactiveError , R > = effect_cpu! { once; body: |_| 42, }; __dsl_program },
+     body: move |value| {
+                                        let subscription = subscription.clone();
+                                        let initial = Arc::clone(&initial);
+                                        effect! {
+     bind;
+     program: effect_map_error! { program: source
+                                            .set::<()>(Arc::new(value))
+                                            .atomically(policy), map: TransactionReactiveError::Transaction, },
+     body: move |_| {
+                                                let disposal = subscription.clone();
+                                                let initial = Arc::clone(&initial);
+                                                effect_map! { program: effect_map_error! { program: subscription
+                                                    .next(), map: TransactionReactiveError::Subscription, }, map: move |committed| {
+                                                        let _ = disposal.dispose();
+                                                        *initial == 41 && *committed == 42
+                                                    }, }
+                                            },
+     }
+                                    },
+     }
+                            },
+     }
+                    },
+     }
+            },
+     }
 }
 
 pub fn notification_loss_after_commit<R>(
@@ -1030,63 +1188,86 @@ pub fn notification_loss_after_commit<R>(
 where
     R: HasTransactionDomain + HasCpuExecutor + Send + Sync + 'static,
 {
-    let namespace = KeyNamespace::<ProviderDomain>::new("transaction-notification")
-        .expect("valid notification fixture namespace");
-    let key = InvalidationKey::from_stable(event_key(&namespace, "source"));
-    let registry = InvalidationRegistry::new(PubSubOptions {
-        capacity: NonZeroUsize::MIN,
-        overflow: PubSubOverflow::Backpressure,
-        replay: ReplayPolicy::None,
-    })
-    .expect("valid invalidation registry");
-    let policy = TransactionPolicy {
-        max_conflicts: NonZeroUsize::MIN,
-    };
-    Effect::<i64, TransactionReactiveError, R>::cpu_once(|_| 42).flat_map(move |value| {
-        let registry = registry.clone();
-        let source = source.clone();
-        let key = key.clone();
-        source
-            .set::<()>(Arc::new(value))
-            .atomically(policy)
-            .map_error(TransactionReactiveError::Transaction)
-            .flat_map(move |_| {
-                let registry = registry.clone();
-                let source = source.clone();
-                let key = key.clone();
-                registry
-                    .shutdown(PubSubShutdown::Discard)
-                    .map_error(TransactionReactiveError::Invalidation)
-                    .flat_map(move |_| {
-                        let source = source.clone();
-                        registry
-                            .invalidate(vec![key.clone()])
-                            .either()
-                            .map_error(TransactionReactiveError::Invalidation)
-                            .flat_map(move |notification| {
-                                if !matches!(
-                                    notification,
-                                    Err(InvalidationError::PubSub(effect::PubSubError::Shutdown))
-                                ) {
-                                    return Effect::fail_with(|| {
-                                        TransactionReactiveError::NotificationInvariant
-                                    });
-                                }
-                                source
-                                    .read_committed::<R>()
-                                    .map_error(TransactionReactiveError::Subscription)
-                                    .map(|committed| *committed == 42)
-                            })
-                    })
-            })
-    })
+    let program = (|| -> Result<_, String> {
+        let namespace = KeyNamespace::<ProviderDomain>::new("transaction-notification")
+            .map_err(|error| format!("notification namespace: {error:?}"))?;
+        let key = InvalidationKey::from_stable(event_key(&namespace, "source")?);
+        let registry = InvalidationRegistry::new(PubSubOptions {
+            capacity: NonZeroUsize::MIN,
+            overflow: PubSubOverflow::Backpressure,
+            replay: ReplayPolicy::None,
+        })
+        .map_err(|error| format!("invalidation registry: {error:?}"))?;
+        let policy = TransactionPolicy {
+            max_conflicts: NonZeroUsize::MIN,
+        };
+        Ok(effect! {
+        bind;
+        program: { let __dsl_program: Effect < i64 , TransactionReactiveError , R > = effect_cpu! { once; body: |_| 42, }; __dsl_program },
+        body: move |value| {
+                       let registry = registry.clone();
+                       let source = source.clone();
+                       let key = key.clone();
+                       effect! {
+        bind;
+        program: effect_map_error! { program: source
+                           .set::<()>(Arc::new(value))
+                           .atomically(policy), map: TransactionReactiveError::Transaction, },
+        body: move |_| {
+                               let registry = registry.clone();
+                               let source = source.clone();
+                               let key = key.clone();
+                               effect! {
+        bind;
+        program: effect_map_error! { program: registry
+                                   .shutdown(PubSubShutdown::Discard), map: TransactionReactiveError::Invalidation, },
+        body: move |_| {
+                                       let source = source.clone();
+                                       effect! {
+        bind;
+        program: effect_map_error! { program: registry
+                                           .invalidate(vec![key.clone()])
+                                           .either(), map: TransactionReactiveError::Invalidation, },
+        body: move |notification| {
+                                               if !matches!(
+                                                   notification,
+                                                   Err(InvalidationError::PubSub(
+                                                       effect::PubSubError::Shutdown
+                                                   ))
+                                               ) {
+                                                   return effect_try_sync! { body: { let __dsl_error = || {
+                                                       TransactionReactiveError::NotificationInvariant
+                                                   }; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
+                                               }
+                                               effect_map! { program: effect_map_error! { program: source
+                                                   .read_committed::<R>(), map: TransactionReactiveError::Subscription, }, map: |committed| *committed == 42, }
+                                           },
+        }
+                                   },
+        }
+                           },
+        }
+                   },
+        })
+    })();
+    match program {
+        Ok(program) => program,
+        Err(error) => effect_die! { defect: Defect::new(error), },
+    }
 }
 
 pub struct CpuClusterExecutor<R>(PhantomData<fn() -> R>);
 
 impl<R> CpuClusterExecutor<R> {
+    #[must_use]
     pub fn new() -> Self {
         Self(PhantomData)
+    }
+}
+
+impl<R> Default for CpuClusterExecutor<R> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1101,67 +1282,84 @@ where
         _address: ClusterAddress,
         encoded_request: Arc<[u8]>,
     ) -> Effect<SavedReply, Self::Error, R> {
-        Effect::cpu_once(move |_| SavedReply {
+        effect_cpu! { once; body: move |_| SavedReply {
             kind: ReplyKind::Success,
             payload: encoded_request,
-        })
+        }, }
     }
 }
 
+#[must_use]
 pub fn cluster_store() -> Arc<MemoryClusterMessageStore> {
     Arc::new(MemoryClusterMessageStore::new(
         MessageStoreCapacity::Bounded(NonZeroUsize::MIN),
     ))
 }
 
+/// Dispatch through a typed catalog after acquiring its checked activation owner.
 pub async fn entity_macro<R>(environment: Arc<R>) -> bool
 where
-    R: Send + Sync + 'static,
+    R: HasClusterActivationStore + HasWallClock + Send + Sync + 'static,
 {
-    let policy = RpcEnvelopePolicy {
-        frame: rpc_frame(),
-        json: rpc_limits(),
+    let fixture = (|| -> Result<_, String> {
+        let policy = RpcEnvelopePolicy {
+            frame: rpc_frame(),
+            json: rpc_limits(),
+        };
+        let operation_id = OperationId::new("provider-entity-increment")
+            .map_err(|error| format!("entity operation: {error:?}"))?;
+        let operation = rpc_operation! {
+            id: operation_id,
+            version: RpcVersion::new(NonZeroU32::MIN),
+            request: json_i64(), success: json_i64(), error: json_i64(),
+            limits: rpc_limits(),
+        };
+        let handler = rpc_operation! { operation: operation.clone(), handler: |request| {
+            { let __dsl_program: Effect < i64 , i64 , R > = effect_sync! { once; body: move || request + 1, }; __dsl_program }
+        }, };
+        let entity_type = ClusterEntityType::new("provider-macro-entity")
+            .map_err(|error| format!("entity type: {error:?}"))?;
+        let protocol = rpc_protocol! {
+            policy: policy,
+            handlers: [handler.clone()],
+        }
+        .map_err(|error| format!("protocol registration: {error:?}"))?;
+        let definition = entity! {
+            entity_type: entity_type.clone(),
+            resources: entity_resource! { () },
+            handlers: [operation.clone() => |_state: Arc<()>, request: i64| { request + 1 }],
+        };
+        let catalog: ClusterDefinition<(), R> = cluster! {
+            policy: policy, entities: [definition],
+        }
+        .map_err(|error| format!("entity catalog: {error:?}"))?;
+        let namespace = KeyNamespace::<ProviderDomain>::new("macro-entity")
+            .map_err(|error| format!("entity namespace: {error:?}"))?;
+        let address = ClusterAddress {
+            entity_type,
+            entity: ClusterEntityId::from_stable(event_key(&namespace, "entity")?),
+            shard: ClusterShardId::from_stable(event_key(&namespace, "shard")?),
+        };
+        let frame = RpcEnvelope {
+            operation: operation.spec().id.clone(),
+            version: operation.spec().version,
+            call: RpcCallId::new("provider-entity-call")
+                .map_err(|error| format!("entity call: {error:?}"))?,
+            kind: RpcEnvelopeKind::Request,
+            sequence: None,
+            payload: JsonValue::from(41),
+            metadata: Default::default(),
+        }
+        .encode(policy)
+        .map_err(|error| format!("entity frame: {error:?}"))?
+        .into_bytes()
+        .map_err(|error| format!("entity bytes: {error:?}"))?;
+        let activation = ActivationId::from_stable(event_key(&namespace, "activation")?);
+        Ok((protocol, catalog, address, frame, activation))
+    })();
+    let Ok((protocol, catalog, address, frame, activation)) = fixture else {
+        return false;
     };
-    let operation = effect::rpc_operation! {
-        id: OperationId::new("provider-entity-increment").expect("entity operation"),
-        version: RpcVersion::new(NonZeroU32::MIN),
-        request: json_i64(), success: json_i64(), error: json_i64(),
-        limits: rpc_limits(),
-    };
-    let handler = RpcHandler::new(operation.clone(), |request| {
-        Effect::<i64, i64, R>::sync_once(move || request + 1)
-    });
-    let entity_type = ClusterEntityType::new("provider-macro-entity").expect("entity type");
-    let protocol = effect::rpc_protocol! {
-        policy: policy,
-        handlers: [handler.clone()],
-    }
-    .expect("typed protocol registration");
-    let dispatcher: EntityDispatcher<R> = effect::entity! {
-        policy: policy,
-        entity_type: entity_type.clone(),
-        handler: handler,
-    }
-    .expect("typed entity registration");
-    let namespace = KeyNamespace::<ProviderDomain>::new("macro-entity").expect("entity namespace");
-    let address = ClusterAddress {
-        entity_type,
-        entity: ClusterEntityId::from_stable(event_key(&namespace, "entity")),
-        shard: ClusterShardId::from_stable(event_key(&namespace, "shard")),
-    };
-    let frame = RpcEnvelope {
-        operation: operation.spec().id.clone(),
-        version: operation.spec().version,
-        call: RpcCallId::new("provider-entity-call").expect("entity call"),
-        kind: RpcEnvelopeKind::Request,
-        sequence: None,
-        payload: JsonValue::from(41),
-        metadata: Default::default(),
-    }
-    .encode(policy)
-    .expect("entity request frame")
-    .into_bytes()
-    .expect("entity request bytes");
     if !matches!(
         protocol
             .handle(frame.clone())
@@ -1171,11 +1369,34 @@ where
     ) {
         return false;
     }
+    let effect::Exit::Success(now) = environment.wall_clock().now().run(Arc::new(())).await else {
+        return false;
+    };
+    let ownership = environment
+        .cluster_activation_store()
+        .activate(
+            address.clone(),
+            activation,
+            now,
+            UtcMillis::new(now.value() + 100),
+        )
+        .run(Arc::new(()))
+        .await;
+    let effect::Exit::Success(ActivationOutcome::Activated { lease, .. }) = ownership else {
+        return false;
+    };
+    let catalog = Arc::new(catalog);
+    let frame: Arc<[u8]> = frame.into();
+    let checked = effect_scope! {
+        body |scope: Scope<()>| {
+            let catalog = Arc::clone(&catalog); let owner = lease.owner.clone();
+            let address = address.clone(); let frame = Arc::clone(&frame);
+            let live = effect_map_error! { program: catalog.activate(scope, owner), map: |_| (), }?;
+            effect_map_error! { program: live.execute(address, frame), map: |_| (), }?
+        },
+    };
     matches!(
-        dispatcher
-            .execute(address, Arc::from(frame))
-            .run(environment)
-            .await,
+        checked.run(environment).await,
         effect::Exit::Success(SavedReply {
             kind: ReplyKind::Success,
             ..
@@ -1186,49 +1407,65 @@ where
 pub fn cluster_prepare(
     store: Arc<MemoryClusterMessageStore>,
 ) -> Effect<ClaimOptions, ClusterStoreError> {
-    let namespace =
-        KeyNamespace::<ProviderDomain>::new("cluster").expect("valid cluster fixture namespace");
-    let address = ClusterAddress {
-        entity_type: ClusterEntityType::new("provider-entity").expect("valid entity type"),
-        entity: ClusterEntityId::from_stable(event_key(&namespace, "entity")),
-        shard: ClusterShardId::from_stable(event_key(&namespace, "shard")),
-    };
-    let request = AcceptedRequest {
-        address: address.clone(),
-        id: ClusterRequestId::from_stable(event_key(&namespace, "request")),
-        payload: Arc::from(&b"provider-message"[..]),
-        idempotency_key: None,
-        accepted_at: UtcMillis::new(1),
-        policy: AcceptancePolicy {
-            dedup_retention: Duration::ZERO,
-            reply_retention: Duration::ZERO,
-            payload_conflict: PayloadConflictPolicy::Reject,
-            maximum_attempts: NonZeroU32::MIN,
-        },
-    };
-    let activation = ActivationId::from_stable(event_key(&namespace, "activation"));
-    store.accept(request).flat_map(move |_| {
-        store
-            .activate(
-                address.clone(),
-                activation.clone(),
-                UtcMillis::new(1),
-                UtcMillis::new(3),
-            )
-            .map(|outcome| {
-                let lease = match outcome {
-                    ActivationOutcome::Activated { lease, .. }
-                    | ActivationOutcome::AlreadyActive(lease) => lease,
-                    ActivationOutcome::Busy(_) => panic!("fixture activation was busy"),
-                };
-                ClaimOptions {
-                    owner: lease.owner,
-                    now: UtcMillis::new(1),
-                    lease_until: UtcMillis::new(2),
-                    limit: NonZeroUsize::MIN,
-                }
-            })
-    })
+    let program = (|| -> Result<_, String> {
+        let namespace = KeyNamespace::<ProviderDomain>::new("cluster")
+            .map_err(|error| format!("cluster namespace: {error:?}"))?;
+        let address = ClusterAddress {
+            entity_type: ClusterEntityType::new("provider-entity")
+                .map_err(|error| format!("entity type: {error:?}"))?,
+            entity: ClusterEntityId::from_stable(event_key(&namespace, "entity")?),
+            shard: ClusterShardId::from_stable(event_key(&namespace, "shard")?),
+        };
+        let request = AcceptedRequest {
+            address: address.clone(),
+            id: ClusterRequestId::from_stable(event_key(&namespace, "request")?),
+            payload: Arc::from(&b"provider-message"[..]),
+            idempotency_key: None,
+            accepted_at: UtcMillis::new(1),
+            policy: AcceptancePolicy {
+                dedup_retention: Duration::ZERO,
+                reply_retention: Duration::ZERO,
+                payload_conflict: PayloadConflictPolicy::Reject,
+                maximum_attempts: NonZeroU32::MIN,
+            },
+        };
+        let activation = ActivationId::from_stable(event_key(&namespace, "activation")?);
+        Ok(effect! {
+        bind;
+        program: store.accept(request),
+        body: move |_| {
+                   effect! {
+        bind;
+        program: store
+                       .activate(
+                           address.clone(),
+                           activation.clone(),
+                           UtcMillis::new(1),
+                           UtcMillis::new(3),
+                       ),
+        body: |outcome| {
+                           let lease = match outcome {
+                               ActivationOutcome::Activated { lease, .. }
+                               | ActivationOutcome::AlreadyActive(lease) => lease,
+                               ActivationOutcome::Busy(_) => {
+                                   return effect_die! { defect: Defect::new("fixture activation was busy"), };
+                               }
+                           };
+                           effect_sync! { once; body: move || ClaimOptions {
+                               owner: lease.owner,
+                               now: UtcMillis::new(1),
+                               lease_until: UtcMillis::new(2),
+                               limit: NonZeroUsize::MIN,
+                           }, }
+                       },
+        }
+               },
+        })
+    })();
+    match program {
+        Ok(program) => program,
+        Err(error) => effect_die! { defect: Defect::new(error), },
+    }
 }
 
 type ClusterCpuError = ClusterRunnerError<ClusterStoreError, (), std::convert::Infallible>;
@@ -1249,6 +1486,7 @@ where
     ClusterRunner::run_once(claim, NonZeroUsize::MIN)
 }
 
+#[must_use]
 pub fn completed_cluster_run(outcomes: &[Result<ClusterRunOutcome, ClusterCpuError>]) -> bool {
     matches!(
         outcomes,
@@ -1263,14 +1501,20 @@ pub fn monotonic_timer<R>(duration: Duration) -> Effect<Duration, (), R>
 where
     R: HasClock + Send + Sync + 'static,
 {
-    Effect::<(), (), R>::sleep(duration).flat_map(|_| Effect::<Duration, (), R>::clock_now())
+    effect! {
+    bind;
+    program: Effect::<(), (), R>::sleep(duration),
+    body: |_| Effect::<Duration, (), R>::clock_now(),
+    }
 }
 
 fn replica_permit(batch: &effect::eventlog::ReplicaBatch) -> effect::eventlog::ReplicaImportPermit {
-    effect::eventlog::ReplicaImportPermit::authorize(
+    match effect::eventlog::ReplicaImportPermit::authorize(
         batch.source().clone(),
         batch.stream().clone(),
         |_, _| Ok::<(), std::convert::Infallible>(()),
-    )
-    .expect("fixture explicitly permits its own replica identity")
+    ) {
+        Ok(permit) => permit,
+        Err(infallible) => match infallible {},
+    }
 }

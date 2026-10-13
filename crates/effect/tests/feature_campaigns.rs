@@ -4,9 +4,12 @@ use effect::{
     SchemaIssue, SchemaIssueKind, SchemaShape, UnknownFields, export_json_schema, json_bool,
     json_i64, json_option, json_string,
 };
+use effect::{codec, effect_schema_parse};
 use futures_executor::block_on;
+use serde_json::json;
 #[path = "support/campaign_report.rs"]
 mod campaign_report;
+use std::io::Write;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
@@ -23,33 +26,33 @@ fn invalid_list() -> SchemaIssue {
     })
 }
 
-fn list_codec() -> PureCodec<List, JsonValue> {
-    PureCodec::recursive(
-        "campaign-list",
-        |_| SchemaShape::Opaque,
-        |self_codec| {
-            let decode_tail = self_codec.clone();
-            Ok(PureCodec::new(
-                move |encoded| match encoded {
-                    JsonValue::Array(items) if items.is_empty() => Ok(List::Nil),
-                    JsonValue::Array(items) if items.len() == 2 => {
-                        let head = json_i64().decode_ref(&items[0])?;
-                        let tail = decode_tail.decode_ref(&items[1])?;
-                        Ok(List::Cons(head, Box::new(tail)))
-                    }
-                    _ => Err(invalid_list()),
-                },
-                move |value| match value {
-                    List::Nil => Ok(JsonValue::Array(Vec::new())),
-                    List::Cons(head, tail) => Ok(JsonValue::Array(vec![
-                        json_i64().encode_ref(head)?,
-                        self_codec.encode_ref(tail)?,
-                    ])),
-                },
-            ))
-        },
-    )
-    .expect("recursive campaign codec")
+fn list_codec() -> Result<PureCodec<List, JsonValue>, SchemaIssue> {
+    codec! { recursive_pure; name: "campaign-list", shape: |_| SchemaShape::Opaque, build: |self_codec| {
+        let decode_tail = self_codec.clone();
+        Ok(codec! { pure; decode: move |encoded| match encoded {
+                JsonValue::Array(items) if items.is_empty() => Ok(List::Nil),
+                JsonValue::Array(items) if items.len() == 2 => {
+                    let [head, tail] = items.as_slice() else {
+                        return Err(invalid_list());
+                    };
+                    let head = json_i64().decode_ref(head)?;
+                    let tail = decode_tail.decode_ref(tail)?;
+                    Ok(List::Cons(head, Box::new(tail)))
+                }
+                JsonValue::Array(_)
+                | JsonValue::Null
+                | JsonValue::Bool(_)
+                | JsonValue::Number(_)
+                | JsonValue::String(_)
+                | JsonValue::Object(_) => Err(invalid_list()),
+            }, encode: move |value| match value {
+                List::Nil => Ok(JsonValue::Array(Vec::new())),
+                List::Cons(head, tail) => Ok(JsonValue::Array(vec![
+                    json_i64().encode_ref(head)?,
+                    self_codec.encode_ref(tail)?,
+                ])),
+            }, })
+    }, }
 }
 
 // Xorshift64 is a specified, reproducible input generator. The seed and
@@ -61,29 +64,32 @@ fn next(state: &mut u64) -> u64 {
     *state
 }
 
-fn config_number(root: &JsonValue, path: &[&str]) -> usize {
+fn config_number(root: &JsonValue, path: &[&str]) -> Result<usize, String> {
     path.iter()
-        .fold(root, |value, key| {
+        .try_fold(root, |value, key| {
             value
                 .get(*key)
-                .unwrap_or_else(|| panic!("missing campaign configuration key {key}"))
-        })
+                .ok_or_else(|| format!("missing campaign configuration key {key}"))
+        })?
         .as_u64()
         .and_then(|value| usize::try_from(value).ok())
-        .expect("positive campaign configuration integer")
+        .ok_or_else(|| format!("campaign integer: {path:?}"))
 }
 
 struct DecodeEnvironment;
 struct EncodeEnvironment;
 struct AlternateDecodeEnvironment;
 
-fn run_first_use_contention(config: &JsonValue, policy: ParsePolicy) {
-    let callers = config_number(config, &["campaigns", "schema_first_use", "callers"]);
-    let rounds = config_number(config, &["campaigns", "schema_first_use", "rounds"]);
+fn run_first_use_contention(
+    config: &JsonValue,
+    policy: ParsePolicy,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let callers = config_number(config, &["campaigns", "schema_first_use", "callers"])?;
+    let rounds = config_number(config, &["campaigns", "schema_first_use", "rounds"])?;
     assert!(callers >= 2 && rounds >= 2);
-    let values = list_codec();
+    let values = list_codec()?;
     let schemas: Vec<_> = (0..rounds)
-        .map(|_| {
+        .map(|_| -> Result<_, SchemaIssue> {
             let ast = SchemaAst::recursive("first-use-list", |reference| {
                 SchemaShape::Union(vec![
                     SchemaAst::new(SchemaShape::Tuple(Vec::new())),
@@ -92,25 +98,20 @@ fn run_first_use_contention(config: &JsonValue, policy: ParsePolicy) {
                         SchemaAst::new(SchemaShape::Reference(reference)),
                     ])),
                 ])
-            })
-            .expect("recursive first-use schema");
+            })?;
             let decode = values.clone();
             let encode = values.clone();
-            let codec = PureCodec::with_ast(
-                ast,
-                move |input| decode.decode_ref(input),
-                move |value| encode.encode_ref(value),
-            );
-            (
+            let codec = codec! { pure; ast: ast, decode: move |input| decode.decode_ref(input), encode: move |value| encode.encode_ref(value), };
+            Ok((
                 codec
                     .into_effect::<DecodeEnvironment, EncodeEnvironment>()
                     .as_effect_schema(),
                 codec
                     .into_effect::<AlternateDecodeEnvironment, EncodeEnvironment>()
                     .as_effect_schema(),
-            )
+            ))
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
     let start = Arc::new(Barrier::new(callers));
     std::thread::scope(|scope| {
         for caller in 0..callers {
@@ -123,14 +124,12 @@ fn run_first_use_contention(config: &JsonValue, policy: ParsePolicy) {
                     start.wait();
                     let result = if caller % 2 == 0 {
                         block_on(
-                            first
-                                .parse("[]", policy)
+                            effect_schema_parse! { codec: first, text: "[]", policy: policy, }
                                 .run(Arc::clone(&first_environment)),
                         )
                     } else {
                         block_on(
-                            alternate
-                                .parse("[]", policy)
+                            effect_schema_parse! { codec: alternate, text: "[]", policy: policy, }
                                 .run(Arc::clone(&alternate_environment)),
                         )
                     };
@@ -144,20 +143,24 @@ fn run_first_use_contention(config: &JsonValue, policy: ParsePolicy) {
         nodes: policy.limits.nodes,
         definitions: NonZeroUsize::MIN,
     };
-    let recursive_document = export_json_schema(schemas[0].0.ast(), export_limits)
-        .expect("recursive schema exports with an explicit definition budget");
+    let first = schemas.first().ok_or("missing first-use schema")?;
+    let recursive_document = export_json_schema(first.0.ast(), export_limits)
+        .map_err(|error| format!("recursive schema export: {error:?}"))?;
     assert_eq!(
         recursive_document.precision(),
         RepresentationPrecision::Approximate
     );
     assert!(
-        recursive_document.value()["$defs"]
+        recursive_document
+            .value()
+            .get("$defs")
+            .ok_or("missing definitions")?
             .get("first-use-list")
             .is_some()
     );
     assert!(matches!(
         export_json_schema(
-            schemas[0].0.ast(),
+            first.0.ast(),
             RepresentationLimits {
                 nodes: NonZeroUsize::MIN,
                 ..export_limits
@@ -166,38 +169,41 @@ fn run_first_use_contention(config: &JsonValue, policy: ParsePolicy) {
         Err(RepresentationError::NodeLimit)
     ));
     let boolean_document = export_json_schema(json_bool().ast(), export_limits)
-        .expect("primitive boolean schema exports exactly");
+        .map_err(|error| format!("boolean schema export: {error:?}"))?;
     assert_eq!(boolean_document.precision(), RepresentationPrecision::Exact);
-    assert_eq!(boolean_document.value()["type"], JsonValue::from("boolean"));
-    eprintln!(
-        "schema first-use contention completed {rounds} rounds with {callers} callers across two environment types"
+    assert_eq!(
+        boolean_document.value().get("type"),
+        Some(&JsonValue::from("boolean"))
     );
+    writeln!(
+        std::io::stderr().lock(),
+        "schema first-use contention completed {rounds} rounds with {callers} callers across two environment types"
+    )?;
+    Ok(())
 }
 
 #[test]
-fn schema_generation_configured_seeds_and_boundary_corpus() {
+fn schema_generation_configured_seeds_and_boundary_corpus() -> Result<(), Box<dyn std::error::Error>>
+{
     let configured = std::env::var_os("EFFECT_CAMPAIGN_CONFIG")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/feature_campaigns.json")
         });
-    let config: JsonValue = std::fs::read_to_string(configured)
-        .expect("campaign configuration is readable")
-        .parse()
-        .expect("valid campaign configuration");
-    let seed = config_number(&config, &["seed"]);
-    let samples = config_number(&config, &["campaigns", "schema", "seeds"]);
-    let bytes = config_number(&config, &["budgets", "bytes"]);
-    let depth = config_number(&config, &["budgets", "depth"]);
-    let width = config_number(&config, &["budgets", "width"]);
+    let config: JsonValue = std::fs::read_to_string(configured)?.parse()?;
+    let seed = config_number(&config, &["seed"])?;
+    let samples = config_number(&config, &["campaigns", "schema", "seeds"])?;
+    let bytes = config_number(&config, &["budgets", "bytes"])?;
+    let depth = config_number(&config, &["budgets", "depth"])?;
+    let width = config_number(&config, &["budgets", "width"])?;
     assert!(seed > 0 && samples >= 1000 && bytes >= 2 && depth > 1 && width > 0);
     let limits = ParseLimits {
-        bytes: NonZeroUsize::new(bytes).expect("byte budget"),
-        depth: NonZeroUsize::new(depth).expect("depth budget"),
-        nodes: NonZeroUsize::new(config_number(&config, &["budgets", "steps"]))
-            .expect("node budget"),
-        collection: NonZeroUsize::new(width).expect("collection budget"),
-        issues: NonZeroUsize::new(width).expect("issue budget"),
+        bytes: NonZeroUsize::new(bytes).ok_or("zero byte budget")?,
+        depth: NonZeroUsize::new(depth).ok_or("zero depth budget")?,
+        nodes: NonZeroUsize::new(config_number(&config, &["budgets", "steps"])?)
+            .ok_or("zero node budget")?,
+        collection: NonZeroUsize::new(width).ok_or("zero collection budget")?,
+        issues: NonZeroUsize::new(width).ok_or("zero issue budget")?,
     };
     let policy = ParsePolicy {
         limits,
@@ -212,52 +218,36 @@ fn schema_generation_configured_seeds_and_boundary_corpus() {
         callback_witness.fetch_add(1, Ordering::SeqCst);
         true
     });
-    let recursive = list_codec();
+    let recursive = list_codec()?;
     let shared = recursive.clone();
-    let optional = json_option(numbers.clone(), "kind", "value", "some", "none", policy)
-        .expect("option campaign codec");
+    let optional = json_option(numbers.clone(), "kind", "value", "some", "none", policy)?;
     let directional = numbers
         .clone()
         .into_effect::<DecodeEnvironment, EncodeEnvironment>();
     let mut generator = seed as u64;
     for _ in 0..samples {
         let value = next(&mut generator) as i64;
-        let encoded = numbers.encode_ref(&value).expect("encode integer");
-        assert_eq!(numbers.decode_ref(&encoded).expect("decode integer"), value);
-        let checked_value = checked.encode_ref(&value).expect("encode checked integer");
-        assert_eq!(
-            checked
-                .decode_ref(&checked_value)
-                .expect("decode checked integer"),
-            value
-        );
+        let encoded = numbers.encode_ref(&value)?;
+        assert_eq!(numbers.decode_ref(&encoded)?, value);
+        let checked_value = checked.encode_ref(&value)?;
+        assert_eq!(checked.decode_ref(&checked_value)?, value);
         assert!(numbers.decode_ref(&JsonValue::Bool(true)).is_err());
         let option = if next(&mut generator) & 1 == 0 {
             Some(value)
         } else {
             None
         };
-        let encoded_option = optional.encode_ref(&option).expect("encode option");
-        assert_eq!(
-            optional.decode_ref(&encoded_option).expect("decode option"),
-            option
-        );
+        let encoded_option = optional.encode_ref(&option)?;
+        assert_eq!(optional.decode_ref(&encoded_option)?, option);
         let length = next(&mut generator) as usize % width.min(depth);
         let mut list = List::Nil;
         for _ in 0..length {
             list = List::Cons(value, Box::new(list));
         }
-        let encoded_list = recursive.encode_ref(&list).expect("encode recursive list");
+        let encoded_list = recursive.encode_ref(&list)?;
+        assert_eq!(shared.decode_ref(&encoded_list)?, list);
         assert_eq!(
-            shared
-                .decode_ref(&encoded_list)
-                .expect("decode shared list"),
-            list
-        );
-        assert_eq!(
-            recursive
-                .parse_str(&encoded_list.to_string(), policy)
-                .expect("parse recursive list"),
+            recursive.parse_str(&encoded_list.to_string(), policy)?,
             list
         );
         assert!(matches!(block_on(directional.decode_once(encoded.clone())
@@ -270,14 +260,18 @@ fn schema_generation_configured_seeds_and_boundary_corpus() {
     assert!(json_string().parse_str(&exact, policy).is_ok());
     let oversized = format!("\"{}\"", "a".repeat(bytes - 1));
     assert!(json_string().parse_str(&oversized, policy).is_err());
-    run_first_use_contention(&config, policy);
+    run_first_use_contention(&config, policy)?;
     campaign_report::completed(
         "schema",
-        serde_json::json!({
+        json!({
             "seeds": samples,
-            "callers": config_number(&config, &["campaigns", "schema_first_use", "callers"]),
-            "rounds": config_number(&config, &["campaigns", "schema_first_use", "rounds"]),
+            "callers": config_number(&config, &["campaigns", "schema_first_use", "callers"])?,
+            "rounds": config_number(&config, &["campaigns", "schema_first_use", "rounds"])?,
         }),
-    );
-    eprintln!("schema campaign completed {samples} configured seeds and byte-limit boundaries");
+    )?;
+    writeln!(
+        std::io::stderr().lock(),
+        "schema campaign completed {samples} configured seeds and byte-limit boundaries"
+    )?;
+    Ok(())
 }

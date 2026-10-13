@@ -2,6 +2,7 @@
 
 use super::{Atom, AtomError};
 use crate::{Effect, Exit, HasWallClock, Semaphore, SemaphoreError, UtcMillis, WallClock};
+use crate::{effect, effect_map, effect_map_error, effect_resource, effect_sync};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -117,21 +118,17 @@ where
         force: bool,
     ) -> Effect<bool, AtomCacheError<E, <R::Clock as WallClock>::Error>, R> {
         let cache = self.clone();
-        self.refresh_gate
-            .acquire(NonZeroUsize::MIN)
-            .map_error(AtomCacheError::Admission)
-            .flat_map(move |permit| {
+        {
+            let __dsl_program = effect_map_error! { program: self.refresh_gate
+            .acquire(NonZeroUsize::MIN), map: AtomCacheError::Admission, };
+            effect! { let __dsl_program = __dsl_program.clone(); let cache = cache.clone(); let permit = __dsl_program.clone()?; {
                 let cache = cache.clone();
-                let action = Effect::wall_now()
-                    .map_error(AtomCacheError::Clock)
-                    .flat_map(move |now| {
+                let action = { let __dsl_program = effect_map_error! { program: Effect::wall_now(), map: AtomCacheError::Clock, }; effect! { let __dsl_program = __dsl_program.clone(); let cache = cache.clone(); let now = __dsl_program.clone()?; {
                         let cache = cache.clone();
                         let cache_for_status = cache.clone();
-                        cache
+                        { let __dsl_program = effect_map_error! { program: cache
                             .atom
-                            .read()
-                            .map_error(AtomCacheError::Atom)
-                            .flat_map(move |status| {
+                            .read(), map: AtomCacheError::Atom, }; effect! { let __dsl_program = __dsl_program.clone(); let cache_for_status = cache_for_status.clone(); let status = __dsl_program.clone()?; (move || {
                                 let cache = cache_for_status.clone();
                                 let cached = *cache
                                     .successful_at
@@ -147,22 +144,18 @@ where
                                             .is_current(cache.atom.id(), generation)
                                 });
                                 if fresh && !force {
-                                    return Effect::sync(|| false);
+                                    return effect_sync! { body: || false, };
                                 }
                                 let cache_after = cache.clone();
                                 let cache_for_settled = cache.clone();
-                                cache
+                                { let __dsl_program = { let __dsl_program = effect_map_error! { program: cache
                                     .atom
-                                    .refresh()
-                                    .map_error(AtomCacheError::Atom)
-                                    .flat_map(move |_| {
-                                        cache_after.atom.read().map_error(AtomCacheError::Atom)
-                                    })
-                                    .flat_map(move |settled| {
+                                    .refresh(), map: AtomCacheError::Atom, }; effect! { let cache_after = cache_after.clone(); let _ = __dsl_program.clone()?; {
+                                        effect_map_error! { program: cache_after.atom.read(), map: AtomCacheError::Atom, }
+                                    }? } }; effect! { let cache_for_settled = cache_for_settled.clone(); let settled = __dsl_program.clone()?; {
                                         let cache = cache_for_settled.clone();
                                         let cache_for_update = cache.clone();
-                                        Effect::wall_now().map_error(AtomCacheError::Clock).map(
-                                            move |finished_at| {
+                                        effect_map! { program: effect_map_error! { program: Effect::wall_now(), map: AtomCacheError::Clock, }, map: move |finished_at| {
                                                 if let Some(generation) = settled.generation()
                                                     && matches!(
                                                         settled.outcome(),
@@ -181,12 +174,12 @@ where
                                                         ) = Some((generation, finished_at));
                                                 }
                                                 true
-                                            },
-                                        )
-                                    })
-                            })
-                    });
-                action.ensuring(Effect::sync_once(move || drop(permit)))
-            })
+                                            }, }
+                                    }? } }
+                            })()? } }
+                    }? } };
+                { let __dsl_program = action; let __dsl_cleanup = effect_sync! { once; body: move || drop(permit), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } }
+            }? }
+        }
     }
 }

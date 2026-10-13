@@ -79,7 +79,7 @@ its next step; application payloads are moved.
 
 ## Composable domain blocks
 
-The crate exports 37 procedural macros. Each domain retains a typed execution
+The crate exposes typed computation and domain macros plus named callback blocks. Each domain retains a typed execution
 boundary and uses the same `Effect<A, E, R>` kernel and environment capabilities.
 `yield_from!` is a local marker consumed inside `stream!`.
 
@@ -148,8 +148,8 @@ lazily. Durable coordination supports deterministic `for` iteration; unbounded
 
 ## Runnable café stories
 
-Start with a customer or staff task below. Run any story with
-`cargo +1.99.0 run --locked -p effect --example NAME`.
+Start with a customer or staff task below. The [example build/run guide](examples/README.md)
+provides explicit commands for all 15 targets, including file setup and supported modes.
 Each file introduces its own café models and reads as one recipe with direct `?`
 binds and one execution boundary in `main`. Prices use integral cents and are
 printed as dollars. `CoffeeOrder`, `Basket`, `Receipt`, and the other café models
@@ -170,39 +170,36 @@ interiors are not traversed. Run the focused check with
 The same check runs with `cargo test -p effect-macros`; stable rustfmt does not
 currently enforce this custom macro-input rule.
 
-| Story | What happens |
-| --- | --- |
-| [browse_cafe_menu](examples/browse_cafe_menu.rs) | Maya compares espresso drinks and dairy choices, sees prices, and gets the refreshed oat-latte price after the menu board changes. |
-| [save_coffee_order](examples/save_coffee_order.rs) | Maya corrects an invalid quantity, selects oat milk, adds a note, and reloads her saved order with the café's defaults. |
-| [live_coffee_basket](examples/live_coffee_basket.rs) | Adding two oat lattes and an americano gives $12.75; removing one latte gives $8.00. Maya reserves both drinks together and restores her saved basket. |
-| [track_coffee_order](examples/track_coffee_order.rs) | Maya places ticket 104, looks it up, and sees accepted, preparing, and ready statuses. Sam's staff session remains acquired through connection cleanup. |
-| [prepare_coffee_orders](examples/prepare_coffee_orders.rs) | Sam prepares Maya's drinks once, retrieves the recorded pickup result, makes Lee's counter order, and takes Nora's queued ticket. |
-| [close_coffee_shop](examples/close_coffee_shop.rs) | Sam opens Maya's pickup pad for its owned activation, inspects the counter, and completes the daily closing sheet under one lease at 17:00 UTC. |
-| [coffee_shop_receipts](examples/coffee_shop_receipts.rs) | Maya and Lee receive receipts. Sam reconstructs the receipt book and daily sales: two receipts, three drinks, $12.75. |
+| Task | Concrete input and useful output | Main DSL role |
+| --- | --- | --- |
+| [Browse the menu](examples/browse_cafe_menu.rs) | Three drinks priced in cents; Maya identifies dairy and confirms her oat-latte price. | Stream choices, select the board, retain the visit menu in a scoped cache. |
+| [Publish a price change](examples/update_menu_prices.rs) | Oat latte changes from 475 to 500 cents; the same live visit owner still returns Maya's accepted 475-cent quote. | Dependency invalidation and weak-key quote retention. |
+| [Save a corrected order](examples/save_coffee_order.rs) | Quantity 0 is corrected to two oat lattes; the saved note and quantity reload intact. | Configured directional codecs, validation and persistence. |
+| [Check out a basket](examples/live_coffee_basket.rs) | Totals change from $12.75 to $8.00; stock reservation is atomic, excessive demand leaves stock unchanged, and the saved basket restores. | Tracked totals, stock transactions, query snapshots and hydration. |
+| [Place an order](examples/place_coffee_order.rs) | A padded pickup name and two cups become accepted ticket 104 and a typed RPC response. | Request middleware, a selected desk and unary protocol dispatch. |
+| [Follow recorded order history](examples/track_coffee_order.rs) | Ticket 104's supplied stages become accepted/preparing/ready messages with its recorded cup count. | Streaming protocol, middleware and scoped transport close. |
+| [Read phone messages](examples/phone_order_status.rs) | A supplied finite native status feed is consumed through peer close. Add `-- --accepted` for an already accepted socket. | Checked socket ownership and pull-driven consumption. |
+| [Issue recorded pickup labels](examples/prepare_coffee_orders.rs) | Maya's two-cup request issues labels once; the same recorded pickup is returned twice. | Workflow/activity recording and replay. |
+| [Deliver one queued ticket](examples/queue_coffee_orders.rs) | Nora's ticket 106 produces pickup instructions and acknowledgement; the next claim is empty. | Persisted queue, durable delivery and recorded result. |
+| [Resolve pickup tickets](examples/resolve_pickup_tickets.rs) | Stored tickets 104/105 return their customer/cup data; 999 returns UnknownTicket. | Batched resolver requests with ordered per-request outcomes. |
+| [Return a cancelled reservation](examples/reserve_cancelled_order.rs) | Stock 8 becomes 6 after reserving two cups, then 8 after compensation; replay leaves it at 8. | Atomic stock modification and recorded compensation. |
+| [File the closing checklist](examples/close_coffee_shop.rs) | Ticket 104's recorded two cups appear in the inspection and scheduled 17:00 UTC checklist. | Resource-aware addressed entities, calendar planning and a closing lease. |
+| [Issue receipts and total sales](examples/coffee_shop_receipts.rs) | Maya/Lee receive 950/325-cent receipts; the default view reports three cups/$12.75. `-- --book` selects the detailed receipt book. | Journal commits and raw/typed projection views. |
+| [Export customer totals](examples/export_receipts.rs) | Caller-supplied counter/mobile CSV batches become sorted customer totals in a new output file. | Bounded borrowed/shared traversal, blocking file I/O and CPU aggregation. |
+| [Append the receipt book](examples/write_receipt_book.rs) | Two receipt rows go into a caller-named new CSV, then the file is flushed and closed. | Pooled file ownership and per-outlet admission. |
 
-The stories cover all 37 procedural macros and stream delegation. The following
-index points to the story that makes each form useful, rather than introducing
-another set of implementation examples.
+Examples share [native provider wiring](examples/cafe_support/mod.rs),
+[transport mechanics](examples/cafe_support/transport.rs), and small domain
+modules for menu data and ticket codecs. Their business recipes remain in the
+named entry files. Core examples use in-memory journals/stores and do not persist
+across restarts. Export and receipt-book examples use the actual files selected
+by the caller; neither collects a payment or sends a notification.
 
-| Story | DSL forms used |
-| --- | --- |
-| Menu | `effect!`; `span!` inline/existing recipes and annotations; `service!` selected services, handles, projections and typed errors; `stream!` resource/effect binds, `yield_from!`; `cache!` inline/borrowed helper loaders; `dependency_cache!` loaders and menu invalidation. |
-| Saved order | `schema!` pure/native optional/default fields; `schema_enum!` unit, tuple and named drink variants; `persistable!` typed save/reload. |
-| Basket | `transaction!` and `atomically`; `atom!` extracted tracked helper; `reactive_source!`; `reactive_derived!` program/callback views; `reactive_query!` stock lifecycle; `reactive_bridge!` display snapshot/changes; `hydration!` saved basket export/import. |
-| Tracking | `rpc_operation!`, `rpc_stream_operation!` descriptions and inline/helper handlers; `rpc_protocol!` unary/grouped endpoints; `rpc_stream_protocol!`; `rpc_middleware!` customer checks and staff acquisition/application; `rpc_stream_middleware!` status callbacks and full scoped serving. |
-| Preparation | `workflow!` inline/body/helper coordination; `activity!` inline/description/helper preparation; `workflow_definition!`, `activity_definition!` used in execution; `persisted_queue!`, `durable_queue!` admission, delivery, recorded pickup result and acknowledgement. |
-| Closing | `entity_resource!` extracted pickup-pad helper; `entity!` resource-aware/legacy registration; `cluster!` checked catalog and addressed activation; `singleton!` closing responsibility; `cluster_schedule!` bounded calendar planning. |
-| Receipts | `event!` ordinary/aggregate definitions; `handled_event!` explicit aggregate/context handlers; `event_group!` ordinary/handled definition views; `projection!` raw receipt decoding and typed sales cases. |
-
-[Provider support](examples/cafe_support/mod.rs) contains only runtime and storage
-wiring: bounded in-memory stores, deterministic clocks, tracing, and application
-workers. Task, CPU, and blocking capabilities use distinct concrete provider
-types selected through `R`; the core selects no executor. The stores retain
-recorded values and ownership rules within one process and do not survive a
-restart. The existing `futures-executor` development dependency drives the outer
-boundary. [Transport support](examples/cafe_support/transport.rs) owns finite
-local RPC frame/producer mechanics. None of these stories uses a network,
-collects a payment, or sends a message.
+For file examples, supply the declared paths after `--`. Receipt export accepts
+`COUNTER.csv MOBILE.csv OUTPUT.csv`; input rows are
+`ticket,customer,cups,unit_cents` without a header or quoted commas. For
+`104,Maya,2,475` and `105,Lee,1,325`, output is `Lee,325` then `Maya,950`.
+Output files must not already exist.
 
 ## Values, captures, and reuse
 
@@ -698,27 +695,35 @@ initial sleeper by driving its program before advancing. Virtual advancement
 awaits continuation progress to the next native wait or outcome; it does not
 represent CPU preemption or completion of unrelated application work.
 
-`Schema` decodes borrowed JSON into owned values or structured application
-errors. Parsing maps syntax errors separately. No derivation system or extra
-format is implied. A reusable schema can be shared across boundaries:
+Directional `Codec` descriptions keep decode and encode environments separate.
+A configured codec prepares metadata once and supplies fresh context/budgets for
+parsing. The following recipe reuses one explicit text envelope for its resource
+bounds; schema errors remain typed throughout the Effect.
 
 ```rust
-use effect::{effect, Effect, Exit, Schema};
+use effect::*;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
-#[derive(Debug)] enum Validation { Syntax, ExpectedInteger }
-let schema = Schema::from_decoder(|json| json.as_i64().ok_or(Validation::ExpectedInteger));
-let program: Effect<i64, Validation> = effect! {
-    let schema = schema.clone();
+let bytes = NonZeroUsize::new(4096).unwrap();
+let depth = NonZeroUsize::new(16).unwrap();
+let parse = ParsePolicy {
+    limits: ParseLimits { bytes, depth, nodes: NonZeroUsize::new(128).unwrap(), collection: NonZeroUsize::new(128).unwrap(), issues: NonZeroUsize::new(8).unwrap() },
+    errors: SchemaErrorMode::First, unknown_fields: UnknownFields::Reject, duplicate_fields: DuplicateFields::Reject,
+};
+// JSON nesting follows the schema envelope; scalar and digit counts follow
+// input bytes. Pattern search uses an explicit work budget from that envelope.
+let codec = Arc::new(json_i64().into_effect::<(), ()>().configured(SchemaPolicy {
+    parse, json_depth: depth, string_length: bytes, integer_digits: bytes, pattern_steps: bytes,
+}).unwrap());
+let program: Effect<i64, SchemaIssue> = effect! {
+    let codec = codec.clone();
     let mut total = 0;
     for text in ["20", "22"] {
-        let value = schema.parse(text, |_| Validation::Syntax)?;
-        total = Effect::sync_once(move || total + value)?;
+        total += effect_schema_parse! { codec: codec.as_ref(), text: text }?;
     }
     total
 };
-# futures_executor::block_on(async {
-assert!(matches!(program.run(Arc::new(())).await, Exit::Success(42)));
-# });
+assert!(matches!(futures_executor::block_on(program.run(Arc::new(()))), Exit::Success(42)));
 ```
 
 `Layer` constructs dependencies within a scope and provides their environment
@@ -930,32 +935,278 @@ Server and Identity finish their demonstrated workflow and exit. Web and OTel
 serve until Ctrl-C; their outer owners then join host/resource and provider
 shutdown. Run from the workspace root on Rust 1.99:
 
-| Consumer | DSL families and demonstrated forms |
+| Task | Input, outcome and DSL role |
 | --- | --- |
-| [Save/load an order](../effect_sql/examples/cafe_orders.rs) | D02 `sql!`: identifier and bound parameter; D03 `sql_insert!`: moved order fields; D04 `sql_update!`: assignments with a typed guard; D05 `row!`: native columns, refinement and strict boolean decoding; D06 `sql_with!`: inline select/handle bodies, extracted `run` helper and `effect` with `project`. |
-| [Serve café orders](../effect_server/examples/serve_cafe_orders.rs) | D07 `server!`: policy, typed request binding, listener and protocols; D08 `endpoint!`: inline authorized/traced body, extracted Effect and explicit R/error projection; D09 `registered!`: health metadata/anonymous policy; D10 `reply!`: status, validators and negotiated body; D11 `representations!`: direct JSON codec and HTML renderer; D12 `route!`: typed order capture and reverse link; D13 `router!`: method mounting; D14 `routes!`: extracted route inclusion; D15 `pipeline!`: inline traced `before`, extracted `on_exit` and response header. |
-| [Customer account](../effect_server_identity/examples/customer_account.rs) | D17 `identity_store!`: selected SQLx and auxiliary stores; D18 `identity!`: native components, policies and typed errors; D19 `identity_endpoints!`: ten semantic groups, custom routes and extracted handlers, consumed by a finite `server!` cookie-login/account-view exchange. |
-| [Café application](../effect_server_web/examples/cafe_application.rs) | D20 `web!`: inline startup and extracted request projection; D21 `security!`: native authentication/authorization and response policy; D22 `csp!`: typed directives and response nonce; D23 `read_through!`: inline menu loader; D24 `dependent_read_through!`: extracted seasonal loader and dependency equality; D25 `availability!`: database readiness and process liveness; D26 `message_arguments!`: typed customer argument; D27 `localization!`: catalogue, culture selection and reload. |
-| [Watch order progress](../effect_otel/examples/watch_order_progress.rs) | D01 `otel!`: inline update body and extracted preparation/ready Effects; D16 Server `stream!`: core source with inline/extracted writers or an owned body Effect, awaiting SSE write/flush (exported by the shared registry as `server_stream!`). |
+| [Correct a saved price](../effect_sql/examples/cafe_orders.rs) | Enter a flat white at 400 cents, correct it to 425, then reload `ready=false`. SQL statement/row blocks preserve bound values, strict decoding and the transaction owner. |
+| [Retrieve a saved order](../effect_server/examples/serve_cafe_orders.rs) | Customer 7 requests saved order 42; the finite native HTTP exchange prints authorized HTML and JSON. Endpoint, representation, route and pipeline blocks retain request/body ownership. |
+| [Save a receipt preference](../effect_server_identity/examples/customer_account.rs) | Register a fresh Maya alias, verify its password with native Identity, then save/reload `email_receipts=true`. Store/component blocks select the real SQLx store and native security policies. |
+| [Sign in and collect an order](../effect_server_web/examples/README.md) | Open the local café page, sign in through native Identity, view your own ready order and confirm collection. Owner-bound SQL records collection once and retains Collected on reload; the public menu and operational probes remain available. |
+| [Replay a recorded timeline](../effect_otel/examples/watch_order_progress.rs) | Caller-provided `elapsed_ms,status` records become SSE updates with native spans. Choose one inline, extracted or body writer; Ctrl-C joins host/provider cleanup. |
+| [Wait for either outlet](../effect_otel/examples/await_pickup.rs) | Two actual ticket-status files show current availability, then identify the first ready outlet or return a wait-window error. Native I/O, concurrent snapshots, polling/retry schedules, race and timeout use the existing Tokio providers. |
 
 ```sh
 DATABASE_URL=turso::memory: cargo +1.99.0 run -p effect-sql --features turso,macros --example cafe_orders
 CAFE_CHUNK_BYTES=4096 CAFE_JSON_BYTES=1024 CAFE_DRAIN_MS=3000 CAFE_TELEMETRY_CAPACITY=32 cargo +1.99.0 run -p effect-server --example serve_cafe_orders
-cargo +1.99.0 run -p effect-server-identity --features sqlx-turso --example customer_account
-cargo +1.99.0 run -p effect-server-web --features identity,otel,sqlx-turso --example cafe_application
-cargo +1.99.0 run -p effect-otel --features server --example watch_order_progress -- 127.0.0.1:8080 400 256 32 32 16 8 5000
+CAFE_DATABASE=target/receipt-accounts.db cargo +1.99.0 run -p effect-server-identity --features sqlx-turso --example customer_account
+cargo +1.99.0 run -p effect-otel --features server --example watch_order_progress -- 127.0.0.1:8080 HISTORY.csv 256 32 32 16 8 5000 inline
+cargo +1.99.0 run -p effect-otel --features server --example await_pickup -- NORTH.status SOUTH.status 2000 20
 ```
 
-Identity requires the environment inputs listed in its linked source, including
-the selected database and native key XML. Web's inputs and catalogue/key file
-selection are documented in [cafe_host](../effect_server_web/examples/cafe_host/mod.rs).
-Set those inputs and supply the selected native XML/catalogue files before
-running. Web serves `/menu`, cookie-authorized `/pickup` and availability
-on `CAFE_LISTEN`. OTel's positional inputs are listener address, preparation
-milliseconds, SSE frame/cursor bytes, active span slots, metric descriptors,
-label sets per descriptor and shared drain/SDK-shutdown milliseconds. Capacities
-and the drain/shutdown duration must be positive. Server's positive
-`CAFE_TELEMETRY_CAPACITY` supplies its three telemetry bounds. OTel streams updates with
-`curl -N http://127.0.0.1:8080/orders/104/events`; disconnecting closes that
-subscription while the listener remains active. Press Ctrl-C in either hosting
-example's terminal to stop the listener and await its owned cleanup.
+Timeline CSV contains no header: for example, `0,accepted`, `400,preparing`,
+`800,ready`. Read `/orders/104/events` with `curl -N`. The writer argument may
+also be `extracted` or `body`; each run mounts the same single route. Timeline
+replay reports the supplied history and does not operate a coffee machine.
+Outlet status files contain `104,pending` or `104,ready`; staff may update either
+while the caller waits. The final two outlet arguments are positive wait-window
+and poll milliseconds. Retry covers only transient native I/O failures, without
+manufacturing a failure. Race and timeout retain loser cancellation and settlement.
+
+Complete build/run instructions and input setup are available in the
+[SQL](../effect_sql/examples/README.md),
+[Server](../effect_server/examples/README.md),
+[Identity](../effect_server_identity/examples/README.md),
+[Web](../effect_server_web/examples/README.md), and
+[OTel](../effect_otel/examples/README.md) example guides.
+Web's native configuration is implemented in
+[cafe_host](../effect_server_web/examples/cafe_host/mod.rs). It serves `/menu`,
+cookie-authorized `/pickup`, and availability on the selected `CAFE_LISTEN`.
+Supply the selected native key/catalogue files before running; account-only
+registration/login/preference work needs just its selected database, without
+cookie-key or external-provider setup.
+
+## Named typed callback blocks
+
+Callback roles use `role |pattern| { statements; tail }`, zero-input `role { ... }`,
+or `role: typed_helper`. Metadata uses `name: expression,`. Fields evaluate once
+in written order; executable bodies remain delayed by their owning operation.
+Native Result/Future bodies keep Rust `?` and explicit `async move`. Effect roles
+use Effect binds. A reusable outer callback may return a fresh one-shot inner
+Effect for each owned invocation input. `once;` consumes a native capture without
+copying it. R continues to select the environment and async/CPU/blocking providers.
+
+Each runnable task above has an explicit input and observable business result.
+Codecs describe the order's wire shape; stock transactions preserve atomic
+reservation; workflow/queue recording retains pickup results; scoped providers
+retain native resource ownership through cleanup. Optional extension facades
+re-export the same callback macros through their existing Effect dependency.
+
+A small intake recipe can validate confirmed pickup names and build the labels
+staff will actually read. The input below is a finite native stream of two names;
+its Future transfers the owned intake batch. Lee supplied a confirmed correction
+for the blank entry, so recovery uses actual customer input. The result is two pickup labels.
+
+```rust
+use effect::{Effect, Exit, effect_all, effect_future, effect_map, effect_map_error, effect_recover, effect_try_sync};
+use futures_util::StreamExt;
+use std::sync::Arc;
+use futures_executor::block_on;
+
+/// Validate a customer's supplied pickup name without copying its owned payload.
+fn pickup_name(name: String) -> Effect<String, &'static str> {
+    effect_try_sync! {
+        once;
+        body {
+            if name.trim().is_empty() { Err("provide a pickup name") }
+            else { Ok(name.trim().to_owned()) }
+        },
+    }
+}
+let input = futures_util::stream::iter([(" Maya ".to_owned(), None), (String::new(), Some("Lee".to_owned()))]);
+let intake: Effect<Vec<(String, Option<String>)>, &'static str> = effect_future! {
+    once;
+    body |_cancel| {
+        async move { input.collect::<Vec<_>>().await }
+    },
+};
+let program = intake.flat_map(|names| {
+    effect_all! {
+        items {
+            for (entered, confirmed_correction) in names {
+                let validated = effect_map_error! {
+                    program: pickup_name(entered), map |_error| { "pickup name needs correction" },
+                };
+                let corrected = effect_recover! {
+                    program: validated,
+                    recover |reason| {
+                        let correction = confirmed_correction.clone();
+                        match correction {
+                            Some(name) => pickup_name(name)?,
+                            None => Effect::fail_with(move || reason)?,
+                        }
+                    },
+                };
+                item!(effect_map! {
+                    program: corrected, map |name| { format!("Pickup for {name}") },
+                });
+            }
+        },
+    }
+});
+assert_eq!(block_on(program.run(Arc::new(()))),
+    Exit::Success(vec!["Pickup for Maya".to_owned(), "Pickup for Lee".to_owned()]));
+```
+
+A receipt export can narrow the caller's configuration to a file writer, commit
+and flush one receipt, then read it back through a Drop-owned file. The native
+file adapters retain I/O errors. The short commit is masked across write/flush;
+an interrupted attempt removes its unpublished file. A finalizer removes this
+example's owned temporary receipt after reading, including on failure.
+
+```rust
+use effect::*;
+use std::{fs::File, io::{Read, Write}, path::PathBuf, sync::Arc};
+use futures_executor::block_on;
+
+/// Caller selects the receipt destination before constructing the recipe.
+struct ReceiptHost { /// Explicit caller-owned export path.
+    path: PathBuf }
+/// Narrow writer configuration; it has no runtime or global lookup.
+struct ReceiptTarget { /// Destination selected by the caller's layer.
+    path: PathBuf }
+/// Native file failures remain distinct from an unexpected adapter defect.
+#[derive(Debug)]
+enum ReceiptError {
+    /// Original native file error.
+    Io(std::io::Error),
+    /// Original unexpected native adapter defect.
+    Native(Defect),
+}
+/// Remove only this recipe's output; absence is already the desired cleanup state.
+fn remove_receipt(path: PathBuf) -> Effect<(), ReceiptError, ReceiptHost> {
+    effect_try_sync! {
+        body {
+            match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(ReceiptError::Io(error)),
+            }
+        },
+    }
+}
+/// Acquisition is delayed; resource release owns the actual file flush and close.
+fn write_receipt() -> Effect<(), ReceiptError, ReceiptTarget> {
+    effect! {
+        let path = service! { env |target: &ReceiptTarget| { target.path.clone() }, }?;
+        effect_resource! {
+            acquire: effect_try_sync! {
+                once; body { File::options().write(true).create_new(true).open(path).map_err(ReceiptError::Io) },
+            },
+            body |file: ResourceValue<File>| {
+                let result = file.access(|file| {
+                    let mut file = file;
+                    file.write_all(b"104,Maya,950\n")
+                })?;
+                Effect::from_result_once(result.map_err(ReceiptError::Io))?;
+            },
+            release |file: File, _primary| {
+                effect_try_sync! { once; body { file.sync_all().map_err(ReceiptError::Io) }, }
+            },
+        }?;
+    }
+}
+/// Native File Drop closes the read descriptor after the owned CSV is returned.
+fn read_receipt() -> Effect<String, ReceiptError, PathBuf> {
+    effect! {
+        let path = service! { env |path: &PathBuf| { path.clone() }, }?;
+        effect_using! {
+            acquire: effect_try_sync! { once; body { File::open(path).map_err(ReceiptError::Io) }, },
+            body |file: ResourceValue<File>| {
+                let text = file.access(|file| {
+                    let mut file = file; let mut text = String::new();
+                    file.read_to_string(&mut text).map(|_| text)
+                })?;
+                Effect::from_result_once(text.map_err(ReceiptError::Io))?
+            },
+        }?
+    }
+}
+let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+let path = std::env::temp_dir().join(format!("effect-receipt-{}-{nonce}.csv", std::process::id()));
+let host = Arc::new(ReceiptHost { path: path.clone() });
+let writer: Layer<ReceiptHost, ReceiptError, ReceiptTarget> = layer! {
+    build |_scope| {
+        service! { env |host: &ReceiptHost| { ReceiptTarget { path: host.path.clone() } }, }?
+    },
+};
+let commit = effect_with_layer! { layer: writer, program: write_receipt() };
+let commit = effect_uninterruptible! { program: commit };
+let interrupted_path = path.clone();
+let commit = effect_on_interrupt! {
+    program: commit, finalizer { let path = interrupted_path.clone(); remove_receipt(path)?; },
+};
+let reader = effect_provide_some! {
+    program: read_receipt(), project |host: &ReceiptHost| { host.path.clone() },
+};
+let cleanup_check = path.clone();
+let export: Effect<String, ReceiptError, ReceiptHost> = effect_scope! {
+    body |scope: Scope<ReceiptError>| {
+        let commit = commit.clone(); let reader = reader.clone(); let path = path.clone();
+        effect_finalizer! { scope: scope, body { let path = path.clone(); remove_receipt(path)?; }, }?;
+        effect_sandbox! { program: commit, defect |defect| { ReceiptError::Native(defect) }, }?;
+        reader?
+    },
+};
+let provided = effect_provided! { environment: host, program: export };
+assert!(matches!(block_on(provided.run(Arc::new(()))), Exit::Success(csv) if csv == "104,Maya,950\n"));
+assert!(!cleanup_check.exists());
+```
+
+The runnable [receipt-book task](examples/write_receipt_book.rs) demonstrates
+checked file ownership, native write/flush errors, scoped disposal and per-outlet
+admission. [Closing](examples/close_coffee_shop.rs) retains its addressed pickup
+record until the activation scope closes. The owning resource operation selects
+whether release receives a checked value, an owned payload, or a borrowed primary
+outcome; that primary borrow cannot escape into a deferred cleanup task.
+
+The [basket](examples/live_coffee_basket.rs) computes a tracked customer total,
+reserves real stock together, commits restock and restores actual saved selections.
+The [cancelled-reservation task](examples/reserve_cancelled_order.rs) returns
+reserved stock once under a recorded compensation identity.
+
+Provider-dependent callbacks use the application's selected R and policies:
+
+| Executing task | Callback role and observable result |
+| --- | --- |
+| [Export receipts](examples/export_receipts.rs) | Two real file reads use bounded borrowed traversal; shared snapshots are validated on CPU workers and aggregated before creating sorted output. |
+| [Wait for pickup](../effect_otel/examples/await_pickup.rs) | Concurrent native outlet reads produce actual snapshots; repeat polls pending records, retry handles transient reads, race selects the first ready outlet and timeout bounds the wait. |
+| [Write the receipt book](examples/write_receipt_book.rs) | One actual pooled file is reused for both appends; a partitioned permit protects that outlet, and final scope cleanup flushes the file. |
+| [Resolve stored tickets](examples/resolve_pickup_tickets.rs) | The resolver returns supplied customer/cup records and a typed missing-ticket outcome. |
+| [Retain a visit quote](examples/update_menu_prices.rs) | The customer retains the visit key and quote owner across board publication; the invalidated public cache reloads 500 cents while the quote remains 475 cents. |
+| [Consume phone status](examples/phone_order_status.rs) | Connected and already-accepted modes consume one selected native feed until peer close, then complete close/disposal. |
+
+A receipt total is a useful stream fold: two customers buy two and three cups
+at 475 cents each. The iterator is dropped normally when consumed; the fold
+returns 2375 cents ($23.75).
+
+```rust
+use effect::{Exit, Sink, Stream, sink, stream};
+use futures_executor::block_on;
+use std::sync::Arc;
+let purchases: Stream<usize, &'static str, ()> = stream! {
+    iterable { [2usize, 3].into_iter() },
+};
+let total: Sink<usize, usize, &'static str, ()> = sink! {
+    fold; initial { 0usize },
+    step |total, cups| { total + cups * 475 },
+};
+assert_eq!(block_on(total.run(purchases).run(Arc::new(()))), Exit::Success(2375));
+```
+
+The [saved-order recipe](examples/save_coffee_order.rs) uses pure codecs for the
+persisted draft and directional effectful codecs for the online form. Absent size
+selects the café's actual default; quantity zero produces business feedback before
+the corrected two-cup order is stored. Configured parsing retains its declared
+JSON, schema, pattern and issue budgets. Contextual callbacks forward ParseContext;
+AST metadata alone grants no validator or writer witness. Recursive and lazy codec
+constructors retain their existing ownership/budget contracts.
+
+[Recorded pickup labels](examples/prepare_coffee_orders.rs) retrieve the same
+recorded result on replay. [Cancelled reservation](examples/reserve_cancelled_order.rs)
+returns two actual reserved cups; calling its compensation again leaves the
+restored stock unchanged. Stable IDs, codecs and parse limits identify those
+recorded operations, without starting an inner Effect run.
+
+[Basket checkout](examples/live_coffee_basket.rs) maps tracked-read failures,
+reserves stock atomically and commits a restock. SoldOut rejection leaves the
+journal's stock unchanged; tracked reads and transaction transitions remain in
+their respective interpreters.

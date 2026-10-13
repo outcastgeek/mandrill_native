@@ -1,7 +1,9 @@
 //! Schema errors mapped explicitly into a domain channel; Effect's other
 //! outcome channels are preserved by map_error.
+
 use super::{Codec, SchemaAst, SchemaIssue};
 use crate::Effect;
+use crate::{effect, effect_all, effect_map, effect_map_error, effect_sync, effect_try_sync};
 use std::sync::Arc;
 type Direction<A, B, E, R> = Arc<dyn Fn(A) -> Effect<B, E, R> + Send + Sync>;
 /// An owned codec with an application-defined typed error channel.
@@ -94,22 +96,22 @@ impl<
         Self {
             ast: codec.ast().clone(),
             decode: Arc::new(move |input| {
-                decode.decode_once(input).map_error({
+                effect_map_error! { program: decode.decode_once(input), map: {
                     let issue = Arc::clone(&decode_issue);
                     move |error| issue(error)
-                })
+                }, }
             }),
             encode: Arc::new(move |input| {
-                codec.encode_once(input).map_error({
+                effect_map_error! { program: codec.encode_once(input), map: {
                     let issue = Arc::clone(&encode_issue);
                     move |error| issue(error)
-                })
+                }, }
             }),
             validate: Arc::new(move |input| {
-                validate.validate_once(input).map_error({
+                effect_map_error! { program: validate.validate_once(input), map: {
                     let issue = Arc::clone(&validation_issue);
                     move |error| issue(error)
-                })
+                }, }
             }),
         }
     }
@@ -121,17 +123,35 @@ impl<
     /// Lazily consume one encoded value and decode it in `D`; the input is not replayable.
     pub fn decode_once(&self, input: Encoded) -> Effect<A, E, D> {
         let decode = Arc::clone(&self.decode);
-        Effect::from_result_once(Ok(input)).flat_map(move |input| decode(input))
+        let input = effect_sync! { once; body: move || input, };
+        effect! {
+            let input = input.clone();
+            let decode = Arc::clone(&decode);
+            let input = input?;
+            decode(input)?
+        }
     }
     /// Lazily consume one application value and encode it in `R`; the input is not cloned.
     pub fn encode_once(&self, input: A) -> Effect<Encoded, E, R> {
         let encode = Arc::clone(&self.encode);
-        Effect::from_result_once(Ok(input)).flat_map(move |input| encode(input))
+        let input = effect_sync! { once; body: move || input, };
+        effect! {
+            let input = input.clone();
+            let encode = Arc::clone(&encode);
+            let input = input?;
+            encode(input)?
+        }
     }
     /// Lazily consume and validate one typed value in `R`, returning it on success.
     pub fn validate_once(&self, input: A) -> Effect<A, E, R> {
         let validate = Arc::clone(&self.validate);
-        Effect::from_result_once(Ok(input)).flat_map(move |input| validate(input))
+        let input = effect_sync! { once; body: move || input, };
+        effect! {
+            let input = input.clone();
+            let validate = Arc::clone(&validate);
+            let input = input?;
+            validate(input)?
+        }
     }
 }
 
@@ -153,16 +173,26 @@ impl<
         DomainCodec::new(
             SchemaAst::opaque(),
             move |input| match input {
-                Some(value) => decode.decode_once(value).map(Some),
-                None => Effect::from_result_once(Ok(None)),
+                Some(value) => {
+                    effect_map! { program: decode.decode_once(value), map: Some, }
+                }
+                None => {
+                    effect_try_sync! { once; body: { let __dsl_result = Ok(None); move || __dsl_result }, on_error: ::core::convert::identity, }
+                }
             },
             move |input| match input {
-                Some(value) => self.encode_once(value).map(Some),
-                None => Effect::from_result_once(Ok(None)),
+                Some(value) => effect_map! { program: self.encode_once(value), map: Some, },
+                None => {
+                    effect_try_sync! { once; body: { let __dsl_result = Ok(None); move || __dsl_result }, on_error: ::core::convert::identity, }
+                }
             },
             move |input| match input {
-                Some(value) => validate.validate_once(value).map(Some),
-                None => Effect::from_result_once(Ok(None)),
+                Some(value) => {
+                    effect_map! { program: validate.validate_once(value), map: Some, }
+                }
+                None => {
+                    effect_try_sync! { once; body: { let __dsl_result = Ok(None); move || __dsl_result }, on_error: ::core::convert::identity, }
+                }
             },
         )
     }
@@ -181,18 +211,24 @@ impl<
             SchemaAst::opaque(),
             move |input| {
                 if is_null(&input) {
-                    Effect::from_result_once(Ok(None))
+                    effect_try_sync! { once; body: { let __dsl_result = Ok(None); move || __dsl_result }, on_error: ::core::convert::identity, }
                 } else {
-                    decode.decode_once(input).map(Some)
+                    effect_map! { program: decode.decode_once(input), map: Some, }
                 }
             },
             move |input| match input {
                 Some(value) => self.encode_once(value),
-                None => Effect::from_result_once(Ok(null())),
+                None => {
+                    effect_try_sync! { once; body: { let __dsl_result = Ok(null()); move || __dsl_result }, on_error: ::core::convert::identity, }
+                }
             },
             move |input| match input {
-                Some(value) => validate.validate_once(value).map(Some),
-                None => Effect::from_result_once(Ok(None)),
+                Some(value) => {
+                    effect_map! { program: validate.validate_once(value), map: Some, }
+                }
+                None => {
+                    effect_try_sync! { once; body: { let __dsl_result = Ok(None); move || __dsl_result }, on_error: ::core::convert::identity, }
+                }
             },
         )
     }
@@ -224,58 +260,53 @@ impl<
                 let read = Arc::clone(&read);
                 let issue = Arc::clone(&decode_issue);
                 let decode = decode.clone();
-                Effect::try_sync_once(
-                    move || read.read(input, limits).map_err(|error| issue(error)),
-                    std::convert::identity,
-                )
-                .flat_map(move |items| {
-                    Effect::all(
-                        items
+                let input = effect_try_sync! {
+                    once;
+                    body: move || read.read(input, limits).map_err(|error| issue(error)),
+                    on_error: std::convert::identity,
+                };
+                effect! {
+                    let decode = decode.clone();
+                    let items = input.clone()?;
+                    effect_all! { items: items
                             .into_iter()
                             .map(|item| decode.decode_once(item))
-                            .collect(),
-                    )
-                })
+                            .collect(), }?
+                }
             },
             move |items: Vec<A>| {
                 if items.len() > limits.collection.get() {
-                    return Effect::from_result_once(Err(encode_issue(super::SchemaIssue::new(
+                    return effect_try_sync! { once; body: { let __dsl_result = Err(encode_issue(super::SchemaIssue::new(
                         super::SchemaIssueKind::LimitExceeded {
                             resource: super::SchemaResource::Width,
                         },
-                    ))));
+                    ))); move || __dsl_result }, on_error: ::core::convert::identity, };
                 }
                 let repr = Arc::clone(&repr);
                 let issue = Arc::clone(&encode_issue);
-                Effect::all(
-                    items
-                        .into_iter()
-                        .map(|item| self.encode_once(item))
-                        .collect(),
-                )
-                .flat_map(move |items| {
+                let encoded = effect_all! { items: items
+                .into_iter()
+                .map(|item| self.encode_once(item))
+                .collect(), };
+                effect! {
                     let repr = Arc::clone(&repr);
                     let issue = Arc::clone(&issue);
-                    Effect::try_sync_once(
-                        move || repr.write(items, limits).map_err(|error| issue(error)),
-                        std::convert::identity,
-                    )
-                })
+                    let items = encoded.clone()?;
+                    effect_try_sync! { once; body: move || repr.write(items, limits).map_err(|error| issue(error)), on_error: std::convert::identity, }?
+                }
             },
             move |items: Vec<A>| {
                 if items.len() > limits.collection.get() {
-                    return Effect::from_result_once(Err(validation_issue(
+                    return effect_try_sync! { once; body: { let __dsl_result = Err(validation_issue(
                         super::SchemaIssue::new(super::SchemaIssueKind::LimitExceeded {
                             resource: super::SchemaResource::Width,
                         }),
-                    )));
+                    )); move || __dsl_result }, on_error: ::core::convert::identity, };
                 }
-                Effect::all(
-                    items
-                        .into_iter()
-                        .map(|item| validate.validate_once(item))
-                        .collect(),
-                )
+                effect_all! { items: items
+                .into_iter()
+                .map(|item| validate.validate_once(item))
+                .collect(), }
             },
         )
     }
@@ -304,92 +335,75 @@ impl<
                 let read = Arc::clone(&read);
                 let issue = Arc::clone(&decode_issue);
                 let decode = decode.clone();
-                Effect::try_sync_once(
-                    move || {
-                        let fields = read.read(input, limits).map_err(|error| issue(error))?;
-                        let mut seen = std::collections::BTreeSet::new();
-                        if fields.len() > limits.collection.get() {
+                let input = effect_try_sync! { once; body: move || {
+                    let fields = read.read(input, limits).map_err(|error| issue(error))?;
+                    let mut seen = std::collections::BTreeSet::new();
+                    if fields.len() > limits.collection.get() {
+                        return Err(issue(SchemaIssue::new(
+                            super::SchemaIssueKind::LimitExceeded {
+                                resource: super::SchemaResource::Width,
+                            },
+                        )));
+                    }
+                    for (name, _) in &fields {
+                        if !seen.insert(name.clone()) {
                             return Err(issue(SchemaIssue::new(
-                                super::SchemaIssueKind::LimitExceeded {
-                                    resource: super::SchemaResource::Width,
-                                },
+                                super::SchemaIssueKind::DuplicateField(name.as_str().into()),
                             )));
                         }
-                        for (name, _) in &fields {
-                            if !seen.insert(name.clone()) {
-                                return Err(issue(SchemaIssue::new(
-                                    super::SchemaIssueKind::DuplicateField(name.as_str().into()),
-                                )));
-                            }
-                        }
-                        Ok(fields)
-                    },
-                    std::convert::identity,
-                )
-                .flat_map(move |fields| {
-                    Effect::all(
-                        fields
+                    }
+                    Ok(fields)
+                }, on_error: std::convert::identity, };
+                effect! {
+                    let decode = decode.clone();
+                    let fields = input.clone()?;
+                    effect_map! { program: effect_all! { items: fields
                             .into_iter()
                             .map(|(name, item)| {
-                                decode
-                                    .decode_once(item)
-                                    .zip(Effect::from_result_once(Ok(name)))
-                                    .map(|(value, name)| (name, value))
+                                effect_map! { program: { let __dsl_left_program = decode
+                                    .decode_once(item); let __dsl_right_program = effect_try_sync! { once; body: { let __dsl_result = Ok(name); move || __dsl_result }, on_error: ::core::convert::identity, }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }, map: |(value, name)| (name, value), }
                             })
-                            .collect(),
-                    )
-                    .map(|fields| fields.into_iter().collect())
-                })
+                            .collect(), }, map: |fields| fields.into_iter().collect(), }?
+                }
             },
             move |items: std::collections::BTreeMap<String, A>| {
                 if items.len() > limits.collection.get() {
-                    return Effect::from_result_once(Err(encode_issue(SchemaIssue::new(
+                    return effect_try_sync! { once; body: { let __dsl_result = Err(encode_issue(SchemaIssue::new(
                         super::SchemaIssueKind::LimitExceeded {
                             resource: super::SchemaResource::Width,
                         },
-                    ))));
+                    ))); move || __dsl_result }, on_error: ::core::convert::identity, };
                 }
                 let repr = Arc::clone(&repr);
                 let issue = Arc::clone(&encode_issue);
-                Effect::all(
-                    items
-                        .into_iter()
-                        .map(|(name, item)| {
-                            self.encode_once(item)
-                                .zip(Effect::from_result_once(Ok(name)))
-                                .map(|(value, name)| (name, value))
-                        })
-                        .collect(),
-                )
-                .flat_map(move |fields| {
+                let encoded = effect_all! { items: items
+                .into_iter()
+                .map(|(name, item)| {
+                    effect_map! { program: { let __dsl_left_program = self.encode_once(item); let __dsl_right_program = effect_try_sync! { once; body: { let __dsl_result = Ok(name); move || __dsl_result }, on_error: ::core::convert::identity, }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }, map: |(value, name)| (name, value), }
+                })
+                .collect(), };
+                effect! {
                     let repr = Arc::clone(&repr);
                     let issue = Arc::clone(&issue);
-                    Effect::try_sync_once(
-                        move || repr.write(fields, limits).map_err(|error| issue(error)),
-                        std::convert::identity,
-                    )
-                })
+                    let fields = encoded.clone()?;
+                    effect_try_sync! { once; body: move || repr.write(fields, limits).map_err(|error| issue(error)), on_error: std::convert::identity, }?
+                }
             },
             move |items: std::collections::BTreeMap<String, A>| {
                 if items.len() > limits.collection.get() {
-                    return Effect::from_result_once(Err(validation_issue(SchemaIssue::new(
+                    return effect_try_sync! { once; body: { let __dsl_result = Err(validation_issue(SchemaIssue::new(
                         super::SchemaIssueKind::LimitExceeded {
                             resource: super::SchemaResource::Width,
                         },
-                    ))));
+                    ))); move || __dsl_result }, on_error: ::core::convert::identity, };
                 }
-                Effect::all(
-                    items
-                        .into_iter()
-                        .map(|(name, item)| {
-                            validate
-                                .validate_once(item)
-                                .zip(Effect::from_result_once(Ok(name)))
-                                .map(|(value, name)| (name, value))
-                        })
-                        .collect(),
-                )
-                .map(|fields| fields.into_iter().collect())
+                effect_map! { program: effect_all! { items: items
+                .into_iter()
+                .map(|(name, item)| {
+                    effect_map! { program: { let __dsl_left_program = validate
+                        .validate_once(item); let __dsl_right_program = effect_try_sync! { once; body: { let __dsl_result = Ok(name); move || __dsl_result }, on_error: ::core::convert::identity, }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }, map: |(value, name)| (name, value), }
+                })
+                .collect(), }, map: |fields| fields.into_iter().collect(), }
             },
         )
     }

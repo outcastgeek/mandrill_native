@@ -5,6 +5,10 @@ use super::{
 };
 use crate::encoding::{FrameDecodeFailure, FrameDecoder, FrameParts};
 use crate::{Effect, SchemaIssue, Semaphore, SemaphoreError};
+use crate::{
+    effect, effect_map_error, effect_provide_some, effect_resource, effect_sync, effect_try_sync,
+    service,
+};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
@@ -199,8 +203,9 @@ where
         let admission = self.admission.clone();
         let request = Mutex::new(Some((request, metadata)));
         let request_call = call.clone();
-        Effect::try_sync(
-            move || {
+        {
+            let __dsl_program = effect_try_sync! {
+            body: move || {
                 let (request, metadata) = request
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -222,61 +227,71 @@ where
                     metadata,
                 };
                 envelope.encode(policy).map_err(RpcClientError::Wire)
-            },
-            std::convert::identity,
-        )
-        .flat_map(move |frame| {
-            let frame = Mutex::new(Some(frame));
-            let admission = admission.clone();
-            let operation = response_operation.clone();
-            let call = call.clone();
-            admission
-                .acquire(NonZeroUsize::MIN)
-                .map_error(RpcClientError::Admission)
-                .flat_map(move |permit| {
-                    let frame = frame
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take();
-                    let response = match frame {
-                        Some(frame) => {
-                            let operation = operation.clone();
-                            let call = call.clone();
-                            let frame = Mutex::new(Some(frame));
-                            Effect::service(|env: &R| env.rpc_channel()).flat_map(move |channel| {
-                                let operation = operation.clone();
-                                let call = call.clone();
-                                let frame = frame
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .take();
-                                match frame {
-                                    Some(frame) => channel
-                                        .exchange(frame)
-                                        .map_error({
-                                            let uncertain_call = call.clone();
-                                            move |source| RpcClientError::UncertainTransport {
-                                                call: uncertain_call.clone(),
-                                                source,
-                                            }
-                                        })
-                                        .provide_some(|_: &R| ())
-                                        .flat_map(move |bytes| {
-                                            Effect::from_result_once(decode_response(
-                                                &operation, &call, &bytes, policy,
-                                            ))
-                                        }),
-                                    None => {
-                                        Effect::from_result_once(Err(RpcClientError::InputConsumed))
-                                    }
-                                }
-                            })
-                        }
-                        None => Effect::from_result_once(Err(RpcClientError::InputConsumed)),
-                    };
-                    response.ensuring(Effect::sync_once(move || drop(permit)))
-                })
-        })
+            }, on_error: std::convert::identity, };
+            effect! {
+                           let __dsl_program = __dsl_program.clone(); let admission = admission.clone(); let call = call.clone(); let response_operation = response_operation.clone(); let frame = __dsl_program?; {
+                       let frame = Mutex::new(Some(frame));
+                       let admission = admission.clone();
+                       let operation = response_operation.clone();
+                       let call = call.clone();
+                       effect! {
+            bind;
+            program: effect_map_error! {
+                program: admission
+                           .acquire(NonZeroUsize::MIN), map: RpcClientError::Admission, },
+            body: move |permit| {
+                               let frame = frame
+                                   .lock()
+                                   .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                   .take();
+                               let response = match frame {
+                                   Some(frame) => {
+                                       let operation = operation.clone();
+                                       let call = call.clone();
+                                       let frame = Mutex::new(Some(frame));
+                                       effect! {
+            bind;
+            program: service! { env: |env: &R| env.rpc_channel(), },
+            body: move |channel| {
+                                           let operation = operation.clone();
+                                           let call = call.clone();
+                                           let frame = frame
+                                               .lock()
+                                               .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                               .take();
+                                           match frame {
+                                               Some(frame) => {
+                                                   let __dsl_program = effect_provide_some! {
+                                                   program: effect_map_error! {
+                                                   program: channel
+                                                   .exchange(frame), map: {
+                                                       let uncertain_call = call.clone();
+                                                       move |source| RpcClientError::UncertainTransport {
+                                                           call: uncertain_call.clone(),
+                                                           source,
+                                                       }
+                                                   }, }, project: |_: &R| (), }; effect! {
+                                                       let __dsl_program = __dsl_program.clone(); let call = call.clone(); let operation = operation.clone(); let bytes = __dsl_program?; {
+                                                       effect_try_sync! {
+                                                           once; body: {
+                                                           let __dsl_result = decode_response(
+                                                           &operation, &call, &bytes, policy,
+                                                       ); move || __dsl_result }, on_error: ::core::convert::identity, }
+                                                   }? } },
+                                               None => {
+                                                   effect_try_sync! { once; body: { let __dsl_result = Err(RpcClientError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, }
+                                               }
+                                           }
+                                       },
+            }
+                                   }
+                                   None => effect_try_sync! { once; body: { let __dsl_result = Err(RpcClientError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, },
+                               };
+                               { let __dsl_program = response; let __dsl_cleanup = effect_sync! { once; body: move || drop(permit), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } }
+                           },
+            }
+                   }? }
+        }
     }
 }
 

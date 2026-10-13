@@ -1,9 +1,10 @@
+use effect::{effect, effect_future, effect_map, effect_resource, effect_scope};
 extern crate effect as fx;
 
 use effect::{
     AsyncQueue, Cancellation, CleanupFailure, Defect, DefectKind, Effect, Exit, LibraryDefect,
-    PrimaryOutcome, PrimaryOutcomeRef, QueueCapacity, QueueError, QueueShutdown, Release,
-    ScheduledTask, Scope, TaskSpawner,
+    PrimaryOutcome, PrimaryOutcomeRef, QueueCapacity, QueueError, QueueShutdown, ScheduledTask,
+    TaskSpawner,
 };
 use futures_executor::block_on;
 use std::cell::Cell;
@@ -32,37 +33,33 @@ fn external_queue_workflows_move_payloads_and_compose_with_scoped_children() {
 // The same finite deadlock-detection deadline as existing lifecycle regressions.
 const DEADLOCK_DEADLINE: Duration = Duration::from_secs(5);
 
-#[allow(clippy::panic)] // Incorrect fixture setup is a harness failure.
 fn bounded(capacity: usize) -> QueueCapacity {
-    QueueCapacity::Bounded(
-        NonZeroUsize::new(capacity).unwrap_or_else(|| panic!("positive capacity required")),
-    )
+    assert!(capacity > 0, "positive capacity required");
+    QueueCapacity::Bounded(NonZeroUsize::MIN.saturating_add(capacity - 1))
 }
 
-#[allow(clippy::panic)] // Preserve the real failure rather than invent a payload.
-fn success<A>(outcome: Exit<A, QueueError>) -> A {
+fn success<A>(outcome: Exit<A, QueueError>) -> Result<A, String> {
     match outcome {
-        Exit::Success(value) => value,
+        Exit::Success(value) => Ok(value),
         Exit::Fail(_) | Exit::Die(_) | Exit::Interrupted | Exit::FinalizationFailed(_) => {
-            panic!("expected fixture success")
+            Err("expected fixture success".to_owned())
         }
     }
 }
 
-#[allow(clippy::panic)] // Bound a gate re-entry failure without adding application timeouts.
 fn run<A: Send + 'static, R: Send + Sync + 'static>(
     program: Effect<A, QueueError, R>,
     env: Arc<R>,
-) -> Exit<A, QueueError> {
+) -> Result<Exit<A, QueueError>, String> {
     let (send, receive) = mpsc::channel();
     let driver = std::thread::spawn(move || {
         assert!(send.send(block_on(program.run(env))).is_ok());
     });
     let outcome = receive
         .recv_timeout(DEADLOCK_DEADLINE)
-        .unwrap_or_else(|error| panic!("queue operation did not settle: {error}"));
+        .map_err(|error| format!("queue operation did not settle: {error}"))?;
     assert!(driver.join().is_ok());
-    outcome
+    Ok(outcome)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,48 +88,52 @@ fn take(queue: &AsyncQueue<Payload>, marker: Marker) {
         Exit::Success(payload(marker))
     );
 }
-fn size<A: Send + 'static>(queue: &AsyncQueue<A>) -> usize {
+fn size<A: Send + 'static>(queue: &AsyncQueue<A>) -> Result<usize, String> {
     success(block_on(queue.size().run(Arc::new(()))))
 }
 
 #[test]
-fn unbounded_queue_moves_non_clone_values_in_fifo_order_and_reports_only_buffered_size() {
+fn unbounded_queue_moves_non_clone_values_in_fifo_order_and_reports_only_buffered_size()
+-> Result<(), String> {
     let queue = AsyncQueue::new(QueueCapacity::Unbounded);
     let values = [Marker::First, Marker::Second, Marker::Third];
     for value in values {
         offer(&queue, value);
     }
-    assert_eq!(size(&queue), values.len());
+    assert_eq!(size(&queue)?, values.len());
     for value in values {
         take(&queue, value);
     }
-    assert_eq!(size(&queue), 0);
+    assert_eq!(size(&queue)?, 0);
+    Ok(())
 }
 
 #[test]
-fn bounded_queue_applies_backpressure_and_refills_from_pending_offers_in_fifo_order() {
+fn bounded_queue_applies_backpressure_and_refills_from_pending_offers_in_fifo_order()
+-> Result<(), String> {
     let queue = AsyncQueue::new(bounded(1)); // One real buffer slot exercises every refill.
     offer(&queue, Marker::First);
     let mut second = Box::pin(queue.offer(payload(Marker::Second)).run(Arc::new(())));
     let mut third = Box::pin(queue.offer(payload(Marker::Third)).run(Arc::new(())));
     suspension::suspended(second.as_mut());
     suspension::suspended(third.as_mut());
-    assert_eq!(size(&queue), 1);
+    assert_eq!(size(&queue)?, 1);
     take(&queue, Marker::First);
     assert_eq!(block_on(second), Exit::Success(()));
-    assert_eq!(size(&queue), 1);
+    assert_eq!(size(&queue)?, 1);
     take(&queue, Marker::Second);
     assert_eq!(block_on(third), Exit::Success(()));
     take(&queue, Marker::Third);
-    assert_eq!(size(&queue), 0);
+    assert_eq!(size(&queue)?, 0);
+    Ok(())
 }
 
 #[test]
-fn rendezvous_requires_a_peer_and_preserves_waiting_taker_order() {
+fn rendezvous_requires_a_peer_and_preserves_waiting_taker_order() -> Result<(), String> {
     let queue = AsyncQueue::new(QueueCapacity::Rendezvous);
     let mut first_offer = Box::pin(queue.offer(payload(Marker::First)).run(Arc::new(())));
     suspension::suspended(first_offer.as_mut());
-    assert_eq!(size(&queue), 0);
+    assert_eq!(size(&queue)?, 0);
     take(&queue, Marker::First);
     assert_eq!(block_on(first_offer), Exit::Success(()));
     let mut first = Box::pin(queue.take().run(Arc::new(())));
@@ -143,6 +144,7 @@ fn rendezvous_requires_a_peer_and_preserves_waiting_taker_order() {
     offer(&queue, Marker::Third);
     assert_eq!(block_on(first), Exit::Success(payload(Marker::Second)));
     assert_eq!(block_on(second), Exit::Success(payload(Marker::Third)));
+    Ok(())
 }
 
 #[test]
@@ -274,7 +276,8 @@ fn cancellation_after_commit_does_not_undo_buffer_or_rendezvous_transfers() {
 }
 
 #[test]
-fn shutdown_drain_retains_only_committed_buffer_and_rejects_pending_and_future_offers() {
+fn shutdown_drain_retains_only_committed_buffer_and_rejects_pending_and_future_offers()
+-> Result<(), String> {
     let queue = AsyncQueue::new(bounded(2)); // The exact two-buffer-value source drain case.
     offer(&queue, Marker::First);
     offer(&queue, Marker::Second);
@@ -285,7 +288,7 @@ fn shutdown_drain_retains_only_committed_buffer_and_rejects_pending_and_future_o
         Exit::Success(())
     );
     assert_eq!(block_on(pending), Exit::Fail(QueueError::Shutdown));
-    assert_eq!(size(&queue), 2);
+    assert_eq!(size(&queue)?, 2);
     assert_eq!(
         block_on(queue.offer(payload(Marker::Fourth)).run(Arc::new(()))),
         Exit::Fail(QueueError::Shutdown)
@@ -296,10 +299,12 @@ fn shutdown_drain_retains_only_committed_buffer_and_rejects_pending_and_future_o
         block_on(queue.take().run(Arc::new(()))),
         Exit::Fail(QueueError::Shutdown)
     );
+    Ok(())
 }
 
 #[test]
-fn shutdown_discards_buffer_wakes_all_takers_and_can_discard_after_an_earlier_drain() {
+fn shutdown_discards_buffer_wakes_all_takers_and_can_discard_after_an_earlier_drain()
+-> Result<(), String> {
     let queue = AsyncQueue::new(bounded(2));
     offer(&queue, Marker::First);
     offer(&queue, Marker::Second);
@@ -307,12 +312,12 @@ fn shutdown_discards_buffer_wakes_all_takers_and_can_discard_after_an_earlier_dr
         block_on(queue.shutdown(QueueShutdown::Drain).run(Arc::new(()))),
         Exit::Success(())
     );
-    assert_eq!(size(&queue), 2);
+    assert_eq!(size(&queue)?, 2);
     assert_eq!(
         block_on(queue.shutdown(QueueShutdown::Discard).run(Arc::new(()))),
         Exit::Success(())
     );
-    assert_eq!(size(&queue), 0);
+    assert_eq!(size(&queue)?, 0);
     assert_eq!(
         block_on(queue.take().run(Arc::new(()))),
         Exit::Fail(QueueError::Shutdown)
@@ -337,13 +342,15 @@ fn shutdown_discards_buffer_wakes_all_takers_and_can_discard_after_an_earlier_dr
     for waiter in waiters {
         assert_eq!(block_on(waiter), Exit::Fail(QueueError::Shutdown));
     }
+    Ok(())
 }
 
 #[test]
-fn queue_construction_and_offer_factories_are_lazy_reusable_and_precancel_safe() {
+fn queue_construction_and_offer_factories_are_lazy_reusable_and_precancel_safe()
+-> Result<(), String> {
     let make: Effect<AsyncQueue<Payload>, QueueError> = AsyncQueue::make(QueueCapacity::Unbounded);
-    let first = success(block_on(make.clone().run(Arc::new(()))));
-    let second = success(block_on(make.run(Arc::new(()))));
+    let first = success(block_on(make.clone().run(Arc::new(()))))?;
+    let second = success(block_on(make.run(Arc::new(()))))?;
     let calls = Arc::new(AtomicUsize::new(0));
     let c = Arc::clone(&calls);
     let offering = first.offer_with(move || {
@@ -367,8 +374,8 @@ fn queue_construction_and_offer_factories_are_lazy_reusable_and_precancel_safe()
         Exit::Success(())
     );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
-    assert_eq!(size(&first), 2);
-    assert_eq!(size(&second), 0);
+    assert_eq!(size(&first)?, 2);
+    assert_eq!(size(&second)?, 0);
     take(&first, Marker::First);
     take(&first, Marker::First);
 
@@ -388,19 +395,20 @@ fn queue_construction_and_offer_factories_are_lazy_reusable_and_precancel_safe()
         if defect.kind() == DefectKind::Library(LibraryDefect::QueueOfferConsumed))
     );
     take(&first, Marker::Second);
+    Ok(())
 }
 
 #[test]
-#[allow(clippy::panic)] // Intentional factory unwind must not enqueue a value.
-fn panicking_offer_factory_leaves_queue_usable() {
+fn panicking_offer_factory_leaves_queue_usable() -> Result<(), String> {
     let queue: AsyncQueue<Payload> = AsyncQueue::new(QueueCapacity::Unbounded);
     assert!(
-        matches!(block_on(queue.offer_with(|| panic!("factory fixture")).run(Arc::new(()))), Exit::Die(defect)
+        matches!(block_on(queue.offer_with(|| std::panic::resume_unwind(Box::new("factory fixture"))).run(Arc::new(()))), Exit::Die(defect)
         if defect.kind() == DefectKind::CallbackPanic)
     );
-    assert_eq!(size(&queue), 0);
+    assert_eq!(size(&queue)?, 0);
     offer(&queue, Marker::First);
     take(&queue, Marker::First);
+    Ok(())
 }
 
 struct InspectWake {
@@ -425,7 +433,8 @@ impl Wake for InspectWake {
 }
 
 #[test]
-fn transfer_notifications_can_reenter_queue_inspection_without_holding_admission_gate() {
+fn transfer_notifications_can_reenter_queue_inspection_without_holding_admission_gate()
+-> Result<(), String> {
     let queue = AsyncQueue::new(QueueCapacity::Rendezvous);
     let mut taker = Box::pin(queue.take().run(Arc::new(())));
     suspension::suspended(taker.as_mut());
@@ -441,11 +450,12 @@ fn transfer_notifications_can_reenter_queue_inspection_without_holding_admission
             .is_pending()
     );
     assert_eq!(
-        run(queue.offer(payload(Marker::First)), Arc::new(())),
+        run(queue.offer(payload(Marker::First)), Arc::new(()))?,
         Exit::Success(())
     );
     assert!(wake.inspected.load(Ordering::SeqCst));
     assert_eq!(block_on(taker), Exit::Success(payload(Marker::First)));
+    Ok(())
 }
 
 struct DropGate {
@@ -478,7 +488,8 @@ impl Drop for ReleaseGate {
 }
 
 #[test]
-fn shutdown_notifies_waiters_and_releases_the_gate_before_discarded_payload_destruction() {
+fn shutdown_notifies_waiters_and_releases_the_gate_before_discarded_payload_destruction()
+-> Result<(), String> {
     struct Value {
         _gate: Option<DropGate>,
     }
@@ -506,12 +517,12 @@ fn shutdown_notifies_waiters_and_releases_the_gate_before_discarded_payload_dest
     let driver = std::thread::spawn(move || {
         assert!(send.send(block_on(shutdown.run(Arc::new(())))).is_ok());
     });
-    let entered_wait = Effect::from_future(move |_| {
+    let entered_wait = effect_future! { body: move |_| {
         let entered = entered.clone();
         async move { entered.cancelled().await }
-    });
-    assert_eq!(run(entered_wait, Arc::new(())), Exit::Success(()));
-    assert_eq!(run(queue.size(), Arc::new(())), Exit::Success(0));
+    }, };
+    assert_eq!(run(entered_wait, Arc::new(()))?, Exit::Success(()));
+    assert_eq!(run(queue.size(), Arc::new(()))?, Exit::Success(0));
     assert_eq!(block_on(pending), Exit::Fail(QueueError::Shutdown));
     assert!(receive.try_recv().is_err());
     drop(release);
@@ -520,18 +531,19 @@ fn shutdown_notifies_waiters_and_releases_the_gate_before_discarded_payload_dest
         Ok(Exit::Success(()))
     );
     assert!(driver.join().is_ok());
+    Ok(())
 }
 
 struct PanicDrop;
 impl Drop for PanicDrop {
-    #[allow(clippy::panic)] // Verify each discarded payload's unwind is retained separately.
     fn drop(&mut self) {
-        panic!("discard fixture");
+        std::panic::resume_unwind(Box::new("discard fixture"));
     }
 }
 
 #[test]
-fn shutdown_preserves_every_discard_defect_after_committing_closed_state_and_waiter_failures() {
+fn shutdown_preserves_every_discard_defect_after_committing_closed_state_and_waiter_failures()
+-> Result<(), String> {
     let queue = AsyncQueue::new(bounded(1));
     assert_eq!(
         block_on(queue.offer(PanicDrop).run(Arc::new(()))),
@@ -550,11 +562,12 @@ fn shutdown_preserves_every_discard_defect_after_committing_closed_state_and_wai
         assert!(details.rest.into_iter().all(|failure| matches!(failure, CleanupFailure::ReleaseDefect(defect) if defect.kind() == DefectKind::CallbackPanic)));
     }
     assert_eq!(block_on(pending), Exit::Fail(QueueError::Shutdown));
-    assert_eq!(size(&queue), 0);
+    assert_eq!(size(&queue)?, 0);
     assert!(matches!(
         block_on(queue.take().run(Arc::new(()))),
         Exit::Fail(QueueError::Shutdown)
     ));
+    Ok(())
 }
 
 #[test]
@@ -658,13 +671,13 @@ fn earlier_pending_cancellation_remains_interrupted_through_shutdown_and_raw_rel
         let observed = Arc::clone(&interrupted);
         let pending: Effect<(), QueueError, Cancellation> = match waiting {
             Waiting::Offer => queue.offer(payload(Marker::First)),
-            Waiting::Take => queue.take().map(drop),
+            Waiting::Take => effect_map! { program: queue.take(), map: drop, },
         };
-        let pending = pending.ensuring_with(move |reason| {
+        let pending = effect_resource! { ensuring_release; program: pending, release: move |reason| {
             let was_interrupted = matches!(reason, PrimaryOutcomeRef::WasInterrupted);
             let observed = Arc::clone(&observed);
-            Release::sync(move || observed.store(was_interrupted, Ordering::SeqCst))
-        });
+            effect_resource! { release_sync; body: move || observed.store(was_interrupted, Ordering::SeqCst), }
+        }, };
         let mut pending = Box::pin(pending.run_cancellable(Arc::clone(&cancellation)));
         suspension::suspended(pending.as_mut());
         assert!(cancellation.request());
@@ -829,7 +842,7 @@ impl effect::HasTaskSpawner for SuspendedTasks {
 }
 
 #[test]
-fn scope_closure_cancels_and_joins_a_child_actually_blocked_on_queue_offer() {
+fn scope_closure_cancels_and_joins_a_child_actually_blocked_on_queue_offer() -> Result<(), String> {
     let env = Arc::new(SuspendedTasks {
         entered: Cancellation::new(),
         worker: Mutex::new(None),
@@ -837,19 +850,24 @@ fn scope_closure_cancels_and_joins_a_child_actually_blocked_on_queue_offer() {
     let entered = env.entered.clone();
     let queue = AsyncQueue::new(QueueCapacity::Rendezvous);
     let offered = queue.clone();
-    let program = Scope::scoped(move |scope| {
-        let entered = entered.clone();
-        scope
-            .fork(offered.offer(payload(Marker::First)))
-            .flat_map(move |_fiber| {
-                let entered = entered.clone();
-                Effect::from_future(move |_| {
+    let program = effect_scope! {
+    body: move |scope| {
+            let entered = entered.clone();
+            effect! {
+     bind;
+     program: scope
+                .fork(offered.offer(payload(Marker::First))),
+     body: move |_fiber| {
                     let entered = entered.clone();
-                    async move { entered.cancelled().await }
-                })
-            })
-    });
-    assert_eq!(run(program, Arc::clone(&env)), Exit::Success(()));
+                    effect_future! { body: move |_| {
+                        let entered = entered.clone();
+                        async move { entered.cancelled().await }
+                    }, }
+                },
+     }
+        },
+    };
+    assert_eq!(run(program, Arc::clone(&env))?, Exit::Success(()));
     let worker = env
         .worker
         .lock()
@@ -863,4 +881,5 @@ fn scope_closure_cancels_and_joins_a_child_actually_blocked_on_queue_offer() {
     suspension::suspended(next.as_mut());
     offer(&queue, Marker::Second);
     assert_eq!(block_on(next), Exit::Success(payload(Marker::Second)));
+    Ok(())
 }

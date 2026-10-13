@@ -20,7 +20,8 @@ use std::time::Duration;
 
 /// Fixture bounds are explicit inputs, independent of production defaults.
 fn nz(value: usize) -> NonZeroUsize {
-    NonZeroUsize::new(value).expect("positive composition fixture bound")
+    assert!(value > 0, "positive composition fixture bound");
+    NonZeroUsize::MIN.saturating_add(value - 1)
 }
 /// Retain explicit parsing bounds, including enough text width for the fixture stable identities.
 fn limits() -> ParseLimits {
@@ -62,10 +63,13 @@ fn parse_policy() -> ParsePolicy {
 }
 /// Only successful primary outcomes satisfy these representative execution assertions.
 #[track_caller]
-fn success<A, E>(exit: Exit<A, E>) -> A {
+fn success<A, E>(exit: Exit<A, E>) -> Result<A, String> {
     match exit {
-        Exit::Success(value) => value,
-        _ => panic!("composition fixture expected success"),
+        Exit::Success(value) => Ok(value),
+        Exit::Fail(_) => Err("composition fixture failed".into()),
+        Exit::Die(error) => Err(format!("composition fixture defect: {error:?}")),
+        Exit::Interrupted => Err("composition fixture interrupted".into()),
+        Exit::FinalizationFailed(_) => Err("composition fixture cleanup failed".into()),
     }
 }
 /// Stable fixture key domain; keys never derive from Rust source positions.
@@ -75,16 +79,16 @@ impl KeyDomain for Domain {
     const TAG: &'static str = "macro-composition";
 }
 /// Names and segments are explicit application vocabulary for the fixture's stored identities.
-fn key(name: &str) -> StableKey<Domain> {
-    StableKey::new(
-        &KeyNamespace::<Domain>::new("macro-composition").expect("fixture namespace"),
-        [KeySegment::Text(name.into())],
-    )
-    .expect("fixture stable key")
+fn key(name: &str) -> Result<StableKey<Domain>, String> {
+    let namespace = KeyNamespace::<Domain>::new("macro-composition")
+        .map_err(|error| format!("fixture namespace: {error:?}"))?;
+    StableKey::new(&namespace, [KeySegment::Text(name.into())])
+        .map_err(|error| format!("fixture stable key: {error:?}"))
 }
 /// Binary wire identities remain explicit and independent of Rust type names.
-fn binary(name: &str) -> BinaryIdentity {
-    BinaryIdentity::new(name, NonZeroU64::MIN).expect("fixture binary identity")
+fn binary(name: &str) -> Result<BinaryIdentity, String> {
+    BinaryIdentity::new(name, NonZeroU64::MIN)
+        .map_err(|error| format!("fixture binary identity: {error:?}"))
 }
 /// Metadata retained from each span creation for parentage/annotation assertions.
 #[derive(Clone)]
@@ -229,7 +233,7 @@ struct Failure {
 }
 /// Extracted ordinary Effect helper participates in nested domain bodies under the same R.
 fn owned<R: Send + Sync + 'static>() -> Effect<Owned, (), R> {
-    Effect::from_future_once(|_| async { Owned(Cell::new(4)) })
+    effect_future! { once; body: |_| async { Owned(Cell::new(4)) }, }
 }
 /// Extracted tracked helper retains the caller's evaluation context instead of reading directly.
 fn tracked<R: Send + Sync + 'static>(source: AtomRef<i64>) -> AtomProgram<i64, AtomRefError, R> {
@@ -251,22 +255,44 @@ impl RpcStreamSession for Session {
     fn receive_frame(&self) -> Effect<Option<Vec<u8>>, Self::Error> {
         {
             let input = Arc::clone(&self.input);
-            Effect::sync_once(move || input.lock().expect("session input").pop_front())
+            effect! {
+            bind;
+            program: effect_sync! { once; body: move || {
+                           input
+                               .lock()
+                               .map(|mut input| input.pop_front())
+                               .map_err(|_| Defect::new("session input lock poisoned"))
+                       }, },
+            body: |result| match result {
+                           Ok(frame) => effect_sync! { once; body: move || frame, },
+                           Err(defect) => effect_die! { defect: defect, },
+                       },
+            }
         }
     }
     /// Retain one transferred response frame without cloning its payload.
     fn send(&self, frame: FrameParts) -> Effect<(), Self::Error> {
         let output = Arc::clone(&self.output);
-        Effect::sync_once(move || {
-            output.lock().expect("session output").push(frame);
-        })
+        effect! {
+        bind;
+        program: effect_sync! { once; body: move || {
+                   output
+                       .lock()
+                       .map(|mut output| output.push(frame))
+                       .map_err(|_| Defect::new("session output lock poisoned"))
+               }, },
+        body: |result| match result {
+                   Ok(()) => effect_sync! { body: || (), },
+                   Err(defect) => effect_die! { defect: defect, },
+               },
+        }
     }
     /// Record close during the existing protected server cleanup.
     fn close(&self) -> Effect<(), Self::Error> {
         let closed = Arc::clone(&self.closed);
-        Effect::sync_once(move || {
+        effect_sync! { once; body: move || {
             closed.fetch_add(1, Ordering::SeqCst);
-        })
+        }, }
     }
 }
 /// Record used by the schema macro to construct and decode an existing native Rust type.
@@ -276,12 +302,12 @@ struct FixtureRecord {
 }
 /// Typed reusable unary callback alternative to inline lowering.
 fn unary<R: Send + Sync + 'static>(request: i64) -> Effect<i64, i64, R> {
-    Effect::sync_once(move || request + 1)
+    effect_sync! { once; body: move || request + 1, }
 }
 
 /// Exercise the same composition and lifecycle contracts under either consumer's providers.
 /// Bounds are supplied exclusively by R; no scenario code creates a task/CPU runtime.
-pub async fn exercise<R>(base: Arc<R>)
+pub async fn exercise<R>(base: Arc<R>) -> Result<(), String>
 where
     R: HasTaskSpawner + HasCpuExecutor + HasBlockingExecutor + HasClock + Send + Sync + 'static,
 {
@@ -296,7 +322,9 @@ where
         ),
         |annotations| Ok(annotations.clone()),
         move |start| {
-            let mut log = start_log.lock().expect("span starts");
+            let mut log = start_log
+                .lock()
+                .map_err(|_| Defect::new("span starts lock poisoned"))?;
             let id = SpanId::new(format!("fixture-span-{}", log.len()));
             log.push(Start {
                 name: Arc::clone(&start.name),
@@ -308,7 +336,7 @@ where
         move |finish| {
             finish_log
                 .lock()
-                .expect("span finishes")
+                .map_err(|_| Defect::new("span finishes lock poisoned"))?
                 .push(finish.outcome);
             Ok(())
         },
@@ -340,50 +368,58 @@ where
             service! {select:|_:&Environment<R>|3i64,run |selected| {
                 let offset=*selected;
                 let value=owned()?;
-                let value=Effect::cpu_once(move|_|value)?;
-                let value=Effect::blocking_once(move|_|value)?;
-                span! {name:"inner",effect:Effect::sync_once(move||value.0.get()+offset)}?
+                let value=effect_cpu! { once; body: move|_|value, }?;
+                let value=effect_blocking! { once; body: move|_|value, }?;
+                span! {name:"inner",effect:effect_sync! { once; body: move||value.0.get()+offset, }}?
             }}?
         },
     };
-    assert!(starts.lock().expect("starts").is_empty());
-    assert_eq!(success(program.run(Arc::clone(&environment)).await), 7);
-    let log = starts.lock().expect("starts");
-    assert_eq!(log.len(), 2);
-    assert_eq!(&*log[0].name, "outer");
-    assert!(log[0].parent.is_none());
-    assert_eq!(
-        log[1].parent.as_ref().map(SpanId::as_str),
-        Some("fixture-span-0")
+    assert!(
+        starts
+            .lock()
+            .map_err(|_| "starts lock poisoned")?
+            .is_empty()
     );
-    assert_eq!(
-        log[1].annotations.get("component").map(AsRef::as_ref),
-        Some("composition")
-    );
-    drop(log);
+    assert_eq!(success(program.run(Arc::clone(&environment)).await)?, 7);
+    {
+        let log = starts.lock().map_err(|_| "starts lock poisoned")?;
+        assert_eq!(log.len(), 2);
+        let outer = log.first().ok_or("outer span start")?;
+        let inner = log.get(1).ok_or("inner span start")?;
+        assert_eq!(&*outer.name, "outer");
+        assert!(outer.parent.is_none());
+        assert_eq!(
+            inner.parent.as_ref().map(SpanId::as_str),
+            Some("fixture-span-0")
+        );
+        assert_eq!(
+            inner.annotations.get("component").map(AsRef::as_ref),
+            Some("composition")
+        );
+    }
     assert!(
         finishes
             .lock()
-            .expect("finishes")
+            .map_err(|_| "finishes lock poisoned")?
             .iter()
             .all(|outcome| *outcome == SpanOutcome::Succeeded)
     );
     let restored: Effect<TraceContext, (), Environment<R>> = Effect::trace_context();
     assert!(
-        success(restored.run(Arc::clone(&environment)).await)
+        success(restored.run(Arc::clone(&environment)).await)?
             .span
             .is_none()
     );
     let mapped: Effect<i64, i64, Environment<R>> = service! {select:|_:&Environment<R>|5i64,on_error:|error:u8|i64::from(error),run |selected| {
-        let ordinary=Effect::sync(||2i64)?;
-        let provider=ServiceOperation::new(|receiver:&i64|Effect::<i64,u8,Environment<R>>::sync_once({let value=*receiver;move||value}))?;
+        let ordinary=effect_sync! { body: ||2i64, }?;
+        let provider=service! { operation: |receiver:&i64|{ let __dsl_program: Effect < i64 , u8 , Environment < R > > = effect_sync! { once; body: {let value=*receiver;move||value}, }; __dsl_program }, }?;
         assert_eq!(*selected,5);ordinary+provider
     }};
-    assert_eq!(success(mapped.run(Arc::clone(&environment)).await), 7);
+    assert_eq!(success(mapped.run(Arc::clone(&environment)).await)?, 7);
     let provider_maps = Arc::new(AtomicUsize::new(0));
     let mappings = Arc::clone(&provider_maps);
     let mapped_failure: Effect<(), i64, Environment<R>> = service! {select:|_:&Environment<R>|5i64,on_error:move|error:u8|{mappings.fetch_add(1,Ordering::SeqCst);i64::from(error)},run |_selected| {
-        ServiceOperation::new(|_:&i64|Effect::<(),u8,Environment<R>>::fail(7))?;
+        service! { operation: |_:&i64|{ let __dsl_program: Effect < () , u8 , Environment < R > > = effect_try_sync! { body: { let __dsl_error = 7; move || Err(__dsl_error) }, on_error: ::core::convert::identity, }; __dsl_program }, }?;
     }};
     assert!(matches!(
         mapped_failure.run(Arc::clone(&environment)).await,
@@ -394,10 +430,14 @@ where
     let disposals = Arc::new(AtomicUsize::new(0));
     let released = Arc::clone(&disposals);
     let selected_resource: Effect<(), i64, Environment<R>> = service! {handle:5i64,on_error:move|error:u8|{mappings.fetch_add(1,Ordering::SeqCst);i64::from(error)},run |_selected| {
-        let disposals=Arc::clone(&released);
-        let _resource=ServiceResource::new(|value:&i64|{let value=*value;Effect::<i64,u8,Environment<R>>::sync_once(move||value)},move|_:i64|{let disposals=Arc::clone(&disposals);Effect::sync_once(move||{disposals.fetch_add(1,Ordering::SeqCst);}).flat_map(|()|Effect::fail(9u8))})?;
-        Effect::<(),i64,Environment<R>>::fail(11)?;
-    }};
+           let disposals=Arc::clone(&released);
+           let _resource=service! { acquire: |value:&i64|{let value=*value;{ let __dsl_program: Effect < i64 , u8 , Environment < R > > = effect_sync! { once; body: move||value, }; __dsl_program }}, release: move|_:i64|{let disposals=Arc::clone(&disposals);effect! {
+    bind;
+    program: effect_sync! { once; body: move||{disposals.fetch_add(1,Ordering::SeqCst);}, },
+    body: |()|effect_try_sync! { body: { let __dsl_error = 9u8; move || Err(__dsl_error) }, on_error: ::core::convert::identity, },
+    }}, }?;
+           { let __dsl_program: Effect < () , i64 , Environment < R > > = effect_try_sync! { body: { let __dsl_error = 11; move || Err(__dsl_error) }, on_error: ::core::convert::identity, }; __dsl_program }?;
+       }};
     assert!(matches!(
         selected_resource.run(Arc::clone(&environment)).await,
         Exit::FinalizationFailed(Finalization {
@@ -408,14 +448,13 @@ where
     ));
     assert_eq!(provider_maps.load(Ordering::SeqCst), 2);
     assert_eq!(disposals.load(Ordering::SeqCst), 1);
-    let failed_span: Effect<(), (), Environment<R>> =
-        span! {name:"failed-span",effect:Effect::fail(())};
+    let failed_span: Effect<(), (), Environment<R>> = span! {name:"failed-span",effect:effect_try_sync! { body: move || Err(()), on_error: ::core::convert::identity, }};
     assert!(matches!(
         failed_span.run(Arc::clone(&environment)).await,
         Exit::Fail(())
     ));
     let defect_span: Effect<(), (), Environment<R>> =
-        span! {name:"defect-span",effect:Effect::die(Defect::new("fixture defect"))};
+        span! {name:"defect-span",effect:effect_die! { defect: Defect::new("fixture defect"), }};
     assert!(matches!(
         defect_span.run(Arc::clone(&environment)).await,
         Exit::Die(_)
@@ -423,26 +462,26 @@ where
     assert!(
         finishes
             .lock()
-            .expect("span outcomes")
+            .map_err(|_| "span outcomes lock poisoned")?
             .contains(&SpanOutcome::Failed)
     );
     assert!(
         finishes
             .lock()
-            .expect("span outcomes")
+            .map_err(|_| "span outcomes lock poisoned")?
             .contains(&SpanOutcome::Defected)
     );
-    let projected: Effect<i64, (), Environment<R>> = service! {project:|_:&Environment<R>|9i64,effect:Effect::<i64,(),i64>::service(|value|*value)};
-    assert_eq!(success(projected.run(Arc::clone(&environment)).await), 9);
+    let projected: Effect<i64, (), Environment<R>> = service! {project:|_:&Environment<R>|9i64,effect:{ let __dsl_program: Effect < i64 , () , i64 > = service! { env: |value|*value, }; __dsl_program }};
+    assert_eq!(success(projected.run(Arc::clone(&environment)).await)?, 9);
 
     let released = Arc::new(AtomicUsize::new(0));
     let release_log = Arc::clone(&released);
     let records: Stream<i64, (), Environment<R>> = stream! {
         let released=Arc::clone(&release_log);
-        let resource=ResourceBinding::new(Effect::sync(||String::from("owned")),move|_,_|{let released=Arc::clone(&released);Release::sync(move||{released.fetch_add(1,Ordering::SeqCst);})})?;
+        let resource=effect_resource! { binding; acquire: effect_sync! { body: ||String::from("owned"), }, release: move|_,_|{let released=Arc::clone(&released);effect_resource! { release_sync; body: move||{released.fetch_add(1,Ordering::SeqCst);}, }}, }?;
         yield resource.access(|value|value.len() as i64)?;
-        for value in 0..2 {match value {value if value==0=>{yield Effect::sync_once(move||value)?;},_=>{yield value;}}}
-        yield_from!(Stream::from_iterable(||[3i64].into_iter()).flat_map(|value|stream!{yield value+1;}));
+        for value in 0..2 {match value {value if value==0=>{yield effect_sync! { once; body: move||value, }?;},_=>{yield value;}}}
+        yield_from!(stream! { iterable: ||[3i64].into_iter(), }.flat_map(|value|stream!{yield value+1;}));
     };
     assert_eq!(released.load(Ordering::SeqCst), 0);
     assert_eq!(
@@ -451,13 +490,12 @@ where
                 .run_collect(Some(4))
                 .run(Arc::clone(&environment))
                 .await
-        ),
+        )?,
         vec![5, 0, 1, 4]
     );
     assert_eq!(released.load(Ordering::SeqCst), 1);
     assert!(matches!(
-        records
-            .run_for_each(|_| Effect::fail(()))
+        effect_stream_for_each! { stream: records, body: |_| effect_try_sync! { body: move || Err(()), on_error: ::core::convert::identity, }, }
             .run(Arc::clone(&environment))
             .await,
         Exit::Fail(())
@@ -469,144 +507,165 @@ where
         overflow: PubSubOverflow::Backpressure,
         replay: ReplayPolicy::None,
     })
-    .expect("registry");
-    let source=reactive_source! {registry:registry.clone(),id:AtomId::from_stable(key("source")),initial:4i64,capacity:nz(8),overflow:PubSubOverflow::Backpressure}.expect("source");
+    .map_err(|error| format!("registry: {error:?}"))?;
+    let source_id = AtomId::from_stable(key("source")?);
+    let source=reactive_source! {registry:registry.clone(),id:source_id,initial:4i64,capacity:nz(8),overflow:PubSubOverflow::Backpressure}.map_err(|error|format!("source: {error:?}"))?;
     let captured = source.clone();
-    let derived=reactive_derived! {registry:registry.clone(),id:AtomId::from_stable(key("view")),capacity:nz(8),overflow:PubSubOverflow::Backpressure,program:atom! {
+    let view_id = AtomId::from_stable(key("view")?);
+    let derived=reactive_derived! {registry:registry.clone(),id:view_id,capacity:nz(8),overflow:PubSubOverflow::Backpressure,program:atom! {
         let captured=captured.clone();
         let value=if true {tracked::<Environment<R>>(captured)?}else{0};
-        Effect::<i64,AtomRefError,Environment<R>>::sync_once(move||value+1)?
-    }}.expect("derived");
-    success(derived.refresh().run(Arc::clone(&environment)).await);
+        { let __dsl_program: Effect < i64 , AtomRefError , Environment < R > > = effect_sync! { once; body: move||value+1, }; __dsl_program }?
+    }}.map_err(|error|format!("derived: {error:?}"))?;
+    success(derived.refresh().run(Arc::clone(&environment)).await)?;
     assert!(
         registry
             .dependencies_of(derived.id())
-            .expect("tracked dependencies")
+            .map_err(|error| format!("tracked dependencies: {error:?}"))?
             .contains(source.id())
     );
     let hydration_schema = HydrationSchema::new(
         source.id().clone(),
-        RecordVersion::new("composition-v1").expect("hydration version"),
+        RecordVersion::new("composition-v1")
+            .map_err(|error| format!("hydration version: {error:?}"))?,
         json_i64(),
         limits(),
     );
     let order = Arc::new(Mutex::new(Vec::new()));
     let set:HydrationSet<Environment<R>>=hydration! {
-        bindings:[{order.lock().expect("order").push("source");source.clone()}=>hydration_schema.clone()],
-        registry:{order.lock().expect("order").push("registry");registry.clone()},limits:limits(),
-    }.expect("hydration");
-    assert_eq!(*order.lock().expect("order"), vec!["source", "registry"]);
+        bindings:[{order.lock().map_err(|_|"order lock poisoned")?.push("source");source.clone()}=>hydration_schema.clone()],
+        registry:{order.lock().map_err(|_|"order lock poisoned")?.push("registry");registry.clone()},limits:limits(),
+    }.map_err(|error|format!("hydration: {error:?}"))?;
+    assert_eq!(
+        *order.lock().map_err(|_| "order lock poisoned")?,
+        vec!["source", "registry"]
+    );
     let duplicate: Result<HydrationSet<Environment<R>>, HydrationError> = hydration! {registry:registry.clone(),limits:limits(),bindings:[source.clone()=>hydration_schema.clone(),source.clone()=>hydration_schema]};
     assert!(matches!(duplicate, Err(HydrationError::DuplicateAtom)));
-    let snapshot = match set.export_all().run(Arc::clone(&environment)).await {
-        Exit::Success(snapshot) => snapshot,
-        other => panic!("hydration export: {other:?}"),
-    };
+    let snapshot = success(set.export_all().run(Arc::clone(&environment)).await)?;
     assert_eq!(snapshot.len(), 1);
     success(
         source
             .set::<Environment<R>>(8)
             .run(Arc::clone(&environment))
             .await,
-    );
+    )?;
     success(
         set.import_all(snapshot, HydrationConflictPolicy::ForceMonotonic)
             .run(Arc::clone(&environment))
             .await,
-    );
+    )?;
     success(
         derived
             .dispose(PubSubShutdown::Discard)
             .run(Arc::clone(&environment))
             .await,
-    );
+    )?;
 
-    let cache_program: Effect<i64, SharedValue<()>, Environment<R>> = Scope::scoped(|scope| {
-        effect! {
-            let cached=cache! {scope:scope.clone(),config:CacheConfig{equal:Arc::new(|left:&i64,right|left==right),ttl:None,capacity:CacheCapacity::Bounded(nz(2)),cache_failure:Arc::new(|_:&()|false)},options:CacheOptions{ttl:CacheTtl::Fixed(None),admission:CacheAdmission::Bounded{maximum:nz(2),capacity_error:Arc::new(||())}},load |key:Arc<i64>| {{let value=*key;span!{name:"cache-load",body{Effect::<i64,(),Environment<R>>::cpu_once(move|_|value+1)?}}?}}}?;
-            let value=cached.get(3)?;value.with(|value|*value).expect("cache borrow")
-        }
-    });
+    let cache_program: Effect<i64, SharedValue<()>, Environment<R>> = effect_scope! {
+    body: |scope| {
+            effect! {
+                let cached=cache! {scope:scope.clone(),config:CacheConfig{equal:Arc::new(|left:&i64,right|left==right),ttl:None,capacity:CacheCapacity::Bounded(nz(2)),cache_failure:Arc::new(|_:&()|false)},options:CacheOptions{ttl:CacheTtl::Fixed(None),admission:CacheAdmission::Bounded{maximum:nz(2),capacity_error:Arc::new(||())}},load |key:Arc<i64>| {{let value=*key;span!{name:"cache-load",body{{ let __dsl_program: Effect < i64 , () , Environment < R > > = effect_cpu! { once; body: move|_|value+1, }; __dsl_program }?}}?}}}?;
+                let value=cached.get(3)?;match value.with(|value|*value){Ok(value)=>value,Err(error)=>effect_die! { defect: Defect::new(format!("cache borrow: {error:?}")), }?}
+            }
+        },
+    };
     assert_eq!(
-        success(cache_program.run(Arc::clone(&environment)).await),
+        success(cache_program.run(Arc::clone(&environment)).await)?,
         4
     );
-    let dependency: Effect<(), SharedValue<DependencyCacheError<()>>, Environment<R>> =
-        Scope::scoped(|scope| {
-            effect! {
-                let cached=dependency_cache!{scope:scope.clone(),policy:DependencyCachePolicy{retention:nz(2),maximum_active:nz(2),maximum_dependencies:nz(2),key_equal:Arc::new(|left:&i64,right|left==right),dependency_equal:Arc::new(|left:&i64,right|left==right),cache_failure:Arc::new(|_:&()|false),ttl:CacheTtl::Fixed(None)},load |key:Arc<i64>|{Effect::<(i64,Vec<i64>),(),Environment<R>>::sync_once(move||(*key,vec![1]))?}}?;
-                let _=cached.get(3)?;cached.invalidate_dependency(1)?;
-            }
-        });
-    success(dependency.run(Arc::clone(&environment)).await);
+    let dependency: Effect<(), SharedValue<DependencyCacheError<()>>, Environment<R>> = effect_scope! {
+    body: |scope| {
+                effect! {
+                    let cached=dependency_cache!{scope:scope.clone(),policy:DependencyCachePolicy{retention:nz(2),maximum_active:nz(2),maximum_dependencies:nz(2),key_equal:Arc::new(|left:&i64,right|left==right),dependency_equal:Arc::new(|left:&i64,right|left==right),cache_failure:Arc::new(|_:&()|false),ttl:CacheTtl::Fixed(None)},load |key:Arc<i64>|{{ let __dsl_program: Effect < (i64 , Vec < i64 >) , () , Environment < R > > = effect_sync! { once; body: move||(*key,vec![1]), }; __dsl_program }?}}?;
+                    let _=cached.get(3)?;cached.invalidate_dependency(1)?;
+                }
+            },
+    };
+    success(dependency.run(Arc::clone(&environment)).await)?;
 
     let callback_calls = Arc::new(AtomicUsize::new(0));
     let call_log = Arc::clone(&callback_calls);
     let callback_prefixes = Arc::new(AtomicUsize::new(0));
     let prefix_log = Arc::clone(&callback_prefixes);
-    let captured_handler = rpc_operation! {id:OperationId::new("captured-helper").expect("operation"),version:RpcVersion::new(NonZeroU32::MIN),request:json_i64(),success:json_i64(),error:json_i64(),limits:limits(),handler |request| {
+    let captured_id =
+        OperationId::new("captured-helper").map_err(|error| format!("operation: {error:?}"))?;
+    let captured_handler = rpc_operation! {id:captured_id,version:RpcVersion::new(NonZeroU32::MIN),request:json_i64(),success:json_i64(),error:json_i64(),limits:limits(),handler |request| {
         let calls=Arc::clone(&call_log);let prefix=Arc::clone(&prefix_log);
         let _fresh={prefix.fetch_add(1,Ordering::SeqCst);String::from("fresh-callback-local")};
-        Effect::<i64,i64,Environment<R>>::cpu_once(move|_|{calls.fetch_add(1,Ordering::SeqCst);request+1})?
+        { let __dsl_program: Effect < i64 , i64 , Environment < R > > = effect_cpu! { once; body: move|_|{calls.fetch_add(1,Ordering::SeqCst);request+1}, }; __dsl_program }?
     }};
     let first = captured_handler.call(1);
     assert_eq!(callback_calls.load(Ordering::SeqCst), 0);
     assert_eq!(callback_prefixes.load(Ordering::SeqCst), 0);
-    assert_eq!(success(first.run(Arc::clone(&environment)).await), 2);
+    assert_eq!(success(first.run(Arc::clone(&environment)).await)?, 2);
     assert_eq!(
-        success(captured_handler.call(2).run(Arc::clone(&environment)).await),
+        success(captured_handler.call(2).run(Arc::clone(&environment)).await)?,
         3
     );
     assert_eq!(callback_calls.load(Ordering::SeqCst), 2);
     assert_eq!(callback_prefixes.load(Ordering::SeqCst), 2);
-    let handler = rpc_operation! {id:OperationId::new("lookup").expect("operation"),version:RpcVersion::new(NonZeroU32::MIN),request:json_i64(),success:json_i64(),error:json_i64(),limits:limits(),handler |request| {Effect::<i64,i64,Environment<R>>::cpu_once(move|_|request+1)?}};
+    let lookup_id = OperationId::new("lookup").map_err(|error| format!("operation: {error:?}"))?;
+    let handler = rpc_operation! {id:lookup_id,version:RpcVersion::new(NonZeroU32::MIN),request:json_i64(),success:json_i64(),error:json_i64(),limits:limits(),handler |request| {{ let __dsl_program: Effect < i64 , i64 , Environment < R > > = effect_cpu! { once; body: move|_|request+1, }; __dsl_program }?}};
     assert_eq!(
-        success(handler.call(3).run(Arc::clone(&environment)).await),
+        success(handler.call(3).run(Arc::clone(&environment)).await)?,
         4
     );
-    let callback = rpc_operation! {id:OperationId::new("callback").expect("operation"),version:RpcVersion::new(NonZeroU32::MIN),request:json_i64(),success:json_i64(),error:json_i64(),limits:limits(),handler:unary::<Environment<R>>};
+    let callback_id =
+        OperationId::new("callback").map_err(|error| format!("operation: {error:?}"))?;
+    let callback = rpc_operation! {id:callback_id,version:RpcVersion::new(NonZeroU32::MIN),request:json_i64(),success:json_i64(),error:json_i64(),limits:limits(),handler:unary::<Environment<R>>};
     assert_eq!(
-        success(callback.call(4).run(Arc::clone(&environment)).await),
+        success(callback.call(4).run(Arc::clone(&environment)).await)?,
         5
     );
-    let stream_handler = rpc_stream_operation! {id:OperationId::new("stream").expect("operation"),version:RpcVersion::new(NonZeroU32::MIN),request:json_i64(),chunk:json_i64(),terminal:json_i64(),error:json_i64(),limits:limits(),handler |request,context:RpcStreamContext| {
+    let stream_id = OperationId::new("stream").map_err(|error| format!("operation: {error:?}"))?;
+    let stream_handler = rpc_stream_operation! {id:stream_id.clone(),version:RpcVersion::new(NonZeroU32::MIN),request:json_i64(),chunk:json_i64(),terminal:json_i64(),error:json_i64(),limits:limits(),handler |request,context:RpcStreamContext| {
         assert!(context.metadata.is_empty());
-        Effect::<_,i64,Environment<R>>::sync_once(move||RpcStreamProducer::new(move||Effect::sync_once(move||RpcProduced::Terminal(request+1))))?
+        { let __dsl_program: Effect < _ , i64 , Environment < R > > = effect_sync! { once; body: move||RpcStreamProducer::new(move||effect_sync! { once; body: move||RpcProduced::Terminal(request+1), }), }; __dsl_program }?
     }};
-    let _group: RpcProtocolGroup<
+    type ProtocolGroup<R> = RpcProtocolGroup<
         RpcProtocol<i64, Environment<R>>,
         RpcStreamProtocol<i64, (), Environment<R>, Session>,
-    > = rpc_protocol! {policy:rpc_policy(),unary:[handler],streaming:[stream_handler.clone()]}
-        .expect("grouped protocols");
+    >;
+    let _group: ProtocolGroup<R> =
+        rpc_protocol! {policy:rpc_policy(),unary:[handler],streaming:[stream_handler.clone()]}
+            .map_err(|error| format!("grouped protocols: {error:?}"))?;
     let middleware_released = Arc::new(AtomicUsize::new(0));
     let acquisition_releases = Arc::clone(&middleware_released);
     let authorization: RpcServiceMiddleware<ResourceValue<i64>, (), Environment<R>> = rpc_middleware! {acquire {
         let releases=Arc::clone(&acquisition_releases);
-        ResourceBinding::new(Effect::sync(||7i64),move|_,_|{let releases=Arc::clone(&releases);Release::sync(move||{releases.fetch_add(1,Ordering::SeqCst);})})?
+        effect_resource! { binding; acquire: effect_sync! { body: ||7i64, }, release: move|_,_|{let releases=Arc::clone(&releases);effect_resource! { release_sync; body: move||{releases.fetch_add(1,Ordering::SeqCst);}, }}, }?
     }};
     let result = authorization.apply(
         |service, _: &Environment<R>| service,
         |input: i64| {
-            Effect::<i64, (), Arc<ResourceValue<i64>>>::service(move |service| {
-                service
-                    .with(|value| *value + input)
-                    .expect("live middleware resource")
-            })
+            effect! {
+ bind;
+ program: { let __dsl_program: Effect < _ , () , Arc < ResourceValue < i64 > > > = service! { environment: Arc::<ResourceValue<i64>>, env: move |service| {
+                service.with(|value| *value + input)
+            }, }; __dsl_program },
+ body: |result| match result {
+                Ok(value) => effect_sync! { once; body: move || value, },
+                Err(error) => {
+                    effect_die! { defect: Defect::new(format!("live middleware resource: {error:?}")), }
+                }
+            },
+ }
         },
         1,
     );
     assert_eq!(middleware_released.load(Ordering::SeqCst), 0);
-    assert_eq!(success(result.run(Arc::clone(&environment)).await), 8);
+    assert_eq!(success(result.run(Arc::clone(&environment)).await)?, 8);
     assert_eq!(middleware_released.load(Ordering::SeqCst), 1);
     let failure_releases = Arc::new(AtomicUsize::new(0));
     let failure_log = Arc::clone(&failure_releases);
     let failing: RpcServiceMiddleware<ResourceValue<i64>, i64, Environment<R>> = rpc_middleware! {acquire {
         let log=Arc::clone(&failure_log);
-        ResourceBinding::new(Effect::sync(||1i64),move|_,_|{let log=Arc::clone(&log);Release::try_sync(move||{log.fetch_add(1,Ordering::SeqCst);Err(17)})})?
+        effect_resource! { binding; acquire: effect_sync! { body: ||1i64, }, release: move|_,_|{let log=Arc::clone(&log);effect_resource! { release_try_sync; body: move||{log.fetch_add(1,Ordering::SeqCst);Err(17)}, }}, }?
     }};
     let failed = failing.apply(
         |service, _: &Environment<R>| service,
-        |_: ()| Effect::<(), i64, Arc<ResourceValue<i64>>>::fail(23),
+        |_: ()| { let __dsl_program: Effect < () , i64 , Arc < ResourceValue < i64 > > > = effect_try_sync! { body: { let __dsl_error = 23; move || Err(__dsl_error) }, on_error: ::core::convert::identity, }; __dsl_program },
         (),
     );
     assert!(matches!(
@@ -624,7 +683,7 @@ where
     let reference = environment
         .transactions
         .reference(0i64)
-        .expect("transaction reference");
+        .map_err(|error| format!("transaction reference: {error:?}"))?;
     let read = reference.clone();
     let transaction: Transaction<String, ()> = transaction! {
         let owned=String::from("attempt-local");counts.fetch_add(1,Ordering::SeqCst);
@@ -636,21 +695,25 @@ where
     assert_eq!(attempts.load(Ordering::SeqCst), 0);
     let writer_counts = Arc::clone(&attempts);
     let write = reference.clone();
-    let retried: Effect<String, TransactionError<()>, Environment<R>> = Scope::scoped(
-        move |scope| {
-            let write = write.clone();
-            let writer_counts = Arc::clone(&writer_counts);
-            let transaction = transaction.clone();
-            effect! {
-                let transaction=transaction.clone();let write=write.clone();let counts=Arc::clone(&writer_counts);
-                let writer=scope.fork(Effect::cpu_once(move|_|{while counts.load(Ordering::SeqCst)==0 {std::thread::yield_now();}}).flat_map(move|()|write.write::<()>(Arc::new(1)).atomically(TransactionPolicy{max_conflicts:nz(8)})))?;
-                let result=transaction.clone().atomically(TransactionPolicy{max_conflicts:nz(8)})?;
-                writer.join()?;result
-            }
-        },
-    );
+    let retried: Effect<String, TransactionError<()>, Environment<R>> = effect_scope! {
+    body: move |scope| {
+                let write = write.clone();
+                let writer_counts = Arc::clone(&writer_counts);
+                let transaction = transaction.clone();
+                effect! {
+                    let transaction=transaction.clone();let write=write.clone();let counts=Arc::clone(&writer_counts);
+                    let writer=scope.fork(effect! {
+     bind;
+     program: effect_cpu! { once; body: move|_|{while counts.load(Ordering::SeqCst)==0 {std::thread::yield_now();}}, },
+     body: move|()|write.write::<()>(Arc::new(1)).atomically(TransactionPolicy{max_conflicts:nz(8)}),
+     })?;
+                    let result=transaction.clone().atomically(TransactionPolicy{max_conflicts:nz(8)})?;
+                    writer.join()?;result
+                }
+            },
+    };
     assert_eq!(
-        success(retried.run(Arc::clone(&environment)).await),
+        success(retried.run(Arc::clone(&environment)).await)?,
         "attempt-local"
     );
     assert!(attempts.load(Ordering::SeqCst) >= 2);
@@ -659,19 +722,19 @@ where
     let cancelled: Transaction<(), ()> = transaction! {loop {iterations.fetch_add(1,Ordering::SeqCst);Transaction::succeed_with(||())?;}};
     let token = environment.cancellation.clone();
     let observed = Arc::clone(&loop_iterations);
-    let interruption: Effect<(), TransactionError<()>, Environment<R>> = Scope::scoped(
-        move |scope| {
-            let cancelled = cancelled.clone();
-            let token = token.clone();
-            let observed = Arc::clone(&observed);
-            effect! {
-                let cancelled=cancelled.clone();let token=token.clone();let observed=Arc::clone(&observed);
-                let running=scope.fork(cancelled.atomically(TransactionPolicy{max_conflicts:nz(8)}))?;
-                Effect::cpu_once(move|_|{while observed.load(Ordering::SeqCst)==0 {std::thread::yield_now();}assert!(token.request());})?;
-                running.join()?;
-            }
-        },
-    );
+    let interruption: Effect<(), TransactionError<()>, Environment<R>> = effect_scope! {
+    body: move |scope| {
+                let cancelled = cancelled.clone();
+                let token = token.clone();
+                let observed = Arc::clone(&observed);
+                effect! {
+                    let cancelled=cancelled.clone();let token=token.clone();let observed=Arc::clone(&observed);
+                    let running=scope.fork(cancelled.atomically(TransactionPolicy{max_conflicts:nz(8)}))?;
+                    effect_cpu! { once; body: move|_|{while observed.load(Ordering::SeqCst)==0 {std::thread::yield_now();}assert!(token.request());}, }?;
+                    running.join()?;
+                }
+            },
+    };
     assert!(matches!(
         interruption.run_cancellable(Arc::clone(&environment)).await,
         Exit::Interrupted
@@ -681,12 +744,13 @@ where
     let resource_releases = Arc::new(AtomicUsize::new(0));
     let resource_log = Arc::clone(&resource_releases);
     let address = ClusterAddress {
-        entity_type: ClusterEntityType::new("composition-entity").expect("entity type"),
-        entity: ClusterEntityId::from_stable(key("entity")),
-        shard: ClusterShardId::from_stable(key("shard")),
+        entity_type: ClusterEntityType::new("composition-entity")
+            .map_err(|error| format!("entity type: {error:?}"))?,
+        entity: ClusterEntityId::from_stable(key("entity")?),
+        shard: ClusterShardId::from_stable(key("shard")?),
     };
-    let activation = ActivationId::from_stable(key("activation"));
-    let owner = match success(
+    let activation = ActivationId::from_stable(key("activation")?);
+    let activation = success(
         environment
             .activation
             .activate(
@@ -697,21 +761,23 @@ where
             )
             .run(Arc::new(()))
             .await,
-    ) {
-        ActivationOutcome::Activated { lease, .. } => lease.owner,
-        _ => panic!("fixture activation"),
+    )?;
+    let ActivationOutcome::Activated { lease, .. } = activation else {
+        return Err("fixture activation was not acquired".into());
     };
+    let owner = lease.owner;
     let partial_releases = Arc::new(AtomicUsize::new(0));
     let partial_log = Arc::clone(&partial_releases);
     let partial: EntityResourcePlan<(), u8, Environment<R>> = entity_resource! {
         let log=Arc::clone(&partial_log);
-        let _resource=ResourceBinding::new(Effect::sync(||String::from("partial")),move|_,_|{let log=Arc::clone(&log);Release::try_sync(move||{log.fetch_add(1,Ordering::SeqCst);Err(9u8)})})?;
-        Effect::<(),u8,Environment<R>>::fail(7)?;
+        let _resource=effect_resource! { binding; acquire: effect_sync! { body: ||String::from("partial"), }, release: move|_,_|{let log=Arc::clone(&log);effect_resource! { release_try_sync; body: move||{log.fetch_add(1,Ordering::SeqCst);Err(9u8)}, }}, }?;
+        { let __dsl_program: Effect < () , u8 , Environment < R > > = effect_try_sync! { body: { let __dsl_error = 7; move || Err(__dsl_error) }, on_error: ::core::convert::identity, }; __dsl_program }?;
     };
     let mapped = partial.map_error(|code| Failure { code });
     let partial_owner = owner.clone();
-    let partial: Effect<(), Failure, Environment<R>> =
-        Scope::scoped(move |scope| mapped.acquire(scope, partial_owner.clone()));
+    let partial: Effect<(), Failure, Environment<R>> = effect_scope! {
+    body: move |scope| mapped.acquire(scope, partial_owner.clone()),
+    };
     assert!(matches!(
         partial.run(Arc::clone(&environment)).await,
         Exit::FinalizationFailed(Finalization {
@@ -723,94 +789,122 @@ where
     assert_eq!(partial_releases.load(Ordering::SeqCst), 1);
     let resources: EntityResourcePlan<ResourceValue<String>, (), Environment<R>> = entity_resource! {
         let releases=Arc::clone(&resource_log);
-        ResourceBinding::new(Effect::sync(||String::from("state")),move|_,_|{let releases=Arc::clone(&releases);Release::sync(move||{releases.fetch_add(1,Ordering::SeqCst);})})?
+        effect_resource! { binding; acquire: effect_sync! { body: ||String::from("state"), }, release: move|_,_|{let releases=Arc::clone(&releases);effect_resource! { release_sync; body: move||{releases.fetch_add(1,Ordering::SeqCst);}, }}, }?
     };
-    let definition = entity! {entity_type:address.entity_type.clone(),resources:resources,handlers:[rpc_operation! {id:OperationId::new("entity-length").expect("operation"),version:RpcVersion::new(NonZeroU32::MIN),request:json_i64(),success:json_i64(),error:json_i64(),limits:limits()}=>|state:Arc<ResourceValue<String>>,request:i64| {let size=state.access(|value|value.len() as i64)?;Effect::<i64,i64,Environment<R>>::sync_once(move||size+request)?}]};
+    let length_id =
+        OperationId::new("entity-length").map_err(|error| format!("operation: {error:?}"))?;
+    let definition = entity! {entity_type:address.entity_type.clone(),resources:resources,handlers:[rpc_operation! {id:length_id,version:RpcVersion::new(NonZeroU32::MIN),request:json_i64(),success:json_i64(),error:json_i64(),limits:limits()}=>|state:Arc<ResourceValue<String>>,request:i64| {let size=state.access(|value|value.len() as i64)?;{ let __dsl_program: Effect < i64 , i64 , Environment < R > > = effect_sync! { once; body: move||size+request, }; __dsl_program }?}]};
     let catalog: ClusterDefinition<(), Environment<R>> =
-        cluster! {policy:rpc_policy(),entities:[definition]}.expect("catalog");
+        cluster! {policy:rpc_policy(),entities:[definition]}
+            .map_err(|error| format!("catalog: {error:?}"))?;
     assert_eq!(resource_releases.load(Ordering::SeqCst), 0);
     let wall = environment.wall.clone();
     let dispatch_address = address.clone();
     let release_check = Arc::clone(&resource_releases);
-    let acquired: Effect<(), (), Environment<R>> = Scope::scoped(move |scope| {
-        let releases = Arc::clone(&resource_releases);
-        let wall = wall.clone();
-        let address = dispatch_address.clone();
-        catalog
-            .activate(scope, owner.clone())
-            .map_error(|_| ())
-            .flat_map(move |live| {
-                let releases = Arc::clone(&releases);
-                let wall = wall.clone();
-                let address = address.clone();
-                Effect::sync_once(move || {
-                    assert_eq!(releases.load(Ordering::SeqCst), 0);
-                    wall.set(UtcMillis::new(100));
-                    live
-                })
-                .flat_map(move |live| {
-                    live.execute(address.clone(), Arc::from(&b""[..]))
-                        .materialize_exit()
-                        .map_error(|never| match never {})
-                })
-                .map(|exit| {
-                    assert!(matches!(
-                        exit,
-                        Exit::Fail(EntityActivationError::StaleOwnership)
-                    ))
-                })
-            })
-    });
-    success(acquired.run(Arc::clone(&environment)).await);
+    let acquired: Effect<(), (), Environment<R>> = effect_scope! {
+    body: move |scope| {
+            let releases = Arc::clone(&resource_releases);
+            let wall = wall.clone();
+            let address = dispatch_address.clone();
+            effect! {
+     bind;
+     program: effect_map_error! { program: catalog
+                .activate(scope, owner.clone()), map: |_| (), },
+     body: move |live| {
+                    let releases = Arc::clone(&releases);
+                    let wall = wall.clone();
+                    let address = address.clone();
+                    effect_map! { program: effect! {
+     bind;
+     program: effect_sync! { once; body: move || {
+                        assert_eq!(releases.load(Ordering::SeqCst), 0);
+                        wall.set(UtcMillis::new(100));
+                        live
+                    }, },
+     body: move |live| {
+                        effect_map_error! { program: live.execute(address.clone(), Arc::from(&b""[..]))
+                            .materialize_exit(), map: |never| match never {}, }
+                    },
+     }, map: |exit| {
+                        assert!(matches!(
+                            exit,
+                            Exit::Fail(EntityActivationError::StaleOwnership)
+                        ))
+                    }, }
+                },
+     }
+        },
+    };
+    success(acquired.run(Arc::clone(&environment)).await)?;
     assert_eq!(release_check.load(Ordering::SeqCst), 1);
     environment.wall.set(UtcMillis::new(0));
     let singleton_address = ClusterAddress {
-        entity_type: ClusterEntityType::new("composition-singleton").expect("entity type"),
-        entity: ClusterEntityId::from_stable(key("singleton")),
-        shard: ClusterShardId::from_stable(key("shard")),
+        entity_type: ClusterEntityType::new("composition-singleton")
+            .map_err(|error| format!("entity type: {error:?}"))?,
+        entity: ClusterEntityId::from_stable(key("singleton")?),
+        shard: ClusterShardId::from_stable(key("shard")?),
     };
-    let single = singleton! {singleton:ClusterSingleton::new(singleton_address),activation:ActivationId::from_stable(key("singleton-activation")),lease_until:UtcMillis::new(100),run |owner:ClusterOwner| {assert_eq!(owner.address.entity_type.as_str(),"composition-singleton");Effect::<i64,(),Environment<R>>::cpu_once(|_|9)?}};
+    let singleton_activation = ActivationId::from_stable(key("singleton-activation")?);
+    let single = singleton! {singleton:singleton! { address: singleton_address, },activation:singleton_activation,lease_until:UtcMillis::new(100),run |owner:ClusterOwner| {assert_eq!(owner.address.entity_type.as_str(),"composition-singleton");{ let __dsl_program: Effect < i64 , () , Environment < R > > = effect_cpu! { once; body: |_|9, }; __dsl_program }?}};
     assert!(matches!(
-        success(single.run(Arc::clone(&environment)).await),
+        success(single.run(Arc::clone(&environment)).await)?,
         SingletonOutcome::Ran(9)
     ));
-    let schedule = cluster_schedule! {id:ClusterScheduleId::from_stable(key("schedule")),cron:Cron::parse("* * * * * *",DayMatch::Both).expect("cron"),transitions:CalendarTransitionPolicy{gap:GapPolicy::Skip,overlap:OverlapPolicy::Earlier},catch_up:MissedOccurrencePolicy::Latest,concurrent:ConcurrentOccurrencePolicy::Skip,deadline_after:Duration::from_secs(10)};
-    assert_eq!(
-        schedule.id(),
-        &ClusterScheduleId::from_stable(key("schedule"))
-    );
+    let schedule_id = ClusterScheduleId::from_stable(key("schedule")?);
+    let cron =
+        Cron::parse("* * * * * *", DayMatch::Both).map_err(|error| format!("cron: {error:?}"))?;
+    let schedule = cluster_schedule! {id:schedule_id.clone(),cron:cron,transitions:CalendarTransitionPolicy{gap:GapPolicy::Skip,overlap:OverlapPolicy::Earlier},catch_up:MissedOccurrencePolicy::Latest,concurrent:ConcurrentOccurrencePolicy::Skip,deadline_after:Duration::from_secs(10)};
+    assert_eq!(schedule.id(), &schedule_id);
 
-    let event_definition = event! {group:EventGroupId::new("composition-events").expect("group"),tag:EventTag::new("incremented").expect("tag"),version:EventVersion::new(NonZeroU32::MIN),payload:json_i64(),success:json_i64(),error:json_i64(),payload_identity:binary("composition-payload"),success_identity:binary("composition-success"),error_identity:binary("composition-error"),limits:binary_limits(),aggregate:|_:&i64|AggregateId::from_stable(key("aggregate"))};
+    let event_group =
+        EventGroupId::new("composition-events").map_err(|error| format!("group: {error:?}"))?;
+    let event_tag = EventTag::new("incremented").map_err(|error| format!("tag: {error:?}"))?;
+    let aggregate_id = AggregateId::from_stable(key("aggregate")?);
+    let event_aggregate = aggregate_id.clone();
+    let payload_identity = binary("composition-payload")?;
+    let success_identity = binary("composition-success")?;
+    let error_identity = binary("composition-error")?;
+    let event_definition = event! {group:event_group.clone(),tag:event_tag.clone(),version:EventVersion::new(NonZeroU32::MIN),payload:json_i64(),success:json_i64(),error:json_i64(),payload_identity:payload_identity,success_identity:success_identity,error_identity:error_identity,limits:binary_limits(),aggregate:move|_:&i64|event_aggregate.clone()};
     let handled = handled_event! {definition:event_definition,commit:EventCommitPolicy::SuccessOnly,handler |context:EventHandlerContext,payload:Arc<i64>| {
         assert_eq!(context.expected,JournalCursor::new(0));
-        span! {name:"handled-event",effect:Effect::<Result<i64,i64>,(),Environment<R>>::cpu_once(move|_|Ok(*payload+1))}?
+        span! {name:"handled-event",effect:{ let __dsl_program: Effect < Result < i64 , i64 > , () , Environment < R > > = effect_cpu! { once; body: move|_|Ok(*payload+1), }; __dsl_program }}?
     }};
-    let grouped=event_group! {group:EventGroupId::new("composition-events").expect("group"),events:[&handled]}.expect("handled grouping");
-    assert!(grouped.contains(
-        &EventTag::new("incremented").expect("tag"),
-        EventVersion::new(NonZeroU32::MIN)
-    ));
+    let grouped = event_group! {group:event_group,events:[&handled]}
+        .map_err(|error| format!("handled grouping: {error:?}"))?;
+    assert!(grouped.contains(&event_tag, EventVersion::new(NonZeroU32::MIN)));
     assert!(matches!(
         success(
             handled
                 .execute(
-                    EventJournalId::from_stable(key("journal")),
-                    EventId::from_stable(key("event")),
+                    EventJournalId::from_stable(key("journal")?),
+                    EventId::from_stable(key("event")?),
                     JournalCursor::new(0),
                     UtcMillis::new(0),
                     Arc::new(4)
                 )
                 .run(Arc::clone(&environment))
                 .await
-        ),
+        )?,
         EventRunOutcome::Committed { result: Ok(5), .. }
     ));
-    let projection=projection! {key:ProjectionKey{id:ProjectionId::from_stable(key("projection")),stream:JournalStream{journal:EventJournalId::from_stable(key("journal")),aggregate:AggregateId::from_stable(key("aggregate"))}},version:ProjectionVersion::new(NonZeroU32::MIN),initial:||0i64,cases:[handled.definition()=>|state:&i64,payload:i64,outcome:Result<i64,i64>|Ok::<i64,()>(*state+payload+outcome.expect("successful domain result"))]}.expect("typed projection");
+    let journal_stream = JournalStream {
+        journal: EventJournalId::from_stable(key("journal")?),
+        aggregate: aggregate_id,
+    };
+    let projection_key = ProjectionKey {
+        id: ProjectionId::from_stable(key("projection")?),
+        stream: journal_stream.clone(),
+    };
+    let projection=projection! {key:projection_key,version:ProjectionVersion::new(NonZeroU32::MIN),initial:||0i64,cases:[handled.definition()=>|state:&i64,payload:i64,outcome:Result<i64,i64>|{assert!(outcome.is_ok(),"successful domain result");outcome.map(|value|*state+payload+value).map_err(|_|())}]}.map_err(|error|format!("typed projection: {error:?}"))?;
     assert!(
-        matches!(success(projection.advance(nz(8)).run(Arc::clone(&environment)).await),ProjectionAdvance::Advanced{snapshot,..} if *snapshot.state==9)
+        matches!(success(projection.advance(nz(8)).run(Arc::clone(&environment)).await)?,ProjectionAdvance::Advanced{snapshot,..} if *snapshot.state==9)
     );
 
-    let failing_projection=projection! {key:ProjectionKey{id:ProjectionId::from_stable(key("projection-failure")),stream:JournalStream{journal:EventJournalId::from_stable(key("journal")),aggregate:AggregateId::from_stable(key("aggregate"))}},version:ProjectionVersion::new(NonZeroU32::MIN),initial:||0i64,cases:[handled.definition()=>|_:&i64,_:i64,_:Result<i64,i64>|Err::<i64,u8>(31)]}.expect("failing typed projection");
+    let failing_key = ProjectionKey {
+        id: ProjectionId::from_stable(key("projection-failure")?),
+        stream: journal_stream,
+    };
+    let failing_projection=projection! {key:failing_key,version:ProjectionVersion::new(NonZeroU32::MIN),initial:||0i64,cases:[handled.definition()=>|_:&i64,_:i64,_:Result<i64,i64>|Err::<i64,u8>(31)]}.map_err(|error|format!("failing typed projection: {error:?}"))?;
     assert!(matches!(
         failing_projection
             .advance(nz(8))
@@ -825,19 +919,22 @@ where
                 .load(failing_projection.key.clone())
                 .run(Arc::new(()))
                 .await
-        )
+        )?
         .is_none()
     );
 
     let coordination_runs = Arc::new(AtomicUsize::new(0));
     let coordination_log = Arc::clone(&coordination_runs);
-    let durable_run = WorkflowRunId::from_stable(key("durable-composition-run"));
+    let durable_run = WorkflowRunId::from_stable(key("durable-composition-run")?);
     let activity_run = durable_run.clone();
-    let work = activity! {name:WorkflowActivityId::from_stable(key("durable-composition-activity")),input:json_i64(),success:json_i64(),error:json_i64(),limits:limits(),body |value:Arc<i64>| {
+    let activity_id = WorkflowActivityId::from_stable(key("durable-composition-activity")?);
+    let work = activity! {name:activity_id,input:json_i64(),success:json_i64(),error:json_i64(),limits:limits(),body |value:Arc<i64>| {
         let value=*value;
-        span!{name:"recorded-activity",effect:Effect::<Result<i64,i64>,(),Environment<R>>::cpu_once(move|_|Ok(value+1))}?
+        span!{name:"recorded-activity",effect:{ let __dsl_program: Effect < Result < i64 , i64 > , () , Environment < R > > = effect_cpu! { once; body: move|_|Ok(value+1), }; __dsl_program }}?
     }};
-    let coordination = workflow! {name:WorkflowDefinitionId::new("durable-composition").expect("definition"),version:WorkflowVersion::new(NonZeroU32::MIN),payload:json_i64(),success:json_i64(),error:json_i64(),compatibility:Arc::from(&b"composition-v1"[..]),limits:limits(),run |value| {
+    let workflow_id = WorkflowDefinitionId::new("durable-composition")
+        .map_err(|error| format!("definition: {error:?}"))?;
+    let coordination = workflow! {name:workflow_id,version:WorkflowVersion::new(NonZeroU32::MIN),payload:json_i64(),success:json_i64(),error:json_i64(),compatibility:Arc::from(&b"composition-v1"[..]),limits:limits(),run |value| {
         let work=work.clone();let run=activity_run.clone();let log=Arc::clone(&coordination_log);
         let attempt_local={log.fetch_add(1,Ordering::SeqCst);String::from("fresh-durable-local")};
         let value=work.call(run,NonZeroU32::MIN,value)?;
@@ -847,19 +944,19 @@ where
     let execution = coordination.run(durable_run, 4);
     assert_eq!(coordination_runs.load(Ordering::SeqCst), 0);
     assert!(matches!(
-        success(execution.run(Arc::clone(&environment)).await),
+        success(execution.run(Arc::clone(&environment)).await)?,
         WorkflowRunResult::Completed(Ok(5))
     ));
     assert!(matches!(
-        success(execution.run(Arc::clone(&environment)).await),
+        success(execution.run(Arc::clone(&environment)).await)?,
         WorkflowRunResult::Completed(Ok(5))
     ));
     assert_eq!(coordination_runs.load(Ordering::SeqCst), 1);
 
-    let run = WorkflowRunId::from_stable(key("queue-run"));
+    let run = WorkflowRunId::from_stable(key("queue-run")?);
     let version = WorkflowVersion::new(NonZeroU32::MIN);
-    let definition =
-        WorkflowDefinitionId::new("composition-queue-workflow").expect("workflow identity");
+    let definition = WorkflowDefinitionId::new("composition-queue-workflow")
+        .map_err(|error| format!("workflow identity: {error:?}"))?;
     success(
         environment
             .workflow
@@ -870,7 +967,7 @@ where
             })
             .run(Arc::new(()))
             .await,
-    );
+    )?;
     success(
         environment
             .workflow
@@ -884,20 +981,23 @@ where
             )
             .run(Arc::new(()))
             .await,
-    );
+    )?;
     let deferred = DurableDeferred {
         run: run.clone(),
-        signal: WorkflowSignalId::from_stable(key("queue-result")),
+        signal: WorkflowSignalId::from_stable(key("queue-result")?),
         version,
         codec: json_i64(),
         limits: limits(),
     };
-    let queue: PersistedQueue<i64, Domain> = persisted_queue! {name:PersistedQueueName::new("composition-jobs").expect("queue name"),payload:json_i64(),identity:binary("composition-job"),limits:binary_limits(),policy:QueueMessagePolicy{maximum_attempts:NonZeroU32::MIN,acknowledged_retention:Duration::from_secs(10)}};
+    let queue_name = PersistedQueueName::new("composition-jobs")
+        .map_err(|error| format!("queue name: {error:?}"))?;
+    let job_identity = binary("composition-job")?;
+    let queue: PersistedQueue<i64, Domain> = persisted_queue! {name:queue_name,payload:json_i64(),identity:job_identity,limits:binary_limits(),policy:QueueMessagePolicy{maximum_attempts:NonZeroU32::MIN,acknowledged_retention:Duration::from_secs(10)}};
     let queue = durable_queue! {queue:queue};
     success(
         queue
             .enqueue(
-                key("queue-run"),
+                key("queue-run")?,
                 || 4,
                 &deferred,
                 UtcMillis::new(0),
@@ -905,36 +1005,36 @@ where
             )
             .run(Arc::clone(&environment))
             .await,
-    );
+    )?;
     let mut claims = success(
         queue
             .claim(
                 QueueClaimOptions::new(
-                    QueueOwner::new("composition-worker").expect("worker"),
+                    QueueOwner::new("composition-worker")
+                        .map_err(|error| format!("worker: {error:?}"))?,
                     UtcMillis::new(0),
                     UtcMillis::new(100),
                     NonZeroUsize::MIN,
                 )
-                .expect("claim policy"),
+                .map_err(|error| format!("claim policy: {error:?}"))?,
             )
             .run(Arc::clone(&environment))
             .await,
-    );
+    )?;
     let delivery = queue
-        .decode_claim(claims.pop().expect("one queued job"))
-        .map_err(|_| ())
-        .expect("decoded job");
-    let worker = durable_queue! {queue:DurableQueue::new(queue.queue().clone()),delivery:delivery,deferred:deferred.clone(),acknowledged_at:UtcMillis::new(1),handler |payload| {span!{name:"queue-worker",body{Effect::<i64,(),Environment<R>>::cpu_once(move|_|payload+1)?}}?}};
+        .decode_claim(claims.pop().ok_or("one queued job")?)
+        .map_err(|error| format!("decoded job: {error:?}"))?;
+    let worker = durable_queue! {queue:durable_queue! { queue: queue.queue().clone(), },delivery:delivery,deferred:deferred.clone(),acknowledged_at:UtcMillis::new(1),handler |payload| {span!{name:"queue-worker",body{{ let __dsl_program: Effect < i64 , () , Environment < R > > = effect_cpu! { once; body: move|_|payload+1, }; __dsl_program }?}}?}};
     assert!(matches!(
-        success(worker.run(Arc::clone(&environment)).await),
+        success(worker.run(Arc::clone(&environment)).await)?,
         QueueSettlement::Applied
     ));
     assert!(matches!(
-        success(deferred.wait().run(Arc::clone(&environment)).await),
+        success(deferred.wait().run(Arc::clone(&environment)).await)?,
         DurableSignalWait::Ready(5)
     ));
     assert!(
-        matches!(success(queue.inspect(key("queue-run")).run(Arc::clone(&environment)).await),Some(record) if matches!(record.state,QueueRecordState::Acknowledged{..}))
+        matches!(success(queue.inspect(key("queue-run")?).run(Arc::clone(&environment)).await)?,Some(record) if matches!(record.state,QueueRecordState::Acknowledged{..}))
     );
 
     // Session ownership and middleware lifetime are observed in the same representative RPC case.
@@ -943,29 +1043,35 @@ where
     let request = RpcEnvelope {
         operation: stream_handler.operation().spec().id.clone(),
         version: stream_handler.operation().spec().version,
-        call: RpcCallId::new("composition-stream-call").expect("call"),
+        call: RpcCallId::new("composition-stream-call")
+            .map_err(|error| format!("call: {error:?}"))?,
         kind: RpcEnvelopeKind::Request,
         sequence: None,
         payload: JsonValue::from(4),
         metadata: BTreeMap::new(),
     }
     .encode(rpc_policy())
-    .expect("request frame")
+    .map_err(|error| format!("request frame: {error:?}"))?
     .into_bytes()
-    .expect("request bytes");
+    .map_err(|error| format!("request bytes: {error:?}"))?;
     let session = Arc::new(Session {
         input: Arc::new(Mutex::new(VecDeque::from([request]))),
         output: Arc::clone(&output),
         closed: Arc::clone(&closed),
     });
     let acquisition: RpcServiceMiddleware<(), (), Environment<R>> =
-        rpc_middleware! {acquire {Effect::sync(||())?}};
-    let serve = rpc_stream_middleware! {middleware:acquisition,connect:|_:Arc<()>,environment:&Environment<R>|Arc::clone(&environment.base),handler:rpc_stream_operation! {id:OperationId::new("stream").expect("operation"),version:RpcVersion::new(NonZeroU32::MIN),request:json_i64(),chunk:json_i64(),terminal:json_i64(),error:json_i64(),limits:limits(),handler |request,_context|{Effect::<_,i64,Arc<R>>::sync_once(move||RpcStreamProducer::new(move||Effect::sync_once(move||RpcProduced::Terminal(request+1))))?}},policy:rpc_policy(),accepted:session};
-    success(serve.run(Arc::clone(&environment)).await);
+        rpc_middleware! {acquire {effect_sync! { body: ||(), }?}};
+    let serve = rpc_stream_middleware! {middleware:acquisition,connect:|_:Arc<()>,environment:&Environment<R>|Arc::clone(&environment.base),handler:rpc_stream_operation! {id:stream_id,version:RpcVersion::new(NonZeroU32::MIN),request:json_i64(),chunk:json_i64(),terminal:json_i64(),error:json_i64(),limits:limits(),handler |request,_context|{{ let __dsl_program: Effect < _ , i64 , Arc < R > > = effect_sync! { once; body: move||RpcStreamProducer::new(move||effect_sync! { once; body: move||RpcProduced::Terminal(request+1), }), }; __dsl_program }?}},policy:rpc_policy(),accepted:session};
+    success(serve.run(Arc::clone(&environment)).await)?;
     assert_eq!(closed.load(Ordering::SeqCst), 1);
-    assert!(!output.lock().expect("stream responses").is_empty());
+    assert!(
+        !output
+            .lock()
+            .map_err(|_| "stream responses lock poisoned")?
+            .is_empty()
+    );
     let codec = schema! {struct FixtureRecord{value:json_i64()}policy:parse_policy()}
-        .expect("record schema");
+        .map_err(|error| format!("record schema: {error:?}"))?;
     assert_eq!(
         codec
             .decode_ref(&JsonValue::Object(
@@ -973,8 +1079,9 @@ where
                     .into_iter()
                     .collect()
             ))
-            .expect("decoded record")
+            .map_err(|error| format!("decoded record: {error:?}"))?
             .value,
         3
     );
+    Ok(())
 }

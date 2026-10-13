@@ -1,6 +1,7 @@
 //! Validated culture identities and bounded JSON catalogue resources.
 
 use super::{LocalizationError, MessageContract, Template};
+use crate::{effect_future, effect_try_blocking};
 use bytes::Bytes;
 use effect::{Effect, Exit};
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
@@ -295,27 +296,25 @@ impl<R: effect::HasBlockingExecutor + Send + Sync + 'static> CatalogResource<R> 
             load: Arc::new(move || {
                 let path = path.clone();
                 let identity = source_identity.clone();
-                Effect::try_blocking(
-                    move |_| {
-                        use std::io::Read;
-                        let length = maximum
-                            .get()
-                            .checked_add(1)
-                            .and_then(|length| u64::try_from(length).ok())
-                            .ok_or_else(|| LocalizationError::Limit("file read bytes".into()))?;
-                        let file = std::fs::File::open(&path)
-                            .map_err(|_| LocalizationError::Load(identity.to_string()))?;
-                        let mut bytes = Vec::new();
-                        file.take(length)
-                            .read_to_end(&mut bytes)
-                            .map_err(|_| LocalizationError::Load(identity.to_string()))?;
-                        if bytes.len() > maximum.get() {
-                            return Err(LocalizationError::Limit("resource bytes".into()));
-                        }
-                        Ok(Bytes::from(bytes))
-                    },
-                    |error| error,
-                )
+                effect_try_blocking! {
+                body: move |_| {
+                    use std::io::Read;
+                    let length = maximum
+                        .get()
+                        .checked_add(1)
+                        .and_then(|length| u64::try_from(length).ok())
+                        .ok_or_else(|| LocalizationError::Limit("file read bytes".into()))?;
+                    let file = std::fs::File::open(&path)
+                        .map_err(|_| LocalizationError::Load(identity.to_string()))?;
+                    let mut bytes = Vec::new();
+                    file.take(length)
+                        .read_to_end(&mut bytes)
+                        .map_err(|_| LocalizationError::Load(identity.to_string()))?;
+                    if bytes.len() > maximum.get() {
+                        return Err(LocalizationError::Limit("resource bytes".into()));
+                    }
+                    Ok(Bytes::from(bytes))
+                }, on_error: |error| error, }
             }),
         }
     }
@@ -425,7 +424,8 @@ impl<C: Send + Sync + 'static, R: Send + Sync + 'static> CatalogDefinition<C, R>
     /// catalogue is published; ownership/cleanup failures remain Effect outcomes.
     pub fn load(&self) -> Effect<Catalog<C>, LocalizationError, R> {
         let definition = self.clone();
-        Effect::from_exit_future_with_context(move |env: Arc<R>, context| {
+        effect_future! {
+            exit_with_context; body: move |env: Arc<R>, context| {
             let definition = definition.clone();
             async move {
                 let mut entries = BTreeMap::new();
@@ -460,7 +460,7 @@ impl<C: Send + Sync + 'static, R: Send + Sync + 'static> CatalogDefinition<C, R>
                     marker: PhantomData,
                 })
             }
-        })
+        }, }
     }
 }
 /// Complete immutable prepared catalogue generation. Equality compares content,

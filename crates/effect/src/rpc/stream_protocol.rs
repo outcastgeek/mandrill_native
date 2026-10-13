@@ -7,6 +7,7 @@ use super::{
 };
 use crate::Effect;
 use crate::encoding::{FrameDecodeFailure, FrameDecoder};
+use crate::{effect, effect_map_error, effect_provide_some, effect_recover, effect_try_sync};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -211,19 +212,18 @@ where
     ) -> Effect<(), RpcStreamProtocolError<E, Backend>, R> {
         let protocol = self.clone();
         let failed = Arc::clone(&session);
-        session
-            .receive_frame()
-            .map_error(RpcStreamProtocolError::Transport)
-            .provide_some(|_: &R| ())
-            .catch_all(move |error| close_after(Arc::clone(&failed), error))
-            .flat_map(move |first| {
+        {
+            let __dsl_program = effect_recover! { program: effect_provide_some! { program: effect_map_error! { program: session
+            .receive_frame(), map: RpcStreamProtocolError::Transport, }, project: |_: &R| (), }, recover: move |error| close_after(Arc::clone(&failed), error), };
+            effect! { let __dsl_program = __dsl_program.clone(); let protocol = protocol.clone(); let session = session.clone(); let first = __dsl_program?; {
                 let protocol = protocol.clone();
                 let session = Arc::clone(&session);
                 match first {
                     Some(first) => protocol.dispatch_first(session, first),
                     None => close_after(session, RpcStreamProtocolError::Disconnected),
                 }
-            })
+            }? }
+        }
     }
 
     /// Dispatch a frame already read by an external session acceptor.
@@ -327,9 +327,9 @@ where
 {
     let error = Arc::new(Mutex::new(Some(error)));
     let on_close = Arc::clone(&error);
-    session
-        .close()
-        .map_error(move |close| {
+    {
+        let __dsl_program = effect_provide_some! { program: effect_map_error! { program: session
+        .close(), map: move |close| {
             let primary = on_close
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -341,14 +341,14 @@ where
                 },
                 None => RpcStreamProtocolError::InputConsumed,
             }
-        })
-        .provide_some(|_: &R| ())
-        .flat_map(move |_| {
+        }, }, project: |_: &R| (), };
+        effect! { let error = error.clone(); let _ = __dsl_program.clone()?; {
             let error = error
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take()
                 .unwrap_or(RpcStreamProtocolError::InputConsumed);
-            Effect::from_result_once(Err(error))
-        })
+            effect_try_sync! { once; body: { let __dsl_result = Err(error); move || __dsl_result }, on_error: ::core::convert::identity, }
+        }? }
+    }
 }

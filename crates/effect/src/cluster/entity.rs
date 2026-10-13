@@ -7,6 +7,7 @@ use crate::rpc::{
     RpcWireError,
 };
 use crate::{Effect, SchemaIssue};
+use crate::{effect, effect_try_sync};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
@@ -372,9 +373,11 @@ impl<R: Send + Sync + 'static> EntityDispatcher<R> {
         encoded_request: Arc<[u8]>,
     ) -> Effect<SavedReply, EntityDispatchError, R> {
         let dispatcher = self.clone();
-        Effect::defer(move || {
-            dispatcher.dispatch_now(address.clone(), Arc::clone(&encoded_request))
-        })
+        {
+            let __dsl_factory =
+                move || dispatcher.dispatch_now(address.clone(), Arc::clone(&encoded_request));
+            effect! { __dsl_factory()? }
+        }
     }
 
     ///
@@ -397,26 +400,28 @@ impl<R: Send + Sync + 'static> EntityDispatcher<R> {
         let frames = match decoder.push(&encoded_request) {
             Ok(frames) => frames,
             Err(FrameDecodeFailure { error, .. }) => {
-                return Effect::from_result_once(Err(EntityDispatchError::Wire(
+                return effect_try_sync! { once; body: { let __dsl_result = Err(EntityDispatchError::Wire(
                     RpcWireError::Frame(error),
-                )));
+                )); move || __dsl_result }, on_error: ::core::convert::identity, };
             }
         };
         if let Err(error) = decoder.finish() {
-            return Effect::from_result_once(Err(EntityDispatchError::Wire(RpcWireError::Frame(
+            return effect_try_sync! { once; body: { let __dsl_result = Err(EntityDispatchError::Wire(RpcWireError::Frame(
                 error,
-            ))));
+            ))); move || __dsl_result }, on_error: ::core::convert::identity, };
         }
         let mut frames = frames.into_iter();
         let Some(first) = frames.next() else {
-            return Effect::from_result_once(Err(EntityDispatchError::MissingFrame));
+            return effect_try_sync! { once; body: { let __dsl_result = Err(EntityDispatchError::MissingFrame); move || __dsl_result }, on_error: ::core::convert::identity, };
         };
         if frames.next().is_some() {
-            return Effect::from_result_once(Err(EntityDispatchError::ExtraFrames));
+            return effect_try_sync! { once; body: { let __dsl_result = Err(EntityDispatchError::ExtraFrames); move || __dsl_result }, on_error: ::core::convert::identity, };
         }
         let envelope = match RpcEnvelope::decode(&first, self.policy) {
             Ok(envelope) => envelope,
-            Err(error) => return Effect::from_result_once(Err(EntityDispatchError::Wire(error))),
+            Err(error) => {
+                return effect_try_sync! { once; body: { let __dsl_result = Err(EntityDispatchError::Wire(error)); move || __dsl_result }, on_error: ::core::convert::identity, };
+            }
         };
         let key = (
             address.entity_type.clone(),
@@ -425,11 +430,13 @@ impl<R: Send + Sync + 'static> EntityDispatcher<R> {
         );
         match self.handlers.get(&key) {
             Some(handler) => handler(address, envelope),
-            None => Effect::from_result_once(Err(EntityDispatchError::UnknownOperation {
-                entity_type: key.0,
-                operation: key.1,
-                version: key.2,
-            })),
+            None => {
+                effect_try_sync! { once; body: { let __dsl_result = Err(EntityDispatchError::UnknownOperation {
+                    entity_type: key.0,
+                    operation: key.1,
+                    version: key.2,
+                }); move || __dsl_result }, on_error: ::core::convert::identity, }
+            }
         }
     }
 }

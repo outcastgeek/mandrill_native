@@ -83,3 +83,17 @@ type-side witnesses. `direct_json_writer` names an unsupported representation;
 `SharedValue` is an opaque Debug label that neither inspects nor copies payloads.
 The AST guard covers production files; this rationale does not exempt files or
 authorize hidden runtime policies.
+
+The callback-block lowering inventory also records native callback arities from
+zero to five, checked positional argument slots, and tuple member indices. Its
+strings are macro field/mode names, typed owner/action names, hygienic local
+identifier recipes, and compiler diagnostics. SQL and route character literals
+check identifier separators, NUL rejection, absolute paths, and capture/query
+syntax; the semicolon character separates explicit constructor modes. These
+values describe Rust syntax and native API contracts and select no runtime
+capacity, deadline, or provider. Moving existing tuple access into macro input
+makes its member indices visible to the token inventory.
+
+The service environment adapter preserves the native caller’s explicit environment
+type at the macro boundary. Its `environment` syntax and hygienic selector name
+choose no runtime policy; the callback factory still evaluates once.

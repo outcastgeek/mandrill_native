@@ -1,9 +1,13 @@
+use effect::{
+    effect, effect_blocking, effect_cpu, effect_future, effect_provide_some, effect_resource,
+    effect_scope, effect_sync, effect_try_blocking, effect_try_cpu,
+};
 extern crate effect as fx;
 
 use effect::{
     BlockingExecutor, Cancellation, CleanupFailure, CpuExecutor, Defect, DefectKind, Effect, Exit,
     HasBlockingExecutor, HasCancellation, HasCpuExecutor, HasTaskSpawner, LibraryDefect,
-    PrimaryOutcome, ScheduledJob, ScheduledTask, Scope, TaskSpawner,
+    PrimaryOutcome, ScheduledJob, ScheduledTask, TaskSpawner,
 };
 use futures_executor::block_on;
 use std::cell::Cell;
@@ -47,7 +51,7 @@ impl Workers {
             threads: Mutex::new(Vec::new()),
         }
     }
-    #[allow(clippy::panic)] // Intentional provider-panic fixture.
+
     fn submit_job(&self, job: ScheduledJob) -> Result<(), Defect> {
         match self.mode {
             Mode::Queued => {
@@ -77,20 +81,20 @@ impl Workers {
             }
             Mode::Panic => {
                 drop(job);
-                panic!("intentional worker admission panic")
+                std::panic::resume_unwind(Box::new("intentional worker admission panic"))
             }
         }
     }
-    #[allow(clippy::panic)] // Missing queued work is a failed fixture assertion.
-    fn take(&self) -> ScheduledJob {
+
+    fn take(&self) -> Result<ScheduledJob, String> {
         match self
             .queued
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pop()
         {
-            Some(job) => job,
-            None => panic!("fixture expected queued work"),
+            Some(job) => Ok(job),
+            None => Err("fixture expected queued work".to_owned()),
         }
     }
     fn count(&self) -> usize {
@@ -218,15 +222,16 @@ impl Gate {
 }
 
 #[test]
-fn cpu_and_blocking_move_fresh_non_clone_non_sync_results_on_independent_workers() {
+fn cpu_and_blocking_move_fresh_non_clone_non_sync_results_on_independent_workers()
+-> Result<(), String> {
     let env = Arc::new(Environment::new(Mode::Threads));
     let caller = std::thread::current().id();
-    let program: Effect<Data, Data, Environment> = effect::effect! {
-        let data = Effect::cpu(move |_| {
+    let program: Effect<Data, Data, Environment> = effect! {
+        let data = effect_cpu! { body: move |_| {
             assert_ne!(std::thread::current().id(), caller);
             Data(Cell::new(7))
-        })?;
-        Effect::blocking_once(move |_| Data(Cell::new(data.0.get() * 2)))?
+        }, }?;
+        effect_blocking! { once; body: move |_| Data(Cell::new(data.0.get() * 2)), }?
     };
     for _ in 0..2 {
         assert_eq!(
@@ -235,13 +240,16 @@ fn cpu_and_blocking_move_fresh_non_clone_non_sync_results_on_independent_workers
         );
     }
     env.finish();
+    Ok(())
 }
 
 #[test]
-fn admission_resolves_the_current_cpu_and_blocking_capabilities_separately_and_lazily() {
+fn admission_resolves_the_current_cpu_and_blocking_capabilities_separately_and_lazily()
+-> Result<(), String> {
     let env = Arc::new(Environment::new(Mode::Queued));
-    let cpu: Effect<Data, Data, Environment> = Effect::cpu(|_| Data(Cell::new(1)));
-    let blocking: Effect<Data, Data, Environment> = Effect::blocking(|_| Data(Cell::new(2)));
+    let cpu: Effect<Data, Data, Environment> = effect_cpu! { body: |_| Data(Cell::new(1)), };
+    let blocking: Effect<Data, Data, Environment> =
+        effect_blocking! { body: |_| Data(Cell::new(2)), };
     assert_eq!(env.cpu.count(), 0);
     assert_eq!(env.blocking.count(), 0);
     let mut first = Box::pin(cpu.run(Arc::clone(&env)));
@@ -250,21 +258,17 @@ fn admission_resolves_the_current_cpu_and_blocking_capabilities_separately_and_l
     suspension::suspended(second.as_mut());
     assert_eq!(env.cpu.count(), 1);
     assert_eq!(env.blocking.count(), 1);
-    let job = env.cpu.take();
+    let job = env.cpu.take()?;
     assert!(!job.is_cancelled()); // The pending future still owns admission.
     let job = match job.cancel_before_start() {
         Err(job) => job,
-        Ok(_) => unreachable_fixture(),
+        Ok(_) => return Err("pending future no longer owns admission".to_owned()),
     };
     assert!(job.run().is_ok());
-    assert!(env.blocking.take().run().is_ok());
+    assert!(env.blocking.take()?.run().is_ok());
     assert_eq!(block_on(first), Exit::Success(Data(Cell::new(1))));
     assert_eq!(block_on(second), Exit::Success(Data(Cell::new(2))));
-}
-
-#[allow(clippy::panic)]
-fn unreachable_fixture<T>() -> T {
-    panic!("fixture contract was violated")
+    Ok(())
 }
 
 #[test]
@@ -272,7 +276,7 @@ fn owned_callbacks_consume_input_without_clone_or_sync_and_precancellation_retai
     let env = Arc::new(Environment::new(Mode::Threads));
     let _ = env.cancellation.request();
     let input = Data(Cell::new(3));
-    let program: Effect<Data, Data, Environment> = Effect::cpu_once(move |_| input);
+    let program: Effect<Data, Data, Environment> = effect_cpu! { once; body: move |_| input, };
     assert_eq!(block_on(program.run_cancellable(env)), Exit::Interrupted);
     let fresh = Arc::new(Environment::new(Mode::Threads));
     assert_eq!(
@@ -290,13 +294,10 @@ fn owned_callbacks_consume_input_without_clone_or_sync_and_precancellation_retai
 fn expected_errors_and_owned_error_mapping_move_on_the_selected_worker() {
     let env = Arc::new(Environment::new(Mode::Threads));
     let caller = std::thread::current().id();
-    let cpu: Effect<Data, Data, Environment> = Effect::try_cpu(
-        |_| Err(Data(Cell::new(5))),
-        move |error: Data| {
-            assert_ne!(std::thread::current().id(), caller);
-            error
-        },
-    );
+    let cpu: Effect<Data, Data, Environment> = effect_try_cpu! { body: |_| Err(Data(Cell::new(5))), on_error: move |error: Data| {
+        assert_ne!(std::thread::current().id(), caller);
+        error
+    }, };
     assert_eq!(
         block_on(cpu.run(Arc::clone(&env))),
         Exit::Fail(Data(Cell::new(5)))
@@ -307,22 +308,19 @@ fn expected_errors_and_owned_error_mapping_move_on_the_selected_worker() {
     );
     let input = Data(Cell::new(9));
     let extra = Cell::new(1); // Non-Sync capture in a single-use mapper.
-    let blocking: Effect<Data, Data, Environment> = Effect::try_blocking_once(
-        move |_| Err(input),
-        move |error: Data| Data(Cell::new(error.0.get() + extra.get())),
-    );
+    let blocking: Effect<Data, Data, Environment> = effect_try_blocking! { once; body: move |_| Err(input), on_error: move |error: Data| Data(Cell::new(error.0.get() + extra.get())), };
     assert_eq!(
         block_on(blocking.run(Arc::clone(&env))),
         Exit::Fail(Data(Cell::new(10)))
     );
     let other: Effect<Data, Data, Environment> =
-        Effect::try_blocking(|_| Err(Data(Cell::new(6))), |error| error);
+        effect_try_blocking! { body: |_| Err(Data(Cell::new(6))), on_error: |error| error, };
     assert_eq!(
         block_on(other.run(Arc::clone(&env))),
         Exit::Fail(Data(Cell::new(6)))
     );
     let last: Effect<Data, Data, Environment> =
-        Effect::try_cpu_once(|_| Err(Data(Cell::new(8))), |error| error);
+        effect_try_cpu! { once; body: |_| Err(Data(Cell::new(8))), on_error: |error| error, };
     assert_eq!(
         block_on(last.run(Arc::clone(&env))),
         Exit::Fail(Data(Cell::new(8)))
@@ -331,27 +329,29 @@ fn expected_errors_and_owned_error_mapping_move_on_the_selected_worker() {
 }
 
 #[test]
-fn queued_cancellation_retires_captures_before_interruption_without_starting_user_work() {
+fn queued_cancellation_retires_captures_before_interruption_without_starting_user_work()
+-> Result<(), String> {
     let env = Arc::new(Environment::new(Mode::Queued));
     let calls = Arc::new(AtomicUsize::new(0));
     let called = Arc::clone(&calls);
     let drops = Arc::new(AtomicUsize::new(0));
     let capture = DropCount(Arc::clone(&drops));
-    let program: Effect<Data, Data, Environment> = Effect::cpu_once(move |_| {
+    let program: Effect<Data, Data, Environment> = effect_cpu! { once; body: move |_| {
         drop(capture);
         let _ = called.fetch_add(1, Ordering::SeqCst);
         Data(Cell::new(0))
-    });
+    }, };
     let mut future = Box::pin(program.run_cancellable(Arc::clone(&env)));
     suspension::suspended(future.as_mut());
     let _ = env.cancellation.request();
     suspension::suspended(future.as_mut()); // Cancellation still awaits ownership settlement.
-    let job = env.cpu.take();
+    let job = env.cpu.take()?;
     assert!(job.is_cancelled());
     assert!(matches!(job.cancel_before_start(), Ok(Ok(()))));
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     assert_eq!(block_on(future), Exit::Interrupted);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+    Ok(())
 }
 
 #[test]
@@ -364,16 +364,17 @@ fn running_cancellation_waits_for_callback_and_finalization_before_publication()
     let finished = Arc::new(AtomicUsize::new(0));
     let done = Arc::clone(&finished);
     let finalized = Arc::clone(&finished);
-    let program: Effect<Data, Data, Environment> = Effect::blocking_once(move |cancel| {
-        let _ = reached.request();
-        blocked.wait();
-        assert!(cancel.is_requested());
-        let _ = done.fetch_add(1, Ordering::SeqCst);
-        Data(Cell::new(4))
-    })
-    .ensuring(Effect::sync(move || {
-        assert_eq!(finalized.load(Ordering::SeqCst), 1);
-    }));
+    let program: Effect<Data, Data, Environment> = effect_resource! {
+    ensuring; program: effect_blocking! { once; body: move |cancel| {
+            let _ = reached.request();
+            blocked.wait();
+            assert!(cancel.is_requested());
+            let _ = done.fetch_add(1, Ordering::SeqCst);
+            Data(Cell::new(4))
+        }, }, release: { let __dsl_cleanup = effect_sync! { body: move || {
+            assert_eq!(finalized.load(Ordering::SeqCst), 1);
+        }, }; move |_| __dsl_cleanup.clone() },
+    };
     let mut future = Box::pin(program.run_cancellable(Arc::clone(&env)));
     drive::until(future.as_mut(), || entered.is_requested());
     let _ = env.cancellation.request();
@@ -385,14 +386,15 @@ fn running_cancellation_waits_for_callback_and_finalization_before_publication()
 }
 
 #[test]
-fn abandoned_waiter_requests_only_its_job_token_and_queued_work_can_retire() {
+fn abandoned_waiter_requests_only_its_job_token_and_queued_work_can_retire() -> Result<(), String> {
     let env = Arc::new(Environment::new(Mode::Queued));
-    let program: Effect<(), (), Environment> = Effect::cpu(|_| unreachable_fixture());
+    let program: Effect<(), (), Environment> = effect_cpu! { body: |_| std::panic::resume_unwind(Box::new("fixture contract was violated")), };
     let mut future = Box::pin(program.run_cancellable(Arc::clone(&env)));
     suspension::suspended(future.as_mut());
     drop(future);
     assert!(!env.cancellation.is_requested());
-    assert!(matches!(env.cpu.take().cancel_before_start(), Ok(Ok(()))));
+    assert!(matches!(env.cpu.take()?.cancel_before_start(), Ok(Ok(()))));
+    Ok(())
 }
 
 #[test]
@@ -409,8 +411,10 @@ fn rejection_accepted_loss_and_submission_panic_are_distinct_defects() {
         (Mode::Panic, DefectKind::CallbackPanic),
     ] {
         let env = Arc::new(Environment::new(mode));
-        let cpu: Effect<(), (), Environment> = Effect::cpu(|_| unreachable_fixture());
-        let blocking: Effect<(), (), Environment> = Effect::blocking(|_| unreachable_fixture());
+        let cpu: Effect<(), (), Environment> = effect_cpu! { body: |_| std::panic::resume_unwind(Box::new("fixture contract was violated")), };
+        let blocking: Effect<(), (), Environment> = effect_blocking! { body: |_| {
+            std::panic::resume_unwind(Box::new("fixture contract was violated"))
+        }, };
         for outcome in [
             block_on(cpu.run(Arc::clone(&env))),
             block_on(blocking.run(Arc::clone(&env))),
@@ -422,28 +426,31 @@ fn rejection_accepted_loss_and_submission_panic_are_distinct_defects() {
 
 struct PanicDrop;
 impl Drop for PanicDrop {
-    #[allow(clippy::panic)] // Intentional capture-destruction fixture.
     fn drop(&mut self) {
-        panic!("intentional callback capture destruction panic");
+        std::panic::resume_unwind(Box::new("intentional callback capture destruction panic"));
     }
 }
 
 #[test]
-fn lost_or_cancelled_capture_destruction_failure_preserves_primary_and_cleanup() {
+fn lost_or_cancelled_capture_destruction_failure_preserves_primary_and_cleanup()
+-> Result<(), String> {
     for mode in [Mode::Queued, Mode::Lose, Mode::Reject] {
         let env = Arc::new(Environment::new(mode));
         let capture = PanicDrop;
-        let program: Effect<(), (), Environment> = Effect::cpu_once(move |_| drop(capture));
+        let program: Effect<(), (), Environment> =
+            effect_cpu! { once; body: move |_| drop(capture), };
         let result = match mode {
             Mode::Queued => {
                 let mut future = Box::pin(program.run_cancellable(Arc::clone(&env)));
                 suspension::suspended(future.as_mut());
                 let _ = env.cancellation.request();
-                assert!(env.cpu.take().run().is_ok());
+                assert!(env.cpu.take()?.run().is_ok());
                 block_on(future)
             }
             Mode::Lose | Mode::Reject => block_on(program.run(Arc::clone(&env))),
-            Mode::Threads | Mode::Panic => unreachable_fixture(),
+            Mode::Threads | Mode::Panic => {
+                return Err("unexpected fixture provider mode".to_owned());
+            }
         };
         match result {
             Exit::FinalizationFailed(details) => {
@@ -461,24 +468,24 @@ fn lost_or_cancelled_capture_destruction_failure_preserves_primary_and_cleanup()
                     Mode::Reject => assert!(
                         matches!(details.primary, PrimaryOutcome::Defected(ref defect) if defect.kind() == DefectKind::Library(LibraryDefect::JobSubmissionRejected))
                     ),
-                    Mode::Threads | Mode::Panic => unreachable_fixture(),
+                    Mode::Threads | Mode::Panic => {
+                        return Err("unexpected fixture provider mode".to_owned());
+                    }
                 }
             }
             Exit::Success(()) | Exit::Fail(()) | Exit::Die(_) | Exit::Interrupted => {
-                unreachable_fixture()
+                return Err("fixture expected cleanup failure".to_owned());
             }
         }
     }
+    Ok(())
 }
 
 #[test]
-#[allow(clippy::panic)] // Intentional callback/mapper unwind fixtures.
 fn callback_and_error_mapper_panics_settle_without_escaping_worker_threads() {
     let env = Arc::new(Environment::new(Mode::Threads));
-    let cpu: Effect<(), (), Environment> =
-        Effect::cpu(|_| panic!("intentional CPU callback panic"));
-    let blocking: Effect<(), (), Environment> =
-        Effect::try_blocking(|_| Err(()), |_| panic!("intentional mapping panic"));
+    let cpu: Effect<(), (), Environment> = effect_cpu! { body: |_| std::panic::resume_unwind(Box::new("intentional CPU callback panic")), };
+    let blocking: Effect<(), (), Environment> = effect_try_blocking! { body: |_| Err(()), on_error: |_| std::panic::resume_unwind(Box::new("intentional mapping panic")), };
     for result in [
         block_on(cpu.run(Arc::clone(&env))),
         block_on(blocking.run(Arc::clone(&env))),
@@ -491,35 +498,37 @@ fn callback_and_error_mapper_panics_settle_without_escaping_worker_threads() {
 }
 
 #[test]
-fn projected_cpu_provider_preserves_active_cancellation_instead_of_replacing_it() {
+fn projected_cpu_provider_preserves_active_cancellation_instead_of_replacing_it()
+-> Result<(), String> {
     let root = Arc::new(Environment::new(Mode::Queued));
     let subtree = Arc::new(Environment::new(Mode::Queued));
     let _ = subtree.cancellation.request(); // Must not override the root run's active token.
-    let program: Effect<Data, Data, Environment> = Effect::cpu(|cancel| {
+    let program: Effect<Data, Data, Environment> = effect_cpu! { body: |cancel| {
         assert!(!cancel.is_requested());
         Data(Cell::new(2))
-    });
+    }, };
     let subtree_provider = Arc::clone(&subtree);
-    let provided = program.provide_some(move |_: &Environment| subtree_provider.projection());
+    let provided = effect_provide_some! { program: program, project: move |_: &Environment| subtree_provider.projection(), };
     let mut future = Box::pin(provided.run_cancellable(Arc::clone(&root)));
     suspension::suspended(future.as_mut());
     assert_eq!(root.cpu.count(), 0);
     assert_eq!(subtree.cpu.count(), 1);
-    let job = subtree.cpu.take();
+    let job = subtree.cpu.take()?;
     assert!(!job.is_cancelled());
     assert!(job.run().is_ok());
     assert_eq!(block_on(future), Exit::Success(Data(Cell::new(2))));
     let projected = Arc::clone(&subtree);
-    let interrupted: Effect<(), (), Environment> = Effect::cpu(|_| unreachable_fixture());
-    let interrupted = interrupted.provide_some(move |_: &Environment| projected.projection());
+    let interrupted: Effect<(), (), Environment> = effect_cpu! { body: |_| std::panic::resume_unwind(Box::new("fixture contract was violated")), };
+    let interrupted = effect_provide_some! { program: interrupted, project: move |_: &Environment| projected.projection(), };
     let mut future = Box::pin(interrupted.run_cancellable(Arc::clone(&root)));
     suspension::suspended(future.as_mut());
     let _ = root.cancellation.request();
     assert!(matches!(
-        subtree.cpu.take().cancel_before_start(),
+        subtree.cpu.take()?.cancel_before_start(),
         Ok(Ok(()))
     ));
     assert_eq!(block_on(future), Exit::Interrupted);
+    Ok(())
 }
 
 #[test]
@@ -530,31 +539,36 @@ fn scope_closure_cancels_and_joins_a_running_cpu_job_through_its_child() {
     let entered = Cancellation::new();
     let tokens = Arc::new(Mutex::new(None::<Cancellation>));
     let recorded = Arc::clone(&tokens);
-    let program: Effect<(), Data, Environment> = Scope::scoped(move |scope| {
-        let blocked = Arc::clone(&blocked);
-        let reached = entered.clone();
-        let entered = entered.clone();
-        let recorded = Arc::clone(&recorded);
-        scope
-            .fork(Effect::cpu_once(move |cancel| {
-                *recorded
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cancel.clone());
-                let _ = reached.request();
-                blocked.wait();
-                assert!(cancel.is_requested());
-                Data(Cell::new(5))
-            }))
-            .flat_map(move |_| {
-                let entered = entered.clone();
-                Effect::from_future(move |_| {
+    let program: Effect<(), Data, Environment> = effect_scope! {
+    body: move |scope| {
+            let blocked = Arc::clone(&blocked);
+            let reached = entered.clone();
+            let entered = entered.clone();
+            let recorded = Arc::clone(&recorded);
+            effect! {
+     bind;
+     program: scope
+                .fork(effect_cpu! { once; body: move |cancel| {
+                    *recorded
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cancel.clone());
+                    let _ = reached.request();
+                    blocked.wait();
+                    assert!(cancel.is_requested());
+                    Data(Cell::new(5))
+                }, }),
+     body: move |_| {
                     let entered = entered.clone();
-                    async move {
-                        entered.cancelled().await;
-                    }
-                })
-            })
-    });
+                    effect_future! { body: move |_| {
+                        let entered = entered.clone();
+                        async move {
+                            entered.cancelled().await;
+                        }
+                    }, }
+                },
+     }
+        },
+    };
     let mut future = Box::pin(program.run(Arc::clone(&env)));
     drive::until(future.as_mut(), || {
         tokens
@@ -579,13 +593,13 @@ fn accepted_running_work_retains_environment_after_its_waiter_is_abandoned() {
     let blocked = Arc::clone(&gate);
     let entered = Cancellation::new();
     let reached = entered.clone();
-    let program: Effect<Data, Data, Environment> = Effect::cpu_once(move |cancel| {
+    let program: Effect<Data, Data, Environment> = effect_cpu! { once; body: move |cancel| {
         let _ = reached.request();
         blocked.wait();
         assert!(cancel.is_requested());
         assert!(observed.upgrade().is_some());
         Data(Cell::new(7))
-    });
+    }, };
     let mut future = Box::pin(program.run_cancellable(Arc::clone(&env)));
     drive::until(future.as_mut(), || entered.is_requested());
     drop(future);
@@ -598,20 +612,21 @@ fn accepted_running_work_retains_environment_after_its_waiter_is_abandoned() {
 }
 
 #[test]
-fn an_unobserved_result_destructor_unwind_is_returned_to_the_provider_without_escaping_worker() {
+fn an_unobserved_result_destructor_unwind_is_returned_to_the_provider_without_escaping_worker()
+-> Result<(), String> {
     let env = Arc::new(Environment::new(Mode::Queued));
     let gate = Arc::new(Gate::new());
     let blocked = Arc::clone(&gate);
     let entered = Cancellation::new();
     let reached = entered.clone();
-    let program: Effect<PanicDrop, (), Environment> = Effect::cpu_once(move |_| {
+    let program: Effect<PanicDrop, (), Environment> = effect_cpu! { once; body: move |_| {
         let _ = reached.request();
         blocked.wait();
         PanicDrop
-    });
+    }, };
     let mut future = Box::pin(program.run(Arc::clone(&env)));
     suspension::suspended(future.as_mut());
-    let job = env.cpu.take();
+    let job = env.cpu.take()?;
     let worker = std::thread::spawn(move || job.run());
     // The explicit entry signal proves the callback started before abandonment.
     block_on(entered.cancelled());
@@ -620,33 +635,35 @@ fn an_unobserved_result_destructor_unwind_is_returned_to_the_provider_without_es
     assert!(
         matches!(worker.join(), Ok(Err(ref defect)) if defect.kind() == DefectKind::CallbackPanic)
     );
+    Ok(())
 }
 
 struct PanicWake;
 impl std::task::Wake for PanicWake {
-    #[allow(clippy::panic)] // Intentional post-publication notification fixture.
     fn wake(self: Arc<Self>) {
-        panic!("intentional worker completion wake panic")
+        std::panic::resume_unwind(Box::new("intentional worker completion wake panic"))
     }
-    #[allow(clippy::panic)]
+
     fn wake_by_ref(self: &Arc<Self>) {
-        panic!("intentional worker completion wake panic")
+        std::panic::resume_unwind(Box::new("intentional worker completion wake panic"))
     }
 }
 
 #[test]
-fn notification_unwind_keeps_committed_completion_and_does_not_escape_job_drop() {
+fn notification_unwind_keeps_committed_completion_and_does_not_escape_job_drop()
+-> Result<(), String> {
     use std::future::Future;
     for run in [true, false] {
         // Exercise both executed work and accepted ownership loss.
         let env = Arc::new(Environment::new(Mode::Queued));
-        let program: Effect<Data, Data, Environment> = Effect::cpu(|_| Data(Cell::new(2)));
+        let program: Effect<Data, Data, Environment> =
+            effect_cpu! { body: |_| Data(Cell::new(2)), };
         let mut future = Box::pin(program.run(Arc::clone(&env)));
         suspension::suspended(future.as_mut());
         let waker = std::task::Waker::from(Arc::new(PanicWake));
         let mut context = std::task::Context::from_waker(&waker);
         assert!(future.as_mut().poll(&mut context).is_pending());
-        let job = env.cpu.take();
+        let job = env.cpu.take()?;
         if run {
             assert!(
                 matches!(job.run(), Err(ref defect) if defect.kind() == DefectKind::CallbackPanic)
@@ -660,21 +677,22 @@ fn notification_unwind_keeps_committed_completion_and_does_not_escape_job_drop()
             );
         }
     }
+    Ok(())
 }
 
 struct BrokenAccess;
 impl HasCpuExecutor for BrokenAccess {
     type Executor = Workers;
-    #[allow(clippy::panic)] // An environment accessor is a user callback boundary.
+
     fn cpu_executor(&self) -> &Workers {
-        panic!("intentional CPU accessor panic")
+        std::panic::resume_unwind(Box::new("intentional CPU accessor panic"))
     }
 }
 impl HasBlockingExecutor for BrokenAccess {
     type Executor = Workers;
-    #[allow(clippy::panic)]
+
     fn blocking_executor(&self) -> &Workers {
-        panic!("intentional blocking accessor panic")
+        std::panic::resume_unwind(Box::new("intentional blocking accessor panic"))
     }
 }
 
@@ -684,16 +702,16 @@ fn accessor_panics_drop_unstarted_captures_and_settle_as_defects_without_calling
     let calls = Arc::new(AtomicUsize::new(0));
     let first = DropCount(Arc::clone(&drops));
     let called = Arc::clone(&calls);
-    let cpu: Effect<(), (), BrokenAccess> = Effect::cpu_once(move |_| {
+    let cpu: Effect<(), (), BrokenAccess> = effect_cpu! { once; body: move |_| {
         drop(first);
         let _ = called.fetch_add(1, Ordering::SeqCst);
-    });
+    }, };
     let second = DropCount(Arc::clone(&drops));
     let called = Arc::clone(&calls);
-    let blocking: Effect<(), (), BrokenAccess> = Effect::blocking_once(move |_| {
+    let blocking: Effect<(), (), BrokenAccess> = effect_blocking! { once; body: move |_| {
         drop(second);
         let _ = called.fetch_add(1, Ordering::SeqCst);
-    });
+    }, };
     for result in [
         block_on(cpu.run(Arc::new(BrokenAccess))),
         block_on(blocking.run(Arc::new(BrokenAccess))),

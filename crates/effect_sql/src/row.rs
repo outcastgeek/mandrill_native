@@ -5,6 +5,9 @@
 //! rather than cloning the whole row or retaining a borrowed cell in a static Effect.
 
 use crate::RowError;
+use crate::{
+    codec, effect_future, effect_provide_some, effect_scope, effect_sync, effect_try_sync,
+};
 use effect::{Codec, Effect, Exit, NativeContext, PureCodec};
 use sqlx::{ColumnIndex, Decode, Row, Turso, TursoRow, Type, ValueRef};
 use std::{future::Future, pin::Pin, sync::Arc};
@@ -89,7 +92,7 @@ impl<A: Send + 'static, T: Send + 'static, R: Send + Sync + 'static> CellCodec<A
     /// Bind this Effect explicitly before `param`/`value`/`set`; construction never
     /// invokes the codec or invents a SQLx Type implementation for a foreign type.
     pub fn encode_once(&self, value: A) -> Effect<T, effect::SchemaIssue, R> {
-        self.codec.encode_once(value).provide_some(|_: &R| ())
+        effect_provide_some! { program: self.codec.encode_once(value), project: |_: &R| (), }
     }
 }
 
@@ -288,27 +291,21 @@ impl<T: Send + Sync + 'static, R: Send + Sync + 'static> RowStep<R>
 }
 impl<R: Send + Sync + 'static> RowContext<R> {
     /// Bind one native read or Effect validation, retaining all failure channels.
-    #[allow(
-        clippy::result_large_err,
-        reason = "The shared row lowering returns complete typed Exit values; boxing would change that ownership contract and allocate for failures"
-    )]
+    /// Only failures allocate a box; the complete exit moves into it intact.
     pub async fn bind<S: RowStep<R>, A: Send + 'static>(
         &self,
         step: S,
-    ) -> Result<S::Output, Exit<A, RowError>> {
+    ) -> Result<S::Output, Box<Exit<A, RowError>>> {
         if self.context.cancellation().is_requested() {
-            return Err(Exit::Interrupted);
+            return Err(Box::new(Exit::Interrupted));
         }
-        failure_as(step.evaluate(self).await)
+        failure_as(step.evaluate(self).await).map_err(Box::new)
     }
     /// Observe cooperative cancellation between row-program loop iterations.
-    #[allow(
-        clippy::result_large_err,
-        reason = "Cancellation uses the same complete typed Exit contract as row binds without an additional failure allocation"
-    )]
-    pub async fn cooperate<A: Send + 'static>(&self) -> Result<(), Exit<A, RowError>> {
+    /// Only interruption allocates a boxed exit; successful checkpoints allocate nothing.
+    pub async fn cooperate<A: Send + 'static>(&self) -> Result<(), Box<Exit<A, RowError>>> {
         if self.context.cancellation().is_requested() {
-            Err(Exit::Interrupted)
+            Err(Box::new(Exit::Interrupted))
         } else {
             Ok(())
         }
@@ -341,9 +338,10 @@ impl<A: Send + 'static, R: Send + Sync + 'static> Clone for RowDecoder<A, R> {
 }
 impl<A: Send + 'static, R: Send + Sync + 'static> RowDecoder<A, R> {
     /// Construct a D05 row-program carrier. The future is fresh for each row, with no borrowed escape.
+    /// Programs box only failures; decoding moves the complete exit out of its box intact.
     pub fn from_program<F>(factory: impl Fn(RowContext<R>) -> F + Send + Sync + 'static) -> Self
     where
-        F: Future<Output = Result<A, Exit<A, RowError>>> + Send + 'static,
+        F: Future<Output = Result<A, Box<Exit<A, RowError>>>> + Send + 'static,
     {
         Self {
             run: Arc::new(move |context| {
@@ -351,7 +349,7 @@ impl<A: Send + 'static, R: Send + Sync + 'static> RowDecoder<A, R> {
                 Box::pin(async move {
                     match pending.await {
                         Ok(value) => Exit::Success(value),
-                        Err(exit) => exit,
+                        Err(exit) => *exit,
                     }
                 })
             }),
@@ -364,7 +362,7 @@ impl<A: Send + 'static, R: Send + Sync + 'static> RowDecoder<A, R> {
         let project = Arc::new(project);
         Self::from_program(move |context| {
             let project = project.clone();
-            async move { project(&context.row).map_err(Exit::Fail) }
+            async move { project(&context.row).map_err(|error| Box::new(Exit::Fail(error))) }
         })
     }
     /// Decode under the outer native bridge, preserving row failures and application capabilities.
@@ -376,18 +374,21 @@ impl<A: Send + 'static, R: Send + Sync + 'static> RowDecoder<A, R> {
     ) -> Exit<A, RowError> {
         let run = self.run.clone();
         let row = Arc::new(row);
-        let program = effect::Scope::scoped(move |scope| {
-            let run = run.clone();
-            let row = row.clone();
-            Effect::from_exit_future_with_context(move |env, context| {
-                (run)(RowContext {
-                    row: row.clone(),
-                    env,
-                    context,
-                    scope: scope.clone(),
-                })
-            })
-        });
+        let program = effect_scope! {
+        body: move |scope| {
+                    let run = run.clone();
+                    let row = row.clone();
+                    effect_future! {
+                        exit_with_context; body: move |env, context| {
+                        (run)(RowContext {
+                            row: row.clone(),
+                            env,
+                            context,
+                            scope: scope.clone(),
+                        })
+                    }, }
+                },
+        };
         context.run(program, env).await
     }
 }
@@ -414,68 +415,65 @@ pub fn refine<A: Send + 'static, R: Send + Sync + 'static>(
 impl<T: Send + 'static, R: Send + Sync + 'static> CellCodec<T, T, R> {
     /// Keep a native SQLx value in its Rust representation, moving both codec directions without Clone.
     pub fn identity() -> Self {
-        Self::new(Codec::new(
-            |value| Effect::sync_once(move || value),
-            |value| Effect::sync_once(move || value),
-        ))
+        Self::new(
+            codec! { decode: |value| effect_sync! { once; body: move || value, }, encode: |value| effect_sync! { once; body: move || value, }, },
+        )
     }
 }
 impl<R: Send + Sync + 'static> CellCodec<bool, i64, R> {
     /// Decode only SQLite/Turso boolean-domain integers 0 and 1; arbitrary nonzero integers fail.
     /// This stricter domain codec coexists with SQLx's native permissive bool interoperability.
     pub fn boolean() -> Self {
-        Self::new(Codec::new(
-            |value| {
-                Effect::from_result_once(match value {
-                    0 => Ok(false),
-                    1 => Ok(true),
-                    _ => Err(effect::SchemaIssue::new(
-                        effect::SchemaIssueKind::OutOfRange,
-                    )),
-                })
-            },
-            |value| Effect::sync_once(move || i64::from(value)),
-        ))
+        Self::new(codec! {
+        decode: |value| {
+            effect_try_sync! {
+                once; body: {
+                let __dsl_result = match value {
+                0 => Ok(false),
+                1 => Ok(true),
+                _ => Err(effect::SchemaIssue::new(
+                    effect::SchemaIssueKind::OutOfRange,
+                )),
+            }; move || __dsl_result }, on_error: ::core::convert::identity, }
+        }, encode: |value| effect_sync! { once; body: move || i64::from(value), }, })
     }
 }
 impl<R: Send + Sync + 'static> CellCodec<f64, f64, R> {
     /// Reject non-finite native reals in both directions without accepting a string/JSON detour.
     pub fn finite_real() -> Self {
-        Self::new(Codec::new(
-            |value: f64| {
-                Effect::from_result_once(if value.is_finite() {
-                    Ok(value)
-                } else {
-                    Err(effect::SchemaIssue::new(effect::SchemaIssueKind::NonFinite))
-                })
-            },
-            |value: f64| {
-                Effect::from_result_once(if value.is_finite() {
-                    Ok(value)
-                } else {
-                    Err(effect::SchemaIssue::new(effect::SchemaIssueKind::NonFinite))
-                })
-            },
-        ))
+        Self::new(codec! {
+        decode: |value: f64| {
+            effect_try_sync! {
+                once; body: {
+                let __dsl_result = if value.is_finite() {
+                Ok(value)
+            } else {
+                Err(effect::SchemaIssue::new(effect::SchemaIssueKind::NonFinite))
+            }; move || __dsl_result }, on_error: ::core::convert::identity, }
+        }, encode: |value: f64| {
+            effect_try_sync! {
+                once; body: {
+                let __dsl_result = if value.is_finite() {
+                Ok(value)
+            } else {
+                Err(effect::SchemaIssue::new(effect::SchemaIssueKind::NonFinite))
+            }; move || __dsl_result }, on_error: ::core::convert::identity, }
+        }, })
     }
 }
 impl<R: Send + Sync + 'static> CellCodec<effect::Decimal, String, R> {
     /// Decode invariant exact decimal text through the existing core Decimal representation.
     /// Grouping, exponent notation and non-finite text remain invalid; no numeric precision is lost.
     pub fn decimal_text() -> Self {
-        Self::new(Codec::new(
-            |value: String| {
-                Effect::try_sync_once(
-                    move || effect::Decimal::parse(&value),
-                    |_| {
-                        effect::SchemaIssue::new(effect::SchemaIssueKind::InvalidValue {
-                            code: "sql.decimal_text".into(),
-                        })
-                    },
-                )
-            },
-            |value: effect::Decimal| Effect::sync_once(move || value.as_str().to_owned()),
-        ))
+        Self::new(codec! {
+        decode: |value: String| {
+            effect_try_sync! {
+                once; body: move || effect::Decimal::parse(&value), on_error: |_| {
+                    effect::SchemaIssue::new(effect::SchemaIssueKind::InvalidValue {
+                        code: "sql.decimal_text".into(),
+                    })
+                }, }
+        }, encode: |value: effect::Decimal| effect_sync! { once; body: move || value.as_str().to_owned(), }, })
     }
 }
 

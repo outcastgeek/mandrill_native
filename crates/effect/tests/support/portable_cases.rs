@@ -1,6 +1,7 @@
 use fx::{
-    Cancellation, Defect, DefectKind, Effect, Exit, HasCancellation, LibraryDefect, Release,
-    ResourceBinding, ResourceValue, Scope, effect,
+    Cancellation, Defect, DefectKind, Effect, Exit, HasCancellation, LibraryDefect, ResourceValue,
+    effect, effect_die, effect_future, effect_resource, effect_scope, effect_scope_acquire,
+    effect_sync, effect_try_sync, service,
 };
 use std::future::{Future, poll_fn};
 use std::sync::Arc;
@@ -21,14 +22,14 @@ impl HasCancellation for Environment {
 
 pub fn workflow() -> Effect<String, String, Environment> {
     effect! {
-        let offset = Effect::service(|env: &Environment| env.offset)?;
-        let value = Effect::from_future(|_| {
+        let offset = service! { env: |env: &Environment| env.offset, }?;
+        let value = effect_future! { body: |_| {
             let mut suspended = false;
             poll_fn(move |cx| {
                 if suspended { Poll::Ready(7) }
                 else { suspended = true; cx.waker().wake_by_ref(); Poll::Pending }
             })
-        })?;
+        }, }?;
         format!("result-{}", value + offset)
     }
 }
@@ -49,12 +50,12 @@ pub async fn portable_cases() {
     );
     assert!(env.cancellation.request());
     assert_eq!(program.run_cancellable(env).await, Exit::Interrupted);
-    let failure: Effect<String, String> = Effect::fail(String::from("expected"));
+    let failure: Effect<String, String> = effect_try_sync! { body: { let error = String::from("expected"); move || Err(error.clone()) }, on_error: ::core::convert::identity, };
     assert_eq!(
         failure.run(Arc::new(())).await,
         Exit::Fail(String::from("expected"))
     );
-    let defect: Effect<String, String> = Effect::die(Defect::new("unexpected"));
+    let defect: Effect<String, String> = effect_die! { defect: Defect::new("unexpected"), };
     assert_eq!(
         defect.run(Arc::new(())).await,
         Exit::Die(Defect::new("unexpected"))
@@ -63,14 +64,14 @@ pub async fn portable_cases() {
     let witness = Arc::clone(&releases);
     let resource_program: Effect<usize, String, Environment> = effect! {
         let witness = Arc::clone(&witness);
-        let resource = ResourceBinding::new(Effect::sync(|| String::from("owned")), move |value, _reason| {
+        let resource = effect_resource! { binding; acquire: effect_sync! { body: || String::from("owned"), }, release: move |value, _reason| {
             let witness = Arc::clone(&witness);
-            Release::from_future(move |masked| async move {
+            effect_resource! { release_future; body: move |masked| async move {
                 assert!(!masked.is_requested());
                 drop(value);
                 let _ = witness.fetch_add(1, Ordering::SeqCst);
-            })
-        })?;
+            }, }
+        }, }?;
         let length = resource.access(String::len)?;
         length
     };
@@ -85,23 +86,23 @@ pub async fn portable_cases() {
 
     let count = Arc::new(AtomicUsize::new(0));
     let witness = Arc::clone(&count);
-    let scoped: Effect<usize, String, Environment> = Scope::scoped(move |scope| {
+    let scoped: Effect<usize, String, Environment> = effect_scope! { body: move |scope| {
         let witness = Arc::clone(&witness);
-        let acquired = scope.acquire(Effect::sync(|| String::from("portable")), move |value| {
+        let acquired = effect_scope_acquire! { scope: scope, acquire: effect_sync! { body: || String::from("portable"), }, release: move |value| {
             let witness = Arc::clone(&witness);
-            Release::from_future(move |masked| async move {
+            effect_resource! { release_future; body: move |masked| async move {
                 assert!(!masked.is_requested());
                 drop(value);
                 let _ = witness.fetch_add(1, Ordering::SeqCst);
-            })
-        });
+            }, }
+        }, };
         effect! {
             let acquired = acquired.clone();
             let handle = acquired?;
             let size = handle.access(String::len)?;
-            if size > 0 { Effect::succeed(size)? } else { 0 }
+            if size > 0 { effect_sync! { body: move || size, }? } else { 0 }
         }
-    });
+    }, };
     let env = Arc::new(Environment::default());
     for _ in 0..2 {
         assert_eq!(
@@ -113,11 +114,11 @@ pub async fn portable_cases() {
 
     // Every host exposes the same typed failure for an escaped scoped handle;
     // diagnostic text is not a matching contract or a substitute identity.
-    let escaped: Effect<ResourceValue<String>, String> = Scope::scoped(|scope| {
-        scope.acquire(Effect::sync(String::new), |value| {
-            Release::sync(move || drop(value))
-        })
-    });
+    let escaped: Effect<ResourceValue<String>, String> = effect_scope! { body: |scope| {
+        effect_scope_acquire! { scope: scope, acquire: effect_sync! { body: String::new, }, release: |value| {
+            effect_resource! { release_sync; body: move || drop(value), }
+        }, }
+    }, };
     let actual = escaped.run(Arc::new(())).await;
     assert!(matches!(actual, Exit::Success(_)));
     if let Exit::Success(handle) = actual {

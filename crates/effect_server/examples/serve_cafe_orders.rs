@@ -1,5 +1,6 @@
-//! A finite café HTTP/1 consumer; needs the `http1` feature. Run with
-//! `CAFE_CHUNK_BYTES=4096 CAFE_JSON_BYTES=1024 CAFE_TELEMETRY_CAPACITY=8 CAFE_DRAIN_MS=3000 cargo run -p effect-server --example serve_cafe_orders`.
+//! Retrieve customer 7's saved order 42 as HTML and JSON over a finite HTTP/1 host.
+//! Run with
+//! `CAFE_CHUNK_BYTES=4096 CAFE_JSON_BYTES=1024 CAFE_TELEMETRY_CAPACITY=8 CAFE_DRAIN_MS=3000 cargo +1.99.0 run -p effect-server --example serve_cafe_orders`.
 //! The caller chooses the bounded frame size and graceful-drain deadline. The finite run
 //! applies the supplied telemetry count to spans, metric descriptors and series per descriptor.
 //! prints HTTP 200 HTML and JSON responses for order 42, then releases the host and providers.
@@ -7,28 +8,60 @@
 //! The public demonstration bearer identifies customer 7 on a loopback listener; it is an
 //! explicit local policy, while the Identity consumer demonstrates native credential validation.
 //! Business steps run in endpoint DSLs; only the outer owned host executes Effect.
-//! The pure fixture catalog projects `R = ()` and `Infallible` explicitly into the café's
+//! The supplied record catalog projects `R = ()` and `Infallible` explicitly into the café's
 //! request environment/error channel; absence and authorization remain separate domain failures.
 
+use effect::{
+    codec, effect_die, effect_map_error, effect_provide_some, effect_resource, effect_sync,
+    effect_try_sync, service,
+};
 #[path = "../../effect_otel/examples/cafe_telemetry/mod.rs"]
 pub mod cafe_telemetry;
+#[cfg(not(test))]
 use cafe_telemetry::TelemetryCapacity;
-use effect::{
-    Cancellation, Effect, HasBlockingExecutor, HasCancellation, HasClock, HasTaskSpawner,
-    HasTracer, JsonWriterPolicy, ParsePolicy,
-};
-use effect_otel::{BorrowedProviders, HasOtel, Otel, OtelBackend, otel};
+#[cfg(not(test))]
+use effect::effect_try_future;
+use effect::schema;
+use effect::{Effect, JsonWriterPolicy, ParsePolicy};
+#[cfg(not(test))]
+use effect_otel::BorrowedProviders;
+use effect_otel::{Otel, otel};
+use effect_server::effect_from_option;
 use effect_server::{
-    BodyPolicy, Endpoint, HasRequest, HasTokio, HostPolicy, HtmlContent, HttpProtocols, HttpStatus,
-    JsonWriterCodec, Reply, Request, RequestBinding, ResourceValidators, Route, Scalar, Server,
-    ServerError, ServerPolicy, endpoint, pipeline, registered, reply, representations, route,
-    router, routes, server,
+    BodyPolicy, Endpoint, HostPolicy, HtmlContent, HttpProtocols, HttpStatus, JsonWriterCodec,
+    Reply, Request, RequestBinding, ResourceValidators, Route, Scalar, Server, ServerError,
+    ServerPolicy, endpoint, pipeline, registered, reply, representations, route, router, routes,
+    server,
 };
 #[cfg(not(test))]
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+#[cfg(not(test))]
 use std::time::Duration;
-use std::{num::NonZeroUsize, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Domain tracing encloses the moved load result and authorization under one request context.
+fn get_order(id: OrderId) -> Endpoint<CafeError, Cafe> {
+    endpoint! {
+        let customer=service! { env: |env:&Cafe| env.customer, }?;
+        let order=otel! {
+            name:"cafe.order.load",body {
+            let loaded=effect_provide_some! { program: effect_map_error! { program: load_order(id), map: |never|match never {}, }, project: |_:&Cafe|(), }?;
+            let order=require_order(loaded)?;
+            authorize_order(customer,&order)?;
+            Otel::tag("order.id",order.id.0.to_string())?;
+            Otel::event("order.loaded")?;
+            order
+        }}?;
+        let policy=service! { env: |env:&Cafe|env.json, }?;
+        let choices=effect_try_sync! { once; body: { let __dsl_result = order_representations(policy).map_err(CafeError::Http); move || __dsl_result }, on_error: ::core::convert::identity, }?;
+        let etag = match "\"order-42\"".parse() {
+            Ok(etag) => etag,
+            Err(error) => effect_die! { defect: effect::Defect::new(format!("order ETag: {error:?}")), }?,
+        };
+        reply! { status:HttpStatus::Ok, conditional_get(ResourceValidators {exists:true,etag:Some(etag),last_modified:None}); negotiate(choices,order); }
+    }
+}
 /// An order's application identity, separate from HTTP path values.
 #[derive(Clone, Copy)]
 struct OrderId(u64);
@@ -56,120 +89,9 @@ pub(crate) enum CafeError {
     /// No saved order has this identity.
     NotFound,
 }
-/// Caller-owned Tokio I/O and scheduling capabilities beside application request state.
-pub(crate) struct Cafe {
-    /// Existing café provider composition, shared by root and request projections.
-    telemetry: cafe_telemetry::Environment,
-    /// Caller-supplied JSON budget and explicit record parse policy.
-    json: ParsePolicy,
-    /// Each selected request has its own cancellation source.
-    cancellation: Cancellation,
-    /// Actual body/metadata owner for this execution.
-    request: Request,
-    /// Trusted result of the explicit local demonstration policy.
-    customer: Option<CustomerId>,
-}
-impl HasTaskSpawner for Cafe {
-    /// Reuse the existing café task provider.
-    type Tasks = effect_tokio::TokioTasks;
-    /// Borrow the selected independent-child scheduler.
-    fn task_spawner(&self) -> &Self::Tasks {
-        &self.telemetry.tasks
-    }
-}
-impl HasBlockingExecutor for Cafe {
-    /// JSON native writes run on the existing independent blocking provider.
-    type Executor = effect_tokio::TokioBlocking;
-    /// Borrow the same provider retained through host drain.
-    fn blocking_executor(&self) -> &Self::Executor {
-        &self.telemetry.blocking
-    }
-}
-impl HasClock for Cafe {
-    /// Request projections preserve the existing monotonic origin.
-    type Clock = effect_tokio::TokioClock;
-    /// Borrow the selected native clock.
-    fn clock(&self) -> &Self::Clock {
-        &self.telemetry.clock
-    }
-}
-impl HasTracer for Cafe {
-    /// Both request and domain spans share the existing OTel-backed tracer.
-    fn tracer(&self) -> &effect::Tracer {
-        &self.telemetry.tracer
-    }
-}
-impl HasOtel for Cafe {
-    /// Borrow the selected native bridge without global discovery.
-    fn otel(&self) -> &OtelBackend {
-        &self.telemetry.otel
-    }
-}
-impl effect_server::HasServerError for Cafe {
-    /// JSON/input failures retain the café HTTP error channel.
-    type Error = CafeError;
-    /// Map the checked native cause once.
-    fn server_error(&self, error: ServerError) -> CafeError {
-        CafeError::Http(error)
-    }
-}
-impl HasTokio for Cafe {
-    /// Borrow the runtime kept alive by main through host drain.
-    fn tokio(&self) -> &tokio::runtime::Handle {
-        self.telemetry.runtime.handle()
-    }
-}
-impl HasCancellation for Cafe {
-    /// Select the cancellation authority belonging to this execution.
-    fn cancellation(&self) -> &Cancellation {
-        &self.cancellation
-    }
-}
-impl HasRequest for Cafe {
-    /// Preserve the real native request and its checked one-body owner.
-    fn request(&self) -> &Request {
-        &self.request
-    }
-}
-/// Root capability state uses caller-owned providers and explicit telemetry/JSON storage bounds.
-pub(crate) fn environment(
-    runtime: Arc<tokio::runtime::Runtime>,
-    providers: BorrowedProviders,
-    json: ParsePolicy,
-    capacity: TelemetryCapacity,
-) -> Result<Arc<Cafe>, String> {
-    let cancellation = Cancellation::new();
-    Ok(Arc::new(Cafe {
-        telemetry: cafe_telemetry::Environment::new(runtime, providers, capacity)?,
-        json,
-        request: Request::from_native(
-            http::Request::new(axum::body::Body::empty()),
-            cancellation.clone(),
-        ),
-        cancellation,
-        customer: None,
-    }))
-}
-/// The caller selects JSON bytes; structural bounds describe this record's three scalar fields.
-pub(crate) fn order_policy(bytes: NonZeroUsize) -> ParsePolicy {
-    ParsePolicy {
-        limits: effect::ParseLimits {
-            bytes,
-            depth: NonZeroUsize::new(2).expect("record and scalar"),
-            nodes: NonZeroUsize::new(4).expect("record plus three fields"),
-            collection: NonZeroUsize::new(3).expect("three fields"),
-            issues: NonZeroUsize::MIN,
-        },
-        errors: effect::SchemaErrorMode::First,
-        unknown_fields: effect::UnknownFields::Reject,
-        duplicate_fields: effect::DuplicateFields::Reject,
-    }
-}
-/// Drain the reused scheduling providers before the caller shuts down its native SDK originals.
-pub(crate) async fn drain_providers(root: &Cafe) {
-    root.telemetry.tasks.stop().wait().await;
-    root.telemetry.blocking.stop().wait().await;
-}
+/// Native request/provider composition selected by the outer host.
+mod cafe_runtime;
+pub(crate) use cafe_runtime::{Cafe, drain_providers, environment, order_policy};
 /// One reversible codec enforces positive order IDs for routing and reverse links.
 fn order_id() -> Scalar<OrderId> {
     Scalar::new(
@@ -195,30 +117,35 @@ fn order_route() -> Result<Route<OrderId>, ServerError> {
 }
 /// The pure local catalog constructs an owned optional order without request-provider requirements.
 fn load_order(id: OrderId) -> Effect<Option<CoffeeOrder>, std::convert::Infallible, ()> {
-    Effect::sync(move || {
+    effect_sync! {
+        body {
         (id.0 == 42).then(|| CoffeeOrder {
             id,
             owner: CustomerId(7),
             drink: "Oat latte".into(),
         })
-    })
+        },
+    }
 }
 /// Absence becomes the café's typed not-found case, without erasing transport or authorization errors.
 fn require_order(order: Option<CoffeeOrder>) -> Effect<CoffeeOrder, CafeError, Cafe> {
-    Effect::from_result_once(order.ok_or(CafeError::NotFound))
+    effect_from_option! {
+        once; value: order, missing { CafeError::NotFound },
+    }
 }
 /// Extracted renderer owns its input once after representation selection.
 fn render_order_html(order: CoffeeOrder) -> Effect<HtmlContent, CafeError, Cafe> {
-    Effect::sync_once(move || HtmlContent::text(format!("Order {}: {}", order.id.0, order.drink)))
+    effect_sync! {
+        once; body { HtmlContent::text(format!("Order {}: {}", order.id.0, order.drink)) },
+    }
 }
 /// Schema fields retain direct writer witnesses without cloning the owned order or building a DOM.
 fn order_json(policy: ParsePolicy) -> Result<JsonWriterCodec<CoffeeOrder>, ServerError> {
-    let id = effect::json_u64().transform(|id| Ok(OrderId(id)), |id: &OrderId| Ok(id.0));
-    let owner = effect::json_u64().transform(
-        |owner| Ok(CustomerId(owner)),
-        |owner: &CustomerId| Ok(owner.0),
-    );
-    let codec=effect::schema! {struct CoffeeOrder {id:id,owner:owner,drink:effect::json_string()} policy:policy}.map_err(ServerError::Schema)?;
+    let id = codec! { transform_pure; source: effect::json_u64(), decode: |id| Ok(OrderId(id)), encode: |id: &OrderId| Ok(id.0), };
+    let owner = codec! { transform_pure; source: effect::json_u64(), decode: |owner| Ok(CustomerId(owner)), encode: |owner: &CustomerId| Ok(owner.0), };
+    let codec =
+        schema! {struct CoffeeOrder {id:id,owner:owner,drink:effect::json_string()} policy:policy}
+            .map_err(ServerError::Schema)?;
     JsonWriterCodec::require(codec)
 }
 /// JSON and HTML stay lazy; the JSON alternative writes directly on selected blocking R.
@@ -232,28 +159,13 @@ fn authorize_order(
     customer: Option<CustomerId>,
     order: &CoffeeOrder,
 ) -> Effect<(), CafeError, Cafe> {
-    Effect::from_result_once(if customer == Some(order.owner) {
+    effect_try_sync! {
+        once; body: {
+        let __dsl_result = if customer == Some(order.owner) {
         Ok(())
     } else {
         Err(CafeError::Unauthorized)
-    })
-}
-/// Domain tracing encloses the moved load result and authorization under one request context.
-fn get_order(id: OrderId) -> Endpoint<CafeError, Cafe> {
-    endpoint! {
-        let customer=Effect::service(|env:&Cafe| env.customer)?;
-        let order=otel! {name:"cafe.order.load",body {
-            let loaded=load_order(id).map_error(|never|match never {}).provide_some(|_:&Cafe|())?;
-            let order=require_order(loaded)?;
-            authorize_order(customer,&order)?;
-            Otel::tag("order.id",order.id.0.to_string())?;
-            Otel::event("order.loaded")?;
-            order
-        }}?;
-        let policy=Effect::service(|env:&Cafe|env.json)?;
-        let choices=Effect::from_result_once(order_representations(policy).map_err(CafeError::Http))?;
-        reply! { status:HttpStatus::Ok, conditional_get(ResourceValidators {exists:true,etag:Some("\"order-42\"".parse().expect("literal ETag")),last_modified:None}); negotiate(choices,order); }
-    }
+    }; move || __dsl_result }, on_error: ::core::convert::identity, }
 }
 /// Expected errors select a fresh finite reply; renderer failure is never recursively handled.
 fn error_reply(error: CafeError) -> Effect<Reply<CafeError, Cafe>, CafeError, Cafe> {
@@ -266,13 +178,15 @@ fn error_reply(error: CafeError) -> Effect<Reply<CafeError, Cafe>, CafeError, Ca
         CafeError::Http(error) => (http::StatusCode::BAD_REQUEST, error.to_string()),
         CafeError::Otel(error) => (http::StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     };
-    Effect::sync_once(
-        move || reply! {status:HttpStatus::new(status).expect("body status"), text(message);},
-    )
+    effect_try_sync! {
+        once; body: move || {
+        let status = HttpStatus::new(status)?;
+        Ok(reply! { status: status, text(message); })
+    }, on_error: CafeError::Http, }
 }
 /// An extracted reusable Effect constructs the readiness reply only when the endpoint runs.
 fn health_reply() -> Effect<Reply<CafeError, Cafe>, CafeError, Cafe> {
-    Effect::sync(|| reply! {text(String::from("ready"));})
+    effect_sync! { body: || reply! {text(String::from("ready"));}, }
 }
 /// Extracted endpoint form keeps the same request/body owner as the inline order endpoint.
 fn health_endpoint() -> Endpoint<CafeError, Cafe> {
@@ -299,10 +213,11 @@ fn record_request_outcome(
         effect::PrimaryOutcomeRef::Defected(_) => "defected",
         effect::PrimaryOutcomeRef::WasInterrupted => "interrupted",
     };
-    effect::Release::from_effect(Otel::event_with(
+    effect_resource! {
+        release_effect; program: Otel::event_with(
         "cafe.request.finished",
         vec![effect_otel::KeyValue::new("cafe.outcome", status)],
-    ))
+    ), }
 }
 /// Inert DSL-led assembly demonstrates typed routes, extracted modules and anonymous metadata.
 pub(crate) fn describe(
@@ -315,7 +230,8 @@ pub(crate) fn describe(
     let orders = router! {pipe_through:policy, on_error(error_reply); get(order_route()?,get_order); get("/health",health);};
     let cafe_routes = routes! {include(orders);};
     let binding = RequestBinding::new(|request: Request| {
-        Effect::service(move |root: &Cafe| {
+        service! {
+            env: move |root: &Cafe| {
             Arc::new(Cafe {
                 telemetry: root.telemetry.clone(),
                 json: root.json,
@@ -327,9 +243,9 @@ pub(crate) fn describe(
                     .map(|_| CustomerId(7)),
                 request: request.clone(),
             })
-        })
+        }, }
     });
-    let server = server! {policy:ServerPolicy::new(body,host,CafeError::Http,error_reply),environment:binding,listen:"127.0.0.1:0".parse::<std::net::SocketAddr>().expect("loopback"),protocols:protocols,routes:cafe_routes}?;
+    let server = server! {policy:ServerPolicy::new(body,host,CafeError::Http,error_reply),environment:binding,listen:std::net::SocketAddr::from(([127,0,0,1],0)),protocols:protocols,routes:cafe_routes}?;
     let propagation = effect_otel::Propagation::new(
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
@@ -340,7 +256,7 @@ pub(crate) fn describe(
             name: Arc::from("cafe.http"),
             attributes: Vec::new(),
         },
-        |_| Effect::sync(|| ()),
+        |_| effect_sync! { body: || (), },
         CafeError::Otel,
     ))
 }
@@ -403,22 +319,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         HostPolicy { drain },
     )?;
-    let execution=host.with_host(move |host| {let link=link.clone();Effect::try_future_once(move |_|async move {
-        for media in ["text/html","application/json"] {let response=exchange(host.address,&format!("GET {link} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer cafe-demo-customer-7\r\nAccept: {media}\r\nConnection: close\r\n\r\n")).await?;println!("{response}");}
+    let execution=host.with_host(move |host| {let link=link.clone();effect_try_future! {
+        once; body: move |_|async move {
+        for media in ["text/html","application/json"] {let response=exchange(host.address,&format!("GET {link} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer cafe-demo-customer-7\r\nAccept: {media}\r\nConnection: close\r\n\r\n")).await?;use std::io::Write;writeln!(std::io::stdout().lock(), "{response}").map_err(ServerError::Io)?;}
         Ok::<_,ServerError>(())
-    },CafeError::Http)});
+    }, on_error: CafeError::Http, }});
     let exit = runtime.block_on(execution.run(root.clone()));
     runtime.block_on(drain_providers(&root));
     traces.force_flush()?;
-    println!(
+    use std::io::Write;
+    writeln!(
+        std::io::stdout().lock(),
         "completed café spans: {}",
         exported.get_finished_spans()?.len()
-    );
+    )?;
     logs.shutdown()?;
     metrics.shutdown()?;
     traces.shutdown()?;
     match exit {
         effect::Exit::Success(()) => Ok(()),
-        other => Err(format!("café host: {other:?}").into()),
+        other @ (effect::Exit::Fail(_)
+        | effect::Exit::Die(_)
+        | effect::Exit::Interrupted
+        | effect::Exit::FinalizationFailed(_)) => Err(format!("café host: {other:?}").into()),
     }
 }

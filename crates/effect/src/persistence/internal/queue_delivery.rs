@@ -8,6 +8,7 @@ use super::super::persisted_queue::{
     QueueStoreCapacity,
 };
 use crate::{Effect, Layer, UtcMillis};
+use crate::{effect_sync, effect_try_sync};
 use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::{Arc, Mutex};
@@ -121,59 +122,56 @@ impl PersistedQueueStore for MemoryPersistedQueueStore {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn offer(&self, offer: QueueOffer) -> Effect<QueueOfferOutcome, Self::Error> {
         let state = Arc::clone(&self.state);
-        Effect::try_sync_once(
-            move || {
-                let (queue, id, payload, policy, offered_at, available_at) = offer.into_parts();
-                let address = (queue, id.clone());
-                let (outcome, removed) = {
-                    let mut state = state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let old = state.records.get(&address);
-                    if let Some(record) = old {
-                        let retention_elapsed = matches!(
-                            &record.state,
-                            QueueRecordState::Acknowledged { retained_until }
-                                if *retained_until <= offered_at
-                        );
-                        if !retention_elapsed {
-                            if record.payload.as_ref() != payload.as_ref()
-                                || record.policy != policy
-                            {
-                                return Ok(QueueOfferOutcome::ConflictingId);
-                            }
-                            return Ok(QueueOfferOutcome::Duplicate {
-                                disposition: record.state.disposition(),
-                            });
+        effect_try_sync! { once; body: move || {
+            let (queue, id, payload, policy, offered_at, available_at) = offer.into_parts();
+            let address = (queue, id.clone());
+            let (outcome, removed) = {
+                let mut state = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let old = state.records.get(&address);
+                if let Some(record) = old {
+                    let retention_elapsed = matches!(
+                        &record.state,
+                        QueueRecordState::Acknowledged { retained_until }
+                            if *retained_until <= offered_at
+                    );
+                    if !retention_elapsed {
+                        if record.payload.as_ref() != payload.as_ref()
+                            || record.policy != policy
+                        {
+                            return Ok(QueueOfferOutcome::ConflictingId);
                         }
-                    } else if !Self::fits(&state) {
-                        return Err(MemoryQueueStoreError::CapacityExceeded);
+                        return Ok(QueueOfferOutcome::Duplicate {
+                            disposition: record.state.disposition(),
+                        });
                     }
-                    let next = state
-                        .next_sequence
-                        .checked_add(1)
-                        .ok_or(MemoryQueueStoreError::SequenceOverflow)?;
-                    let sequence =
-                        NonZeroU64::new(next).ok_or(MemoryQueueStoreError::SequenceOverflow)?;
-                    state.next_sequence = next;
-                    let record = QueueRecord {
-                        id,
-                        payload,
-                        policy,
-                        sequence,
-                        offered_at,
-                        available_at,
-                        attempts: 0,
-                        state: QueueRecordState::Ready,
-                    };
-                    let removed = state.records.insert(address, record);
-                    (QueueOfferOutcome::Accepted { sequence }, removed)
+                } else if !Self::fits(&state) {
+                    return Err(MemoryQueueStoreError::CapacityExceeded);
+                }
+                let next = state
+                    .next_sequence
+                    .checked_add(1)
+                    .ok_or(MemoryQueueStoreError::SequenceOverflow)?;
+                let sequence =
+                    NonZeroU64::new(next).ok_or(MemoryQueueStoreError::SequenceOverflow)?;
+                state.next_sequence = next;
+                let record = QueueRecord {
+                    id,
+                    payload,
+                    policy,
+                    sequence,
+                    offered_at,
+                    available_at,
+                    attempts: 0,
+                    state: QueueRecordState::Ready,
                 };
-                drop(removed);
-                Ok(outcome)
-            },
-            std::convert::identity,
-        )
+                let removed = state.records.insert(address, record);
+                (QueueOfferOutcome::Accepted { sequence }, removed)
+            };
+            drop(removed);
+            Ok(outcome)
+        }, on_error: std::convert::identity, }
     }
 
     ///
@@ -190,112 +188,109 @@ impl PersistedQueueStore for MemoryPersistedQueueStore {
         options: QueueClaimOptions,
     ) -> Effect<Vec<QueueClaim>, Self::Error> {
         let state = Arc::clone(&self.state);
-        Effect::try_sync_once(
-            move || {
-                let now = options.now();
-                let (claims, discarded) = {
-                    let mut state = state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let mut candidates = Vec::new();
-                    for (address, record) in &state.records {
-                        if address.0 != queue || record.available_at > now {
-                            continue;
-                        }
-                        let due = match &record.state {
-                            QueueRecordState::Ready => true,
-                            QueueRecordState::Claimed { lease_until, .. } => *lease_until <= now,
-                            QueueRecordState::Acknowledged { .. }
-                            | QueueRecordState::DeadLetter { .. } => false,
-                        };
-                        if due {
-                            candidates.push(Candidate {
-                                address: address.clone(),
-                                available_at: record.available_at,
-                                sequence: record.sequence,
-                                exhausted: record.attempts >= record.policy.maximum_attempts.get(),
-                            });
-                        }
+        effect_try_sync! { once; body: move || {
+            let now = options.now();
+            let (claims, discarded) = {
+                let mut state = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut candidates = Vec::new();
+                for (address, record) in &state.records {
+                    if address.0 != queue || record.available_at > now {
+                        continue;
                     }
-                    candidates.sort_unstable_by_key(|candidate| {
-                        (candidate.available_at, candidate.sequence)
-                    });
-                    let claimable = candidates
-                        .iter()
-                        .filter(|item| !item.exhausted)
-                        .take(options.limit().get())
-                        .count();
-                    let count = u64::try_from(claimable)
-                        .map_err(|_| MemoryQueueStoreError::GenerationOverflow)?;
-                    state
-                        .next_generation
-                        .checked_add(count)
-                        .ok_or(MemoryQueueStoreError::GenerationOverflow)?;
-                    let mut next_generation = state.next_generation;
-                    let mut claims = Vec::new();
-                    let mut discarded = Vec::new();
-                    for candidate in candidates {
-                        let record = state
-                            .records
-                            .get_mut(&candidate.address)
-                            .ok_or(MemoryQueueStoreError::InconsistentState)?;
-                        if candidate.exhausted {
-                            let previous = std::mem::replace(
-                                &mut record.state,
-                                QueueRecordState::DeadLetter {
-                                    reason: QueueDeadLetterReason::AttemptsExhausted,
-                                },
-                            );
-                            discarded.push(previous);
-                            continue;
-                        }
-                        if claims.len() == options.limit().get() {
-                            continue;
-                        }
-                        next_generation = next_generation
-                            .checked_add(1)
-                            .ok_or(MemoryQueueStoreError::GenerationOverflow)?;
-                        let generation = NonZeroU64::new(next_generation)
-                            .ok_or(MemoryQueueStoreError::GenerationOverflow)?;
-                        let attempt = record
-                            .attempts
-                            .checked_add(1)
-                            .and_then(NonZeroU32::new)
-                            .ok_or(MemoryQueueStoreError::AttemptOverflow)?;
-                        let token = QueueClaimToken::new(
-                            queue.clone(),
-                            record.id.clone(),
-                            options.owner().clone(),
-                            generation,
-                        );
+                    let due = match &record.state {
+                        QueueRecordState::Ready => true,
+                        QueueRecordState::Claimed { lease_until, .. } => *lease_until <= now,
+                        QueueRecordState::Acknowledged { .. }
+                        | QueueRecordState::DeadLetter { .. } => false,
+                    };
+                    if due {
+                        candidates.push(Candidate {
+                            address: address.clone(),
+                            available_at: record.available_at,
+                            sequence: record.sequence,
+                            exhausted: record.attempts >= record.policy.maximum_attempts.get(),
+                        });
+                    }
+                }
+                candidates.sort_unstable_by_key(|candidate| {
+                    (candidate.available_at, candidate.sequence)
+                });
+                let claimable = candidates
+                    .iter()
+                    .filter(|item| !item.exhausted)
+                    .take(options.limit().get())
+                    .count();
+                let count = u64::try_from(claimable)
+                    .map_err(|_| MemoryQueueStoreError::GenerationOverflow)?;
+                state
+                    .next_generation
+                    .checked_add(count)
+                    .ok_or(MemoryQueueStoreError::GenerationOverflow)?;
+                let mut next_generation = state.next_generation;
+                let mut claims = Vec::new();
+                let mut discarded = Vec::new();
+                for candidate in candidates {
+                    let record = state
+                        .records
+                        .get_mut(&candidate.address)
+                        .ok_or(MemoryQueueStoreError::InconsistentState)?;
+                    if candidate.exhausted {
                         let previous = std::mem::replace(
                             &mut record.state,
-                            QueueRecordState::Claimed {
-                                token: token.clone(),
-                                claimed_at: now,
-                                lease_until: options.lease_until(),
+                            QueueRecordState::DeadLetter {
+                                reason: QueueDeadLetterReason::AttemptsExhausted,
                             },
                         );
                         discarded.push(previous);
-                        record.attempts = attempt.get();
-                        claims.push(QueueClaim {
-                            token,
-                            payload: Arc::clone(&record.payload),
-                            attempt,
-                            offered_at: record.offered_at,
-                            available_at: record.available_at,
+                        continue;
+                    }
+                    if claims.len() == options.limit().get() {
+                        continue;
+                    }
+                    next_generation = next_generation
+                        .checked_add(1)
+                        .ok_or(MemoryQueueStoreError::GenerationOverflow)?;
+                    let generation = NonZeroU64::new(next_generation)
+                        .ok_or(MemoryQueueStoreError::GenerationOverflow)?;
+                    let attempt = record
+                        .attempts
+                        .checked_add(1)
+                        .and_then(NonZeroU32::new)
+                        .ok_or(MemoryQueueStoreError::AttemptOverflow)?;
+                    let token = QueueClaimToken::new(
+                        queue.clone(),
+                        record.id.clone(),
+                        options.owner().clone(),
+                        generation,
+                    );
+                    let previous = std::mem::replace(
+                        &mut record.state,
+                        QueueRecordState::Claimed {
+                            token: token.clone(),
                             claimed_at: now,
                             lease_until: options.lease_until(),
-                        });
-                    }
-                    state.next_generation = next_generation;
-                    (claims, discarded)
-                };
-                drop(discarded);
-                Ok(claims)
-            },
-            std::convert::identity,
-        )
+                        },
+                    );
+                    discarded.push(previous);
+                    record.attempts = attempt.get();
+                    claims.push(QueueClaim {
+                        token,
+                        payload: Arc::clone(&record.payload),
+                        attempt,
+                        offered_at: record.offered_at,
+                        available_at: record.available_at,
+                        claimed_at: now,
+                        lease_until: options.lease_until(),
+                    });
+                }
+                state.next_generation = next_generation;
+                (claims, discarded)
+            };
+            drop(discarded);
+            Ok(claims)
+        }, on_error: std::convert::identity, }
     }
 
     ///
@@ -312,53 +307,50 @@ impl PersistedQueueStore for MemoryPersistedQueueStore {
         action: QueueSettlementAction,
     ) -> Effect<QueueSettlement, Self::Error> {
         let state = Arc::clone(&self.state);
-        Effect::try_sync_once(
-            move || {
-                let at = action.at();
-                let address = (token.queue().clone(), token.id().clone());
-                let (result, removed) = {
-                    let mut state = state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let Some(record) = state.records.get_mut(&address) else {
-                        return Ok(QueueSettlement::Missing);
-                    };
-                    let QueueRecordState::Claimed {
-                        token: current,
-                        claimed_at,
-                        lease_until,
-                    } = &record.state
-                    else {
-                        return Ok(QueueSettlement::StaleClaim);
-                    };
-                    if current != &token || at < *claimed_at || at >= *lease_until {
-                        return Ok(QueueSettlement::StaleClaim);
-                    }
-                    let (next, next_available) = match action {
-                        QueueSettlementAction::Acknowledge { at } => {
-                            let retained_until = at
-                                .checked_add(record.policy.acknowledged_retention)
-                                .map_err(MemoryQueueStoreError::Time)?;
-                            (QueueRecordState::Acknowledged { retained_until }, None)
-                        }
-                        QueueSettlementAction::Retry(retry) => {
-                            (QueueRecordState::Ready, Some(retry.available_at()))
-                        }
-                        QueueSettlementAction::DeadLetter { reason, .. } => {
-                            (QueueRecordState::DeadLetter { reason }, None)
-                        }
-                    };
-                    if let Some(available_at) = next_available {
-                        record.available_at = available_at;
-                    }
-                    let previous = std::mem::replace(&mut record.state, next);
-                    (QueueSettlement::Applied, previous)
+        effect_try_sync! { once; body: move || {
+            let at = action.at();
+            let address = (token.queue().clone(), token.id().clone());
+            let (result, removed) = {
+                let mut state = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let Some(record) = state.records.get_mut(&address) else {
+                    return Ok(QueueSettlement::Missing);
                 };
-                drop(removed);
-                Ok(result)
-            },
-            std::convert::identity,
-        )
+                let QueueRecordState::Claimed {
+                    token: current,
+                    claimed_at,
+                    lease_until,
+                } = &record.state
+                else {
+                    return Ok(QueueSettlement::StaleClaim);
+                };
+                if current != &token || at < *claimed_at || at >= *lease_until {
+                    return Ok(QueueSettlement::StaleClaim);
+                }
+                let (next, next_available) = match action {
+                    QueueSettlementAction::Acknowledge { at } => {
+                        let retained_until = at
+                            .checked_add(record.policy.acknowledged_retention)
+                            .map_err(MemoryQueueStoreError::Time)?;
+                        (QueueRecordState::Acknowledged { retained_until }, None)
+                    }
+                    QueueSettlementAction::Retry(retry) => {
+                        (QueueRecordState::Ready, Some(retry.available_at()))
+                    }
+                    QueueSettlementAction::DeadLetter { reason, .. } => {
+                        (QueueRecordState::DeadLetter { reason }, None)
+                    }
+                };
+                if let Some(available_at) = next_available {
+                    record.available_at = available_at;
+                }
+                let previous = std::mem::replace(&mut record.state, next);
+                (QueueSettlement::Applied, previous)
+            };
+            drop(removed);
+            Ok(result)
+        }, on_error: std::convert::identity, }
     }
 
     ///
@@ -375,14 +367,14 @@ impl PersistedQueueStore for MemoryPersistedQueueStore {
         id: QueueMessageId,
     ) -> Effect<Option<QueueRecord>, Self::Error> {
         let state = Arc::clone(&self.state);
-        Effect::sync_once(move || {
+        effect_sync! { once; body: move || {
             state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .records
                 .get(&(queue, id))
                 .cloned()
-        })
+        }, }
     }
 
     ///
@@ -399,7 +391,7 @@ impl PersistedQueueStore for MemoryPersistedQueueStore {
         scan: QueueScan,
     ) -> Effect<Vec<QueueRecord>, Self::Error> {
         let state = Arc::clone(&self.state);
-        Effect::sync_once(move || {
+        effect_sync! { once; body: move || {
             let state = state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -418,7 +410,7 @@ impl PersistedQueueStore for MemoryPersistedQueueStore {
             records.sort_unstable_by_key(|record| record.sequence);
             records.truncate(scan.limit.get());
             records.into_iter().cloned().collect()
-        })
+        }, }
     }
 
     ///
@@ -437,7 +429,7 @@ impl PersistedQueueStore for MemoryPersistedQueueStore {
         request: QueueRequeue,
     ) -> Effect<QueueRequeueOutcome, Self::Error> {
         let state = Arc::clone(&self.state);
-        Effect::sync_once(move || {
+        effect_sync! { once; body: move || {
             let previous = {
                 let mut state = state
                     .lock()
@@ -461,7 +453,7 @@ impl PersistedQueueStore for MemoryPersistedQueueStore {
             };
             drop(previous);
             QueueRequeueOutcome::Requeued
-        })
+        }, }
     }
 
     ///
@@ -474,7 +466,7 @@ impl PersistedQueueStore for MemoryPersistedQueueStore {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn cleanup(&self, queue: PersistedQueueName, now: UtcMillis) -> Effect<usize, Self::Error> {
         let state = Arc::clone(&self.state);
-        Effect::sync_once(move || {
+        effect_sync! { once; body: move || {
             let removed = {
                 let mut state = state
                     .lock()
@@ -498,6 +490,6 @@ impl PersistedQueueStore for MemoryPersistedQueueStore {
             let count = removed.len();
             drop(removed);
             count
-        })
+        }, }
     }
 }

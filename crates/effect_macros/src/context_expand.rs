@@ -4,6 +4,7 @@ use proc_macro2::{Ident, Span, TokenStream};
 use quote::quote;
 use syn::fold::Fold;
 use syn::{Expr, Stmt};
+use syn::{parse_quote, parse_quote_spanned};
 
 /// Rewrites domain binds without inspecting macro tokens, callbacks, or item bodies.
 struct Lower {
@@ -12,52 +13,44 @@ struct Lower {
 }
 impl Fold for Lower {
     /// Preserve guards, patterns and ownership while binding through the domain context.
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "Other syn expression variants retain native Rust syntax"
-    )]
     fn fold_expr(&mut self, expr: Expr) -> Expr {
-        match expr {
-            Expr::Closure(_) | Expr::Async(_) => expr,
-            Expr::Try(step) => {
-                let program = self.fold_expr(*step.expr);
-                let context = &self.context;
-                syn::parse_quote_spanned!(step.question_token.span=> #context.bind(#program).await?)
-            }
-            Expr::Return(step) => {
-                let value = step
-                    .expr
-                    .map(|value| self.fold_expr(*value))
-                    .unwrap_or_else(|| syn::parse_quote!(()));
-                syn::parse_quote!(return Ok(#value))
-            }
-            Expr::While(mut step) => {
-                step.cond = Box::new(self.fold_expr(*step.cond));
-                step.body = self.fold_block(step.body);
-                let context = &self.context;
-                step.body
-                    .stmts
-                    .insert(0, syn::parse_quote!(#context.cooperate().await?;));
-                Expr::While(step)
-            }
-            Expr::ForLoop(mut step) => {
-                step.expr = Box::new(self.fold_expr(*step.expr));
-                step.body = self.fold_block(step.body);
-                let context = &self.context;
-                step.body
-                    .stmts
-                    .insert(0, syn::parse_quote!(#context.cooperate().await?;));
-                Expr::ForLoop(step)
-            }
-            Expr::Loop(mut step) => {
-                step.body = self.fold_block(step.body);
-                let context = &self.context;
-                step.body
-                    .stmts
-                    .insert(0, syn::parse_quote!(#context.cooperate().await?;));
-                Expr::Loop(step)
-            }
-            other => syn::fold::fold_expr(self, other),
+        if matches!(&expr, Expr::Closure(_) | Expr::Async(_)) {
+            expr
+        } else if let Expr::Try(step) = expr {
+            let program = self.fold_expr(*step.expr);
+            let context = &self.context;
+            parse_quote_spanned!(step.question_token.span.resolved_at(proc_macro2::Span::mixed_site())=> #context.bind(#program).await?)
+        } else if let Expr::Return(step) = expr {
+            let value = step
+                .expr
+                .map(|value| self.fold_expr(*value))
+                .unwrap_or_else(|| parse_quote!(()));
+            parse_quote!(return Ok(#value))
+        } else if let Expr::While(mut step) = expr {
+            step.cond = Box::new(self.fold_expr(*step.cond));
+            step.body = self.fold_block(step.body);
+            let context = &self.context;
+            step.body
+                .stmts
+                .insert(0, parse_quote!(#context.cooperate().await?;));
+            Expr::While(step)
+        } else if let Expr::ForLoop(mut step) = expr {
+            step.expr = Box::new(self.fold_expr(*step.expr));
+            step.body = self.fold_block(step.body);
+            let context = &self.context;
+            step.body
+                .stmts
+                .insert(0, parse_quote!(#context.cooperate().await?;));
+            Expr::ForLoop(step)
+        } else if let Expr::Loop(mut step) = expr {
+            step.body = self.fold_block(step.body);
+            let context = &self.context;
+            step.body
+                .stmts
+                .insert(0, parse_quote!(#context.cooperate().await?;));
+            Expr::Loop(step)
+        } else {
+            syn::fold::fold_expr(self, expr)
         }
     }
     /// Nested items retain their own language and failure boundary.
@@ -78,6 +71,30 @@ pub(crate) fn callback(statements: Vec<Stmt>) -> TokenStream {
         .map(|stmt| lower.fold_stmt(stmt))
         .collect::<Vec<_>>();
     quote!(move |#context| async move { #[allow(unreachable_code)] { Ok({ #(#body)* }) } })
+}
+
+/// Expose a borrowed execution context inside a restricted callback's future.
+/// The original binder continues to own that context, so nested resource binds
+/// retain the activation scope/fencing owner; the user borrow cannot escape it.
+pub(crate) fn named_callback(
+    statements: Vec<Stmt>,
+    pattern: &syn::Pat,
+) -> syn::Result<TokenStream> {
+    let context = Ident::new("__domain_context", Span::mixed_site());
+    let mut lower = Lower {
+        context: context.clone(),
+    };
+    let body = statements
+        .into_iter()
+        .map(|stmt| lower.fold_stmt(stmt))
+        .collect::<Vec<_>>();
+    let path = crate::expand::effect_crate_path()?;
+    Ok(
+        quote!(move |#context: #path::cluster::EntityPlanContext<_, _>| async move {
+            #[allow(unused_variables)] let #pattern = &#context;
+            #[allow(unreachable_code)] { Ok({ #(#body)* }) }
+        }),
+    )
 }
 
 /// Wrap a body with a domain constructor resolved through the caller's Cargo dependency.
@@ -158,14 +175,14 @@ mod tests {
     use super::*;
     /// An explicit capture copy may precede a local suspension, but suspension remains in the future.
     #[test]
-    fn suspension_stays_in_future() {
+    fn suspension_stays_in_future() -> syn::Result<()> {
         let statements = syn::parse::Parser::parse_str(
             syn::Block::parse_within,
             "let shared=shared.clone();let value={yield 1;2};yield value;",
-        )
-        .expect("statements");
+        )?;
         let (prefix, body) = split_prefix(statements);
         assert_eq!(prefix.len(), 1);
         assert_eq!(body.len(), 2);
+        Ok(())
     }
 }

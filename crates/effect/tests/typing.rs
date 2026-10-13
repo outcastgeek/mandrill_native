@@ -24,8 +24,28 @@ fn external_compiler_contracts() -> Result<(), Box<dyn std::error::Error>> {
         "[package]\nname = \"effect-typing-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\nrust-version = \"1.99\"\n[workspace]\n[profile.dev]\ndebug = 0\nincremental = false\n[dependencies]\nmandrill_effect = {{ package = \"effect\", path = {:?} }}\n",
         env!("CARGO_MANIFEST_DIR")
     );
-    std::fs::write(directory.0.join("Cargo.toml"), manifest)?;
+    std::fs::write(directory.0.join("Cargo.toml"), &manifest)?;
     let cases = [
+        (
+            "callback_blocks",
+            include_str!("ui/callback_blocks.rs"),
+            None,
+        ),
+        (
+            "callback_arity",
+            include_str!("ui/callback_arity.rs"),
+            Some("role requires 1 parameters"),
+        ),
+        (
+            "callback_duplicate",
+            include_str!("ui/callback_duplicate.rs"),
+            Some("duplicate descriptor field"),
+        ),
+        (
+            "callback_missing",
+            include_str!("ui/callback_missing.rs"),
+            Some("missing descriptor field: encode"),
+        ),
         (
             "composition_helpers",
             include_str!("ui/composition_helpers.rs"),
@@ -279,7 +299,7 @@ fn planned_feature_type_pairs() -> Result<(), Box<dyn std::error::Error>> {
         "[package]\nname = \"effect-feature-typing-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\nrust-version = \"1.99\"\n[workspace]\n[profile.dev]\ndebug = 0\nincremental = false\n[dependencies]\nmandrill_effect = {{ package = \"effect\", path = {:?} }}\n",
         env!("CARGO_MANIFEST_DIR")
     );
-    std::fs::write(directory.0.join("Cargo.toml"), manifest)?;
+    std::fs::write(directory.0.join("Cargo.toml"), &manifest)?;
 
     let limits = r#"
 fn limits() -> mandrill_effect::ParseLimits {
@@ -1022,7 +1042,7 @@ fn extension_compiler_contracts() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("workspace Identity dependency is missing")?;
     manifest.push_str(identity);
     manifest.push('\n');
-    std::fs::write(directory.0.join("Cargo.toml"), manifest)?;
+    std::fs::write(directory.0.join("Cargo.toml"), &manifest)?;
 
     // Server/Web reuse this existing provider module across their example trees.
     copy_renamed_consumer(
@@ -1056,145 +1076,174 @@ fn extension_compiler_contracts() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // The renamed extension facade also owns expansion when Effect is only transitive.
+    let facade_manifest = manifest
+        .lines()
+        .filter(|line| !line.starts_with("mandrill_effect ="))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(directory.0.join("Cargo.toml"), facade_manifest)?;
+    std::fs::write(
+        directory.0.join("src/main.rs"),
+        r#"
+
+use database::{effect_try_sync};
+fn main() {
+    let program = effect_try_sync! {
+        once; body { Ok::<_, String>(String::from("Maya")) },
+    };
+    let run = program.run(std::sync::Arc::new(()));
+    drop(run);
+}
+"#,
+    )?;
+    let output = extension_check(&directory.0, &root)?;
+    assert!(
+        output.status.success(),
+        "renamed extension-only native callback: {}",
+        String::from_utf8(output.stderr)?
+    );
+    std::fs::write(directory.0.join("Cargo.toml"), &manifest)?;
+
     for (name, source, reason) in [
         (
             "sql_identifier",
-            "database::sql! { identifier(\"a..b\"); }",
+            "\nuse database::{sql};\nsql! { identifier(\"a..b\"); }",
             "identifier parts must be nonempty",
         ),
         (
             "sql_assignment",
-            "database::sql_insert! { table: \"orders\", value(\"id\", 1); value(\"id\", 2); }",
+            "\nuse database::{sql_insert};\nsql_insert! { table: \"orders\", value(\"id\", 1); value(\"id\", 2); }",
             "duplicate mutation column",
         ),
         (
             "sql_guard",
-            "database::sql_update! { table: \"orders\", set(\"ready\", true); }",
+            "\nuse database::{sql_update};\nsql_update! { table: \"orders\", set(\"ready\", true); }",
             "exactly one WHERE",
         ),
         (
             "sql_projection",
-            "database::sql_with! { select: (), effect: (), run: () }",
+            "\nuse database::{sql_with};\nsql_with! { select: (), effect: (), run: () }",
             "requires exactly one",
         ),
         (
             "endpoint_forms",
-            "http_server::endpoint! { body { () } effect: () }",
+            "\nuse http_server::{endpoint};\nendpoint! { body { () } effect: () }",
             "mutually exclusive",
         ),
         (
             "reply_terminal",
-            "http_server::reply! { text(\"a\"); text(\"b\"); }",
+            "\nuse http_server::{reply};\nreply! { text(\"a\"); text(\"b\"); }",
             "exactly one terminal body",
         ),
         (
             "reply_status",
-            "http_server::reply! { status(()); no_content(); }",
+            "\nuse http_server::{reply};\nreply! { status(()); no_content(); }",
             "bodyless terminal controls its own status",
         ),
         (
             "route_shape",
-            "http_server::route! { literal(\"/{id}\"); }",
+            "\nuse http_server::{route};\nroute! { literal(\"/{id}\"); }",
             "without captures",
         ),
         (
             "route_phase",
-            "http_server::route! { capture(\"id\", ()); }",
+            "\nuse http_server::{route};\nroute! { capture(\"id\", ()); }",
             "before captures",
         ),
         (
             "registration",
-            "http_server::registered! { endpoint: (), authorize(\"customer\"); allow_anonymous(true); }",
+            "\nuse http_server::{registered};\nregistered! { endpoint: (), authorize(\"customer\"); allow_anonymous(true); }",
             "conflicts with authorize",
         ),
         (
             "representation",
-            "http_server::representations! {}",
+            "\nuse http_server::{representations};\nrepresentations! {}",
             "requires an alternative",
         ),
         (
             "router_arity",
-            "http_server::router! { get(()); }",
+            "\nuse http_server::{router};\nrouter! { get(()); }",
             "requires 2 arguments",
         ),
         (
             "routes_arity",
-            "http_server::routes! { methods((), ()); }",
+            "\nuse http_server::{routes};\nroutes! { methods((), ()); }",
             "requires 3 arguments",
         ),
         (
             "pipeline_callback",
-            "http_server::pipeline! { before |a,b| { () } }",
+            "\nuse http_server::{pipeline};\npipeline! { before |a,b| { () } }",
             "wrong inline callback parameter count",
         ),
         (
             "server_required",
-            "http_server::server! {}",
+            "\nuse http_server::{server};\nserver! {}",
             "server requires policy",
         ),
         (
             "stream_forms",
-            "http_server::stream! { source: (), body |writer| { () } }",
+            "\nuse http_server::{stream};\nstream! { source: (), body |writer| { () } }",
             "mutually exclusive",
         ),
         (
             "identity_duplicate",
-            "accounts::identity_store! { backend: (), backend: () }",
+            "\nuse accounts::{identity_store};\nidentity_store! { backend: (), backend: () }",
             "duplicate Identity field",
         ),
         (
             "identity_required",
-            "accounts::identity! {}",
+            "\nuse accounts::{identity};\nidentity! {}",
             "missing Identity field: storage",
         ),
         (
             "identity_endpoint",
-            "accounts::identity_endpoints! {}",
+            "\nuse accounts::{identity_endpoints};\nidentity_endpoints! {}",
             "missing Identity endpoint field: identity",
         ),
         (
             "web_required",
-            "application::web! {}",
+            "\nuse application::{web};\nweb! {}",
             "missing required Web field",
         ),
         (
             "security_duplicate",
-            "application::security! { body_limit: (), body_limit: () }",
+            "\nuse application::{security};\nsecurity! { body_limit: (), body_limit: () }",
             "duplicate Web descriptor field",
         ),
         (
             "csp_duplicate",
-            "application::csp! { directive(\"default-src\", ()); directive(\"default-src\", ()); }",
+            "\nuse application::{csp};\ncsp! { directive(\"default-src\", ()); directive(\"default-src\", ()); }",
             "duplicate CSP directive",
         ),
         (
             "cache_required",
-            "application::read_through! {}",
+            "\nuse application::{read_through};\nread_through! {}",
             "missing required Web field `scope`",
         ),
         (
             "dependency_required",
-            "application::dependent_read_through! {}",
+            "\nuse application::{dependent_read_through};\ndependent_read_through! {}",
             "missing required Web field `scope`",
         ),
         (
             "availability_required",
-            "application::availability! {}",
+            "\nuse application::{availability};\navailability! {}",
             "missing required Web field `service`",
         ),
         (
             "message_duplicate",
-            "application::message_arguments! { message: (), field(\"drink\", 1); field(\"drink\", 2); }",
+            "\nuse application::{message_arguments};\nmessage_arguments! { message: (), field(\"drink\", 1); field(\"drink\", 2); }",
             "empty/duplicate message field",
         ),
         (
             "localization_required",
-            "application::localization! {}",
+            "\nuse application::{localization};\nlocalization! {}",
             "missing required Web field `catalogue`",
         ),
         (
             "otel_forms",
-            "telemetry::otel! { name: \"order\", body { () }, effect: () }",
+            "\nuse telemetry::{otel};\notel! { name: \"order\", body { () }, effect: () }",
             "requires exactly one",
         ),
     ] {

@@ -1,6 +1,7 @@
 //! Inert SQL descriptions separate caller-reviewed syntax from bound values.
 
 use crate::SqlError;
+use crate::sql;
 use sqlx::{Arguments, Encode, Turso, TursoArguments, Type, Value};
 use std::collections::HashSet;
 
@@ -186,15 +187,13 @@ impl SqlPredicate {
     }
     /// Combine predicates while preserving native parameter ordering.
     pub fn and(self, other: Self) -> Result<Self, SqlError> {
-        Ok(Self(
-            SqlStatement::builder()
-                .text("(")
-                .fragment(self.0)
-                .text(") AND (")
-                .fragment(other.0)
-                .text(")")
-                .finish()?,
-        ))
+        Ok(Self(sql! {
+            text("(");
+            fragment(self.0);
+            text(") AND (");
+            fragment(other.0);
+            text(")");
+        }?))
     }
 }
 

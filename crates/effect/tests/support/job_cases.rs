@@ -1,7 +1,9 @@
 use super::tasks::Threads;
+use fx::{effect_blocking, effect_cpu, effect_future, effect_scope, effect_try_cpu};
+use fx::effect;
 use fx::{
     Cancellation, Effect, Exit, HasBlockingExecutor, HasCancellation, HasCpuExecutor,
-    HasTaskSpawner, Scope,
+    HasTaskSpawner,
 };
 use std::{cell::Cell, sync::Arc};
 
@@ -40,22 +42,24 @@ struct Data(Cell<usize>); // Neither Clone nor Sync.
 
 pub async fn job_cases() {
     let env = Arc::new(Environment::default());
-    let workflow: Effect<Data, Data, Environment> = Scope::scoped(|scope| {
-        fx::effect! {
-            let scope = scope.clone();
-            let fetched = Effect::from_future(|_| async { Data(Cell::new(3)) })?;
-            let parsed = Effect::cpu_once(move |cancel| {
-                assert!(!cancel.is_requested());
-                fetched
-            })?;
-            let local = scope.fork(Effect::cpu_once(move |_| Data(Cell::new(parsed.0.get()))))?;
-            let remote = Effect::from_future(|_| async { Data(Cell::new(2)) })?;
-            let scored = local.join()?;
-            let saved = Effect::blocking_once(move |_| Data(Cell::new(scored.0.get() + remote.0.get())))?;
-            let result = saved.0.get();
-            Effect::from_future(move |_| async move { Data(Cell::new(result)) })?
-        }
-    });
+    let workflow: Effect<Data, Data, Environment> = effect_scope! {
+    body: |scope| {
+            effect! {
+                let scope = scope.clone();
+                let fetched = effect_future! { body: |_| async { Data(Cell::new(3)) }, }?;
+                let parsed = effect_cpu! { once; body: move |cancel| {
+                    assert!(!cancel.is_requested());
+                    fetched
+                }, }?;
+                let local = scope.fork(effect_cpu! { once; body: move |_| Data(Cell::new(parsed.0.get())), })?;
+                let remote = effect_future! { body: |_| async { Data(Cell::new(2)) }, }?;
+                let scored = local.join()?;
+                let saved = effect_blocking! { once; body: move |_| Data(Cell::new(scored.0.get() + remote.0.get())), }?;
+                let result = saved.0.get();
+                effect_future! { body: move |_| async move { Data(Cell::new(result)) }, }?
+            }
+        },
+    };
     for _ in 0..2 {
         assert_eq!(
             workflow.run_cancellable(Arc::clone(&env)).await,
@@ -63,7 +67,7 @@ pub async fn job_cases() {
         );
     }
     let failure: Effect<Data, Data, Environment> =
-        Effect::try_cpu_once(|_| Err(Data(Cell::new(7))), |error| error);
+        effect_try_cpu! { once; body: |_| Err(Data(Cell::new(7))), on_error: |error| error, };
     assert_eq!(
         failure.run(Arc::clone(&env)).await,
         Exit::Fail(Data(Cell::new(7)))

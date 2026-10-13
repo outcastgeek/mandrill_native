@@ -3,6 +3,7 @@
 use super::internal::journal::JournalError;
 use super::{Transaction, TransactionDomain, TransactionDomainError, TxRef, TxValue};
 use crate::{Chunk, Effect, Release, Stream};
+use crate::{effect, effect_map, effect_try_future, effect_try_sync, transaction};
 use event_listener::Event;
 use futures_util::future::select;
 use std::collections::VecDeque;
@@ -138,34 +139,36 @@ impl<T: TxValue> TxPubSub<T> {
     pub fn publish(&self, value: Arc<T>) -> Transaction<TxPublishReceipt, TxPubSubError> {
         let capacity = self.capacity;
         let overflow = self.overflow;
-        self.cell.update(move |current| {
-            let sequence = current
-                .last_sequence
-                .checked_add(1)
-                .and_then(NonZeroU64::new)
-                .ok_or(TxPubSubError::SequenceExhausted)?;
-            let mut next = current.clone();
-            let dropped_oldest = if next.retained.len() >= capacity.get() {
-                match overflow {
-                    TxPubSubOverflow::Reject => return Err(TxPubSubError::Full),
-                    TxPubSubOverflow::DropOldest => {
-                        next.retained.pop_front();
-                        true
-                    }
-                }
-            } else {
-                false
-            };
-            next.last_sequence = sequence.get();
-            next.retained.push_back((sequence, Arc::clone(&value)));
-            Ok((
-                next,
-                TxPublishReceipt {
-                    sequence,
-                    dropped_oldest,
+        transaction! {
+        modify; reference: self.cell, modify: move |current| {
+                    let sequence = current
+                        .last_sequence
+                        .checked_add(1)
+                        .and_then(NonZeroU64::new)
+                        .ok_or(TxPubSubError::SequenceExhausted)?;
+                    let mut next = current.clone();
+                    let dropped_oldest = if next.retained.len() >= capacity.get() {
+                        match overflow {
+                            TxPubSubOverflow::Reject => return Err(TxPubSubError::Full),
+                            TxPubSubOverflow::DropOldest => {
+                                next.retained.pop_front();
+                                true
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    next.last_sequence = sequence.get();
+                    next.retained.push_back((sequence, Arc::clone(&value)));
+                    Ok((
+                        next,
+                        TxPublishReceipt {
+                            sequence,
+                            dropped_oldest,
+                        },
+                    ))
                 },
-            ))
-        })
+        }
     }
 
     /// Register an observer for future committed changes.
@@ -181,16 +184,13 @@ impl<T: TxValue> TxPubSub<T> {
         &self,
     ) -> Effect<TxPubSubSubscription<T>, TxPubSubError, R> {
         let pubsub = self.clone();
-        Effect::try_sync(
-            move || {
-                let (_, state) = pubsub
-                    .cell
-                    .inspect_committed()
-                    .map_err(|_| TxPubSubError::MissingCell)?;
-                Ok(pubsub.subscription_after(state.last_sequence))
-            },
-            std::convert::identity,
-        )
+        effect_try_sync! { body: move || {
+            let (_, state) = pubsub
+                .cell
+                .inspect_committed()
+                .map_err(|_| TxPubSubError::MissingCell)?;
+            Ok(pubsub.subscription_after(state.last_sequence))
+        }, on_error: std::convert::identity, }
     }
 
     #[must_use]
@@ -231,11 +231,10 @@ impl<T: TxValue> TxPubSub<T> {
         Stream::from_pull(
             self.subscribe::<R>(),
             |resource| {
-                resource
-                    .access(|subscription| subscription.clone())
-                    .flat_map(|subscription| {
-                        subscription.next().map(|value| Chunk::Values(vec![value]))
-                    })
+                let __dsl_program = resource.access(|subscription| subscription.clone());
+                effect! { let subscription = __dsl_program.clone()?; {
+                    effect_map! { program: subscription.next(), map: |value| Chunk::Values(vec![value]), }
+                }? }
             },
             |subscription| {
                 Release::sync(move || {
@@ -305,59 +304,56 @@ impl<T: TxValue> TxPubSubSubscription<T> {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn next<R: Send + Sync + 'static>(&self) -> Effect<(NonZeroU64, Arc<T>), TxPubSubError, R> {
         let subscription = self.clone();
-        Effect::try_future(
-            move |cancellation| {
-                let subscription = subscription.clone();
-                async move {
-                    loop {
-                        if subscription.inner.disposed.load(Ordering::Acquire) {
-                            return Err(TxPubSubError::Disposed);
-                        }
-                        let changed = subscription.inner.cell.changed().listen();
-                        let closed = subscription.inner.closed.listen();
-                        let (_, state) = subscription
+        effect_try_future! { body: move |cancellation| {
+            let subscription = subscription.clone();
+            async move {
+                loop {
+                    if subscription.inner.disposed.load(Ordering::Acquire) {
+                        return Err(TxPubSubError::Disposed);
+                    }
+                    let changed = subscription.inner.cell.changed().listen();
+                    let closed = subscription.inner.closed.listen();
+                    let (_, state) = subscription
+                        .inner
+                        .cell
+                        .inspect_committed()
+                        .map_err(|_error: JournalError| TxPubSubError::MissingCell)?;
+                    {
+                        let mut cursor = subscription
                             .inner
-                            .cell
-                            .inspect_committed()
-                            .map_err(|_error: JournalError| TxPubSubError::MissingCell)?;
+                            .cursor
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let Some((first, _)) = state.retained.front()
+                            && (*cursor).saturating_add(1) < first.get()
                         {
-                            let mut cursor = subscription
-                                .inner
-                                .cursor
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            if let Some((first, _)) = state.retained.front()
-                                && (*cursor).saturating_add(1) < first.get()
-                            {
-                                *cursor = first.get() - 1;
-                                return Err(TxPubSubError::Lagged {
-                                    first_available: *first,
-                                });
-                            }
-                            if let Some((sequence, value)) = state
-                                .retained
-                                .iter()
-                                .find(|(sequence, _)| sequence.get() > *cursor)
-                            {
-                                *cursor = sequence.get();
-                                return Ok((*sequence, Arc::clone(value)));
-                            }
+                            *cursor = first.get() - 1;
+                            return Err(TxPubSubError::Lagged {
+                                first_available: *first,
+                            });
                         }
-                        if subscription.inner.disposed.load(Ordering::Acquire) {
-                            return Err(TxPubSubError::Disposed);
-                        }
-                        let _ = select(
-                            Box::pin(changed),
-                            Box::pin(select(Box::pin(closed), Box::pin(cancellation.cancelled()))),
-                        )
-                        .await;
-                        if cancellation.is_requested() {
-                            return Err(TxPubSubError::Cancelled);
+                        if let Some((sequence, value)) = state
+                            .retained
+                            .iter()
+                            .find(|(sequence, _)| sequence.get() > *cursor)
+                        {
+                            *cursor = sequence.get();
+                            return Ok((*sequence, Arc::clone(value)));
                         }
                     }
+                    if subscription.inner.disposed.load(Ordering::Acquire) {
+                        return Err(TxPubSubError::Disposed);
+                    }
+                    let _ = select(
+                        Box::pin(changed),
+                        Box::pin(select(Box::pin(closed), Box::pin(cancellation.cancelled()))),
+                    )
+                    .await;
+                    if cancellation.is_requested() {
+                        return Err(TxPubSubError::Cancelled);
+                    }
                 }
-            },
-            std::convert::identity,
-        )
+            }
+        }, on_error: std::convert::identity, }
     }
 }

@@ -8,15 +8,15 @@
 //! selected callbacks provide their actual native state and native router/service.
 //! Paths, decoding policies, permitted modes and public response fields stay explicit.
 
-use effect::Effect;
-use effect_server::{
-    Endpoint, HasRequest, HttpMethodSet, Registered, Registration, Reply, Request, Router,
-    ServerError,
-};
+use effect::{Effect, effect, service};
+use effect_server::{HasRequest, HttpMethodSet, Reply, Request, Router, ServerError};
+use effect_server::{endpoint, registered, reply, router};
 use std::sync::Arc;
 
 /// Selected Identity workflow consuming one typed input under the request owner.
 type Workflow<D, I, O, E, R> = dyn Fn(Arc<D>, I) -> Effect<O, E, R> + Send + Sync;
+/// Safe response renderer consuming the workflow's owned result.
+type RequestGuard<D, E, R> = dyn Fn(Arc<D>, Request) -> Effect<(), E, R> + Send + Sync;
 /// Safe response renderer consuming the workflow's owned result.
 type Renderer<O, E, R> = dyn Fn(O) -> Effect<Reply<E, R>, E, R> + Send + Sync;
 /// Native protocol workflow retaining its original response body.
@@ -25,6 +25,26 @@ type NativeHttpWorkflow<D, E, R> =
 /// One-shot inert registration factory sharing the installed definition.
 type RouteFactory<D, E, R> =
     dyn FnOnce(Arc<D>) -> Result<Router<E, R>, EndpointError> + Send + 'static;
+
+/// Compose an endpoint policy before its resource guard without invoking a denied guard.
+#[doc(hidden)]
+pub fn authorized_guard<D: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>(
+    authorize: impl Fn(Request) -> Effect<(), E, R> + Send + Sync + 'static,
+    guard: impl Fn(Arc<D>, Request) -> Effect<(), E, R> + Send + Sync + 'static,
+) -> impl Fn(Arc<D>, Request) -> Effect<(), E, R> + Send + Sync + 'static {
+    let guard = Arc::new(guard);
+    move |identity, request| {
+        let guard = guard.clone();
+        let authorized = authorize(request.clone());
+        effect! {
+            let guard = guard.clone();
+            let identity = identity.clone();
+            let request = request.clone();
+            authorized.clone()?;
+            guard(identity, request)?
+        }
+    }
+}
 
 /// Typed Identity endpoint configuration failure before serving begins.
 #[derive(Debug)]
@@ -117,6 +137,8 @@ pub struct WorkflowGroup<
     workflow: Arc<Workflow<D, I, O, E, R>>,
     /// Safe selected renderer; HTML safety/native codecs remain its concrete return type.
     render: Arc<Renderer<O, E, R>>,
+    /// Optional route-local authorization runs before decoding or executing this request.
+    guard: Option<Arc<RequestGuard<D, E, R>>>,
 }
 impl<D, I: Send + 'static, O: Send + 'static, E: Send + 'static, R: Send + Sync + 'static>
     WorkflowGroup<D, I, O, E, R>
@@ -135,7 +157,18 @@ impl<D, I: Send + 'static, O: Send + 'static, E: Send + 'static, R: Send + Sync 
             input: Arc::new(input),
             workflow: Arc::new(workflow),
             render: Arc::new(render),
+            guard: None,
         }
+    }
+    /// Select exact endpoint/resource authorization in the same request scope.
+    /// Guard failures retain their full Effect outcome and skip input/workflow/rendering.
+    #[must_use]
+    pub fn with_guard(
+        mut self,
+        guard: impl Fn(Arc<D>, Request) -> Effect<(), E, R> + Send + Sync + 'static,
+    ) -> Self {
+        self.guard = Some(Arc::new(guard));
+        self
     }
 }
 impl<
@@ -146,20 +179,33 @@ impl<
     R: HasRequest + Send + Sync + 'static,
 > IdentityGroup<D, E, R> for WorkflowGroup<D, I, O, E, R>
 {
-    /// Compose common Effect binds; no input/workflow/render callback runs while building.
+    /// Await request input, workflow and rendering in order under the request owner.
+    /// Building retains reusable callbacks without evaluating them or cloning I/O payloads.
     fn build(self, identity: Arc<D>) -> Result<Router<E, R>, EndpointError> {
         let input = self.input;
         let workflow = self.workflow;
         let render = self.render;
-        let program = Effect::service(|env: &R| env.request().clone())
-            .flat_map(move |request| input(request))
-            .flat_map(move |value| workflow(identity.clone(), value))
-            .flat_map(move |value| render(value));
-        Ok(Router::new().registered(
-            HttpMethodSet::new(vec![self.method])?,
-            &self.path,
-            Registered::new(Endpoint::from_effect(program), Registration::default()),
-        )?)
+        let guard = self.guard;
+        let program = effect! {
+            let input = Arc::clone(&input);
+            let workflow = Arc::clone(&workflow);
+            let render = Arc::clone(&render);
+            let guard = guard.clone();
+            let identity = Arc::clone(&identity);
+            let request = service! { env |env: &R| { env.request().clone() }, }?;
+            if let Some(guard) = guard { guard(identity.clone(), request.clone())?; }
+            let value = input(request)?;
+            let value = workflow(identity, value)?;
+            render(value)?
+        };
+        Ok(router! {
+            methods(HttpMethodSet::new(vec![self.method])?, self.path.as_str(),
+                registered! {
+                    endpoint: endpoint! {
+                        effect(program),
+                    },
+                });
+        }?)
     }
 }
 /// One public native HTTP handler composed as an actual scoped Effect route.
@@ -194,17 +240,25 @@ impl<D, E: Send + 'static, R: Send + Sync + 'static> NativeHttpGroup<D, E, R> {
 impl<D: Send + Sync + 'static, E: Send + 'static, R: HasRequest + Send + Sync + 'static>
     IdentityGroup<D, E, R> for NativeHttpGroup<D, E, R>
 {
-    /// Validate native registration, then retain ordinary Effect composition and body ownership.
+    /// Validate registration, then await the native handler under the selected request.
+    /// The original response body transfers directly into Reply without buffering or copying.
     fn build(self, identity: Arc<D>) -> Result<Router<E, R>, EndpointError> {
         let workflow = self.workflow;
-        let program = Effect::service(|env: &R| env.request().clone())
-            .flat_map(move |request| workflow(identity.clone(), request))
-            .map(Reply::native);
-        Ok(Router::new().registered(
-            HttpMethodSet::new(vec![self.method])?,
-            &self.path,
-            Registered::new(Endpoint::from_effect(program), Registration::default()),
-        )?)
+        let program = effect! {
+            let workflow = Arc::clone(&workflow);
+            let identity = Arc::clone(&identity);
+            let request = service! { env |env: &R| { env.request().clone() }, }?;
+            let response = workflow(identity, request)?;
+            reply! { native(response) }
+        };
+        Ok(router! {
+            methods(HttpMethodSet::new(vec![self.method])?, self.path.as_str(),
+                registered! {
+                    endpoint: endpoint! {
+                        effect(program),
+                    },
+                });
+        }?)
     }
 }
 /// One nonempty semantic group containing heterogeneous typed workflow routes.
@@ -233,9 +287,13 @@ impl<D: 'static, E: Send + 'static, R: Send + Sync + 'static> IdentityGroup<D, E
 {
     /// Build each checked registration once while retaining the exact definition generation.
     fn build(self, identity: Arc<D>) -> Result<Router<E, R>, EndpointError> {
-        let mut router = Router::new();
+        let mut router = router! {}?;
         for route in self.routes {
-            router = router.include(route(identity.clone())?)
+            let child = route(identity.clone())?;
+            router = router! {
+                source: router,
+                include(child);
+            }?;
         }
         Ok(router)
     }
@@ -264,6 +322,12 @@ impl<D: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
             groups: Vec::new(),
         })
     }
+    /// Share the installed definition for policy lowering without cloning its native payload.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn definition(&self) -> Arc<D> {
+        self.identity.clone()
+    }
     /// Build one actual native/Effect route group using the installed definition.
     pub fn group(
         mut self,
@@ -277,6 +341,38 @@ impl<D: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
         self.groups.push(kind);
         self.router = self.router.include(router);
         Ok(self)
+    }
+    /// Contextually type an inline group at the installed definition's native boundary.
+    /// The callback builds only inert routes and executes exactly once, as group does.
+    pub fn group_with(
+        self,
+        kind: EndpointGroup,
+        build: impl FnOnce(Arc<D>) -> Result<Router<E, R>, EndpointError>,
+    ) -> Result<Self, EndpointError> {
+        self.group(kind, build)
+    }
+    /// Contextually type route input, authorization, workflow and renderer from this definition.
+    /// Only inert registration is built now. Each request runs its guard first, then
+    /// moves decoded input and workflow output once through the existing Server owner.
+    pub fn workflow_route<I: Send + 'static, O: Send + 'static>(
+        self,
+        kind: Option<EndpointGroup>,
+        route: (http::Method, String),
+        guard: impl Fn(Arc<D>, Request) -> Effect<(), E, R> + Send + Sync + 'static,
+        input: impl Fn(Request) -> Effect<I, E, R> + Send + Sync + 'static,
+        workflow: impl Fn(Arc<D>, I) -> Effect<O, E, R> + Send + Sync + 'static,
+        render: impl Fn(O) -> Effect<Reply<E, R>, E, R> + Send + Sync + 'static,
+    ) -> Result<Self, EndpointError>
+    where
+        R: HasRequest,
+    {
+        let group = WorkflowGroup::new(route.0, route.1, input, workflow, render).with_guard(guard);
+        if let Some(kind) = kind {
+            self.group(kind, group)
+        } else {
+            let router = group.build(self.identity.clone())?;
+            Ok(self.include(router))
+        }
     }
     /// Include an explicit custom typed route module under the same Identity prefix.
     #[must_use]

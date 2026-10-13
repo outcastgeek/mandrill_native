@@ -1,3 +1,5 @@
+use effect::transaction;
+use serde_json::json;
 #[path = "support/campaign_report.rs"]
 mod campaign_report;
 
@@ -7,6 +9,7 @@ use effect::transactional::{
 };
 use effect::{Exit, JsonValue};
 use futures_executor::block_on;
+use std::io::Write;
 use std::num::NonZeroUsize;
 use std::sync::{
     Arc, Barrier, Mutex,
@@ -34,15 +37,15 @@ fn next(state: &mut u64) -> u64 {
     *state
 }
 
-fn configured_number(config: &JsonValue, path: &[&str]) -> u64 {
+fn configured_number(config: &JsonValue, path: &[&str]) -> Result<u64, String> {
     path.iter()
-        .fold(config, |value, key| {
+        .try_fold(config, |value, key| {
             value
                 .get(*key)
-                .unwrap_or_else(|| panic!("missing campaign field {key}"))
-        })
+                .ok_or_else(|| format!("missing campaign field {key}"))
+        })?
         .as_u64()
-        .expect("campaign field is a nonnegative integer")
+        .ok_or_else(|| format!("campaign integer: {path:?}"))
 }
 
 fn run<A: Send + 'static>(
@@ -55,12 +58,18 @@ fn run<A: Send + 'static>(
 
 fn snapshot(left: &TxRef<i64>, right: &TxRef<i64>) -> Transaction<(i64, i64), &'static str> {
     let right = right.clone();
-    left.read::<&'static str>().flat_map(move |first| {
-        let first = *first;
-        right
-            .read::<&'static str>()
-            .map(move |second| (first, *second))
-    })
+    {
+        let __dsl_transaction = left.read::<&'static str>();
+        transaction! {
+        let first = __dsl_transaction.clone()?; {
+                let first = *first;
+                { let __dsl_transaction = right
+                    .read::<&'static str>(); transaction! {
+        let second = __dsl_transaction.clone()?; (first, *second)
+        } }
+            }?
+        }
+    }
 }
 
 fn transfer(
@@ -69,15 +78,22 @@ fn transfer(
     amount: i64,
 ) -> Transaction<(), &'static str> {
     let destination = destination.clone();
-    source
-        .update(move |balance| {
-            if *balance < amount {
-                Err(DOMAIN_ERROR)
-            } else {
-                Ok((*balance - amount, ()))
-            }
-        })
-        .flat_map(move |_| destination.update(move |balance| Ok((*balance + amount, ()))))
+    {
+        let __dsl_transaction = transaction! {
+        modify; reference: source, modify: move |balance| {
+                    if *balance < amount {
+                        Err(DOMAIN_ERROR)
+                    } else {
+                        Ok((*balance - amount, ()))
+                    }
+                },
+        };
+        transaction! {
+        __dsl_transaction.clone()?; transaction! {
+        modify; reference: destination, modify: move |balance| Ok((*balance + amount, ())),
+        }?
+        }
+    }
 }
 
 fn clear_if_guard_positive(
@@ -89,49 +105,60 @@ fn clear_if_guard_positive(
 ) -> Transaction<(), &'static str> {
     let target = target.clone();
     let entered = AtomicBool::new(false);
-    guard.read::<&'static str>().flat_map(move |value| {
-        trace
-            .lock()
-            .expect("trace lock")
-            .push(format!("{label}-read:{value}"));
-        if !entered.swap(true, Ordering::SeqCst) {
-            first_read.wait();
+    {
+        let __dsl_transaction = guard.read::<&'static str>();
+        transaction! {
+        let value = __dsl_transaction.clone()?; {
+                let trace_guard = trace.lock();
+                assert!(
+                    trace_guard.is_ok(),
+                    "trace lock: {:?}",
+                    trace_guard.as_ref().err()
+                );
+                if let Ok(mut trace) = trace_guard {
+                    trace.push(format!("{label}-read:{value}"));
+                }
+                if !entered.swap(true, Ordering::SeqCst) {
+                    first_read.wait();
+                }
+                if *value > 0 {
+                    target.write(Arc::new(0))
+                } else {
+                    Transaction::succeed_with(|| ())
+                }
+            }?
         }
-        if *value > 0 {
-            target.write(Arc::new(0))
-        } else {
-            Transaction::succeed_with(|| ())
-        }
-    })
+    }
 }
 
 #[test]
-fn overlapping_disjoint_writes_match_a_serial_order() {
+fn overlapping_disjoint_writes_match_a_serial_order() -> Result<(), Box<dyn std::error::Error>> {
     let configured = std::env::var_os("EFFECT_CAMPAIGN_CONFIG")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/feature_campaigns.json")
         });
-    let config: JsonValue = std::fs::read_to_string(configured)
-        .expect("campaign configuration is readable")
-        .parse()
-        .expect("campaign configuration is JSON");
-    let rounds = configured_number(&config, &["campaigns", "transaction", "seeds"]);
-    let deadline = Duration::from_secs(configured_number(&config, &["budgets", "seconds"]));
+    let config: JsonValue = std::fs::read_to_string(configured)?.parse()?;
+    let rounds = configured_number(&config, &["campaigns", "transaction", "seeds"])?;
+    let deadline = Duration::from_secs(configured_number(&config, &["budgets", "seconds"])?);
     let started = Instant::now();
     let policy = TransactionPolicy {
-        max_conflicts: NonZeroUsize::new(MODEL_CELLS).expect("positive conflict bound"),
+        max_conflicts: NonZeroUsize::MIN.saturating_add(MODEL_CELLS - 1),
     };
     let mut observed_serial_orders = [0_u64; MODEL_CELLS];
     let mut schedule_trace = String::new();
 
     for round in 0..rounds {
         let domain = Arc::new(TransactionDomain::new(
-            NonZeroUsize::new(MODEL_CELLS).expect("positive model cell count"),
+            NonZeroUsize::MIN.saturating_add(MODEL_CELLS - 1),
         ));
         let environment = Arc::new(Environment(Arc::clone(&domain)));
-        let left = domain.reference(1_i64).expect("left cell");
-        let right = domain.reference(1_i64).expect("right cell");
+        let left = domain
+            .reference(1_i64)
+            .map_err(|error| format!("left cell: {error:?}"))?;
+        let right = domain
+            .reference(1_i64)
+            .map_err(|error| format!("right cell: {error:?}"))?;
         let first_read = Arc::new(Barrier::new(MODEL_CELLS));
         let trace = Arc::new(Mutex::new(Vec::new()));
         let clear_left = clear_if_guard_positive(
@@ -147,39 +174,55 @@ fn overlapping_disjoint_writes_match_a_serial_order() {
         let first_env = Arc::clone(&environment);
         let first_send = send.clone();
         let first_trace = Arc::clone(&trace);
-        let first = std::thread::spawn(move || {
+        let first = std::thread::spawn(move || -> Result<(), String> {
             let outcome = run(clear_left, &first_env, policy);
-            first_trace
+            let traced = first_trace
                 .lock()
-                .expect("trace lock")
-                .push(String::from("left-settled"));
-            let _ = first_send.send(outcome);
+                .map(|mut trace| trace.push(String::from("left-settled")))
+                .map_err(|error| format!("trace lock: {error}"));
+            first_send
+                .send(outcome)
+                .map_err(|error| format!("left outcome: {error}"))?;
+            traced
         });
         let second_trace = Arc::clone(&trace);
-        let second = std::thread::spawn(move || {
+        let second = std::thread::spawn(move || -> Result<(), String> {
             let outcome = run(clear_right, &environment, policy);
-            second_trace
+            let traced = second_trace
                 .lock()
-                .expect("trace lock")
-                .push(String::from("right-settled"));
-            let _ = send.send(outcome);
+                .map(|mut trace| trace.push(String::from("right-settled")))
+                .map_err(|error| format!("trace lock: {error}"));
+            send.send(outcome)
+                .map_err(|error| format!("right outcome: {error}"))?;
+            traced
         });
         for _ in 0..MODEL_CELLS {
             let remaining = deadline
                 .checked_sub(started.elapsed())
-                .expect("native transaction campaign exceeded its time budget");
+                .ok_or("native transaction campaign exceeded its time budget")?;
             assert!(
                 matches!(receive.recv_timeout(remaining), Ok(Exit::Success(()))),
                 "overlapping transaction failed or stalled at round {round}"
             );
         }
-        first.join().expect("first transaction thread");
-        second.join().expect("second transaction thread");
+        let first = first.join();
+        let second = second.join();
+        first.map_err(|panic| {
+            format!(
+                "first transaction thread: {:?}",
+                effect::Defect::from_panic(panic)
+            )
+        })??;
+        second.map_err(|panic| {
+            format!(
+                "second transaction thread: {:?}",
+                effect::Defect::from_panic(panic)
+            )
+        })??;
 
         let environment = Arc::new(Environment(Arc::clone(&domain)));
-        let actual = match run(snapshot(&left, &right), &environment, policy) {
-            Exit::Success(value) => value,
-            _ => panic!("committed snapshot failed at round {round}"),
+        let Exit::Success(actual) = run(snapshot(&left, &right), &environment, policy) else {
+            return Err(format!("committed snapshot failed at round {round}").into());
         };
         let mut first_then_second = (1_i64, 1_i64);
         if first_then_second.1 > 0 {
@@ -200,24 +243,30 @@ fn overlapping_disjoint_writes_match_a_serial_order() {
         } else if actual == second_then_first {
             observed_serial_orders[1] += 1;
         } else {
-            panic!(
+            return Err(format!(
                 "write skew or partial commit at round {round}: {actual:?}; trace {:?}",
-                trace.lock().expect("trace lock")
-            );
+                trace
+                    .lock()
+                    .map_err(|error| format!("trace lock: {error}"))?
+            )
+            .into());
         }
         schedule_trace.push_str(&format!(
             "{round}: {} => {actual:?}\n",
-            trace.lock().expect("trace lock").join(", ")
+            trace
+                .lock()
+                .map_err(|error| format!("trace lock: {error}"))?
+                .join(", ")
         ));
     }
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
-        .expect("workspace root");
+        .ok_or("missing workspace root")?;
     let artifact_relative = config
         .get("artifacts")
         .and_then(JsonValue::as_str)
-        .expect("campaign artifact directory");
+        .ok_or("missing campaign artifact directory")?;
     let relative = std::path::Path::new(artifact_relative);
     assert!(
         relative
@@ -226,41 +275,40 @@ fn overlapping_disjoint_writes_match_a_serial_order() {
     );
     let artifacts = workspace.join(relative);
     assert!(artifacts.starts_with(workspace.join("scratch/reports")));
-    std::fs::create_dir_all(&artifacts).expect("campaign artifact directory is writable");
+    std::fs::create_dir_all(&artifacts)?;
     let profile = if cfg!(debug_assertions) {
         "debug"
     } else {
         "release"
     };
     let trace_path = artifacts.join(format!("transaction-overlap-{profile}.trace"));
-    std::fs::write(&trace_path, schedule_trace).expect("native transaction trace is writable");
-    eprintln!(
+    std::fs::write(&trace_path, schedule_trace)?;
+    writeln!(
+        std::io::stderr().lock(),
         "{rounds} overlapping write-skew histories matched serial orders {observed_serial_orders:?}; trace {}",
         trace_path.display()
-    );
+    )?;
+    Ok(())
 }
 
 #[test]
-fn configured_transaction_histories_match_independent_state_model() {
+fn configured_transaction_histories_match_independent_state_model()
+-> Result<(), Box<dyn std::error::Error>> {
     let configured = std::env::var_os("EFFECT_CAMPAIGN_CONFIG")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/feature_campaigns.json")
         });
-    let config: JsonValue = std::fs::read_to_string(configured)
-        .expect("campaign configuration is readable")
-        .parse()
-        .expect("campaign configuration is JSON");
-    let seeds = configured_number(&config, &["campaigns", "transaction", "seeds"]);
-    let transitions = configured_number(&config, &["campaigns", "transaction", "transitions"]);
-    let step_budget = configured_number(&config, &["budgets", "steps"]);
-    let seconds = configured_number(&config, &["budgets", "seconds"]);
+    let config: JsonValue = std::fs::read_to_string(configured)?.parse()?;
+    let seeds = configured_number(&config, &["campaigns", "transaction", "seeds"])?;
+    let transitions = configured_number(&config, &["campaigns", "transaction", "transitions"])?;
+    let step_budget = configured_number(&config, &["budgets", "steps"])?;
+    let seconds = configured_number(&config, &["budgets", "seconds"])?;
     let initial_balance = i64::try_from(configured_number(
         &config,
         &["campaigns", "transaction", "initial_balance"],
-    ))
-    .expect("fixture balance fits i64");
-    let max_transfer = configured_number(&config, &["campaigns", "transaction", "max_transfer"]);
+    )?)?;
+    let max_transfer = configured_number(&config, &["campaigns", "transaction", "max_transfer"])?;
     assert!(seeds >= 1_000 && transitions >= 100);
     assert!(initial_balance > 0 && max_transfer > 0);
     assert!(max_transfer <= i64::MAX as u64);
@@ -284,19 +332,25 @@ fn configured_transaction_histories_match_independent_state_model() {
 
     for seed in 0..seeds {
         let domain = Arc::new(TransactionDomain::new(
-            NonZeroUsize::new(MODEL_CELLS).expect("positive model cell count"),
+            NonZeroUsize::MIN.saturating_add(MODEL_CELLS - 1),
         ));
         let environment = Arc::new(Environment(Arc::clone(&domain)));
-        let left = domain.reference(initial_balance).expect("left cell");
-        let right = domain.reference(initial_balance).expect("right cell");
+        let left = domain
+            .reference(initial_balance)
+            .map_err(|error| format!("left cell: {error:?}"))?;
+        let right = domain
+            .reference(initial_balance)
+            .map_err(|error| format!("right cell: {error:?}"))?;
         let mut model = (initial_balance, initial_balance);
-        let mut random = configured_number(&config, &["seed"])
+        let mut random = configured_number(&config, &["seed"])?
             .wrapping_add(seed)
             .max(1);
 
         for step in 0..transitions {
             let choice = (next(&mut random) % operations.len() as u64) as usize;
-            operations[choice] += 1;
+            *operations
+                .get_mut(choice)
+                .ok_or("operation outside configured set")? += 1;
             match choice {
                 0 => {
                     assert!(matches!(
@@ -305,8 +359,7 @@ fn configured_transaction_histories_match_independent_state_model() {
                     ));
                 }
                 1 | 2 => {
-                    let amount = i64::try_from(next(&mut random) % max_transfer + 1)
-                        .expect("fixture transfer fits i64");
+                    let amount = i64::try_from(next(&mut random) % max_transfer + 1)?;
                     let (source, destination, available) = if choice == 1 {
                         (&left, &right, model.0)
                     } else {
@@ -330,19 +383,30 @@ fn configured_transaction_histories_match_independent_state_model() {
                     }
                 }
                 3 => {
-                    let aborted: Transaction<(), &'static str> = left
-                        .write(Arc::new(model.0 + 1))
-                        .flat_map(|_| Transaction::fail_with(|| ABORT_ERROR));
+                    let aborted: Transaction<(), &'static str> = {
+                        let __dsl_transaction = left.write(Arc::new(model.0 + 1));
+                        transaction! {
+                        __dsl_transaction.clone()?; Transaction::fail_with(|| ABORT_ERROR)?
+                        }
+                    };
                     assert!(matches!(
                         run(aborted, &environment, policy),
                         Exit::Fail(TransactionError::Domain(ABORT_ERROR))
                     ));
                 }
                 4 => {
-                    let abandoned = left
-                        .write::<&'static str>(Arc::new(model.0 + 1))
-                        .flat_map(|_| Transaction::<(), &'static str>::retry());
-                    let alternative = right.read::<&'static str>().map(|_| ());
+                    let abandoned = {
+                        let __dsl_transaction = left.write::<&'static str>(Arc::new(model.0 + 1));
+                        transaction! {
+                        __dsl_transaction.clone()?; Transaction::<(), &'static str>::retry()?
+                        }
+                    };
+                    let alternative = {
+                        let __dsl_transaction = right.read::<&'static str>();
+                        transaction! {
+                        __dsl_transaction.clone()?; ()
+                        }
+                    };
                     assert!(matches!(
                         run(abandoned.or_else(alternative), &environment, policy),
                         Exit::Success(())
@@ -350,16 +414,23 @@ fn configured_transaction_histories_match_independent_state_model() {
                 }
                 5 => {
                     let observed = left.clone();
-                    let increment = left
-                        .update(|balance| Ok::<_, &'static str>((*balance + 1, ())))
-                        .flat_map(move |_| observed.read::<&'static str>().map(|value| *value));
+                    let increment = {
+                        let __dsl_transaction = transaction! {
+                        modify; reference: left, modify: |balance| Ok::<_, &'static str>((*balance + 1, ())),
+                        };
+                        transaction! {
+                        __dsl_transaction.clone()?; { let __dsl_transaction = observed.read::<&'static str>(); transaction! {
+                        let value = __dsl_transaction.clone()?; *value
+                        } }?
+                        }
+                    };
                     model.0 += 1;
                     assert!(matches!(
                         run(increment, &environment, policy),
                         Exit::Success(value) if value == model.0
                     ));
                 }
-                _ => unreachable!("choice is bounded by the operation count"),
+                _ => return Err("operation outside configured set".into()),
             }
             assert!(
                 matches!(
@@ -377,11 +448,13 @@ fn configured_transaction_histories_match_independent_state_model() {
     assert!(operations.iter().all(|count| *count > 0));
     campaign_report::completed(
         "transaction",
-        serde_json::json!({
+        json!({
             "seeds": seeds, "transitions": transitions, "operations": operations,
         }),
-    );
-    eprintln!(
+    )?;
+    writeln!(
+        std::io::stderr().lock(),
         "transaction model completed {seeds} seeds × {transitions} transitions; operation counts {operations:?}"
-    );
+    )?;
+    Ok(())
 }

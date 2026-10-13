@@ -7,6 +7,7 @@ use super::{
 };
 use crate::reactivity::{InvalidationError, InvalidationKey, InvalidationRegistry};
 use crate::{Effect, PublishReport};
+use crate::{effect, effect_map_error, effect_provide_some, effect_sync, effect_try_sync, service};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -118,62 +119,82 @@ impl EventObservation {
         let registry = self.registry.clone();
         let keys = Arc::clone(&self.keys);
         let validation_stream = stream.clone();
-        Effect::service(|env: &R| env.event_journal())
-            .flat_map(move |journal| {
-                journal
-                    .read(stream.clone(), after, limit)
-                    .map_error(EventObservationError::Journal)
-                    .provide_some(|_: &R| ())
-            })
-            .flat_map(move |read| {
-                let read = match read {
-                    JournalReadOutcome::Complete(read) => read,
-                    JournalReadOutcome::HistoryTruncated { first_available } => {
-                        return Effect::from_result_once(Err(
-                            EventObservationError::HistoryTruncated { first_available },
-                        ));
-                    }
-                    JournalReadOutcome::CursorAhead { head } => {
-                        return Effect::from_result_once(Err(EventObservationError::CursorAhead {
-                            head,
-                        }));
-                    }
-                };
-                if let Err(issue) = validate_journal_read(&read, &validation_stream, after, limit) {
-                    return Effect::from_result_once(Err(
-                        EventObservationError::InvalidJournalRead {
-                            replay_after: after,
-                            issue,
-                        },
-                    ));
-                }
-                let mut batch = Vec::new();
-                for entry in &read.entries {
-                    batch.extend(keys(entry));
-                }
-                registry
-                    .invalidate(batch)
-                    .map_error(move |source| EventObservationError::Notification {
-                        replay_after: after,
-                        source,
-                    })
-                    .flat_map(move |notification| {
-                        if let Some(dropped) =
-                            notification.and_then(|report| NonZeroUsize::new(report.dropped))
-                        {
-                            return Effect::from_result_once(Err(
-                                EventObservationError::NotificationDropped {
-                                    replay_after: after,
-                                    dropped,
-                                },
-                            ));
-                        }
-                        Effect::sync_once(move || EventObservationReport {
-                            next: read.next,
-                            has_more: read.has_more,
-                            notification,
-                        })
-                    })
-            })
+        {
+            let __dsl_program = {
+                let __dsl_program = service! { env: |env: &R| env.event_journal(), };
+                effect! {
+                let stream = stream.clone(); let journal = __dsl_program.clone()?; {
+                    effect_provide_some! {
+                        program: effect_map_error! {
+                        program: journal
+                        .read(stream.clone(), after, limit), map: EventObservationError::Journal, }, project: |_: &R| (), }
+                }? }
+            };
+            effect! {
+                           let __dsl_program = __dsl_program.clone(); let keys = keys.clone(); let registry = registry.clone(); let validation_stream = validation_stream.clone(); let read = __dsl_program.clone()?; (move || {
+                           let read = match read {
+                               JournalReadOutcome::Complete(read) => read,
+                               JournalReadOutcome::HistoryTruncated { first_available } => {
+                                   return effect_try_sync! {
+                                       once; body: {
+                                       let __dsl_result = Err(
+                                       EventObservationError::HistoryTruncated { first_available },
+                                   ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                               }
+                               JournalReadOutcome::CursorAhead { head } => {
+                                   return effect_try_sync! {
+                                       once; body: {
+                                       let __dsl_result = Err(EventObservationError::CursorAhead {
+                                       head,
+                                   }); move || __dsl_result }, on_error: ::core::convert::identity, };
+                               }
+                           };
+                           if let Err(issue) = validate_journal_read(&read, &validation_stream, after, limit) {
+                               return effect_try_sync! {
+                                   once; body: {
+                                   let __dsl_result = Err(
+                                   EventObservationError::InvalidJournalRead {
+                                       replay_after: after,
+                                       issue,
+                                   },
+                               ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                           }
+                           let mut batch = Vec::new();
+                           for entry in &read.entries {
+                               batch.extend(keys(entry));
+                           }
+                           let next = read.next;
+                           let has_more = read.has_more;
+                           effect! {
+            bind;
+            program: effect_map_error! {
+                program: registry
+                               .invalidate(batch), map: move |source| EventObservationError::Notification {
+                                   replay_after: after,
+                                   source,
+                               }, },
+            body: move |notification| {
+                                   if let Some(dropped) =
+                                       notification.and_then(|report| NonZeroUsize::new(report.dropped))
+                                   {
+                                       return effect_try_sync! {
+                                           once; body: {
+                                           let __dsl_result = Err(
+                                           EventObservationError::NotificationDropped {
+                                               replay_after: after,
+                                               dropped,
+                                           },
+                                       ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                   }
+                                   effect_sync! {
+                                       once; body: move || EventObservationReport {
+                                       next,
+                                       has_more,
+                                       notification,
+                                   }, }
+                               },
+            }
+                       })()? }
+        }
     }
 }

@@ -101,6 +101,16 @@ impl<E: Send + 'static, R: Send + Sync + 'static> MacroContext<E, R> {
         self.scope.clone()
     }
 
+    /// Share existing execution and scope handles for an owned typed callback future.
+    /// This creates no new owner or runtime and copies no environment or error payload.
+    pub(crate) fn share(&self) -> Self {
+        Self {
+            env: Arc::clone(&self.env),
+            context: self.context.clone(),
+            scope: self.scope.clone(),
+        }
+    }
+
     /// Sequence the next macro-expanded step after a successful Effect result.
     ///
     /// # Type parameters

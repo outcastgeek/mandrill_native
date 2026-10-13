@@ -2,6 +2,7 @@
 
 use crate::internal::scoped_body::ScopedBody;
 use crate::{Effect, Exit, Scope};
+use crate::{effect, effect_map_error, effect_provide_some, effect_sync};
 use std::future::Future;
 use std::sync::Arc;
 
@@ -14,6 +15,9 @@ pub enum RpcServiceMiddlewareError<MiddlewareError, HandlerError> {
     /// The connected handler or complete streaming serving operation failed.
     Handler(HandlerError),
 }
+/// Keep the streaming provider failure nested in its original handler channel.
+type StreamingMiddlewareError<E, H, T> =
+    RpcServiceMiddlewareError<E, super::RpcStreamServerError<H, T>>;
 /// A lazy service-producing description. Its primary environment R supplies both acquisition
 /// and execution capabilities; `apply` explicitly connects the service to the handler environment.
 /// Payloads are moved, and the service is shared only for environment projection.
@@ -93,31 +97,33 @@ impl<S: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
         let connect = Arc::new(connect);
         let handler = Arc::new(handler);
         // The input is one-shot, but the reusable description never requires its Clone.
-        let input = Effect::sync_once(move || input);
-        Effect::defer(move || {
-            let scope = Scope::new();
-            let connect = Arc::clone(&connect);
-            let handler = Arc::clone(&handler);
-            let input = input.clone();
-            let program = acquire
-                .evaluate(scope.clone())
-                .map_error(RpcServiceMiddlewareError::Acquire)
-                .flat_map(move |service| {
-                    let service = Arc::new(service);
-                    let connect = Arc::clone(&connect);
-                    let handler = Arc::clone(&handler);
-                    input.clone().flat_map(move |input| {
-                        let service = Arc::clone(&service);
+        let input = effect_sync! { once; body: move || input, };
+        {
+            let __dsl_factory = move || {
+                let scope = Scope::new();
+                let connect = Arc::clone(&connect);
+                let handler = Arc::clone(&handler);
+                let input = input.clone();
+                let program = {
+                    let __dsl_program = effect_map_error! { program: acquire
+                    .evaluate(scope.clone()), map: RpcServiceMiddlewareError::Acquire, };
+                    effect! { let connect = connect.clone(); let handler = handler.clone(); let input = input.clone(); let service = __dsl_program.clone()?; {
+                        let service = Arc::new(service);
                         let connect = Arc::clone(&connect);
-                        handler(input)
-                            .map_error(RpcServiceMiddlewareError::Handler)
-                            .provide_some(move |environment| {
-                                connect(Arc::clone(&service), environment)
-                            })
-                    })
-                });
-            scope.own_mapped(program, RpcServiceMiddlewareError::Acquire)
-        })
+                        let handler = Arc::clone(&handler);
+                        { let __dsl_program = input.clone(); effect! { let connect = connect.clone(); let handler = handler.clone(); let service = service.clone(); let input = __dsl_program.clone()?; {
+                            let service = Arc::clone(&service);
+                            let connect = Arc::clone(&connect);
+                            effect_provide_some! { program: effect_map_error! { program: handler(input), map: RpcServiceMiddlewareError::Handler, }, project: move |environment| {
+                                    connect(Arc::clone(&service), environment)
+                                }, }
+                        }? } }
+                    }? }
+                };
+                scope.own_mapped(program, RpcServiceMiddlewareError::Acquire)
+            };
+            effect! { __dsl_factory()? }
+        }
     }
 }
 /// Explicit grouping of existing protocols, preserving all streaming backend/session types.
@@ -166,17 +172,13 @@ impl<S: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
     /// The caller supplies the accepted session and protocol policy; the original server owns
     /// acknowledgement/close while the middleware owner retains its resources until serving
     /// and session cleanup finish. Streaming backend errors remain inside the typed handler variant.
-    #[allow(
-        clippy::type_complexity,
-        reason = "Retains separate acquisition, handler, and transport provider error channels"
-    )]
     pub fn serve_stream<Q, C, T, H, L, Session>(
         &self,
         connect: impl Fn(Arc<S>, &R) -> L + Send + Sync + 'static,
         handler: super::RpcStreamHandler<Q, C, T, H, L>,
         policy: super::RpcEnvelopePolicy,
         accepted: Arc<Session>,
-    ) -> Effect<(), RpcServiceMiddlewareError<E, super::RpcStreamServerError<H, Session::Error>>, R>
+    ) -> Effect<(), StreamingMiddlewareError<E, H, Session::Error>, R>
     where
         Q: Send + 'static,
         C: Send + 'static,

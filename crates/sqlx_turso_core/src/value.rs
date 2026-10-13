@@ -1,4 +1,6 @@
+use sqlx_core::impl_encode_for_option;
 use std::{borrow::Cow, sync::Arc};
+use time::macros::format_description;
 
 use sqlx_core::{
     decode::Decode,
@@ -1069,9 +1071,8 @@ impl Encode<'_, Turso> for time::PrimitiveDateTime {
         &self,
         buf: &mut <Turso as sqlx_core::database::Database>::ArgumentBuffer,
     ) -> Result<IsNull, BoxDynError> {
-        let format = time::macros::format_description!(
-            "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond]"
-        );
+        let format =
+            format_description!("[year]-[month]-[day] [hour]:[minute]:[second].[subsecond]");
         buf.push(TursoValue::text(self.format(&format)?));
         Ok(IsNull::No)
     }
@@ -1101,7 +1102,7 @@ impl Encode<'_, Turso> for time::Date {
         &self,
         buf: &mut <Turso as sqlx_core::database::Database>::ArgumentBuffer,
     ) -> Result<IsNull, BoxDynError> {
-        let format = time::macros::format_description!("[year]-[month]-[day]");
+        let format = format_description!("[year]-[month]-[day]");
         buf.push(TursoValue::text(self.format(&format)?));
         Ok(IsNull::No)
     }
@@ -1110,7 +1111,7 @@ impl Encode<'_, Turso> for time::Date {
 #[cfg(feature = "time")]
 impl<'r> Decode<'r, Turso> for time::Date {
     fn decode(value: TursoValueRef<'r>) -> Result<Self, BoxDynError> {
-        let format = time::macros::format_description!("[year]-[month]-[day]");
+        let format = format_description!("[year]-[month]-[day]");
         Ok(time::Date::parse(value.text()?, &format)?)
     }
 }
@@ -1132,7 +1133,7 @@ impl Encode<'_, Turso> for time::Time {
         &self,
         buf: &mut <Turso as sqlx_core::database::Database>::ArgumentBuffer,
     ) -> Result<IsNull, BoxDynError> {
-        let format = time::macros::format_description!("[hour]:[minute]:[second].[subsecond]");
+        let format = format_description!("[hour]:[minute]:[second].[subsecond]");
         buf.push(TursoValue::text(self.format(&format)?));
         Ok(IsNull::No)
     }
@@ -1142,9 +1143,9 @@ impl Encode<'_, Turso> for time::Time {
 impl<'r> Decode<'r, Turso> for time::Time {
     fn decode(value: TursoValueRef<'r>) -> Result<Self, BoxDynError> {
         let sqlite_time_formats = [
-            time::macros::format_description!("[hour]:[minute]:[second].[subsecond]"),
-            time::macros::format_description!("[hour]:[minute]:[second]"),
-            time::macros::format_description!("[hour]:[minute]"),
+            format_description!("[hour]:[minute]:[second].[subsecond]"),
+            format_description!("[hour]:[minute]:[second]"),
+            format_description!("[hour]:[minute]"),
         ];
 
         for format in sqlite_time_formats {
@@ -1168,7 +1169,9 @@ fn decode_time_offset_datetime(
         TursoTemporalValue::Text(value) => time::OffsetDateTime::parse(value, &Rfc3339)
             .or_else(|_| decode_time_primitive_datetime_from_text(value).map(|dt| dt.assume_utc())),
         TursoTemporalValue::Integer(value) => Ok(time::OffsetDateTime::from_unix_timestamp(value)?),
-        TursoTemporalValue::Real { .. } => Err("REAL datetimes are not supported by sqlx time".into()),
+        TursoTemporalValue::Real { .. } => {
+            Err("REAL datetimes are not supported by sqlx time".into())
+        }
     }?;
 
     Ok(datetime)
@@ -1185,7 +1188,9 @@ fn decode_time_primitive_datetime(
             let parsed = time::OffsetDateTime::from_unix_timestamp(value)?;
             Ok(time::PrimitiveDateTime::new(parsed.date(), parsed.time()))
         }
-        TursoTemporalValue::Real { .. } => Err("REAL datetimes are not supported by sqlx time".into()),
+        TursoTemporalValue::Real { .. } => {
+            Err("REAL datetimes are not supported by sqlx time".into())
+        }
     }?;
 
     Ok(datetime)
@@ -1195,20 +1200,17 @@ fn decode_time_primitive_datetime(
 fn decode_time_primitive_datetime_from_text(
     value: &str,
 ) -> Result<time::PrimitiveDateTime, BoxDynError> {
-    let default_format = time::macros::format_description!(
-        "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond]"
-    );
+    let default_format =
+        format_description!("[year]-[month]-[day] [hour]:[minute]:[second].[subsecond]");
     if let Ok(datetime) = time::PrimitiveDateTime::parse(value, &default_format) {
         return Ok(datetime);
     }
 
-    let t_format = time::macros::format_description!(
-        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond]"
-    );
+    let t_format = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond]");
     Ok(time::PrimitiveDateTime::parse(value, &t_format)?)
 }
 
-sqlx_core::impl_encode_for_option!(Turso);
+impl_encode_for_option!(Turso);
 
 #[cfg(all(test, feature = "chrono"))]
 mod tests {

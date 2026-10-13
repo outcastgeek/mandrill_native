@@ -3,6 +3,7 @@
 use super::{RpcCallId, RpcEnvelope, RpcEnvelopeKind, RpcEnvelopePolicy, RpcHandler, RpcWireError};
 use crate::encoding::{FrameDecodeFailure, FrameDecoder, FrameParts};
 use crate::{Effect, SchemaIssue};
+use crate::{effect, effect_map_error, effect_try_sync};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -121,18 +122,18 @@ where
         let policy = self.policy;
         let pending = Mutex::new(Some(bytes));
         let server = self.clone();
-        Effect::try_sync(
-            move || {
+        {
+            let __dsl_program = effect_try_sync! {
+            body: move || {
                 let bytes = pending
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take()
                     .ok_or(RpcServerError::InputConsumed)?;
                 decode_request(&handler, &bytes, policy)
-            },
-            std::convert::identity,
-        )
-        .flat_map(move |decoded| server.execute(decoded))
+            }, on_error: std::convert::identity, };
+            effect! { let server = server.clone(); let decoded = __dsl_program.clone()?; server.execute(decoded)? }
+        }
     }
 
     /// Use an envelope already validated by an encoded protocol dispatcher.
@@ -157,18 +158,18 @@ where
         let handler = self.handler.clone();
         let server = self.clone();
         let pending = Mutex::new(Some(envelope));
-        Effect::try_sync(
-            move || {
+        {
+            let __dsl_program = effect_try_sync! {
+            body: move || {
                 let envelope = pending
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take()
                     .ok_or(RpcServerError::InputConsumed)?;
                 decode_envelope(&handler, envelope)
-            },
-            std::convert::identity,
-        )
-        .flat_map(move |decoded| server.execute(decoded))
+            }, on_error: std::convert::identity, };
+            effect! { let server = server.clone(); let decoded = __dsl_program.clone()?; server.execute(decoded)? }
+        }
     }
 
     ///
@@ -188,48 +189,51 @@ where
         let operation = handler.operation().clone();
         let policy = self.policy;
         let metadata = Mutex::new(Some(metadata));
-        handler
-            .call(request)
-            .either()
-            .map_error(RpcServerError::Handler)
-            .flat_map(move |outcome| {
-                let encoded = match &outcome {
-                    Ok(value) => operation.success_codec().encode_ref(value),
-                    Err(error) => operation.error_codec().encode_ref(error),
-                }
-                .map_err(RpcServerError::ResponseSchema);
-                let payload = match encoded {
-                    Ok(payload) => payload,
-                    Err(error) => return Effect::from_result_once(Err(error)),
-                };
-                if let Err(error) =
-                    crate::schema::internal::parser::check_limits(&payload, &operation.limits())
-                {
-                    return Effect::from_result_once(Err(RpcServerError::ResponseSchema(error)));
-                }
-                let metadata = metadata
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
-                let Some(metadata) = metadata else {
-                    return Effect::from_result_once(Err(RpcServerError::InputConsumed));
-                };
-                let kind = if outcome.is_ok() {
-                    RpcEnvelopeKind::Success
-                } else {
-                    RpcEnvelopeKind::DomainError
-                };
-                let envelope = RpcEnvelope {
-                    operation: operation.spec().id.clone(),
-                    version: operation.spec().version,
-                    call: call.clone(),
-                    kind,
-                    sequence: None,
-                    payload,
-                    metadata,
-                };
-                Effect::from_result_once(envelope.encode(policy).map_err(RpcServerError::Wire))
-            })
+        effect! {
+        bind;
+        program: effect_map_error! {
+            program: handler
+                   .call(request)
+                   .either(), map: RpcServerError::Handler, },
+        body: move |outcome| {
+                       let encoded = match &outcome {
+                           Ok(value) => operation.success_codec().encode_ref(value),
+                           Err(error) => operation.error_codec().encode_ref(error),
+                       }
+                       .map_err(RpcServerError::ResponseSchema);
+                       let payload = match encoded {
+                           Ok(payload) => payload,
+                           Err(error) => return effect_try_sync! { once; body: { let __dsl_result = Err(error); move || __dsl_result }, on_error: ::core::convert::identity, },
+                       };
+                       if let Err(error) =
+                           crate::schema::internal::parser::check_limits(&payload, &operation.limits())
+                       {
+                           return effect_try_sync! { once; body: { let __dsl_result = Err(RpcServerError::ResponseSchema(error)); move || __dsl_result }, on_error: ::core::convert::identity, };
+                       }
+                       let metadata = metadata
+                           .lock()
+                           .unwrap_or_else(std::sync::PoisonError::into_inner)
+                           .take();
+                       let Some(metadata) = metadata else {
+                           return effect_try_sync! { once; body: { let __dsl_result = Err(RpcServerError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, };
+                       };
+                       let kind = if outcome.is_ok() {
+                           RpcEnvelopeKind::Success
+                       } else {
+                           RpcEnvelopeKind::DomainError
+                       };
+                       let envelope = RpcEnvelope {
+                           operation: operation.spec().id.clone(),
+                           version: operation.spec().version,
+                           call: call.clone(),
+                           kind,
+                           sequence: None,
+                           payload,
+                           metadata,
+                       };
+                       effect_try_sync! { once; body: { let __dsl_result = envelope.encode(policy).map_err(RpcServerError::Wire); move || __dsl_result }, on_error: ::core::convert::identity, }
+                   },
+        }
     }
 }
 

@@ -1,7 +1,14 @@
 //! Lazy Effect SQL adapters over the shared native async kernel.
 
 use crate::{NativeSession, RowDecoder, SqlError, SqlKernel, SqlStatement};
-use effect::{CleanupFailure, Defect, Effect, Exit, Finalization, NativeContext, PrimaryOutcome};
+use crate::{
+    effect_future, effect_provide_some, effect_resource, effect_sync, effect_try_sync, row,
+};
+use effect::{
+    CleanupFailure, Defect, Effect, Exit, Finalization, NativeContext, PrimaryOutcome, effect,
+    service,
+};
+use effect::{sink, stream};
 use futures_util::FutureExt;
 use sqlx::{Decode, Row, Turso, TursoPool, Type};
 use std::{
@@ -92,7 +99,8 @@ impl SqlClient {
     {
         let kernel = self.kernel.clone();
         let statement = Arc::new(statement.into_factory());
-        Effect::from_exit_future_with_context(move |_, context| {
+        effect_future! {
+            exit_with_context; body: move |_, context| {
             let kernel = kernel.clone();
             let statement = statement.clone();
             async move {
@@ -104,7 +112,7 @@ impl SqlClient {
                 })
                 .await
             }
-        })
+        }, }
     }
     /// Buffer decoded rows, retaining native decode errors and ordered lease cleanup.
     pub fn query<M, A, R>(
@@ -118,7 +126,8 @@ impl SqlClient {
     {
         let kernel = self.kernel.clone();
         let statement = Arc::new(statement.into_factory());
-        Effect::from_exit_future_with_context(move |env: Arc<R>, context| {
+        effect_future! {
+            exit_with_context; body: move |env: Arc<R>, context| {
             let kernel = kernel.clone();
             let statement = statement.clone();
             let decoder = decoder.clone();
@@ -160,7 +169,7 @@ impl SqlClient {
                 .unwrap_or_else(|panic| Exit::Die(Defect::from_panic(panic)));
                 append_cleanup(work, session.close().await)
             }
-        })
+        }, }
     }
     /// Decode only the first optional row; a present invalid row is never translated to None.
     pub fn first<M, A, R>(
@@ -174,7 +183,8 @@ impl SqlClient {
     {
         let kernel = self.kernel.clone();
         let statement = Arc::new(statement.into_factory());
-        Effect::from_exit_future_with_context(move |env, context| {
+        effect_future! {
+            exit_with_context; body: move |env, context| {
             let kernel = kernel.clone();
             let statement = statement.clone();
             let decoder = decoder.clone();
@@ -214,7 +224,7 @@ impl SqlClient {
                 .unwrap_or_else(|panic| Exit::Die(Defect::from_panic(panic)));
                 append_cleanup(work, session.close().await)
             }
-        })
+        }, }
     }
     /// Read a required scalar from ordinal zero through SQLx native Type/Decode.
     pub fn scalar<M, T, R>(&self, statement: impl StatementSource<M>) -> Effect<T, SqlError, R>
@@ -223,19 +233,24 @@ impl SqlClient {
         for<'a> T: Decode<'a, Turso>,
         R: Send + Sync + 'static,
     {
-        self.first(
-            statement,
-            RowDecoder::pure(|row| {
-                row.try_get(0).map_err(|source| crate::RowError::Native {
-                    column: "[0]".into(),
-                    source,
-                })
-            }),
-        )
-        .flat_map(|value| match value {
-            Some(value) => once_value(value),
-            None => Effect::fail_with(|| SqlError::RowAbsent),
-        })
+        effect! {
+         bind;
+         program: self.first(
+                    statement,
+                    row! {
+        project: |row| {
+                        row.try_get(0).map_err(|source| crate::RowError::Native {
+                            column: "[0]".into(),
+                            source,
+                        })
+                    },
+        },
+                ),
+         body: |value| match value {
+                    Some(value) => once_value(value),
+                    None => effect_try_sync! { body: { let __dsl_error = || SqlError::RowAbsent; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, },
+                },
+         }
     }
     /// Execute an ordered batch of bound statements on one lease; it is not implicitly transactional.
     /// Each statement retains its own row/result sequence, including provider-supported multi-results.
@@ -248,7 +263,8 @@ impl SqlClient {
     {
         let kernel = self.kernel.clone();
         let statements = Arc::new(statements);
-        Effect::from_exit_future_with_context(move |env, context| {
+        effect_future! {
+            exit_with_context; body: move |env, context| {
             let kernel = kernel.clone();
             let statements = statements.clone();
             async move {
@@ -266,7 +282,7 @@ impl SqlClient {
                     .unwrap_or_else(|panic| Exit::Die(Defect::from_panic(panic)));
                 append_cleanup(outcome, session.close().await)
             }
-        })
+        }, }
     }
     /// Incrementally fold rows under a live private cursor; accumulator and row payloads move.
     pub fn fold_rows<M, A, S, R>(
@@ -301,7 +317,8 @@ impl SqlClient {
     {
         let kernel = self.kernel.clone();
         let statement = Arc::new(statement.into_factory());
-        let acquire = Effect::from_exit_future_with_context(move |_, context| {
+        let acquire = effect_future! {
+            exit_with_context; body: move |_, context| {
             let kernel = kernel.clone();
             let statement = statement.clone();
             async move {
@@ -330,7 +347,7 @@ impl SqlClient {
                     }
                 }
             }
-        });
+        }, };
         fold_from_cursor(acquire, decoder, initial, step)
     }
 
@@ -346,7 +363,8 @@ impl SqlClient {
     {
         let kernel = self.kernel.clone();
         let body = Arc::new(body);
-        Effect::from_exit_future_with_context(move |env, context| {
+        effect_future! {
+            exit_with_context; body: move |env, context| {
             let kernel = kernel.clone();
             let body = body.clone();
             async move {
@@ -384,7 +402,7 @@ impl SqlClient {
                 };
                 append_cleanup(outcome, session.close().await)
             }
-        })
+        }, }
     }
     /// Transfer one transaction callback and its non-Clone captures into this execution.
     /// Reuse reports consumption before acquiring a connection; reusable transaction
@@ -395,7 +413,8 @@ impl SqlClient {
     ) -> Effect<A, SqlError, R> {
         let client = self.clone();
         let body = Arc::new(Mutex::new(Some(body)));
-        Effect::from_exit_future_with_context(move |env, context| {
+        effect_future! {
+            exit_with_context; body: move |env, context| {
             let client = client.clone();
             let body = body.clone();
             async move {
@@ -419,14 +438,14 @@ impl SqlClient {
                                 .take()
                             {
                                 Some(body) => body(tx),
-                                None => Effect::fail_with(|| SqlError::Consumed),
+                                None => effect_try_sync! { body: { let __dsl_error = || SqlError::Consumed; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, },
                             }
                         }),
                         env,
                     )
                     .await
             }
-        })
+        }, }
     }
     /// Scope a transferred SQLx/native connection. Borrowed native transactions use SqlKernel::with_borrowed.
     /// Repeated runs require a fresh owner factory; transferred owners are finalized exactly once.
@@ -441,7 +460,8 @@ impl SqlClient {
     {
         let acquire = Arc::new(acquire);
         let body = Arc::new(body);
-        Effect::from_exit_future_with_context(move |env, context| {
+        effect_future! {
+            exit_with_context; body: move |env, context| {
             let acquire = acquire.clone();
             let body = body.clone();
             async move {
@@ -462,7 +482,7 @@ impl SqlClient {
                 };
                 append_cleanup(outcome, session.close().await)
             }
-        })
+        }, }
     }
 }
 
@@ -538,7 +558,8 @@ impl SqlTransaction {
     ) -> Effect<A, SqlError, R> {
         let session = self.session.clone();
         let body = Arc::new(body);
-        Effect::from_exit_future_with_context(move |env, context| {
+        effect_future! {
+            exit_with_context; body: move |env, context| {
             let session = session.clone();
             let body = body.clone();
             async move {
@@ -570,7 +591,7 @@ impl SqlTransaction {
                     }
                 }
             }
-        })
+        }, }
     }
     /// Transfer one savepoint callback and its captures without a hidden Clone requirement.
     /// Its one-use ownership delegates the same checked frame and settlement path.
@@ -580,7 +601,8 @@ impl SqlTransaction {
     ) -> Effect<A, SqlError, R> {
         let transaction = self.clone();
         let body = Arc::new(Mutex::new(Some(body)));
-        Effect::from_exit_future_with_context(move |env, context| {
+        effect_future! {
+            exit_with_context; body: move |env, context| {
             let transaction = transaction.clone();
             let body = body.clone();
             async move {
@@ -604,14 +626,14 @@ impl SqlTransaction {
                                 .take()
                             {
                                 Some(body) => body(tx),
-                                None => Effect::fail_with(|| SqlError::Consumed),
+                                None => effect_try_sync! { body: { let __dsl_error = || SqlError::Consumed; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, },
                             }
                         }),
                         env,
                     )
                     .await
             }
-        })
+        }, }
     }
     /// Borrow the native frame only within a checked async callback; no unrestricted handle escapes.
     pub fn native<A: Send + 'static, R: Send + Sync + 'static>(
@@ -623,7 +645,8 @@ impl SqlTransaction {
     ) -> Effect<A, SqlError, R> {
         let session = self.session.clone();
         let body = Arc::new(body);
-        Effect::from_exit_future_with_context(move |_, context| {
+        effect_future! {
+            exit_with_context; body: move |_, context| {
             let session = session.clone();
             let body = body.clone();
             async move {
@@ -635,7 +658,7 @@ impl SqlTransaction {
                     Err(error) => error.into_exit(),
                 }
             }
-        })
+        }, }
     }
 }
 
@@ -647,10 +670,11 @@ impl Sql {
         statement: impl StatementSource<M>,
     ) -> Effect<u64, SqlError, R> {
         let statement = Arc::new(statement.into_factory());
-        Effect::service(|env: &R| env.sql_client().clone()).flat_map(move |client| {
+        effect! {
             let statement = statement.clone();
-            client.execute(move || statement())
-        })
+            let client = service! { env |env: &R| { env.sql_client().clone() }, }?;
+            client.execute(move || statement())?
+        }
     }
     /// Decode a fresh or transferred statement using the selected client and original R.
     pub fn query<M, A: Send + 'static, R: HasSqlClient + Send + Sync + 'static>(
@@ -658,10 +682,12 @@ impl Sql {
         decoder: RowDecoder<A, R>,
     ) -> Effect<Vec<A>, SqlError, R> {
         let statement = Arc::new(statement.into_factory());
-        Effect::service(|env: &R| env.sql_client().clone()).flat_map(move |client| {
+        effect! {
             let statement = statement.clone();
-            client.query(move || statement(), decoder.clone())
-        })
+            let decoder = decoder.clone();
+            let client = service! { env |env: &R| { env.sql_client().clone() }, }?;
+            client.query(move || statement(), decoder)?
+        }
     }
     /// Decode one optional row from a factory or owned input; only true absence becomes None.
     pub fn first<M, A: Send + 'static, R: HasSqlClient + Send + Sync + 'static>(
@@ -669,10 +695,12 @@ impl Sql {
         decoder: RowDecoder<A, R>,
     ) -> Effect<Option<A>, SqlError, R> {
         let statement = Arc::new(statement.into_factory());
-        Effect::service(|env: &R| env.sql_client().clone()).flat_map(move |client| {
+        effect! {
             let statement = statement.clone();
-            client.first(move || statement(), decoder.clone())
-        })
+            let decoder = decoder.clone();
+            let client = service! { env |env: &R| { env.sql_client().clone() }, }?;
+            client.first(move || statement(), decoder)?
+        }
     }
 }
 /// Project an extracted SQL Effect into R lazily, preserving every typed failure channel.
@@ -685,7 +713,7 @@ pub fn sql_with<
     select: impl Fn(&R) -> S + Send + Sync + 'static,
     program: Effect<A, E, SqlClient>,
 ) -> Effect<A, E, R> {
-    program.provide_some(move |env| select(env).borrow().clone())
+    effect_provide_some! { program: program, project: move |env| select(env).borrow().clone(), }
 }
 
 /// Join one native operation with session cleanup; panics become defects before the lease closes.
@@ -787,13 +815,13 @@ fn one_statement(
 }
 /// Lift one moved value into core's existing single-use workflow rather than cloning it.
 fn once_value<A: Send + 'static, R: Send + Sync + 'static>(value: A) -> Effect<A, SqlError, R> {
-    Effect::sync_once(move || value)
+    effect_sync! { once; body: move || value, }
 }
 /// Lift an explicit Result without interpreting arbitrary Result ? as an Effect bind.
 fn once_result<A: Send + 'static, R: Send + Sync + 'static>(
     result: Result<A, SqlError>,
 ) -> Effect<A, SqlError, R> {
-    Effect::from_result_once(result)
+    effect_try_sync! { once; body: { let __dsl_result = result; move || __dsl_result }, on_error: ::core::convert::identity, }
 }
 /// Execute one fresh statement on a scoped frame with cooperative cancellation at boundaries.
 fn session_execute<M, R: Send + Sync + 'static>(
@@ -801,7 +829,8 @@ fn session_execute<M, R: Send + Sync + 'static>(
     statement: impl StatementSource<M>,
 ) -> Effect<u64, SqlError, R> {
     let statement = Arc::new(statement.into_factory());
-    Effect::from_exit_future_with_context(move |_, context| {
+    effect_future! {
+        exit_with_context; body: move |_, context| {
         let session = session.clone();
         let statement = statement.clone();
         async move {
@@ -819,7 +848,7 @@ fn session_execute<M, R: Send + Sync + 'static>(
                 Err(error) => error.into_exit(),
             }
         }
-    })
+    }, }
 }
 /// Decode rows on a transaction/session frame without opening another lease.
 fn session_query<M, A: Send + 'static, R: Send + Sync + 'static>(
@@ -828,7 +857,8 @@ fn session_query<M, A: Send + 'static, R: Send + Sync + 'static>(
     decoder: RowDecoder<A, R>,
 ) -> Effect<Vec<A>, SqlError, R> {
     let statement = Arc::new(statement.into_factory());
-    Effect::from_exit_future_with_context(move |env: Arc<R>, context| {
+    effect_future! {
+        exit_with_context; body: move |env: Arc<R>, context| {
         let session = session.clone();
         let statement = statement.clone();
         let decoder = decoder.clone();
@@ -861,7 +891,7 @@ fn session_query<M, A: Send + 'static, R: Send + Sync + 'static>(
             }
             Exit::Success(values)
         }
-    })
+    }, }
 }
 /// A private convenience retaining the original statement error before query I/O.
 trait StatementQuery {
@@ -893,11 +923,12 @@ where
     S: Send + 'static,
     R: Send + Sync + 'static,
 {
-    let source = effect::Stream::from_pull(
-        acquire,
-        move |resource| {
+    let source = stream! {
+        pull: acquire,
+        read: move |resource| {
             let decoder = decoder.clone();
-            Effect::from_exit_future_with_context(move |env, context| {
+            effect_future! {
+                exit_with_context; body: move |env, context| {
                 let owner = resource.with(|owner| owner.cursor.clone());
                 let decoder = decoder.clone();
                 async move {
@@ -927,10 +958,12 @@ where
                         Err(error) => error.into_exit(),
                     }
                 }
-            })
+            }, }
         },
-        |owner| {
-            effect::Release::from_exit_future(move |_| async move {
+        release: |owner| {
+            effect_resource! {
+                release_exit_future;
+                body: move |_| async move {
                 let cursor = owner.cursor.lock().await.take();
                 let cursor_result = match cursor {
                     Some(cursor) => cursor.close().await,
@@ -948,10 +981,16 @@ where
                     },
                     close,
                 )
-            })
+                },
+            }
         },
-    );
-    effect::Sink::fold(initial, step).run(source)
+    };
+    sink! {
+        fold_effect;
+        initial: initial,
+        step: step,
+    }
+    .run(source)
 }
 
 /// Lower shared scoped operations to the same native session helpers for ordinary and transaction handles.
@@ -963,7 +1002,13 @@ macro_rules! scoped_operations {
             /// Decode a required native scalar from ordinal zero; absent rows remain RowAbsent.
             pub fn scalar<M, T, R>(&self, statement: impl StatementSource<M>) -> Effect<T, SqlError, R>
             where T: Send + 'static + Type<Turso>, for<'a> T: Decode<'a, Turso>, R: Send + Sync + 'static {
-                self.first(statement, RowDecoder::pure(|row| row.try_get(0).map_err(|source| crate::RowError::Native { column: "[0]".into(), source }))).flat_map(|value| match value { Some(value) => once_value(value), None => Effect::fail_with(|| SqlError::RowAbsent) })
+                effect! {
+ bind;
+ program: self.first(statement, row! {
+project: |row| row.try_get(0).map_err(|source| crate::RowError::Native { column: "[0]".into(), source }),
+}),
+ body: |value| match value { Some(value) => once_value(value), None => effect_try_sync! { body: { let __dsl_error = || SqlError::RowAbsent; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, } },
+ }
             }
             /// Incrementally fold native rows without buffering; the enclosing scope retains the lease.
             pub fn fold_rows<M, A, S, R>(&self, statement: impl StatementSource<M>, decoder: RowDecoder<A, R>, initial: impl Fn() -> S + Send + Sync + 'static, step: impl Fn(S, A) -> Result<S, SqlError> + Send + Sync + 'static) -> Effect<S, SqlError, R>
@@ -1017,7 +1062,8 @@ impl SqlClient {
     ) -> Effect<A, SqlError, R> {
         let kernel = self.kernel.clone();
         let body = Arc::new(body);
-        Effect::from_exit_future_with_context(move |env, context| {
+        effect_future! {
+            exit_with_context; body: move |env, context| {
             let kernel = kernel.clone();
             let body = body.clone();
             async move {
@@ -1038,7 +1084,7 @@ impl SqlClient {
                 };
                 append_cleanup(outcome, session.close().await)
             }
-        })
+        }, }
     }
     /// Transfer a freshly acquired async native SQLx owner into a scoped Effect session.
     /// The factory may adopt a native database/connection through SQLx's real ownership APIs.
@@ -1054,7 +1100,8 @@ impl SqlClient {
     {
         let acquire = Arc::new(acquire);
         let body = Arc::new(body);
-        Effect::from_exit_future_with_context(move |env, context| {
+        effect_future! {
+            exit_with_context; body: move |env, context| {
             let acquire = acquire.clone();
             let body = body.clone();
             async move {
@@ -1075,7 +1122,7 @@ impl SqlClient {
                 };
                 append_cleanup(outcome, session.close().await)
             }
-        })
+        }, }
     }
 }
 impl Sql {
@@ -1087,10 +1134,14 @@ impl Sql {
         R: HasSqlClient + Send + Sync + 'static,
     {
         let statement = Arc::new(statement.into_factory());
-        Effect::service(|env: &R| env.sql_client().clone()).flat_map(move |client| {
-            let statement = statement.clone();
-            client.scalar(move || statement())
-        })
+        effect! {
+        bind;
+        program: service! { env: |env: &R| env.sql_client().clone(), },
+        body: move |client| {
+                   let statement = statement.clone();
+                   client.scalar(move || statement())
+               },
+        }
     }
 }
 
@@ -1101,7 +1152,8 @@ fn session_first<M, A: Send + 'static, R: Send + Sync + 'static>(
     decoder: RowDecoder<A, R>,
 ) -> Effect<Option<A>, SqlError, R> {
     let statement = Arc::new(statement.into_factory());
-    Effect::from_exit_future_with_context(move |env, context| {
+    effect_future! {
+        exit_with_context; body: move |env, context| {
         let session = session.clone();
         let statement = statement.clone();
         let decoder = decoder.clone();
@@ -1128,7 +1180,7 @@ fn session_first<M, A: Send + 'static, R: Send + Sync + 'static>(
                 Err(error) => error.into_exit(),
             }
         }
-    })
+    }, }
 }
 /// Acquire only a cursor for a retained frame; core Stream cleanup releases it before parent settlement.
 fn session_fold<M, A, S, R>(
@@ -1144,7 +1196,8 @@ where
     R: Send + Sync + 'static,
 {
     let statement = Arc::new(statement.into_factory());
-    let acquire = Effect::from_exit_future_with_context(move |_, context| {
+    let acquire = effect_future! {
+        exit_with_context; body: move |_, context| {
         let session = session.clone();
         let statement = statement.clone();
         async move {
@@ -1164,7 +1217,7 @@ where
                 Err(error) => error.into_exit(),
             }
         }
-    });
+    }, };
     fold_from_cursor(acquire, decoder, initial, step)
 }
 /// Execute ordered batch items without another lease and with cancellation between native result steps.
@@ -1173,7 +1226,8 @@ fn session_batch<R: Send + Sync + 'static>(
     statements: impl Fn() -> Result<Vec<SqlStatement>, SqlError> + Send + Sync + 'static,
 ) -> Effect<Vec<BatchResult>, SqlError, R> {
     let statements = Arc::new(statements);
-    Effect::from_exit_future_with_context(move |_, context| {
+    effect_future! {
+        exit_with_context; body: move |_, context| {
         let session = session.clone();
         let statements = statements.clone();
         async move {
@@ -1214,5 +1268,5 @@ fn session_batch<R: Send + Sync + 'static>(
             }
             Exit::Success(results)
         }
-    })
+    }, }
 }

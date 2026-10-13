@@ -3,13 +3,14 @@ use effect::eventlog::{
     EventJournalId, EventTag, EventVersion, JournalCursor, MemoryEventJournal,
     MemoryJournalCapacity,
 };
+use effect::schema_enum;
 use effect::transactional::{
     HasTransactionDomain, Transaction, TransactionDomain, TransactionDomainError, TransactionError,
     TransactionPolicy, TxSubscriptionRef, TxValue,
 };
 use effect::{
     DuplicateFields, JsonValue, ParseLimits, ParsePolicy, SchemaErrorMode, StringPattern,
-    TaggedEnumBuilder, UnknownFields, json_i64, json_string_pattern,
+    UnknownFields, json_i64, json_string_pattern,
 };
 use effect::{Effect, Exit, schema, transaction};
 use effect::{KeyDomain, KeyNamespace, KeySegment, StableKey, UtcMillis};
@@ -38,18 +39,24 @@ fn run<A: Send + 'static, E: Send + 'static>(
 }
 
 #[test]
-fn transaction_for_each_commits_all_steps_and_rolls_back_on_failure() {
-    let domain = Arc::new(TransactionDomain::new(NonZeroUsize::new(1).unwrap()));
+fn transaction_for_each_commits_all_steps_and_rolls_back_on_failure() -> Result<(), String> {
+    let domain = Arc::new(TransactionDomain::new(NonZeroUsize::MIN));
     let environment = Arc::new(Environment(Arc::clone(&domain)));
-    let reference = domain.reference(0usize).unwrap();
+    let reference = domain
+        .reference(0usize)
+        .map_err(|error| format!("initial cell: {error:?}"))?;
     let policy = TransactionPolicy {
-        max_conflicts: NonZeroUsize::new(1).unwrap(),
+        max_conflicts: NonZeroUsize::MIN,
     };
 
     let item_ref = reference.clone();
     let successful = Transaction::<(), &'static str>::for_each(
         || 0..3,
-        move |item| item_ref.update(move |value| Ok((value + item + 1, ()))),
+        move |item| {
+            transaction! {
+            modify; reference: item_ref, modify: move |value| Ok((value + item + 1, ())),
+            }
+        },
     );
     assert!(matches!(
         run(&successful.atomically(policy), Arc::clone(&environment)),
@@ -63,13 +70,15 @@ fn transaction_for_each_commits_all_steps_and_rolls_back_on_failure() {
     let failing = Transaction::<(), &'static str>::for_each(
         || 0..3,
         move |item| {
-            item_ref.update(move |value| {
-                if item == 1 {
-                    Err("stop")
-                } else {
-                    Ok((value + 1, ()))
-                }
-            })
+            transaction! {
+            modify; reference: item_ref, modify: move |value| {
+                            if item == 1 {
+                                Err("stop")
+                            } else {
+                                Ok((value + 1, ()))
+                            }
+                        },
+            }
         },
     );
     assert!(matches!(
@@ -79,14 +88,17 @@ fn transaction_for_each_commits_all_steps_and_rolls_back_on_failure() {
     assert!(
         matches!(run(&reference.read::<&'static str>().atomically(policy), environment), Exit::Success(value) if *value == 6)
     );
+    Ok(())
 }
 
 #[test]
-fn transaction_cell_lives_with_its_last_reference_owner() {
+fn transaction_cell_lives_with_its_last_reference_owner() -> Result<(), String> {
     let capacity = NonZeroUsize::MIN;
     let domain = Arc::new(TransactionDomain::new(capacity));
     let environment = Arc::new(Environment(Arc::clone(&domain)));
-    let reference = domain.reference(7usize).expect("first cell");
+    let reference = domain
+        .reference(7usize)
+        .map_err(|error| format!("first cell: {error:?}"))?;
     let original_id = reference.id();
     let read = reference.read::<()>();
     drop(reference);
@@ -104,24 +116,37 @@ fn transaction_cell_lives_with_its_last_reference_owner() {
     ));
 
     drop(read);
-    let replacement = domain.reference(8usize).expect("released capacity");
+    let replacement = domain
+        .reference(8usize)
+        .map_err(|error| format!("released capacity: {error:?}"))?;
     assert_ne!(replacement.id(), original_id);
 
     drop(replacement);
     let dynamic_domain = Arc::clone(&domain);
-    let temporary: Transaction<Arc<usize>, ()> =
-        Transaction::succeed_with(|| ()).flat_map(move |_| {
-            dynamic_domain
-                .reference(11usize)
-                .expect("temporary cell")
-                .read()
-        });
+    let temporary: Transaction<Arc<usize>, ()> = {
+        let __dsl_transaction = Transaction::succeed_with(|| ());
+        transaction! {
+        __dsl_transaction.clone()?; {
+                    let temporary = dynamic_domain.reference(11usize);
+                    assert!(
+                        temporary.is_ok(),
+                        "temporary cell: {:?}",
+                        temporary.as_ref().err()
+                    );
+                    match temporary {
+                        Ok(reference) => reference.read(),
+                        Err(_) => Transaction::fail_with(|| ()),
+                    }
+                }?
+        }
+    };
     let environment = Arc::new(Environment(Arc::clone(&domain)));
     assert!(matches!(
         run(&temporary.atomically(policy), environment),
         Exit::Success(value) if *value == 11
     ));
     assert!(domain.reference(12usize).is_ok());
+    Ok(())
 }
 
 struct ReentrantDrop {
@@ -139,18 +164,16 @@ impl Drop for ReentrantDrop {
 }
 
 #[test]
-fn transaction_commit_drops_replaced_values_outside_domain_gate() {
+fn transaction_commit_drops_replaced_values_outside_domain_gate() -> Result<(), String> {
     const COMMIT_DEADLINE: Duration = Duration::from_secs(5);
-    let domain = Arc::new(TransactionDomain::new(
-        NonZeroUsize::new(2).expect("two fixture cells"),
-    ));
+    let domain = Arc::new(TransactionDomain::new(NonZeroUsize::MIN.saturating_add(1)));
     let entered = Arc::new(AtomicBool::new(false));
     let reference = domain
         .reference(ReentrantDrop {
             domain: Arc::clone(&domain),
             entered: Arc::clone(&entered),
         })
-        .expect("initial cell");
+        .map_err(|error| format!("initial cell: {error:?}"))?;
     let replacement = Arc::new(ReentrantDrop {
         domain: Arc::clone(&domain),
         entered: Arc::new(AtomicBool::new(false)),
@@ -171,19 +194,25 @@ fn transaction_commit_drops_replaced_values_outside_domain_gate() {
     assert!(
         receive
             .recv_timeout(COMMIT_DEADLINE)
-            .expect("commit must settle without deadlocking a reentrant destructor")
+            .map_err(|error| format!(
+                "commit must settle without deadlocking a reentrant destructor: {error}"
+            ))?
     );
-    worker.join().expect("commit thread");
+    worker
+        .join()
+        .map_err(|error| format!("commit thread: {error:?}"))?;
     assert!(entered.load(Ordering::SeqCst));
+    Ok(())
 }
 
 #[test]
-fn schema_pattern_rejects_bad_encoded_and_decoded_values() {
-    let codec = json_string_pattern(StringPattern::Prefix(Arc::from("evt-")), "event-id").unwrap();
+fn schema_pattern_rejects_bad_encoded_and_decoded_values() -> Result<(), String> {
+    let codec = json_string_pattern(StringPattern::Prefix(Arc::from("evt-")), "event-id")
+        .map_err(|error| format!("event pattern: {error:?}"))?;
     assert_eq!(
         codec
             .decode_ref(&JsonValue::String(String::from("evt-1")))
-            .unwrap(),
+            .map_err(|error| format!("valid event ID: {error:?}"))?,
         "evt-1"
     );
     assert!(
@@ -192,7 +221,7 @@ fn schema_pattern_rejects_bad_encoded_and_decoded_values() {
             .is_err()
     );
     assert!(codec.encode_ref(&String::from("bad")).is_err());
-    let budget = NonZeroUsize::new(128).unwrap();
+    let budget = NonZeroUsize::MIN.saturating_add(127);
     let policy = ParsePolicy {
         limits: ParseLimits {
             bytes: budget,
@@ -205,37 +234,48 @@ fn schema_pattern_rejects_bad_encoded_and_decoded_values() {
         unknown_fields: UnknownFields::Reject,
         duplicate_fields: DuplicateFields::Reject,
     };
-    assert_eq!(codec.parse_str("\"evt-2\"", policy).unwrap(), "evt-2");
+    assert_eq!(
+        codec
+            .parse_str("\"evt-2\"", policy)
+            .map_err(|error| format!("parsed event ID: {error:?}"))?,
+        "evt-2"
+    );
+    Ok(())
 }
 
 #[test]
-fn transaction_macro_for_loop_shares_one_journal() {
-    let domain = Arc::new(TransactionDomain::new(NonZeroUsize::new(1).unwrap()));
+fn transaction_macro_for_loop_shares_one_journal() -> Result<(), String> {
+    let domain = Arc::new(TransactionDomain::new(NonZeroUsize::MIN));
     let environment = Arc::new(Environment(Arc::clone(&domain)));
-    let reference = domain.reference(0usize).unwrap();
+    let reference = domain
+        .reference(0usize)
+        .map_err(|error| format!("initial cell: {error:?}"))?;
     let policy = TransactionPolicy {
-        max_conflicts: NonZeroUsize::new(1).unwrap(),
+        max_conflicts: NonZeroUsize::MIN,
     };
     let operation: Transaction<usize, &'static str> = transaction! {
-        let target = reference.clone();
-        for _ in 0..3 {
-            target.update(|value| Ok((value + 1, ())))?;
-        }
-        let total = reference.read()?;
-        *total
-    };
+            let target = reference.clone();
+            for _ in 0..3 {
+                transaction! {
+    modify; reference: target, modify: |value| Ok((value + 1, ())),
+    }?;
+            }
+            let total = reference.read()?;
+            *total
+        };
     assert!(matches!(
         run(&operation.atomically(policy), environment),
         Exit::Success(3)
     ));
+    Ok(())
 }
 
 #[test]
-fn tagged_enum_codec_round_trips_and_rejects_unknown_tag() {
+fn tagged_enum_codec_round_trips_and_rejects_unknown_tag() -> Result<(), String> {
     enum Message {
         Number(i64),
     }
-    let budget = NonZeroUsize::new(128).unwrap();
+    let budget = NonZeroUsize::MIN.saturating_add(127);
     let policy = ParsePolicy {
         limits: ParseLimits {
             bytes: budget,
@@ -248,34 +288,30 @@ fn tagged_enum_codec_round_trips_and_rejects_unknown_tag() {
         unknown_fields: UnknownFields::Reject,
         duplicate_fields: DuplicateFields::Reject,
     };
-    let codec = TaggedEnumBuilder::<Message>::new("kind", "payload")
-        .variant(
-            "number",
-            json_i64(),
-            |message| match message {
-                Message::Number(value) => Some(value),
-            },
-            Message::Number,
-        )
-        .unwrap()
-        .finish(policy)
-        .unwrap();
-    let encoded = codec.encode_ref(&Message::Number(7)).unwrap();
+    let codec = schema_enum! { enum Message { Number(json_i64()) => "number", } tag_field: "kind", content_field: "payload", policy: policy, }
+        .map_err(|error| format!("tagged enum: {error:?}"))?;
+    let encoded = codec
+        .encode_ref(&Message::Number(7))
+        .map_err(|error| format!("encoded number: {error:?}"))?;
     assert!(matches!(codec.decode_ref(&encoded), Ok(Message::Number(7))));
     let mut wrong = encoded;
-    wrong.as_object_mut().unwrap().insert(
-        String::from("kind"),
-        JsonValue::String(String::from("unknown")),
-    );
+    wrong
+        .as_object_mut()
+        .ok_or("encoded tagged value must be an object")?
+        .insert(
+            String::from("kind"),
+            JsonValue::String(String::from("unknown")),
+        );
     assert!(codec.decode_ref(&wrong).is_err());
+    Ok(())
 }
 
 #[test]
-fn schema_macro_builds_typed_record_codec() {
+fn schema_macro_builds_typed_record_codec() -> Result<(), String> {
     struct Record {
         count: i64,
     }
-    let budget = NonZeroUsize::new(128).unwrap();
+    let budget = NonZeroUsize::MIN.saturating_add(127);
     let policy = ParsePolicy {
         limits: ParseLimits {
             bytes: budget,
@@ -288,17 +324,27 @@ fn schema_macro_builds_typed_record_codec() {
         unknown_fields: UnknownFields::Reject,
         duplicate_fields: DuplicateFields::Reject,
     };
-    let codec = schema! { struct Record { count: json_i64() } policy: policy }.unwrap();
-    let encoded = codec.encode_ref(&Record { count: 11 }).unwrap();
-    assert_eq!(codec.decode_ref(&encoded).unwrap().count, 11);
+    let codec = schema! { struct Record { count: json_i64() } policy: policy }
+        .map_err(|error| format!("record schema: {error:?}"))?;
+    let encoded = codec
+        .encode_ref(&Record { count: 11 })
+        .map_err(|error| format!("encoded record: {error:?}"))?;
+    assert_eq!(
+        codec
+            .decode_ref(&encoded)
+            .map_err(|error| format!("decoded record: {error:?}"))?
+            .count,
+        11
+    );
+    Ok(())
 }
 
 #[test]
-fn schema_macro_builds_tagged_enum_codec() {
+fn schema_macro_builds_tagged_enum_codec() -> Result<(), String> {
     enum Message {
         Number(i64),
     }
-    let budget = NonZeroUsize::new(128).unwrap();
+    let budget = NonZeroUsize::MIN.saturating_add(127);
     let policy = ParsePolicy {
         limits: ParseLimits {
             bytes: budget,
@@ -317,28 +363,36 @@ fn schema_macro_builds_tagged_enum_codec() {
         content_field: "payload",
         policy: policy
     }
-    .unwrap();
-    let encoded = codec.encode_ref(&Message::Number(9)).unwrap();
+    .map_err(|error| format!("enum schema: {error:?}"))?;
+    let encoded = codec
+        .encode_ref(&Message::Number(9))
+        .map_err(|error| format!("encoded enum: {error:?}"))?;
     assert!(matches!(codec.decode_ref(&encoded), Ok(Message::Number(9))));
+    Ok(())
 }
 
 #[test]
-fn transaction_commit_reaches_reactive_subscription_without_exposing_rollback() {
-    let domain = Arc::new(TransactionDomain::new(NonZeroUsize::new(1).unwrap()));
+fn transaction_commit_reaches_reactive_subscription_without_exposing_rollback() -> Result<(), String>
+{
+    let domain = Arc::new(TransactionDomain::new(NonZeroUsize::MIN));
     let environment = Arc::new(Environment(Arc::clone(&domain)));
-    let source = TxSubscriptionRef::new(&domain, 1usize).unwrap();
+    let source = TxSubscriptionRef::new(&domain, 1usize)
+        .map_err(|error| format!("transactional subscription: {error:?}"))?;
     let policy = TransactionPolicy {
-        max_conflicts: NonZeroUsize::new(1).unwrap(),
+        max_conflicts: NonZeroUsize::MIN,
     };
-    let (initial, subscription) = match run(&source.subscribe(), Arc::clone(&environment)) {
-        Exit::Success(pair) => pair,
-        _ => panic!("subscription failed"),
+    let Exit::Success((initial, subscription)) = run(&source.subscribe(), Arc::clone(&environment))
+    else {
+        return Err(String::from("transactional subscription must succeed"));
     };
     assert_eq!(*initial, 1);
 
-    let rollback = source
-        .set::<&'static str>(Arc::new(2))
-        .flat_map(|_| Transaction::<(), &'static str>::fail_with(|| "abort"));
+    let rollback = {
+        let __dsl_transaction = source.set::<&'static str>(Arc::new(2));
+        transaction! {
+        __dsl_transaction.clone()?; Transaction::<(), &'static str>::fail_with(|| "abort")?
+        }
+    };
     assert!(matches!(
         run(&rollback.atomically(policy), Arc::clone(&environment)),
         Exit::Fail(TransactionError::Domain("abort"))
@@ -356,30 +410,33 @@ fn transaction_commit_reaches_reactive_subscription_without_exposing_rollback() 
     ));
     assert!(matches!(run(&subscription.next(), environment), Exit::Success(value) if *value == 3));
     assert!(subscription.dispose());
+    Ok(())
 }
 
 #[test]
-fn memory_journal_fences_stale_writes_and_deduplicates_stable_event_ids() {
+fn memory_journal_fences_stale_writes_and_deduplicates_stable_event_ids() -> Result<(), String> {
     struct Domain;
     impl KeyDomain for Domain {
         const TAG: &'static str = "journal-test";
     }
-    let namespace = KeyNamespace::<Domain>::new("events").unwrap();
+    let namespace = KeyNamespace::<Domain>::new("events")
+        .map_err(|error| format!("event namespace: {error:?}"))?;
     let key = |value: &'static str| {
-        StableKey::new(&namespace, [KeySegment::Text(Arc::from(value))]).unwrap()
+        StableKey::new(&namespace, [KeySegment::Text(Arc::from(value))])
+            .map_err(|error| format!("{value} identity: {error:?}"))
     };
     let journal = MemoryEventJournal::new(MemoryJournalCapacity {
-        streams: NonZeroUsize::new(1).unwrap(),
-        entries_per_stream: NonZeroUsize::new(2).unwrap(),
-        tombstones_per_stream: NonZeroUsize::new(1).unwrap(),
+        streams: NonZeroUsize::MIN,
+        entries_per_stream: NonZeroUsize::MIN.saturating_add(1),
+        tombstones_per_stream: NonZeroUsize::MIN,
     });
     let event = EventEnvelope {
-        journal: EventJournalId::from_stable(key("journal")),
-        aggregate: AggregateId::from_stable(key("aggregate")),
-        id: EventId::from_stable(key("event")),
-        group: EventGroupId::new("group").unwrap(),
-        tag: EventTag::new("created").unwrap(),
-        version: EventVersion::new(NonZeroU32::new(1).unwrap()),
+        journal: EventJournalId::from_stable(key("journal")?),
+        aggregate: AggregateId::from_stable(key("aggregate")?),
+        id: EventId::from_stable(key("event")?),
+        group: EventGroupId::new("group").map_err(|error| format!("event group: {error:?}"))?,
+        tag: EventTag::new("created").map_err(|error| format!("event tag: {error:?}"))?,
+        version: EventVersion::new(NonZeroU32::MIN),
         payload: Arc::from(&b"payload"[..]),
         outcome: None,
         occurred_at: UtcMillis::new(0),
@@ -394,16 +451,18 @@ fn memory_journal_fences_stale_writes_and_deduplicates_stable_event_ids() {
         Exit::Success(AppendReceipt::Decided(AppendDecision::Duplicate(_)))
     ));
     let mut different = event.clone();
-    different.id = EventId::from_stable(key("other"));
+    different.id = EventId::from_stable(key("other")?);
     assert!(
         matches!(execute(different, JournalCursor::new(0)), Exit::Success(AppendReceipt::Decided(AppendDecision::StaleCursor { actual })) if actual.value() == 1)
     );
+    Ok(())
 }
 
 #[path = "support/drive.rs"]
 mod correction_drive;
 #[test]
-fn cancelled_transactional_permit_and_lock_waits_preserve_interruption_and_ownership() {
+fn cancelled_transactional_permit_and_lock_waits_preserve_interruption_and_ownership()
+-> Result<(), String> {
     use effect::transactional::{TxExecutionId, TxReentrantLock, TxSemaphore};
     use effect::{Cancellation, HasCancellation};
     struct CancelEnv {
@@ -424,11 +483,12 @@ fn cancelled_transactional_permit_and_lock_waits_preserve_interruption_and_owner
     impl KeyDomain for LockDomain {
         const TAG: &'static str = "cancelled-lock-test";
     }
-    let domain = Arc::new(TransactionDomain::new(NonZeroUsize::new(4).unwrap()));
+    let domain = Arc::new(TransactionDomain::new(NonZeroUsize::MIN.saturating_add(3)));
     let policy = TransactionPolicy {
         max_conflicts: NonZeroUsize::MIN,
     };
-    let semaphore = TxSemaphore::new(&domain, 0).unwrap();
+    let semaphore =
+        TxSemaphore::new(&domain, 0).map_err(|error| format!("semaphore: {error:?}"))?;
     let env = Arc::new(CancelEnv {
         domain: Arc::clone(&domain),
         cancel: Cancellation::new(),
@@ -436,9 +496,14 @@ fn cancelled_transactional_permit_and_lock_waits_preserve_interruption_and_owner
     let entered = Arc::new(AtomicBool::new(false));
     let marker = Arc::clone(&entered);
     let acquire = semaphore.acquire::<()>(NonZeroUsize::MIN);
-    let waiting = Transaction::succeed_with(move || marker.store(true, Ordering::SeqCst))
-        .flat_map(move |_| acquire.clone())
-        .atomically(policy);
+    let waiting = {
+        let __dsl_transaction =
+            Transaction::succeed_with(move || marker.store(true, Ordering::SeqCst));
+        transaction! {
+        __dsl_transaction.clone()?; acquire.clone()?
+        }
+    }
+    .atomically(policy);
     let mut future = Box::pin(waiting.run_cancellable(Arc::clone(&env)));
     correction_drive::until(future.as_mut(), || entered.load(Ordering::SeqCst));
     assert!(env.cancel.request());
@@ -456,15 +521,17 @@ fn cancelled_transactional_permit_and_lock_waits_preserve_interruption_and_owner
         block_on(semaphore.available::<()>().atomically(policy).run(env)),
         Exit::Success(1)
     ));
-    let lock = TxReentrantLock::new(&domain).unwrap();
-    let namespace = KeyNamespace::<LockDomain>::new("owners").unwrap();
+    let lock =
+        TxReentrantLock::new(&domain).map_err(|error| format!("reentrant lock: {error:?}"))?;
+    let namespace = KeyNamespace::<LockDomain>::new("owners")
+        .map_err(|error| format!("lock owner namespace: {error:?}"))?;
     let owner = |name: &'static str| {
-        TxExecutionId::from_stable(
-            StableKey::new(&namespace, [KeySegment::Text(name.into())]).unwrap(),
-        )
+        StableKey::new(&namespace, [KeySegment::Text(name.into())])
+            .map(TxExecutionId::from_stable)
+            .map_err(|error| format!("{name} lock owner: {error:?}"))
     };
-    let first = owner("first");
-    let second = owner("second");
+    let first = owner("first")?;
+    let second = owner("second")?;
     let env = Arc::new(CancelEnv {
         domain,
         cancel: Cancellation::new(),
@@ -480,9 +547,14 @@ fn cancelled_transactional_permit_and_lock_waits_preserve_interruption_and_owner
     let entered = Arc::new(AtomicBool::new(false));
     let marker = Arc::clone(&entered);
     let acquire = lock.acquire(second.clone());
-    let waiting = Transaction::succeed_with(move || marker.store(true, Ordering::SeqCst))
-        .flat_map(move |_| acquire.clone())
-        .atomically(policy);
+    let waiting = {
+        let __dsl_transaction =
+            Transaction::succeed_with(move || marker.store(true, Ordering::SeqCst));
+        transaction! {
+        __dsl_transaction.clone()?; acquire.clone()?
+        }
+    }
+    .atomically(policy);
     let mut future = Box::pin(waiting.run_cancellable(Arc::clone(&env)));
     correction_drive::until(future.as_mut(), || entered.load(Ordering::SeqCst));
     assert!(env.cancel.request());
@@ -495,4 +567,5 @@ fn cancelled_transactional_permit_and_lock_waits_preserve_interruption_and_owner
         block_on(lock.acquire(second).atomically(policy).run(env)),
         Exit::Success(())
     ));
+    Ok(())
 }

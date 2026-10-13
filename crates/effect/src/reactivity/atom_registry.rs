@@ -2,6 +2,9 @@
 
 use super::{InvalidationError, InvalidationKey, InvalidationRegistry};
 use crate::{Effect, KeyDomain, PubSubOptions, PubSubShutdown, StableKey};
+use crate::{
+    effect, effect_map, effect_map_error, effect_sync, effect_try_sync, effect_uninterruptible,
+};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
@@ -412,10 +415,8 @@ impl AtomRegistry {
         &self,
         keys: Vec<InvalidationKey>,
     ) -> Effect<(), AtomRegistryError, R> {
-        self.invalidations
-            .invalidate(keys)
-            .map_error(AtomRegistryError::Invalidation)
-            .map(|_| ())
+        effect_map! { program: effect_map_error! { program: self.invalidations
+        .invalidate(keys), map: AtomRegistryError::Invalidation, }, map: |_| (), }
     }
     /// Allocate a globally fresh evaluation generation for a registered derived ID.
     ///
@@ -525,29 +526,19 @@ impl AtomRegistry {
         id: AtomId,
     ) -> Effect<(), AtomRegistryError, R> {
         let registry = self.clone();
-        Effect::try_sync(
-            move || {
-                let mut graph = registry
-                    .graph
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if graph.disposed {
-                    return Err(AtomRegistryError::Disposed);
-                }
-                commit_change(&mut graph, &id)
-            },
-            std::convert::identity,
-        )
-        .flat_map({
-            let invalidations = self.invalidations.clone();
-            move |keys| {
-                invalidations
-                    .invalidate(keys)
-                    .map_error(AtomRegistryError::Invalidation)
-                    .map(|_| ())
+        effect_uninterruptible! { program: { let __dsl_program = effect_try_sync! { body: move || {
+            let mut graph = registry
+                .graph
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if graph.disposed {
+                return Err(AtomRegistryError::Disposed);
             }
-        })
-        .uninterruptible()
+            commit_change(&mut graph, &id)
+        }, on_error: std::convert::identity, }; let invalidations = self.invalidations.clone(); effect! { let __dsl_program = __dsl_program.clone(); let invalidations = invalidations.clone(); let keys = __dsl_program?; {
+            effect_map! { program: effect_map_error! { program: invalidations
+                .invalidate(keys), map: AtomRegistryError::Invalidation, }, map: |_| (), }
+        }? } }, }
     }
 
     /// Lazily remove the current registration by ID and invalidate its dependents.
@@ -567,72 +558,62 @@ impl AtomRegistry {
         owner: Option<Arc<()>>,
     ) -> Effect<bool, AtomRegistryError, R> {
         let registry = self.clone();
-        Effect::try_sync(
-            move || {
-                let mut graph = registry
-                    .graph
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if graph.disposed {
-                    return Err(AtomRegistryError::Disposed);
-                }
-                if owner.as_ref().is_some_and(|owner| {
-                    graph
-                        .nodes
-                        .get(&id)
-                        .is_none_or(|node| !Arc::ptr_eq(owner, &node.owner))
-                }) {
-                    return Ok(None);
-                }
-                let Some(node) = graph.nodes.remove(&id) else {
-                    return Ok(None);
-                };
-                let mut affected = BTreeSet::new();
-                let mut pending = VecDeque::from([id.clone()]);
-                while let Some(current) = pending.pop_front() {
-                    if affected.insert(current.clone())
-                        && let Some(dependents) = graph.dependents.get(&current)
-                    {
-                        pending.extend(dependents.iter().cloned());
-                    }
-                }
-                for dependent in affected.iter().filter(|candidate| *candidate != &id) {
-                    if let Some(node) = graph.nodes.get_mut(dependent) {
-                        node.invalidated = true;
-                    }
-                }
-                for dependency in node.dependencies {
-                    if let Some(dependents) = graph.dependents.get_mut(&dependency) {
-                        dependents.remove(&id);
-                    }
-                }
-                if let Some(dependents) = graph.dependents.remove(&id) {
-                    for dependent in dependents {
-                        if let Some(node) = graph.nodes.get_mut(&dependent) {
-                            node.dependencies.remove(&id);
-                        }
-                    }
-                }
-                Ok(Some(
-                    affected
-                        .into_iter()
-                        .map(|atom| atom.invalidation_key())
-                        .collect::<Vec<_>>(),
-                ))
-            },
-            std::convert::identity,
-        )
-        .flat_map({
-            let invalidations = self.invalidations.clone();
-            move |affected| match affected {
-                None => Effect::sync(|| false),
-                Some(keys) => invalidations
-                    .invalidate(keys)
-                    .map_error(AtomRegistryError::RemovalCommittedWithoutInvalidation)
-                    .map(|_| true),
+        effect_uninterruptible! { program: { let __dsl_program = effect_try_sync! { body: move || {
+            let mut graph = registry
+                .graph
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if graph.disposed {
+                return Err(AtomRegistryError::Disposed);
             }
-        })
-        .uninterruptible()
+            if owner.as_ref().is_some_and(|owner| {
+                graph
+                    .nodes
+                    .get(&id)
+                    .is_none_or(|node| !Arc::ptr_eq(owner, &node.owner))
+            }) {
+                return Ok(None);
+            }
+            let Some(node) = graph.nodes.remove(&id) else {
+                return Ok(None);
+            };
+            let mut affected = BTreeSet::new();
+            let mut pending = VecDeque::from([id.clone()]);
+            while let Some(current) = pending.pop_front() {
+                if affected.insert(current.clone())
+                    && let Some(dependents) = graph.dependents.get(&current)
+                {
+                    pending.extend(dependents.iter().cloned());
+                }
+            }
+            for dependent in affected.iter().filter(|candidate| *candidate != &id) {
+                if let Some(node) = graph.nodes.get_mut(dependent) {
+                    node.invalidated = true;
+                }
+            }
+            for dependency in node.dependencies {
+                if let Some(dependents) = graph.dependents.get_mut(&dependency) {
+                    dependents.remove(&id);
+                }
+            }
+            if let Some(dependents) = graph.dependents.remove(&id) {
+                for dependent in dependents {
+                    if let Some(node) = graph.nodes.get_mut(&dependent) {
+                        node.dependencies.remove(&id);
+                    }
+                }
+            }
+            Ok(Some(
+                affected
+                    .into_iter()
+                    .map(|atom| atom.invalidation_key())
+                    .collect::<Vec<_>>(),
+            ))
+        }, on_error: std::convert::identity, }; let invalidations = self.invalidations.clone(); effect! { let __dsl_program = __dsl_program.clone(); let invalidations = invalidations.clone(); let affected = __dsl_program?; match affected {
+            None => effect_sync! { body: || false, },
+            Some(keys) => effect_map! { program: effect_map_error! { program: invalidations
+                .invalidate(keys), map: AtomRegistryError::RemovalCommittedWithoutInvalidation, }, map: |_| true, },
+        }? } }, }
     }
 
     /// Release owned native state and await its disposal where required.
@@ -651,33 +632,33 @@ impl AtomRegistry {
         mode: PubSubShutdown,
     ) -> Effect<bool, AtomRegistryError, R> {
         let registry = self.clone();
-        Effect::sync({
-            let registry = registry.clone();
-            move || {
-                let mut graph = registry
-                    .graph
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if graph.disposed {
-                    return false;
+        {
+            let __dsl_program = effect_sync! { body: {
+                let registry = registry.clone();
+                move || {
+                    let mut graph = registry
+                        .graph
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if graph.disposed {
+                        return false;
+                    }
+                    graph.disposed = true;
+                    graph.nodes.clear();
+                    graph.dependents.clear();
+                    true
                 }
-                graph.disposed = true;
-                graph.nodes.clear();
-                graph.dependents.clear();
-                true
-            }
-        })
-        .flat_map(move |first| {
-            if first {
-                registry
-                    .invalidations
-                    .shutdown(mode)
-                    .map_error(AtomRegistryError::Invalidation)
-                    .map(|_| true)
-            } else {
-                Effect::sync(|| false)
-            }
-        })
+            }, };
+            effect! { let registry = registry.clone(); let first = __dsl_program.clone()?; {
+                if first {
+                    effect_map! { program: effect_map_error! { program: registry
+                        .invalidations
+                        .shutdown(mode), map: AtomRegistryError::Invalidation, }, map: |_| true, }
+                } else {
+                    effect_sync! { body: || false, }
+                }
+            }? }
+        }
     }
 }
 

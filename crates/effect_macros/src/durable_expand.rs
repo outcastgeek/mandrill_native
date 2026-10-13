@@ -4,6 +4,7 @@ use proc_macro2::{Ident, Span, TokenStream};
 use quote::quote;
 use syn::fold::Fold;
 use syn::{Expr, Stmt};
+use syn::{parse_quote, parse_quote_spanned};
 
 /// Keeps binds on the durable boundary without traversing nested callbacks or items.
 struct Lower {
@@ -14,35 +15,29 @@ struct Lower {
 }
 impl Fold for Lower {
     /// Preserve native Rust branches and guards while replacing only domain binds.
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "Other syn expression variants retain native Rust syntax"
-    )]
     fn fold_expr(&mut self, expr: Expr) -> Expr {
-        match expr {
-            Expr::Closure(_) | Expr::Async(_) => expr,
-            Expr::Try(step) => {
-                let program = self.fold_expr(*step.expr);
-                let context = &self.context;
-                syn::parse_quote_spanned!(step.question_token.span=> match #context.bind(#program).await {
-                    Ok(value) => value, Err(failure) => return Err(failure),
-                })
-            }
-            Expr::Return(step) => {
-                let value = step
-                    .expr
-                    .map(|value| self.fold_expr(*value))
-                    .unwrap_or_else(|| syn::parse_quote!(()));
-                syn::parse_quote!(return ::core::result::Result::Ok(#value))
-            }
-            Expr::While(_) | Expr::Loop(_) => {
-                self.error = Some(syn::Error::new_spanned(
-                    &expr,
-                    "durable coordination supports deterministic for iteration, not while or loop",
-                ));
-                expr
-            }
-            other => syn::fold::fold_expr(self, other),
+        if matches!(&expr, Expr::Closure(_) | Expr::Async(_)) {
+            expr
+        } else if let Expr::Try(step) = expr {
+            let program = self.fold_expr(*step.expr);
+            let context = &self.context;
+            parse_quote_spanned!(step.question_token.span.resolved_at(proc_macro2::Span::mixed_site())=> match #context.bind(#program).await {
+                Ok(value) => value, Err(failure) => return Err(failure),
+            })
+        } else if let Expr::Return(step) = expr {
+            let value = step
+                .expr
+                .map(|value| self.fold_expr(*value))
+                .unwrap_or_else(|| parse_quote!(()));
+            parse_quote!(return ::core::result::Result::Ok(#value))
+        } else if matches!(&expr, Expr::While(_) | Expr::Loop(_)) {
+            self.error = Some(syn::Error::new_spanned(
+                &expr,
+                "durable coordination supports deterministic for iteration, not while or loop",
+            ));
+            expr
+        } else {
+            syn::fold::fold_expr(self, expr)
         }
     }
     /// Item bodies keep their own error and execution boundaries.
@@ -86,7 +81,7 @@ pub(crate) fn expand_once(statements: Vec<Stmt>) -> syn::Result<TokenStream> {
         ));
     };
     let path = crate::expand::effect_crate_path()?;
-    *call.func = syn::parse_quote!(#path::workflow::Durable::from_body_once);
+    *call.func = parse_quote!(#path::workflow::Durable::from_body_once);
     Ok(quote!(#call))
 }
 
@@ -96,12 +91,11 @@ mod tests {
     use super::*;
     /// Generated binds retain guards and native callback boundaries while enforcing the domain bridge.
     #[test]
-    fn native_lowering_contract() {
+    fn native_lowering_contract() -> syn::Result<()> {
         let statements = syn::parse::Parser::parse_str(
             syn::Block::parse_within,
             "let value=step()?; match value {v if v>0=>v,_=>0}; let callback=||nested()?;",
-        )
-        .expect("Rust statements");
+        )?;
         let mut lower = Lower {
             context: Ident::new("durable_context", Span::mixed_site()),
             error: None,
@@ -115,5 +109,6 @@ mod tests {
         assert!(output.contains("return Err (failure)"));
         assert!(output.contains("nested () ?"));
         assert!(lower.error.is_none());
+        Ok(())
     }
 }

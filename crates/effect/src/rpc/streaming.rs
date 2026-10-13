@@ -5,8 +5,10 @@ use super::{
     RpcOperationSpec, RpcVersion, RpcWireError,
 };
 use crate::encoding::{FrameDecodeFailure, FrameDecoder, FrameParts};
+use crate::{Effect, JsonValue, ParseLimits, PureCodec, ResourceValue, SchemaIssue, Scope};
 use crate::{
-    Effect, JsonValue, ParseLimits, PureCodec, Release, ResourceValue, SchemaIssue, Scope,
+    effect, effect_map, effect_map_error, effect_provide_some, effect_resource,
+    effect_scope_acquire, effect_sync, effect_try_sync, effect_uninterruptible, service,
 };
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
@@ -444,8 +446,9 @@ where
         let scope = scope.clone();
         let request = Mutex::new(Some((request, metadata)));
         let request_call = call.clone();
-        Effect::try_sync(
-            move || {
+        {
+            let __dsl_program = effect_try_sync! {
+            body: move || {
                 let (request, metadata) = request
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -468,73 +471,78 @@ where
                 }
                 .encode(policy)
                 .map_err(RpcStreamError::Wire)
-            },
-            std::convert::identity,
-        )
-        .flat_map(move |frame| {
-            let frame = Arc::new(Mutex::new(Some(frame)));
-            let scope = scope.clone();
-            let operation = reader_operation.clone();
-            let call = call.clone();
-            let connector =
-                Effect::service(|env: &R| env.rpc_stream_connector()).flat_map(|connector| {
-                    connector
-                        .open()
-                        .map_error(RpcStreamError::Transport)
-                        .provide_some(|_: &R| ())
-                });
-            let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let release_closed = Arc::clone(&closed);
-            scope
-                .acquire(connector, move |session| {
-                    let closed = Arc::clone(&release_closed);
-                    Release::from_effect(
-                        Effect::defer(move || {
-                            if closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                                Effect::succeed(())
-                            } else {
-                                session.close()
-                            }
-                        })
-                        .map_error(RpcStreamError::Transport)
-                        .provide_some(|_: &R| ()),
-                    )
-                })
-                .flat_map(move |session| {
-                    let source = session.clone();
-                    let operation = operation.clone();
-                    let call = call.clone();
-                    let frame = Arc::clone(&frame);
-                    let closed = Arc::clone(&closed);
-                    session.access(Arc::clone).flat_map(move |session| {
-                        let frame = frame
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take();
-                        let Some(frame) = frame else {
-                            return Effect::from_result_once(Err(RpcStreamError::InputConsumed));
-                        };
-                        let reader = RpcStreamReader::new(
-                            source.clone(),
-                            operation.clone(),
-                            call.clone(),
-                            policy,
-                            Arc::clone(&closed),
-                        );
-                        session
-                            .send(frame)
-                            .map_error({
-                                let uncertain_call = call.clone();
-                                move |source| RpcStreamError::RequestUncertain {
-                                    call: uncertain_call.clone(),
-                                    source,
-                                }
-                            })
-                            .provide_some(|_: &R| ())
-                            .map(move |_| reader.clone())
-                    })
-                })
-        })
+            }, on_error: std::convert::identity, };
+            effect! {
+                            let __dsl_program = __dsl_program.clone(); let call = call.clone(); let reader_operation = reader_operation.clone(); let scope = scope.clone(); let frame = __dsl_program?; {
+                        let frame = Arc::new(Mutex::new(Some(frame)));
+                        let scope = scope.clone();
+                        let operation = reader_operation.clone();
+                        let call = call.clone();
+                        let connector =
+                            {
+                                let __dsl_program = service! { env: |env: &R| env.rpc_stream_connector(), }; effect! {
+                                let connector = __dsl_program.clone()?; {
+                                effect_provide_some! {
+                                    program: effect_map_error! {
+                                    program: connector
+                                    .open(), map: RpcStreamError::Transport, }, project: |_: &R| (), }
+                            }? } };
+                        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let release_closed = Arc::clone(&closed);
+                        {
+                            let __dsl_program = effect_scope_acquire! {
+            scope: scope, acquire: connector, release: move |session| {
+                                let closed = Arc::clone(&release_closed);
+                                effect_provide_some! {
+                                    program: effect_map_error! {
+                                    program: {
+                                    let __dsl_factory = move || {
+                                        if closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                                            effect_sync! { body { () }, }
+                                        } else {
+                                            session.close()
+                                        }
+                                    }; effect! { __dsl_factory()? } }, map: RpcStreamError::Transport, }, project: |_: &R| (), }
+                            },
+            }; effect! {
+                let __dsl_program = __dsl_program.clone(); let call = call.clone(); let closed = closed.clone(); let frame = frame.clone(); let operation = operation.clone(); let session = __dsl_program?; {
+                                let source = session.clone();
+                                let operation = operation.clone();
+                                let call = call.clone();
+                                let frame = Arc::clone(&frame);
+                                let closed = Arc::clone(&closed);
+                                {
+                                    let __dsl_program = session.access(Arc::clone); effect! {
+                                    let __dsl_program = __dsl_program.clone(); let call = call.clone(); let closed = closed.clone(); let frame = frame.clone(); let operation = operation.clone(); let source = source.clone(); let session = __dsl_program?; (move || {
+                                    let frame = frame
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .take();
+                                    let Some(frame) = frame else {
+                                        return effect_try_sync! { once; body: { let __dsl_result = Err(RpcStreamError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                    };
+                                    let reader = RpcStreamReader::new(
+                                        source.clone(),
+                                        operation.clone(),
+                                        call.clone(),
+                                        policy,
+                                        Arc::clone(&closed),
+                                    );
+                                    effect_map! {
+                                        program: effect_provide_some! {
+                                        program: effect_map_error! {
+                                        program: session
+                                        .send(frame), map: {
+                                            let uncertain_call = call.clone();
+                                            move |source| RpcStreamError::RequestUncertain {
+                                                call: uncertain_call.clone(),
+                                                source,
+                                            }
+                                        }, }, project: |_: &R| (), }, map: move |_| reader.clone(), }
+                                })()? } }
+                            }? } }
+                    }? }
+        }
     }
 }
 
@@ -674,8 +682,9 @@ where
     ) -> Effect<RpcStreamItem<C, T>, RpcStreamError<E, Backend>, R> {
         let state = Arc::clone(&self.state);
         let reader = self.clone();
-        Effect::try_sync(
-            move || {
+        {
+            let __dsl_program = effect_try_sync! {
+            body: move || {
                 let mut state = state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -693,44 +702,48 @@ where
                 }
                 state.reading = true;
                 Ok(())
-            },
-            std::convert::identity,
-        )
-        .flat_map(move |_| {
-            let reader = reader.clone();
-            let state = Arc::clone(&reader.state);
-            let close = reader.close_once::<R>();
-            reader
-                .session
-                .access(Arc::clone)
-                .flat_map(move |session| {
-                    let reader = reader.clone();
-                    session
-                        .receive_frame()
-                        .map_error(RpcStreamError::Transport)
-                        .provide_some(|_: &R| ())
-                        .flat_map(move |bytes| {
-                            let result = bytes
-                                .ok_or(RpcStreamError::Disconnected)
-                                .and_then(|bytes| reader.decode_next(&bytes));
-                            Effect::from_result_once(result)
-                        })
-                })
-                .ensuring(Effect::sync(move || {
-                    state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .reading = false;
-                }))
-                .ensuring_with(move |reason| match reason {
-                    crate::PrimaryOutcomeRef::Succeeded => crate::Release::sync(|| ()),
-                    crate::PrimaryOutcomeRef::Failed(_)
-                    | crate::PrimaryOutcomeRef::Defected(_)
-                    | crate::PrimaryOutcomeRef::WasInterrupted => {
-                        crate::Release::from_effect(close.clone())
-                    }
-                })
-        })
+            }, on_error: std::convert::identity, };
+            effect! {
+                    let reader = reader.clone(); let _ = __dsl_program.clone()?; {
+                let reader = reader.clone();
+                let state = Arc::clone(&reader.state);
+                let close = reader.close_once::<R>();
+                {
+                    let __dsl_program = {
+                    let __dsl_program = {
+                    let __dsl_program = reader
+                    .session
+                    .access(Arc::clone); effect! {
+                        let reader = reader.clone(); let session = __dsl_program.clone()?; {
+                        let reader = reader.clone();
+                        {
+                            let __dsl_program = effect_provide_some! {
+                            program: effect_map_error! {
+                            program: session
+                            .receive_frame(), map: RpcStreamError::Transport, }, project: |_: &R| (), }; effect! {
+                                let reader = reader.clone(); let bytes = __dsl_program.clone()?; {
+                                let result = bytes
+                                    .ok_or(RpcStreamError::Disconnected)
+                                    .and_then(|bytes| reader.decode_next(&bytes));
+                                effect_try_sync! { once; body: { let __dsl_result = result; move || __dsl_result }, on_error: ::core::convert::identity, }
+                            }? } }
+                    }? } }; let __dsl_cleanup = effect_sync! {
+                        body: move || {
+                        state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .reading = false;
+                    }, }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } }; effect_resource! {
+                        acquire: effect_sync! { body: || (), }, release: move |(), reason| match reason {
+                        crate::PrimaryOutcomeRef::Succeeded => crate::Release::sync(|| ()),
+                        crate::PrimaryOutcomeRef::Failed(_)
+                        | crate::PrimaryOutcomeRef::Defected(_)
+                        | crate::PrimaryOutcomeRef::WasInterrupted => {
+                            crate::Release::from_effect(close.clone())
+                        }
+                    }, body: move |_| __dsl_program.clone(), } }
+            }? }
+        }
     }
 
     ///
@@ -874,8 +887,9 @@ where
     ) -> Effect<(), RpcStreamError<E, Backend>, R> {
         let reader = self.clone();
         let state = Arc::clone(&self.state);
-        Effect::try_sync(
-            move || {
+        {
+            let __dsl_program = effect_try_sync! {
+            body: move || {
                 let mut state = state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -900,85 +914,92 @@ where
                 }
                 state.acknowledging = true;
                 Ok(())
-            },
-            std::convert::identity,
-        )
-        .flat_map(move |_| {
-            let reader = reader.clone();
-            let close = reader.close_once::<R>();
-            let state = Arc::clone(&reader.state);
-            let envelope = RpcEnvelope {
-                operation: reader.spec.id.clone(),
-                version: reader.spec.version,
-                call: reader.call.clone(),
-                kind: RpcEnvelopeKind::Acknowledge,
-                sequence: Some(sequence),
-                payload: JsonValue::Null,
-                metadata: BTreeMap::new(),
-            };
-            let session_handle = reader.session.clone();
-            let final_state = Arc::clone(&reader.state);
-            let uncertain_call = reader.call.clone();
-            Effect::from_result_once(envelope.encode(reader.policy).map_err(RpcStreamError::Wire))
-                .flat_map(move |frame| {
-                    let frame = Mutex::new(Some(frame));
-                    let state = Arc::clone(&state);
-                    let uncertain_call = uncertain_call.clone();
-                    session_handle.access(Arc::clone).flat_map(move |session| {
-                        let frame = frame
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take();
-                        match frame {
-                            Some(frame) => session
-                                .send(frame)
-                                .map_error({
-                                    let failed_state = Arc::clone(&state);
-                                    let uncertain_call = uncertain_call.clone();
-                                    move |source| {
-                                        failed_state
-                                            .lock()
-                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                            .phase = StreamPhase::Failed;
-                                        RpcStreamError::AcknowledgementUncertain {
-                                            call: uncertain_call.clone(),
-                                            sequence,
-                                            source,
-                                        }
-                                    }
-                                })
-                                .provide_some(|_: &R| ())
-                                .map({
-                                    let state = Arc::clone(&state);
-                                    move |_| {
-                                        state
-                                            .lock()
-                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                            .awaiting_ack = None;
-                                    }
-                                }),
-                            None => Effect::from_result_once(Err(RpcStreamError::InputConsumed)),
-                        }
-                    })
-                })
-                .ensuring(Effect::sync({
-                    let state = final_state;
-                    move || {
-                        state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .acknowledging = false;
-                    }
-                }))
-                .ensuring_with(move |reason| match reason {
-                    crate::PrimaryOutcomeRef::Succeeded => crate::Release::sync(|| ()),
-                    crate::PrimaryOutcomeRef::Failed(_)
-                    | crate::PrimaryOutcomeRef::Defected(_)
-                    | crate::PrimaryOutcomeRef::WasInterrupted => {
-                        crate::Release::from_effect(close.clone())
-                    }
-                })
-        })
+            }, on_error: std::convert::identity, };
+            effect! {
+                           let reader = reader.clone(); let _ = __dsl_program.clone()?; {
+                       let reader = reader.clone();
+                       let close = reader.close_once::<R>();
+                       let state = Arc::clone(&reader.state);
+                       let envelope = RpcEnvelope {
+                           operation: reader.spec.id.clone(),
+                           version: reader.spec.version,
+                           call: reader.call.clone(),
+                           kind: RpcEnvelopeKind::Acknowledge,
+                           sequence: Some(sequence),
+                           payload: JsonValue::Null,
+                           metadata: BTreeMap::new(),
+                       };
+                       let session_handle = reader.session.clone();
+                       let final_state = Arc::clone(&reader.state);
+                       let uncertain_call = reader.call.clone();
+                       {
+                           let __dsl_program = {
+                           let __dsl_program = {
+                           let __dsl_program = effect_try_sync! { once; body: { let __dsl_result = envelope.encode(reader.policy).map_err(RpcStreamError::Wire); move || __dsl_result }, on_error: ::core::convert::identity, }; effect! {
+                           let __dsl_program = __dsl_program.clone(); let session_handle = session_handle.clone(); let state = state.clone(); let uncertain_call = uncertain_call.clone(); let frame = __dsl_program?; {
+                               let frame = Mutex::new(Some(frame));
+                               let state = Arc::clone(&state);
+                               let uncertain_call = uncertain_call.clone();
+                               effect! {
+            bind;
+            program: session_handle.access(Arc::clone),
+            body: move |session| {
+                                   let frame = frame
+                                       .lock()
+                                       .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                       .take();
+                                   match frame {
+                                       Some(frame) => effect_map! {
+                                           program: effect_provide_some! {
+                                           program: effect_map_error! {
+                                           program: session
+                                           .send(frame), map: {
+                                               let failed_state = Arc::clone(&state);
+                                               let uncertain_call = uncertain_call.clone();
+                                               move |source| {
+                                                   failed_state
+                                                       .lock()
+                                                       .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                       .phase = StreamPhase::Failed;
+                                                   RpcStreamError::AcknowledgementUncertain {
+                                                       call: uncertain_call.clone(),
+                                                       sequence,
+                                                       source,
+                                                   }
+                                               }
+                                           }, }, project: |_: &R| (), }, map: {
+                                               let state = Arc::clone(&state);
+                                               move |_| {
+                                                   state
+                                                       .lock()
+                                                       .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                       .awaiting_ack = None;
+                                               }
+                                           }, },
+                                       None => effect_try_sync! { once; body: { let __dsl_result = Err(RpcStreamError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, },
+                                   }
+                               },
+            }
+                           }? } }; let __dsl_cleanup = effect_sync! {
+                               body: {
+                               let state = final_state;
+                               move || {
+                                   state
+                                       .lock()
+                                       .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                       .acknowledging = false;
+                               }
+                           }, }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } }; effect_resource! {
+                               acquire: effect_sync! { body: || (), }, release: move |(), reason| match reason {
+                               crate::PrimaryOutcomeRef::Succeeded => crate::Release::sync(|| ()),
+                               crate::PrimaryOutcomeRef::Failed(_)
+                               | crate::PrimaryOutcomeRef::Defected(_)
+                               | crate::PrimaryOutcomeRef::WasInterrupted => {
+                                   crate::Release::from_effect(close.clone())
+                               }
+                           }, body: move |_| __dsl_program.clone(), } }
+                   }? }
+        }
     }
 
     /// Claim this session's close flag before invoking the backend, with interruption
@@ -986,22 +1007,24 @@ where
     /// retain their cleanup outcome rather than retrying an already claimed close.
     fn close_once<R: Send + Sync + 'static>(&self) -> Effect<(), RpcStreamError<E, Backend>, R> {
         let closed = Arc::clone(&self.closed);
-        self.session
-            .access(Arc::clone)
-            .flat_map(move |session| {
-                let closed = Arc::clone(&closed);
-                Effect::defer(move || {
-                    if closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                        Effect::succeed(())
-                    } else {
-                        session
-                            .close()
-                            .map_error(RpcStreamError::Transport)
-                            .provide_some(|_: &R| ())
-                    }
-                })
-            })
-            .uninterruptible()
+        effect_uninterruptible! {
+        program: {
+        let __dsl_program = self.session
+        .access(Arc::clone); effect! {
+            let closed = closed.clone(); let session = __dsl_program.clone()?; {
+            let closed = Arc::clone(&closed);
+            {
+                let __dsl_factory = move || {
+                if closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    effect_sync! { body { () }, }
+                } else {
+                    effect_provide_some! {
+                        program: effect_map_error! {
+                        program: session
+                        .close(), map: RpcStreamError::Transport, }, project: |_: &R| (), }
+                }
+            }; effect! { __dsl_factory()? } }
+        }? } }, }
     }
 
     /// Lazily mark the stream cancelled and attempt protected session closure once.
@@ -1010,52 +1033,52 @@ where
     /// close path does not close a replacement or repeat a previous close attempt.
     pub fn cancel<R: Send + Sync + 'static>(&self) -> Effect<(), RpcStreamError<E, Backend>, R> {
         let reader = self.clone();
-        Effect::try_sync(
-            move || {
-                let mut state = reader
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                match state.phase {
-                    StreamPhase::Open => state.phase = StreamPhase::Cancelled,
-                    StreamPhase::Ended => return Err(RpcStreamError::Ended),
-                    StreamPhase::Cancelled => return Err(RpcStreamError::Cancelled),
-                    StreamPhase::Failed => return Err(RpcStreamError::Failed),
-                }
-                let envelope = RpcEnvelope {
-                    operation: reader.spec.id.clone(),
-                    version: reader.spec.version,
-                    call: reader.call.clone(),
-                    kind: RpcEnvelopeKind::Cancel,
-                    sequence: None,
-                    payload: JsonValue::Null,
-                    metadata: BTreeMap::new(),
-                };
-                envelope.encode(reader.policy).map_err(RpcStreamError::Wire)
-            },
-            std::convert::identity,
-        )
-        .flat_map({
-            let session = self.session.clone();
-            move |frame| {
-                let frame = Mutex::new(Some(frame));
-                session.access(Arc::clone).flat_map(move |session| {
-                    let frame = frame
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take();
-                    match frame {
-                        Some(frame) => session
-                            .send(frame)
-                            .map_error(RpcStreamError::CancellationUncertain)
-                            .provide_some(|_: &R| ()),
-                        None => Effect::from_result_once(Err(RpcStreamError::InputConsumed)),
-                    }
-                })
-            }
-        })
-        .ensuring(self.close_once::<R>())
-        .uninterruptible()
+        effect_uninterruptible! {
+                   program: {
+                   let __dsl_program = {
+                   let __dsl_program = effect_try_sync! {
+                   body: move || {
+                       let mut state = reader
+                           .state
+                           .lock()
+                           .unwrap_or_else(std::sync::PoisonError::into_inner);
+                       match state.phase {
+                           StreamPhase::Open => state.phase = StreamPhase::Cancelled,
+                           StreamPhase::Ended => return Err(RpcStreamError::Ended),
+                           StreamPhase::Cancelled => return Err(RpcStreamError::Cancelled),
+                           StreamPhase::Failed => return Err(RpcStreamError::Failed),
+                       }
+                       let envelope = RpcEnvelope {
+                           operation: reader.spec.id.clone(),
+                           version: reader.spec.version,
+                           call: reader.call.clone(),
+                           kind: RpcEnvelopeKind::Cancel,
+                           sequence: None,
+                           payload: JsonValue::Null,
+                           metadata: BTreeMap::new(),
+                       };
+                       envelope.encode(reader.policy).map_err(RpcStreamError::Wire)
+                   }, on_error: std::convert::identity, }; let session = self.session.clone(); effect! {
+                       let __dsl_program = __dsl_program.clone(); let session = session.clone(); let frame = __dsl_program?; {
+                       let frame = Mutex::new(Some(frame));
+                       effect! {
+        bind;
+        program: session.access(Arc::clone),
+        body: move |session| {
+                           let frame = frame
+                               .lock()
+                               .unwrap_or_else(std::sync::PoisonError::into_inner)
+                               .take();
+                           match frame {
+                               Some(frame) => effect_provide_some! {
+                                   program: effect_map_error! {
+                                   program: session
+                                   .send(frame), map: RpcStreamError::CancellationUncertain, }, project: |_: &R| (), },
+                               None => effect_try_sync! { once; body: { let __dsl_result = Err(RpcStreamError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, },
+                           }
+                       },
+        }
+                   }? } }; let __dsl_cleanup = self.close_once::<R>(); effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } }, }
     }
 }
 

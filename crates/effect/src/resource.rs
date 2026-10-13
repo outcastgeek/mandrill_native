@@ -567,3 +567,12 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Release<E, R> {
         }
     }
 }
+
+/// Adapt an existing Effect cleanup description into a single-use protected release.
+/// This conversion does not run cleanup or change expected-error/defect channels.
+impl<E: Send + 'static, R: Send + Sync + 'static> From<Effect<(), E, R>> for Release<E, R> {
+    /// Preserve the Effect description until protected release execution.
+    fn from(program: Effect<(), E, R>) -> Self {
+        Self::from_effect(program)
+    }
+}

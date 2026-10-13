@@ -1,11 +1,11 @@
 //! Transport-neutral HTTP requests, responses, and body ownership.
 
 use crate::internal::runtime::{self, Step};
-use crate::internal::workflow::{self, bind, success};
 use crate::{
     AdmissionCapacity, Cancellation, Defect, Effect, Exit, ProviderAdmission, Release,
     ResourceValue, Scope,
 };
+use crate::{effect, effect_die, effect_scope, effect_scope_acquire, effect_sync, effect_try_sync};
 use futures_util::FutureExt;
 use futures_util::future::{Either, select};
 use std::collections::BTreeMap;
@@ -302,17 +302,23 @@ where
     let on_error = Arc::new(on_error);
     let transport_error = Arc::clone(&on_error);
     let acquire = Effect::http_request(request, move |error| transport_error(error));
-    let owned = scope.acquire(acquire, move |response| {
-        Release::from_exit_future(move |_| response.close())
-    });
-    owned.flat_map(move |response| match response.with(HttpResponse::status) {
-        Ok(status) if accept_status(status) => Effect::sync(move || response.clone()),
-        Ok(status) => {
-            let on_error = Arc::clone(&on_error);
-            Effect::fail_with(move || on_error(FetchFailure::Http(status)))
-        }
-        Err(defect) => Effect::die(defect),
-    })
+    let owned = effect_scope_acquire! {
+        scope: scope,
+        acquire: acquire,
+        release: move |response| Release::from_exit_future(move |_| response.close()),
+    };
+    effect! {
+    bind;
+    program: owned,
+    body: move |response| match response.with(HttpResponse::status) {
+           Ok(status) if accept_status(status) => effect_sync! { body: move || response.clone(), },
+           Ok(status) => {
+               let on_error = Arc::clone(&on_error);
+               effect_try_sync! { body: { let __dsl_error = move || on_error(FetchFailure::Http(status)); move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }
+           }
+           Err(defect) => effect_die! { defect: defect, },
+       },
+    }
 }
 /// Decode a response body as UTF-8 after honoring status and size policies.
 ///
@@ -386,7 +392,8 @@ where
 {
     let accept_status = Arc::new(accept_status);
     let on_error = Arc::new(on_error);
-    Scope::scoped(move |scope| {
+    effect_scope! {
+        body: move |scope| {
         let accept_status = Arc::clone(&accept_status);
         let on_error = Arc::clone(&on_error);
         let request_error = Arc::clone(&on_error);
@@ -396,11 +403,10 @@ where
             move |status| accept_status(status),
             move |error| request_error(error),
         );
-        workflow::reusable(move || {
+        effect! {
             let on_error = Arc::clone(&on_error);
-            bind(acquire.clone(), move |response| {
-                bind(text(response, move |error| on_error(error)), success)
-            })
-        })
-    })
+            let response = acquire.clone()?;
+            text(response, move |error| on_error(error))?
+        }
+    }, }
 }

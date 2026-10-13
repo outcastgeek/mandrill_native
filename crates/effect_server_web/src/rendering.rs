@@ -4,7 +4,9 @@
 //! Untrusted text uses the selected renderer's escaping operations. Native trusted
 //! markup crosses an explicit finite Server HtmlContent boundary.
 
+use crate::effect_map;
 use effect::Effect;
+use effect_server::reply;
 use effect_server::{HtmlContent, Reply};
 use std::sync::Arc;
 
@@ -35,14 +37,19 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Renderer<A,
     }
     /// Compose the existing lazy native reply boundary; no body collection occurs.
     pub fn reply(&self, model: A) -> Reply<E, R> {
-        Reply::render(self.html(model).map(Reply::html))
+        reply! {
+            render(effect_map! {
+                program: self.html(model),
+                map: |html| reply! { html(html) },
+            }),
+        }
     }
     /// Native Maud owns escaping and markup construction. Conversion transfers its
     /// encoded finite String into Server's trusted markup, without a JSON intermediary.
     #[cfg(feature = "maud")]
     pub fn maud(render: impl Fn(A) -> Effect<maud::Markup, E, R> + Send + Sync + 'static) -> Self {
         Self::new(move |model| {
-            render(model).map(|markup| HtmlContent::trusted(markup.into_string()))
+            effect_map! { program: render(model), map: |markup| HtmlContent::trusted(markup.into_string()), }
         })
     }
 }

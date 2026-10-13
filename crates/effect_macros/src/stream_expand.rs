@@ -4,6 +4,7 @@ use proc_macro2::{Ident, Span, TokenStream};
 use quote::quote;
 use syn::fold::Fold;
 use syn::{Expr, Stmt};
+use syn::{parse_quote, parse_quote_spanned};
 
 /// Rewrites only the stream body, preserving native control flow and nested callback boundaries.
 struct Lower {
@@ -45,36 +46,33 @@ impl Lower {
             .map(|stmt| self.fold_stmt(stmt))
             .collect::<Vec<_>>();
         let context = &self.context;
-        syn::parse_quote!({let #checkpoint=#context.checkpoint();let __stream_fragment={#(#statements)*};#context.release(#checkpoint).await?;__stream_fragment})
+        parse_quote!({let #checkpoint=#context.checkpoint();let __stream_fragment={#(#statements)*};#context.release(#checkpoint).await?;__stream_fragment})
     }
 }
 impl Fold for Lower {
     /// Replace yields with suspension and Effects with lazy runtime binds.
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "Other syn expression variants retain native Rust syntax"
-    )]
     fn fold_expr(&mut self, expr: Expr) -> Expr {
-        match expr {
-            Expr::Closure(_) | Expr::Async(_) => expr,
-            Expr::Try(step) => {
-                let program = self.fold_expr(*step.expr);
-                let context = &self.context;
-                syn::parse_quote_spanned!(step.question_token.span=> #context.bind(#program).await?)
-            }
-            Expr::Yield(step) => {
-                let value = step
-                    .expr
-                    .map(|value| self.fold_expr(*value))
-                    .unwrap_or_else(|| syn::parse_quote!(()));
-                let context = &self.context;
-                syn::parse_quote_spanned!(step.yield_token.span=> #context.emit(#value).await)
-            }
-            Expr::Macro(invocation) if invocation.mac.path.is_ident("yield_from") => {
+        if matches!(&expr, Expr::Closure(_) | Expr::Async(_)) {
+            expr
+        } else if let Expr::Try(step) = expr {
+            let program = self.fold_expr(*step.expr);
+            let context = &self.context;
+            parse_quote_spanned!(step.question_token.span.resolved_at(proc_macro2::Span::mixed_site())=> #context.bind(#program).await?)
+        } else if let Expr::Yield(step) = expr {
+            let value = step
+                .expr
+                .map(|value| self.fold_expr(*value))
+                .unwrap_or_else(|| parse_quote!(()));
+            let context = &self.context;
+            parse_quote_spanned!(step.yield_token.span.resolved_at(proc_macro2::Span::mixed_site())=> #context.emit(#value).await)
+        } else if let Expr::Macro(invocation) = expr {
+            if !(invocation.mac.path.is_ident("yield_from")) {
+                syn::fold::fold_expr(self, Expr::Macro(invocation))
+            } else {
                 match syn::parse2::<Expr>(invocation.mac.tokens.clone()) {
                     Ok(source) => {
                         let context = &self.context;
-                        syn::parse_quote!(#context.append(#source).await?)
+                        parse_quote!(#context.append(#source).await?)
                     }
                     Err(error) => {
                         self.error = Some(error);
@@ -82,97 +80,91 @@ impl Fold for Lower {
                     }
                 }
             }
-            Expr::Return(step) => {
-                if step.expr.is_some() {
-                    self.error = Some(syn::Error::new_spanned(
-                        &step,
-                        "stream completion uses return; or unit completion",
-                    ));
-                }
-                syn::parse_quote!(return Ok(()))
+        } else if let Expr::Return(step) = expr {
+            if step.expr.is_some() {
+                self.error = Some(syn::Error::new_spanned(
+                    &step,
+                    "stream completion uses return; or unit completion",
+                ));
             }
-            Expr::Break(mut step) => {
-                step.expr = step.expr.map(|value| Box::new(self.fold_expr(*value)));
-                if let Some(checkpoint) = self.target(&step.label, false) {
-                    let context = &self.context;
-                    let label = &step.label;
-                    if let Some(value) = step.expr {
-                        syn::parse_quote!({let __stream_break=#value;#context.release(#checkpoint).await?;break #label __stream_break})
-                    } else {
-                        syn::parse_quote!({#context.release(#checkpoint).await?;break #label})
-                    }
+            parse_quote!(return Ok(()))
+        } else if let Expr::Break(mut step) = expr {
+            step.expr = step.expr.map(|value| Box::new(self.fold_expr(*value)));
+            if let Some(checkpoint) = self.target(&step.label, false) {
+                let context = &self.context;
+                let label = &step.label;
+                if let Some(value) = step.expr {
+                    parse_quote!({let __stream_break=#value;#context.release(#checkpoint).await?;break #label __stream_break})
                 } else {
-                    Expr::Break(step)
+                    parse_quote!({#context.release(#checkpoint).await?;break #label})
                 }
+            } else {
+                Expr::Break(step)
             }
-            Expr::Continue(step) => {
-                if let Some(checkpoint) = self.target(&step.label, true) {
-                    let context = &self.context;
-                    syn::parse_quote!({#context.release(#checkpoint).await?;#step})
-                } else {
-                    Expr::Continue(step)
-                }
-            }
-            Expr::While(mut step) => {
-                step.cond = Box::new(self.fold_expr(*step.cond));
-                let checkpoint = self.checkpoint();
-                self.targets.push((
-                    step.label.as_ref().map(|label| label.name.clone()),
-                    checkpoint.clone(),
-                    true,
-                ));
-                step.body = self.scoped_block(step.body, checkpoint);
-                self.targets.pop();
+        } else if let Expr::Continue(step) = expr {
+            if let Some(checkpoint) = self.target(&step.label, true) {
                 let context = &self.context;
-                step.body
-                    .stmts
-                    .insert(0, syn::parse_quote!(#context.cooperate().await?;));
-                Expr::While(step)
+                parse_quote!({#context.release(#checkpoint).await?;#step})
+            } else {
+                Expr::Continue(step)
             }
-            Expr::ForLoop(mut step) => {
-                step.expr = Box::new(self.fold_expr(*step.expr));
-                let checkpoint = self.checkpoint();
-                self.targets.push((
-                    step.label.as_ref().map(|label| label.name.clone()),
-                    checkpoint.clone(),
-                    true,
-                ));
-                step.body = self.scoped_block(step.body, checkpoint);
+        } else if let Expr::While(mut step) = expr {
+            step.cond = Box::new(self.fold_expr(*step.cond));
+            let checkpoint = self.checkpoint();
+            self.targets.push((
+                step.label.as_ref().map(|label| label.name.clone()),
+                checkpoint.clone(),
+                true,
+            ));
+            step.body = self.scoped_block(step.body, checkpoint);
+            self.targets.pop();
+            let context = &self.context;
+            step.body
+                .stmts
+                .insert(0, parse_quote!(#context.cooperate().await?;));
+            Expr::While(step)
+        } else if let Expr::ForLoop(mut step) = expr {
+            step.expr = Box::new(self.fold_expr(*step.expr));
+            let checkpoint = self.checkpoint();
+            self.targets.push((
+                step.label.as_ref().map(|label| label.name.clone()),
+                checkpoint.clone(),
+                true,
+            ));
+            step.body = self.scoped_block(step.body, checkpoint);
+            self.targets.pop();
+            let context = &self.context;
+            step.body
+                .stmts
+                .insert(0, parse_quote!(#context.cooperate().await?;));
+            Expr::ForLoop(step)
+        } else if let Expr::Loop(mut step) = expr {
+            let checkpoint = self.checkpoint();
+            self.targets.push((
+                step.label.as_ref().map(|label| label.name.clone()),
+                checkpoint.clone(),
+                true,
+            ));
+            step.body = self.scoped_block(step.body, checkpoint);
+            self.targets.pop();
+            let context = &self.context;
+            step.body
+                .stmts
+                .insert(0, parse_quote!(#context.cooperate().await?;));
+            Expr::Loop(step)
+        } else if let Expr::Block(mut step) = expr {
+            let checkpoint = self.checkpoint();
+            if let Some(label) = &step.label {
+                self.targets
+                    .push((Some(label.name.clone()), checkpoint.clone(), false));
+            }
+            step.block = self.scoped_block(step.block, checkpoint);
+            if step.label.is_some() {
                 self.targets.pop();
-                let context = &self.context;
-                step.body
-                    .stmts
-                    .insert(0, syn::parse_quote!(#context.cooperate().await?;));
-                Expr::ForLoop(step)
             }
-            Expr::Loop(mut step) => {
-                let checkpoint = self.checkpoint();
-                self.targets.push((
-                    step.label.as_ref().map(|label| label.name.clone()),
-                    checkpoint.clone(),
-                    true,
-                ));
-                step.body = self.scoped_block(step.body, checkpoint);
-                self.targets.pop();
-                let context = &self.context;
-                step.body
-                    .stmts
-                    .insert(0, syn::parse_quote!(#context.cooperate().await?;));
-                Expr::Loop(step)
-            }
-            Expr::Block(mut step) => {
-                let checkpoint = self.checkpoint();
-                if let Some(label) = &step.label {
-                    self.targets
-                        .push((Some(label.name.clone()), checkpoint.clone(), false));
-                }
-                step.block = self.scoped_block(step.block, checkpoint);
-                if step.label.is_some() {
-                    self.targets.pop();
-                }
-                Expr::Block(step)
-            }
-            other => syn::fold::fold_expr(self, other),
+            Expr::Block(step)
+        } else {
+            syn::fold::fold_expr(self, expr)
         }
     }
     /// Handle the statement form of the local marker before it can become an exported macro call.
@@ -188,7 +180,7 @@ impl Fold for Lower {
                 }
             };
             let context = &self.context;
-            return syn::parse_quote!(#context.append(#source).await?;);
+            return parse_quote!(#context.append(#source).await?;);
         }
         syn::fold::fold_stmt(self, stmt)
     }
@@ -226,12 +218,11 @@ mod tests {
     use super::*;
     /// Generated binds retain guards and native callback boundaries while enforcing the domain bridge.
     #[test]
-    fn native_lowering_contract() {
+    fn native_lowering_contract() -> syn::Result<()> {
         let statements = syn::parse::Parser::parse_str(
             syn::Block::parse_within,
             "yield_from!(helper()); for value in values {yield step(value)?;continue;}",
-        )
-        .expect("Rust statements");
+        )?;
         let mut lower = Lower {
             context: Ident::new("stream_context", Span::mixed_site()),
             error: None,
@@ -248,5 +239,6 @@ mod tests {
         assert!(output.contains("release"));
         assert!(!output.contains("yield_from"));
         assert!(lower.error.is_none());
+        Ok(())
     }
 }

@@ -1,3 +1,5 @@
+use effect::projection;
+use serde_json::json;
 #[path = "support/campaign_report.rs"]
 mod campaign_report;
 
@@ -7,12 +9,13 @@ use effect::eventlog::{
     EventVersion, HasAtomicProjectionStore, HasEventJournal, JournalCompaction, JournalCursor,
     JournalEntry, JournalRead, JournalReadOutcome, JournalStream, MemoryEventJournal,
     MemoryJournalCapacity, MemoryJournalError, MemoryProjectionStore, MemoryRetentionAuthority,
-    Projection, ProjectionAdvance, ProjectionAdvanceError, ProjectionId, ProjectionKey,
-    ProjectionVersion, ReplayRetention,
+    ProjectionAdvance, ProjectionAdvanceError, ProjectionId, ProjectionKey, ProjectionVersion,
+    ReplayRetention,
 };
 use effect::{Exit, JsonValue, KeyDomain, KeyNamespace, KeySegment, StableKey, UtcMillis};
 use futures_executor::block_on;
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -48,15 +51,15 @@ fn next(state: &mut u64) -> u64 {
     *state
 }
 
-fn number(config: &JsonValue, path: &[&str]) -> u64 {
+fn number(config: &JsonValue, path: &[&str]) -> Result<u64, String> {
     path.iter()
-        .fold(config, |value, field| {
+        .try_fold(config, |value, field| {
             value
                 .get(*field)
-                .unwrap_or_else(|| panic!("missing campaign field {field}"))
-        })
+                .ok_or_else(|| format!("missing campaign field {field}"))
+        })?
         .as_u64()
-        .expect("campaign field is a nonnegative integer")
+        .ok_or_else(|| format!("campaign integer: {path:?}"))
 }
 
 enum Location {
@@ -81,7 +84,11 @@ impl Model {
         }
     }
 
-    fn append(&mut self, event: EventEnvelope, expected: JournalCursor) -> AppendReceipt {
+    fn append(
+        &mut self,
+        event: EventEnvelope,
+        expected: JournalCursor,
+    ) -> Result<AppendReceipt, &'static str> {
         let decision = match self.by_id.get(&event.id) {
             Some(Location::Compacted) => AppendDecision::CompactedEventId,
             Some(Location::Retained(entry)) if entry.event == event => {
@@ -94,7 +101,7 @@ impl Model {
             None => {
                 self.cursor += 1;
                 let entry = JournalEntry {
-                    sequence: NonZeroU64::new(self.cursor).expect("model cursor is positive"),
+                    sequence: NonZeroU64::new(self.cursor).ok_or("zero model cursor")?,
                     event,
                 };
                 self.by_id
@@ -103,7 +110,7 @@ impl Model {
                 AppendDecision::Committed(entry)
             }
         };
-        AppendReceipt::Decided(decision)
+        Ok(AppendReceipt::Decided(decision))
     }
 
     fn inspect(&self, id: &EventId) -> EventInspection {
@@ -146,7 +153,7 @@ impl Model {
     }
 
     fn compact(&mut self, through: JournalCursor) -> CompactionOutcome {
-        if self.cursor == 0 || through.value() + 1 <= self.first_available {
+        if self.cursor == 0 || through.value() < self.first_available {
             return CompactionOutcome::NoChange;
         }
         let removed = self
@@ -166,37 +173,37 @@ impl Model {
 }
 
 #[test]
-fn configured_journal_histories_match_independent_model() {
+fn configured_journal_histories_match_independent_model() -> Result<(), Box<dyn std::error::Error>>
+{
     let configured = std::env::var_os("EFFECT_CAMPAIGN_CONFIG")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/feature_campaigns.json")
         });
-    let config: JsonValue = std::fs::read_to_string(configured)
-        .expect("campaign configuration is readable")
-        .parse()
-        .expect("campaign configuration is JSON");
-    let seeds = number(&config, &["campaigns", "eventlog", "seeds"]);
-    let transitions = number(&config, &["campaigns", "eventlog", "transitions"]);
-    let identities = number(&config, &["campaigns", "eventlog", "identities"]);
-    let page_limit = NonZeroUsize::new(
-        usize::try_from(number(&config, &["campaigns", "eventlog", "page_limit"]))
-            .expect("page limit fits usize"),
-    )
-    .expect("positive page limit");
-    let capacity = NonZeroUsize::new(usize::try_from(transitions).expect("workload fits usize"))
-        .expect("positive workload");
-    let budget = Duration::from_secs(number(&config, &["budgets", "seconds"]));
+    let config: JsonValue = std::fs::read_to_string(configured)?.parse()?;
+    let seeds = number(&config, &["campaigns", "eventlog", "seeds"])?;
+    let transitions = number(&config, &["campaigns", "eventlog", "transitions"])?;
+    let identities = number(&config, &["campaigns", "eventlog", "identities"])?;
+    let page_limit = NonZeroUsize::new(usize::try_from(number(
+        &config,
+        &["campaigns", "eventlog", "page_limit"],
+    )?)?)
+    .ok_or("zero page limit")?;
+    let capacity = NonZeroUsize::new(usize::try_from(transitions)?).ok_or("zero workload")?;
+    let budget = Duration::from_secs(number(&config, &["budgets", "seconds"])?);
     assert!(seeds >= 1_000 && transitions >= 100 && identities > 0);
-    let namespace = KeyNamespace::<Domain>::new("journal").expect("campaign namespace");
-    let key =
-        |slot| StableKey::new(&namespace, [KeySegment::Unsigned(slot)]).expect("campaign key");
-    let stream = JournalStream {
-        journal: EventJournalId::from_stable(key(0)),
-        aggregate: AggregateId::from_stable(key(1)),
+    let namespace =
+        KeyNamespace::<Domain>::new("journal").map_err(|error| format!("namespace: {error:?}"))?;
+    let key = |slot| {
+        StableKey::new(&namespace, [KeySegment::Unsigned(slot)])
+            .map_err(|error| format!("campaign key: {error:?}"))
     };
-    let group = EventGroupId::new("campaign").expect("event group");
-    let tag = EventTag::new("recorded").expect("event tag");
+    let stream = JournalStream {
+        journal: EventJournalId::from_stable(key(0)?),
+        aggregate: AggregateId::from_stable(key(1)?),
+    };
+    let group = EventGroupId::new("campaign").map_err(|error| format!("group: {error:?}"))?;
+    let tag = EventTag::new("recorded").map_err(|error| format!("tag: {error:?}"))?;
     let version = EventVersion::new(NonZeroU32::MIN);
     let started = Instant::now();
     let mut operations = [0_u64; 6];
@@ -216,16 +223,10 @@ fn configured_journal_histories_match_independent_model() {
             journal: Arc::clone(&journal),
             projections: Arc::clone(&projection_store),
         });
-        let projection = Projection::new(
-            ProjectionKey {
-                id: ProjectionId::from_stable(key(2)),
-                stream: stream.clone(),
-            },
-            ProjectionVersion::new(NonZeroU32::MIN),
-            BTreeMap::from([((group.clone(), tag.clone()), version)]),
-            || 0usize,
-            |count, _| Ok::<usize, ()>(count + 1),
-        );
+        let projection = projection! { key: ProjectionKey {
+            id: ProjectionId::from_stable(key(2)?),
+            stream: stream.clone(),
+        }, version: ProjectionVersion::new(NonZeroU32::MIN), accepted: BTreeMap::from([((group.clone(), tag.clone()), version)]), initial: || 0usize, fold: |count, _| Ok::<usize, ()>(count + 1),  };
         let retention = journal.retention_authority();
         if seed == 0 {
             let unrelated = MemoryRetentionAuthority::new();
@@ -240,18 +241,19 @@ fn configured_journal_histories_match_independent_model() {
         }
         retention
             .replay_policy(stream.clone(), ReplayRetention::DiscardHistory)
-            .expect("explicit discard policy");
+            .map_err(|error| format!("discard policy: {error:?}"))?;
         let mut model = Model::new();
         let mut projected: Option<(JournalCursor, usize)> = None;
-        let mut generator = number(&config, &["seed"]).wrapping_add(seed).max(1);
+        let mut generator = number(&config, &["seed"])?.wrapping_add(seed).max(1);
         for _ in 0..transitions {
-            let choice = usize::try_from(next(&mut generator) % operations.len() as u64)
-                .expect("operation index fits usize");
-            operations[choice] += 1;
+            let choice = usize::try_from(next(&mut generator) % operations.len() as u64)?;
+            *operations
+                .get_mut(choice)
+                .ok_or("invalid operation index")? += 1;
             match choice {
                 0 => {
                     let slot = next(&mut generator) % identities;
-                    let id = EventId::from_stable(key(slot));
+                    let id = EventId::from_stable(key(slot)?);
                     let event = if let Some(Location::Retained(entry)) = model.by_id.get(&id) {
                         if next(&mut generator) & 1 == 0 {
                             entry.event.clone()
@@ -278,7 +280,7 @@ fn configured_journal_histories_match_independent_model() {
                     } else {
                         model.cursor.saturating_sub(1)
                     });
-                    let predicted = model.append(event.clone(), expected);
+                    let predicted = model.append(event.clone(), expected)?;
                     if let AppendReceipt::Decided(decision) = &predicted {
                         let index = match decision {
                             AppendDecision::Committed(_) => 0,
@@ -287,7 +289,7 @@ fn configured_journal_histories_match_independent_model() {
                             AppendDecision::CompactedEventId => 3,
                             AppendDecision::StaleCursor { .. } => 4,
                         };
-                        decisions[index] += 1;
+                        *decisions.get_mut(index).ok_or("invalid decision index")? += 1;
                     }
                     assert_eq!(
                         block_on(journal.append(event, expected).run(Arc::new(()))),
@@ -296,14 +298,16 @@ fn configured_journal_histories_match_independent_model() {
                     );
                 }
                 1 => {
-                    let id = EventId::from_stable(key(next(&mut generator) % identities));
+                    let id = EventId::from_stable(key(next(&mut generator) % identities)?);
                     let predicted = model.inspect(&id);
                     let index = match &predicted {
                         EventInspection::Present(_) => 0,
                         EventInspection::Compacted => 1,
                         EventInspection::Missing => 2,
                     };
-                    inspections[index] += 1;
+                    *inspections
+                        .get_mut(index)
+                        .ok_or("invalid inspection index")? += 1;
                     assert_eq!(
                         block_on(
                             journal
@@ -322,7 +326,7 @@ fn configured_journal_histories_match_independent_model() {
                         JournalReadOutcome::HistoryTruncated { .. } => 1,
                         JournalReadOutcome::CursorAhead { .. } => 2,
                     };
-                    reads[index] += 1;
+                    *reads.get_mut(index).ok_or("invalid read index")? += 1;
                     assert_eq!(
                         block_on(
                             journal
@@ -336,9 +340,12 @@ fn configured_journal_histories_match_independent_model() {
                 3 => {
                     let through = JournalCursor::new(next(&mut generator) % (model.cursor + 1));
                     let predicted = model.compact(through);
-                    compactions
-                        [usize::from(matches!(predicted, CompactionOutcome::Compacted { .. }))] +=
-                        1;
+                    *compactions
+                        .get_mut(usize::from(matches!(
+                            predicted,
+                            CompactionOutcome::Compacted { .. }
+                        )))
+                        .ok_or("invalid compaction index")? += 1;
                     assert_eq!(
                         block_on(
                             journal
@@ -384,7 +391,9 @@ fn configured_journal_histories_match_independent_model() {
                             projected = Some((page.next, next_count));
                         }
                         JournalReadOutcome::CursorAhead { .. } => {
-                            unreachable!("a projection checkpoint cannot exceed this model journal")
+                            return Err(
+                                "a projection checkpoint cannot exceed this model journal".into()
+                            );
                         }
                     }
                     let saved = block_on(
@@ -420,14 +429,16 @@ fn configured_journal_histories_match_independent_model() {
     );
     campaign_report::completed(
         "eventlog",
-        serde_json::json!({
+        json!({
             "seeds": seeds, "transitions": transitions,
             "operations": operations, "append_decisions": decisions,
             "inspections": inspections, "reads": reads,
             "compactions": compactions, "projections": projections,
         }),
-    );
-    eprintln!(
+    )?;
+    writeln!(
+        std::io::stderr().lock(),
         "event journal/projection model completed {seeds} seeds x {transitions} transitions; operations {operations:?}; append decisions {decisions:?}; inspections {inspections:?}; reads {reads:?}; compactions {compactions:?}; projections {projections:?}"
-    );
+    )?;
+    Ok(())
 }

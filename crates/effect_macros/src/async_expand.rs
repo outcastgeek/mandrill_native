@@ -5,6 +5,7 @@ use quote::{quote, quote_spanned};
 use syn::fold::Fold;
 use syn::spanned::Spanned;
 use syn::{Expr, Stmt};
+use syn::{parse_quote, parse_quote_spanned};
 
 /// Typed target used by async expand.
 struct Target {
@@ -77,9 +78,9 @@ impl Lower {
         match checkpoint {
             Some(checkpoint) => {
                 let close = self.close(&checkpoint);
-                syn::parse_quote!({ let #checkpoint = #context.checkpoint(); #yielding let __effect_value = { #(#statements)* }; #close __effect_value })
+                parse_quote!({ let #checkpoint = #context.checkpoint(); #yielding let __effect_value = { #(#statements)* }; #close __effect_value })
             }
-            None => syn::parse_quote!({ #yielding #(#statements)* }),
+            None => parse_quote!({ #yielding #(#statements)* }),
         }
     }
     ///
@@ -115,10 +116,6 @@ impl Fold for Lower {
     fn fold_item(&mut self, item: syn::Item) -> syn::Item {
         item
     }
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "Delegate ordinary and future non-exhaustive syn syntax to syn folding"
-    )]
     ///
     /// # Parameters
     /// - `expr` (`Expr`): Rust syntax expression parsed or expanded by this macro.
@@ -127,96 +124,90 @@ impl Fold for Lower {
     /// Type: `Expr`.
     /// Returns `Expr`.
     fn fold_expr(&mut self, expr: Expr) -> Expr {
-        match expr {
-            Expr::Closure(expr) => Expr::Closure(expr),
-            Expr::Async(expr) => Expr::Async(expr),
-            Expr::Try(expr) => {
-                let program = self.fold_expr(*expr.expr);
-                let context = &self.context;
-                syn::parse_quote_spanned!(expr.question_token.span=> match #context.bind(#program).await { Ok(__effect_value) => __effect_value, Err(__effect_failure) => return __effect_failure })
-            }
-            Expr::Return(expr) => {
-                let value = expr
-                    .expr
-                    .map(|expr| self.fold_expr(*expr))
-                    .unwrap_or_else(|| syn::parse_quote!(()));
-                let path = &self.path;
-                syn::parse_quote_spanned!(expr.return_token.span=> return #path::Exit::Success(#value))
-            }
-            Expr::Break(mut expr) => {
-                expr.expr = expr.expr.map(|value| Box::new(self.fold_expr(*value)));
-                match self.target(&expr.label, false) {
-                    Some(checkpoint) => {
-                        let close = self.close(checkpoint);
-                        let label = &expr.label;
-                        match expr.expr {
-                            Some(value) => {
-                                syn::parse_quote!({ let __effect_break_value = #value; #close break #label __effect_break_value })
-                            }
-                            None => syn::parse_quote!({ #close break #label }),
-                        }
-                    }
-                    None => Expr::Break(expr),
-                }
-            }
-            Expr::Continue(expr) => match self.target(&expr.label, true) {
+        if matches!(&expr, Expr::Closure(_) | Expr::Async(_)) {
+            expr
+        } else if let Expr::Try(expr) = expr {
+            let program = self.fold_expr(*expr.expr);
+            let context = &self.context;
+            parse_quote_spanned!(expr.question_token.span.resolved_at(proc_macro2::Span::mixed_site())=> match #context.bind(#program).await { Ok(__effect_value) => __effect_value, Err(__effect_failure) => return __effect_failure })
+        } else if let Expr::Return(expr) = expr {
+            let value = expr
+                .expr
+                .map(|expr| self.fold_expr(*expr))
+                .unwrap_or_else(|| parse_quote!(()));
+            let path = &self.path;
+            parse_quote_spanned!(expr.return_token.span.resolved_at(proc_macro2::Span::mixed_site())=> return #path::Exit::Success(#value))
+        } else if let Expr::Break(mut expr) = expr {
+            expr.expr = expr.expr.map(|value| Box::new(self.fold_expr(*value)));
+            match self.target(&expr.label, false) {
                 Some(checkpoint) => {
                     let close = self.close(checkpoint);
-                    syn::parse_quote_spanned!(expr.span()=> { #close #expr })
+                    let label = &expr.label;
+                    match expr.expr {
+                        Some(value) => {
+                            parse_quote!({ let __effect_break_value = #value; #close break #label __effect_break_value })
+                        }
+                        None => parse_quote!({ #close break #label }),
+                    }
+                }
+                None => Expr::Break(expr),
+            }
+        } else if let Expr::Continue(expr) = expr {
+            match self.target(&expr.label, true) {
+                Some(checkpoint) => {
+                    let close = self.close(checkpoint);
+                    parse_quote_spanned!(expr.span().resolved_at(proc_macro2::Span::mixed_site())=> { #close #expr })
                 }
                 None => Expr::Continue(expr),
-            },
-            Expr::Loop(mut expr) => {
+            }
+        } else if let Expr::Loop(mut expr) = expr {
+            let checkpoint = self.checkpoint();
+            self.targets.push(Target {
+                label: expr.label.as_ref().map(|label| label.name.clone()),
+                checkpoint: checkpoint.clone(),
+                continuing: true,
+            });
+            expr.body = self.block(expr.body, Some(checkpoint), true);
+            let _ = self.targets.pop();
+            Expr::Loop(expr)
+        } else if let Expr::While(mut expr) = expr {
+            expr.cond = Box::new(self.fold_expr(*expr.cond));
+            let checkpoint = self.checkpoint();
+            self.targets.push(Target {
+                label: expr.label.as_ref().map(|label| label.name.clone()),
+                checkpoint: checkpoint.clone(),
+                continuing: true,
+            });
+            expr.body = self.block(expr.body, Some(checkpoint), true);
+            let _ = self.targets.pop();
+            Expr::While(expr)
+        } else if let Expr::ForLoop(mut expr) = expr {
+            expr.expr = Box::new(self.fold_expr(*expr.expr));
+            let checkpoint = self.checkpoint();
+            self.targets.push(Target {
+                label: expr.label.as_ref().map(|label| label.name.clone()),
+                checkpoint: checkpoint.clone(),
+                continuing: true,
+            });
+            expr.body = self.block(expr.body, Some(checkpoint), true);
+            let _ = self.targets.pop();
+            Expr::ForLoop(expr)
+        } else if let Expr::Block(mut expr) = expr {
+            if let Some(label) = &expr.label {
                 let checkpoint = self.checkpoint();
                 self.targets.push(Target {
-                    label: expr.label.as_ref().map(|label| label.name.clone()),
+                    label: Some(label.name.clone()),
                     checkpoint: checkpoint.clone(),
-                    continuing: true,
+                    continuing: false,
                 });
-                expr.body = self.block(expr.body, Some(checkpoint), true);
+                expr.block = self.block(expr.block, Some(checkpoint), false);
                 let _ = self.targets.pop();
-                Expr::Loop(expr)
+            } else {
+                expr.block = self.fold_block(expr.block);
             }
-            Expr::While(mut expr) => {
-                expr.cond = Box::new(self.fold_expr(*expr.cond));
-                let checkpoint = self.checkpoint();
-                self.targets.push(Target {
-                    label: expr.label.as_ref().map(|label| label.name.clone()),
-                    checkpoint: checkpoint.clone(),
-                    continuing: true,
-                });
-                expr.body = self.block(expr.body, Some(checkpoint), true);
-                let _ = self.targets.pop();
-                Expr::While(expr)
-            }
-            Expr::ForLoop(mut expr) => {
-                expr.expr = Box::new(self.fold_expr(*expr.expr));
-                let checkpoint = self.checkpoint();
-                self.targets.push(Target {
-                    label: expr.label.as_ref().map(|label| label.name.clone()),
-                    checkpoint: checkpoint.clone(),
-                    continuing: true,
-                });
-                expr.body = self.block(expr.body, Some(checkpoint), true);
-                let _ = self.targets.pop();
-                Expr::ForLoop(expr)
-            }
-            Expr::Block(mut expr) => {
-                if let Some(label) = &expr.label {
-                    let checkpoint = self.checkpoint();
-                    self.targets.push(Target {
-                        label: Some(label.name.clone()),
-                        checkpoint: checkpoint.clone(),
-                        continuing: false,
-                    });
-                    expr.block = self.block(expr.block, Some(checkpoint), false);
-                    let _ = self.targets.pop();
-                } else {
-                    expr.block = self.fold_block(expr.block);
-                }
-                Expr::Block(expr)
-            }
-            other => syn::fold::fold_expr(self, other),
+            Expr::Block(expr)
+        } else {
+            syn::fold::fold_expr(self, expr)
         }
     }
     ///

@@ -4,8 +4,10 @@ use super::{
     AsyncResult, InvalidationBatch, InvalidationError, InvalidationKey, InvalidationRegistry,
 };
 use crate::pub_sub::{Subscription, SubscriptionEvent};
+use crate::{Chunk, Effect, Exit, ResourceValue, Scope, SharedValue, Stream, StreamReader};
 use crate::{
-    Chunk, Effect, Exit, Release, ResourceValue, Scope, SharedValue, Stream, StreamReader,
+    effect, effect_die, effect_map, effect_map_error, effect_resource, effect_scope_acquire,
+    effect_sync, effect_try_sync,
 };
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
@@ -122,26 +124,27 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> ReactiveQue
         let query = self.clone();
         Stream::new(move |scope: Scope<ReactiveQueryError>| {
             let query = query.clone();
-            let subscription = query
-                .registry
-                .subscribe()
-                .map_error(ReactiveQueryError::Invalidation);
-            scope
-                .acquire(subscription, |subscription| {
-                    Release::sync(move || {
-                        subscription.close_now();
-                    })
-                })
-                .map(move |subscription| {
-                    let state = Arc::new(Mutex::new(QueryState {
-                        stage: QueryStage::Initial,
-                        generation: None,
-                        previous_success: None,
-                        seen_revision: None,
-                    }));
-                    let query = query.clone();
-                    StreamReader::new(query_pull(query, subscription, state))
-                })
+            let subscription = effect_map_error! {
+            program: query
+            .registry
+            .subscribe(), map: ReactiveQueryError::Invalidation, };
+            effect_map! {
+                            program: effect_scope_acquire! {
+            scope: scope, acquire: subscription, release: |subscription| {
+                                crate::Release::sync(move || {
+                                    subscription.close_now();
+                                })
+                            },
+            }, map: move |subscription| {
+                                let state = Arc::new(Mutex::new(QueryState {
+                                    stage: QueryStage::Initial,
+                                    generation: None,
+                                    previous_success: None,
+                                    seen_revision: None,
+                                }));
+                                let query = query.clone();
+                                StreamReader::new(query_pull(query, subscription, state))
+                            }, }
         })
     }
 }
@@ -170,58 +173,64 @@ where
     E: Send + 'static,
     R: Send + Sync + 'static,
 {
-    Effect::defer(move || {
-        let query = query.clone();
-        let subscription = subscription.clone();
-        let state = Arc::clone(&state);
-        let stage = {
-            let mut state = state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match state.stage {
-                QueryStage::Initial => {
-                    state.stage = QueryStage::NeedEvaluation;
-                    return Effect::sync(|| Chunk::Values(vec![AsyncResult::Initial]));
+    {
+        let __dsl_factory = move || {
+            let query = query.clone();
+            let subscription = subscription.clone();
+            let state = Arc::clone(&state);
+            let stage = {
+                let mut state = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match state.stage {
+                    QueryStage::Initial => {
+                        state.stage = QueryStage::NeedEvaluation;
+                        return effect_sync! { body: || Chunk::Values(vec![AsyncResult::Initial]), };
+                    }
+                    QueryStage::NeedEvaluation => {
+                        let next = match state.generation {
+                            None => Some(NonZeroU64::MIN),
+                            Some(generation) => {
+                                generation.get().checked_add(1).and_then(NonZeroU64::new)
+                            }
+                        };
+                        let Some(generation) = next else {
+                            return effect_try_sync! {
+                                once; body: {
+                                let __dsl_result = Err(
+                                ReactiveQueryError::GenerationExhausted,
+                            ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                        };
+                        state.generation = Some(generation);
+                        state.stage = QueryStage::Evaluating;
+                        let previous_success = state.previous_success.clone();
+                        return effect_sync! {
+                            once; body: move || {
+                            Chunk::Values(vec![AsyncResult::Running {
+                                generation,
+                                refreshing: previous_success.is_some(),
+                                previous_success,
+                            }])
+                        }, };
+                    }
+                    QueryStage::Evaluating => {
+                        state.stage = QueryStage::EvaluationActive;
+                        QueryStage::Evaluating
+                    }
+                    QueryStage::EvaluationActive => QueryStage::EvaluationActive,
+                    QueryStage::Waiting => QueryStage::Waiting,
                 }
-                QueryStage::NeedEvaluation => {
-                    let next = match state.generation {
-                        None => Some(NonZeroU64::MIN),
-                        Some(generation) => {
-                            generation.get().checked_add(1).and_then(NonZeroU64::new)
-                        }
-                    };
-                    let Some(generation) = next else {
-                        return Effect::from_result_once(Err(
-                            ReactiveQueryError::GenerationExhausted,
-                        ));
-                    };
-                    state.generation = Some(generation);
-                    state.stage = QueryStage::Evaluating;
-                    let previous_success = state.previous_success.clone();
-                    return Effect::sync_once(move || {
-                        Chunk::Values(vec![AsyncResult::Running {
-                            generation,
-                            refreshing: previous_success.is_some(),
-                            previous_success,
-                        }])
-                    });
+            };
+            match stage {
+                QueryStage::Evaluating => evaluate_query(query, subscription, state),
+                QueryStage::Waiting => wait_invalidation(query, subscription, state),
+                QueryStage::Initial | QueryStage::NeedEvaluation | QueryStage::EvaluationActive => {
+                    effect_try_sync! { once; body: { let __dsl_result = Err(ReactiveQueryError::ConcurrentPull); move || __dsl_result }, on_error: ::core::convert::identity, }
                 }
-                QueryStage::Evaluating => {
-                    state.stage = QueryStage::EvaluationActive;
-                    QueryStage::Evaluating
-                }
-                QueryStage::EvaluationActive => QueryStage::EvaluationActive,
-                QueryStage::Waiting => QueryStage::Waiting,
             }
         };
-        match stage {
-            QueryStage::Evaluating => evaluate_query(query, subscription, state),
-            QueryStage::Waiting => wait_invalidation(query, subscription, state),
-            QueryStage::Initial | QueryStage::NeedEvaluation | QueryStage::EvaluationActive => {
-                Effect::from_result_once(Err(ReactiveQueryError::ConcurrentPull))
-            }
-        }
-    })
+        effect! { __dsl_factory()? }
+    }
 }
 
 ///
@@ -253,66 +262,63 @@ where
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .generation;
     let Some(generation) = generation else {
-        return Effect::from_result_once(Err(ReactiveQueryError::ConcurrentPull));
+        return effect_try_sync! { once; body: { let __dsl_result = Err(ReactiveQueryError::ConcurrentPull); move || __dsl_result }, on_error: ::core::convert::identity, };
     };
     let dependencies = Arc::clone(&query.dependencies);
     let registry = query.registry.clone();
     let evaluate = Arc::clone(&query.evaluate);
     let state_for_cleanup = Arc::clone(&state);
-    registry
-        .revision_of(Arc::clone(&dependencies))
-        .map_error(ReactiveQueryError::Invalidation)
-        .flat_map(move |before| {
-            let registry = registry.clone();
-            let dependencies = Arc::clone(&dependencies);
-            let state = Arc::clone(&state);
-            (evaluate)()
-                .materialize_exit()
-                .map_error(|never: std::convert::Infallible| match never {})
-                .flat_map(move |outcome| {
-                    let outcome = Mutex::new(Some(outcome));
-                    let state = Arc::clone(&state);
-                    registry
-                        .revision_of(Arc::clone(&dependencies))
-                        .map_error(ReactiveQueryError::Invalidation)
-                        .flat_map(move |after| {
-                            let outcome = outcome
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .take();
-                            let Some(outcome) = outcome else {
-                                return Effect::from_result_once(Err(
-                                    ReactiveQueryError::ConcurrentPull,
-                                ));
-                            };
-                            let mut state = state
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            if state.generation != Some(generation)
-                                || !matches!(state.stage, QueryStage::EvaluationActive)
-                            {
-                                return Effect::sync(|| Chunk::Values(Vec::new()));
-                            }
-                            let previous = state.previous_success.clone();
-                            let result = AsyncResult::settle(generation, outcome, previous);
-                            if let AsyncResult::Settled {
-                                outcome: Exit::Success(value),
-                                ..
-                            } = &result
-                            {
-                                state.previous_success = Some(value.clone());
-                            }
-                            state.seen_revision = after;
-                            state.stage = if after != before {
-                                QueryStage::NeedEvaluation
-                            } else {
-                                QueryStage::Waiting
-                            };
-                            Effect::sync_once(move || Chunk::Values(vec![result]))
-                        })
-                })
-        })
-        .ensuring(Effect::sync(move || {
+    let program = effect! {
+        let registry = registry.clone();
+        let dependencies = Arc::clone(&dependencies);
+        let evaluate = Arc::clone(&evaluate);
+        let state = Arc::clone(&state);
+        let before = effect_map_error! {
+            program: registry.revision_of(Arc::clone(&dependencies)),
+            map: ReactiveQueryError::Invalidation,
+        }?;
+        let outcome = effect_map_error! {
+            program: evaluate().materialize_exit(),
+            map: |never: std::convert::Infallible| match never {},
+        }?;
+        let after = effect_map_error! {
+            program: registry.revision_of(dependencies),
+            map: ReactiveQueryError::Invalidation,
+        }?;
+        let chunk = {
+            let mut state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.generation != Some(generation)
+                || !matches!(state.stage, QueryStage::EvaluationActive)
+            {
+                Chunk::Values(Vec::new())
+            } else {
+                let previous = state.previous_success.clone();
+                let result = AsyncResult::settle(generation, outcome, previous);
+                if let AsyncResult::Settled {
+                    outcome: Exit::Success(value),
+                    ..
+                } = &result
+                {
+                    state.previous_success = Some(value.clone());
+                }
+                state.seen_revision = after;
+                state.stage = if after != before {
+                    QueryStage::NeedEvaluation
+                } else {
+                    QueryStage::Waiting
+                };
+                Chunk::Values(vec![result])
+            }
+        };
+        effect_sync! {
+            once;
+            body: move || chunk,
+        }?
+    };
+    let cleanup = effect_sync! {
+        body: move || {
             let mut state = state_for_cleanup
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -321,7 +327,13 @@ where
             {
                 state.stage = QueryStage::NeedEvaluation;
             }
-        }))
+        },
+    };
+    effect_resource! {
+        acquire: effect_sync! { body: || (), },
+        release: move |(), _| cleanup.clone(),
+        body: move |_| program.clone(),
+    }
 }
 
 ///
@@ -349,34 +361,39 @@ where
     R: Send + Sync + 'static,
 {
     let next = match subscription.with(|value| value.take::<R>()) {
-        Ok(next) => next
-            .map_error(|error| ReactiveQueryError::Invalidation(InvalidationError::PubSub(error))),
-        Err(defect) => return Effect::die(defect),
+        Ok(next) => {
+            effect_map_error! { program: next, map: |error| ReactiveQueryError::Invalidation(InvalidationError::PubSub(error)), }
+        }
+        Err(defect) => return effect_die! { defect: defect, },
     };
-    next.flat_map(move |event| {
-        let relevant = match event {
-            SubscriptionEvent::Item(batch) => {
-                let seen = state
+    {
+        let __dsl_program = next;
+        effect! {
+            let __dsl_program = __dsl_program.clone(); let query = query.clone(); let state = state.clone(); let subscription = subscription.clone(); let event = __dsl_program?; (move || {
+            let relevant = match event {
+                SubscriptionEvent::Item(batch) => {
+                    let seen = state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .seen_revision;
+                    Some(batch.revision) > seen
+                        && batch
+                            .keys
+                            .iter()
+                            .any(|key| query.dependencies.binary_search(key).is_ok())
+                }
+                SubscriptionEvent::Lagged(_) => true,
+                SubscriptionEvent::End => {
+                    return effect_try_sync! { once; body: { let __dsl_result = Err(ReactiveQueryError::SubscriptionEnded); move || __dsl_result }, on_error: ::core::convert::identity, };
+                }
+            };
+            if relevant {
+                state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .seen_revision;
-                Some(batch.revision) > seen
-                    && batch
-                        .keys
-                        .iter()
-                        .any(|key| query.dependencies.binary_search(key).is_ok())
+                    .stage = QueryStage::NeedEvaluation;
             }
-            SubscriptionEvent::Lagged(_) => true,
-            SubscriptionEvent::End => {
-                return Effect::from_result_once(Err(ReactiveQueryError::SubscriptionEnded));
-            }
-        };
-        if relevant {
-            state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .stage = QueryStage::NeedEvaluation;
-        }
-        query_pull(query.clone(), subscription.clone(), Arc::clone(&state))
-    })
+            query_pull(query.clone(), subscription.clone(), Arc::clone(&state))
+        })()? }
+    }
 }

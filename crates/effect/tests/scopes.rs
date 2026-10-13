@@ -3,6 +3,10 @@ use effect::{
     Cancellation, CleanupFailure, Defect, Effect, Exit, Finalization, PrimaryOutcome, Release,
     ResourceValue, Scope, ScopeCloseStatus, effect,
 };
+use effect::{
+    effect_finalizer, effect_future, effect_map, effect_provided, effect_resource, effect_scope,
+    effect_scope_acquire, effect_sync, effect_try_future, effect_try_sync, service,
+};
 use futures_executor::block_on;
 use futures_util::future::join;
 use std::future::Future;
@@ -22,9 +26,9 @@ enum Error {
 }
 
 fn count_release(counter: Arc<AtomicUsize>) -> Release<Error> {
-    Release::sync(move || {
+    effect_resource! { release_sync; body: move || {
         let _ = counter.fetch_add(1, Ordering::SeqCst);
-    })
+    }, }
 }
 
 #[test]
@@ -43,25 +47,31 @@ fn abandoned_scope_invalidates_owned_resources_before_waking_closed_observers() 
     let witness = Arc::clone(&slot);
     let count = Arc::new(AtomicUsize::new(0));
     let released = Arc::clone(&count);
-    let program: Effect<(), Error> = Scope::scoped(move |scope| {
-        let released = Arc::clone(&released);
-        let witness = Arc::clone(&witness);
-        scope
-            .acquire(Effect::sync(|| String::from("owned")), move |resource| {
-                let released = Arc::clone(&released);
-                Release::sync(move || {
-                    drop(resource);
-                    let _ = released.fetch_add(1, Ordering::SeqCst);
-                })
-            })
-            .flat_map(move |handle| {
-                *witness
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some((scope.clone(), handle));
-                Effect::from_future(|_| std::future::pending())
-            })
-    });
+    let program: Effect<(), Error> = effect_scope! {
+    body: move |scope| {
+            let released = Arc::clone(&released);
+            let witness = Arc::clone(&witness);
+            effect! {
+     bind;
+     program: effect_scope_acquire! {
+    scope: scope, acquire: effect_sync! { body: || String::from("owned"), }, release: move |resource| {
+                    let released = Arc::clone(&released);
+                    effect_resource! { release_sync; body: move || {
+                        drop(resource);
+                        let _ = released.fetch_add(1, Ordering::SeqCst);
+                    }, }
+                },
+    },
+     body: move |handle| {
+                    *witness
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some((scope.clone(), handle));
+                    effect_future! { body: |_| std::future::pending(), }
+                },
+     }
+        },
+    };
     let (mut driver, observer) = program.owned_run(Arc::new(()));
     drive::suspended(Pin::new(&mut driver));
     let handles = slot
@@ -96,32 +106,34 @@ fn scopes_are_lazy_fresh_and_drain_reverse_order_after_primary_failure() {
     let order = Arc::new(Mutex::new(Vec::new()));
     let started_witness = Arc::clone(&started);
     let order_witness = Arc::clone(&order);
-    let program = Scope::scoped(move |scope| {
-        let _ = started_witness.fetch_add(1, Ordering::SeqCst);
-        let order = Arc::clone(&order_witness);
-        let make = |id| {
-            let order = Arc::clone(&order);
-            scope.add_release(move || {
+    let program = effect_scope! {
+    body: move |scope| {
+            let _ = started_witness.fetch_add(1, Ordering::SeqCst);
+            let order = Arc::clone(&order_witness);
+            let make = |id| {
                 let order = Arc::clone(&order);
-                Release::try_sync(move || {
-                    order
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(id);
-                    Err(Error::Release(std::cell::Cell::new(id)))
-                })
-            })
-        };
-        let first = make(1);
-        let second = make(2);
-        effect! {
-            let first = first.clone();
-            let second = second.clone();
-            first?;
-            second?;
-            Effect::<(), Error>::fail_with(|| Error::Body(std::cell::Cell::new(42)))?
-        }
-    });
+                effect_finalizer! { release; scope: scope, release: move || {
+                    let order = Arc::clone(&order);
+                    effect_resource! { release_try_sync; body: move || {
+                        order
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(id);
+                        Err(Error::Release(std::cell::Cell::new(id)))
+                    }, }
+                }, }
+            };
+            let first = make(1);
+            let second = make(2);
+            effect! {
+                let first = first.clone();
+                let second = second.clone();
+                first?;
+                second?;
+                { let __dsl_program: Effect < () , Error > = effect_try_sync! { body: { let __dsl_error = || Error::Body(std::cell::Cell::new(42)); move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }; __dsl_program }?
+            }
+        },
+    };
     assert_eq!(started.load(Ordering::SeqCst), 0);
     for _ in 0..2 {
         assert_eq!(
@@ -156,41 +168,44 @@ fn concurrent_closers_join_one_drain_and_owner_retains_non_clone_errors() {
     let entered_witness = entered.clone();
     let release_witness = release_gate.clone();
     let body_witness = body_gate.clone();
-    let program: Effect<(), Error> = Scope::scoped(move |scope| {
-        *slot_witness
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(scope.clone());
-        let released = Arc::clone(&released);
-        let entered = entered_witness.clone();
-        let release_gate = release_witness.clone();
-        let registration = scope.add_release(move || {
+    let program: Effect<(), Error> = effect_scope! {
+    body: move |scope| {
+            *slot_witness
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(scope.clone());
             let released = Arc::clone(&released);
-            let entered = entered.clone();
-            let release_gate = release_gate.clone();
-            Release::try_future(move |masked| async move {
-                assert!(!masked.is_requested());
-                let _ = released.fetch_add(1, Ordering::SeqCst);
-                assert!(entered.request());
-                release_gate.cancelled().await;
-                assert!(!masked.is_requested());
-                Err(Error::Release(std::cell::Cell::new(7)))
-            })
-        });
-        let body_gate = body_witness.clone();
-        registration.flat_map(move |()| {
-            let body_gate = body_gate.clone();
-            Effect::try_future(
-                move |_| {
-                    let body_gate = body_gate.clone();
-                    async move {
-                        body_gate.cancelled().await;
-                        Err::<(), _>(Error::Body(std::cell::Cell::new(42)))
-                    }
-                },
-                |error| error,
-            )
-        })
-    });
+            let entered = entered_witness.clone();
+            let release_gate = release_witness.clone();
+            let registration = effect_finalizer! { release; scope: scope, release: move || {
+                let released = Arc::clone(&released);
+                let entered = entered.clone();
+                let release_gate = release_gate.clone();
+                Release::try_future(move |masked| async move {
+                    assert!(!masked.is_requested());
+                    let _ = released.fetch_add(1, Ordering::SeqCst);
+                    assert!(entered.request());
+                    release_gate.cancelled().await;
+                    assert!(!masked.is_requested());
+                    Err(Error::Release(std::cell::Cell::new(7)))
+                })
+            }, };
+            let body_gate = body_witness.clone();
+            effect! {
+     bind;
+     program: registration,
+     body: move |()| {
+                let body_gate = body_gate.clone();
+                effect_try_future! { body: move |_| {
+                        let body_gate = body_gate.clone();
+                        async move {
+                            body_gate.cancelled().await;
+                            Err::<(), _>(Error::Body(std::cell::Cell::new(42)))
+                        }
+                    }, on_error: |error| error, }
+            },
+     }
+        },
+    };
     let (mut driver, observer) = program.owned_run(Arc::new(()));
     drive::suspended(Pin::new(&mut driver));
     let scope = slot
@@ -237,16 +252,20 @@ fn concurrent_closers_join_one_drain_and_owner_retains_non_clone_errors() {
 fn scoped_handles_are_invalidated_and_failed_acquisition_installs_no_release() {
     let count = Arc::new(AtomicUsize::new(0));
     let witness = Arc::clone(&count);
-    let program: Effect<_, Error> = Scope::scoped(move |scope| {
-        let witness = Arc::clone(&witness);
-        scope.acquire(Effect::sync(|| String::from("scoped")), move |value| {
+    let program: Effect<_, Error> = effect_scope! {
+    body: move |scope| {
             let witness = Arc::clone(&witness);
-            Release::sync(move || {
-                assert_eq!(value, "scoped");
-                let _ = witness.fetch_add(1, Ordering::SeqCst);
-            })
-        })
-    });
+            effect_scope_acquire! {
+    scope: scope, acquire: effect_sync! { body: || String::from("scoped"), }, release: move |value| {
+                let witness = Arc::clone(&witness);
+                effect_resource! { release_sync; body: move || {
+                    assert_eq!(value, "scoped");
+                    let _ = witness.fetch_add(1, Ordering::SeqCst);
+                }, }
+            },
+    }
+        },
+    };
     let handle = match block_on(program.run(Arc::new(()))) {
         Exit::Success(handle) => Some(handle),
         Exit::Fail(_) | Exit::Die(_) | Exit::Interrupted | Exit::FinalizationFailed(_) => None,
@@ -260,13 +279,14 @@ fn scoped_handles_are_invalidated_and_failed_acquisition_installs_no_release() {
     }
     assert_eq!(count.load(Ordering::SeqCst), 1);
     let witness = Arc::clone(&count);
-    let failed: Effect<_, Error> = Scope::scoped(move |scope| {
-        let witness = Arc::clone(&witness);
-        scope.acquire(
-            Effect::<String, Error>::fail_with(|| Error::Body(std::cell::Cell::new(1))),
-            move |_| count_release(Arc::clone(&witness)),
-        )
-    });
+    let failed: Effect<_, Error> = effect_scope! {
+    body: move |scope| {
+            let witness = Arc::clone(&witness);
+            effect_scope_acquire! {
+    scope: scope, acquire: { let __dsl_program: Effect < String , Error > = effect_try_sync! { body: { let __dsl_error = || Error::Body(std::cell::Cell::new(1)); move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }; __dsl_program }, release: move |_| count_release(Arc::clone(&witness)),
+    }
+        },
+    };
     assert!(matches!(block_on(failed.run(Arc::new(()))), Exit::Fail(_)));
     assert_eq!(count.load(Ordering::SeqCst), 1);
 }
@@ -275,32 +295,38 @@ fn scoped_handles_are_invalidated_and_failed_acquisition_installs_no_release() {
 fn acquisition_into_closed_scope_awaits_masked_release_before_rejection() {
     let count = Arc::new(AtomicUsize::new(0));
     let witness = Arc::clone(&count);
-    let program: Effect<(), Error> = Scope::scoped(move |scope| {
-        let witness = Arc::clone(&witness);
-        let acquisition = scope
-            .acquire(Effect::sync(|| String::from("late")), move |value| {
-                let witness = Arc::clone(&witness);
-                Release::try_future(move |masked| async move {
-                    assert!(!masked.is_requested());
-                    assert_eq!(value, "late");
-                    let mut yielded = false;
-                    std::future::poll_fn(move |cx| {
-                        if yielded {
-                            std::task::Poll::Ready(())
-                        } else {
-                            yielded = true;
-                            cx.waker().wake_by_ref();
-                            std::task::Poll::Pending
-                        }
-                    })
-                    .await;
-                    let _ = witness.fetch_add(1, Ordering::SeqCst);
-                    Err(Error::Release(std::cell::Cell::new(1)))
-                })
-            })
-            .map(|_| ());
-        scope.close::<()>().flat_map(move |_| acquisition.clone())
-    });
+    let program: Effect<(), Error> = effect_scope! {
+    body: move |scope| {
+            let witness = Arc::clone(&witness);
+            let acquisition = effect_map! { program: effect_scope_acquire! {
+    scope: scope, acquire: effect_sync! { body: || String::from("late"), }, release: move |value| {
+                    let witness = Arc::clone(&witness);
+                    effect_resource! { release_try_future; body: move |masked| async move {
+                        assert!(!masked.is_requested());
+                        assert_eq!(value, "late");
+                        let mut yielded = false;
+                        std::future::poll_fn(move |cx| {
+                            if yielded {
+                                std::task::Poll::Ready(())
+                            } else {
+                                yielded = true;
+                                cx.waker().wake_by_ref();
+                                std::task::Poll::Pending
+                            }
+                        })
+                        .await;
+                        let _ = witness.fetch_add(1, Ordering::SeqCst);
+                        Err(Error::Release(std::cell::Cell::new(1)))
+                    }, }
+                },
+    }, map: |_| (), };
+            effect! {
+     bind;
+     program: scope.close::<()>(),
+     body: move |_| acquisition.clone(),
+     }
+        },
+    };
     assert_eq!(
         block_on(program.run(Arc::new(()))),
         Exit::FinalizationFailed(Finalization {
@@ -317,22 +343,24 @@ fn registered_finalizers_keep_their_environment_across_scoped_provision() {
     struct Environment(&'static str);
     let seen = Arc::new(Mutex::new(Vec::new()));
     let witness = Arc::clone(&seen);
-    let program: Effect<(), Error> = Scope::scoped(move |scope| {
-        let make = |name| {
-            let witness = Arc::clone(&witness);
-            let finalizer: Effect<(), Error, Environment> =
-                Effect::service(move |env: &Environment| {
-                    witness
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(env.0);
-                });
-            scope
-                .add_finalizer(finalizer)
-                .provide(Arc::new(Environment(name)))
-        };
-        make("first").zip(make("second")).map(|_| ())
-    });
+    let program: Effect<(), Error> = effect_scope! {
+    body: move |scope| {
+            let make = |name| {
+                let witness = Arc::clone(&witness);
+                let finalizer: Effect<(), Error, Environment> =
+                    service! { env: move |env: &Environment| {
+                        witness
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(env.0);
+                    }, };
+                effect_provided! { program: effect_finalizer! {
+    scope: scope, body: finalizer,
+    }, environment: Arc::new(Environment(name)), }
+            };
+            effect_map! { program: { let __dsl_left_program = make("first"); let __dsl_right_program = make("second"); effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }, map: |_| (), }
+        },
+    };
     assert_eq!(block_on(program.run(Arc::new(()))), Exit::Success(()));
     assert_eq!(
         *seen
@@ -343,16 +371,17 @@ fn registered_finalizers_keep_their_environment_across_scoped_provision() {
 }
 
 #[test]
-#[allow(clippy::panic)] // The fresh release factory is a user-code boundary.
 fn release_factory_defect_does_not_skip_remaining_finalizers() {
     let count = Arc::new(AtomicUsize::new(0));
     let witness = Arc::clone(&count);
-    let program: Effect<(), Error> = Scope::scoped(move |scope| {
-        let witness = Arc::clone(&witness);
-        let first = scope.add_release(move || count_release(Arc::clone(&witness)));
-        let last = scope.add_release::<()>(|| panic!("scope release factory"));
-        first.zip(last).map(|_| ())
-    });
+    let program: Effect<(), Error> = effect_scope! {
+    body: move |scope| {
+            let witness = Arc::clone(&witness);
+            let first = effect_finalizer! { release; scope: scope, release: move || count_release(Arc::clone(&witness)), };
+            let last = effect_finalizer! { release; scope: scope, release: || std::panic::resume_unwind(Box::new("scope release factory")), };
+            effect_map! { program: { let __dsl_left_program = first; let __dsl_right_program = last; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }, map: |_| (), }
+        },
+    };
     assert_eq!(
         block_on(program.run(Arc::new(()))),
         Exit::FinalizationFailed(Finalization {
@@ -372,21 +401,25 @@ fn abandoned_close_driver_wakes_joiners_and_owner_publishes_cleanup_defect() {
     let witness = Arc::clone(&slot);
     let body_gate = Cancellation::new();
     let body_witness = body_gate.clone();
-    let program: Effect<(), Error> = Scope::scoped(move |scope| {
-        *witness
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(scope.clone());
-        let body_gate = body_witness.clone();
-        scope
-            .add_release(|| Release::<Error>::from_future(|_| std::future::pending()))
-            .flat_map(move |()| {
-                let body_gate = body_gate.clone();
-                Effect::from_future(move |_| {
+    let program: Effect<(), Error> = effect_scope! {
+    body: move |scope| {
+            *witness
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(scope.clone());
+            let body_gate = body_witness.clone();
+            effect! {
+     bind;
+     program: effect_finalizer! { release; scope: scope, release: || { let __dsl_program: Release < Error > = effect_resource! { release_future; body: |_| std::future::pending(), }; __dsl_program }, },
+     body: move |()| {
                     let body_gate = body_gate.clone();
-                    async move { body_gate.cancelled().await }
-                })
-            })
-    });
+                    effect_future! { body: move |_| {
+                        let body_gate = body_gate.clone();
+                        async move { body_gate.cancelled().await }
+                    }, }
+                },
+     }
+        },
+    };
     let (mut driver, observer) = program.owned_run(Arc::new(()));
     drive::suspended(Pin::new(&mut driver));
     let scope = slot
@@ -423,20 +456,26 @@ fn abandoned_close_driver_wakes_joiners_and_owner_publishes_cleanup_defect() {
 fn late_registration_releases_immediately_and_retains_its_failure() {
     let count = Arc::new(AtomicUsize::new(0));
     let witness = Arc::clone(&count);
-    let program: Effect<(), Error> = Scope::scoped(move |scope| {
-        let late = scope.add_release({
-            let witness = Arc::clone(&witness);
-            move || {
+    let program: Effect<(), Error> = effect_scope! {
+    body: move |scope| {
+            let late = effect_finalizer! { release; scope: scope, release: {
                 let witness = Arc::clone(&witness);
-                Release::try_sync(move || {
-                    let _ = witness.fetch_add(1, Ordering::SeqCst);
-                    Err(Error::Release(std::cell::Cell::new(9)))
-                })
-            }
-        });
-        let close = scope.close::<()>();
-        close.flat_map(move |_| late.clone())
-    });
+                move || {
+                    let witness = Arc::clone(&witness);
+                    effect_resource! { release_try_sync; body: move || {
+                        let _ = witness.fetch_add(1, Ordering::SeqCst);
+                        Err(Error::Release(std::cell::Cell::new(9)))
+                    }, }
+                }
+            }, };
+            let close = scope.close::<()>();
+            effect! {
+     bind;
+     program: close,
+     body: move |_| late.clone(),
+     }
+        },
+    };
     assert_eq!(
         block_on(program.run(Arc::new(()))),
         Exit::FinalizationFailed(Finalization {
@@ -455,28 +494,31 @@ fn scoped_acquisition_owns_late_success_before_cancellation() {
     let bodies = Arc::new(AtomicUsize::new(0));
     let body_witness = Arc::clone(&bodies);
     let token = Arc::new(Cancellation::new());
-    let program: Effect<(), Error, Cancellation> = Scope::scoped(move |scope| {
-        let witness = Arc::clone(&witness);
-        let body_witness = Arc::clone(&body_witness);
-        scope
-            .acquire(
-                Effect::from_future(|cancel| async move {
-                    cancel.cancelled().await;
-                    String::from("owned")
-                }),
-                move |value| {
-                    let witness = Arc::clone(&witness);
-                    Release::sync(move || {
-                        assert_eq!(value, "owned");
-                        let _ = witness.fetch_add(1, Ordering::SeqCst);
-                    })
+    let program: Effect<(), Error, Cancellation> = effect_scope! {
+    body: move |scope| {
+            let witness = Arc::clone(&witness);
+            let body_witness = Arc::clone(&body_witness);
+            effect! {
+     bind;
+     program: effect_scope_acquire! {
+    scope: scope, acquire: effect_future! { body: |cancel| async move {
+                        cancel.cancelled().await;
+                        String::from("owned")
+                    }, }, release: move |value| {
+                        let witness = Arc::clone(&witness);
+                        effect_resource! { release_sync; body: move || {
+                            assert_eq!(value, "owned");
+                            let _ = witness.fetch_add(1, Ordering::SeqCst);
+                        }, }
+                    },
+    },
+     body: move |_| {
+                    let _ = body_witness.fetch_add(1, Ordering::SeqCst);
+                    effect_sync! { body: { let __dsl_value = (); move || __dsl_value }, }
                 },
-            )
-            .flat_map(move |_| {
-                let _ = body_witness.fetch_add(1, Ordering::SeqCst);
-                Effect::succeed(())
-            })
-    });
+     }
+        },
+    };
     let (mut driver, observer) = program.owned_run_cancellable(Arc::clone(&token));
     drive::suspended(Pin::new(&mut driver));
     assert!(token.request());
@@ -493,16 +535,18 @@ fn registration_close_races_release_each_obligation_once() -> Result<(), Box<dyn
     let witness = body_gate.clone();
     let slot = Arc::new(Mutex::new(None::<Scope<Error>>));
     let slot_witness = Arc::clone(&slot);
-    let program: Effect<(), Error> = Scope::scoped(move |scope| {
-        *slot_witness
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(scope);
-        let witness = witness.clone();
-        Effect::from_future(move |_| {
+    let program: Effect<(), Error> = effect_scope! {
+    body: move |scope| {
+            *slot_witness
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(scope);
             let witness = witness.clone();
-            async move { witness.cancelled().await }
-        })
-    });
+            effect_future! { body: move |_| {
+                let witness = witness.clone();
+                async move { witness.cancelled().await }
+            }, }
+        },
+    };
     let (mut driver, observer) = program.owned_run(Arc::new(()));
     drive::suspended(Pin::new(&mut driver));
     let scope = slot
@@ -522,8 +566,7 @@ fn registration_close_races_release_each_obligation_once() -> Result<(), Box<dyn
         workers.push(std::thread::spawn(move || {
             barrier.wait();
             let result = block_on(
-                scope
-                    .add_release(move || count_release(Arc::clone(&count)))
+                effect_finalizer! { release; scope: scope, release: move || count_release(Arc::clone(&count)), }
                     .run(Arc::new(())),
             );
             let _ = sent.send(matches!(result, Exit::Success(()) | Exit::Die(_)));
@@ -552,12 +595,14 @@ fn registration_close_races_release_each_obligation_once() -> Result<(), Box<dyn
 fn abandoned_owner_wakes_closed_observers_with_failure() {
     let slot = Arc::new(Mutex::new(None::<Scope<Error>>));
     let witness = Arc::clone(&slot);
-    let program: Effect<(), Error> = Scope::scoped(move |scope| {
-        *witness
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(scope);
-        Effect::from_future(|_| std::future::pending())
-    });
+    let program: Effect<(), Error> = effect_scope! {
+    body: move |scope| {
+            *witness
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(scope);
+            effect_future! { body: |_| std::future::pending(), }
+        },
+    };
     let (mut driver, observer) = program.owned_run(Arc::new(()));
     drive::suspended(Pin::new(&mut driver));
     let scope = slot

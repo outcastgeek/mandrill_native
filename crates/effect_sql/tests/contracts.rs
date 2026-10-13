@@ -1,6 +1,7 @@
 //! Finite V03 SQL contracts; native driver/core tests retain their existing lower-level evidence.
 #![cfg(feature = "turso")]
 
+use effect::{effect, effect_die, effect_sync, effect_try_sync};
 #[path = "support/database.rs"]
 /// Shared native database policy for these finite contracts.
 mod database;
@@ -15,8 +16,8 @@ use effect_sql::sqlx::{
 };
 use effect_sql::{
     CellCodec, MigrationCatalog, MigrationStep, RecoveryDecision, Rollback, RowDecoder, RowError,
-    SQLX_JOURNAL, SqlClient, SqlError, SqlMigrator, SqlPredicate, SqlStatement, row, sql,
-    sql_insert, sql_update, sql_with,
+    SQLX_JOURNAL, SqlClient, SqlError, SqlMigrator, SqlPredicate, row, sql, sql_insert, sql_update,
+    sql_with,
 };
 use std::{borrow::Cow, sync::Arc};
 
@@ -45,7 +46,7 @@ fn drink_row() -> RowDecoder<Drink, SqlClient> {
 async fn statements_rows_and_result_modes() -> Result<(), SqlError> {
     let database = Database::open().await?;
     let env = Arc::new(database.client.clone());
-    success(database.client.execute(|| SqlStatement::trusted("CREATE TABLE orders(id INTEGER PRIMARY KEY, drink TEXT, amount INTEGER, ready INTEGER)")).run(env.clone()).await)?;
+    success(database.client.execute(|| sql! { text: "CREATE TABLE orders(id INTEGER PRIMARY KEY, drink TEXT, amount INTEGER, ready INTEGER)", }).run(env.clone()).await)?;
     let moved = Drink(String::from("oat latte"));
     let insert = sql_insert! { table: "orders", value("id", 1_i64); value("drink", moved.0); value("amount", 425_i64); value("ready", 1_i64); };
     assert_eq!(
@@ -63,18 +64,17 @@ async fn statements_rows_and_result_modes() -> Result<(), SqlError> {
         Some(Drink(String::from("oat latte")))
     );
     let absent = database.client.first(
-        || SqlStatement::trusted("SELECT drink FROM orders WHERE id=99"),
+        || sql! { text: "SELECT drink FROM orders WHERE id=99", },
         drink_row(),
     );
     assert_eq!(success(absent.run(env.clone()).await)?, None);
-    let buffered = database.client.query(
-        || SqlStatement::trusted("SELECT drink FROM orders"),
-        drink_row(),
-    );
+    let buffered = database
+        .client
+        .query(|| sql! { text: "SELECT drink FROM orders", }, drink_row());
     assert_eq!(success(buffered.run(env.clone()).await)?.len(), 1);
     let absent_scalar: Effect<i64, SqlError, SqlClient> = database
         .client
-        .scalar(|| SqlStatement::trusted("SELECT amount FROM orders WHERE id=99"));
+        .scalar(|| sql! { text: "SELECT amount FROM orders WHERE id=99", });
     assert!(matches!(
         absent_scalar.run(env.clone()).await,
         Exit::Fail(SqlError::RowAbsent)
@@ -82,17 +82,17 @@ async fn statements_rows_and_result_modes() -> Result<(), SqlError> {
     assert!(matches!(
         database
             .client
-            .first(|| SqlStatement::trusted("SELECT 'x' AS other"), drink_row())
+            .first(|| sql! { text: "SELECT 'x' AS other", }, drink_row())
             .run(env.clone())
             .await,
         Exit::Fail(SqlError::Decode(RowError::MissingColumn(_)))
     ));
     let scalar: Effect<i64, SqlError, SqlClient> = database
         .client
-        .scalar(|| SqlStatement::trusted("SELECT amount FROM orders"));
+        .scalar(|| sql! { text: "SELECT amount FROM orders", });
     assert_eq!(success(scalar.run(env.clone()).await)?, 450);
     let fold = database.client.fold_rows(
-        || SqlStatement::trusted("SELECT drink FROM orders"),
+        || sql! { text: "SELECT drink FROM orders", },
         drink_row(),
         String::new,
         |mut all, Drink(value)| {
@@ -102,16 +102,16 @@ async fn statements_rows_and_result_modes() -> Result<(), SqlError> {
     );
     assert_eq!(success(fold.run(env.clone()).await)?, "oat latte");
     let folded = database.client.fold_rows_effect(
-        || SqlStatement::trusted("SELECT drink FROM orders"),
+        || sql! { text: "SELECT drink FROM orders", },
         drink_row(),
         || 0_usize,
-        |count, _| Effect::sync_once(move || count + 1),
+        |count, _| effect_sync! { once; body: move || count + 1, },
     );
     assert_eq!(success(folded.run(env.clone()).await)?, 1);
     let batch = database.client.batch(|| {
-        Ok(vec![SqlStatement::trusted(
-            "SELECT drink FROM orders; SELECT amount FROM orders",
-        )?])
+        Ok(vec![
+            sql! { text: "SELECT drink FROM orders; SELECT amount FROM orders", }?,
+        ])
     });
     let batch = success(batch.run(env.clone()).await)?;
     assert_eq!(
@@ -128,7 +128,7 @@ async fn statements_rows_and_result_modes() -> Result<(), SqlError> {
         success(
             database
                 .client
-                .first(|| SqlStatement::trusted("SELECT NULL AS drink"), nullable)
+                .first(|| sql! { text: "SELECT NULL AS drink", }, nullable)
                 .run(env.clone())
                 .await
         )?,
@@ -137,10 +137,7 @@ async fn statements_rows_and_result_modes() -> Result<(), SqlError> {
     assert!(matches!(
         database
             .client
-            .first(
-                || SqlStatement::trusted("SELECT NULL AS drink"),
-                drink_row()
-            )
+            .first(|| sql! { text: "SELECT NULL AS drink", }, drink_row())
             .run(env.clone())
             .await,
         Exit::Fail(SqlError::Decode(RowError::NullColumn(_)))
@@ -148,16 +145,18 @@ async fn statements_rows_and_result_modes() -> Result<(), SqlError> {
     assert!(matches!(
         database
             .client
-            .first(
-                || SqlStatement::trusted("SELECT 'wrong' AS ready"),
-                RowDecoder::<bool, SqlClient>::pure(|row| row
-                    .try_get::<i64, _>("ready")
-                    .map(|value| value == 1)
-                    .map_err(|source| RowError::Native {
-                        column: "ready".into(),
-                        source
-                    }))
-            )
+            .first(|| sql! { text: "SELECT 'wrong' AS ready", }, {
+                let __dsl_program: RowDecoder<bool, SqlClient> = row! {
+                project: |row| row
+                                    .try_get::<i64, _>("ready")
+                                    .map(|value| value == 1)
+                                    .map_err(|source| RowError::Native {
+                                        column: "ready".into(),
+                                        source
+                                    }),
+                };
+                __dsl_program
+            })
             .run(env.clone())
             .await,
         Exit::Fail(SqlError::Decode(RowError::Native { .. }))
@@ -166,12 +165,12 @@ async fn statements_rows_and_result_modes() -> Result<(), SqlError> {
     assert_eq!(quoted.quoted(), "\"odd\"\"name\"");
     let null = SqlPredicate::equal("drink", Option::<String>::None)?;
     assert!(
-        SqlStatement::builder()
-            .text("SELECT id FROM orders")
-            .predicate(null)
-            .finish()?
-            .sql()
-            .ends_with("IS NULL")
+        sql! {
+            text("SELECT id FROM orders");
+            where(null);
+        }?
+        .sql()
+        .ends_with("IS NULL")
     );
     database.close().await
 }
@@ -181,63 +180,65 @@ async fn statements_rows_and_result_modes() -> Result<(), SqlError> {
 async fn transaction_savepoint_and_stale_handles() -> Result<(), SqlError> {
     let database = Database::open().await?;
     let root = database.client.kernel().session().await?;
-    root.execute(SqlStatement::trusted(
-        "CREATE TABLE writes(id INTEGER PRIMARY KEY)",
-    )?)
-    .await?;
+    root.execute(sql! { text: "CREATE TABLE writes(id INTEGER PRIMARY KEY)", }?)
+        .await?;
     let tx = root.begin().await?;
-    tx.execute(SqlStatement::trusted("INSERT INTO writes VALUES(1)")?)
+    tx.execute(sql! { text: "INSERT INTO writes VALUES(1)", }?)
         .await?;
     let nested = tx.begin_savepoint().await?;
     nested
-        .execute(SqlStatement::trusted("INSERT INTO writes VALUES(2)")?)
+        .execute(sql! { text: "INSERT INTO writes VALUES(2)", }?)
         .await?;
     nested.rollback().await?;
     let next = tx.begin_savepoint().await?;
     assert!(matches!(
-        nested.execute(SqlStatement::trusted("SELECT 1")?).await,
+        nested.execute(sql! { text: "SELECT 1", }?).await,
         Err(SqlError::InactiveSession)
     ));
     next.commit().await?;
-    let cursor = tx
-        .cursor(SqlStatement::trusted("SELECT id FROM writes")?)
-        .await?;
+    let cursor = tx.cursor(sql! { text: "SELECT id FROM writes", }?).await?;
     assert!(matches!(
-        tx.execute(SqlStatement::trusted("SELECT 1")?).await,
+        tx.execute(sql! { text: "SELECT 1", }?).await,
         Err(SqlError::InactiveSession)
     ));
     cursor.close().await?;
     tx.commit().await?;
     let next_tx = root.begin().await?;
     assert!(matches!(
-        tx.execute(SqlStatement::trusted("SELECT 1")?).await,
+        tx.execute(sql! { text: "SELECT 1", }?).await,
         Err(SqlError::InactiveSession)
     ));
     next_tx.rollback().await?;
     root.close().await?;
     assert!(matches!(
-        root.execute(SqlStatement::trusted("SELECT 1")?).await,
+        root.execute(sql! { text: "SELECT 1", }?).await,
         Err(SqlError::InactiveSession)
     ));
     let env = Arc::new(database.client.clone());
     let failed: Effect<(), SqlError, SqlClient> = database.client.transaction(|tx| {
-        tx.execute(|| SqlStatement::trusted("INSERT INTO writes VALUES(3)"))
-            .flat_map(|_| {
-                Effect::fail_with(|| SqlError::Configuration("deliberate rollback".into()))
-            })
+        effect! {
+ bind;
+ program: tx.execute(|| sql! { text: "INSERT INTO writes VALUES(3)", }),
+ body: |_| {
+                effect_try_sync! { body: { let __dsl_error = || SqlError::Configuration("deliberate rollback".into()); move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }
+            },
+ }
     });
     assert!(matches!(
         failed.run(env.clone()).await,
         Exit::Fail(SqlError::Configuration(_))
     ));
     let defected: Effect<(), SqlError, SqlClient> = database.client.transaction(|tx| {
-        tx.execute(|| SqlStatement::trusted("INSERT INTO writes VALUES(4)"))
-            .flat_map(|_| Effect::die(Defect::new("deliberate body defect")))
+        effect! {
+        bind;
+        program: tx.execute(|| sql! { text: "INSERT INTO writes VALUES(4)", }),
+        body: |_| effect_die! { defect: Defect::new("deliberate body defect"), },
+        }
     });
     assert!(matches!(defected.run(env.clone()).await, Exit::Die(_)));
     let count: Effect<i64, SqlError, SqlClient> = database
         .client
-        .scalar(|| SqlStatement::trusted("SELECT COUNT(*) FROM writes"));
+        .scalar(|| sql! { text: "SELECT COUNT(*) FROM writes", });
     assert_eq!(success(count.run(env).await)?, 1);
     database.close().await
 }
@@ -264,10 +265,9 @@ async fn cancellation_and_native_cleanup_channels() -> Result<(), SqlError> {
     let entered = Arc::new(std::sync::Mutex::new(Some(entered)));
     let (release, released) = tokio::sync::oneshot::channel();
     let released = Arc::new(tokio::sync::Mutex::new(Some(released)));
-    let decoder = RowDecoder::from_program(move |_row| {
+    let decoder = row! {
         let entered = entered.clone();
         let released = released.clone();
-        async move {
             if let Some(entered) = entered
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -278,11 +278,10 @@ async fn cancellation_and_native_cleanup_channels() -> Result<(), SqlError> {
             if let Some(released) = released.lock().await.take() {
                 let _released = released.await;
             }
-            Ok(1_i64)
-        }
-    });
+            1_i64
+    };
     let fold = database.client.fold_rows(
-        || SqlStatement::trusted("SELECT 1 AS value UNION ALL SELECT 2"),
+        || sql! { text: "SELECT 1 AS value UNION ALL SELECT 2", },
         decoder,
         || 0_i64,
         |sum, value| Ok(sum + value),
@@ -314,7 +313,7 @@ async fn cancellation_and_native_cleanup_channels() -> Result<(), SqlError> {
         })
     ));
     let session = database.client.kernel().session().await?;
-    session.execute(SqlStatement::trusted("BEGIN")?).await?;
+    session.execute(sql! { text: "BEGIN", }?).await?;
     session.close().await?;
     let unknown = database
         .client
@@ -335,7 +334,7 @@ async fn cancellation_and_native_cleanup_channels() -> Result<(), SqlError> {
         }
     }
     let fresh = database.client.kernel().session().await?;
-    fresh.execute(SqlStatement::trusted("SELECT 1")?).await?;
+    fresh.execute(sql! { text: "SELECT 1", }?).await?;
     fresh.close().await?;
     database.close().await
 }

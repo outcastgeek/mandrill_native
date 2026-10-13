@@ -5,6 +5,7 @@ use super::{
     SchemaIssue, SchemaIssueKind, SchemaReference, SchemaShape,
 };
 use crate::Effect;
+use crate::{codec, effect, effect_provide_some, effect_try_sync};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Codec callbacks are shared trait objects: Rust dispatches each callback
@@ -122,6 +123,25 @@ impl<A: Send + 'static, Encoded: Send + 'static> PureCodec<A, Encoded> {
             ast,
             decode: Arc::new(decode),
             encode: Arc::new(encode),
+            validate_type: None,
+            writer: None,
+            equivalent: None,
+        }
+    }
+
+    /// Store macro-generated directions in their existing native callback slots.
+    /// Each direction retains its borrowed inputs and original shared allocation;
+    /// this boundary creates no validator, writer or equivalence witness.
+    #[doc(hidden)]
+    pub fn from_shared_context(
+        ast: SchemaAst,
+        decode: Decoder<A, Encoded>,
+        encode: Encoder<A, Encoded>,
+    ) -> Self {
+        Self {
+            ast,
+            decode,
+            encode,
             validate_type: None,
             writer: None,
             equivalent: None,
@@ -253,46 +273,30 @@ impl<A: Send + 'static, Encoded: Send + 'static> PureCodec<A, Encoded> {
         let decode = Arc::clone(&self.decode);
         let encode = Arc::clone(&self.encode);
         let validator = self.validate_type.as_ref().map(Arc::clone);
-        let mut lifted = Codec::with_context(
-            self.ast.clone(),
-            move |value, context| {
-                let decode = Arc::clone(&decode);
-                Effect::try_sync_once(
-                    move || decode(&value, context.as_ref()),
-                    std::convert::identity,
-                )
-            },
-            move |value, context| {
-                let encode = Arc::clone(&encode);
-                Effect::try_sync_once(
-                    move || encode(&value, context.as_ref()),
-                    std::convert::identity,
-                )
-            },
-        );
+        let mut lifted = codec! { contextual; ast: self.ast.clone(), decode: move |value, context| {
+            let decode = Arc::clone(&decode);
+            effect_try_sync! { once; body: move || decode(&value, context.as_ref()), on_error: std::convert::identity, }
+        }, encode: move |value, context| {
+            let encode = Arc::clone(&encode);
+            effect_try_sync! { once; body: move || encode(&value, context.as_ref()), on_error: std::convert::identity, }
+        }, };
         lifted.pure_validate = validator.as_ref().map(Arc::clone);
         if let Some(writer) = self.writer.as_ref().map(Arc::clone) {
             lifted.writer = Some(Arc::new(move |value, mut output| {
                 let writer = Arc::clone(&writer);
-                Effect::try_sync_once(
-                    move || {
-                        writer(&value, &mut output)?;
-                        Ok(output)
-                    },
-                    std::convert::identity,
-                )
+                effect_try_sync! { once; body: move || {
+                    writer(&value, &mut output)?;
+                    Ok(output)
+                }, on_error: std::convert::identity, }
             }));
         }
         match validator {
             Some(validate) => lifted.with_context_validator(move |value, context| {
                 let validate = Arc::clone(&validate);
-                Effect::try_sync_once(
-                    move || {
-                        validate(&value, context.as_ref())?;
-                        Ok(value)
-                    },
-                    std::convert::identity,
-                )
+                effect_try_sync! { once; body: move || {
+                    validate(&value, context.as_ref())?;
+                    Ok(value)
+                }, on_error: std::convert::identity, }
             }),
             None => lifted,
         }
@@ -689,10 +693,22 @@ impl<
         + Sync
         + 'static,
     ) -> Self {
+        Self::from_shared_context(ast, Arc::new(decode), Arc::new(encode))
+    }
+
+    /// Store macro-generated owned directions in the existing native callback slots.
+    /// ParseContext and both environment types remain explicit; already shared
+    /// callbacks are retained without another allocation or inferred witnesses.
+    #[doc(hidden)]
+    pub fn from_shared_context(
+        ast: SchemaAst,
+        decode: EffectDecoder<A, Encoded, DecodeEnv>,
+        encode: EffectEncoder<A, Encoded, EncodeEnv>,
+    ) -> Self {
         Self {
             ast,
-            decode: Arc::new(decode),
-            encode: Arc::new(encode),
+            decode,
+            encode,
             validate: None,
             pure_validate: None,
             writer: None,
@@ -836,20 +852,33 @@ impl<
             Some(write) => {
                 let boundary = match writer.boundary() {
                     Ok(boundary) => Arc::new(boundary),
-                    Err(issue) => return Effect::from_result_once(Err(issue)),
+                    Err(issue) => {
+                        return effect_try_sync! { once; body: { let __dsl_result = Err(issue); move || __dsl_result }, on_error: ::core::convert::identity, };
+                    }
                 };
-                Effect::from_result_once(Ok((value, writer))).flat_map(move |(value, writer)| {
+                let input = effect_try_sync! {
+                    once;
+                    body: move || Ok((value, writer)),
+                    on_error: std::convert::identity,
+                };
+                effect! {
+                    let input = input.clone();
+                    let write = Arc::clone(&write);
                     let boundary = Arc::clone(&boundary);
-                    write(value, writer).flat_map(move |mut writer| {
-                        Effect::from_result_once(writer.complete_value(&boundary).map(|()| writer))
-                    })
-                })
+                    let (value, writer) = input?;
+                    let mut writer = write(value, writer)?;
+                    effect_try_sync! {
+                        once;
+                        body: move || writer.complete_value(&boundary).map(|()| writer),
+                        on_error: std::convert::identity,
+                    }?
+                }
             }
-            None => Effect::fail_with(|| {
+            None => effect_try_sync! { body: { let __dsl_error = || {
                 SchemaIssue::new(SchemaIssueKind::UnsupportedRepresentation {
                     kind: "direct_json_writer".into(),
                 })
-            }),
+            }; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, },
         }
     }
     /// Lazily write a complete document in `EncodeEnv` using the supplied output bounds.
@@ -861,8 +890,15 @@ impl<
         value: A,
         policy: JsonWriterPolicy,
     ) -> Effect<Vec<u8>, SchemaIssue, EncodeEnv> {
-        self.write_into_once(value, JsonWriter::new(policy))
-            .flat_map(|writer| Effect::from_result_once(writer.finish()))
+        let write = self.write_into_once(value, JsonWriter::new(policy));
+        effect! {
+            let writer = write.clone()?;
+            effect_try_sync! {
+                once;
+                body: move || writer.finish(),
+                on_error: std::convert::identity,
+            }?
+        }
     }
 
     /// Add immutable annotation metadata while preserving directional witnesses.
@@ -944,70 +980,77 @@ impl<
         context: Option<ParseContext>,
     ) -> Effect<A, SchemaIssue, EncodeEnv> {
         let validate = self.validate.as_ref().map(Arc::clone);
-        Effect::try_sync_once(
-            move || {
-                if let Some(context) = &context {
-                    context.visit()?;
-                }
-                Ok((value, context))
-            },
-            std::convert::identity,
-        )
-        .flat_map(move |(value, context)| match &validate {
-            Some(validate) => validate(value, context),
-            None => Effect::fail_with(|| SchemaIssue::new(SchemaIssueKind::MissingValidator)),
-        })
+        let input = effect_try_sync! { once; body: move || {
+            if let Some(context) = &context {
+                context.visit()?;
+            }
+            Ok((value, context))
+        }, on_error: std::convert::identity, };
+        effect! {
+            let validate = validate.as_ref().map(Arc::clone);
+            let (value, context) = input.clone()?;
+            match validate {
+                Some(validate) => validate(value, context)?,
+                None => effect_try_sync! {
+                    body: || Err(SchemaIssue::new(SchemaIssueKind::MissingValidator)),
+                    on_error: std::convert::identity,
+                }?,
+            }
+        }
     }
 
-    pub(crate) fn decode_in(
+    /// Decode one owned input while forwarding a caller's optional traversal context.
+    /// Custom contextual codec directions use this existing boundary to share paths
+    /// and cumulative budgets through nested work and suspension. The input is consumed
+    /// once; None selects an unconfigured invocation and grants no purity/writer witness.
+    pub fn decode_in(
         &self,
         value: Encoded,
         context: Option<ParseContext>,
     ) -> Effect<A, SchemaIssue, DecodeEnv> {
         let decode = Arc::clone(&self.decode);
-        Effect::try_sync_once(
-            move || {
-                if let Some(context) = &context {
-                    context.visit()?;
-                    context.check_representation(&value)?;
-                }
-                Ok((value, context))
-            },
-            std::convert::identity,
-        )
-        .flat_map(move |(value, context)| decode(value, context))
+        let input = effect_try_sync! { once; body: move || {
+            if let Some(context) = &context {
+                context.visit()?;
+                context.check_representation(&value)?;
+            }
+            Ok((value, context))
+        }, on_error: std::convert::identity, };
+        effect! {
+            let decode = Arc::clone(&decode);
+            let (value, context) = input.clone()?;
+            decode(value, context)?
+        }
     }
 
-    pub(crate) fn encode_in(
+    /// Encode one owned value under the caller's optional traversal context.
+    /// The same context and directional EncodeEnv cross nested codec callbacks;
+    /// visits and cumulative budgets retain their existing checks. No payload copy,
+    /// context reset or validator/writer witness is introduced by this adapter.
+    pub fn encode_in(
         &self,
         value: A,
         context: Option<ParseContext>,
     ) -> Effect<Encoded, SchemaIssue, EncodeEnv> {
         let encode = Arc::clone(&self.encode);
-        Effect::try_sync_once(
-            move || {
-                if let Some(context) = &context {
-                    context.visit()?;
-                }
-                Ok((value, context))
-            },
-            std::convert::identity,
-        )
-        .flat_map(move |(value, context)| {
+        let input = effect_try_sync! { once; body: move || {
+            if let Some(context) = &context {
+                context.visit()?;
+            }
+            Ok((value, context))
+        }, on_error: std::convert::identity, };
+        effect! {
+            let encode = Arc::clone(&encode);
+            let (value, context) = input.clone()?;
             let checked = context.clone();
-            encode(value, context).flat_map(move |value| {
-                let checked = checked.clone();
-                Effect::try_sync_once(
-                    move || {
+            let value = encode(value, context)?;
+            effect_try_sync! { once; body: move || {
                         if let Some(context) = checked {
                             context.check_representation(&value)?;
                         }
                         Ok(value)
-                    },
-                    std::convert::identity,
-                )
-            })
-        })
+                    }, on_error: std::convert::identity, }?
+        }
     }
 
     /// Create a reusable lazy decode in `DecodeEnv` from a fresh owned input factory.
@@ -1018,7 +1061,10 @@ impl<
         input: impl Fn() -> Encoded + Send + Sync + 'static,
     ) -> Effect<A, SchemaIssue, DecodeEnv> {
         let codec = self.clone();
-        Effect::defer(move || codec.decode_once(input()))
+        {
+            let __dsl_factory = move || codec.decode_once(input());
+            effect! { __dsl_factory()? }
+        }
     }
 
     /// Create a reusable lazy encode in `EncodeEnv`; the factory supplies a fresh owned application value per execution.
@@ -1027,7 +1073,10 @@ impl<
         input: impl Fn() -> A + Send + Sync + 'static,
     ) -> Effect<Encoded, SchemaIssue, EncodeEnv> {
         let encode = Arc::clone(&self.encode);
-        Effect::defer(move || encode(input(), None))
+        {
+            let __dsl_factory = move || encode(input(), None);
+            effect! { __dsl_factory()? }
+        }
     }
 
     /// Borrow the immutable encoded-side AST without acquiring directional capabilities.
@@ -1045,14 +1094,10 @@ impl<
         let decode = Arc::clone(&self.decode);
         let encode = Arc::clone(&self.encode);
         let project = Arc::new(project);
-        let mut codec = Codec::with_context(
-            self.ast.clone(),
-            move |input, context| {
-                let project = Arc::clone(&project);
-                decode(input, context).provide_some(move |outer| project(outer))
-            },
-            move |input, context| encode(input, context),
-        );
+        let mut codec = codec! { contextual; ast: self.ast.clone(), decode: move |input, context| {
+            let project = Arc::clone(&project);
+            effect_provide_some! { program: decode(input, context), project: move |outer| project(outer), }
+        }, encode: move |input, context| encode(input, context), };
         codec.validate = self.validate.as_ref().map(Arc::clone);
         codec.writer = self.writer.as_ref().map(Arc::clone);
         codec.pure_validate = self.pure_validate.as_ref().map(Arc::clone);
@@ -1069,19 +1114,15 @@ impl<
         let encode = Arc::clone(&self.encode);
         let project = Arc::new(project);
         let validation_project = Arc::clone(&project);
-        let mut codec = Codec::with_context(
-            self.ast.clone(),
-            move |input, context| decode(input, context),
-            move |input, context| {
-                let project = Arc::clone(&project);
-                encode(input, context).provide_some(move |outer| project(outer))
-            },
-        );
+        let mut codec = codec! { contextual; ast: self.ast.clone(), decode: move |input, context| decode(input, context), encode: move |input, context| {
+            let project = Arc::clone(&project);
+            effect_provide_some! { program: encode(input, context), project: move |outer| project(outer), }
+        }, };
         if let Some(validate) = self.validate.as_ref().map(Arc::clone) {
             let validation_project = Arc::clone(&validation_project);
             codec.validate = Some(Arc::new(move |value, context| {
                 let project = Arc::clone(&validation_project);
-                validate(value, context).provide_some(move |outer| project(outer))
+                effect_provide_some! { program: validate(value, context), project: move |outer| project(outer), }
             }));
         }
         codec.pure_validate = self.pure_validate.as_ref().map(Arc::clone);
@@ -1089,7 +1130,7 @@ impl<
             let project = Arc::clone(&validation_project);
             codec.writer = Some(Arc::new(move |value, writer| {
                 let project = Arc::clone(&project);
-                write(value, writer).provide_some(move |outer| project(outer))
+                effect_provide_some! { program: write(value, writer), project: move |outer| project(outer), }
             }));
         }
         codec
@@ -1117,19 +1158,40 @@ impl<
             ast,
             move |encoded, context| {
                 let after_decode = Arc::clone(&after_decode);
-                decode(encoded, context).flat_map(move |value| after_decode(value))
+                let decoded = decode(encoded, context);
+                effect! {
+                    let after_decode = Arc::clone(&after_decode);
+                    let value = decoded.clone()?;
+                    after_decode(value)?
+                }
             },
             move |value, context| {
                 let encode = Arc::clone(&encode);
-                before_encode(value).flat_map(move |value| encode(value, context.clone()))
+                let input = before_encode(value);
+                effect! {
+                    let encode = Arc::clone(&encode);
+                    let context = context.clone();
+                    let value = input.clone()?;
+                    encode(value, context)?
+                }
             },
         );
         if let Some(write) = writer {
             transformed.writer = Some(Arc::new(move |value, writer| {
                 let write = Arc::clone(&write);
-                writer_before(value)
-                    .zip(Effect::from_result_once(Ok(writer)))
-                    .flat_map(move |(value, writer)| write(value, writer))
+                let input = writer_before(value);
+                let output = effect_try_sync! {
+                    once;
+                    body: move || Ok(writer),
+                    on_error: std::convert::identity,
+                };
+                effect! {
+                    let write = Arc::clone(&write);
+                    let output = output.clone();
+                    let value = input.clone()?;
+                    let writer = output?;
+                    write(value, writer)?
+                }
             }));
         }
         transformed
@@ -1150,12 +1212,17 @@ impl<
         let validate = self.clone();
         let before_encode = Arc::new(before_encode);
         let validation_check = Arc::clone(&before_encode);
-        let mut refined = self.transform_effectful(after_decode, move |value| before_encode(value));
+        let mut refined = codec! { transform; source: self, decode: after_decode, encode: move |value| before_encode(value), };
         if validate.validate.is_some() {
             refined = refined.with_context_validator(move |value, context| {
                 let validate = validate.clone();
-                validation_check(value)
-                    .flat_map(move |value| validate.validate_in(value, context.clone()))
+                let input = validation_check(value);
+                effect! {
+                    let validate = validate.clone();
+                    let context = context.clone();
+                    let value = input.clone()?;
+                    validate.validate_in(value, context)?
+                }
             });
         }
         refined.ast = refined.ast.derive(SchemaShape::Checked {
@@ -1219,16 +1286,19 @@ impl<A: Send + 'static, DecodeEnv: Send + Sync + 'static> EffectSchema<A, Decode
     pub fn decode_once(&self, input: JsonValue) -> Effect<A, SchemaIssue, DecodeEnv> {
         let decode = Arc::clone(&self.decode);
         let input = Mutex::new(Some(input));
-        Effect::defer(move || {
-            match input
+        {
+            let __dsl_factory = move || match input
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take()
             {
                 Some(value) => decode(value, None),
-                None => Effect::fail_with(|| SchemaIssue::new(SchemaIssueKind::InputConsumed)),
-            }
-        })
+                None => {
+                    effect_try_sync! { body: { let __dsl_error = || SchemaIssue::new(SchemaIssueKind::InputConsumed); move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }
+                }
+            };
+            effect! { __dsl_factory()? }
+        }
     }
 
     /// Lazily parse shared immutable JSON text and decode in DecodeEnv on each execution.
@@ -1244,14 +1314,15 @@ impl<A: Send + 'static, DecodeEnv: Send + Sync + 'static> EffectSchema<A, Decode
         let text = text.into();
         let decode = Arc::clone(&self.decode);
         let ast = self.ast.clone();
-        Effect::try_sync(
-            move || {
-                ast.prepare(policy.limits)?;
-                super::internal::parser::parse_json(&text, policy)
-            },
-            std::convert::identity,
-        )
-        .flat_map(move |json| decode(json, None))
+        let parsed = effect_try_sync! { body: move || {
+            ast.prepare(policy.limits)?;
+            super::internal::parser::parse_json(&text, policy)
+        }, on_error: std::convert::identity, };
+        effect! {
+            let decode = Arc::clone(&decode);
+            let json = parsed.clone()?;
+            decode(json, None)?
+        }
     }
 }
 

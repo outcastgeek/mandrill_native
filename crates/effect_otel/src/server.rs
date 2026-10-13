@@ -7,8 +7,11 @@
 //! observation uses `ServerPolicy::on_exit`; response construction is not completion.
 //! This module neither consumes a request body nor constructs an axum/Effect runtime.
 
-use crate::{HasOtel, NativeError, Otel, OtelContext, Propagation, SpanOptions};
+use crate::{HasOtel, NativeError, Otel, OtelContext, Propagation};
+use crate::{effect_sync, effect_try_sync, otel};
 use effect::{Clock, Effect, Exit, PrimaryOutcomeRef, SpanOutcome};
+use effect::{effect, service};
+use effect_server::server;
 use effect_server::{BodyOutcome, Request, RequestCompletion, Server};
 use opentelemetry::propagation::{Extractor, Injector};
 use std::sync::Arc;
@@ -129,17 +132,15 @@ where
     E: Send + 'static,
     R: Send + Sync + 'static,
 {
-    Effect::try_sync(
-        move || {
-            let context = propagation.extract(
-                &OtelContext::default(),
-                &HeaderExtractor::new(request.headers()),
-            )?;
-            request.insert_extension(IncomingContext { context });
-            Ok(())
-        },
-        on_error,
-    )
+    effect_try_sync! {
+    body: move || {
+        let context = propagation.extract(
+            &OtelContext::default(),
+            &HeaderExtractor::new(request.headers()),
+        )?;
+        request.insert_extension(IncomingContext { context });
+        Ok(())
+    }, on_error: on_error, }
 }
 
 /// Borrow the extracted detached identity for a native request environment resolver.
@@ -192,44 +193,54 @@ where
 {
     let on_error = Arc::new(on_error);
     let metadata = Arc::new(metadata);
-    server = server.around_selection(move |request, complete| {
-        let on_error = Arc::clone(&on_error);
-        let metadata = Arc::clone(&metadata);
-        extract_parent(request.clone(), propagation.clone(), move |error| {
-            on_error(error)
-        })
-        .flat_map(move |()| {
-            let metadata = Arc::clone(&metadata);
-            let request_effect = request.clone();
-            let request = request.clone();
-            let complete = complete.clone();
-            Effect::service(move |env: &R| {
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    metadata(&request_effect)
-                })) {
-                    Ok(metadata) => Some(metadata),
-                    Err(panic) => {
-                        env.otel()
-                            .diagnostics()
-                            .record(effect::Defect::from_panic(panic));
-                        None
-                    }
-                }
-            })
-            .flat_map(move |metadata| match metadata {
-                Some(metadata) => trace_request(
-                    request.clone(),
-                    metadata.name,
-                    metadata.attributes,
-                    complete.clone(),
-                ),
-                None => match incoming_context(&request) {
-                    Some(context) => Otel::envelope(context, complete.clone()),
-                    None => complete.clone(),
-                },
-            })
-        })
-    });
+    server = server! {
+           source: server,
+           around_selection(move |request, complete| {
+           let on_error = Arc::clone(&on_error);
+           let metadata = Arc::clone(&metadata);
+           effect! {
+    bind;
+    program: extract_parent(request.clone(), propagation.clone(), move |error| {
+               on_error(error)
+           }),
+    body: move |()| {
+               let metadata = Arc::clone(&metadata);
+               let request_effect = request.clone();
+               let request = request.clone();
+               let complete = complete.clone();
+               effect! {
+    bind;
+    program: service! {
+        env: move |env: &R| {
+                   match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                       metadata(&request_effect)
+                   })) {
+                       Ok(metadata) => Some(metadata),
+                       Err(panic) => {
+                           env.otel()
+                               .diagnostics()
+                               .record(effect::Defect::from_panic(panic));
+                           None
+                       }
+                   }
+               }, },
+    body: move |metadata| match metadata {
+                   Some(metadata) => trace_request(
+                       request.clone(),
+                       metadata.name,
+                       metadata.attributes,
+                       complete.clone(),
+                   ),
+                   None => match incoming_context(&request) {
+                       Some(context) => Otel::envelope(context, complete.clone()),
+                       None => complete.clone(),
+                   },
+               },
+    }
+           },
+    }
+           }),
+       };
     let observe = Arc::new(observe);
     server.policy = server.policy.on_exit(move |_, request, completion| {
         let observe = Arc::clone(&observe);
@@ -256,37 +267,47 @@ where
     E: Send + 'static,
     R: HasOtel + Send + Sync + 'static,
 {
-    let options = SpanOptions {
-        kind: opentelemetry::trace::SpanKind::Server,
-        parent: incoming_context(&request),
-        attributes,
-        links: Vec::new(),
+    let parent = incoming_context(&request);
+    let captured = effect! {
+    bind;
+    program: Otel::current_context(),
+    body: move |context| {
+           let request = request.clone();
+           service! {
+               env: move |env: &R| {
+               let (started, clock_origin) =
+                   match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                       let clock = env.clock();
+                       (clock.now(), clock_origin(clock))
+                   })) {
+                       Ok((now, origin)) => (Some(now), Some(origin)),
+                       Err(panic) => {
+                           env.otel()
+                               .diagnostics()
+                               .record(effect::Defect::from_panic(panic));
+                           (None, None)
+                       }
+                   };
+               request.insert_extension(ActiveRequest {
+                   context: context.clone(),
+                   started,
+                   clock_origin,
+               });
+           }, }
+       },
     };
-    let captured = Otel::current_context().flat_map(move |context| {
-        let request = request.clone();
-        Effect::service(move |env: &R| {
-            let (started, clock_origin) =
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let clock = env.clock();
-                    (clock.now(), clock_origin(clock))
-                })) {
-                    Ok((now, origin)) => (Some(now), Some(origin)),
-                    Err(panic) => {
-                        env.otel()
-                            .diagnostics()
-                            .record(effect::Defect::from_panic(panic));
-                        (None, None)
-                    }
-                };
-            request.insert_extension(ActiveRequest {
-                context: context.clone(),
-                started,
-                clock_origin,
-            });
-        })
-    });
-    let program = captured.flat_map(move |()| complete_request.clone());
-    Otel::span(name, options, program)
+    let program = effect! {
+    bind;
+    program: captured,
+    body: move |()| complete_request.clone(),
+    };
+    otel! {
+        name: name,
+        kind: opentelemetry::trace::SpanKind::Server,
+        parent_option: parent,
+        attributes: attributes,
+        effect: program,
+    }
 }
 
 /// Safe final-body/request summary; no borrowed application error escapes.
@@ -333,30 +354,35 @@ where
     let body = completion.body;
     let committed = completion.committed;
     let observe = Arc::new(observe);
-    Effect::service(move |env: &R| {
-        active.as_ref().map(|active| {
-            let elapsed = active.started.and_then(|started| {
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let clock = env.clock(); (clock.now(), clock_origin(clock))
-                })) {
-                    Ok((now, origin)) => {
-                        if active.clock_origin != Some(origin) {
-                            env.otel().diagnostics().record(effect::Defect::new("request telemetry clock service changed during environment selection"));
-                            return None;
-                        }
-                        let elapsed = now.checked_sub(started);
-                        if elapsed.is_none() { env.otel().diagnostics().record(effect::Defect::new("request telemetry clock origin moved backwards")); }
-                        elapsed
-                    },
-                    Err(panic) => { env.otel().diagnostics().record(effect::Defect::from_panic(panic)); None },
-                }
-            });
-            RequestObservation { context: active.context.clone(), elapsed, primary, cleanup_failed, body, committed }
-        })
-    }).flat_map(move |summary| match summary {
-        Some(summary) => { let context = summary.context.clone(); Otel::envelope(context, observe(summary)) },
-        None => Effect::sync(|| ()),
-    })
+    effect! {
+    bind;
+    program: service! {
+        env: move |env: &R| {
+           active.as_ref().map(|active| {
+               let elapsed = active.started.and_then(|started| {
+                   match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                       let clock = env.clock(); (clock.now(), clock_origin(clock))
+                   })) {
+                       Ok((now, origin)) => {
+                           if active.clock_origin != Some(origin) {
+                               env.otel().diagnostics().record(effect::Defect::new("request telemetry clock service changed during environment selection"));
+                               return None;
+                           }
+                           let elapsed = now.checked_sub(started);
+                           if elapsed.is_none() { env.otel().diagnostics().record(effect::Defect::new("request telemetry clock origin moved backwards")); }
+                           elapsed
+                       },
+                       Err(panic) => { env.otel().diagnostics().record(effect::Defect::from_panic(panic)); None },
+                   }
+               });
+               RequestObservation { context: active.context.clone(), elapsed, primary, cleanup_failed, body, committed }
+           })
+       }, },
+    body: move |summary| match summary {
+           Some(summary) => { let context = summary.context.clone(); Otel::envelope(context, observe(summary)) },
+           None => effect_sync! { body: || (), },
+       },
+    }
 }
 
 /// Compare an exact borrowed clock service without retaining `R` in request

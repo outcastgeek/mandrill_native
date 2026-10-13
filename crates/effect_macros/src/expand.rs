@@ -40,9 +40,22 @@ pub(crate) fn expand_with_path(
 
 /// Resolve the owning Cargo package, retaining a consumer dependency alias and self-use.
 pub(crate) fn effect_crate_path() -> syn::Result<TokenStream> {
-    let name = match crate_name(EFFECT_PACKAGE_NAME)
-        .map_err(|error| syn::Error::new(Span::call_site(), error))?
-    {
+    let resolved = crate_name(EFFECT_PACKAGE_NAME);
+    if resolved.is_err() {
+        for package in [
+            "effect-sql",
+            "effect-server",
+            "effect-server-identity",
+            "effect-server-web",
+            "effect-otel",
+        ] {
+            if crate_name(package).is_ok() {
+                let extension = crate::extension_support::crate_path(package)?;
+                return Ok(quote!(#extension::__private::effect));
+            }
+        }
+    }
+    let name = match resolved.map_err(|error| syn::Error::new(Span::call_site(), error))? {
         FoundCrate::Itself => String::from(EFFECT_PACKAGE_NAME),
         FoundCrate::Name(name) => name,
     };
@@ -71,7 +84,7 @@ fn lower(statements: &[Stmt], path: &TokenStream) -> TokenStream {
                 let pattern = &local.pat;
                 let attrs = &local.attrs;
                 let program = &expr.expr;
-                return quote_spanned!(statement.span()=> #path::bind(#program, move |#(#attrs)* #pattern| { #rest }));
+                return quote_spanned!(statement.span().resolved_at(proc_macro2::Span::mixed_site())=> #path::bind(#program, move |#(#attrs)* #pattern| { #rest }));
             }
             if let Some(init) = &local.init
                 && is_control_flow(&init.expr)
@@ -79,32 +92,41 @@ fn lower(statements: &[Stmt], path: &TokenStream) -> TokenStream {
                 let pattern = &local.pat;
                 let attrs = &local.attrs;
                 let program = expression(&init.expr, path);
-                return quote_spanned!(statement.span()=> #path::bind(#program, move |#(#attrs)* #pattern| { #rest }));
+                return quote_spanned!(statement.span().resolved_at(proc_macro2::Span::mixed_site())=> #path::bind(#program, move |#(#attrs)* #pattern| { #rest }));
             }
             quote!(#local #rest)
         }
         Stmt::Expr(Expr::Try(expr), semi) => {
             let program = &expr.expr;
             if semi.is_none() && remaining.is_empty() {
-                quote_spanned!(statement.span()=> #path::bind(#program, move |value| #path::success(value)))
+                quote_spanned!(statement.span().resolved_at(proc_macro2::Span::mixed_site())=> #path::bind(#program, move |value| #path::success(value)))
             } else {
-                quote_spanned!(statement.span()=> #path::bind(#program, move |_| { #rest }))
+                quote_spanned!(statement.span().resolved_at(proc_macro2::Span::mixed_site())=> #path::bind(#program, move |_| { #rest }))
             }
         }
         Stmt::Expr(Expr::Return(expr), _) => match &expr.expr {
-            Some(value) => quote_spanned!(statement.span()=> #path::success(#value)),
-            None => quote_spanned!(statement.span()=> #path::success(())),
+            Some(value) => {
+                quote_spanned!(statement.span().resolved_at(proc_macro2::Span::mixed_site())=> #path::success(#value))
+            }
+            None => {
+                quote_spanned!(statement.span().resolved_at(proc_macro2::Span::mixed_site())=> #path::success(()))
+            }
         },
         Stmt::Expr(expr, semi) if is_control_flow(expr) => {
             let program = expression(expr, path);
             if semi.is_none() && remaining.is_empty() {
                 program
             } else {
-                quote_spanned!(statement.span()=> #path::bind(#program, move |_| { #rest }))
+                quote_spanned!(statement.span().resolved_at(proc_macro2::Span::mixed_site())=> #path::bind(#program, move |_| { #rest }))
             }
         }
         Stmt::Expr(expr, None) if remaining.is_empty() => {
-            quote_spanned!(statement.span()=> #path::success(#expr))
+            quote_spanned!(statement.span().resolved_at(proc_macro2::Span::mixed_site())=> #path::success(#expr))
+        }
+        Stmt::Macro(invocation) if invocation.semi_token.is_none() && remaining.is_empty() => {
+            // Let Rust expand a tail macro in its original block context: a
+            // value remains the value, while an item-producing macro yields ().
+            quote!(#path::success({ #invocation }))
         }
         other @ (Stmt::Item(_) | Stmt::Expr(..) | Stmt::Macro(_)) => quote!(#other #rest),
     }
@@ -134,7 +156,7 @@ fn expression(expr: &Expr, path: &TokenStream) -> TokenStream {
             || quote!(#path::success(())),
             |(_, other)| expression(other, path),
         );
-        return quote_spanned!(expr.span()=> #(#attrs)* if #condition { #then_branch } else { #else_branch });
+        return quote_spanned!(expr.span().resolved_at(proc_macro2::Span::mixed_site())=> #(#attrs)* if #condition { #then_branch } else { #else_branch });
     }
     if let Expr::Match(expr) = expr {
         let attrs = &expr.attrs;
@@ -144,22 +166,22 @@ fn expression(expr: &Expr, path: &TokenStream) -> TokenStream {
             let pattern = &arm.pat;
             // syn 3 retains match guards inside Pat::Guard; emit the complete pattern.
             let body = expression(&arm.body, path);
-            quote_spanned!(arm.span()=> #(#attrs)* #pattern => { #body },)
+            quote_spanned!(arm.span().resolved_at(proc_macro2::Span::mixed_site())=> #(#attrs)* #pattern => { #body },)
         });
-        return quote_spanned!(expr.span()=> #(#attrs)* match #value { #(#arms)* });
+        return quote_spanned!(expr.span().resolved_at(proc_macro2::Span::mixed_site())=> #(#attrs)* match #value { #(#arms)* });
     }
     if let Expr::Block(expr) = expr
         && expr.label.is_none()
     {
         let attrs = &expr.attrs;
         let body = lower(&expr.block.stmts, path);
-        return quote_spanned!(expr.span()=> #(#attrs)* #path::defer(move || { #body }));
+        return quote_spanned!(expr.span().resolved_at(proc_macro2::Span::mixed_site())=> #(#attrs)* #path::defer(move || { #body }));
     }
     if let Expr::Try(expr) = expr {
         let program = &expr.expr;
-        return quote_spanned!(expr.span()=> #path::bind(#program, move |value| #path::success(value)));
+        return quote_spanned!(expr.span().resolved_at(proc_macro2::Span::mixed_site())=> #path::bind(#program, move |value| #path::success(value)));
     }
-    quote_spanned!(expr.span()=> #path::success(#expr))
+    quote_spanned!(expr.span().resolved_at(proc_macro2::Span::mixed_site())=> #path::success(#expr))
 }
 
 /// Lower a callback's owned inputs through a one-shot body rather than cloning captures.

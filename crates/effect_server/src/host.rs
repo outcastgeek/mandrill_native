@@ -4,8 +4,13 @@ use crate::{
     BodyCompletion, BodyOutcome, BodyPolicy, Endpoint, Pipeline, Reply, Request, RequestCompletion,
     ResponseHeaders, Router, ServerError,
 };
+use crate::{
+    effect_die, effect_future, effect_recover, effect_resource, effect_scope, effect_try_sync,
+    effect_uninterruptible, endpoint, pipeline, registered,
+};
 use axum::body::Body;
 use axum::extract::FromRequestParts;
+use effect::effect;
 use effect::{
     Cancellation, Defect, Effect, Exit, HasCancellation, HasTaskSpawner, NativeContext, Scope,
 };
@@ -17,7 +22,29 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{oneshot, watch};
+use tokio::{pin, select};
 use tower::service_fn;
+
+/// Move the request and its mutually exclusive terminal outcomes together.
+struct NativeResponseState<E: Send + 'static> {
+    /// Owned request whose headers, cancellation and response policy survive selection.
+    request: Request,
+    /// Already prepared response, consumed instead of observing the routed fiber.
+    ready: Option<http::Response<Body>>,
+    /// Retained driver joined when selection has not already produced a response or failure.
+    routed: Option<effect::Fiber<http::Response<Body>, E>>,
+    /// Primary failure moved intact into terminal response and cleanup processing.
+    failure: Option<Exit<(), E>>,
+}
+/// Selection handshake gates retain their existing owners and send order.
+struct NativeSelectionGates<R> {
+    /// Observe the chosen request/environment before transferring the routed driver.
+    selected: watch::Receiver<Option<Arc<NativeSelection<R>>>>,
+    /// Release terminal execution with its decorated native context.
+    start: oneshot::Sender<NativeContext>,
+    /// Release matched authentication with the outer selection context.
+    selection_start: oneshot::Sender<NativeContext>,
+}
 
 /// The serving adapter's Tokio reactor is selected explicitly through R.
 pub trait HasTokio {
@@ -424,30 +451,38 @@ where
         let output = Arc::new(Mutex::new(Some(send)));
         let owner = self.clone();
         let routing = Arc::new(Mutex::new(Some(routing)));
-        let task = Scope::scoped(move |scope| {
-            let owner = owner.clone();
-            let output = output.clone();
-            let routing = routing.clone();
-            let router = router.clone();
-            crate::endpoint::native_once(move |env: Arc<R>, context| async move {
-                let routing = routing
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
-                let Some(routing) = routing else {
-                    return Exit::Die(Defect::new("native routing owner already consumed"));
-                };
-                let cancellation = routing.request().cancellation().clone();
-                let interrupted = context.cancellation().clone();
-                let running =
-                    owner.execute_native(routing, router, scope, output, context, env.clone());
-                tokio::pin!(running);
-                native_io(env.tokio().clone(),async {tokio::select! {exit=&mut running=>exit,()=cancellation.cancelled()=>{let _=interrupted.request();running.await}}}).await
-            })
-        });
+        let task = effect_scope! {
+        body: move |scope| {
+                    let owner = owner.clone();
+                    let output = output.clone();
+                    let routing = routing.clone();
+                    let router = router.clone();
+                    crate::endpoint::native_once(move |env: Arc<R>, context| async move {
+                        let routing = routing
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take();
+                        let Some(routing) = routing else {
+                            return Exit::Die(Defect::new("native routing owner already consumed"));
+                        };
+                        let cancellation = routing.request().cancellation().clone();
+                        let interrupted = context.cancellation().clone();
+                        let running =
+                            owner.execute_native(routing, router, scope, output, context, env.clone());
+                        pin!(running);
+                        native_io(env.tokio().clone(),async {select! {exit=&mut running=>exit,()=cancellation.cancelled()=>{let _=interrupted.request();running.await}}}).await
+                    })
+                },
+        };
         match self
             .context
-            .run(self.scope.fork(task), self.environment.clone())
+            // Native body completion can precede request cleanup. Retain this admitted
+            // owner through host-scope closure; explicit disconnect cancellation still
+            // reaches its nested work through the existing request token.
+            .run(
+                self.scope.fork(effect_uninterruptible! { program: task, }),
+                self.environment.clone(),
+            )
             .await
         {
             Exit::Success(_) => match receive.await {
@@ -541,7 +576,7 @@ where
             match context.run(scope.fork(program), root.clone()).await {
                 Exit::Success(fiber) => {
                     let observing = context.run(fiber.join(), root.clone());
-                    tokio::pin!(observing);
+                    pin!(observing);
                     loop {
                         let classified = classification.borrow_and_update().clone();
                         if let Some(classified) = classified {
@@ -549,7 +584,7 @@ where
                             matched = true;
                             break;
                         }
-                        tokio::select! {
+                        select! {
                             response=&mut observing=>{match response {Exit::Success(response)=>ready=Some(response),Exit::Fail(error)=>failure=Some(Exit::Fail(error)),Exit::Die(defect)=>failure=Some(Exit::Die(defect)),Exit::Interrupted=>failure=Some(Exit::Interrupted),Exit::FinalizationFailed(failed)=>failure=Some(Exit::FinalizationFailed(failed))};break;},
                             changed=classification.changed()=>{if changed.is_err(){failure=Some(Exit::Die(Defect::new("native route classification closed")));break;}}
                         }
@@ -576,19 +611,21 @@ where
             crate::endpoint::native_once(move |root: Arc<R>, decorated| async move {
                 owner
                     .complete_native_selection(
-                        request,
-                        ready,
-                        routed,
-                        failure,
-                        scope,
+                        NativeResponseState {
+                            request,
+                            ready,
+                            routed,
+                            failure,
+                        },
+                        (scope, decorated, root),
                         output,
                         slot,
-                        selected,
-                        start,
-                        selection_start,
+                        NativeSelectionGates {
+                            selected,
+                            start,
+                            selection_start,
+                        },
                         matched,
-                        decorated,
-                        root,
                     )
                     .await
             });
@@ -599,39 +636,40 @@ where
     }
     /// Start matched authentication under the outer context, then retain that context across
     /// selected-R execution and the uniquely owned terminal/cleanup outcome.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "Explicit ownership transfer keeps request, selection gates and scope owners distinct"
-    )]
     async fn complete_native_selection(
         self: Arc<Self>,
-        mut request: Request,
-        mut ready: Option<http::Response<Body>>,
-        mut routed: Option<effect::Fiber<http::Response<Body>, E>>,
-        mut failure: Option<Exit<(), E>>,
-        scope: Scope<E>,
+        state: NativeResponseState<E>,
+        execution: (Scope<E>, NativeContext, Arc<R>),
         output: Arc<Mutex<Option<oneshot::Sender<http::Response<Body>>>>>,
         slot: NativeSlot<E, R>,
-        mut selected: watch::Receiver<Option<Arc<NativeSelection<R>>>>,
-        start: oneshot::Sender<NativeContext>,
-        selection_start: oneshot::Sender<NativeContext>,
+        gates: NativeSelectionGates<R>,
         matched: bool,
-        context: NativeContext,
-        root: Arc<R>,
     ) -> Exit<(), E> {
+        let NativeResponseState {
+            mut request,
+            mut ready,
+            mut routed,
+            mut failure,
+        } = state;
+        let (scope, context, root) = execution;
+        let NativeSelectionGates {
+            mut selected,
+            start,
+            selection_start,
+        } = gates;
         let mut chosen = None;
         if matched {
             let _ = selection_start.send(context.clone());
             if let Some(fiber) = routed.take() {
                 let observing = context.run(fiber.join(), root.clone());
-                tokio::pin!(observing);
+                pin!(observing);
                 loop {
                     let selection = selected.borrow_and_update().clone();
                     if selection.is_some() {
                         chosen = selection;
                         break;
                     }
-                    tokio::select! {
+                    select! {
                         response=&mut observing=>{match response {Exit::Success(response)=>ready=Some(response),Exit::Fail(error)=>failure=Some(Exit::Fail(error)),Exit::Die(defect)=>failure=Some(Exit::Die(defect)),Exit::Interrupted=>failure=Some(Exit::Interrupted),Exit::FinalizationFailed(failed)=>failure=Some(Exit::FinalizationFailed(failed))};break;},
                         changed=selected.changed()=>{if changed.is_err(){failure=Some(Exit::Die(Defect::new("native environment selection closed")));break;}}
                     }
@@ -693,21 +731,21 @@ where
         let observation_output = output.clone();
         let close_scope = scope.clone();
         let inner = slot.inner.clone();
-        let mut complete =
-            crate::endpoint::native_once(move |environment: Arc<R>, decorated| async move {
+        let mut complete = crate::endpoint::native_once(
+            move |environment: Arc<R>, decorated| async move {
                 let _ = start.send(decorated.clone());
                 let mut exit = finish_native_response(
-                    failure,
-                    ready,
-                    routed,
-                    response_request.clone(),
-                    scope,
+                    NativeResponseState {
+                        request: response_request.clone(),
+                        ready,
+                        routed,
+                        failure,
+                    },
+                    (scope, &decorated, environment.clone()),
                     output,
                     body_state,
                     policy.clone(),
                     hooks,
-                    &decorated,
-                    environment.clone(),
                 )
                 .await;
                 if final_state
@@ -741,13 +779,16 @@ where
                     .take();
                 if let Some(endpoint) = endpoint {
                     let endpoint = decorated
-                        .run(endpoint.join().uninterruptible(), environment.clone())
+                        .run(
+                            effect_uninterruptible! { program: endpoint.join(), },
+                            environment.clone(),
+                        )
                         .await;
                     exit = combine_completion(endpoint, exit);
                 }
                 let closed = decorated
                     .run(
-                        effect::__private::close_scope_owned(close_scope).uninterruptible(),
+                        effect_uninterruptible! { program: effect::__private::close_scope_owned(close_scope), },
                         environment.clone(),
                     )
                     .await;
@@ -774,12 +815,16 @@ where
                 let mut exit = completion.exit;
                 for observation in observations {
                     let observed = decorated
-                        .run(observation.uninterruptible(), environment.clone())
+                        .run(
+                            effect_uninterruptible! { program: observation, },
+                            environment.clone(),
+                        )
                         .await;
                     exit = combine_completion(exit, observed);
                 }
                 exit
-            });
+            },
+        );
         for decorate in self.decorators.iter().rev() {
             complete = decorate(request.clone(), complete);
         }
@@ -793,8 +838,8 @@ where
                 context.run(complete, environment).await
             }
         });
-        tokio::pin!(running);
-        tokio::select! {exit=&mut running=>exit,()=request_cancel.cancelled()=>{if selected_request{let _=cancellation.request();}running.await}}
+        pin!(running);
+        select! {exit=&mut running=>exit,()=request_cancel.cancelled()=>{if selected_request{let _=cancellation.request();}running.await}}
     }
     /// Admit managed request work before returning its native response observer.
     async fn dispatch(
@@ -841,8 +886,8 @@ where
             let disconnected = request_for_work.cancellation().clone();
             let interrupted = context.cancellation().clone();
             native_io(env.tokio().clone(), async move {
-                let executing = owner.execute(request_for_work, endpoint, output, context,work_slot); tokio::pin!(executing);
-                tokio::select! { exit = &mut executing => exit, () = disconnected.cancelled() => { let _ = interrupted.request(); executing.await } }
+                let executing = owner.execute(request_for_work, endpoint, output, context,work_slot); pin!(executing);
+                select! { exit = &mut executing => exit, () = disconnected.cancelled() => { let _ = interrupted.request(); executing.await } }
             }).await
         });
         let context = slot
@@ -947,7 +992,8 @@ where
             }
         };
         let endpoint = if let Some(failure) = selection_failure {
-            Endpoint::from_effect(crate::endpoint::native_once(move |_, _| async move {
+            endpoint! {
+                effect: crate::endpoint::native_once(move |_, _| async move {
                 match failure {
                     Exit::Success(()) => Exit::Die(Defect::new("invalid selection failure")),
                     Exit::Fail(error) => Exit::Fail(error),
@@ -955,7 +1001,7 @@ where
                     Exit::Interrupted => Exit::Interrupted,
                     Exit::FinalizationFailed(failure) => Exit::FinalizationFailed(failure),
                 }
-            }))
+            }), }
         } else {
             endpoint
         };
@@ -993,94 +1039,109 @@ where
         let body_state = Arc::new(Mutex::new(None::<BodyCompletion>));
         let final_state = body_state.clone();
         let boundary_request = request.clone();
-        let middleware = self.middleware.clone().append(endpoint.pipeline);
+        let middleware = pipeline! { source: self.middleware.clone(), include: endpoint.pipeline, };
         let native_output = output.clone();
-        let work = Scope::scoped(move |scope| {
-            let request = boundary_request.clone();
-            let output = native_output.clone();
-            let policy = policy.clone();
-            let state = body_state.clone();
-            let response_scope = scope.clone();
-            let response_request = request.clone();
-            let response_output = output.clone();
-            let response_policy = policy.clone();
-            let response_state = state.clone();
-            let continuation = crate::endpoint::ReplyContinuation(Arc::new(move |reply| {
-                deliver(
-                    reply,
-                    response_request.clone(),
-                    response_scope.clone(),
-                    response_policy.clone(),
-                    response_output.clone(),
-                    response_state.clone(),
-                )
-            }));
-            request.insert_extension(continuation.clone());
-            // A downstream endpoint scope closes before outer after/on-exit stages.
-            // Its reply still awaits native delivery within this same scope.
-            let endpoint_request = request.clone();
-            let recovery_output = output.clone();
-            let endpoint_body = endpoint_body.clone();
-            let input_error = policy.native_error.clone();
-            let reply = Scope::scoped(move |endpoint_scope| {
-                let delivery_scope = endpoint_scope.clone();
-                let continuation = crate::endpoint::ReplyContinuation(Arc::new({
-                    let request = endpoint_request.clone();
-                    let output = output.clone();
+        let work = effect_scope! {
+        body: move |scope| {
+                    let request = boundary_request.clone();
+                    let output = native_output.clone();
                     let policy = policy.clone();
-                    let state = state.clone();
-                    move |reply| {
+                    let state = body_state.clone();
+                    let response_scope = scope.clone();
+                    let response_request = request.clone();
+                    let response_output = output.clone();
+                    let response_policy = policy.clone();
+                    let response_state = state.clone();
+                    let continuation = crate::endpoint::ReplyContinuation(Arc::new(move |reply| {
                         deliver(
                             reply,
-                            request.clone(),
-                            delivery_scope.clone(),
-                            policy.clone(),
-                            output.clone(),
-                            state.clone(),
+                            response_request.clone(),
+                            response_scope.clone(),
+                            response_policy.clone(),
+                            response_output.clone(),
+                            response_state.clone(),
                         )
-                    }
-                }));
-                let accepts = endpoint_request.with_extensions(|extensions| {
-                    extensions
-                        .get::<crate::Registration>()
-                        .map(|metadata| metadata.accepts.clone())
-                        .unwrap_or_default()
-                });
-                if !accepts.is_empty() {
-                    let actual = endpoint_request.singleton_header::<headers::ContentType>();
-                    let checked = match actual {
-                        Ok(Some(actual)) => HeaderValue::from_str(&actual.to_string())
-                            .ok()
-                            .is_some_and(|actual| {
-                                accepts
-                                    .iter()
-                                    .any(|expected| media_matches(expected, &actual))
-                            }),
-                        Ok(None) => false,
-                        Err(error) => return Effect::from_result_once(Err(input_error(error))),
-                    };
-                    if !checked {
-                        return Effect::from_result_once(Err(input_error(ServerError::Invalid(
-                            "request content type not registered in accepts".into(),
-                        ))));
-                    }
-                }
-                endpoint_body(endpoint_scope).flat_map(move |reply| (continuation.0)(reply))
-            });
-            let terminal: crate::Continuation<E, R> = Arc::new(move || reply.clone());
-            let on_error = on_error.clone();
-            middleware.apply(request, terminal).catch_all(move |error| {
-                if recovery_output
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .is_none()
-                {
-                    return Effect::from_result_once(Err(error));
-                }
-                let continuation = continuation.clone();
-                on_error(error).flat_map(move |reply| (continuation.0)(reply))
-            })
-        });
+                    }));
+                    request.insert_extension(continuation.clone());
+                    // A downstream endpoint scope closes before outer after/on-exit stages.
+                    // Its reply still awaits native delivery within this same scope.
+                    let endpoint_request = request.clone();
+                    let recovery_output = output.clone();
+                    let endpoint_body = endpoint_body.clone();
+                    let input_error = policy.native_error.clone();
+                    let reply = effect_scope! {
+        body: move |endpoint_scope| {
+                        let delivery_scope = endpoint_scope.clone();
+                        let continuation = crate::endpoint::ReplyContinuation(Arc::new({
+                            let request = endpoint_request.clone();
+                            let output = output.clone();
+                            let policy = policy.clone();
+                            let state = state.clone();
+                            move |reply| {
+                                deliver(
+                                    reply,
+                                    request.clone(),
+                                    delivery_scope.clone(),
+                                    policy.clone(),
+                                    output.clone(),
+                                    state.clone(),
+                                )
+                            }
+                        }));
+                        let accepts = endpoint_request.with_extensions(|extensions| {
+                            extensions
+                                .get::<crate::Registration>()
+                                .map(|metadata| metadata.accepts.clone())
+                                .unwrap_or_default()
+                        });
+                        if !accepts.is_empty() {
+                            let actual = endpoint_request.singleton_header::<headers::ContentType>();
+                            let checked = match actual {
+                                Ok(Some(actual)) => HeaderValue::from_str(&actual.to_string())
+                                    .ok()
+                                    .is_some_and(|actual| {
+                                        accepts
+                                            .iter()
+                                            .any(|expected| media_matches(expected, &actual))
+                                    }),
+                                Ok(None) => false,
+                                Err(error) => return effect_try_sync! { once; body: { let __dsl_result = Err(input_error(error)); move || __dsl_result }, on_error: ::core::convert::identity, },
+                            };
+                            if !checked {
+                                return effect_try_sync! {
+                                    once; body: {
+                                    let __dsl_result = Err(input_error(ServerError::Invalid(
+                                    "request content type not registered in accepts".into(),
+                                ))); move || __dsl_result }, on_error: ::core::convert::identity, };
+                            }
+                        }
+                        effect! {
+         bind;
+         program: endpoint_body(endpoint_scope),
+         body: move |reply| (continuation.0)(reply),
+         }
+                    },
+        };
+                    let terminal: crate::Continuation<E, R> = Arc::new(move || reply.clone());
+                    let on_error = on_error.clone();
+                    effect_recover! {
+                        program: middleware.apply(request, terminal), recover: move |error| {
+                        if recovery_output
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .is_none()
+                        {
+                            return effect_try_sync! { once; body: { let __dsl_result = Err(error); move || __dsl_result }, on_error: ::core::convert::identity, };
+                        }
+                        let continuation = continuation.clone();
+                        effect! {
+         bind;
+         program: on_error(error),
+         body: move |reply| (continuation.0)(reply),
+         }
+                    }, }
+                },
+        };
         let policy = self.policy.clone();
         let observation_request = request.clone();
         let outer_owned = slot.is_some();
@@ -1114,7 +1175,10 @@ where
                 let mut exit = completion.exit;
                 for observation in observations {
                     let observed = context
-                        .run(observation.uninterruptible(), selected.clone())
+                        .run(
+                            effect_uninterruptible! { program: observation, },
+                            selected.clone(),
+                        )
                         .await;
                     exit = combine_completion(exit, observed);
                 }
@@ -1133,8 +1197,8 @@ where
                 context.run(complete, selected).await
             }
         });
-        tokio::pin!(run);
-        tokio::select! { exit = &mut run => exit, () = request_cancellation.cancelled() => { if selected_request { let _ = cancellation.request(); } run.await } }
+        pin!(run);
+        select! { exit = &mut run => exit, () = request_cancellation.cancelled() => { if selected_request { let _ = cancellation.request(); } run.await } }
     }
 }
 /// Prepare one typed early/native error without recursively rendering a handler failure.
@@ -1147,15 +1211,18 @@ async fn native_error_reply<E: Send + 'static, R: Send + Sync + 'static>(
     env: Arc<R>,
 ) -> Exit<crate::reply::PreparedReply<E, R>, E> {
     match context
-        .run((policy.on_error)(error).uninterruptible(), env.clone())
+        .run(
+            effect_uninterruptible! { program: (policy.on_error)(error), },
+            env.clone(),
+        )
         .await
     {
         Exit::Success(reply) => {
             context
                 .run(
-                    reply
-                        .prepare(request, scope, policy.body, policy.native_error.clone())
-                        .uninterruptible(),
+                    effect_uninterruptible! {
+                    program: reply
+                    .prepare(request, scope, policy.body, policy.native_error.clone()), },
                     env,
                 )
                 .await
@@ -1167,23 +1234,21 @@ async fn native_error_reply<E: Send + 'static, R: Send + Sync + 'static>(
     }
 }
 /// Decorate/commit one native response, then await its actual body and any owned producer.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "Terminal delivery explicitly receives each owned request resource and native completion gate"
-)]
 async fn finish_native_response<E: Send + 'static, R: Send + Sync + 'static>(
-    failure: Option<Exit<(), E>>,
-    ready: Option<http::Response<Body>>,
-    routed: Option<effect::Fiber<http::Response<Body>, E>>,
-    request: Request,
-    scope: Scope<E>,
+    state: NativeResponseState<E>,
+    execution: (Scope<E>, &NativeContext, Arc<R>),
     output: Arc<Mutex<Option<oneshot::Sender<http::Response<Body>>>>>,
     body_state: Arc<Mutex<Option<BodyCompletion>>>,
     policy: ServerPolicy<E, R>,
     hooks: Vec<ResponseHook<E, R>>,
-    context: &NativeContext,
-    env: Arc<R>,
 ) -> Exit<(), E> {
+    let NativeResponseState {
+        request,
+        ready,
+        routed,
+        failure,
+    } = state;
+    let (scope, context, env) = execution;
     let response = match failure {
         Some(Exit::Fail(error)) => Exit::Fail(error),
         Some(Exit::Die(defect)) => return Exit::Die(defect),
@@ -1329,68 +1394,78 @@ fn deliver<E: Send + 'static, R: Send + Sync + 'static>(
             }
         }
     });
-    reply
-        .prepare(
-            request.clone(),
-            scope,
-            policy.body,
-            policy.native_error.clone(),
-        )
-        .flat_map(move |prepared| {
-            let produces = request.with_extensions(|extensions| {
-                extensions
-                    .get::<crate::Registration>()
-                    .map(|metadata| metadata.produces.clone())
-                    .unwrap_or_default()
-            });
-            if let Some(actual) = prepared.response.headers().get(http::header::CONTENT_TYPE)
-                && !produces.is_empty()
-                && !produces
-                    .iter()
-                    .any(|expected| media_matches(expected, actual))
-            {
-                return Effect::from_result_once(Err((policy.native_error)(ServerError::Invalid(
-                    "response content type not registered in produces".into(),
-                ))));
-            }
-            *state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some(prepared.completion.clone());
-            request.insert_extension(EndpointDelivery(prepared.completion.clone()));
-            if !request.with_extensions(|extensions| extensions.get::<OuterDelivery>().is_some()) {
-                prepared.completion.arm();
-            }
-            let sender = output
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            match sender {
-                Some(sender) => {
-                    if sender.send(prepared.response).is_err() {
-                        let _ = request.cancellation().request();
-                    }
-                    {
-                        let outer = request.with_extensions(|extensions| {
-                            extensions.get::<OuterDelivery>().cloned()
-                        });
-                        match outer {
-                            Some(outer) => prepared.finish.ensuring_with(move |_| {
-                                let gate = outer.0.clone();
-                                effect::Release::from_effect(Effect::from_future(move |_| {
-                                    let gate = gate.clone();
-                                    async move {
-                                        let _ = gate.wait().await;
-                                    }
-                                }))
-                            }),
-                            None => prepared.finish,
-                        }
-                    }
-                }
-                None => Effect::die(effect::Defect::new("response already committed")),
-            }
-        })
+    effect! {
+    bind;
+    program: reply
+           .prepare(
+               request.clone(),
+               scope,
+               policy.body,
+               policy.native_error.clone(),
+           ),
+    body: move |prepared| {
+               let produces = request.with_extensions(|extensions| {
+                   extensions
+                       .get::<crate::Registration>()
+                       .map(|metadata| metadata.produces.clone())
+                       .unwrap_or_default()
+               });
+               if let Some(actual) = prepared.response.headers().get(http::header::CONTENT_TYPE)
+                   && !produces.is_empty()
+                   && !produces
+                       .iter()
+                       .any(|expected| media_matches(expected, actual))
+               {
+                   return effect_try_sync! {
+                       once; body: {
+                       let __dsl_result = Err((policy.native_error)(ServerError::Invalid(
+                       "response content type not registered in produces".into(),
+                   ))); move || __dsl_result }, on_error: ::core::convert::identity, };
+               }
+               *state
+                   .lock()
+                   .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                   Some(prepared.completion.clone());
+               request.insert_extension(EndpointDelivery(prepared.completion.clone()));
+               if !request.with_extensions(|extensions| extensions.get::<OuterDelivery>().is_some()) {
+                   prepared.completion.arm();
+               }
+               let sender = output
+                   .lock()
+                   .unwrap_or_else(std::sync::PoisonError::into_inner)
+                   .take();
+               match sender {
+                   Some(sender) => {
+                       if sender.send(prepared.response).is_err() {
+                           let _ = request.cancellation().request();
+                       }
+                       {
+                           let outer = request.with_extensions(|extensions| {
+                               extensions.get::<OuterDelivery>().cloned()
+                           });
+                           match outer {
+                               Some(outer) => effect_resource! {
+                                   ensuring;
+                                   program: prepared.finish,
+                                   release: move |_| {
+                                   let gate = outer.0.clone();
+                                   effect_future! {
+                                       body: move |_| {
+                                       let gate = gate.clone();
+                                       async move {
+                                           let _ = gate.wait().await;
+                                       }
+                                   }, }
+                                   },
+                               },
+                               None => prepared.finish,
+                           }
+                       }
+                   }
+                   None => effect_die! { defect: effect::Defect::new("response already committed"), },
+               }
+           },
+    }
 }
 /// Preserve original primary plus observer failures using the existing ordered cleanup carrier.
 fn combine_completion<E>(primary: Exit<(), E>, observed: Exit<(), E>) -> Exit<(), E> {
@@ -1466,175 +1541,174 @@ where
     ) -> Effect<A, E, R> {
         let description = Arc::new(self);
         let use_host = Arc::new(use_host);
-        Scope::scoped(move |scope| {
-            let server = description.as_ref().clone();
-            let use_host = use_host.clone();
-            crate::endpoint::native_once(move |env: Arc<R>, context| async move {
-                let selected = env.tokio().clone();
-                let valid = match server.protocols {
-                    HttpProtocols::Http1 => cfg!(feature = "http1"),
-                    HttpProtocols::Http2 => cfg!(feature = "http2"),
-                    HttpProtocols::Http1And2 => cfg!(feature = "http1") && cfg!(feature = "http2"),
-                };
-                if !valid {
-                    return Exit::Fail((server.policy.native_error)(ServerError::Configuration(
-                        "requested HTTP protocol feature disabled".into(),
-                    )));
-                }
-                let boundary = Arc::new(Boundary {
-                    scope: scope.clone(),
-                    context: context.clone(),
-                    environment: env.clone(),
-                    policy: server.policy.clone(),
-                    binding: server.environment,
-                    hooks: server.request_hooks,
-                    routing_hooks: server.routing_hooks,
-                    response_hooks: server.response_hooks,
-                    middleware: server.middleware,
-                    decorators: server.decorators,
-                    selection_decorators: server.selection_decorators,
-                });
-                let mut router = match mount(server.routes, boundary.clone()) {
-                    Ok(router) => router,
-                    Err(error) => return Exit::Fail((server.policy.native_error)(error)),
-                };
-                for configure in server.configure {
-                    router = match configure(router) {
-                        Ok(router) => router,
-                        Err(error) => return Exit::Fail((server.policy.native_error)(error)),
-                    };
-                }
-                let listener = match native_io(
-                    selected.clone(),
-                    tokio::net::TcpListener::bind(server.listen),
-                )
-                .await
-                {
-                    Ok(listener) => listener,
-                    Err(error) => {
-                        return Exit::Fail((server.policy.native_error)(ServerError::Io(error)));
-                    }
-                };
-                let address = match listener.local_addr() {
-                    Ok(address) => address,
-                    Err(error) => {
-                        return Exit::Fail((server.policy.native_error)(ServerError::Io(error)));
-                    }
-                };
-                let stop = Cancellation::new();
-                let native_stop = stop.clone();
-                let (stopped, observer) = watch::channel(false);
-                let host = ServerHost {
-                    address,
-                    stop: stop.clone(),
-                    stopped: observer,
-                };
-                let _stop_guard = HostStopGuard(stop.clone());
-                let map = server.policy.native_error.clone();
-                let protocols = server.protocols;
-                let drain = server.policy.host.drain;
-                let connection_scope = scope.clone();
-                let serving =
+        effect_scope! {
+        body: move |scope| {
+                    let server = description.as_ref().clone();
+                    let use_host = use_host.clone();
                     crate::endpoint::native_once(move |env: Arc<R>, context| async move {
-                        let result = native_io(
-                            selected,
-                            serve_connections(
-                                listener,
-                                router,
-                                protocols,
-                                native_stop,
-                                drain,
-                                connection_scope,
-                                context,
-                                env,
-                                map,
-                                boundary,
-                            ),
+                        let selected = env.tokio().clone();
+                        let valid = match server.protocols {
+                            HttpProtocols::Http1 => cfg!(feature = "http1"),
+                            HttpProtocols::Http2 => cfg!(feature = "http2"),
+                            HttpProtocols::Http1And2 => cfg!(feature = "http1") && cfg!(feature = "http2"),
+                        };
+                        if !valid {
+                            return Exit::Fail((server.policy.native_error)(ServerError::Configuration(
+                                "requested HTTP protocol feature disabled".into(),
+                            )));
+                        }
+                        let boundary = Arc::new(Boundary {
+                            scope: scope.clone(),
+                            context: context.clone(),
+                            environment: env.clone(),
+                            policy: server.policy.clone(),
+                            binding: server.environment,
+                            hooks: server.request_hooks,
+                            routing_hooks: server.routing_hooks,
+                            response_hooks: server.response_hooks,
+                            middleware: server.middleware,
+                            decorators: server.decorators,
+                            selection_decorators: server.selection_decorators,
+                        });
+                        let mut router = match mount(server.routes, boundary.clone()) {
+                            Ok(router) => router,
+                            Err(error) => return Exit::Fail((server.policy.native_error)(error)),
+                        };
+                        for configure in server.configure {
+                            router = match configure(router) {
+                                Ok(router) => router,
+                                Err(error) => return Exit::Fail((server.policy.native_error)(error)),
+                            };
+                        }
+                        let listener = match native_io(
+                            selected.clone(),
+                            tokio::net::TcpListener::bind(server.listen),
                         )
+                        .await
+                        {
+                            Ok(listener) => listener,
+                            Err(error) => {
+                                return Exit::Fail((server.policy.native_error)(ServerError::Io(error)));
+                            }
+                        };
+                        let address = match listener.local_addr() {
+                            Ok(address) => address,
+                            Err(error) => {
+                                return Exit::Fail((server.policy.native_error)(ServerError::Io(error)));
+                            }
+                        };
+                        let stop = Cancellation::new();
+                        let native_stop = stop.clone();
+                        let (stopped, observer) = watch::channel(false);
+                        let host = ServerHost {
+                            address,
+                            stop: stop.clone(),
+                            stopped: observer,
+                        };
+                        let _stop_guard = HostStopGuard(stop.clone());
+                        let map = server.policy.native_error.clone();
+                        let protocols = server.protocols;
+                        let drain = server.policy.host.drain;
+                        let connection_scope = scope.clone();
+                        let serving =
+                            effect_uninterruptible! {
+                                program: crate::endpoint::native_once(move |env: Arc<R>, context| async move {
+                                let result = native_io(
+                                    selected,
+                                    serve_connections(
+                                        listener,
+                                        router,
+                                        (protocols, native_stop, drain),
+                                        (connection_scope, context, env),
+                                        map,
+                                        boundary,
+                                    ),
+                                )
+                                .await;
+                                let _ = stopped.send(true);
+                                result
+                            }), };
+                        let running = match context.run(scope.fork(serving), env.clone()).await {
+                            Exit::Success(running) => running,
+                            Exit::Fail(error) => return Exit::Fail(error),
+                            Exit::Die(defect) => return Exit::Die(defect),
+                            Exit::Interrupted => return Exit::Interrupted,
+                            Exit::FinalizationFailed(failure) => return Exit::FinalizationFailed(failure),
+                        };
+                        let final_host = host.clone();
+                        let drain = server.policy.host.drain;
+                        let using = match context.run(scope.fork(use_host(host)), env.clone()).await {
+                            Exit::Success(using) => using,
+                            Exit::Fail(error) => return Exit::Fail(error),
+                            Exit::Die(defect) => return Exit::Die(defect),
+                            Exit::Interrupted => return Exit::Interrupted,
+                            Exit::FinalizationFailed(failure) => return Exit::FinalizationFailed(failure),
+                        };
+                        let used = context.run(using.join(), env.clone());
+                        pin!(used);
+                        let result = select! {
+                            result=&mut used=>result,
+                            status=running.settled()=>{
+                                if status==effect::OutcomeStatus::Succeeded {used.await}
+                                else {
+                                    final_host.stop();
+                                    let stopped=context.run(effect_uninterruptible! { program: running.join(), },env.clone()).await;
+                                    let interrupted=context.run(effect_uninterruptible! { program: using.interrupt(), },env.clone()).await;
+                                    let primary=match stopped {Exit::Success(())=>Exit::Die(Defect::new("host failure status without failure")),Exit::Fail(error)=>Exit::Fail(error),Exit::Die(defect)=>Exit::Die(defect),Exit::Interrupted=>Exit::Interrupted,Exit::FinalizationFailed(failure)=>Exit::FinalizationFailed(failure)};
+                                    return match interrupted {Exit::Success(outcome)=>append_host_cleanup(primary,outcome),Exit::Fail(error)=>append_cleanup_value(primary,effect::CleanupFailure::ReleaseFailure(error)),Exit::Die(defect)=>append_cleanup_value(primary,effect::CleanupFailure::ReleaseDefect(defect)),Exit::Interrupted=>primary,Exit::FinalizationFailed(failure)=>append_host_cleanup(primary,Exit::<A,E>::FinalizationFailed(failure))};
+                                }
+                            }
+                        };
+                        final_host.stop();
+                        let drain_result = native_io(env.tokio().clone(), async {
+                            tokio::time::timeout(drain, final_host.drained()).await
+                        })
                         .await;
-                        let _ = stopped.send(true);
-                        result
+                        if drain_result.is_err() {
+                            let _ = stop.request();
+                        }
+                        let stopped = context.run(effect_uninterruptible! { program: running.join(), }, env).await;
+                        match result {
+                            Exit::Success(value) => match stopped {
+                                Exit::Success(()) => Exit::Success(value),
+                                Exit::Fail(error) => Exit::Fail(error),
+                                Exit::Die(defect) => Exit::Die(defect),
+                                Exit::Interrupted => Exit::Interrupted,
+                                Exit::FinalizationFailed(failure) => Exit::FinalizationFailed(failure),
+                            },
+                            failure @ Exit::Fail(_)
+                            | failure @ Exit::Die(_)
+                            | failure @ Exit::Interrupted
+                            | failure @ Exit::FinalizationFailed(_) => match stopped {
+                                Exit::Success(()) => failure,
+                                Exit::Fail(error) => append_cleanup_value(
+                                    failure,
+                                    effect::CleanupFailure::ReleaseFailure(error),
+                                ),
+                                Exit::Die(defect) => append_cleanup_value(
+                                    failure,
+                                    effect::CleanupFailure::ReleaseDefect(defect),
+                                ),
+                                Exit::Interrupted => append_cleanup_value(
+                                    failure,
+                                    effect::CleanupFailure::ReleaseInterrupted,
+                                ),
+                                Exit::FinalizationFailed(cleanup) => {
+                                    append_host_cleanup(failure, Exit::<(), E>::FinalizationFailed(cleanup))
+                                }
+                            },
+                        }
                     })
-                    .uninterruptible();
-                let running = match context.run(scope.fork(serving), env.clone()).await {
-                    Exit::Success(running) => running,
-                    Exit::Fail(error) => return Exit::Fail(error),
-                    Exit::Die(defect) => return Exit::Die(defect),
-                    Exit::Interrupted => return Exit::Interrupted,
-                    Exit::FinalizationFailed(failure) => return Exit::FinalizationFailed(failure),
-                };
-                let final_host = host.clone();
-                let drain = server.policy.host.drain;
-                let using = match context.run(scope.fork(use_host(host)), env.clone()).await {
-                    Exit::Success(using) => using,
-                    Exit::Fail(error) => return Exit::Fail(error),
-                    Exit::Die(defect) => return Exit::Die(defect),
-                    Exit::Interrupted => return Exit::Interrupted,
-                    Exit::FinalizationFailed(failure) => return Exit::FinalizationFailed(failure),
-                };
-                let used = context.run(using.join(), env.clone());
-                tokio::pin!(used);
-                let result = tokio::select! {
-                    result=&mut used=>result,
-                    status=running.settled()=>{
-                        if status==effect::OutcomeStatus::Succeeded {used.await}
-                        else {
-                            final_host.stop();
-                            let stopped=context.run(running.join().uninterruptible(),env.clone()).await;
-                            let interrupted=context.run(using.interrupt().uninterruptible(),env.clone()).await;
-                            let primary=match stopped {Exit::Success(())=>Exit::Die(Defect::new("host failure status without failure")),Exit::Fail(error)=>Exit::Fail(error),Exit::Die(defect)=>Exit::Die(defect),Exit::Interrupted=>Exit::Interrupted,Exit::FinalizationFailed(failure)=>Exit::FinalizationFailed(failure)};
-                            return match interrupted {Exit::Success(outcome)=>append_host_cleanup(primary,outcome),Exit::Fail(error)=>append_cleanup_value(primary,effect::CleanupFailure::ReleaseFailure(error)),Exit::Die(defect)=>append_cleanup_value(primary,effect::CleanupFailure::ReleaseDefect(defect)),Exit::Interrupted=>primary,Exit::FinalizationFailed(failure)=>append_host_cleanup(primary,Exit::<A,E>::FinalizationFailed(failure))};
-                        }
-                    }
-                };
-                final_host.stop();
-                let drain_result = native_io(env.tokio().clone(), async {
-                    tokio::time::timeout(drain, final_host.drained()).await
-                })
-                .await;
-                if drain_result.is_err() {
-                    let _ = stop.request();
-                }
-                let stopped = context.run(running.join().uninterruptible(), env).await;
-                match result {
-                    Exit::Success(value) => match stopped {
-                        Exit::Success(()) => Exit::Success(value),
-                        Exit::Fail(error) => Exit::Fail(error),
-                        Exit::Die(defect) => Exit::Die(defect),
-                        Exit::Interrupted => Exit::Interrupted,
-                        Exit::FinalizationFailed(failure) => Exit::FinalizationFailed(failure),
-                    },
-                    failure @ Exit::Fail(_)
-                    | failure @ Exit::Die(_)
-                    | failure @ Exit::Interrupted
-                    | failure @ Exit::FinalizationFailed(_) => match stopped {
-                        Exit::Success(()) => failure,
-                        Exit::Fail(error) => append_cleanup_value(
-                            failure,
-                            effect::CleanupFailure::ReleaseFailure(error),
-                        ),
-                        Exit::Die(defect) => append_cleanup_value(
-                            failure,
-                            effect::CleanupFailure::ReleaseDefect(defect),
-                        ),
-                        Exit::Interrupted => append_cleanup_value(
-                            failure,
-                            effect::CleanupFailure::ReleaseInterrupted,
-                        ),
-                        Exit::FinalizationFailed(cleanup) => {
-                            append_host_cleanup(failure, Exit::<(), E>::FinalizationFailed(cleanup))
-                        }
-                    },
-                }
-            })
-        })
+                },
+        }
     }
     /// Serve until the selected environment requests cancellation, then drain and join cleanup.
     pub fn run(self) -> Effect<(), E, R> {
         self.with_host(|_| {
-            Effect::from_future_with_env(|env: Arc<R>, _| async move {
+            effect_future! {
+                with_env; body: |env: Arc<R>, _| async move {
                 env.cancellation().cancelled().await
-            })
+            }, }
         })
     }
 }
@@ -1721,7 +1795,8 @@ where
         let handler = entry.endpoint.clone();
         let pipeline = routes.pipeline.clone();
         entry.endpoint = Arc::new(move |captures| {
-            let mut endpoint = handler(captures)?.pipe_through(pipeline.clone());
+            let mut endpoint =
+                endpoint! { source: handler(captures)?, pipe_through: pipeline.clone(), };
             if endpoint.on_error.is_none() {
                 endpoint.on_error = policy.clone();
             }
@@ -1805,9 +1880,12 @@ where
                                     }
                                     Err(error) => {
                                         let map = boundary.policy.native_error.clone();
-                                        let endpoint = Endpoint::from_effect(
-                                            Effect::from_result_once(Err(map(error))),
-                                        );
+                                        let endpoint = endpoint! {
+                                            effect: effect_try_sync! {
+                                                once;
+                                                body: { let result = Err(map(error)); move || result },
+                                            },
+                                        };
                                         boundary
                                             .dispatch(
                                                 request,
@@ -1855,7 +1933,7 @@ where
     }
     for group in routes.groups {
         let mut child = *group.child;
-        child.pipeline = routes.pipeline.clone().append(child.pipeline);
+        child.pipeline = pipeline! { source: routes.pipeline.clone(), include: child.pipeline, };
         if child.on_error.is_none() {
             child.on_error = routes.on_error.clone();
         }
@@ -1866,7 +1944,7 @@ where
         .map_err(|_| ServerError::Configuration("native route group conflict".into()))?;
     }
     if let Some(mut endpoint) = routes.fallback {
-        endpoint = endpoint.pipe_through(routes.pipeline.clone());
+        endpoint = endpoint! { source: endpoint, pipe_through: routes.pipeline.clone(), };
         if endpoint.on_error.is_none() {
             endpoint.on_error = routes.on_error.clone();
         }
@@ -1875,12 +1953,13 @@ where
             let owner = owner.clone();
             let endpoint = endpoint.clone();
             async move {
+                let registered = registered! { endpoint: endpoint, };
                 Ok::<_, Infallible>(
                     owner
                         .dispatch(
                             request,
-                            endpoint,
-                            crate::Registration::default(),
+                            registered.endpoint,
+                            registered.metadata,
                             BTreeMap::new(),
                         )
                         .await,
@@ -2038,19 +2117,11 @@ impl Drop for RequestDisconnect {
 /// Accept native sockets under the host scope, joining and retiring completed handles as they
 /// settle. Only live connection handles remain in the serving set; failures retain core ordering.
 /// Hyper supplies HTTP parsing/framing/flow control/upgrades; this is a serving adapter only.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "Native serving adapter receives the caller-selected policies and existing execution owners"
-)]
 async fn serve_connections<E, R>(
     listener: tokio::net::TcpListener,
     router: axum::Router,
-    protocols: HttpProtocols,
-    stop: Cancellation,
-    drain: Duration,
-    scope: Scope<E>,
-    context: NativeContext,
-    env: Arc<R>,
+    serving: (HttpProtocols, Cancellation, Duration),
+    execution: (Scope<E>, NativeContext, Arc<R>),
     map: Arc<dyn Fn(ServerError) -> E + Send + Sync>,
     boundary: Arc<Boundary<E, R>>,
 ) -> Exit<(), E>
@@ -2058,14 +2129,16 @@ where
     E: Send + 'static,
     R: HasTokio + HasCancellation + HasTaskSpawner + Send + Sync + 'static,
 {
+    let (protocols, stop, drain) = serving;
+    let (scope, context, env) = execution;
     let mut connections = futures_util::stream::FuturesUnordered::new();
     let mut result = Exit::Success(());
     loop {
-        let accepted = tokio::select! {
+        let accepted = select! {
             () = stop.cancelled() => break,
             Some(connection)=connections.next(),if !connections.is_empty()=>{
                 let connection:effect::Fiber<(),E>=connection;
-                let exit=context.run(connection.join().uninterruptible(),env.clone()).await;
+                let exit=context.run(effect_uninterruptible! { program: connection.join(), },env.clone()).await;
                 result=combine_completion(result,exit);continue;
             },
             accepted = listener.accept() => accepted
@@ -2081,7 +2154,8 @@ where
         let stop = stop.clone();
         let map = map.clone();
         let boundary = boundary.clone();
-        let connection = crate::endpoint::native_once(move |env: Arc<R>, _| async move {
+        let connection = effect_uninterruptible! {
+            program: crate::endpoint::native_once(move |env: Arc<R>, _| async move {
             native_io(env.tokio().clone(), async move {
                 let builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
                 let builder = match protocols {
@@ -2097,13 +2171,14 @@ where
                 };
                 let service=tower::service_fn(move |mut request: http::Request<hyper::body::Incoming>| {let router=router.clone();let boundary=boundary.clone();request.extensions_mut().insert(peer);let request=request.map(Body::new);async move {Ok::<_,Infallible>(boundary.dispatch_native(request,router).await)}});
                 let service = hyper_util::service::TowerToHyperService::new(service);
-                let connection = builder.serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(socket), service); tokio::pin!(connection);
-                let result = tokio::select! { result = &mut connection => Some(result), () = stop.cancelled() => {
+                let connection = builder.serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(socket), service); pin!(connection);
+                let result = select! {
+                    result = &mut connection => Some(result), () = stop.cancelled() => {
                     connection.as_mut().graceful_shutdown(); tokio::time::timeout(drain, &mut connection).await.ok()
                 } };
                 match result { Some(Ok(())) => Exit::Success(()), None=>Exit::Fail(map(ServerError::Limit("HTTP connection drain deadline".into()))), Some(Err(error)) => Exit::Fail(map(ServerError::Transport(Defect::new(error.to_string())))) }
             }).await
-        }).uninterruptible();
+        }), };
         let admitted = context.run(scope.fork(connection), env.clone()).await;
         match admitted {
             Exit::Success(connection) => connections.push(async move {
@@ -2131,7 +2206,10 @@ where
     let _ = stop.request();
     while let Some(connection) = connections.next().await {
         let exit = context
-            .run(connection.join().uninterruptible(), env.clone())
+            .run(
+                effect_uninterruptible! { program: connection.join(), },
+                env.clone(),
+            )
             .await;
         result = combine_completion(result, exit);
     }

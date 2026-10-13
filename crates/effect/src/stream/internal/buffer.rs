@@ -6,6 +6,7 @@ use crate::{
     Cancellation, Chunk, Defect, Effect, Exit, Fiber, HasTaskSpawner, LibraryDefect, OutcomeStatus,
     Scope, Stream, StreamReader,
 };
+use crate::{effect, effect_all, effect_map};
 use event_listener::{Event, EventListener};
 use futures_util::FutureExt;
 use futures_util::future::{Either, select};
@@ -13,6 +14,7 @@ use futures_util::lock::Mutex as AsyncMutex;
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::panic::AssertUnwindSafe;
+use std::pin::pin;
 use std::sync::{Arc, Mutex};
 
 /// Explicit element capacity and maximum number of values returned per pull.
@@ -122,7 +124,7 @@ impl<A: Send + 'static> Buffered<A> {
                     return Ok(true);
                 }
             }
-            let cancelled = std::pin::pin!(cancellation.cancelled());
+            let cancelled = pin!(cancellation.cancelled());
             let _ = select(changed, cancelled).await;
         }
     }
@@ -254,8 +256,8 @@ impl<A: Send + 'static> Buffered<A> {
                 let work = async {
                     // Cloned readers share one pull gate, so only one can
                     // transfer a producer's non-Clone terminal error.
-                    let gate = std::pin::pin!(buffer.inner.pull_gate.lock());
-                    let cancelled = std::pin::pin!(context.cancellation.cancelled());
+                    let gate = pin!(buffer.inner.pull_gate.lock());
+                    let cancelled = pin!(context.cancellation.cancelled());
                     let _pull = match select(gate, cancelled).await {
                         Either::Left((guard, _)) => guard,
                         Either::Right(_) => return Exit::Interrupted,
@@ -383,11 +385,11 @@ async fn wait_for_change<E: Send + 'static>(
 ) -> Wake {
     match (left, right) {
         (Some(left), Some(right)) => {
-            let left_wait = std::pin::pin!(left.settled());
-            let right_wait = std::pin::pin!(right.settled());
-            let finished = std::pin::pin!(select(left_wait, right_wait));
-            let wake = std::pin::pin!(select(changed, finished));
-            let cancelled = std::pin::pin!(cancellation.cancelled());
+            let left_wait = pin!(left.settled());
+            let right_wait = pin!(right.settled());
+            let finished = pin!(select(left_wait, right_wait));
+            let wake = pin!(select(changed, finished));
+            let cancelled = pin!(cancellation.cancelled());
             match select(wake, cancelled).await {
                 Either::Left((Either::Left(_), _)) => Wake::Data,
                 Either::Left((Either::Right(_), _)) => Wake::Finished,
@@ -395,9 +397,9 @@ async fn wait_for_change<E: Send + 'static>(
             }
         }
         (Some(fiber), None) | (None, Some(fiber)) => {
-            let settled = std::pin::pin!(fiber.settled());
-            let wake = std::pin::pin!(select(changed, settled));
-            let cancelled = std::pin::pin!(cancellation.cancelled());
+            let settled = pin!(fiber.settled());
+            let wake = pin!(select(changed, settled));
+            let cancelled = pin!(cancellation.cancelled());
             match select(wake, cancelled).await {
                 Either::Left((Either::Left(_), _)) => Wake::Data,
                 Either::Left((Either::Right(_), _)) => Wake::Finished,
@@ -432,13 +434,15 @@ where
     Stream::new(move |scope: Scope<E>| {
         let buffer = Buffered::new(options.capacity);
         let fork_scope = scope.clone();
-        upstream.open(scope).flat_map(move |reader| {
-            let producer = buffer.producer(reader);
-            let buffer = buffer.clone();
-            fork_scope
-                .fork(producer)
-                .map(move |fiber| buffer.reader(vec![fiber], options.pull_batch))
-        })
+        {
+            let __dsl_program = upstream.open(scope);
+            effect! { let buffer = buffer.clone(); let fork_scope = fork_scope.clone(); let reader = __dsl_program.clone()?; {
+                let producer = buffer.producer(reader);
+                let buffer = buffer.clone();
+                effect_map! { program: fork_scope
+                    .fork(producer), map: move |fiber| buffer.reader(vec![fiber], options.pull_batch), }
+            }? }
+        }
     })
 }
 
@@ -469,17 +473,20 @@ where
         let buffer = Buffered::new(options.capacity);
         let right_open = right.open(scope.clone());
         let fork_scope = scope.clone();
-        left.open(scope).flat_map(move |left_reader| {
-            let buffer = buffer.clone();
-            let fork_scope = fork_scope.clone();
-            right_open.clone().flat_map(move |right_reader| {
-                let producers = Effect::all(vec![
-                    fork_scope.fork(buffer.producer(left_reader.clone())),
-                    fork_scope.fork(buffer.producer(right_reader)),
-                ]);
+        {
+            let __dsl_program = left.open(scope);
+            effect! { let buffer = buffer.clone(); let fork_scope = fork_scope.clone(); let right_open = right_open.clone(); let left_reader = __dsl_program.clone()?; {
                 let buffer = buffer.clone();
-                producers.map(move |fibers| buffer.reader(fibers, options.pull_batch))
-            })
-        })
+                let fork_scope = fork_scope.clone();
+                { let __dsl_program = right_open.clone(); effect! { let buffer = buffer.clone(); let fork_scope = fork_scope.clone(); let left_reader = left_reader.clone(); let right_reader = __dsl_program.clone()?; {
+                    let producers = effect_all! { items: vec![
+                        fork_scope.fork(buffer.producer(left_reader.clone())),
+                        fork_scope.fork(buffer.producer(right_reader)),
+                    ], };
+                    let buffer = buffer.clone();
+                    effect_map! { program: producers, map: move |fibers| buffer.reader(fibers, options.pull_batch), }
+                }? } }
+            }? }
+        }
     })
 }

@@ -14,6 +14,7 @@ use syn::{
     parse::{Parse, ParseStream},
     punctuated::Punctuated,
 };
+use syn::{parenthesized, parse_quote};
 
 /// One inert named field, ordered call or explicit inline callback.
 enum Entry {
@@ -44,7 +45,7 @@ impl Parse for Description {
                 }
             } else if input.peek(syn::token::Paren) {
                 let values;
-                syn::parenthesized!(values in input);
+                parenthesized!(values in input);
                 entries.push(Entry::Call(
                     name,
                     Punctuated::<Expr, Token![,]>::parse_terminated(&values)?
@@ -236,12 +237,12 @@ fn callback(
                 ));
             };
             let name = &pattern.ident;
-            statements.insert(0, syn::parse_quote!(let #name = #name.clone();));
+            statements.insert(0, parse_quote!(let #name = #name.clone();));
         }
     }
     let (prefix, statements) = crate::context_expand::split_prefix(statements);
     let body = crate::extension_support::effect_body_once(statements, path);
-    closure.capture = Some(syn::parse_quote!(move));
+    closure.capture = Some(parse_quote!(move));
     *closure.body = Expr::Verbatim(quote!({ #(#prefix)* #body }));
     Ok(quote!(#closure))
 }
@@ -268,7 +269,7 @@ fn observer_callback(value: Expr, inline: bool, path: &TokenStream) -> syn::Resu
     let (prefix, body) =
         crate::context_expand::split_prefix(std::mem::take(&mut block.block.stmts));
     let body = crate::extension_support::effect_body_once(body, path);
-    closure.capture = Some(syn::parse_quote!(move));
+    closure.capture = Some(parse_quote!(move));
     *closure.body = Expr::Verbatim(quote!({ #(#prefix)* #body }));
     Ok(quote!(#closure))
 }
@@ -330,7 +331,11 @@ fn csp(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> {
                 ));
             }
         }
-        steps.push(quote!(let #builder = #builder.#name(#directive, #sources)?;));
+        let method = Ident::new(
+            &name.to_string(),
+            name.span().resolved_at(Span::mixed_site()),
+        );
+        steps.push(quote!(let #builder = #builder.#method(#directive, #sources)?;));
     }
     Ok(
         quote!((|| -> ::core::result::Result<#path::csp::Csp, #path::WebError> { let #builder = #path::csp::Csp::new(); #(#steps)* Ok(#builder) })()),

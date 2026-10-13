@@ -5,6 +5,7 @@ use super::{
     WorkflowRunId, WorkflowSnapshot,
 };
 use crate::{Effect, HasWallClock, WallClock};
+use crate::{effect, effect_map_error, effect_provide_some, service};
 
 #[derive(Debug)]
 /// An engine or time-provider failure while waiting on a recorded deadline.
@@ -57,20 +58,17 @@ impl DurableClock {
     where
         R: HasWorkflowEngine + HasWallClock + Send + Sync + 'static,
     {
-        Effect::wall_now()
-            .map_error(DurableClockError::Clock)
-            .flat_map(move |now| {
-                Effect::service(|env: &R| env.workflow_engine()).flat_map({
-                    let run = run.clone();
-                    let deadline = deadline.clone();
-                    move |engine| {
-                        engine
-                            .wait_deadline(run.clone(), deadline.clone(), now)
-                            .map_error(DurableClockError::Engine)
-                            .provide_some(|_: &R| ())
-                    }
-                })
-            })
+        {
+            let __dsl_program =
+                effect_map_error! { program: Effect::wall_now(), map: DurableClockError::Clock, };
+            effect! { let deadline = deadline.clone(); let run = run.clone(); let now = __dsl_program.clone()?; {
+                            { let __dsl_program = service! { env: |env: &R| env.workflow_engine(), }; let run = run.clone();
+            let deadline = deadline.clone(); effect! { let __dsl_program = __dsl_program.clone(); let deadline = deadline.clone(); let run = run.clone(); let engine = __dsl_program?; {
+                                    effect_provide_some! { program: effect_map_error! { program: engine
+                                        .wait_deadline(run.clone(), deadline.clone(), now), map: DurableClockError::Engine, }, project: |_: &R| (), }
+                                }? } }
+                        }? }
+        }
     }
 
     /// Record a deadline so replay can recover the same scheduling decision.
@@ -92,11 +90,13 @@ impl DurableClock {
     where
         R: HasWorkflowEngine + Send + Sync + 'static,
     {
-        Effect::service(|env: &R| env.workflow_engine()).flat_map(move |engine| {
-            engine
-                .set_deadline(run.clone(), deadline.clone())
-                .provide_some(|_: &R| ())
-        })
+        {
+            let __dsl_program = service! { env: |env: &R| env.workflow_engine(), };
+            effect! { let deadline = deadline.clone(); let run = run.clone(); let engine = __dsl_program.clone()?; {
+                effect_provide_some! { program: engine
+                    .set_deadline(run.clone(), deadline.clone()), project: |_: &R| (), }
+            }? }
+        }
     }
 
     /// Remove a recorded deadline after its wait is no longer needed.
@@ -118,11 +118,13 @@ impl DurableClock {
     where
         R: HasWorkflowEngine + Send + Sync + 'static,
     {
-        Effect::service(|env: &R| env.workflow_engine()).flat_map(move |engine| {
-            engine
-                .clear_deadline(run.clone(), expected.clone())
-                .provide_some(|_: &R| ())
-        })
+        {
+            let __dsl_program = service! { env: |env: &R| env.workflow_engine(), };
+            effect! { let expected = expected.clone(); let run = run.clone(); let engine = __dsl_program.clone()?; {
+                effect_provide_some! { program: engine
+                    .clear_deadline(run.clone(), expected.clone()), project: |_: &R| (), }
+            }? }
+        }
     }
 
     /// Resume recorded waits whose deadlines have become due.
@@ -136,16 +138,16 @@ impl DurableClock {
     where
         R: HasWorkflowEngine + HasWallClock + Send + Sync + 'static,
     {
-        Effect::wall_now()
-            .map_error(DurableClockError::Clock)
-            .flat_map(|now| {
-                Effect::service(|env: &R| env.workflow_engine()).flat_map(move |engine| {
-                    engine
-                        .wake_due(now)
-                        .map_error(DurableClockError::Engine)
-                        .provide_some(|_: &R| ())
-                })
-            })
+        {
+            let __dsl_program =
+                effect_map_error! { program: Effect::wall_now(), map: DurableClockError::Clock, };
+            effect! { let now = __dsl_program.clone()?; {
+                { let __dsl_program = service! { env: |env: &R| env.workflow_engine(), }; effect! { let engine = __dsl_program.clone()?; {
+                    effect_provide_some! { program: effect_map_error! { program: engine
+                        .wake_due(now), map: DurableClockError::Engine, }, project: |_: &R| (), }
+                }? } }
+            }? }
+        }
     }
 
     /// Wake one recorded deadline only if it has not been rescheduled.
@@ -166,19 +168,16 @@ impl DurableClock {
     where
         R: HasWorkflowEngine + HasWallClock + Send + Sync + 'static,
     {
-        Effect::wall_now()
-            .map_error(DurableClockError::Clock)
-            .flat_map(move |now| {
-                Effect::service(|env: &R| env.workflow_engine()).flat_map({
-                    let run = run.clone();
-                    let expected = expected.clone();
-                    move |engine| {
-                        engine
-                            .wake_deadline(run.clone(), expected.clone(), now)
-                            .map_error(DurableClockError::Engine)
-                            .provide_some(|_: &R| ())
-                    }
-                })
-            })
+        {
+            let __dsl_program =
+                effect_map_error! { program: Effect::wall_now(), map: DurableClockError::Clock, };
+            effect! { let expected = expected.clone(); let run = run.clone(); let now = __dsl_program.clone()?; {
+                            { let __dsl_program = service! { env: |env: &R| env.workflow_engine(), }; let run = run.clone();
+            let expected = expected.clone(); effect! { let __dsl_program = __dsl_program.clone(); let expected = expected.clone(); let run = run.clone(); let engine = __dsl_program?; {
+                                    effect_provide_some! { program: effect_map_error! { program: engine
+                                        .wake_deadline(run.clone(), expected.clone(), now), map: DurableClockError::Engine, }, project: |_: &R| (), }
+                                }? } }
+                        }? }
+        }
     }
 }

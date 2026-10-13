@@ -1,6 +1,9 @@
 //! Fixed V07 cases: native context/signals, carriers, and provider ownership.
 #![cfg(feature = "server")]
 
+use effect::{effect, effect_all_concurrent, effect_future, effect_map, effect_try_blocking, span};
+use effect_otel::otel;
+use tokio::join;
 #[path = "../examples/cafe_telemetry/mod.rs"]
 #[allow(
     dead_code,
@@ -66,32 +69,31 @@ fn discard_success<A, E>(exit: Exit<A, E>) -> Exit<(), E> {
 /// Capture a native future's identity after suspension, then check the selected
 /// blocking callback receives exactly that same request/span context.
 fn native_child(name: &'static str) -> Effect<SpanContext, NativeError, Environment> {
-    let future = Effect::from_future_with_env(|_, _| async {
+    let future = effect_future! { with_env; body: |_, _| async {
         tokio::task::yield_now().await;
         opentelemetry::Context::current()
             .span()
             .span_context()
             .clone()
-    });
-    future
-        .flat_map(|native: SpanContext| {
-            let expected = native.clone();
-            Effect::try_blocking(
-                move |_| {
-                    let actual = opentelemetry::Context::current()
-                        .span()
-                        .span_context()
-                        .clone();
-                    if actual == expected {
-                        Ok(actual)
-                    } else {
-                        Err(NativeError::Parent(Arc::from("blocking context differs")))
-                    }
-                },
-                std::convert::identity,
-            )
-        })
-        .with_span(name)
+    }, };
+    span! { name: name, effect: effect! {
+    bind;
+    program: future,
+    body: |native: SpanContext| {
+               let expected = native.clone();
+               effect_try_blocking! { body: move |_| {
+                       let actual = opentelemetry::Context::current()
+                           .span()
+                           .span_context()
+                           .clone();
+                       if actual == expected {
+                           Ok(actual)
+                       } else {
+                           Err(NativeError::Parent(Arc::from("blocking context differs")))
+                       }
+                   }, on_error: std::convert::identity, }
+           },
+    }, }
 }
 
 /// Concurrent/nested native work restores its parent and exports typed signals
@@ -149,63 +151,70 @@ fn parent_native_carrier_and_signal_mapping() -> Result<(), Box<dyn std::error::
     let expected_trace = parent.span_context().trace_id();
     let expected_parent = parent.span_context().span_id();
     let linked = parent.span_context();
-    let source =
-        Effect::from_exit_future_with_context(move |env: Arc<Environment>, context| async move {
-            // Core owns sibling joining and retains whichever side actually failed.
-            let children = Effect::all_concurrent(
-                child_concurrency,
-                vec![native_child("first"), native_child("second")],
-            )
-            .map(|spans| {
-                assert_eq!(spans.len(), 2);
-                if let Some((a, b)) = spans.first().zip(spans.get(1)) {
-                    assert_ne!(a.span_id(), b.span_id());
-                    assert_eq!(a.trace_id(), b.trace_id());
-                }
-            });
-            let before = opentelemetry::Context::current()
-                .span()
-                .span_context()
-                .clone();
-            let result = context.run(children, env.clone()).await;
-            if !matches!(result, Exit::Success(())) {
-                return result;
-            }
-            let after = opentelemetry::Context::current()
-                .span()
-                .span_context()
-                .clone();
-            assert_eq!(before, after);
-            let checked = context
-                .run(
-                    Otel::use_span(|span| {
-                        use tracing_opentelemetry::OpenTelemetrySpanExt;
-                        Ok(span.context().span().span_context().clone())
-                    }),
-                    env.clone(),
-                )
-                .await;
-            match checked {
-                Exit::Success(checked) => assert_eq!(checked, before),
-                failed => return discard_success(failed),
-            }
-            context
-                .run(
-                    Otel::event_with(
-                        "order.ready",
-                        vec![
-                            effect_otel::KeyValue::new("cups", 2_i64),
-                            effect_otel::KeyValue::new("paid", true),
-                        ],
-                    )
-                    .flat_map(|()| Otel::status(Status::Ok))
-                    .flat_map(|()| Otel::count("cafe.orders", 1))
-                    .flat_map(|()| Otel::log(LogLevel::Info, "pickup ready")),
-                    env,
-                )
-                .await
-        });
-    let program = effect_otel::otel! { name: "order", parent: parent, links: vec![effect_otel::Link::with_context(linked)], effect: source };
+    let source = effect_future! { exit_with_context; body: move |env: Arc<Environment>, context| async move {
+               // Core owns sibling joining and retains whichever side actually failed.
+               let children = effect_map! { program: effect_all_concurrent! { concurrency: child_concurrency, items: vec![native_child("first"), native_child("second")], }, map: |spans| {
+                   assert_eq!(spans.len(), 2);
+                   if let Some((a, b)) = spans.first().zip(spans.get(1)) {
+                       assert_ne!(a.span_id(), b.span_id());
+                       assert_eq!(a.trace_id(), b.trace_id());
+                   }
+               }, };
+               let before = opentelemetry::Context::current()
+                   .span()
+                   .span_context()
+                   .clone();
+               let result = context.run(children, env.clone()).await;
+               if !matches!(result, Exit::Success(())) {
+                   return result;
+               }
+               let after = opentelemetry::Context::current()
+                   .span()
+                   .span_context()
+                   .clone();
+               assert_eq!(before, after);
+               let checked = context
+                   .run(
+                       Otel::use_span(|span| {
+                           use tracing_opentelemetry::OpenTelemetrySpanExt;
+                           Ok(span.context().span().span_context().clone())
+                       }),
+                       env.clone(),
+                   )
+                   .await;
+               match checked {
+                   Exit::Success(checked) => assert_eq!(checked, before),
+                   failed @ (Exit::Fail(_)
+                   | Exit::Die(_)
+                   | Exit::Interrupted
+                   | Exit::FinalizationFailed(_)) => return discard_success(failed),
+               }
+               context
+                   .run(
+                       effect! {
+    bind;
+    program: effect! {
+    bind;
+    program: effect! {
+    bind;
+    program: Otel::event_with(
+                           "order.ready",
+                           vec![
+                               effect_otel::KeyValue::new("cups", 2_i64),
+                               effect_otel::KeyValue::new("paid", true),
+                           ],
+                       ),
+    body: |()| Otel::status(Status::Ok),
+    },
+    body: |()| Otel::count("cafe.orders", 1),
+    },
+    body: |()| Otel::log(LogLevel::Info, "pickup ready"),
+    },
+                       env,
+                   )
+                   .await
+           }, };
+    let program = otel! { name: "order", parent: parent, links: vec![effect_otel::Link::with_context(linked)], effect: source };
     assert!(matches!(
         runtime.block_on(program.run(environment.clone())),
         Exit::Success(())
@@ -355,12 +364,14 @@ fn owned_close_and_partial_acquisition_failure() -> Result<(), Box<dyn std::erro
     let policy = ShutdownPolicy::new(Duration::from_secs(5), true)?;
     let owned = match runtime.block_on(OwnedProviders::start(factories, policy).run(env.clone())) {
         Exit::Success(owned) => owned,
-        other => return Err(format!("acquire failed: {:?}", discard_success(other)).into()),
+        other
+        @ (Exit::Fail(_) | Exit::Die(_) | Exit::Interrupted | Exit::FinalizationFailed(_)) => {
+            return Err(format!("acquire failed: {:?}", discard_success(other)).into());
+        }
     };
     let first = owned.close();
     let second = owned.close();
-    let (a, b) =
-        runtime.block_on(async { tokio::join!(first.run(env.clone()), second.run(env.clone())) });
+    let (a, b) = runtime.block_on(async { join!(first.run(env.clone()), second.run(env.clone())) });
     assert!(matches!(a, Exit::Success(())));
     assert!(matches!(b, Exit::Success(())));
     assert!(spans.is_shutdown_called());

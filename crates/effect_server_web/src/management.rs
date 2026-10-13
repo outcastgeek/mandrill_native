@@ -4,10 +4,12 @@
 //! not a Web text-format serializer. A separate loopback listener/router owns the
 //! scrape surface; forging Host on the application listener does not reach it.
 
+use crate::effect_future;
 use effect::{Effect, HasCancellation, HasTaskSpawner};
 use effect_server::{
-    HasTokio, HttpProtocols, RequestBinding, Router, Server, ServerError, ServerHost, ServerPolicy,
+    HasTokio, HttpProtocols, RequestBinding, ServerError, ServerHost, ServerPolicy,
 };
+use effect_server::{route, router, server};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 
@@ -59,29 +61,37 @@ where
     S::Future: Send + 'static,
 {
     // Reuse Server's route validation rather than introducing a management matcher.
-    let _validated = effect_server::Route::literal(scrape_path)?;
+    let _validated = route! { literal: scrape_path }?;
     let path = scrape_path.to_owned();
-    let routes = Router::new().native(move |router| {
+    let routes = router! {
+        native: move |router| {
         Ok(router.route(&path, axum::routing::get_service(exporter.clone())))
-    });
+    } };
     let environment = RequestBinding::new(|_| {
-        Effect::from_future_with_env(|environment, _| async move { environment })
+        effect_future! { with_env; body: |environment, _| async move { environment }, }
     });
-    Ok(Server::new(policy, environment, exposure.address(), protocols, routes).with_host(use_host))
+    Ok(server! {
+        policy: policy,
+        environment: environment,
+        listen: exposure.address(),
+        protocols: protocols,
+        routes: routes,
+    }?
+    .with_host(use_host))
 }
 
 /// Host the supported native Prometheus registry/encoder on a separate loopback
 /// listener. The registry belongs to the caller's native OTel Prometheus reader or
 /// native Prometheus collectors; Web installs no global registry/provider/exporter.
 /// Encoding uses the official library and a caller-bounded native byte sink.
+/// `exporter` pairs the caller-owned registry with its maximum encoded response size.
 #[cfg(feature = "prometheus")]
 pub fn with_prometheus_host<A, E, R>(
     policy: ServerPolicy<E, R>,
     exposure: LoopbackExposure,
     protocols: HttpProtocols,
     scrape_path: &str,
-    registry: prometheus::Registry,
-    maximum_bytes: std::num::NonZeroUsize,
+    exporter: (prometheus::Registry, std::num::NonZeroUsize),
     errors: impl Fn(prometheus::Error) -> E + Send + Sync + 'static,
     use_host: impl Fn(ServerHost) -> Effect<A, E, R> + Send + Sync + 'static,
 ) -> Result<Effect<A, E, R>, ServerError>
@@ -90,10 +100,15 @@ where
     E: Send + 'static,
     R: HasTokio + HasCancellation + HasTaskSpawner + Send + Sync + 'static,
 {
+    use crate::effect_try_sync;
+    use effect::effect_map;
+    use effect_server::{endpoint, registered, reply};
     use prometheus::Encoder;
+    let (registry, maximum_bytes) = exporter;
     let errors = std::sync::Arc::new(errors);
-    let render = Effect::try_sync(
-        move || {
+    let render = effect_map! {
+        program: effect_try_sync! {
+        body: move || {
             let encoder = prometheus::TextEncoder::new();
             let families = registry.gather();
             let mut output = BoundedMetrics {
@@ -105,28 +120,32 @@ where
                 .map_err(|error| prometheus::Error::Msg(error.to_string()))?;
             Ok::<_, prometheus::Error>((bytes::Bytes::from(output.bytes), media))
         },
-        move |error| errors(error),
-    )
-    .map(|(bytes, media)| {
-        effect_server::ReplyDraft::new()
-            .header(
+        on_error: move |error| errors(error),
+        },
+        map: |(bytes, media)| reply! {
+            header(
                 http::header::CACHE_CONTROL,
                 http::HeaderValue::from_static("no-store"),
-            )
-            .finish(effect_server::Reply::bytes(bytes, media))
-    });
-    let routes = Router::new().registered(
-        effect_server::HttpMethodSet::new(vec![http::Method::GET])?,
-        scrape_path,
-        effect_server::Registered::new(
-            effect_server::Endpoint::from_effect(render),
-            effect_server::Registration::default(),
         ),
-    )?;
+            bytes(bytes, media),
+        },
+    };
+    let routes = router! {
+        methods(effect_server::HttpMethodSet::new(vec![http::Method::GET])?, scrape_path, registered! {
+            endpoint(endpoint! { effect(render) }),
+        }),
+    }?;
     let environment = RequestBinding::new(|_| {
-        Effect::from_future_with_env(|environment, _| async move { environment })
+        effect_future! { with_env; body: |environment, _| async move { environment }, }
     });
-    Ok(Server::new(policy, environment, exposure.address(), protocols, routes).with_host(use_host))
+    Ok(server! {
+        policy: policy,
+        environment: environment,
+        listen: exposure.address(),
+        protocols: protocols,
+        routes: routes,
+    }?
+    .with_host(use_host))
 }
 /// Finite native encoding sink. It enforces caller policy while the official
 /// Prometheus encoder supplies every wire-format rule; Web implements no serializer.

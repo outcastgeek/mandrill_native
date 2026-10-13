@@ -1,7 +1,8 @@
 //! Endpoint descriptions, registration metadata and owned middleware continuations.
 
+use crate::effect_future;
 use crate::{BodyOutcome, HasRequest, Reply, Request, ResourceValidators, ServerError};
-use effect::{Effect, Exit, PrimaryOutcomeRef, Release, Scope};
+use effect::{Effect, Exit, PrimaryOutcomeRef, Release, Scope, effect, service};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
@@ -16,7 +17,8 @@ where
     F: Future<Output = Exit<A, E>> + Send + 'static,
 {
     let factory = Mutex::new(Some(factory));
-    Effect::from_exit_future_with_context(move |env, context| {
+    effect_future! {
+        exit_with_context; body: move |env, context| {
         let factory = factory
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -29,7 +31,7 @@ where
                 )),
             }
         }
-    })
+    }, }
 }
 /// The awaited middleware continuation owns its reply/body delivery and scope lifetime.
 pub type Continuation<E, R> = Arc<dyn Fn() -> Effect<(), E, R> + Send + Sync>;
@@ -94,7 +96,8 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Endpoint<E, R> {
         self.on_error = Some(Arc::new(handler));
         self
     }
-    /// Check mutation preconditions before any endpoint/body/application writes.
+    /// Await current validators and check mutation preconditions before application writes.
+    /// Short-circuit replies retain validators; only Proceed evaluates the original scoped body.
     pub fn preconditions(
         self,
         validators: impl Fn(Request) -> Effect<ResourceValidators, E, R> + Send + Sync + 'static,
@@ -110,30 +113,30 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Endpoint<E, R> {
             let body = body.clone();
             let validators = validators.clone();
             let map = map.clone();
-            Effect::service(|env: &R| env.request().clone()).flat_map(move |request| {
+            effect! {
                 let body = body.clone();
                 let scope = scope.clone();
                 let map = map.clone();
-                validators(request.clone()).flat_map(move |current| {
-                    let decision = current.evaluate(&request).map_err(|error| map(error));
-                    match decision {
-                        Ok(crate::ConditionalOutcome::Proceed) => body(scope.clone()),
-                        Ok(crate::ConditionalOutcome::NotModified) => {
-                            let mut reply = Reply::empty();
-                            reply.status = http::StatusCode::NOT_MODIFIED;
-                            current.write(&mut reply.headers);
-                            Effect::from_result_once(Ok(reply))
-                        }
-                        Ok(crate::ConditionalOutcome::PreconditionFailed) => {
-                            let mut reply = Reply::empty();
-                            reply.status = http::StatusCode::PRECONDITION_FAILED;
-                            current.write(&mut reply.headers);
-                            Effect::from_result_once(Ok(reply))
-                        }
-                        Err(error) => Effect::from_result_once(Err(error)),
+                let validators = validators.clone();
+                let request = service! { env |env: &R| { env.request().clone() }, }?;
+                let current = validators(request.clone())?;
+                let decision = Effect::from_result_once(current.evaluate(&request).map_err(|error| map(error)))?;
+                match decision {
+                    crate::ConditionalOutcome::Proceed => body(scope)?,
+                    crate::ConditionalOutcome::NotModified => {
+                        let mut reply = Reply::empty();
+                        reply.status = http::StatusCode::NOT_MODIFIED;
+                        current.write(&mut reply.headers);
+                        reply
                     }
-                })
-            })
+                    crate::ConditionalOutcome::PreconditionFailed => {
+                        let mut reply = Reply::empty();
+                        reply.status = http::StatusCode::PRECONDITION_FAILED;
+                        current.write(&mut reply.headers);
+                        reply
+                    }
+                }
+            }
         });
         Self {
             body: checked,
@@ -182,8 +185,12 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Pipeline<E, R> {
     ) -> Self {
         let action = Arc::new(action);
         self.stage(move |request, next| {
-            let next = next.clone();
-            action(request).flat_map(move |()| next())
+            let before = action(request);
+            effect! {
+                let next = next.clone();
+                before.clone()?;
+                next()?
+            }
         })
     }
     /// Run an Effect after downstream delivery succeeds, before the enclosing scope finalizes.
@@ -194,7 +201,13 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Pipeline<E, R> {
         let action = Arc::new(action);
         self.stage(move |request, next| {
             let action = action.clone();
-            next().flat_map(move |()| action(request.clone()))
+            let delivery = next();
+            effect! {
+                let action = action.clone();
+                let request = request.clone();
+                delivery.clone()?;
+                action(request)?
+            }
         })
     }
     /// Short-circuit with a typed expected failure before awaiting downstream work.
@@ -206,15 +219,18 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Pipeline<E, R> {
         let predicate = Arc::new(predicate);
         let rejected = Arc::new(rejected);
         self.stage(move |request, next| {
-            let rejected = rejected.clone();
-            predicate(request).flat_map(move |allowed| {
+            let test = predicate(request);
+            let rejected = Arc::clone(&rejected);
+            effect! {
+                let rejected = rejected.clone();
+                let next = next.clone();
+                let allowed = test.clone()?;
                 if allowed {
-                    next()
+                    next()?
                 } else {
-                    let rejected = rejected.clone();
-                    Effect::fail_with(move || rejected())
+                    Effect::fail_with(move || rejected())?
                 }
-            })
+            }
         })
     }
     /// Observe the original full-delivery outcome, retaining release failures in core order.

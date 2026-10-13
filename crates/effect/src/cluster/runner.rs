@@ -6,6 +6,10 @@ use super::{
     MessageClaim, StoreCompletion,
 };
 use crate::{Effect, HasTaskSpawner, HasWallClock, UtcMillis, WallClock};
+use crate::{
+    effect, effect_all_concurrent, effect_map, effect_map_error, effect_provide_some,
+    effect_try_sync, effect_uninterruptible, service,
+};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
@@ -153,28 +157,37 @@ impl ClusterRunner {
         ClockError: Send + 'static,
     {
         let options = Mutex::new(Some(options));
-        Effect::service(|env: &R| env.cluster_message_store()).flat_map(move |store| {
-            let options = options
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            let Some(options) = options else {
-                return Effect::from_result_once(Err(ClusterRunnerError::InputConsumed));
-            };
-            store
-                .claim(options)
-                .map_error(ClusterRunnerError::UncertainClaim)
-                .provide_some(|_: &R| ())
-                .flat_map(move |claims| {
-                    let programs = claims
-                        .into_iter()
-                        .map(|claim| {
-                            run_claim::<R, StoreError, ExecutionError, ClockError>(claim).either()
-                        })
-                        .collect();
-                    Effect::all_concurrent(parallelism, programs)
-                })
-        })
+        effect! {
+        bind;
+        program: service! { env: |env: &R| env.cluster_message_store(), },
+        body: move |store| {
+                   let options = options
+                       .lock()
+                       .unwrap_or_else(std::sync::PoisonError::into_inner)
+                       .take();
+                   let Some(options) = options else {
+                       return effect_try_sync! {
+                           once;
+                           body: || Err(()),
+                           on_error: |_| ClusterRunnerError::InputConsumed,
+                       };
+                   };
+                   {
+                       let __dsl_program = effect_provide_some! {
+                       program: effect_map_error! {
+                       program: store
+                       .claim(options), map: ClusterRunnerError::UncertainClaim, }, project: |_: &R| (), }; effect! {
+                           let claims = __dsl_program.clone()?; {
+                           let programs = claims
+                               .into_iter()
+                               .map(|claim| {
+                                   run_claim::<R, StoreError, ExecutionError, ClockError>(claim).either()
+                               })
+                               .collect();
+                           effect_all_concurrent! { concurrency: parallelism, items: programs, }
+                       }? } }
+               },
+        }
     }
 }
 
@@ -205,62 +218,71 @@ where
 {
     let token = claim.token;
     let payload = claim.payload;
-    Effect::service(|env: &R| (env.cluster_executor(), env.cluster_message_store())).flat_map(
-        move |(executor, store)| {
-            let token = token.clone();
-            let payload = Arc::clone(&payload);
-            executor
-                .execute(token.address.clone(), payload)
-                .map_error({
-                    let error_token = token.clone();
-                    move |source| ClusterRunnerError::Execution {
-                        token: error_token.clone(),
-                        source,
-                    }
-                })
-                .flat_map(move |reply| {
-                    let reply = Mutex::new(Some(reply));
-                    let token = token.clone();
-                    let store = Arc::clone(&store);
-                    Effect::wall_now()
-                        .map_error({
-                            let error_token = token.clone();
-                            move |source| ClusterRunnerError::UncertainCompletionClock {
-                                token: error_token.clone(),
-                                source,
-                            }
-                        })
-                        .flat_map(move |completed_at: UtcMillis| {
-                            let reply = reply
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .take();
-                            let Some(reply) = reply else {
-                                return Effect::from_result_once(Err(
-                                    ClusterRunnerError::InputConsumed,
-                                ));
-                            };
-                            let completion = CompletedReply {
-                                token: token.clone(),
-                                reply,
-                                completed_at,
-                            };
-                            let error_token = token.clone();
-                            let request = token.request.clone();
-                            store
-                                .complete(completion)
-                                .map_error(move |source| ClusterRunnerError::UncertainCompletion {
-                                    token: error_token.clone(),
-                                    source,
-                                })
-                                .provide_some(|_: &R| ())
-                                .map(move |completion| ClusterRunOutcome {
-                                    request: request.clone(),
-                                    completion,
-                                })
-                        })
-                        .uninterruptible()
-                })
-        },
-    )
+    {
+        let __dsl_program =
+            service! { env: |env: &R| (env.cluster_executor(), env.cluster_message_store()), };
+        effect! {
+               let __dsl_program = __dsl_program.clone(); let payload = payload.clone(); let token = token.clone(); let (executor , store) = __dsl_program?; {
+                   let token = token.clone();
+                   let payload = Arc::clone(&payload);
+                   {
+                       let __dsl_program = effect_map_error! {
+                       program: executor
+                       .execute(token.address.clone(), payload), map: {
+                           let error_token = token.clone();
+                           move |source| ClusterRunnerError::Execution {
+                               token: error_token.clone(),
+                               source,
+                           }
+                       }, }; effect! {
+                           let __dsl_program = __dsl_program.clone(); let store = store.clone(); let token = token.clone(); let reply = __dsl_program?; {
+                           let reply = Mutex::new(Some(reply));
+                           let token = token.clone();
+                           let store = Arc::clone(&store);
+                           effect_uninterruptible! {
+                               program: effect! {
+        bind;
+        program: effect_map_error! {
+            program: Effect::wall_now(), map: {
+                                   let error_token = token.clone();
+                                   move |source| ClusterRunnerError::UncertainCompletionClock {
+                                       token: error_token.clone(),
+                                       source,
+                                   }
+                               }, },
+        body: move |completed_at: UtcMillis| {
+                                   let reply = reply
+                                       .lock()
+                                       .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                       .take();
+                                   let Some(reply) = reply else {
+                                       return effect_try_sync! {
+                                           once;
+                                           body: || Err(()),
+                                           on_error: |_| ClusterRunnerError::InputConsumed,
+                                       };
+                                   };
+                                   let completion = CompletedReply {
+                                       token: token.clone(),
+                                       reply,
+                                       completed_at,
+                                   };
+                                   let error_token = token.clone();
+                                   let request = token.request.clone();
+                                   effect_map! {
+                                       program: effect_provide_some! {
+                                       program: effect_map_error! {
+                                       program: store
+                                       .complete(completion), map: move |source| ClusterRunnerError::UncertainCompletion {
+                                           token: error_token.clone(),
+                                           source,
+                                       }, }, project: |_: &R| (), }, map: move |completion| ClusterRunOutcome {
+                                           request: request.clone(),
+                                           completion,
+                                       }, }
+                               },
+        }, }
+                       }? } }
+               }? }
+    }
 }

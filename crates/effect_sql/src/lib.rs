@@ -19,6 +19,19 @@
 
 extern crate self as effect_sql;
 
+/// Typed callback blocks using this facade's existing Effect dependency.
+pub use effect::{
+    codec, effect_all, effect_all_concurrent, effect_blocking, effect_cpu, effect_die,
+    effect_finalizer, effect_for_each, effect_for_each_concurrent, effect_from_option,
+    effect_future, effect_map, effect_map_error, effect_on_interrupt, effect_permit,
+    effect_provide_some, effect_provided, effect_race, effect_recover, effect_ref, effect_repeat,
+    effect_resource, effect_retry, effect_sandbox, effect_schema_parse, effect_scope,
+    effect_scope_acquire, effect_socket, effect_stream_for_each, effect_sync, effect_timeout,
+    effect_try_blocking, effect_try_cpu, effect_try_future, effect_try_sync,
+    effect_uninterruptible, effect_using, effect_with_layer, layer, pool, request_resolver,
+    schedule, sink, weak_cache,
+};
+
 #[cfg(feature = "turso")]
 mod client;
 #[cfg(feature = "turso")]
@@ -66,6 +79,7 @@ pub use telemetry::{SqlCompletion, SqlObservation, SqlOperation, observe};
 pub use sqlx;
 
 /// Construct a reusable native row program with scoped column reads and Effect validation.
+/// `row! { project: callback }` adapts an extracted borrowed native row projection.
 #[cfg(feature = "turso")]
 pub use effect_macros::row;
 /// Build an inert statement with text/identifier/fragment/where/param operations.

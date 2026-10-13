@@ -1,7 +1,11 @@
 //! Resources owned by one entity activation.
 
 use super::ClusterOwner;
-use crate::{Effect, Release, ResourceValue, Scope};
+use crate::{Effect, ResourceValue, Scope};
+use crate::{
+    effect, effect_finalizer, effect_map, effect_map_error, effect_provide_some,
+    effect_scope_acquire, effect_sync, effect_try_sync, service,
+};
 use std::sync::Arc;
 
 /// Type alias for entity acquire in cluster entity resource.
@@ -98,34 +102,24 @@ impl<T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
         let release = Arc::clone(&self.release);
         let check_owner = owner.clone();
         let now = Arc::new(now);
-        scope
-            .acquire(
-                Effect::defer(move || acquire(&owner)).map_error(EntityResourceError::Resource),
-                move |value| {
-                    Release::from_effect(release(value).map_error(EntityResourceError::Resource))
-                },
-            )
-            .flat_map(move |value| {
+        {
+            let __dsl_program = effect_scope_acquire! {
+            scope: scope, acquire: effect_map_error! { program: { let __dsl_factory = move || acquire(&owner); effect! { __dsl_factory()? } }, map: EntityResourceError::Resource, }, release: move |value| {
+                                effect_map_error! { program: release(value), map: EntityResourceError::Resource, }
+                            },
+            };
+            effect! { let check_owner = check_owner.clone(); let now = now.clone(); let value = __dsl_program.clone()?; {
                 let owner = check_owner.clone();
                 let check_owner = check_owner.clone();
                 let now = Arc::clone(&now);
-                Effect::defer(move || now())
-                    .map_error(EntityResourceError::Resource)
-                    .zip(Effect::from_result_once(Ok(value)))
-                    .flat_map(move |(now, value)| {
+                { let __dsl_program = { let __dsl_left_program = effect_map_error! { program: { let __dsl_factory = move || now(); effect! { __dsl_factory()? } }, map: EntityResourceError::Resource, }; let __dsl_right_program = effect_try_sync! { once; body: { let __dsl_result = Ok(value); move || __dsl_result }, on_error: ::core::convert::identity, }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }; effect! { let check_owner = check_owner.clone(); let owner = owner.clone(); let (now , value) = __dsl_program.clone()?; {
                         let owner = owner.clone();
                         let check_owner = check_owner.clone();
-                        Effect::service(|env: &R| env.cluster_activation_store())
-                            .flat_map(move |store| {
-                                store
-                                    .inspect_activation(owner.address.clone())
-                                    .map_error(EntityResourceError::Store)
-                                    .provide_some(|_: &R| ())
-                            })
-                            .zip(Effect::from_result_once(Ok(value)))
-                            .flat_map(move |(status, value)| {
-                                Effect::from_result_once(
-                                    if status.is_some_and(|status| {
+                        { let __dsl_program = { let __dsl_left_program = { let __dsl_program = service! { env: |env: &R| env.cluster_activation_store(), }; effect! { let owner = owner.clone(); let store = __dsl_program.clone()?; {
+                                effect_provide_some! { program: effect_map_error! { program: store
+                                    .inspect_activation(owner.address.clone()), map: EntityResourceError::Store, }, project: |_: &R| (), }
+                            }? } }; let __dsl_right_program = effect_try_sync! { once; body: { let __dsl_result = Ok(value); move || __dsl_result }, on_error: ::core::convert::identity, }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }; effect! { let check_owner = check_owner.clone(); let (status , value) = __dsl_program.clone()?; {
+                                effect_try_sync! { once; body: { let __dsl_result = if status.is_some_and(|status| {
                                         status.phase == super::ActivationPhase::Active
                                             && status.lease.owner == check_owner
                                             && now < status.lease.lease_until
@@ -133,11 +127,11 @@ impl<T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
                                         Ok(value)
                                     } else {
                                         Err(EntityResourceError::StaleOwnership)
-                                    },
-                                )
-                            })
-                    })
-            })
+                                    }; move || __dsl_result }, on_error: ::core::convert::identity, }
+                            }? } }
+                    }? } }
+            }? }
+        }
     }
 }
 
@@ -173,7 +167,10 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> EntityResou
     /// Execute lazily in the supplied scope. Partial acquisition remains protected by its owner.
     pub fn acquire(&self, scope: Scope<E>, owner: ClusterOwner) -> Effect<A, E, R> {
         let acquire = Arc::clone(&self.acquire);
-        Effect::defer(move || acquire(scope.clone(), owner.clone()))
+        {
+            let __dsl_factory = move || acquire(scope.clone(), owner.clone());
+            effect! { __dsl_factory()? }
+        }
     }
     /// Lift an ordinary Effect without replacing the enclosing activation scope.
     #[must_use]
@@ -186,7 +183,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> EntityResou
     }
     /// Produce a fresh value on acquisition, with no payload Clone requirement.
     pub fn succeed_with(value: impl Fn() -> A + Send + Sync + 'static) -> Self {
-        Self::from_effect(Effect::sync(value))
+        Self::from_effect(effect_sync! { body: value, })
     }
     /// Transform live state while retaining the existing resource owner.
     pub fn map<B: Send + 'static>(
@@ -196,7 +193,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> EntityResou
         let map = Arc::new(map);
         EntityResourcePlan::new(move |scope, owner| {
             let map = Arc::clone(&map);
-            self.acquire(scope, owner).map(move |value| map(value))
+            effect_map! { program: self.acquire(scope, owner), map: move |value| map(value), }
         })
     }
     /// Compose dependent acquisitions under the same activation and scope.
@@ -207,8 +204,10 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> EntityResou
         let next = Arc::new(next);
         EntityResourcePlan::new(move |scope, owner| {
             let next = Arc::clone(&next);
-            self.acquire(scope.clone(), owner.clone())
-                .flat_map(move |value| next(value).acquire(scope.clone(), owner.clone()))
+            {
+                let __dsl_program = self.acquire(scope.clone(), owner.clone());
+                effect! { let next = next.clone(); let owner = owner.clone(); let scope = scope.clone(); let value = __dsl_program.clone()?; next(value).acquire(scope.clone(), owner.clone())? }
+            }
         })
     }
     /// Map acquisition and registered finalizer failures together, before changing the scope type.
@@ -225,16 +224,15 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> EntityResou
             let cleanup = child.clone();
             let map_cleanup = Arc::clone(&map);
             let map_acquire = Arc::clone(&map);
-            let acquisition = self
-                .acquire(child, owner)
-                .map_error(move |error| map_acquire(error));
-            parent
-                .add_finalizer(
-                    cleanup
-                        .close_owned()
-                        .map_error(move |error| map_cleanup(error)),
-                )
-                .flat_map(move |_| acquisition.clone())
+            let acquisition = effect_map_error! { program: self
+            .acquire(child, owner), map: move |error| map_acquire(error), };
+            {
+                let __dsl_program = effect_finalizer! {
+                scope: parent, body: effect_map_error! { program: cleanup
+                                        .close_owned(), map: move |error| map_cleanup(error), },
+                };
+                effect! { let acquisition = acquisition.clone(); let _ = __dsl_program.clone()?; acquisition.clone()? }
+            }
         })
     }
     /// Generated native body bridge. Resources remain in the externally supplied activation scope.

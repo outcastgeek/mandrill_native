@@ -497,6 +497,20 @@ where
         &self.operation
     }
 
+    /// Project each invocation into this handler's R through existing Effect
+    /// provision. Request ownership and operation identity remain unchanged;
+    /// projection runs only when the returned Effect executes.
+    pub fn provide_some<Outer: Send + Sync + 'static>(
+        self,
+        project: impl Fn(&Outer) -> R + Send + Sync + 'static,
+    ) -> RpcHandler<Q, A, E, Outer> {
+        let project = Arc::new(project);
+        RpcHandler::new(self.operation, move |request| {
+            let project = Arc::clone(&project);
+            (self.invoke)(request).provide_some(move |outer| project(outer))
+        })
+    }
+
     /// Invoke the typed operation through its selected channel or handler.
     ///
     /// # Type parameters

@@ -4,10 +4,15 @@
 //! durations are native process user/system times; peak resident bytes are labelled
 //! as peak, not current working-set size. .NET-specific counters remain unavailable.
 
+use crate::{
+    effect_die, effect_finalizer, effect_future, effect_map, effect_map_error, effect_resource,
+    effect_try_blocking, effect_try_sync, effect_using,
+};
+use effect::stream;
 use effect::{
     AdmissionCapacity, Effect, Exit, HasBlockingExecutor, HasClock, HasTaskSpawner,
-    ProviderAdmission, PubSubError, PubSubOverflow, Release, ResourceBinding, Scope, SharedValue,
-    Stream, SubscriptionRef,
+    ProviderAdmission, PubSubError, PubSubOverflow, Scope, SharedValue, Stream, SubscriptionRef,
+    effect,
 };
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -93,11 +98,10 @@ impl OperationTracker {
         on_error: impl Fn(effect::AdmissionError) -> E + Send + Sync + 'static,
     ) -> Effect<A, E, R> {
         let owner = self.owner.clone();
-        ResourceBinding::new(
-            Effect::try_sync(move || owner.admit(), on_error),
-            |permit, _| Release::sync(move || drop(permit)),
-        )
-        .use_with(move |_| program.clone())
+        effect_using! {
+            acquire: effect_try_sync! { body { owner.admit() }, on_error: on_error, },
+            body: move |_permit| program.clone(),
+        }
     }
     /// Register tracking in the real request/body scope for long-lived operations.
     pub fn scoped<E: Send + 'static, R: Send + Sync + 'static>(
@@ -106,16 +110,24 @@ impl OperationTracker {
         on_error: impl Fn(effect::AdmissionError) -> E + Send + Sync + 'static,
     ) -> Effect<(), E, R> {
         let owner = self.owner.clone();
-        Effect::try_sync(move || owner.admit(), on_error).flat_map(move |permit| {
-            let permit = Arc::new(std::sync::Mutex::new(Some(permit)));
-            scope.add_release(move || {
-                let permit = permit
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
-                Release::sync(move || drop(permit))
-            })
-        })
+        effect! {
+        bind;
+        program: effect_try_sync! { body: move || owner.admit(), on_error: on_error, },
+        body: move |permit| {
+                   let permit = Arc::new(std::sync::Mutex::new(Some(permit)));
+                   effect_finalizer! {
+                       release;
+                       scope: scope,
+                       release: move || {
+                       let permit = permit
+                           .lock()
+                           .unwrap_or_else(std::sync::PoisonError::into_inner)
+                           .take();
+                           effect_resource! { release_sync; body: move || drop(permit) }
+                       },
+                   }
+               },
+        }
     }
 }
 impl Default for OperationTracker {
@@ -129,7 +141,7 @@ impl Default for OperationTracker {
 pub fn process<R: HasBlockingExecutor + Send + Sync + 'static>(
     tracker: OperationTracker,
 ) -> Effect<RuntimeSnapshot, std::io::Error, R> {
-    Effect::try_blocking(move |_| native_process(&tracker), |error| error)
+    effect_try_blocking! { body: move |_| native_process(&tracker), on_error: |error| error, }
 }
 /// Native POSIX getrusage observes the current process; unsafe pointers remain
 /// confined to initialized libc storage and checked syscall acknowledgment.
@@ -239,111 +251,103 @@ impl<E: Send + 'static> RuntimeSampler<E> {
         source: impl Fn() -> Effect<RuntimeSnapshot, E, R> + Send + Sync + 'static,
     ) -> Effect<Self, DiagnosticsError<E>, R> {
         if interval.is_zero() {
-            return Effect::fail_with(|| DiagnosticsError::Definition);
+            return effect_try_sync! { body: { let __dsl_error = || DiagnosticsError::Definition; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
         }
         let source = Arc::new(source);
-        let initial_source = source.clone();
-        Effect::defer(move || initial_source())
-            .map_error(DiagnosticsError::Source)
-            .flat_map(move |sample| {
-                let sampler = Self {
-                    state: SubscriptionRef::new(
-                        RuntimeStatus {
-                            sample: Arc::new(sample),
-                            failure: None,
-                        },
-                        subscription_capacity,
-                        PubSubOverflow::DropOldest,
-                    ),
-                    interval,
-                };
-                let worker_sampler = sampler.clone();
-                let worker_source = source.clone();
-                let worker = Effect::from_exit_future_with_context(move |env: Arc<R>, context| {
-                    let sampler = worker_sampler.clone();
-                    let source = worker_source.clone();
-                    async move {
-                        loop {
-                            let sleep = context
-                                .run(
-                                    Effect::<(), DiagnosticsError<E>, R>::sleep(interval),
-                                    env.clone(),
-                                )
-                                .await;
-                            if !matches!(sleep, Exit::Success(())) {
-                                return sleep;
-                            }
-                            let sampled = context.run(source(), env.clone()).await;
-                            let status = match sampled {
-                                Exit::Success(sample) => RuntimeStatus {
-                                    sample: Arc::new(sample),
-                                    failure: None,
-                                },
-                                Exit::Fail(error) => {
-                                    let old = match context
-                                        .run(sampler.state.read(), env.clone())
-                                        .await
-                                    {
-                                        Exit::Success(old) => old,
-                                        failure @ (Exit::Fail(_)
-                                        | Exit::Die(_)
-                                        | Exit::Interrupted
-                                        | Exit::FinalizationFailed(_)) => {
-                                            return discard_value(
-                                                failure.map_error(DiagnosticsError::Subscription),
-                                            );
+        effect! {
+                    let source = source.clone();
+                    let scope = scope.clone();
+                    let initial_source = source.clone();
+                    let sample = effect_map_error! { program: { let __dsl_factory = move || initial_source(); effect! { __dsl_factory()? } }, map: DiagnosticsError::Source, }?;
+                    let sampler = Self {
+                        state: SubscriptionRef::new(
+                            RuntimeStatus {
+                                sample: Arc::new(sample),
+                                failure: None,
+                            },
+                            subscription_capacity,
+                            PubSubOverflow::DropOldest,
+                        ),
+                        interval,
+                    };
+                    let worker_sampler = sampler.clone();
+                    let worker_source = source.clone();
+                    let worker = effect_future! {
+                        exit_with_context; body: move |env: Arc<R>, context| {
+                        let sampler = worker_sampler.clone();
+                        let source = worker_source.clone();
+                        async move {
+                            loop {
+                                let sleep = context
+                                    .run(
+                                        Effect::<(), DiagnosticsError<E>, R>::sleep(interval),
+                                        env.clone(),
+                                    )
+                                    .await;
+                                if !matches!(sleep, Exit::Success(())) {
+                                    return sleep;
+                                }
+                                let sampled = context.run(source(), env.clone()).await;
+                                let status = match sampled {
+                                    Exit::Success(sample) => RuntimeStatus {
+                                        sample: Arc::new(sample),
+                                        failure: None,
+                                    },
+                                    Exit::Fail(error) => {
+                                        let old = match context
+                                            .run(sampler.state.read(), env.clone())
+                                            .await
+                                        {
+                                            Exit::Success(old) => old,
+                                            failure @ (Exit::Fail(_)
+                                            | Exit::Die(_)
+                                            | Exit::Interrupted
+                                            | Exit::FinalizationFailed(_)) => {
+                                                return discard_value(
+                                                    failure.map_error(DiagnosticsError::Subscription),
+                                                );
+                                            }
+                                        };
+                                        RuntimeStatus {
+                                            sample: old.sample.clone(),
+                                            failure: Some(SharedValue::new(error)),
                                         }
-                                    };
-                                    RuntimeStatus {
-                                        sample: old.sample.clone(),
-                                        failure: Some(SharedValue::new(error)),
                                     }
+                                    failure @ (Exit::Die(_)
+                                    | Exit::Interrupted
+                                    | Exit::FinalizationFailed(_)) => {
+                                        return discard_value(
+                                            failure.map_error(DiagnosticsError::Source),
+                                        );
+                                    }
+                                };
+                                let published = context
+                                    .run(
+                                        effect_map_error! {
+                                            program: sampler
+                                            .state
+                                            .set(status), map: DiagnosticsError::Subscription, },
+                                        env.clone(),
+                                    )
+                                    .await;
+                                if !matches!(published, Exit::Success(_)) {
+                                    return discard_value(published);
                                 }
-                                failure @ (Exit::Die(_)
-                                | Exit::Interrupted
-                                | Exit::FinalizationFailed(_)) => {
-                                    return discard_value(
-                                        failure.map_error(DiagnosticsError::Source),
-                                    );
-                                }
-                            };
-                            let published = context
-                                .run(
-                                    sampler
-                                        .state
-                                        .set(status)
-                                        .map_error(DiagnosticsError::Subscription),
-                                    env.clone(),
-                                )
-                                .await;
-                            if !matches!(published, Exit::Success(_)) {
-                                return discard_value(published);
                             }
                         }
-                    }
-                });
-                let worker_scope = scope.clone();
-                scope
-                    .add_finalizer(
-                        sampler
-                            .state
-                            .shutdown(effect::PubSubShutdown::Discard)
-                            .map_error(DiagnosticsError::Subscription)
-                            .map(|_| ()),
-                    )
-                    .flat_map(move |()| {
-                        let sampler = sampler.clone();
-                        worker_scope
-                            .fork(worker.clone())
-                            .map(move |_| sampler.clone())
-                    })
-            })
+                    }, };
+                    effect_finalizer! {
+        scope: scope, body: effect_map! { program: effect_map_error! { program: sampler.state.shutdown(effect::PubSubShutdown::Discard), map: DiagnosticsError::Subscription, }, map: |_| (), },
+        }?;
+                    scope.fork(worker)?;
+                    sampler
+                }
     }
     /// Read the same latest immutable status used by initial views and subscriptions.
     pub fn status<R: Send + Sync + 'static>(
         &self,
     ) -> Effect<Arc<RuntimeStatus<E>>, DiagnosticsError<E>, R> {
-        self.state.read().map_error(DiagnosticsError::Subscription)
+        effect_map_error! { program: self.state.read(), map: DiagnosticsError::Subscription, }
     }
     /// Existing core stream pins an atomic current sample, then bounded changes.
     /// Lag/backpressure/termination follow the selected core subscription owner.
@@ -363,15 +367,15 @@ impl<E: Send + 'static> RuntimeSampler<E> {
         let acquire_inject = inject.clone();
         let pull_inject = inject.clone();
         let release_inject = inject;
-        Stream::from_pull(
-            self.state
-                .subscribe()
-                .map_error(move |error| acquire_inject(DiagnosticsError::Subscription(error)))
-                .map(|snapshot| Cursor {
+        stream! {
+            pull: effect_map! {
+                program: effect_map_error! {
+                program: self.state
+                .subscribe(), map: move |error| acquire_inject(DiagnosticsError::Subscription(error)), }, map: |snapshot| Cursor {
                     initial: std::sync::Mutex::new(Some(snapshot.value)),
                     subscription: snapshot.subscription,
-                }),
-            move |resource| {
+                }, },
+            read: move |resource| {
                 let inject = pull_inject.clone();
                 match resource.with(|cursor| {
                     match cursor
@@ -381,29 +385,27 @@ impl<E: Send + 'static> RuntimeSampler<E> {
                         .take()
                     {
                         Some(initial) => {
-                            Effect::from_result_once(Ok(effect::Chunk::Values(vec![initial])))
+                            effect_try_sync! { once; body: { let __dsl_result = Ok(effect::Chunk::Values(vec![initial])); move || __dsl_result }, on_error: ::core::convert::identity, }
                         }
-                        None => cursor
+                        None => effect_map_error! {
+                            program: cursor
                             .subscription
-                            .pull_chunk()
-                            .map_error(move |error| inject(DiagnosticsError::Subscription(error))),
+                            .pull_chunk(), map: move |error| inject(DiagnosticsError::Subscription(error)), },
                     }
                 }) {
                     Ok(pull) => pull,
-                    Err(defect) => Effect::die(defect),
+                    Err(defect) => effect_die! { defect: defect, },
                 }
             },
-            move |cursor| {
+            release: move |cursor| {
                 let inject = release_inject.clone();
-                Release::from_effect(
-                    cursor
+                effect_map! {
+                    program: effect_map_error! {
+                    program: cursor
                         .subscription
-                        .unsubscribe()
-                        .map_error(move |error| inject(DiagnosticsError::Subscription(error)))
-                        .map(|_| ()),
-                )
+                        .unsubscribe(), map: move |error| inject(DiagnosticsError::Subscription(error)), }, map: |_| (), }
             },
-        )
+        }
     }
 }
 

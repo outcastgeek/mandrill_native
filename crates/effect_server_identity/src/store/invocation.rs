@@ -5,6 +5,7 @@
 //! store handle. No global context, nested interpreter or synchronous I/O is used.
 
 use super::SqlxIdentityStore;
+use crate::{effect_future, effect_uninterruptible};
 use effect::{Effect, Exit};
 use effect_sql::SqlError;
 use std::{
@@ -114,15 +115,16 @@ where
     F: Future<Output = Result<A, E>> + Send + 'static,
 {
     let operation = Arc::new(operation);
-    Effect::from_exit_future_with_context(move |env: Arc<R>, _| {
+    effect_uninterruptible! {
+        program: effect_future! {
+        exit_with_context; body: move |env: Arc<R>, _| {
         let invocation = select(&env).invocation();
         let operation = operation.clone();
         async move {
             let result = operation(env, invocation.store()).await;
             invocation.finish(result)
         }
-    })
-    .uninterruptible()
+    }, }, }
 }
 
 #[cfg(test)]

@@ -1,5 +1,7 @@
 //! Owned Tokio execution and cancellation for consumer-defined native futures.
 //! No payload schema, database policy, global runtime or callback thread is imposed.
+
+use tokio::pin;
 pub mod foreign;
 
 use futures_util::FutureExt;
@@ -64,7 +66,7 @@ impl Cancellation {
     pub async fn cancelled(&self) {
         loop {
             let notification = self.changed.notified();
-            tokio::pin!(notification);
+            pin!(notification);
             notification.as_mut().enable();
             if self.is_cancelled() {
                 return;
@@ -405,7 +407,7 @@ impl Draining {
     pub async fn wait(self) {
         loop {
             let notification = self.handle.admission.drained.notified();
-            tokio::pin!(notification);
+            pin!(notification);
             notification.as_mut().enable();
             if self.handle.active() == 0 {
                 return;

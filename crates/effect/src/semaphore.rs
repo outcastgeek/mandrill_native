@@ -2,12 +2,14 @@
 
 use crate::internal::notification::notify_all;
 use crate::internal::runtime::{self, Step};
-use crate::{Cancellation, Defect, Effect, Exit, Release, ResourceValue, Scope};
+use crate::{Cancellation, Defect, Effect, Exit, ResourceValue, Scope};
+use crate::{effect_scope_acquire, effect_sync, effect_try_sync};
 use event_listener::Event;
 use futures_util::{FutureExt, future::select};
 use std::collections::BTreeMap;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::pin::pin;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,10 +144,7 @@ impl Semaphore {
         capacity: NonZeroUsize,
         initially_available: usize,
     ) -> Effect<Self, SemaphoreError, R> {
-        Effect::try_sync(
-            move || Self::new(capacity, initially_available),
-            |error| error,
-        )
+        effect_try_sync! { body: move || Self::new(capacity, initially_available), on_error: |error| error, }
     }
 
     #[must_use]
@@ -182,14 +181,14 @@ impl Semaphore {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn available<R: Send + Sync + 'static>(&self) -> Effect<usize, SemaphoreError, R> {
         let semaphore = self.clone();
-        Effect::sync(move || {
+        effect_sync! { body: move || {
             semaphore
                 .inner
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .available
-        })
+        }, }
     }
 
     /// Mint permits only within the caller-declared capacity. This can open a
@@ -323,9 +322,11 @@ impl Semaphore {
         scope: &Scope<SemaphoreError>,
         count: NonZeroUsize,
     ) -> Effect<ResourceValue<SemaphorePermit>, SemaphoreError, R> {
-        scope.acquire(self.acquire(count), |mut permit| {
-            Release::try_sync(move || permit.release_now().map(|_| ()))
-        })
+        effect_scope_acquire! {
+        scope: scope, acquire: self.acquire(count), release: |mut permit| {
+                    crate::Release::try_sync(move || permit.release_now().map(|_| ()))
+                },
+        }
     }
 
     /// Closing rejects pending/new acquisition, but already acquired guards
@@ -339,7 +340,7 @@ impl Semaphore {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn close<R: Send + Sync + 'static>(&self) -> Effect<bool, SemaphoreError, R> {
         let semaphore = self.clone();
-        Effect::sync(move || semaphore.close_now())
+        effect_sync! { body: move || semaphore.close_now(), }
     }
 
     /// # Returns
@@ -447,8 +448,8 @@ impl Semaphore {
                 notify_all(&self.inner.changed);
                 return result;
             }
-            let changed = std::pin::pin!(changed);
-            let cancelled = std::pin::pin!(cancellation.cancelled());
+            let changed = pin!(changed);
+            let cancelled = pin!(cancellation.cancelled());
             let _ = select(changed, cancelled).await;
         }
     }

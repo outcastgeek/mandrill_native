@@ -5,6 +5,7 @@ use super::{
     RpcStreamHandler, RpcStreamProducer,
 };
 use crate::{Effect, JsonValue, PureCodec};
+use crate::{effect, effect_map_error};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -143,12 +144,15 @@ where
         metadata: BTreeMap<Arc<str>, Arc<str>>,
     ) -> Effect<B, RpcClientMiddlewareError<DomainError, Backend, MiddlewareError>, R> {
         let client = self.clone();
-        self.call_raw(request, call, metadata)
-            .flat_map(move |response| {
-                client
-                    .apply_after(response)
-                    .map_error(RpcClientMiddlewareError::After)
-            })
+        {
+            let __dsl_program = self.call_raw(request, call, metadata);
+            effect! {
+            let client = client.clone(); let response = __dsl_program.clone()?; {
+                effect_map_error! {
+                    program: client
+                    .apply_after(response), map: RpcClientMiddlewareError::After, }
+            }? }
+        }
     }
 
     /// Return only after the remote call has produced a successful typed
@@ -179,13 +183,15 @@ where
         metadata: BTreeMap<Arc<str>, Arc<str>>,
     ) -> Effect<A, RpcClientMiddlewareError<DomainError, Backend, MiddlewareError>, R> {
         let client = self.client.clone();
-        (self.before)(request)
-            .map_error(RpcClientMiddlewareError::Before)
-            .flat_map(move |request| {
-                client
-                    .call(request, call.clone(), metadata.clone())
-                    .map_error(RpcClientMiddlewareError::Client)
-            })
+        effect! {
+        bind;
+        program: effect_map_error! { program: (self.before)(request), map: RpcClientMiddlewareError::Before, },
+        body: move |request| {
+                       effect_map_error! {
+                           program: client
+                           .call(request, call.clone(), metadata.clone()), map: RpcClientMiddlewareError::Client, }
+                   },
+        }
     }
 
     /// # Type parameters

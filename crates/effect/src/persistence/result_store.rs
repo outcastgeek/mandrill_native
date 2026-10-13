@@ -6,6 +6,10 @@ use super::{
     StoredValue,
 };
 use crate::{Effect, KeyDomain, StoredOutcome, UtcMillis};
+use crate::{
+    effect, effect_map, effect_map_error, effect_provide_some, effect_sync, effect_try_sync,
+    service,
+};
 use std::sync::Arc;
 
 /// Type alias for backend error in persistence result store.
@@ -142,25 +146,28 @@ where
     D: KeyDomain,
 {
     let key_definition = definition.clone();
-    Effect::try_sync(
-        move || {
+    {
+        let __dsl_program = effect_try_sync! {
+        body: move || {
             let request = input();
             key_definition.key(&request).map(|key| key.into_bytes())
-        },
-        PersistenceError::Identity,
-    )
-    .flat_map(move |key| {
-        let definition = definition.clone();
-        Effect::service(|environment: &R| environment.key_value_store()).flat_map(move |store| {
+        }, on_error: PersistenceError::Identity, };
+        effect! {
+                let definition = definition.clone(); let key = __dsl_program.clone()?; {
             let definition = definition.clone();
-            let key = Arc::clone(&key);
-            store
-                .get(key, now)
-                .map_error(PersistenceError::Backend)
-                .provide_some(|_: &R| ())
-                .flat_map(move |record| Effect::from_result_once(decode_entry(&definition, record)))
-        })
-    })
+            {
+                let __dsl_program = service! { env: |environment: &R| environment.key_value_store(), }; effect! {
+                let definition = definition.clone(); let key = key.clone(); let store = __dsl_program.clone()?; {
+                let definition = definition.clone();
+                let key = Arc::clone(&key);
+                {
+                    let __dsl_program = effect_provide_some! {
+                    program: effect_map_error! {
+                    program: store
+                    .get(key, now), map: PersistenceError::Backend, }, project: |_: &R| (), }; effect! { let definition = definition.clone(); let record = __dsl_program.clone()?; effect_try_sync! { once; body: { let __dsl_result = decode_entry(&definition, record); move || __dsl_result }, on_error: ::core::convert::identity, }? } }
+            }? } }
+        }? }
+    }
 }
 
 /// Batch reads preserve request order and key association. Identity, backend
@@ -194,65 +201,72 @@ where
     D: KeyDomain,
 {
     let key_definition = definition.clone();
-    Effect::sync(move || {
-        inputs()
-            .iter()
-            .map(|input| key_definition.key(input).map(|key| key.into_bytes()))
-            .collect::<Vec<_>>()
-    })
-    .flat_map(move |slots| {
-        let keys = Arc::new(slots);
-        let definition = definition.clone();
-        Effect::service(|environment: &R| environment.key_value_store()).flat_map(move |store| {
-            let keys = Arc::clone(&keys);
-            let definition = definition.clone();
-            let valid: Vec<_> = keys
+    {
+        let __dsl_program = effect_sync! {
+            body: move || {
+            inputs()
                 .iter()
-                .filter_map(|key| key.as_ref().ok().cloned())
-                .collect();
-            if valid.is_empty() {
-                let failures = keys
+                .map(|input| key_definition.key(input).map(|key| key.into_bytes()))
+                .collect::<Vec<_>>()
+        }, };
+        effect! {
+            let __dsl_program = __dsl_program.clone(); let definition = definition.clone(); let slots = __dsl_program.clone()?; {
+            let keys = Arc::new(slots);
+            let definition = definition.clone();
+            {
+                let __dsl_program = service! { env: |environment: &R| environment.key_value_store(), }; effect! {
+                let __dsl_program = __dsl_program.clone(); let definition = definition.clone(); let keys = keys.clone(); let store = __dsl_program.clone()?; (move || {
+                let keys = Arc::clone(&keys);
+                let definition = definition.clone();
+                let valid: Vec<_> = keys
                     .iter()
-                    .filter_map(|slot| {
-                        slot.as_ref()
-                            .err()
-                            .copied()
-                            .map(|error| Err(PersistenceError::Identity(error)))
-                    })
-                    .collect::<Vec<_>>();
-                return Effect::sync_once(move || failures);
-            }
-            store
-                .get_many(valid, now)
-                .map_error(PersistenceError::Backend)
-                .provide_some(|_: &R| ())
-                .flat_map(move |records| {
-                    let mut records = records.into_iter();
-                    let mut decoded = Vec::with_capacity(keys.len());
-                    for slot in keys.iter() {
-                        match slot {
-                            Err(error) => decoded.push(Err(PersistenceError::Identity(*error))),
-                            Ok(expected) => {
-                                let Some(record) = records.next() else {
-                                    return Effect::fail_with(|| PersistenceError::BatchMismatch);
-                                };
-                                if expected.as_ref() != record.key.as_ref() {
-                                    return Effect::fail_with(|| PersistenceError::BatchMismatch);
+                    .filter_map(|key| key.as_ref().ok().cloned())
+                    .collect();
+                if valid.is_empty() {
+                    let failures = keys
+                        .iter()
+                        .filter_map(|slot| {
+                            slot.as_ref()
+                                .err()
+                                .copied()
+                                .map(|error| Err(PersistenceError::Identity(error)))
+                        })
+                        .collect::<Vec<_>>();
+                    return effect_sync! { once; body: move || failures, };
+                }
+                {
+                    let __dsl_program = effect_provide_some! {
+                    program: effect_map_error! {
+                    program: store
+                    .get_many(valid, now), map: PersistenceError::Backend, }, project: |_: &R| (), }; effect! {
+                        let __dsl_program = __dsl_program.clone(); let definition = definition.clone(); let keys = keys.clone(); let records = __dsl_program.clone()?; (move || {
+                        let mut records = records.into_iter();
+                        let mut decoded = Vec::with_capacity(keys.len());
+                        for slot in keys.iter() {
+                            match slot {
+                                Err(error) => decoded.push(Err(PersistenceError::Identity(*error))),
+                                Ok(expected) => {
+                                    let Some(record) = records.next() else {
+                                        return effect_try_sync! { body: { let __dsl_error = || PersistenceError::BatchMismatch; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
+                                    };
+                                    if expected.as_ref() != record.key.as_ref() {
+                                        return effect_try_sync! { body: { let __dsl_error = || PersistenceError::BatchMismatch; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
+                                    }
+                                    decoded.push(match record.result {
+                                        Ok(read) => decode_entry(&definition, read),
+                                        Err(error) => Err(PersistenceError::Backend(error)),
+                                    });
                                 }
-                                decoded.push(match record.result {
-                                    Ok(read) => decode_entry(&definition, read),
-                                    Err(error) => Err(PersistenceError::Backend(error)),
-                                });
                             }
                         }
-                    }
-                    if records.next().is_some() {
-                        return Effect::fail_with(|| PersistenceError::BatchMismatch);
-                    }
-                    Effect::sync_once(move || decoded)
-                })
-        })
-    })
+                        if records.next().is_some() {
+                            return effect_try_sync! { body: { let __dsl_error = || PersistenceError::BatchMismatch; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
+                        }
+                        effect_sync! { once; body: move || decoded, }
+                    })()? } }
+            })()? } }
+        }? }
+    }
 }
 
 /// A write error from the provider is uncertain because the provider may have
@@ -292,8 +306,9 @@ where
     E: Send + 'static,
     D: KeyDomain,
 {
-    Effect::try_sync(
-        move || {
+    {
+        let __dsl_program = effect_try_sync! {
+        body: move || {
             let request = input();
             let key = definition
                 .key(&request)
@@ -301,56 +316,61 @@ where
             let value = outcome();
             let bytes = definition.encode(&value).map_err(PersistenceError::Codec)?;
             Ok((key.into_bytes(), StoredValue { bytes, expires_at }))
-        },
-        std::convert::identity,
-    )
-    .flat_map(move |(key, value)| {
-        let value = Arc::new(std::sync::Mutex::new(Some(value)));
-        Effect::service(|environment: &R| environment.key_value_store()).flat_map(move |store| {
-            let key = Arc::clone(&key);
-            let value = Arc::clone(&value);
-            Effect::defer(move || {
-                let value = value
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
-                match value {
-                    Some(value) => store
-                        .put(Arc::clone(&key), value)
-                        .map_error({
-                            let key = Arc::clone(&key);
-                            move |source| PersistenceError::Uncertain {
-                                operation: PersistenceMutation::Write,
-                                key: Arc::clone(&key),
-                                source,
-                            }
-                        })
-                        .provide_some(|_: &R| ())
-                        .flat_map({
-                            let key = Arc::clone(&key);
-                            move |revision| {
-                                if revision.value() == 0 {
-                                    let key = Arc::clone(&key);
-                                    Effect::fail_with(move || {
-                                        PersistenceError::InvalidAcknowledgement {
-                                            operation: PersistenceMutation::Write,
-                                            key: Arc::clone(&key),
-                                        }
-                                    })
-                                } else {
-                                    Effect::sync_once(move || revision)
+        }, on_error: std::convert::identity, };
+        effect! {
+                let (key , value) = __dsl_program.clone()?; {
+            let value = Arc::new(std::sync::Mutex::new(Some(value)));
+            {
+                let __dsl_program = service! { env: |environment: &R| environment.key_value_store(), }; effect! {
+                let key = key.clone(); let value = value.clone(); let store = __dsl_program.clone()?; {
+                let key = Arc::clone(&key);
+                let value = Arc::clone(&value);
+                {
+                    let __dsl_factory = move || {
+                    let value = value
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    match value {
+                        Some(value) => {
+                            let __dsl_program = effect_provide_some! {
+                            program: effect_map_error! {
+                            program: store
+                            .put(Arc::clone(&key), value), map: {
+                                let key = Arc::clone(&key);
+                                move |source| PersistenceError::Uncertain {
+                                    operation: PersistenceMutation::Write,
+                                    key: Arc::clone(&key),
+                                    source,
                                 }
-                            }
-                        }),
-                    None => Effect::fail_with(|| {
-                        PersistenceError::Codec(crate::SchemaIssue::new(
-                            crate::SchemaIssueKind::InputConsumed,
-                        ))
-                    }),
-                }
-            })
-        })
-    })
+                            }, }, project: |_: &R| (), }; let key = Arc::clone(&key); effect! {
+                                let __dsl_program = __dsl_program.clone(); let key = key.clone(); let revision = __dsl_program?; {
+                                    if revision.value() == 0 {
+                                        let key = Arc::clone(&key);
+                                        effect_try_sync! {
+                                            body: {
+                                            let __dsl_error = move || {
+                                            PersistenceError::InvalidAcknowledgement {
+                                                operation: PersistenceMutation::Write,
+                                                key: Arc::clone(&key),
+                                            }
+                                        }; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }
+                                    } else {
+                                        effect_sync! { once; body: move || revision, }
+                                    }
+                                }? } },
+                        None => effect_try_sync! {
+                            body: {
+                            let __dsl_error = || {
+                            PersistenceError::Codec(crate::SchemaIssue::new(
+                                crate::SchemaIssueKind::InputConsumed,
+                            ))
+                        }; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, },
+                    }
+                }; effect! { __dsl_factory()? } }
+            }? } }
+        }? }
+    }
 }
 
 /// Remove the selected entry through this collection or store contract.
@@ -380,29 +400,32 @@ where
     E: Send + 'static,
     D: KeyDomain,
 {
-    Effect::try_sync(
-        move || {
+    {
+        let __dsl_program = effect_try_sync! {
+        body: move || {
             let request = input();
             definition.key(&request).map(|key| key.into_bytes())
-        },
-        PersistenceError::Identity,
-    )
-    .flat_map(move |key| {
-        Effect::service(|environment: &R| environment.key_value_store()).flat_map(move |store| {
-            store
-                .remove(Arc::clone(&key))
-                .map(|removed| removed.is_some())
-                .map_error({
-                    let key = Arc::clone(&key);
-                    move |source| PersistenceError::Uncertain {
-                        operation: PersistenceMutation::Remove,
-                        key: Arc::clone(&key),
-                        source,
-                    }
-                })
-                .provide_some(|_: &R| ())
-        })
-    })
+        }, on_error: PersistenceError::Identity, };
+        effect! {
+                let key = __dsl_program.clone()?; {
+            {
+                let __dsl_program = service! { env: |environment: &R| environment.key_value_store(), }; effect! {
+                let key = key.clone(); let store = __dsl_program.clone()?; {
+                effect_provide_some! {
+                    program: effect_map_error! {
+                    program: effect_map! {
+                    program: store
+                    .remove(Arc::clone(&key)), map: |removed| removed.is_some(), }, map: {
+                        let key = Arc::clone(&key);
+                        move |source| PersistenceError::Uncertain {
+                            operation: PersistenceMutation::Remove,
+                            key: Arc::clone(&key),
+                            source,
+                        }
+                    }, }, project: |_: &R| (), }
+            }? } }
+        }? }
+    }
 }
 
 /// Conditional mutation is available only when R's store supplies the
@@ -434,40 +457,49 @@ where
     R::Store: ConditionalKeyValueStore,
 {
     let replacement = std::sync::Mutex::new(Some(replacement));
-    Effect::service(|environment: &R| environment.key_value_store()).flat_map(move |store| {
+    effect! {
+        bind;
+        program: service! { env: |environment: &R| environment.key_value_store(), },
+        body: move |store| {
         let key = Arc::clone(&key);
         let replacement = replacement
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         let Some(replacement) = replacement else {
-            return Effect::fail_with(|| {
+            return effect_try_sync! {
+                body: {
+                let __dsl_error = || {
                 PersistenceError::Codec(crate::SchemaIssue::new(
                     crate::SchemaIssueKind::InputConsumed,
                 ))
-            });
+            }; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
         };
-        store
-            .compare_exchange(Arc::clone(&key), expected, replacement)
-            .map_error({
+        {
+            let __dsl_program = effect_provide_some! {
+            program: effect_map_error! {
+            program: store
+            .compare_exchange(Arc::clone(&key), expected, replacement), map: {
                 let key = Arc::clone(&key);
                 move |source| PersistenceError::Uncertain {
                     operation: PersistenceMutation::CompareExchange,
                     key: Arc::clone(&key),
                     source,
                 }
-            })
-            .provide_some(|_: &R| ())
-            .flat_map(move |result| {
+            }, }, project: |_: &R| (), }; effect! {
+                let key = key.clone(); let result = __dsl_program.clone()?; {
                 if matches!(result, CompareExchange::Written(revision) if revision.value() == 0) {
                     let key = Arc::clone(&key);
-                    Effect::fail_with(move || PersistenceError::InvalidAcknowledgement {
+                    effect_try_sync! {
+                        body: {
+                        let __dsl_error = move || PersistenceError::InvalidAcknowledgement {
                         operation: PersistenceMutation::CompareExchange,
                         key: Arc::clone(&key),
-                    })
+                    }; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }
                 } else {
-                    Effect::sync_once(move || result)
+                    effect_sync! { once; body: move || result, }
                 }
-            })
-    })
+            }? } }
+        },
+    }
 }

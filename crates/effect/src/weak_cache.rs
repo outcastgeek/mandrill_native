@@ -6,6 +6,10 @@ use crate::{
     Cache, CacheCapacity, CacheConfig, Defect, Effect, Exit, HasClock, HasTaskSpawner,
     LibraryDefect, Release, Scope, SharedValue,
 };
+use crate::{
+    effect, effect_all, effect_die, effect_finalizer, effect_map, effect_provide_some,
+    effect_uninterruptible,
+};
 use std::sync::{
     Arc, Mutex, Weak,
     atomic::{AtomicBool, Ordering},
@@ -145,25 +149,32 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> WeakCache<K
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
             match program {
-                Some(program) => program.provide_some(|_: &R| ()),
-                None => Effect::die(Defect::from(LibraryDefect::WeakCacheLoadConsumed)),
+                Some(program) => effect_provide_some! { program: program, project: |_: &R| (), },
+                None => effect_die! { defect: Defect::from(LibraryDefect::WeakCacheLoadConsumed), },
             }
         });
-        build.flat_map(move |cache| {
-            let cache = Self {
-                inner: Arc::new(Inner {
-                    cache,
-                    entries: Mutex::new(Vec::new()),
-                    closed: AtomicBool::new(false),
-                }),
-            };
-            let close = cache.clone();
-            let registered = scope.add_release(move || {
-                let close = close.clone();
-                Release::sync(move || close.close_index())
-            });
-            registered.map(move |()| cache.clone())
-        })
+        {
+            let __dsl_program = build;
+            effect! { let scope = scope.clone(); let cache = __dsl_program.clone()?; {
+                let cache = Self {
+                    inner: Arc::new(Inner {
+                        cache,
+                        entries: Mutex::new(Vec::new()),
+                        closed: AtomicBool::new(false),
+                    }),
+                };
+                let close = cache.clone();
+                let registered = effect_finalizer! {
+                    release;
+                    scope: scope,
+                    release: move || {
+                    let close = close.clone();
+                    Release::sync(move || close.close_index())
+                    },
+                };
+                effect_map! { program: registered, map: move |()| cache.clone(), }
+            }? }
+        }
     }
     ///
     /// # Returns
@@ -309,7 +320,7 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> WeakCache<K
     ) -> Effect<(), SharedValue<E>, R> {
         let cache = self.clone();
         let identity = Arc::downgrade(key);
-        Effect::defer(move || {
+        effect_uninterruptible! { program: { let __dsl_factory = move || {
             let selected = {
                 let mut entries = cache
                     .inner
@@ -337,9 +348,8 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> WeakCache<K
                     load: Mutex::new(None),
                 }));
             }
-            Effect::all(retire).map(|_| ())
-        })
-        .uninterruptible()
+            effect_map! { program: effect_all! { items: retire, }, map: |_| (), }
+        }; effect! { __dsl_factory()? } }, }
     }
     /// Stop accepting new work and describe the settlement of owned work.
     ///
@@ -356,10 +366,9 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> WeakCache<K
         &self,
     ) -> Effect<crate::PoolEndStatus, SharedValue<E>, R> {
         let cache = self.clone();
-        Effect::defer(move || {
+        effect_uninterruptible! { program: { let __dsl_factory = move || {
             cache.close_index();
             cache.inner.cache.shutdown()
-        })
-        .uninterruptible()
+        }; effect! { __dsl_factory()? } }, }
     }
 }

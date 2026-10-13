@@ -4,7 +4,7 @@ use super::{
     ChildWait, Durable, HasWorkflowEngine, RecordedChild, WorkflowCodecError, WorkflowDefinition,
     WorkflowEngine, WorkflowHandle, WorkflowRunError, WorkflowRunId, WorkflowRunResult,
 };
-use crate::Effect;
+use crate::{effect, effect_map_error, effect_provide_some, effect_try_sync, service};
 use std::sync::{Arc, Mutex};
 
 /// Type alias for engine error in workflow durable child.
@@ -65,13 +65,13 @@ impl DurableChild {
     where
         R: HasWorkflowEngine + Send + Sync + 'static,
     {
-        Durable::from_effect(Effect::service(|env: &R| env.workflow_engine()).flat_map(
-            move |engine| {
-                engine
-                    .wait_child(parent.clone(), child.clone())
-                    .provide_some(|_: &R| ())
-            },
-        ))
+        Durable::from_effect({
+            let __dsl_program = service! { env: |env: &R| env.workflow_engine(), };
+            effect! { let child = child.clone(); let parent = parent.clone(); let engine = __dsl_program.clone()?; {
+                effect_provide_some! { program: engine
+                    .wait_child(parent.clone(), child.clone()), project: |_: &R| (), }
+            }? }
+        })
     }
 
     /// Execute or describe one run using the supplied environment and inputs.
@@ -115,20 +115,17 @@ impl DurableChild {
         };
         let body = Arc::new(body);
         let definition_for_encoding = definition.clone();
-        Durable::from_effect(
-            Effect::try_sync(
-                move || {
-                    let guard = input_for_encoding
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let input = guard.as_ref().ok_or(DurableChildError::InputConsumed)?;
-                    definition_for_encoding
-                        .encode_input_bytes(input)
-                        .map_err(DurableChildError::Codec)
-                },
-                std::convert::identity,
-            )
-            .flat_map(move |encoded_input| {
+        Durable::from_effect({
+            let __dsl_program = effect_try_sync! { body: move || {
+                let guard = input_for_encoding
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let input = guard.as_ref().ok_or(DurableChildError::InputConsumed)?;
+                definition_for_encoding
+                    .encode_input_bytes(input)
+                    .map_err(DurableChildError::Codec)
+            }, on_error: std::convert::identity, };
+            effect! { let __dsl_program = __dsl_program.clone(); let body = body.clone(); let child_run = child_run.clone(); let definition = definition.clone(); let handle = handle.clone(); let input = input.clone(); let parent = parent.clone(); let encoded_input = __dsl_program?; {
                 let input = Arc::clone(&input);
                 let definition = definition.clone();
                 let body = Arc::clone(&body);
@@ -138,41 +135,37 @@ impl DurableChild {
                     handle: handle.clone(),
                     encoded_input,
                 };
-                Effect::service(|env: &R| env.workflow_engine()).flat_map(move |engine| {
+                { let __dsl_program = service! { env: |env: &R| env.workflow_engine(), }; effect! { let __dsl_program = __dsl_program.clone(); let body = body.clone(); let child = child.clone(); let child_run = child_run.clone(); let definition = definition.clone(); let input = input.clone(); let parent = parent.clone(); let engine = __dsl_program.clone()?; {
                     let input = Arc::clone(&input);
                     let definition = definition.clone();
                     let body = Arc::clone(&body);
                     let parent = parent.clone();
                     let child_run = child_run.clone();
                     let expected = child.clone();
-                    engine
-                        .link_child(parent.clone(), child.clone())
-                        .map_error(DurableChildError::Engine)
-                        .provide_some(|_: &R| ())
-                        .flat_map(move |recorded| {
+                    { let __dsl_program = effect_provide_some! { program: effect_map_error! { program: engine
+                        .link_child(parent.clone(), child.clone()), map: DurableChildError::Engine, }, project: |_: &R| (), }; effect! { let __dsl_program = __dsl_program.clone(); let body = body.clone(); let child_run = child_run.clone(); let definition = definition.clone(); let expected = expected.clone(); let input = input.clone(); let recorded = __dsl_program.clone()?; (move || {
                             if recorded != expected {
-                                return Effect::from_result_once(Err(
+                                return effect_try_sync! { once; body: { let __dsl_result = Err(
                                     DurableChildError::RecordedChildMismatch,
-                                ));
+                                ); move || __dsl_result }, on_error: ::core::convert::identity, };
                             }
                             let input = input
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .take();
                             match input {
-                                Some(input) => definition
+                                Some(input) => effect_map_error! { program: definition
                                     .execute(child_run.clone(), input, {
                                         let body = Arc::clone(&body);
                                         move |value| body(value)
-                                    })
-                                    .map_error(DurableChildError::Run),
+                                    }), map: DurableChildError::Run, },
                                 None => {
-                                    Effect::from_result_once(Err(DurableChildError::InputConsumed))
+                                    effect_try_sync! { once; body: { let __dsl_result = Err(DurableChildError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, }
                                 }
                             }
-                        })
-                })
-            }),
-        )
+                        })()? } }
+                }? } }
+            }? }
+        })
     }
 }

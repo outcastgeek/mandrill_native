@@ -5,6 +5,10 @@ use super::{
     WorkflowEngine, WorkflowHandle, WorkflowRunId, WorkflowSnapshot, WorkflowStatus,
 };
 use crate::{Effect, PrimaryOutcomeRef, Release};
+use crate::{
+    effect, effect_map_error, effect_provide_some, effect_recover, effect_resource, effect_sync,
+    effect_try_sync, service,
+};
 use std::sync::{Arc, Mutex};
 
 /// The selected engine's error type remains part of the environment contract.
@@ -228,248 +232,272 @@ impl<I: Send + 'static, A: Send + 'static, E: Send + 'static> WorkflowDefinition
             definition: definition.id.clone(),
             version: definition.version,
         };
-        Effect::try_sync(move || {
-            let mut state = input.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(bytes) = &state.1 { return Ok(Arc::clone(bytes)); }
-            let value = state.0.take().ok_or(WorkflowRunError::InputConsumed)?;
-            drop(state);
-            let bytes = definition.encode_input_bytes(&value).map_err(WorkflowRunError::Codec)?;
-            input.lock().unwrap_or_else(std::sync::PoisonError::into_inner).1 = Some(Arc::clone(&bytes));
-            Ok(bytes)
-        }, std::convert::identity)
-        .flat_map(move |encoded_input| {
-            let definition = run_definition.clone();
-            let body = Arc::clone(&body);
-            let pending_reset = Arc::clone(&pending_reset);
-            let handle = handle.clone();
-            Effect::service(|env: &R| env.workflow_engine())
-                .flat_map(move |engine| {
-                    let definition = definition.clone();
-                    let body = Arc::clone(&body);
-            let pending_reset = Arc::clone(&pending_reset);
-                    let handle = handle.clone();
-                    let encoded_input = Arc::clone(&encoded_input);
-                    engine.register(definition.registration())
-                        .map_error(WorkflowRunError::Engine)
-                        .provide_some(|_: &R| ())
-                        .flat_map(move |_| {
-                            let definition = definition.clone();
-                            let body = Arc::clone(&body);
-            let pending_reset = Arc::clone(&pending_reset);
-                            let engine = Arc::clone(&engine);
-                            let handle_for_run = handle.clone();
-                            let expected_input = Arc::clone(&encoded_input);
-                            engine.start(handle.clone(), Arc::clone(&encoded_input))
-                                .map_error(WorkflowRunError::Engine)
-                                .provide_some(|_: &R| ())
-                                .flat_map({ let engine=Arc::clone(&engine); let pending=Arc::clone(&pending_reset); let expected_handle=handle_for_run.clone();let compatibility=Arc::clone(&definition.compatibility);let input=Arc::clone(&expected_input); move |snapshot| {if snapshot.handle!=expected_handle||snapshot.compatibility!=compatibility||snapshot.encoded_input!=input{return Effect::from_result_once(Err(WorkflowRunError::StartedRunMismatch));}recover_pending::<R,BodyError>(Arc::clone(&engine),snapshot,Arc::clone(&pending))} })
-                                .flat_map(move |snapshot| {
-                                    if snapshot.handle != handle_for_run
-                                        || snapshot.compatibility != definition.compatibility
-                                        || snapshot.encoded_input != expected_input {
-                                        return Effect::from_result_once(Err(
-                                            WorkflowRunError::StartedRunMismatch
-                                        ));
-                                    }
-                                    match snapshot.status {
-                                    WorkflowStatus::Completed(ref outcome) => {
-                                        Effect::from_result_once(
-                                            definition.decode_outcome(outcome)
-                                                .map(WorkflowRunResult::Completed)
-                                                .map_err(WorkflowRunError::Codec),
-                                        )
-                                    }
-                                    WorkflowStatus::Running => {
-                                        Effect::sync(|| WorkflowRunResult::Busy)
-                                    }
-                                    WorkflowStatus::Suspended => {
-                                        Effect::sync(|| WorkflowRunResult::Suspended)
-                                    }
-                                    WorkflowStatus::Cancelled => {
-                                        Effect::sync(|| WorkflowRunResult::Cancelled)
-                                    }
-                                    WorkflowStatus::Abandoned => {
-                                        Effect::sync(|| WorkflowRunResult::Abandoned)
-                                    }
-                                    WorkflowStatus::Ready => {
+        {
+            let __dsl_program = effect_try_sync! {
+                body: move || {
+                let mut state = input.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(bytes) = &state.1 { return Ok(Arc::clone(bytes)); }
+                let value = state.0.take().ok_or(WorkflowRunError::InputConsumed)?;
+                drop(state);
+                let bytes = definition.encode_input_bytes(&value).map_err(WorkflowRunError::Codec)?;
+                input.lock().unwrap_or_else(std::sync::PoisonError::into_inner).1 = Some(Arc::clone(&bytes));
+                Ok(bytes)
+            }, on_error: std::convert::identity, };
+            effect! {
+                        let __dsl_program = __dsl_program.clone(); let body = body.clone(); let handle = handle.clone(); let pending_reset = pending_reset.clone(); let run_definition = run_definition.clone(); let encoded_input = __dsl_program?; {
+                        let definition = run_definition.clone();
+                        let body = Arc::clone(&body);
+                        let pending_reset = Arc::clone(&pending_reset);
+                        let handle = handle.clone();
+                        {
+                            let __dsl_program = service! { env: |env: &R| env.workflow_engine(), }; effect! {
+                            let __dsl_program = __dsl_program.clone(); let body = body.clone(); let definition = definition.clone(); let encoded_input = encoded_input.clone(); let handle = handle.clone(); let pending_reset = pending_reset.clone(); let engine = __dsl_program?; {
+                                let definition = definition.clone();
+                                let body = Arc::clone(&body);
+                        let pending_reset = Arc::clone(&pending_reset);
+                                let handle = handle.clone();
+                                let encoded_input = Arc::clone(&encoded_input);
+                                {
+                                    let __dsl_program = effect_provide_some! { program: effect_map_error! { program: engine.register(definition.registration()), map: WorkflowRunError::Engine, }, project: |_: &R| (), }; effect! {
+                                    let __dsl_program = __dsl_program.clone(); let body = body.clone(); let definition = definition.clone(); let encoded_input = encoded_input.clone(); let engine = engine.clone(); let handle = handle.clone(); let pending_reset = pending_reset.clone(); let _ = __dsl_program?; {
                                         let definition = definition.clone();
                                         let body = Arc::clone(&body);
-            let pending_reset = Arc::clone(&pending_reset);
+                        let pending_reset = Arc::clone(&pending_reset);
                                         let engine = Arc::clone(&engine);
-                                        let run = handle_for_run.run.clone();
-                                        let input = match definition
-                                            .decode_input_bytes(&snapshot.encoded_input) {
-                                            Ok(value) => value,
-                                            Err(error) => return Effect::from_result_once(
-                                                Err(WorkflowRunError::Codec(error))
-                                            ),
-                                        };
-                                        let input = Arc::new(Mutex::new(Some(input)));
-                                        engine.transition(
-                                            run.clone(), snapshot.checkpoint(),
-                                            WorkflowStatus::Running,
-                                        ).map_error(WorkflowRunError::Engine)
-                                            .provide_some(|_: &R| ())
-                                            .flat_map(move |transitioned| {
-                                                if transitioned.handle.run != run
-                                                    || transitioned.status != WorkflowStatus::Running {
-                                                    return Effect::from_result_once(Err(
-                                                        WorkflowRunError::RunningTransitionMismatch
-                                                    ));
+                                        let handle_for_run = handle.clone();
+                                        let expected_input = Arc::clone(&encoded_input);
+                                        {
+                                            let __dsl_program = {
+                                            let __dsl_program = effect_provide_some! { program: effect_map_error! { program: engine.start(handle.clone(), Arc::clone(&encoded_input)), map: WorkflowRunError::Engine, }, project: |_: &R| (), }; let engine=Arc::clone(&engine);
+            let pending=Arc::clone(&pending_reset);
+            let expected_handle=handle_for_run.clone();
+            let compatibility=Arc::clone(&definition.compatibility);
+            let input=Arc::clone(&expected_input); effect! { let __dsl_program = __dsl_program.clone(); let compatibility = compatibility.clone(); let engine = engine.clone(); let expected_handle = expected_handle.clone(); let input = input.clone(); let pending = pending.clone(); let snapshot = __dsl_program?; (move || {if snapshot.handle!=expected_handle||snapshot.compatibility!=compatibility||snapshot.encoded_input!=input{return effect_try_sync! { once; body: { let __dsl_result = Err(WorkflowRunError::StartedRunMismatch); move || __dsl_result }, on_error: ::core::convert::identity, };}recover_pending::<R,BodyError>(Arc::clone(&engine),snapshot,Arc::clone(&pending))})()? } }; effect! {
+                let __dsl_program = __dsl_program.clone(); let body = body.clone(); let definition = definition.clone(); let engine = engine.clone(); let expected_input = expected_input.clone(); let handle_for_run = handle_for_run.clone(); let pending_reset = pending_reset.clone(); let snapshot = __dsl_program?; (move || {
+                                                if snapshot.handle != handle_for_run
+                                                    || snapshot.compatibility != definition.compatibility
+                                                    || snapshot.encoded_input != expected_input {
+                                                    return effect_try_sync! {
+                                                        once; body: {
+                                                        let __dsl_result = Err(
+                                                        WorkflowRunError::StartedRunMismatch
+                                                    ); move || __dsl_result }, on_error: ::core::convert::identity, };
                                                 }
-                                                let input = match input.lock()
-                                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                                    .take() {
-                                                    Some(value) => value,
-                                                    None => return Effect::from_result_once(
-                                                        Err(WorkflowRunError::InputConsumed)
-                                                    ),
-                                                };
-                                                let failure_checkpoint=transitioned.checkpoint();let interruption_checkpoint=failure_checkpoint.clone();let expected_execution=transitioned.execution;
-                                                let pending_failure=Arc::clone(&pending_reset);let pending_interruption=Arc::clone(&pending_reset);
-                                                let engine_for_failure = Arc::clone(&engine);
-                                                let failure_run = run.clone();
-                                                let engine_for_interruption = Arc::clone(&engine);
-                                                let interrupted_run = run.clone();
-                                                let definition = definition.clone();
-                                                let engine_for_completion = Arc::clone(&engine);
-                                                let run_for_result = run.clone();
-                                                let body=Arc::clone(&body);let input=Arc::new(Mutex::new(Some(input)));
-                                                Effect::defer(move ||{let input=input.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();match input{Some(input)=>body(input).into_effect().map_error(WorkflowRunError::Body),None=>Effect::from_result_once(Err(WorkflowRunError::InputConsumed))}})
-                                                    .ensuring_with(move |outcome| match outcome {
-                                                        PrimaryOutcomeRef::Defected(_)
-                                                        | PrimaryOutcomeRef::WasInterrupted => {
-                                                            let expected_run = interrupted_run.clone();
-                                                            *pending_interruption.lock().unwrap_or_else(std::sync::PoisonError::into_inner)=Some(interruption_checkpoint.clone());
-                                                            let pending=Arc::clone(&pending_interruption);let failed_run=interrupted_run.clone();let checkpoint=interruption_checkpoint.clone();
-                                                            Release::from_effect(
-                                                                engine_for_interruption.transition(
-                                                                    interrupted_run.clone(),
-                                                                    interruption_checkpoint.clone(),
-                                                                    WorkflowStatus::Ready,
-                                                                )
-                                                                .map_error(move |source| WorkflowRunError::Recovery {body:None,source,run:failed_run.clone(),checkpoint:checkpoint.clone()})
-                                                                .provide_some(|_: &R| ())
-                                                                .flat_map(move |snapshot| {
-                                                                    if snapshot.handle.run != expected_run
-                                                                        || snapshot.status != WorkflowStatus::Ready || snapshot.execution!=expected_execution {
-                                                                        Effect::from_result_once(Err(
-                                                                            WorkflowRunError::RecoveryTransitionMismatch {
-                                                                                body: None,
-                                                                            },
-                                                                        ))
-                                                                    } else {
-                                                                        *pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner)=None;
-                                                                        Effect::sync(|| ())
-                                                                    }
-                                                                }),
-                                                            )
-                                                        }
-                                                        PrimaryOutcomeRef::Succeeded
-                                                        | PrimaryOutcomeRef::Failed(_) => Release::sync(|| ()),
-                                                    })
-                                                    .catch_all(move |failure| {
-                                                        let WorkflowRunError::Body(body) = failure
-                                                            else { return Effect::from_result_once(
-                                                                Err(failure)
-                                                            ); };
-                                                        *pending_failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner)=Some(failure_checkpoint.clone());
-                                                        let pending=Arc::clone(&pending_failure);let failed_run=failure_run.clone();let checkpoint=failure_checkpoint.clone();
-                                                        let body = Arc::new(Mutex::new(Some(body)));
-                                                        let body_for_error = Arc::clone(&body);
-                                                        let expected_run = failure_run.clone();
-                                                        engine_for_failure.transition(
-                                                            failure_run.clone(),
-                                                            failure_checkpoint.clone(),
-                                                            WorkflowStatus::Ready,
-                                                        ).map_error(move |source| {
-                                                            let body = body_for_error.lock()
-                                                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                                                .take();
-                                                            WorkflowRunError::Recovery { body, source, run:failed_run.clone(), checkpoint:checkpoint.clone() }
-                                                        }).provide_some(|_: &R| ())
-                                                            .flat_map(move |snapshot| {
-                                                                let body = body.lock()
-                                                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                                                    .take();
-                                                                if snapshot.handle.run != expected_run
-                                                                    || snapshot.status != WorkflowStatus::Ready || snapshot.execution!=expected_execution {
-                                                                    return Effect::from_result_once(Err(
-                                                                        WorkflowRunError::RecoveryTransitionMismatch { body }
-                                                                    ));
-                                                                }
-                                                                *pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner)=None;
-                                                                let body = body.ok_or(WorkflowRunError::InputConsumed);
-                                                                Effect::from_result_once(Err(
-                                                                    match body {
-                                                                        Ok(body) => WorkflowRunError::Body(body),
-                                                                        Err(error) => error,
-                                                                    }
-                                                                ))
-                                                            })
-                                                    })
-                                                    .flat_map(move |step| match step {
-                                                        WorkflowStep::Suspended => {
-                                                            engine_for_completion.inspect(run_for_result.clone())
-                                                                .map_error(WorkflowRunError::Engine)
-                                                                .provide_some(|_: &R| ())
-                                                                .flat_map(|snapshot| match snapshot
-                                                                    .map(|value| value.status) {
-                                                                    Some(WorkflowStatus::Suspended) => {
-                                                                        Effect::sync(|| WorkflowRunResult::Suspended)
-                                                                    }
-                                                                    Some(WorkflowStatus::Ready) => {
-                                                                        Effect::sync(|| WorkflowRunResult::Ready)
-                                                                    }
-                                                                    _ => Effect::from_result_once(Err(
-                                                                        WorkflowRunError::UnregisteredSuspension
-                                                                    )),
-                                                                })
-                                                        }
-                                                        WorkflowStep::Completed(outcome) => {
-                                                        let encoded = match definition
-                                                            .encode_outcome(&outcome) {
-                                                            Ok(value) => value,
-                                                            Err(error) => return Effect::from_result_once(
-                                                                Err(WorkflowRunError::Codec(error))
-                                                            ),
-                                                        };
-                                                        let outcome = Arc::new(Mutex::new(Some(outcome)));
-                                                        let failed_run = run_for_result.clone();
-                                                        let expected_run = run_for_result.clone();
-                                                        let expected = encoded.clone();
-                                                        engine_for_completion.complete(
-                                                            run_for_result.clone(), encoded,
-                                                        ).map_error(move |source| {
-                                                            WorkflowRunError::UncertainCompletion {
-                                                                run: failed_run.clone(), source,
+                                                match snapshot.status {
+                                                WorkflowStatus::Completed(ref outcome) => {
+                                                    effect_try_sync! {
+                                                        once; body: {
+                                                        let __dsl_result = definition.decode_outcome(outcome)
+                                                            .map(WorkflowRunResult::Completed)
+                                                            .map_err(WorkflowRunError::Codec); move || __dsl_result }, on_error: ::core::convert::identity, }
+                                                }
+                                                WorkflowStatus::Running => {
+                                                    effect_sync! { body: || WorkflowRunResult::Busy, }
+                                                }
+                                                WorkflowStatus::Suspended => {
+                                                    effect_sync! { body: || WorkflowRunResult::Suspended, }
+                                                }
+                                                WorkflowStatus::Cancelled => {
+                                                    effect_sync! { body: || WorkflowRunResult::Cancelled, }
+                                                }
+                                                WorkflowStatus::Abandoned => {
+                                                    effect_sync! { body: || WorkflowRunResult::Abandoned, }
+                                                }
+                                                WorkflowStatus::Ready => {
+                                                    let definition = definition.clone();
+                                                    let body = Arc::clone(&body);
+                        let pending_reset = Arc::clone(&pending_reset);
+                                                    let engine = Arc::clone(&engine);
+                                                    let run = handle_for_run.run.clone();
+                                                    let input = match definition
+                                                        .decode_input_bytes(&snapshot.encoded_input) {
+                                                        Ok(value) => value,
+                                                        Err(error) => return effect_try_sync! { once; body: { let __dsl_result = Err(WorkflowRunError::Codec(error)); move || __dsl_result }, on_error: ::core::convert::identity, },
+                                                    };
+                                                    let input = Arc::new(Mutex::new(Some(input)));
+                                                    {
+                                                        let __dsl_program = effect_provide_some! {
+                                                        program: effect_map_error! {
+                                                        program: engine.transition(
+                                                        run.clone(), snapshot.checkpoint(),
+                                                        WorkflowStatus::Running,
+                                                    ), map: WorkflowRunError::Engine, }, project: |_: &R| (), }; effect! {
+                                                        let __dsl_program = __dsl_program.clone(); let body = body.clone(); let definition = definition.clone(); let engine = engine.clone(); let input = input.clone(); let pending_reset = pending_reset.clone(); let run = run.clone(); let transitioned = __dsl_program.clone()?; (move || {
+                                                            if transitioned.handle.run != run
+                                                                || transitioned.status != WorkflowStatus::Running {
+                                                                return effect_try_sync! {
+                                                                    once; body: {
+                                                                    let __dsl_result = Err(
+                                                                    WorkflowRunError::RunningTransitionMismatch
+                                                                ); move || __dsl_result }, on_error: ::core::convert::identity, };
                                                             }
-                                                        }).provide_some(|_: &R| ())
-                                                            .flat_map(move |snapshot| {
-                                                                if snapshot.handle.run != expected_run
-                                                                    || !matches!(snapshot.status,
-                                                                        WorkflowStatus::Completed(ref recorded)
-                                                                            if recorded == &expected) {
-                                                                    return Effect::from_result_once(Err(
-                                                                        WorkflowRunError::RecordedCompletionMismatch
-                                                                    ));
-                                                                }
-                                                                let result = outcome.lock()
-                                                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                                                    .take()
-                                                                    .map(WorkflowRunResult::Completed)
-                                                                    .ok_or(WorkflowRunError::InputConsumed);
-                                                                Effect::from_result_once(result)
-                                                            })
-                                                        }
-                                                    })
-                                            })
-                                    }
-                                    }
-                                })
-                        })
-                })
-        })
+                                        let owned_input = input.lock()
+                                                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                            .take();
+                                        let input = match owned_input {
+                                                                Some(value) => value,
+                                                                None => return effect_try_sync! { once; body: { let __dsl_result = Err(WorkflowRunError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, },
+                                                            };
+                                                            let failure_checkpoint=transitioned.checkpoint();let interruption_checkpoint=failure_checkpoint.clone();let expected_execution=transitioned.execution;
+                                                            let pending_failure=Arc::clone(&pending_reset);let pending_interruption=Arc::clone(&pending_reset);
+                                                            let engine_for_failure = Arc::clone(&engine);
+                                                            let failure_run = run.clone();
+                                                            let engine_for_interruption = Arc::clone(&engine);
+                                                            let interrupted_run = run.clone();
+                                                            let definition = definition.clone();
+                                                            let engine_for_completion = Arc::clone(&engine);
+                                                            let run_for_result = run.clone();
+                                                            let body=Arc::clone(&body);let input=Arc::new(Mutex::new(Some(input)));
+                                                            {
+                                                                let __dsl_program = effect_recover! {
+                                                                program: {
+                                                                let __dsl_program = { let __dsl_factory = move ||{let input=input.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();match input{Some(input)=>effect_map_error! { program: body(input).into_effect(), map: WorkflowRunError::Body, },None=>effect_try_sync! { once; body: { let __dsl_result = Err(WorkflowRunError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, }}}; effect! { __dsl_factory()? } }; effect_resource! {
+                                                                acquire: effect_sync! { body: || (), }, release: move |(), outcome| match outcome {
+                                                                    PrimaryOutcomeRef::Defected(_)
+                                                                    | PrimaryOutcomeRef::WasInterrupted => {
+                                                                        let expected_run = interrupted_run.clone();
+                                                                        *pending_interruption.lock().unwrap_or_else(std::sync::PoisonError::into_inner)=Some(interruption_checkpoint.clone());
+                                                                        let pending=Arc::clone(&pending_interruption);let failed_run=interrupted_run.clone();let checkpoint=interruption_checkpoint.clone();
+                                                                        Release::from_effect(
+                                                                            {
+                                                                                let __dsl_program = effect_provide_some! {
+                                                                                program: effect_map_error! {
+                                                                                program: engine_for_interruption.transition(
+                                                                                interrupted_run.clone(),
+                                                                                interruption_checkpoint.clone(),
+                                                                                WorkflowStatus::Ready,
+                                                                            ), map: move |source| WorkflowRunError::Recovery {body:None,source,run:failed_run.clone(),checkpoint:checkpoint.clone()}, }, project: |_: &R| (), }; effect! {
+                                                                                let expected_run = expected_run.clone(); let pending = pending.clone(); let snapshot = __dsl_program.clone()?; {
+                                                                                if snapshot.handle.run != expected_run
+                                                                                    || snapshot.status != WorkflowStatus::Ready || snapshot.execution!=expected_execution {
+                                                                                    effect_try_sync! {
+                                                                                        once; body: {
+                                                                                        let __dsl_result = Err(
+                                                                                        WorkflowRunError::RecoveryTransitionMismatch {
+                                                                                            body: None,
+                                                                                        },
+                                                                                    ); move || __dsl_result }, on_error: ::core::convert::identity, }
+                                                                                } else {
+                                                                                    *pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner)=None;
+                                                                                    effect_sync! { body: || (), }
+                                                                                }
+                                                                            }? } },
+                                                                        )
+                                                                    }
+                                                                    PrimaryOutcomeRef::Succeeded
+                                                                    | PrimaryOutcomeRef::Failed(_) => Release::sync(|| ()),
+                                                                }, body: move |_| __dsl_program.clone(), } }, recover: move |failure| {
+                                                                    let WorkflowRunError::Body(body) = failure
+                                                                        else { return effect_try_sync! { once; body: { let __dsl_result = Err(failure); move || __dsl_result }, on_error: ::core::convert::identity, }; };
+                                                                    *pending_failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner)=Some(failure_checkpoint.clone());
+                                                                    let pending=Arc::clone(&pending_failure);let failed_run=failure_run.clone();let checkpoint=failure_checkpoint.clone();
+                                                                    let body = Arc::new(Mutex::new(Some(body)));
+                                                                    let body_for_error = Arc::clone(&body);
+                                                                    let expected_run = failure_run.clone();
+                                                                    {
+                                                                        let __dsl_program = effect_provide_some! {
+                                                                        program: effect_map_error! {
+                                                                        program: engine_for_failure.transition(
+                                                                        failure_run.clone(),
+                                                                        failure_checkpoint.clone(),
+                                                                        WorkflowStatus::Ready,
+                                                                    ), map: move |source| {
+                                                                        let body = body_for_error.lock()
+                                                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                                            .take();
+                                                                        WorkflowRunError::Recovery { body, source, run:failed_run.clone(), checkpoint:checkpoint.clone() }
+                                                                    }, }, project: |_: &R| (), }; effect! {
+                                                                        let __dsl_program = __dsl_program.clone(); let body = body.clone(); let expected_run = expected_run.clone(); let pending = pending.clone(); let snapshot = __dsl_program.clone()?; (move || {
+                                                                            let body = body.lock()
+                                                                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                                                .take();
+                                                                            if snapshot.handle.run != expected_run
+                                                                                || snapshot.status != WorkflowStatus::Ready || snapshot.execution!=expected_execution {
+                                                                                return effect_try_sync! {
+                                                                                    once; body: {
+                                                                                    let __dsl_result = Err(
+                                                                                    WorkflowRunError::RecoveryTransitionMismatch { body }
+                                                                                ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                                                            }
+                                                                            *pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner)=None;
+                                                                            let body = body.ok_or(WorkflowRunError::InputConsumed);
+                                                                            effect_try_sync! {
+                                                                                once; body: {
+                                                                                let __dsl_result = Err(
+                                                                                match body {
+                                                                                    Ok(body) => WorkflowRunError::Body(body),
+                                                                                    Err(error) => error,
+                                                                                }
+                                                                            ); move || __dsl_result }, on_error: ::core::convert::identity, }
+                                                                        })()? } }
+                                                                }, }; effect! {
+                                                                    let __dsl_program = __dsl_program.clone(); let definition = definition.clone(); let engine_for_completion = engine_for_completion.clone(); let run_for_result = run_for_result.clone(); let step = __dsl_program.clone()?; match step {
+                                                                    WorkflowStep::Suspended => {
+                                                                        {
+                                                                            let __dsl_program = effect_provide_some! { program: effect_map_error! { program: engine_for_completion.inspect(run_for_result.clone()), map: WorkflowRunError::Engine, }, project: |_: &R| (), }; effect! {
+                                                                            let snapshot = __dsl_program.clone()?; match snapshot
+                                                                                .map(|value| value.status) {
+                                                                                Some(WorkflowStatus::Suspended) => {
+                                                                                    effect_sync! { body: || WorkflowRunResult::Suspended, }
+                                                                                }
+                                                                                Some(WorkflowStatus::Ready) => {
+                                                                                    effect_sync! { body: || WorkflowRunResult::Ready, }
+                                                                                }
+                                                                                _ => effect_try_sync! {
+                                                                                    once; body: {
+                                                                                    let __dsl_result = Err(
+                                                                                    WorkflowRunError::UnregisteredSuspension
+                                                                                ); move || __dsl_result }, on_error: ::core::convert::identity, },
+                                                                            }? } }
+                                                                    }
+                                                                    WorkflowStep::Completed(outcome) => {
+                                                                    let encoded = match definition
+                                                                        .encode_outcome(&outcome) {
+                                                                        Ok(value) => value,
+                                                                        Err(error) => return effect_try_sync! { once; body: { let __dsl_result = Err(WorkflowRunError::Codec(error)); move || __dsl_result }, on_error: ::core::convert::identity, }?,
+                                                                    };
+                                                                    let outcome = Arc::new(Mutex::new(Some(outcome)));
+                                                                    let failed_run = run_for_result.clone();
+                                                                    let expected_run = run_for_result.clone();
+                                                                    let expected = encoded.clone();
+                                                                    {
+                                                                        let __dsl_program = effect_provide_some! {
+                                                                        program: effect_map_error! {
+                                                                        program: engine_for_completion.complete(
+                                                                        run_for_result.clone(), encoded,
+                                                                    ), map: move |source| {
+                                                                        WorkflowRunError::UncertainCompletion {
+                                                                            run: failed_run.clone(), source,
+                                                                        }
+                                                                    }, }, project: |_: &R| (), }; effect! {
+                                                                        let __dsl_program = __dsl_program.clone(); let expected = expected.clone(); let expected_run = expected_run.clone(); let outcome = outcome.clone(); let snapshot = __dsl_program?; (move || {
+                                                                            if snapshot.handle.run != expected_run
+                                                                                || !matches!(snapshot.status,
+                                                                                    WorkflowStatus::Completed(ref recorded)
+                                                                                        if recorded == &expected) {
+                                                                                return effect_try_sync! {
+                                                                                    once; body: {
+                                                                                    let __dsl_result = Err(
+                                                                                    WorkflowRunError::RecordedCompletionMismatch
+                                                                                ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                                                            }
+                                                                            let result = outcome.lock()
+                                                                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                                                .take()
+                                                                                .map(WorkflowRunResult::Completed)
+                                                                                .ok_or(WorkflowRunError::InputConsumed);
+                                                                            effect_try_sync! { once; body: { let __dsl_result = result; move || __dsl_result }, on_error: ::core::convert::identity, }
+                                                                        })()? } }
+                                                                    }
+                                                                }? } }
+                                                        })()? } }
+                                                }
+                                                }
+                                            })()? } }
+                                    }? } }
+                            }? } }
+                    }? }
+        }
     }
 }
 
@@ -490,7 +518,7 @@ where
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let Some(checkpoint) = checkpoint else {
-        return Effect::sync_once(move || snapshot);
+        return effect_sync! { once; body: move || snapshot, };
     };
     if snapshot.status == WorkflowStatus::Running {
         let run = snapshot.handle.run.clone();
@@ -498,34 +526,41 @@ where
         let failed_checkpoint = checkpoint.clone();
         let expected_execution = checkpoint.execution;
         let expected_run = run.clone();
-        engine
-            .transition(run, checkpoint, WorkflowStatus::Ready)
-            .map_error(move |source| WorkflowRunError::Recovery {
+        {
+            let __dsl_program = effect_provide_some! {
+            program: effect_map_error! {
+            program: engine
+            .transition(run, checkpoint, WorkflowStatus::Ready), map: move |source| WorkflowRunError::Recovery {
                 body: None,
                 source,
                 run: failed_run.clone(),
                 checkpoint: failed_checkpoint.clone(),
-            })
-            .provide_some(|_: &R| ())
-            .flat_map(move |snapshot| {
+            }, }, project: |_: &R| (), };
+            effect! {
+                let __dsl_program = __dsl_program.clone(); let expected_run = expected_run.clone(); let pending = pending.clone(); let snapshot = __dsl_program.clone()?; (move || {
                 if snapshot.status != WorkflowStatus::Ready
                     || snapshot.execution != expected_execution
                     || snapshot.handle.run != expected_run
                 {
-                    return Effect::from_result_once(Err(
+                    return effect_try_sync! {
+                        once; body: {
+                        let __dsl_result = Err(
                         WorkflowRunError::RecoveryTransitionMismatch { body: None },
-                    ));
+                    ); move || __dsl_result }, on_error: ::core::convert::identity, };
                 }
                 *pending
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                Effect::sync_once(move || snapshot)
-            })
+                effect_sync! { once; body: move || snapshot, }
+            })()? }
+        }
     } else {
         if snapshot.status == WorkflowStatus::Ready && snapshot.execution != checkpoint.execution {
-            return Effect::from_result_once(Err(WorkflowRunError::RecoveryTransitionMismatch {
+            return effect_try_sync! {
+                once; body: {
+                let __dsl_result = Err(WorkflowRunError::RecoveryTransitionMismatch {
                 body: None,
-            }));
+            }); move || __dsl_result }, on_error: ::core::convert::identity, };
         }
         // Ready acknowledges an already committed reset; completion acknowledges durable outcome.
         if snapshot.execution == checkpoint.execution
@@ -538,12 +573,14 @@ where
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
-        Effect::sync_once(move || snapshot)
+        effect_sync! { once; body: move || snapshot, }
     }
 }
 
 #[cfg(test)]
 mod correction_tests {
+    use crate::{effect_retry, effect_try_sync, workflow, workflow_definition};
+
     use super::*;
     use crate::workflow::*;
     use crate::{KeyDomain, KeyNamespace, KeySegment, StableKey, UtcMillis, json_i64};
@@ -580,7 +617,7 @@ mod correction_tests {
         ) -> Effect<WorkflowSnapshot, Self::Error> {
             if next == WorkflowStatus::Ready && self.reset_calls.fetch_add(1, Ordering::SeqCst) == 0
             {
-                Effect::fail_with(|| WorkflowEngineError::StateConflict)
+                effect_try_sync! { body: { let __dsl_error = || WorkflowEngineError::StateConflict; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }
             } else {
                 self.inner.transition(run, expected, next)
             }
@@ -738,12 +775,15 @@ mod correction_tests {
         }
     }
     #[test]
-    fn failed_reset_retries_exact_checkpoint_and_replays_encoded_owned_input() {
-        let namespace = KeyNamespace::<Domain>::new("run").unwrap();
+    fn failed_reset_retries_exact_checkpoint_and_replays_encoded_owned_input() -> Result<(), String>
+    {
+        let namespace = KeyNamespace::<Domain>::new("run")
+            .map_err(|error| format!("workflow namespace: {error:?}"))?;
         let run = WorkflowRunId::from_stable(
-            StableKey::new(&namespace, [KeySegment::Text("retry".into())]).unwrap(),
+            StableKey::new(&namespace, [KeySegment::Text("retry".into())])
+                .map_err(|error| format!("workflow run identity: {error:?}"))?,
         );
-        let bound = NonZeroUsize::new(1024).unwrap();
+        let bound = NonZeroUsize::MIN.saturating_add(1023);
         let limits = crate::ParseLimits {
             bytes: bound,
             depth: bound,
@@ -751,26 +791,29 @@ mod correction_tests {
             collection: bound,
             issues: bound,
         };
-        let definition = WorkflowDefinition {
-            id: WorkflowDefinitionId::new("reset-retry").unwrap(),
+        let definition = workflow_definition! {
+            id: WorkflowDefinitionId::new("reset-retry")
+                .map_err(|error| format!("workflow definition: {error:?}"))?,
             version: WorkflowVersion::new(NonZeroU32::MIN),
             input: json_i64(),
             success: json_i64(),
             error: json_i64(),
             compatibility: Arc::from(&b"retry"[..]),
-            limits,
+            limits: limits,
         };
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&calls);
         let effect = definition.execute::<Env, String>(run.clone(), 7, move |input| {
             let calls = Arc::clone(&calls);
-            Durable::from_effect(Effect::defer(move || {
-                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                    Effect::from_result_once(Err(String::from("body")))
+            workflow! {
+                let calls = Arc::clone(&calls);
+                let result = if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(String::from("body"))
                 } else {
-                    Effect::from_result_once(Ok(Ok(input)))
-                }
-            }))
+                    Ok(Ok(input))
+                };
+                workflow! { result; value: result, }?
+            }
         });
         let env = Arc::new(Env(
             Arc::new(FailingReset {
@@ -780,24 +823,22 @@ mod correction_tests {
             crate::TestClock::new(std::time::Duration::ZERO),
         ));
         let first = futures_executor::block_on(effect.run(Arc::clone(&env)));
-        let fence = match first {
-            crate::Exit::Fail(WorkflowRunError::Recovery {
-                body: Some(body),
-                checkpoint,
-                run: failed_run,
-                ..
-            }) => {
-                assert_eq!(body, "body");
-                assert_eq!(failed_run, run);
-                checkpoint
-            }
-            _ => panic!("failed reset must retain ownership"),
+        let crate::Exit::Fail(WorkflowRunError::Recovery {
+            body: Some(body),
+            checkpoint: fence,
+            run: failed_run,
+            ..
+        }) = first
+        else {
+            return Err(String::from("failed reset must retain ownership"));
         };
-        let snapshot =
-            match futures_executor::block_on(env.0.inspect(run.clone()).run(Arc::new(()))) {
-                crate::Exit::Success(Some(snapshot)) => snapshot,
-                _ => panic!("retained run"),
-            };
+        assert_eq!(body, "body");
+        assert_eq!(failed_run, run);
+        let crate::Exit::Success(Some(snapshot)) =
+            futures_executor::block_on(env.0.inspect(run.clone()).run(Arc::new(())))
+        else {
+            return Err(String::from("expected the retained run"));
+        };
         assert_eq!(snapshot.checkpoint(), fence);
         assert!(matches!(
             futures_executor::block_on(effect.run(Arc::clone(&env))),
@@ -809,27 +850,31 @@ mod correction_tests {
         ));
         assert_eq!(observed.load(Ordering::SeqCst), 2);
         let other = WorkflowRunId::from_stable(
-            StableKey::new(&namespace, [KeySegment::Text("scheduled-retry".into())]).unwrap(),
+            StableKey::new(&namespace, [KeySegment::Text("scheduled-retry".into())])
+                .map_err(|error| format!("scheduled workflow identity: {error:?}"))?,
         );
         let calls = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&calls);
         env.0.reset_calls.store(0, Ordering::SeqCst);
-        let retry = definition
-            .execute::<Env, String>(other, 9, move |input| {
+        let retry = effect_retry! {
+        program: definition
+        .execute::<Env, String>(other, 9, move |input| {
+            let calls = Arc::clone(&calls);
+            workflow! {
                 let calls = Arc::clone(&calls);
-                Durable::from_effect(Effect::defer(move || {
-                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                        Effect::from_result_once(Err(String::from("body")))
-                    } else {
-                        Effect::from_result_once(Ok(Ok(input)))
-                    }
-                }))
-            })
-            .retry(crate::Schedule::recurs(1));
+                let result = if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(String::from("body"))
+                } else {
+                    Ok(Ok(input))
+                };
+                workflow! { result; value: result, }?
+            }
+        }), schedule: crate::Schedule::recurs(1), };
         assert!(matches!(
             futures_executor::block_on(retry.run(env)),
             crate::Exit::Success(WorkflowRunResult::Completed(Ok(9)))
         ));
         assert_eq!(counted.load(Ordering::SeqCst), 2);
+        Ok(())
     }
 }

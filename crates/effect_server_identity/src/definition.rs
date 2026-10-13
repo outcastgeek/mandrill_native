@@ -8,6 +8,7 @@ use crate::{
     },
     capabilities::{NativeBackend, StoreSelection},
 };
+use crate::{effect_future, effect_uninterruptible};
 use effect::{Effect, Exit};
 use std::{
     future::Future,
@@ -65,6 +66,71 @@ where
     ) -> Result<N, IdentityError> {
         (self.factory)(self.configuration.clone(), backend, clock, policies)
     }
+}
+/// A retained native factory whose input types are inferred from the installed definition.
+/// Construction is inert; the same actual invocation backend, clock and policies
+/// reach every native operation without boxing or selecting another provider.
+pub struct NativeComponents<F, N> {
+    /// Reusable caller-owned native constructor.
+    factory: F,
+    /// Preserve the concrete native service result without storing an instance.
+    native: PhantomData<fn() -> N>,
+}
+impl<B: NativeBackend, P, F, N: Send + Sync + 'static> IdentityComponents<B, P>
+    for NativeComponents<F, N>
+where
+    F: Fn(B, IdentityClock, Arc<P>) -> Result<N, IdentityError> + Send + Sync + 'static,
+{
+    type Native = N;
+    /// Invoke the retained pure factory with this execution's exact backend and policies.
+    fn construct(
+        &self,
+        backend: B,
+        clock: IdentityClock,
+        policies: Arc<P>,
+    ) -> Result<N, IdentityError> {
+        (self.factory)(backend, clock, policies)
+    }
+}
+/// Typed macro boundary infers native inputs from the selected storage/policy bundle.
+#[doc(hidden)]
+pub fn definition_with_factory<S, P, M, F, N, E>(
+    storage: S,
+    factory: F,
+    policies: P,
+    errors: M,
+    clock: IdentityClock,
+    grants: GrantPolicy,
+    admission: NonZeroUsize,
+) -> Result<IdentityDefinition<S, NativeComponents<F, N>, P, M>, IdentityError>
+where
+    S: StoreSelection,
+    P: Send + Sync + 'static,
+    M: Fn(IdentityError) -> E + Send + Sync + 'static,
+    F: Fn(S::Backend, IdentityClock, Arc<P>) -> Result<N, IdentityError> + Send + Sync + 'static,
+    N: Send + Sync + 'static,
+{
+    IdentityDefinition::new(
+        storage,
+        NativeComponents {
+            factory,
+            native: PhantomData,
+        },
+        policies,
+        errors,
+        clock,
+        grants,
+        admission,
+    )
+}
+/// Give an inline pure error role its real IdentityError input during Rust inference.
+#[doc(hidden)]
+#[must_use]
+pub fn error_mapper<M, E>(mapper: M) -> M
+where
+    M: Fn(IdentityError) -> E,
+{
+    mapper
 }
 /// Inert typed definition retaining native selections and application error mapping.
 /// Clone copies configuration handles only; request/credential inputs move per invocation.
@@ -196,6 +262,24 @@ impl<
             }
         })
         .uninterruptible()
+    }
+    /// Run a typed native authorization block against this invocation's scoped authority.
+    /// Request and resource grants remain minted/revalidated by IdentityAuthority;
+    /// this adapter only omits the unused native manager from the callback signature.
+    pub fn authorize_once<I, A, E, R, F, Fut>(&self, input: I, authorize: F) -> Effect<A, E, R>
+    where
+        I: Send + 'static,
+        A: Send + 'static,
+        E: Send + 'static,
+        R: Send + Sync + 'static,
+        C: IdentityComponents<S::Backend, P>,
+        M: Fn(IdentityError) -> E,
+        F: Fn(I, IdentityAuthority<S::Backend>, Arc<P>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<A, IdentityError>> + Send + 'static,
+    {
+        self.invoke_once(input, move |_, input, authority, policies| {
+            authorize(input, authority, policies)
+        })
     }
     /// Move one owned credential/request/grant into its single native execution;
     /// repeated execution yields core's consumed-factory defect instead of copying it.
@@ -362,7 +446,9 @@ impl<
         move |request: effect_server::Request| {
             let definition = definition.clone();
             let provider = provider.clone();
-            Effect::from_exit_future_with_context(move |_: Arc<R>, _| {
+            effect_uninterruptible! {
+                program: effect_future! {
+                exit_with_context; body: move |_: Arc<R>, _| {
                 let definition = definition.clone();
                 let provider = provider.clone();
                 let request = request.clone();
@@ -403,8 +489,7 @@ impl<
                             .map_error(|error| (definition.errors)(error)),
                     }
                 }
-            })
-            .uninterruptible()
+            }, }, }
         }
     }
     /// Build the selected native server-backed CSRF stage after trusted authentication.
@@ -424,7 +509,9 @@ impl<
         move |request: effect_server::Request| {
             let definition = definition.clone();
             let browser = browser.clone();
-            Effect::from_exit_future_with_context(move |_: Arc<R>, _| {
+            effect_uninterruptible! {
+                program: effect_future! {
+                exit_with_context; body: move |_: Arc<R>, _| {
                 let definition = definition.clone();
                 let browser = browser.clone();
                 let request = request.clone();
@@ -454,8 +541,7 @@ impl<
                             .map_error(|error| (definition.errors)(error)),
                     }
                 }
-            })
-            .uninterruptible()
+            }, }, }
         }
     }
 }

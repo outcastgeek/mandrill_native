@@ -4,7 +4,8 @@ use super::{
     HasTransactionDomain, Transaction, TransactionDomain, TransactionDomainError, TransactionError,
     TransactionPolicy, TxRef,
 };
-use crate::{Effect, Release, ResourceValue, Scope};
+use crate::{Effect, ResourceValue, Scope};
+use crate::{effect_scope_acquire, transaction};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -53,7 +54,12 @@ impl TxSemaphore {
     /// # Returns
     /// Type: `Transaction<usize, E>`.
     pub fn available<E: Send + 'static>(&self) -> Transaction<usize, E> {
-        self.cell.read().map(|value| *value)
+        {
+            let __dsl_transaction = self.cell.read();
+            transaction! {
+            let value = __dsl_transaction.clone()?; *value
+            }
+        }
     }
 
     #[must_use]
@@ -69,13 +75,18 @@ impl TxSemaphore {
     /// Type: `Transaction<(), E>`.
     pub fn acquire<E: Send + 'static>(&self, permits: NonZeroUsize) -> Transaction<(), E> {
         let cell = self.cell.clone();
-        self.cell.read().flat_map(move |available| {
-            if *available < permits.get() {
-                Transaction::retry()
-            } else {
-                cell.write(Arc::new(*available - permits.get()))
+        {
+            let __dsl_transaction = self.cell.read();
+            transaction! {
+            let available = __dsl_transaction.clone()?; {
+                        if *available < permits.get() {
+                            Transaction::retry()
+                        } else {
+                            cell.write(Arc::new(*available - permits.get()))
+                        }
+                    }?
             }
-        })
+        }
     }
 
     #[must_use]
@@ -87,12 +98,14 @@ impl TxSemaphore {
     /// # Returns
     /// Type: `Transaction<(), TxSemaphoreError>`.
     pub fn release(&self, permits: NonZeroUsize) -> Transaction<(), TxSemaphoreError> {
-        self.cell.update(move |available| {
-            available
-                .checked_add(permits.get())
-                .map(|next| (next, ()))
-                .ok_or(TxSemaphoreError::Overflow)
-        })
+        transaction! {
+        modify; reference: self.cell, modify: move |available| {
+                    available
+                        .checked_add(permits.get())
+                        .map(|next| (next, ()))
+                        .ok_or(TxSemaphoreError::Overflow)
+                },
+        }
     }
 
     /// Scope owns the permit from acquisition through final release,
@@ -119,9 +132,8 @@ impl TxSemaphore {
         R: HasTransactionDomain + Send + Sync + 'static,
     {
         let semaphore = self.clone();
-        scope.acquire(
-            self.acquire::<TxSemaphoreError>(permits).atomically(policy),
-            move |()| Release::from_effect(semaphore.release(permits).atomically(policy)),
-        )
+        effect_scope_acquire! {
+        scope: scope, acquire: self.acquire::<TxSemaphoreError>(permits).atomically(policy), release: move |()| semaphore.release(permits).atomically(policy),
+        }
     }
 }

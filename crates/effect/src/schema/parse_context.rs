@@ -1,10 +1,12 @@
 //! Fresh traversal state. Immutable preparation belongs to SchemaAst, while
 //! counters and paths belong to one invocation, including suspended invocations.
+
 use super::{
     Codec, IssueSegment, JsonValue, ParsePolicy, SchemaAst, SchemaIssue, SchemaIssueKind,
     SchemaResource,
 };
 use crate::Effect;
+use crate::{effect, effect_try_sync};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 /// Bounds for one configured schema invocation, including its JSON representation.
@@ -398,34 +400,31 @@ impl<A: Send + 'static, D: Send + Sync + 'static, E: Send + Sync + 'static>
         let text = text.into();
         let policy = self.policy;
         let codec = self.codec.clone();
-        Effect::try_sync(
-            move || {
-                let context = ParseContext::new(policy);
-                let mut parse = policy.parse;
-                parse.limits.depth = policy.json_depth;
-                let value = super::internal::parser::parse_json(&text, parse).map_err(|issue| {
-                    if matches!(
-                        issue.kind(),
-                        SchemaIssueKind::LimitExceeded {
-                            resource: SchemaResource::Depth
-                        }
-                    ) {
-                        let mut located = SchemaIssue::new(SchemaIssueKind::LimitExceeded {
-                            resource: SchemaResource::JsonDepth,
-                        });
-                        for segment in issue.path().iter().rev() {
-                            located = located.at(segment.clone());
-                        }
-                        located
-                    } else {
-                        issue
+        (effect_try_sync! { body: move || {
+            let context = ParseContext::new(policy);
+            let mut parse = policy.parse;
+            parse.limits.depth = policy.json_depth;
+            let value = super::internal::parser::parse_json(&text, parse).map_err(|issue| {
+                if matches!(
+                    issue.kind(),
+                    SchemaIssueKind::LimitExceeded {
+                        resource: SchemaResource::Depth
                     }
-                })?;
-                context.check_json(&value)?;
-                Ok((value, context))
-            },
-            std::convert::identity,
-        )
+                ) {
+                    let mut located = SchemaIssue::new(SchemaIssueKind::LimitExceeded {
+                        resource: SchemaResource::JsonDepth,
+                    });
+                    for segment in issue.path().iter().rev() {
+                        located = located.at(segment.clone());
+                    }
+                    located
+                } else {
+                    issue
+                }
+            })?;
+            context.check_json(&value)?;
+            Ok((value, context))
+        }, on_error: std::convert::identity, })
         .flat_map(move |(value, context)| codec.decode_in(value, Some(context)))
     }
     /// Lazily check an owned JSON tree against configured representation bounds,
@@ -433,14 +432,13 @@ impl<A: Send + 'static, D: Send + Sync + 'static, E: Send + Sync + 'static>
     pub fn decode_json_once(&self, input: JsonValue) -> Effect<A, SchemaIssue, D> {
         let context = ParseContext::new(self.policy);
         let codec = self.codec.clone();
-        Effect::try_sync_once(
-            move || {
+        {
+            let __dsl_program = effect_try_sync! { once; body: move || {
                 context.check_json(&input)?;
                 Ok((input, context))
-            },
-            std::convert::identity,
-        )
-        .flat_map(move |(input, context)| codec.decode_in(input, Some(context)))
+            }, on_error: std::convert::identity, };
+            effect! { let codec = codec.clone(); let (input , context) = __dsl_program.clone()?; codec.decode_in(input, Some(context))? }
+        }
     }
 }
 impl<A: Send + 'static, Encoded: Send + 'static, D: Send + Sync + 'static, E: Send + Sync + 'static>

@@ -1,5 +1,6 @@
 //! Scoped resource pooling, leases, and shutdown.
 
+use crate::effect_uninterruptible;
 use crate::internal::gate::{Gate, GateError};
 use crate::internal::notification::notify_all;
 use crate::internal::outcome;
@@ -377,14 +378,13 @@ impl<T: Send + Sync + 'static, E: Send + 'static> PoolLease<T, E> {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn end_effect<R: Send + Sync + 'static>(&self, retire: bool) -> Effect<PoolEndStatus, E, R> {
         let lease = self.clone();
-        Effect::new(move |_, context, finish| {
+        effect_uninterruptible! { program: Effect::new(move |_, context, finish| {
             let lease = lease.clone();
             Step::Suspended(Box::pin(async move {
                 lease.end(retire, context).await;
                 runtime::finish(finish, Exit::Success(lease.status()))
             }))
-        })
-        .uninterruptible()
+        }), }
     }
     ///
     /// # Type parameters
@@ -1301,7 +1301,7 @@ impl<T: Send + Sync + 'static, E: Send + 'static> Pool<T, E> {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn shutdown<R: Send + Sync + 'static>(&self) -> Effect<PoolEndStatus, E, R> {
         let pool = self.clone();
-        Effect::new(move |_, context, finish| {
+        effect_uninterruptible! { program: Effect::new(move |_, context, finish| {
             let pool = pool.clone();
             Step::Suspended(Box::pin(async move {
                 pool.shutdown_start(context.protected()).await;
@@ -1327,8 +1327,7 @@ impl<T: Send + Sync + 'static, E: Send + 'static> Pool<T, E> {
                 };
                 runtime::finish(finish, Exit::Success(status))
             }))
-        })
-        .uninterruptible()
+        }), }
     }
 }
 /// Typed shutdown driver used by pool.

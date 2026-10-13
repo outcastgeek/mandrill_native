@@ -3,6 +3,7 @@
 use super::UtcMillis;
 use crate::encoding::{BinaryError, BinaryIdentity, BinaryLimits, SchemaBinary};
 use crate::{Effect, JsonValue, KeyDomain, KeyError, PureCodec, StableKey, TimeError};
+use crate::{effect, effect_map_error, effect_provide_some, effect_try_sync, service};
 use std::marker::PhantomData;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
@@ -1017,8 +1018,9 @@ impl<P: Send + 'static, D: KeyDomain> PersistedQueue<P, D> {
         R: HasPersistedQueueStore + Send + Sync + 'static,
     {
         let queue = self.clone();
-        Effect::try_sync(
-            move || {
+        {
+            let __dsl_program = effect_try_sync! {
+            body: move || {
                 let value = payload();
                 let bytes = queue
                     .inner
@@ -1032,34 +1034,38 @@ impl<P: Send + 'static, D: KeyDomain> PersistedQueue<P, D> {
                     offered_at,
                     available_at,
                 ))
-            },
-            PersistedQueueError::Encoding,
-        )
-        .flat_map(move |offer| {
-            let queue = offer.queue().clone();
-            let id = offer.id().clone();
-            let offer = std::sync::Mutex::new(Some(offer));
-            Effect::service(|env: &R| env.persisted_queue_store()).flat_map(move |store| {
-                let offer = offer
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
-                let Some(offer) = offer else {
-                    return Effect::from_result_once(Err(PersistedQueueError::InputConsumed));
-                };
-                let queue = queue.clone();
-                let id = id.clone();
-                store
-                    .offer(offer)
-                    .map_error(move |source| PersistedQueueError::Uncertain {
-                        operation: QueueOperation::Offer,
-                        queue: queue.clone(),
-                        id: Some(id.clone()),
-                        source,
-                    })
-                    .provide_some(|_: &R| ())
-            })
-        })
+            }, on_error: PersistedQueueError::Encoding, };
+            effect! {
+                           let __dsl_program = __dsl_program.clone(); let offer = __dsl_program.clone()?; {
+                       let queue = offer.queue().clone();
+                       let id = offer.id().clone();
+                       let offer = std::sync::Mutex::new(Some(offer));
+                       effect! {
+            bind;
+            program: service! { env: |env: &R| env.persisted_queue_store(), },
+            body: move |store| {
+                           let offer = offer
+                               .lock()
+                               .unwrap_or_else(std::sync::PoisonError::into_inner)
+                               .take();
+                           let Some(offer) = offer else {
+                               return effect_try_sync! { once; body: { let __dsl_result = Err(PersistedQueueError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, };
+                           };
+                           let queue = queue.clone();
+                           let id = id.clone();
+                           effect_provide_some! {
+                               program: effect_map_error! {
+                               program: store
+                               .offer(offer), map: move |source| PersistedQueueError::Uncertain {
+                                   operation: QueueOperation::Offer,
+                                   queue: queue.clone(),
+                                   id: Some(id.clone()),
+                                   source,
+                               }, }, project: |_: &R| (), }
+                       },
+            }
+                   }? }
+        }
     }
 
     /// Lease eligible work to the supplied owner under a fenced claim token.
@@ -1087,18 +1093,22 @@ impl<P: Send + 'static, D: KeyDomain> PersistedQueue<P, D> {
         R: HasPersistedQueueStore + Send + Sync + 'static,
     {
         let name = self.inner.name.clone();
-        Effect::service(|env: &R| env.persisted_queue_store()).flat_map(move |store| {
-            let name_for_error = name.clone();
-            store
-                .claim(name.clone(), options.clone())
-                .map_error(move |source| PersistedQueueError::Uncertain {
-                    operation: QueueOperation::Claim,
-                    queue: name_for_error.clone(),
-                    id: None,
-                    source,
-                })
-                .provide_some(|_: &R| ())
-        })
+        {
+            let __dsl_program = service! { env: |env: &R| env.persisted_queue_store(), };
+            effect! {
+                let __dsl_program = __dsl_program.clone(); let name = name.clone(); let options = options.clone(); let store = __dsl_program?; {
+                let name_for_error = name.clone();
+                effect_provide_some! {
+                    program: effect_map_error! {
+                    program: store
+                    .claim(name.clone(), options.clone()), map: move |source| PersistedQueueError::Uncertain {
+                        operation: QueueOperation::Claim,
+                        queue: name_for_error.clone(),
+                        id: None,
+                        source,
+                    }, }, project: |_: &R| (), }
+            }? }
+        }
     }
 
     /// Read recorded details without changing the authoritative state.
@@ -1126,12 +1136,16 @@ impl<P: Send + 'static, D: KeyDomain> PersistedQueue<P, D> {
         R: HasPersistedQueueStore + Send + Sync + 'static,
     {
         let name = self.inner.name.clone();
-        Effect::service(|env: &R| env.persisted_queue_store()).flat_map(move |store| {
-            store
-                .inspect(name.clone(), QueueMessageId::from_key(id.clone()))
-                .map_error(PersistedQueueError::Backend)
-                .provide_some(|_: &R| ())
-        })
+        {
+            let __dsl_program = service! { env: |env: &R| env.persisted_queue_store(), };
+            effect! {
+                let __dsl_program = __dsl_program.clone(); let id = id.clone(); let name = name.clone(); let store = __dsl_program?; {
+                effect_provide_some! {
+                    program: effect_map_error! {
+                    program: store
+                    .inspect(name.clone(), QueueMessageId::from_key(id.clone())), map: PersistedQueueError::Backend, }, project: |_: &R| (), }
+            }? }
+        }
     }
 
     /// Apply the selected terminal action to a fenced claim.
@@ -1161,33 +1175,37 @@ impl<P: Send + 'static, D: KeyDomain> PersistedQueue<P, D> {
         R: HasPersistedQueueStore + Send + Sync + 'static,
     {
         if token.queue() != &self.inner.name {
-            return Effect::fail_with(|| PersistedQueueError::WrongQueue);
+            return effect_try_sync! { body: { let __dsl_error = || PersistedQueueError::WrongQueue; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
         }
         let queue = self.inner.name.clone();
         let id = token.id().clone();
         let action = std::sync::Mutex::new(Some(action));
-        Effect::service(|env: &R| env.persisted_queue_store()).flat_map(move |store| {
-            let action = action
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            let Some(action) = action else {
-                return Effect::fail_with(|| PersistedQueueError::InputConsumed);
-            };
-            store
-                .settle(token.clone(), action)
-                .map_error({
-                    let queue = queue.clone();
-                    let id = id.clone();
-                    move |source| PersistedQueueError::Uncertain {
-                        operation: QueueOperation::Settle,
-                        queue: queue.clone(),
-                        id: Some(id.clone()),
-                        source,
-                    }
-                })
-                .provide_some(|_: &R| ())
-        })
+        effect! {
+        bind;
+        program: service! { env: |env: &R| env.persisted_queue_store(), },
+        body: move |store| {
+                   let action = action
+                       .lock()
+                       .unwrap_or_else(std::sync::PoisonError::into_inner)
+                       .take();
+                   let Some(action) = action else {
+                       return effect_try_sync! { body: { let __dsl_error = || PersistedQueueError::InputConsumed; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
+                   };
+                   effect_provide_some! {
+                       program: effect_map_error! {
+                       program: store
+                       .settle(token.clone(), action), map: {
+                           let queue = queue.clone();
+                           let id = id.clone();
+                           move |source| PersistedQueueError::Uncertain {
+                               operation: QueueOperation::Settle,
+                               queue: queue.clone(),
+                               id: Some(id.clone()),
+                               source,
+                           }
+                       }, }, project: |_: &R| (), }
+               },
+        }
     }
 
     /// Inspect messages retained after ordinary delivery was exhausted.
@@ -1215,12 +1233,16 @@ impl<P: Send + 'static, D: KeyDomain> PersistedQueue<P, D> {
         R: HasPersistedQueueStore + Send + Sync + 'static,
     {
         let queue = self.inner.name.clone();
-        Effect::service(|env: &R| env.persisted_queue_store()).flat_map(move |store| {
-            store
-                .dead_letters(queue.clone(), scan)
-                .map_error(PersistedQueueError::Backend)
-                .provide_some(|_: &R| ())
-        })
+        {
+            let __dsl_program = service! { env: |env: &R| env.persisted_queue_store(), };
+            effect! {
+                let __dsl_program = __dsl_program.clone(); let queue = queue.clone(); let store = __dsl_program?; {
+                effect_provide_some! {
+                    program: effect_map_error! {
+                    program: store
+                    .dead_letters(queue.clone(), scan), map: PersistedQueueError::Backend, }, project: |_: &R| (), }
+            }? }
+        }
     }
 
     /// Make a retained message eligible for delivery again under the supplied policy.
@@ -1251,28 +1273,32 @@ impl<P: Send + 'static, D: KeyDomain> PersistedQueue<P, D> {
     {
         let queue = self.inner.name.clone();
         let request = std::sync::Mutex::new(Some(request));
-        Effect::service(|env: &R| env.persisted_queue_store()).flat_map(move |store| {
-            let request = request
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            let Some(request) = request else {
-                return Effect::fail_with(|| PersistedQueueError::InputConsumed);
-            };
-            let id = QueueMessageId::from_key(id.clone());
-            store
-                .requeue(queue.clone(), id.clone(), request)
-                .map_error({
-                    let queue = queue.clone();
-                    move |source| PersistedQueueError::Uncertain {
-                        operation: QueueOperation::Requeue,
-                        queue: queue.clone(),
-                        id: Some(id.clone()),
-                        source,
-                    }
-                })
-                .provide_some(|_: &R| ())
-        })
+        effect! {
+        bind;
+        program: service! { env: |env: &R| env.persisted_queue_store(), },
+        body: move |store| {
+                   let request = request
+                       .lock()
+                       .unwrap_or_else(std::sync::PoisonError::into_inner)
+                       .take();
+                   let Some(request) = request else {
+                       return effect_try_sync! { body: { let __dsl_error = || PersistedQueueError::InputConsumed; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
+                   };
+                   let id = QueueMessageId::from_key(id.clone());
+                   effect_provide_some! {
+                       program: effect_map_error! {
+                       program: store
+                       .requeue(queue.clone(), id.clone(), request), map: {
+                           let queue = queue.clone();
+                           move |source| PersistedQueueError::Uncertain {
+                               operation: QueueOperation::Requeue,
+                               queue: queue.clone(),
+                               id: Some(id.clone()),
+                               source,
+                           }
+                       }, }, project: |_: &R| (), }
+               },
+        }
     }
 
     /// Settle or release retained queue state after an operation ends.
@@ -1300,20 +1326,24 @@ impl<P: Send + 'static, D: KeyDomain> PersistedQueue<P, D> {
         R: HasPersistedQueueStore + Send + Sync + 'static,
     {
         let queue = self.inner.name.clone();
-        Effect::service(|env: &R| env.persisted_queue_store()).flat_map(move |store| {
-            store
-                .cleanup(queue.clone(), now)
-                .map_error({
-                    let queue = queue.clone();
-                    move |source| PersistedQueueError::Uncertain {
-                        operation: QueueOperation::Cleanup,
-                        queue: queue.clone(),
-                        id: None,
-                        source,
-                    }
-                })
-                .provide_some(|_: &R| ())
-        })
+        {
+            let __dsl_program = service! { env: |env: &R| env.persisted_queue_store(), };
+            effect! {
+                let __dsl_program = __dsl_program.clone(); let queue = queue.clone(); let store = __dsl_program?; {
+                effect_provide_some! {
+                    program: effect_map_error! {
+                    program: store
+                    .cleanup(queue.clone(), now), map: {
+                        let queue = queue.clone();
+                        move |source| PersistedQueueError::Uncertain {
+                            operation: QueueOperation::Cleanup,
+                            queue: queue.clone(),
+                            id: None,
+                            source,
+                        }
+                    }, }, project: |_: &R| (), }
+            }? }
+        }
     }
 }
 

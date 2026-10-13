@@ -4,6 +4,7 @@ use super::{
     AtomicProjectionStore, JournalCursor, ProjectionKey, ProjectionSnapshot, ProjectionWrite,
 };
 use crate::Effect;
+use crate::{effect_sync, effect_try_sync};
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
@@ -116,13 +117,13 @@ impl<S: Send + Sync + 'static> AtomicProjectionStore<S> for MemoryProjectionStor
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn load(&self, key: ProjectionKey) -> Effect<Option<ProjectionSnapshot<S>>, Self::Error> {
         let state = Arc::clone(&self.state);
-        Effect::sync(move || {
+        effect_sync! { body: move || {
             state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&key)
                 .cloned()
-        })
+        }, }
     }
 
     ///
@@ -146,40 +147,37 @@ impl<S: Send + Sync + 'static> AtomicProjectionStore<S> for MemoryProjectionStor
         let state = Arc::clone(&self.state);
         let capacity = self.capacity;
         let next = Mutex::new(Some(next));
-        Effect::try_sync(
-            move || {
-                let mut next = next
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let proposed = next.as_ref().ok_or(MemoryProjectionError::InputConsumed)?;
-                if proposed.key != key {
-                    return Err(MemoryProjectionError::KeyMismatch);
-                }
-                let mut state = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let existing = state.get(&key);
-                if let Some(existing) = existing
-                    && existing.version != proposed.version
-                {
-                    return Ok(ProjectionWrite::VersionConflict(existing.version));
-                }
-                if existing.map(|value| value.checkpoint) != expected {
-                    return Ok(ProjectionWrite::Conflict(existing.cloned()));
-                }
-                if existing.is_none() && state.len() >= capacity.get() {
-                    return Err(MemoryProjectionError::Capacity);
-                }
-                let next = next.take().ok_or(MemoryProjectionError::InputConsumed)?;
-                if expected.is_some_and(|checkpoint| next.checkpoint < checkpoint) {
-                    return Err(MemoryProjectionError::CheckpointRegression);
-                }
-                let retired = state.insert(key.clone(), next.clone());
-                drop(state);
-                drop(retired);
-                Ok(ProjectionWrite::Committed(next))
-            },
-            std::convert::identity,
-        )
+        effect_try_sync! { body: move || {
+            let mut next = next
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let proposed = next.as_ref().ok_or(MemoryProjectionError::InputConsumed)?;
+            if proposed.key != key {
+                return Err(MemoryProjectionError::KeyMismatch);
+            }
+            let mut state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let existing = state.get(&key);
+            if let Some(existing) = existing
+                && existing.version != proposed.version
+            {
+                return Ok(ProjectionWrite::VersionConflict(existing.version));
+            }
+            if existing.map(|value| value.checkpoint) != expected {
+                return Ok(ProjectionWrite::Conflict(existing.cloned()));
+            }
+            if existing.is_none() && state.len() >= capacity.get() {
+                return Err(MemoryProjectionError::Capacity);
+            }
+            let next = next.take().ok_or(MemoryProjectionError::InputConsumed)?;
+            if expected.is_some_and(|checkpoint| next.checkpoint < checkpoint) {
+                return Err(MemoryProjectionError::CheckpointRegression);
+            }
+            let retired = state.insert(key.clone(), next.clone());
+            drop(state);
+            drop(retired);
+            Ok(ProjectionWrite::Committed(next))
+        }, on_error: std::convert::identity, }
     }
 }

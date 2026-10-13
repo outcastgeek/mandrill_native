@@ -20,8 +20,15 @@ pub struct TursoTransactionManager;
 impl TursoTransactionManager {
     /// Begin an operation-owned transaction through the existing SQLx manager.
     /// Callers must retain exclusive connection ownership until explicit settlement.
-    pub async fn begin_owned(connection: &mut TursoConnection, immediate: bool) -> Result<(), Error> {
-        <Self as TransactionManager>::begin(connection, immediate.then(|| sqlx_core::sql_str::AssertSqlSafe("BEGIN IMMEDIATE").into_sql_str())).await
+    pub async fn begin_owned(
+        connection: &mut TursoConnection,
+        immediate: bool,
+    ) -> Result<(), Error> {
+        <Self as TransactionManager>::begin(
+            connection,
+            immediate.then(|| sqlx_core::sql_str::AssertSqlSafe("BEGIN IMMEDIATE").into_sql_str()),
+        )
+        .await
     }
 
     /// Await commit and publish the existing driver's depth update together.

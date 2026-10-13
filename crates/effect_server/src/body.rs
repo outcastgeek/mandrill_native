@@ -1,8 +1,10 @@
 //! Pull-driven native response bodies with explicit delivery acknowledgment.
 
 use crate::{Request, ServerError};
+use crate::{effect_future, effect_sync, effect_try_future, effect_try_sync};
 use axum::body::Body;
 use bytes::Bytes;
+use effect::effect;
 use effect::{Cancellation, Effect, Exit, Scope, Stream};
 use http::{HeaderMap, HeaderValue};
 use http_body::{Body as HttpBody, Frame, SizeHint};
@@ -136,15 +138,13 @@ impl<E: Send + 'static, R: Send + Sync + 'static> BodyWriter<E, R> {
     pub fn write(&self, bytes: Bytes) -> Effect<(), E, R> {
         let state = self.state.clone();
         let map = self.map_error.clone();
-        Effect::try_future_once(
-            move |_| async move {
-                if bytes.len() > state.policy.chunk_bytes.get() {
-                    return Err(ServerError::Limit("response chunk bytes".into()));
-                }
-                send_frame(&state, Frame::data(bytes)).await
-            },
-            move |error| map(error),
-        )
+        effect_try_future! {
+        once; body: move |_| async move {
+            if bytes.len() > state.policy.chunk_bytes.get() {
+                return Err(ServerError::Limit("response chunk bytes".into()));
+            }
+            send_frame(&state, Frame::data(bytes)).await
+        }, on_error: move |error| map(error), }
     }
     /// Flush at a native polling boundary. HTTP framing/coalescing remains transport-owned.
     pub fn flush(&self) -> Effect<(), E, R> {
@@ -153,21 +153,21 @@ impl<E: Send + 'static, R: Send + Sync + 'static> BodyWriter<E, R> {
     /// Move terminal HTTP trailers into the native body, preserving repeated fields.
     pub fn trailers(&self, trailers: HeaderMap) -> Effect<(), E, R> {
         if trailers.is_empty() {
-            return Effect::sync(|| ());
+            return effect_sync! { body: || (), };
         }
         let state = self.state.clone();
         let map = self.map_error.clone();
-        Effect::try_future_once(
-            move |_| async move { send_frame(&state, Frame::trailers(trailers)).await },
-            move |error| map(error),
-        )
+        effect_try_future! { once; body: move |_| async move { send_frame(&state, Frame::trailers(trailers)).await }, on_error: move |error| map(error), }
     }
     /// Emit a checked SSE record with LF framing and no injected field lines.
     pub fn sse(&self, record: SseRecord, policy: SsePolicy) -> Effect<(), E, R> {
         let writer = self.clone();
         let map = self.map_error.clone();
-        Effect::from_result_once(record.frame(policy).map_err(move |error| map(error)))
-            .flat_map(move |bytes| writer.write(bytes))
+        effect! {
+        bind;
+        program: effect_try_sync! { once; body: { let __dsl_result = record.frame(policy).map_err(move |error| map(error)); move || __dsl_result }, on_error: ::core::convert::identity, },
+        body: move |bytes| writer.write(bytes),
+        }
     }
     /// Close producer access; the effect still awaits the native body's terminal poll.
     pub(crate) fn finish(&self) {
@@ -377,38 +377,43 @@ impl<E: Send + 'static, R: Send + Sync + 'static> BodyProgram<E, R> {
         Self {
             body: Arc::new(move |writer, scope| {
                 let write = write.clone();
-                source.open(scope).flat_map(move |reader| {
-                    let write = write.clone();
-                    let writer = writer.clone();
-                    Effect::from_exit_future_with_context(move |env: Arc<R>, context| {
-                        let reader = reader.clone();
-                        let write = write.clone();
-                        let writer = writer.clone();
-                        async move {
-                            loop {
-                                match context.run(reader.pull(), env.clone()).await {
-                                    Exit::Success(effect::Chunk::Values(values)) => {
-                                        for value in values {
-                                            let result = context
-                                                .run(write(value, writer.clone()), env.clone())
-                                                .await;
-                                            if !matches!(result, Exit::Success(())) {
-                                                return result;
-                                            }
-                                        }
-                                    }
-                                    Exit::Success(effect::Chunk::End) => return Exit::Success(()),
-                                    Exit::Fail(error) => return Exit::Fail(error),
-                                    Exit::Die(defect) => return Exit::Die(defect),
-                                    Exit::Interrupted => return Exit::Interrupted,
-                                    Exit::FinalizationFailed(failure) => {
-                                        return Exit::FinalizationFailed(failure);
-                                    }
-                                }
-                            }
-                        }
-                    })
-                })
+                effect! {
+                bind;
+                program: source.open(scope),
+                body: move |reader| {
+                                   let write = write.clone();
+                                   let writer = writer.clone();
+                                   effect_future! {
+                                       exit_with_context; body: move |env: Arc<R>, context| {
+                                       let reader = reader.clone();
+                                       let write = write.clone();
+                                       let writer = writer.clone();
+                                       async move {
+                                           loop {
+                                               match context.run(reader.pull(), env.clone()).await {
+                                                   Exit::Success(effect::Chunk::Values(values)) => {
+                                                       for value in values {
+                                                           let result = context
+                                                               .run(write(value, writer.clone()), env.clone())
+                                                               .await;
+                                                           if !matches!(result, Exit::Success(())) {
+                                                               return result;
+                                                           }
+                                                       }
+                                                   }
+                                                   Exit::Success(effect::Chunk::End) => return Exit::Success(()),
+                                                   Exit::Fail(error) => return Exit::Fail(error),
+                                                   Exit::Die(defect) => return Exit::Die(defect),
+                                                   Exit::Interrupted => return Exit::Interrupted,
+                                                   Exit::FinalizationFailed(failure) => {
+                                                       return Exit::FinalizationFailed(failure);
+                                                   }
+                                               }
+                                           }
+                                       }
+                                   }, }
+                               },
+                }
             }),
         }
     }

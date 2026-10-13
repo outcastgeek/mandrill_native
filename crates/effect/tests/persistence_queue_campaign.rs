@@ -1,3 +1,4 @@
+use serde_json::json;
 #[path = "support/campaign_report.rs"]
 mod campaign_report;
 
@@ -10,6 +11,7 @@ use effect::persistence::{
 };
 use effect::{Effect, Exit, JsonValue, KeyDomain, KeyNamespace, KeySegment, StableKey, UtcMillis};
 use futures_executor::block_on;
+use std::io::Write;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,10 +28,15 @@ fn next(state: &mut u64) -> u64 {
     *state
 }
 
-fn success<A: Send + 'static, E: Send + 'static>(effect: Effect<A, E>) -> A {
+fn success<A: Send + 'static, E: std::fmt::Debug + Send + 'static>(
+    effect: Effect<A, E>,
+) -> Result<A, String> {
     match block_on(effect.run(Arc::new(()))) {
-        Exit::Success(value) => value,
-        _ => panic!("memory queue operation must succeed"),
+        Exit::Success(value) => Ok(value),
+        Exit::Fail(error) => Err(format!("queue failure: {error:?}")),
+        Exit::Die(defect) => Err(format!("queue defect: {defect:?}")),
+        Exit::Interrupted => Err("queue interrupted".into()),
+        Exit::FinalizationFailed(error) => Err(format!("queue finalization: {error:?}")),
     }
 }
 
@@ -70,8 +77,8 @@ fn inspect(
     queue: &PersistedQueueName,
     id: &QueueMessageId,
     model: &Option<Model>,
-) {
-    let observed = success(store.inspect(queue.clone(), id.clone()));
+) -> Result<(), String> {
+    let observed = success(store.inspect(queue.clone(), id.clone()))?;
     match (model, observed) {
         (None, None) => {}
         (Some(expected), Some(record)) => {
@@ -102,86 +109,84 @@ fn inspect(
                 _ => {}
             }
         }
-        _ => panic!("queue inspection disagrees with the independent history model"),
+        _ => return Err("queue inspection disagrees with the independent history model".into()),
     }
+    Ok(())
 }
 
 #[test]
-fn configured_queue_histories_match_independent_state_model() {
+fn configured_queue_histories_match_independent_state_model()
+-> Result<(), Box<dyn std::error::Error>> {
     let configured = std::env::var_os("EFFECT_CAMPAIGN_CONFIG")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/feature_campaigns.json")
         });
-    let config: JsonValue = std::fs::read_to_string(configured)
-        .expect("campaign configuration is readable")
-        .parse()
-        .expect("campaign configuration is JSON");
-    let number = |path: &[&str]| -> u64 {
+    let config: JsonValue = std::fs::read_to_string(configured)?.parse()?;
+    let number = |path: &[&str]| -> Result<u64, String> {
         path.iter()
-            .fold(&config, |value, field| {
+            .try_fold(&config, |value, field| {
                 value
                     .get(*field)
-                    .unwrap_or_else(|| panic!("missing campaign field {field}"))
-            })
+                    .ok_or_else(|| format!("missing campaign field {field}"))
+            })?
             .as_u64()
-            .expect("campaign field is a nonnegative integer")
+            .ok_or_else(|| format!("campaign integer: {path:?}"))
     };
-    let seeds = number(&["campaigns", "persistence", "seeds"]);
-    let transitions = number(&["campaigns", "persistence", "transitions"]);
-    let maximum_attempts = NonZeroU32::new(
-        u32::try_from(number(&[
-            "campaigns",
-            "persistence",
-            "queue",
-            "maximum_attempts",
-        ]))
-        .expect("attempt policy fits u32"),
-    )
-    .expect("attempt policy is positive");
+    let seeds = number(&["campaigns", "persistence", "seeds"])?;
+    let transitions = number(&["campaigns", "persistence", "transitions"])?;
+    let maximum_attempts = NonZeroU32::new(u32::try_from(number(&[
+        "campaigns",
+        "persistence",
+        "queue",
+        "maximum_attempts",
+    ])?)?)
+    .ok_or("zero attempt policy")?;
     let lease = i64::try_from(number(&[
         "campaigns",
         "persistence",
         "queue",
         "lease_millis",
-    ]))
-    .expect("lease fits clock");
+    ])?)?;
     let retention = i64::try_from(number(&[
         "campaigns",
         "persistence",
         "queue",
         "retention_millis",
-    ]))
-    .expect("retention fits clock");
-    let seconds = number(&["budgets", "seconds"]);
+    ])?)?;
+    let seconds = number(&["budgets", "seconds"])?;
     assert!(seeds >= 1_000 && transitions >= 100 && maximum_attempts.get() > 1);
     assert!(lease > 0 && retention > 0 && seconds > 0);
     let policy = QueueMessagePolicy {
         maximum_attempts,
         acknowledged_retention: Duration::from_millis(retention as u64),
     };
-    let namespace = KeyNamespace::<CampaignDomain>::new("queue").expect("valid campaign namespace");
+    let namespace = KeyNamespace::<CampaignDomain>::new("queue")
+        .map_err(|error| format!("namespace: {error:?}"))?;
     let id = QueueMessageId::from_key(
         StableKey::new(&namespace, [KeySegment::Text(Arc::from("message"))])
-            .expect("valid campaign key"),
+            .map_err(|error| format!("campaign key: {error:?}"))?,
     );
-    let queue = PersistedQueueName::new("campaign").expect("valid queue name");
+    let queue =
+        PersistedQueueName::new("campaign").map_err(|error| format!("queue name: {error:?}"))?;
     let owners = [
-        QueueOwner::new("first").expect("valid owner"),
-        QueueOwner::new("second").expect("valid owner"),
+        QueueOwner::new("first").map_err(|error| format!("first owner: {error:?}"))?,
+        QueueOwner::new("second").map_err(|error| format!("second owner: {error:?}"))?,
     ];
     let started = Instant::now();
     let mut operations = [0_u64; 5];
     for seed in 0..seeds {
         let store = MemoryPersistedQueueStore::new(QueueStoreCapacity::Unbounded);
-        let mut generator = number(&["seed"]).wrapping_add(seed).max(1);
+        let mut generator = number(&["seed"])?.wrapping_add(seed).max(1);
         let mut model: Option<Model> = None;
         let mut sequence = 0_u64;
         let mut last_generation = 0_u64;
         let mut now = 0_i64;
         for _ in 0..transitions {
             let choice = (next(&mut generator) % operations.len() as u64) as usize;
-            operations[choice] += 1;
+            *operations
+                .get_mut(choice)
+                .ok_or("invalid operation index")? += 1;
             match choice {
                 0 => {
                     let payload = next(&mut generator) as u8;
@@ -192,7 +197,7 @@ fn configured_queue_histories_match_independent_state_model() {
                         policy,
                         UtcMillis::new(now),
                         UtcMillis::new(now),
-                    )));
+                    )))?;
                     let replace = model.as_ref().is_none_or(|record| {
                         matches!(
                             record.phase,
@@ -204,7 +209,7 @@ fn configured_queue_histories_match_independent_state_model() {
                         assert_eq!(
                             outcome,
                             QueueOfferOutcome::Accepted {
-                                sequence: NonZeroU64::new(sequence).expect("positive sequence")
+                                sequence: NonZeroU64::new(sequence).ok_or("zero sequence")?
                             }
                         );
                         model = Some(Model {
@@ -215,7 +220,7 @@ fn configured_queue_histories_match_independent_state_model() {
                             phase: Phase::Ready,
                         });
                     } else {
-                        let record = model.as_ref().expect("existing model record");
+                        let record = model.as_ref().ok_or("missing model record")?;
                         let expected = if record.payload == payload {
                             QueueOfferOutcome::Duplicate {
                                 disposition: record.phase.disposition(),
@@ -227,7 +232,10 @@ fn configured_queue_histories_match_independent_state_model() {
                     }
                 }
                 1 => {
-                    let owner = owners[(next(&mut generator) as usize) % owners.len()].clone();
+                    let owner = owners
+                        .get((next(&mut generator) as usize) % owners.len())
+                        .ok_or("invalid owner index")?
+                        .clone();
                     let claims = success(
                         store.claim(
                             queue.clone(),
@@ -237,9 +245,9 @@ fn configured_queue_histories_match_independent_state_model() {
                                 UtcMillis::new(now + lease),
                                 NonZeroUsize::MIN,
                             )
-                            .expect("valid claim interval"),
+                            .map_err(|error| format!("claim interval: {error:?}"))?,
                         ),
-                    );
+                    )?;
                     let eligible = model.as_ref().is_some_and(|record| {
                         record.available <= now
                             && match &record.phase {
@@ -251,13 +259,13 @@ fn configured_queue_histories_match_independent_state_model() {
                     if !eligible {
                         assert!(claims.is_empty());
                     } else {
-                        let record = model.as_mut().expect("eligible record exists");
+                        let record = model.as_mut().ok_or("missing eligible record")?;
                         if record.attempts >= maximum_attempts.get() {
                             assert!(claims.is_empty());
                             record.phase = Phase::DeadLetter;
                         } else {
                             assert_eq!(claims.len(), 1);
-                            let claim = &claims[0];
+                            let claim = claims.first().ok_or("missing bounded claim")?;
                             last_generation += 1;
                             assert_eq!(claim.token.generation().get(), last_generation);
                             assert_eq!(claim.token.owner(), &owner);
@@ -275,16 +283,22 @@ fn configured_queue_histories_match_independent_state_model() {
                 2 => {
                     let current = model.as_ref().and_then(|record| match &record.phase {
                         Phase::Claimed { token, until, .. } if now < *until => Some(token.clone()),
-                        _ => None,
+                        Phase::Claimed { .. }
+                        | Phase::Ready
+                        | Phase::Acknowledged { .. }
+                        | Phase::DeadLetter => None,
                     });
-                    let token = current.clone().unwrap_or_else(|| {
-                        QueueClaimToken::new(
-                            queue.clone(),
-                            id.clone(),
-                            owners[0].clone(),
-                            NonZeroU64::MAX,
-                        )
-                    });
+                    let token = current.clone().map_or_else(
+                        || -> Result<_, &'static str> {
+                            Ok(QueueClaimToken::new(
+                                queue.clone(),
+                                id.clone(),
+                                owners.first().ok_or("missing first owner")?.clone(),
+                                NonZeroU64::MAX,
+                            ))
+                        },
+                        Ok,
+                    )?;
                     let action = next(&mut generator) % 3;
                     let settlement = success(
                         store.settle(
@@ -298,7 +312,7 @@ fn configured_queue_histories_match_independent_state_model() {
                                         UtcMillis::new(now),
                                         UtcMillis::new(now + lease),
                                     )
-                                    .expect("valid retry"),
+                                    .map_err(|error| format!("retry interval: {error:?}"))?,
                                 ),
                                 _ => QueueSettlementAction::DeadLetter {
                                     at: UtcMillis::new(now),
@@ -308,7 +322,7 @@ fn configured_queue_histories_match_independent_state_model() {
                                 },
                             },
                         ),
-                    );
+                    )?;
                     let expected = if current.is_some() {
                         QueueSettlement::Applied
                     } else if model.is_some() {
@@ -318,7 +332,7 @@ fn configured_queue_histories_match_independent_state_model() {
                     };
                     assert_eq!(settlement, expected);
                     if current.is_some() {
-                        let record = model.as_mut().expect("claimed model record");
+                        let record = model.as_mut().ok_or("missing claimed model record")?;
                         record.phase = match action {
                             0 => Phase::Acknowledged {
                                 retained_until: now + retention,
@@ -346,9 +360,9 @@ fn configured_queue_histories_match_independent_state_model() {
                                     QueueRequeueAttempts::Preserve
                                 },
                             )
-                            .expect("valid requeue"),
+                            .map_err(|error| format!("requeue interval: {error:?}"))?,
                         ),
-                    );
+                    )?;
                     let expected = match model.as_mut() {
                         None => QueueRequeueOutcome::Missing,
                         Some(record) if matches!(record.phase, Phase::DeadLetter) => {
@@ -368,7 +382,7 @@ fn configured_queue_histories_match_independent_state_model() {
                     assert_eq!(outcome, expected);
                 }
                 4 => {
-                    let removed = success(store.cleanup(queue.clone(), UtcMillis::new(now)));
+                    let removed = success(store.cleanup(queue.clone(), UtcMillis::new(now)))?;
                     let expired = model.as_ref().is_some_and(|record| {
                         matches!(
                             record.phase,
@@ -380,11 +394,11 @@ fn configured_queue_histories_match_independent_state_model() {
                         model = None;
                     }
                 }
-                _ => unreachable!("operation index is reduced modulo operation count"),
+                _ => return Err("invalid operation index".into()),
             }
-            inspect(&store, &queue, &id, &model);
+            inspect(&store, &queue, &id, &model)?;
             let advance = next(&mut generator) % (lease as u64 + 2);
-            now += i64::try_from(advance).expect("bounded clock step");
+            now += i64::try_from(advance)?;
             assert!(
                 started.elapsed().as_secs() <= seconds,
                 "queue campaign timed out"
@@ -394,11 +408,13 @@ fn configured_queue_histories_match_independent_state_model() {
     assert!(operations.into_iter().all(|count| count > 0));
     campaign_report::completed(
         "persistence_queue",
-        serde_json::json!({
+        json!({
             "seeds": seeds, "transitions": transitions, "operations": operations,
         }),
-    );
-    eprintln!(
+    )?;
+    writeln!(
+        std::io::stderr().lock(),
         "queue model completed {seeds} seeds x {transitions} transitions; operations={operations:?}"
-    );
+    )?;
+    Ok(())
 }

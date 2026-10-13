@@ -5,14 +5,19 @@
 //! policy denial. Session reservations are registered with the request/body scope.
 
 use crate::WebError;
+use crate::{
+    effect_finalizer, effect_future, effect_map_error, effect_resource, effect_sync,
+    effect_try_sync, effect_using,
+};
 use effect::persistence::{
     HasRateLimitStore, RateLimitDecision, RateLimitError, RateLimitStore, RateLimiter, UtcMillis,
 };
 use effect::{
     AdmissionCapacity, AdmissionError, AdmissionPermit, Effect, Exit, HasClock, HasTaskSpawner,
-    ProviderAdmission, Release, Scope,
+    ProviderAdmission, Scope,
 };
 use effect::{KeyDomain, StableKey};
+use effect::{effect, effect_timeout};
 use http::{HeaderMap, HeaderValue};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Mutex};
@@ -115,12 +120,13 @@ impl Maintenance {
         mode: MaintenanceMode,
     ) -> Effect<(), E, R> {
         let control = self.clone();
-        Effect::sync(move || {
+        effect_sync! {
+            body: move || {
             *control
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = mode
-        })
+        }, }
     }
     /// Classify local policy without synthesizing a user-facing response.
     pub fn decision(&self, class: AdmissionClass) -> Result<(), MaintenanceRejection> {
@@ -147,15 +153,19 @@ impl Maintenance {
         reject: impl Fn(MaintenanceRejection) -> Effect<A, E, R> + Send + Sync + 'static,
     ) -> Effect<A, E, R> {
         let control = self.clone();
-        Effect::sync(move || control.decision(class)).flat_map(move |decision| match decision {
-            Ok(()) => admitted(),
-            Err(decision) => reject(decision),
-        })
+        effect! {
+        bind;
+        program: effect_sync! { body { control.decision(class) }, },
+        body: move |decision| match decision {
+                       Ok(()) => admitted(),
+                       Err(decision) => reject(decision),
+                   },
+        }
     }
     /// Local traffic readiness reports drain state; dependency probes remain separate.
     pub fn traffic_ready<E: Send + 'static, R: Send + Sync + 'static>(&self) -> Effect<bool, E, R> {
         let control = self.clone();
-        Effect::sync(move || control.mode() != MaintenanceMode::Draining)
+        effect_sync! { body: move || control.mode() != MaintenanceMode::Draining, }
     }
 }
 /// Session admission delegates immediate reservation/draining to the core provider.
@@ -185,16 +195,24 @@ impl SessionAdmission {
         on_error: impl Fn(AdmissionError) -> E + Send + Sync + 'static,
     ) -> Effect<(), E, R> {
         let owner = self.owner.clone();
-        Effect::try_sync(move || owner.admit(), on_error).flat_map(move |permit| {
-            let permit = Arc::new(Mutex::new(Some(permit)));
-            scope.add_release(move || {
-                let permit = permit
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
-                Release::sync(move || drop(permit))
-            })
-        })
+        effect! {
+        bind;
+        program: effect_try_sync! { body: move || owner.admit(), on_error: on_error, },
+        body: move |permit| {
+                   let permit = Arc::new(Mutex::new(Some(permit)));
+                   effect_finalizer! {
+                       release;
+                       scope: scope,
+                       release: move || {
+                       let permit = permit
+                           .lock()
+                           .unwrap_or_else(std::sync::PoisonError::into_inner)
+                           .take();
+                           effect_resource! { release_sync; body: move || drop(permit) }
+                       },
+                   }
+               },
+        }
     }
     /// Bind an immediate admission result into the existing endpoint scope. Denial
     /// is a typed value so a caller can execute its finite rejection renderer before
@@ -203,20 +221,22 @@ impl SessionAdmission {
         &self,
     ) -> effect::ResourceBinding<Result<AdmissionPermit, AdmissionError>, E, R> {
         let owner = self.owner.clone();
-        effect::ResourceBinding::new(Effect::sync(move || owner.admit()), |reservation, _| {
-            Release::sync(move || drop(reservation))
-        })
+        effect_using! {
+            binding;
+            acquire: effect_sync! { body: move || owner.admit() },
+        }
     }
     /// Close new local sessions and join every already owned reservation.
     pub fn shutdown<E: Send + 'static, R: Send + Sync + 'static>(&self) -> Effect<(), E, R> {
         let owner = self.owner.clone();
-        Effect::from_exit_future_with_context(move |_, _| {
+        effect_future! {
+            exit_with_context; body: move |_, _| {
             let drain = owner.stop();
             async move {
                 drain.wait().await;
                 Exit::Success(())
             }
-        })
+        }, }
     }
 }
 /// Apply a deadline only to deliberately finite work. Core timeout cancels and
@@ -234,7 +254,11 @@ where
     if deadline.is_zero() {
         return Err(WebError::Configuration("finite deadline".into()));
     }
-    Ok(program.timeout(deadline, on_timeout))
+    Ok(effect_timeout! {
+        program: program,
+        duration: deadline,
+        on_timeout: on_timeout,
+    })
 }
 /// A rate-limit decision through the selected core store and explicit UTC instant.
 /// Denied/ImpossibleCost/AdaptationRequired invoke the selected rejection Effect. Store
@@ -254,15 +278,18 @@ where
     R: HasRateLimitStore + Send + Sync + 'static,
     D: KeyDomain,
 {
-    limiter
-        .acquire(partition, now, cost)
-        .map_error(on_error)
-        .flat_map(move |decision| match decision {
-            RateLimitDecision::Allowed { .. } => allowed(),
-            RateLimitDecision::Denied { .. }
-            | RateLimitDecision::ImpossibleCost { .. }
-            | RateLimitDecision::AdaptationRequired { .. } => reject(decision),
-        })
+    effect! {
+    bind;
+    program: effect_map_error! {
+        program: limiter
+           .acquire(partition, now, cost), map: on_error, },
+    body: move |decision| match decision {
+               RateLimitDecision::Allowed { .. } => allowed(),
+               RateLimitDecision::Denied { .. }
+               | RateLimitDecision::ImpossibleCost { .. }
+               | RateLimitDecision::AdaptationRequired { .. } => reject(decision),
+           },
+    }
 }
 /// Execute one independent finite producer with an existing core reservation held
 /// until its Effect and nested cleanup finish. Used by disabled origin caches.
@@ -271,9 +298,8 @@ pub(crate) fn independent<A: Send + 'static, E: Send + 'static, R: Send + Sync +
     work: impl Fn() -> Effect<A, E, R> + Send + Sync + 'static,
     capacity: impl Fn(AdmissionError) -> E + Send + Sync + 'static,
 ) -> Effect<A, E, R> {
-    let acquire = Effect::try_sync(move || owner.admit(), capacity);
-    effect::ResourceBinding::new(acquire, |permit: AdmissionPermit, _| {
-        Release::sync(move || drop(permit))
-    })
-    .use_with(move |_| work())
+    effect_using! {
+        acquire: effect_try_sync! { body { owner.admit() }, on_error: capacity, },
+        body: move |_permit| work(),
+    }
 }

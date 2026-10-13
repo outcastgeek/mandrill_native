@@ -1,7 +1,8 @@
 //! Selected service operations whose provider failures are mapped at their own typed boundary.
 
 use crate::internal::macro_future::MacroContext;
-use crate::{Effect, Exit, Release, ResourceBinding, ResourceValue, Scope};
+use crate::{Effect, Exit, ResourceBinding, ResourceValue, Scope};
+use crate::{effect_map_error, effect_scope_acquire};
 use std::future::Future;
 use std::sync::Arc;
 
@@ -21,6 +22,32 @@ impl<S, A: Send + 'static, P: Send + 'static, R: Send + Sync + 'static>
         Self {
             operation: Arc::new(operation),
         }
+    }
+    /// Describe a synchronous native receiver Result. Invocation occurs when
+    /// this operation is bound in a selected service body; the receiver is borrowed
+    /// only during that call. Native errors map to P, and panics remain defects.
+    /// The owned Result enters a one-shot Effect without requiring Clone on A/P.
+    pub fn try_sync<X>(
+        operation: impl Fn(&S) -> Result<A, X> + Send + Sync + 'static,
+        on_error: impl Fn(X) -> P + Send + Sync + 'static,
+    ) -> Self {
+        Self::new(move |service| Effect::from_result_once(operation(service).map_err(&on_error)))
+    }
+
+    /// Describe a native receiver Future factory. The factory borrows S when
+    /// selected and returns a Send + 'static Future, so data needed after suspension
+    /// must be owned by that Future. The existing Future owner controls cancellation;
+    /// native errors map to P before the service body's application mapping.
+    pub fn try_future<X: Send + 'static, F: Future<Output = Result<A, X>> + Send + 'static>(
+        operation: impl Fn(&S) -> F + Send + Sync + 'static,
+        on_error: impl Fn(X) -> P + Send + Sync + 'static,
+    ) -> Self {
+        let on_error = Arc::new(on_error);
+        Self::new(move |service| {
+            let future = operation(service);
+            let on_error = Arc::clone(&on_error);
+            Effect::try_future_once(move |_| future, move |error| on_error(error))
+        })
     }
 }
 /// Selected resource with provider-typed acquisition and disposal. Disposal consumes its payload;
@@ -119,7 +146,7 @@ impl<S, A: Send + 'static, P: Send + 'static, E: Send + 'static, R: Send + Sync 
         mapper: Arc<dyn Fn(P) -> E + Send + Sync>,
         _: Scope<E>,
     ) -> Effect<A, E, R> {
-        (self.operation)(service).map_error(move |error| mapper(error))
+        effect_map_error! { program: (self.operation)(service), map: move |error| mapper(error), }
     }
 }
 impl<S, T: Send + Sync + 'static, P: Send + 'static, E: Send + 'static, R: Send + Sync + 'static>
@@ -136,13 +163,20 @@ impl<S, T: Send + Sync + 'static, P: Send + 'static, E: Send + 'static, R: Send 
     ) -> Effect<Self::Value, E, R> {
         let acquire_mapper = Arc::clone(&mapper);
         let release = self.release;
-        scope.acquire(
-            (self.acquire)(service).map_error(move |error| acquire_mapper(error)),
-            move |value| {
-                let mapper = Arc::clone(&mapper);
-                Release::from_effect(release(value).map_error(move |error| mapper(error)))
+        effect_scope_acquire! {
+            scope: scope,
+            acquire: effect_map_error! {
+                program: (self.acquire)(service),
+                map: move |error| acquire_mapper(error),
             },
-        )
+            release: move |value| {
+                let mapper = Arc::clone(&mapper);
+                effect_map_error! {
+                    program: release(value),
+                    map: move |error| mapper(error),
+                }
+            },
+        }
     }
 }
 /// Generated service-body constructor; the returned Effect is one-shot for this selected handle.
@@ -196,17 +230,19 @@ impl<S, P: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> ServiceC
         &self.service
     }
     /// Bind provider operations or ordinary application Effects through their distinct typed adapters.
-    pub async fn bind<B: ServiceBindable<S, P, E, R>, A: Send + 'static>(
+    pub fn bind<B: ServiceBindable<S, P, E, R>, A: Send + 'static>(
         &self,
         program: B,
-    ) -> Result<B::Value, Exit<A, E>> {
-        self.context
-            .bind(program.selected(
-                &self.service,
-                Arc::clone(&self.mapper),
-                self.context.scope(),
-            ))
-            .await
+    ) -> impl Future<Output = Result<B::Value, Exit<A, E>>> + Send + 'static {
+        // Selection prepares one owned Effect inside the executing callback.
+        // The typed future shares the same execution and lexical scope handles.
+        let program = program.selected(
+            &self.service,
+            Arc::clone(&self.mapper),
+            self.context.scope(),
+        );
+        let context = self.context.share();
+        async move { context.bind(program).await }
     }
     /// Observe interruption between native loop iterations under the same runtime.
     pub async fn cooperate<A: Send + 'static>(&self) -> Result<(), Exit<A, E>> {

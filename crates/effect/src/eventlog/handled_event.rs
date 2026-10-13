@@ -4,6 +4,7 @@ use super::{
     AggregateId, EventCommitPolicy, EventDefinition, EventId, EventInvocation, EventJournalId,
     EventLog, HasEventJournal, JournalCursor,
 };
+use crate::effect;
 use crate::{Effect, UtcMillis};
 use std::sync::Arc;
 
@@ -173,28 +174,31 @@ impl<
         let definition = self.event.definition.clone();
         let commit = self.commit;
         let handler = Arc::clone(&self.handler);
-        Effect::defer(move || {
-            let aggregate = selector(&payload);
-            let context = EventHandlerContext {
-                journal: journal.clone(),
-                aggregate: aggregate.clone(),
-                event: event.clone(),
-                expected,
-                occurred_at,
-            };
-            let handler = Arc::clone(&handler);
-            EventLog::new(definition.clone(), commit).execute(
-                EventInvocation {
+        {
+            let __dsl_factory = move || {
+                let aggregate = selector(&payload);
+                let context = EventHandlerContext {
                     journal: journal.clone(),
-                    aggregate,
+                    aggregate: aggregate.clone(),
                     event: event.clone(),
                     expected,
                     occurred_at,
-                    payload: Arc::clone(&payload),
-                },
-                move |payload| handler(context.clone(), payload),
-            )
-        })
+                };
+                let handler = Arc::clone(&handler);
+                EventLog::new(definition.clone(), commit).execute(
+                    EventInvocation {
+                        journal: journal.clone(),
+                        aggregate,
+                        event: event.clone(),
+                        expected,
+                        occurred_at,
+                        payload: Arc::clone(&payload),
+                    },
+                    move |payload| handler(context.clone(), payload),
+                )
+            };
+            effect! { __dsl_factory()? }
+        }
     }
 }
 impl<

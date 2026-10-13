@@ -1,7 +1,7 @@
 use effect::{
     CleanupFailure, Defect, DefectKind, Effect, Exit, Finalization, LibraryDefect, PrimaryOutcome,
-    Release, ResourceBinding,
 };
+use effect::{effect_map_error, effect_resource, effect_sync, effect_try_sync};
 use futures_executor::block_on;
 use std::future::Future;
 use std::pin::Pin;
@@ -58,9 +58,9 @@ fn diagnostic_text_cannot_impersonate_a_library_failure_or_panic() {
 }
 
 #[test]
-#[allow(clippy::panic)] // A non-string user panic must retain its typed panic classification.
 fn a_non_string_panic_has_a_typed_identity_through_the_real_callback_boundary() {
-    let program: Effect<(), Expected> = Effect::sync(|| std::panic::panic_any(PanicPayload));
+    let program: Effect<(), Expected> =
+        effect_sync! { body: || std::panic::resume_unwind(Box::new(PanicPayload)), };
     let actual = block_on(program.run(Arc::new(())));
     assert_eq!(
         actual,
@@ -73,15 +73,15 @@ fn a_non_string_panic_has_a_typed_identity_through_the_real_callback_boundary() 
 }
 
 #[test]
-#[allow(clippy::panic)] // Cleanup must retain both E and the panic identity.
 fn typed_defect_identity_survives_finalization_and_error_mapping() {
-    let body: Effect<(), Expected> = ResourceBinding::new(Effect::succeed(()), |(), _| {
-        Release::sync(|| std::panic::panic_any(PanicPayload))
-    })
-    .use_with(|_| Effect::fail_with(|| Expected::Rejected));
-    let program = body.map_error(|error| match error {
+    let body: Effect<(), Expected> = effect_resource! {
+    acquire: effect_sync! { body: { let __dsl_value = (); move || __dsl_value }, }, release: |(), _| {
+            effect_resource! { release_sync; body: || std::panic::resume_unwind(Box::new(PanicPayload)), }
+        }, body: |_| effect_try_sync! { body: { let __dsl_error = || Expected::Rejected; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, },
+    };
+    let program = effect_map_error! { program: body, map: |error| match error {
         Expected::Rejected => Translated::Rejected,
-    });
+    }, };
     assert_eq!(
         block_on(program.run(Arc::new(()))),
         Exit::FinalizationFailed(Finalization {
@@ -94,7 +94,12 @@ fn typed_defect_identity_survives_finalization_and_error_mapping() {
 
 #[test]
 fn a_consumed_observer_reports_a_typed_library_defect() {
-    let (driver, mut observer) = Effect::<(), Expected>::succeed(()).owned_run(Arc::new(()));
+    let (driver, mut observer) = {
+        let __dsl_program: Effect<(), Expected> =
+            effect_sync! { body: { let __dsl_value = (); move || __dsl_value }, };
+        __dsl_program
+    }
+    .owned_run(Arc::new(()));
     block_on(driver);
     assert_eq!(block_on(&mut observer), Exit::Success(()));
     let mut context = Context::from_waker(Waker::noop());

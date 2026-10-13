@@ -13,6 +13,7 @@ use effect::{
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
+use tracing::{event, span};
 #[derive(Clone)]
 /// Adapter that emits Effect telemetry through the `tracing` subscriber.
 pub struct TracingBackend {
@@ -149,16 +150,16 @@ impl TracingBackend {
             });
             tracing::dispatcher::with_default(&backend.dispatch, || match event.level {
                 LogLevel::Debug => {
-                    tracing::event!(parent: span.as_ref().and_then(tracing::Span::id), tracing::Level::DEBUG, message = %event.message, annotations = ?event.context.annotations)
+                    event!(parent: span.as_ref().and_then(tracing::Span::id), tracing::Level::DEBUG, message = %event.message, annotations = ?event.context.annotations)
                 }
                 LogLevel::Info => {
-                    tracing::event!(parent: span.as_ref().and_then(tracing::Span::id), tracing::Level::INFO, message = %event.message, annotations = ?event.context.annotations)
+                    event!(parent: span.as_ref().and_then(tracing::Span::id), tracing::Level::INFO, message = %event.message, annotations = ?event.context.annotations)
                 }
                 LogLevel::Warn => {
-                    tracing::event!(parent: span.as_ref().and_then(tracing::Span::id), tracing::Level::WARN, message = %event.message, annotations = ?event.context.annotations)
+                    event!(parent: span.as_ref().and_then(tracing::Span::id), tracing::Level::WARN, message = %event.message, annotations = ?event.context.annotations)
                 }
                 LogLevel::Error => {
-                    tracing::event!(parent: span.as_ref().and_then(tracing::Span::id), tracing::Level::ERROR, message = %event.message, annotations = ?event.context.annotations)
+                    event!(parent: span.as_ref().and_then(tracing::Span::id), tracing::Level::ERROR, message = %event.message, annotations = ?event.context.annotations)
                 }
             });
             Ok(())
@@ -184,7 +185,7 @@ impl TracingBackend {
         });
         let span = tracing::dispatcher::with_default(
             &self.dispatch,
-            || tracing::span!(parent: parent.as_ref().and_then(tracing::Span::id), tracing::Level::INFO, stringify!(EffectSpan), name = %info.name, annotations = ?info.annotations, started = ?info.time, outcome = tracing::field::Empty, cleanup_failed = tracing::field::Empty, finished = tracing::field::Empty, otel.name = tracing::field::Empty, otel.kind = tracing::field::Empty),
+            || span!(parent: parent.as_ref().and_then(tracing::Span::id), tracing::Level::INFO, stringify!(EffectSpan), name = %info.name, annotations = ?info.annotations, started = ?info.time, outcome = tracing::field::Empty, cleanup_failed = tracing::field::Empty, finished = tracing::field::Empty, otel.name = tracing::field::Empty, otel.kind = tracing::field::Empty),
         );
         tracing::dispatcher::with_default(&self.dispatch, || decorate(&span, info))?;
         let Some(id) = span.id().map(|id| SpanId::new(id.into_u64().to_string())) else {

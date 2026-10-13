@@ -33,7 +33,7 @@ impl Parse for NamedField {
 /// Variants of payload used by schema enum expand.
 enum Payload {
     Unit,
-    Tuple(Expr),
+    Tuple(Box<Expr>),
     Named(Vec<NamedField>),
 }
 
@@ -60,7 +60,7 @@ impl Parse for Variant {
             if !content.is_empty() {
                 return Err(content.error("one payload codec is required"));
             }
-            Payload::Tuple(codec)
+            Payload::Tuple(Box::new(codec))
         } else if input.peek(syn::token::Brace) {
             let content;
             braced!(content in input);
@@ -154,6 +154,7 @@ pub(crate) fn expand(input: SchemaEnumInput) -> syn::Result<TokenStream> {
     let tag_field = &input.tag_field;
     let content_field = &input.content_field;
     let policy = &input.policy;
+    let builder = Ident::new("__effect_builder", Span::mixed_site());
     if input.variants.is_empty() {
         return Err(syn::Error::new(enum_path.span(), "enum needs variants"));
     }
@@ -206,7 +207,7 @@ pub(crate) fn expand(input: SchemaEnumInput) -> syn::Result<TokenStream> {
                     .collect();
                 let definitions = fields.iter().zip(&codecs).map(|(field, codec)| {
                     let value = &field.codec;
-                    quote_spanned!(value.span()=> let #codec = #value;)
+                    quote_spanned!(value.span().resolved_at(proc_macro2::Span::mixed_site())=> let #codec = #value;)
                 });
                 let decoder_definitions = codecs
                     .iter()
@@ -301,21 +302,23 @@ pub(crate) fn expand(input: SchemaEnumInput) -> syn::Result<TokenStream> {
                 )
             }
         };
-        registrations.push(quote_spanned!(name.span()=> {
-            #preparation
-            __effect_builder = __effect_builder.variant(
-                #tag, #codec, #project, #construct,
-            )?;
-        }));
+        registrations.push(
+            quote_spanned!(name.span().resolved_at(proc_macro2::Span::mixed_site())=> {
+                #preparation
+                #builder = #builder.variant(
+                    #tag, #codec, #project, #construct,
+                )?;
+            }),
+        );
     }
     Ok(
         quote!((|| -> ::core::result::Result<_, #effect::SchemaIssue> {
         let __effect_schema_policy = #policy;
-        let mut __effect_builder = #effect::TaggedEnumBuilder::<#enum_path>::new(
+        let mut #builder = #effect::TaggedEnumBuilder::<#enum_path>::new(
             #tag_field, #content_field,
         );
         #(#registrations)*
-        __effect_builder.finish(__effect_schema_policy)
+        #builder.finish(__effect_schema_policy)
     })()),
     )
 }

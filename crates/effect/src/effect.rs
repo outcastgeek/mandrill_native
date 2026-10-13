@@ -1,6 +1,7 @@
 //! The lazy Effect program and its typed execution combinators.
 
 use crate::LibraryDefect;
+use crate::effect_map;
 use crate::internal::destruction::FlatDrop;
 use crate::internal::outcome;
 use crate::internal::runtime::{self, Context, Finish, Step};
@@ -643,7 +644,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
     /// Type: `Effect<Option<A>, E, R>`.
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn option(self) -> Effect<Option<A>, E, R> {
-        self.either().map(Result::ok)
+        effect_map! { program: self.either(), map: Result::ok, }
     }
 
     /// Map a top-level defect into the expected-error channel using `on_defect`.

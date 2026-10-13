@@ -8,11 +8,13 @@ use crate::{
     admission::SessionAdmission,
     diagnostics::{DiagnosticsError, RuntimeSampler, RuntimeSnapshot},
 };
-use effect::{Effect, Exit};
+use crate::{effect_map_error, effect_try_sync};
+use effect::{Effect, Exit, effect, service};
 use effect_server::{
-    BodyProgram, Endpoint, HasRequest, HtmlContent, HttpMethodSet, Registered, Registration, Reply,
-    ReplyDraft, Request, Router, ServerError, SsePolicy, SseRecord,
+    HasRequest, HtmlContent, HttpMethodSet, Reply, Request, Router, ServerError, SsePolicy,
+    SseRecord,
 };
+use effect_server::{endpoint, registered, reply, router, stream};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -127,7 +129,7 @@ impl<E: Send + 'static, R: HasRequest + Send + Sync + 'static> ProtectedDashboar
         let inject = Arc::new(inject);
         let native_error: Arc<dyn Fn(ServerError) -> E + Send + Sync> = Arc::new(native_error);
         let admission = SessionAdmission::new(policy.sessions);
-        let mut routes = Router::new();
+        let mut routes = router! {}?;
         let methods = HttpMethodSet::new(vec![http::Method::GET])?;
         for (path, render) in [
             (policy.page.clone(), presentation.page.clone()),
@@ -143,44 +145,30 @@ impl<E: Send + 'static, R: HasRequest + Send + Sync + 'static> ProtectedDashboar
             let path_for_view = path.clone();
             let bound = policy.html_bytes;
             let page_error = native_error.clone();
-            let reply = Effect::service(|env: &R| env.request().clone()).flat_map(move |request| {
+            let reply = effect! {
+                let access = access.clone();
                 let sampler = sampler.clone();
                 let inject = inject.clone();
                 let render = render.clone();
                 let path = path_for_view.clone();
                 let page_error = page_error.clone();
-                (access.authorize)(request).flat_map(move |()| {
-                    let inject = inject.clone();
-                    let render = render.clone();
-                    let path = path.clone();
-                    let page_error = page_error.clone();
-                    sampler
-                        .status()
-                        .map_error(move |error| inject(error))
-                        .flat_map({
-                            let interval = sampler.interval;
-                            move |status| {
-                                render(DashboardPage {
-                                    snapshot: status.sample.clone(),
-                                    degraded: status.failure.is_some(),
-                                    path: path.clone(),
-                                    interval,
-                                })
-                                .flat_map({
-                                    let errors = page_error.clone();
-                                    move |html| {
-                                        Effect::from_result_once(finite_html(html, bound, &errors))
-                                    }
-                                })
-                            }
-                        })
-                })
-            });
-            routes = routes.registered(
-                methods.clone(),
-                &path,
-                Registered::new(Endpoint::from_effect(reply), Registration::default()),
-            )?;
+                let request = service! { env |env: &R| { env.request().clone() }, }?;
+                (access.authorize)(request)?;
+                let status = effect_map_error! { program: sampler.status(), map: move |error| inject(error), }?;
+                let html = render(DashboardPage {
+                    snapshot: status.sample.clone(),
+                    degraded: status.failure.is_some(),
+                    path,
+                    interval: sampler.interval,
+                })?;
+                effect_try_sync! { once; body: { let __dsl_result = finite_html(html, bound, &page_error); move || __dsl_result }, on_error: ::core::convert::identity, }?
+            };
+            routes = router! {
+                source: routes,
+                methods(methods.clone(), path.as_ref(), registered! {
+                    endpoint(endpoint! { effect(reply) }),
+                }),
+            }?;
         }
         let live_policy = policy.clone();
         let live_access = access.clone();
@@ -188,7 +176,8 @@ impl<E: Send + 'static, R: HasRequest + Send + Sync + 'static> ProtectedDashboar
         let live_inject = inject.clone();
         let live_errors = native_error.clone();
         let live_presentation = presentation.clone();
-        let live = Endpoint::from_body(move |context| {
+        let live = endpoint! {
+            body: move |context| {
             let policy = live_policy.clone();
             let sampler = live_sampler.clone();
             let presentation = live_presentation.clone();
@@ -198,14 +187,14 @@ impl<E: Send + 'static, R: HasRequest + Send + Sync + 'static> ProtectedDashboar
             let access = live_access.clone();
             async move {
                 let request = context
-                    .bind(Effect::service(|env: &R| env.request().clone()))
+                    .bind(service! { env: |env: &R| env.request().clone(), })
                     .await?;
                 context.bind((access.authorize)(request.clone())).await?;
                 let cursor = effect_server::sse_cursor(&request, policy.sse).map_err({
                     let errors = errors.clone();
                     move |error| errors(error)
                 });
-                context.bind(Effect::from_result_once(cursor)).await?;
+                context.bind(effect_try_sync! { once; body: { let __dsl_result = cursor; move || __dsl_result }, on_error: ::core::convert::identity, }).await?;
                 let reservation = context.bind(admission.reservation()).await?;
                 let admitted = reservation
                     .with(|result| result.as_ref().map(|_| ()).map_err(|error| *error))
@@ -217,7 +206,7 @@ impl<E: Send + 'static, R: HasRequest + Send + Sync + 'static> ProtectedDashboar
                     let status =
                         effect_server::BodyStatus::new(http::StatusCode::TOO_MANY_REQUESTS)
                             .map_err(|error| Exit::Fail(errors(error)))?;
-                    return Ok(ReplyDraft::new().status(status).finish(reply));
+                    return Ok(reply! { status(status); source(reply); });
                 }
                 let source = sampler.changes_with({
                     let inject = inject.clone();
@@ -227,70 +216,66 @@ impl<E: Send + 'static, R: HasRequest + Send + Sync + 'static> ProtectedDashboar
                 let native_error = errors.clone();
                 let view_policy = policy.clone();
                 let interval = sampler.interval;
-                let program = BodyProgram::source(source, move |status, writer| {
+                let program = stream! {
+                    source: source,
+                    write: move |status, writer| {
                     let errors = native_error.clone();
                     let policy = view_policy.clone();
                     let writer = writer.clone();
-                    fragment(DashboardPage {
+                    let rendered = fragment(DashboardPage {
                         snapshot: status.sample.clone(),
                         degraded: status.failure.is_some(),
                         path: policy.page.clone(),
                         interval,
-                    })
-                    .flat_map(move |html| {
-                        let finite = Reply::<E, R>::html(html)
-                            .into_finite(policy.html_bytes)
-                            .map_err({
-                                let errors = errors.clone();
-                                move |error| errors(error)
-                            });
-                        let writer = writer.clone();
+                    });
+                    effect! {
                         let errors = errors.clone();
-                        Effect::from_result_once(finite).flat_map(move |finite| {
-                            let data = std::str::from_utf8(&finite.bytes)
-                                .map(|html| {
-                                    html.lines()
-                                        .map(|line| format!("elements {line}"))
-                                        .collect::<Vec<_>>()
-                                        .join("\n")
-                                })
-                                .map_err(|_| {
-                                    errors(ServerError::Invalid("diagnostic HTML UTF-8".into()))
-                                });
-                            let writer = writer.clone();
-                            Effect::from_result_once(data).flat_map(move |data| {
-                                // Datastar's patch-elements protocol repeats the elements line
-                                // prefix within native bounded SSE data framing.
-                                writer.sse(
-                                    SseRecord {
-                                        event: Some("datastar-patch-elements".into()),
-                                        id: None,
-                                        retry: None,
-                                        data,
-                                    },
-                                    policy.sse,
-                                )
-                            })
-                        })
-                    })
-                });
-                Ok(ReplyDraft::new()
-                    .header(
+                        let policy = policy.clone();
+                        let writer = writer.clone();
+                        let html = rendered.clone()?;
+                        let finite = effect_try_sync! {
+                            once; body: {
+                            let reply: Reply<E, R> = reply! { html(html) };
+                            let __dsl_result = reply.into_finite(policy.html_bytes)
+                                .map_err(|error| errors(error)); move || __dsl_result }, on_error: ::core::convert::identity, }?;
+                        // Datastar repeats its elements prefix within native bounded SSE framing.
+                        let data = std::str::from_utf8(&finite.bytes).map(|html| {
+                            html.lines()
+                                .map(|line| format!("elements {line}"))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        }).map_err(|_| errors(ServerError::Invalid("diagnostic HTML UTF-8".into())));
+                        drop(finite);
+                        let data = effect_try_sync! { once; body: { let __dsl_result = data; move || __dsl_result }, on_error: ::core::convert::identity, }?;
+                        writer.sse(SseRecord {
+                            event: Some("datastar-patch-elements".into()),
+                            id: None,
+                            retry: None,
+                            data,
+                        }, policy.sse)?;
+                    }
+                    },
+                };
+                Ok(reply! {
+                    header(
                         http::header::CACHE_CONTROL,
                         http::HeaderValue::from_static("no-store"),
-                    )
-                    .header(
+                    );
+                    header(
                         http::header::VARY,
                         http::HeaderValue::from_static("Authorization, Cookie"),
-                    )
-                    .finish(Reply::sse(program)))
+                    );
+                    sse(program);
+                })
             }
-        });
-        routes = routes.registered(
-            methods,
-            &policy.live,
-            Registered::new(live, Registration::default()),
-        )?;
+            },
+        };
+        routes = router! {
+            source: routes,
+            methods(methods, policy.live.as_ref(), registered! {
+                endpoint(live),
+            }),
+        }?;
         Ok(Self { routes })
     }
     /// Consume protected registrations into the existing server/router assembly.
@@ -306,17 +291,17 @@ fn finite_html<E: Send + 'static, R: Send + Sync + 'static>(
     bound: NonZeroUsize,
     errors: &Arc<dyn Fn(ServerError) -> E + Send + Sync>,
 ) -> Result<Reply<E, R>, E> {
-    let finite = Reply::<E, R>::html(html)
-        .into_finite(bound)
-        .map_err(|error| errors(error))?;
-    Ok(ReplyDraft::new()
-        .header(
+    let reply: Reply<E, R> = reply! { html(html) };
+    let finite = reply.into_finite(bound).map_err(|error| errors(error))?;
+    Ok(reply! {
+        header(
             http::header::CACHE_CONTROL,
             http::HeaderValue::from_static("no-store"),
-        )
-        .header(
+        );
+        header(
             http::header::VARY,
             http::HeaderValue::from_static("Authorization, Cookie"),
-        )
-        .finish(Reply::from_finite(finite)))
+        );
+        finite(finite);
+    })
 }

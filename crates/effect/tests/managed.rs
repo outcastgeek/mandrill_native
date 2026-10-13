@@ -53,26 +53,28 @@ fn cache_shares_owned_nonclone_values_then_invalidates_expires_and_evicts() {
     let env = Arc::new(Env::default());
     let calls = count();
     let loads = Arc::clone(&calls);
-    let program: Effect<(), SharedValue<()>, Env> = Scope::scoped(move |scope| {
-        let loads = Arc::clone(&loads);
-        effect! {
+    let program: Effect<(), SharedValue<()>, Env> = effect_scope! {
+    body: move |scope| {
             let loads = Arc::clone(&loads);
-            let cache = Cache::make(scope.clone(), CacheConfig { equal: Arc::new(|a: &usize,b| a==b), ttl: Some(Duration::from_secs(2)), capacity: CacheCapacity::Bounded(NonZeroUsize::MIN), cache_failure: Arc::new(|_| false) }, move |_| { let loads = Arc::clone(&loads); Effect::sync(move || Value(Cell::new(loads.fetch_add(1,Ordering::SeqCst)))) })?;
-            let first = cache.get(1)?;
-            let second = cache.get(1)?;
-            assert_eq!(first.with(|value| std::ptr::from_ref(value) as usize), second.with(|value| std::ptr::from_ref(value) as usize));
-            assert_eq!(first.with(|value| value.0.get()), Ok(0));
-            cache.invalidate(1)?;
-            let reloaded = cache.get(1)?;
-            assert_eq!(reloaded.with(|value| value.0.get()), Ok(1));
-            Effect::from_future_with_env(|env: Arc<Env>, _| env.clock.advance(Duration::from_secs(2)))?;
-            let expired = cache.get(1)?;
-            assert_eq!(expired.with(|value| value.0.get()), Ok(2));
-            cache.get(2)?;
-            let evicted = cache.get(1)?;
-            assert_eq!(evicted.with(|value| value.0.get()), Ok(4));
-        }
-    });
+            effect! {
+                let loads = Arc::clone(&loads);
+                let cache = Cache::make(scope.clone(), CacheConfig { equal: Arc::new(|a: &usize,b| a==b), ttl: Some(Duration::from_secs(2)), capacity: CacheCapacity::Bounded(NonZeroUsize::MIN), cache_failure: Arc::new(|_| false) }, move |_| { let loads = Arc::clone(&loads); effect_sync! { body: move || Value(Cell::new(loads.fetch_add(1,Ordering::SeqCst))), } })?;
+                let first = cache.get(1)?;
+                let second = cache.get(1)?;
+                assert_eq!(first.with(|value| std::ptr::from_ref(value) as usize), second.with(|value| std::ptr::from_ref(value) as usize));
+                assert_eq!(first.with(|value| value.0.get()), Ok(0));
+                cache.invalidate(1)?;
+                let reloaded = cache.get(1)?;
+                assert_eq!(reloaded.with(|value| value.0.get()), Ok(1));
+                effect_future! { with_env; body: |env: Arc<Env>, _| env.clock.advance(Duration::from_secs(2)), }?;
+                let expired = cache.get(1)?;
+                assert_eq!(expired.with(|value| value.0.get()), Ok(2));
+                cache.get(2)?;
+                let evicted = cache.get(1)?;
+                assert_eq!(evicted.with(|value| value.0.get()), Ok(4));
+            }
+        },
+    };
     assert!(matches!(
         block_on(program.run(Arc::clone(&env))),
         Exit::Success(())
@@ -85,27 +87,33 @@ fn concurrent_cache_misses_share_one_producer_and_observed_cleanup_is_not_retain
     let env = Arc::new(Env::default());
     let calls = count();
     let loads = Arc::clone(&calls);
-    let program: Effect<(), SharedValue<()>, Env> = Scope::scoped(move |scope| {
-        let loads = Arc::clone(&loads);
-        effect! {
+    let program: Effect<(), SharedValue<()>, Env> = effect_scope! {
+    body: move |scope| {
             let loads = Arc::clone(&loads);
-            let cache = Cache::make(scope.clone(), CacheConfig { equal: Arc::new(|a: &usize,b| a==b), ttl: None, capacity: CacheCapacity::Unbounded, cache_failure: Arc::new(|_| false) }, move |_| { let loads = Arc::clone(&loads); Effect::sync(move || loads.fetch_add(1,Ordering::SeqCst)) })?;
-            let results = Effect::all_concurrent(nz(4), (0..16).map(|_| cache.get(1)).collect())?;
-            assert!(results.iter().all(|value| value.with(|value| *value) == Ok(0)));
-        }
-    });
+            effect! {
+                let loads = Arc::clone(&loads);
+                let cache = Cache::make(scope.clone(), CacheConfig { equal: Arc::new(|a: &usize,b| a==b), ttl: None, capacity: CacheCapacity::Unbounded, cache_failure: Arc::new(|_| false) }, move |_| { let loads = Arc::clone(&loads); effect_sync! { body: move || loads.fetch_add(1,Ordering::SeqCst), } })?;
+                let results = effect_all_concurrent! { concurrency: nz(4), items: (0..16).map(|_| cache.get(1)).collect(), }?;
+                assert!(results.iter().all(|value| value.with(|value| *value) == Ok(0)));
+            }
+        },
+    };
     assert!(matches!(
         block_on(program.run(Arc::clone(&env))),
         Exit::Success(())
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    let cleanup: Effect<(), SharedValue<()>, Env> = Scope::scoped(|scope| {
-        effect! {
-            let cache = Cache::make(scope.clone(), CacheConfig { equal: Arc::new(|a: &usize,b| a==b), ttl: None, capacity: CacheCapacity::NoRetention, cache_failure: Arc::new(|_| false) }, |_| Effect::sync(|| ()).ensuring(Effect::die(Defect::from(LibraryDefect::ProviderClosed))))?;
-            let observed = Effect::from_future_with_env(move |env: Arc<Env>, _| { let cache = cache.clone(); async move { cache.get(1).run(env).await } })?;
-            assert!(matches!(observed, Exit::FinalizationFailed(_)));
-        }
-    });
+    let cleanup: Effect<(), SharedValue<()>, Env> = effect_scope! {
+    body: |scope| {
+            effect! {
+                let cache = Cache::make(scope.clone(), CacheConfig { equal: Arc::new(|a: &usize,b| a==b), ttl: None, capacity: CacheCapacity::NoRetention, cache_failure: Arc::new(|_| false) }, |_| effect_resource! {
+    ensuring; program: effect_sync! { body: || (), }, release: { let __dsl_cleanup = effect_die! { defect: Defect::from(LibraryDefect::ProviderClosed), }; move |_| __dsl_cleanup.clone() },
+    })?;
+                let observed = effect_future! { with_env; body: move |env: Arc<Env>, _| { let cache = cache.clone(); async move { cache.get(1).run(env).await } }, }?;
+                assert!(matches!(observed, Exit::FinalizationFailed(_)));
+            }
+        },
+    };
     assert!(matches!(
         block_on(cleanup.run(Arc::clone(&env))),
         Exit::Success(())
@@ -134,19 +142,24 @@ fn rejected_cache_submission_keeps_the_reported_provider_cause() {
             &self.1
         }
     }
-    let program: Effect<(), SharedValue<()>, Rejected> = Scope::scoped(|scope| {
-        Cache::make(
-            scope.clone(),
-            CacheConfig {
-                equal: Arc::new(|a: &usize, b| a == b),
-                ttl: None,
-                capacity: CacheCapacity::Unbounded,
-                cache_failure: Arc::new(|_| false),
-            },
-            |_| Effect::sync(|| ()),
-        )
-        .flat_map(|cache| cache.get(1).map(|_| ()))
-    });
+    let program: Effect<(), SharedValue<()>, Rejected> = effect_scope! {
+    body: |scope| {
+            effect! {
+     bind;
+     program: Cache::make(
+                scope.clone(),
+                CacheConfig {
+                    equal: Arc::new(|a: &usize, b| a == b),
+                    ttl: None,
+                    capacity: CacheCapacity::Unbounded,
+                    cache_failure: Arc::new(|_| false),
+                },
+                |_| effect_sync! { body: || (), },
+            ),
+     body: |cache| effect_map! { program: cache.get(1), map: |_| (), },
+     }
+        },
+    };
     assert!(
         matches!(block_on(program.run(Arc::new(Rejected(TestClock::default(),Reject)))), Exit::Die(defect) if defect.kind() == DefectKind::Library(LibraryDefect::ProviderCapacityFull))
     );
@@ -156,22 +169,24 @@ fn weak_cache_never_retains_a_settled_value_to_key_cycle_and_partitions_are_sepa
     let env = Arc::new(Env::default());
     let calls = count();
     let loads = Arc::clone(&calls);
-    let program: Effect<(), SharedValue<()>, Env> = Scope::scoped(move |scope| {
-        let loads = Arc::clone(&loads);
-        effect! {
+    let program: Effect<(), SharedValue<()>, Env> = effect_scope! {
+    body: move |scope| {
             let loads = Arc::clone(&loads);
-            let key = Arc::new(String::from("key"));
-            let weak = Arc::downgrade(&key);
-            let cache = WeakCache::make(scope.clone())?;
-            let source = Arc::clone(&key);
-            let first = cache.get(&key, move || { let source = Arc::clone(&source); Effect::sync(move || Arc::clone(&source)) })?;
-            let loads = Arc::clone(&loads);
-            let partition = cache.get_partition(CachePartition::Named(Arc::from("other")), &key, move || { let loads = Arc::clone(&loads); Effect::sync(move || { loads.fetch_add(1,Ordering::SeqCst); Arc::new(String::from("separate")) }) })?;
-            assert_eq!(partition.with(|value| value.as_str() == "separate"), Ok(true));
-            drop(partition); drop(key); drop(first);
-            assert!(weak.upgrade().is_none());
-        }
-    });
+            effect! {
+                let loads = Arc::clone(&loads);
+                let key = Arc::new(String::from("key"));
+                let weak = Arc::downgrade(&key);
+                let cache = WeakCache::make(scope.clone())?;
+                let source = Arc::clone(&key);
+                let first = weak_cache! { cache: cache, key: &key, load: move || { let source = Arc::clone(&source); effect_sync! { body: move || Arc::clone(&source), } }, }?;
+                let loads = Arc::clone(&loads);
+                let partition = weak_cache! { partition: CachePartition::Named(Arc::from("other")), cache: cache, key: &key, load: move || { let loads = Arc::clone(&loads); effect_sync! { body: move || { loads.fetch_add(1,Ordering::SeqCst); Arc::new(String::from("separate")) }, } }, }?;
+                assert_eq!(partition.with(|value| value.as_str() == "separate"), Ok(true));
+                drop(partition); drop(key); drop(first);
+                assert!(weak.upgrade().is_none());
+            }
+        },
+    };
     assert!(matches!(
         block_on(program.run(Arc::clone(&env))),
         Exit::Success(())
@@ -192,28 +207,30 @@ fn pool_population_is_independent_and_capacity_validation_ttl_and_disposal_own_r
     let creating = Arc::clone(&created);
     let disposing = Arc::clone(&disposed);
     let wait = gate.clone();
-    let program: Effect<(), (), Env> = Scope::scoped(move |scope| {
-        let creating = Arc::clone(&creating);
-        let disposing = Arc::clone(&disposing);
-        let wait = wait.clone();
-        let create = effect! { let creating = Arc::clone(&creating); let wait = wait.clone(); let resource = Effect::sync(move || Resource(creating.fetch_add(1,Ordering::SeqCst)))?; wait.await_open()?; resource };
-        effect! {
+    let program: Effect<(), (), Env> = effect_scope! {
+    body: move |scope| {
+            let creating = Arc::clone(&creating);
             let disposing = Arc::clone(&disposing);
-            let scope = scope.clone();
-            let pool = Pool::make(scope.clone(), PoolCapacity::Bounded(nz(2)), Some(Duration::from_secs(2)), create.clone(), |resource: &Resource| { let valid = resource.0 != usize::MAX; Effect::sync(move || valid) }, move |resource| { let disposing = Arc::clone(&disposing); Effect::sync_once(move || { drop(resource); disposing.fetch_add(1,Ordering::SeqCst); }) })?;
-            pool.ensure_size(2)?;
-            let idle = pool.exists_idle(|_| true)?; assert!(idle);
-            let lease = pool.acquire(scope.clone())?;
-            assert!(lease.with(|resource| resource.0 < 2).unwrap_or(false));
-            let status = lease.release()?; assert_eq!(status, PoolEndStatus::Clean);
-            assert!(lease.with(|_| ()).is_err());
-            Effect::from_future_with_env(|env: Arc<Env>, _| env.clock.advance(Duration::from_secs(2)))?;
-            let replacement = pool.acquire(scope)?;
-            assert!(replacement.with(|resource| resource.0 >= 2).unwrap_or(false));
-            replacement.discard()?;
-            pool.set_capacity(PoolCapacity::Bounded(NonZeroUsize::MIN))?;
-        }
-    });
+            let wait = wait.clone();
+            let create = effect! { let creating = Arc::clone(&creating); let wait = wait.clone(); let resource = effect_sync! { body: move || Resource(creating.fetch_add(1,Ordering::SeqCst)), }?; wait.await_open()?; resource };
+            effect! {
+                let disposing = Arc::clone(&disposing);
+                let scope = scope.clone();
+                let pool = pool! { scope: scope.clone(), capacity: PoolCapacity::Bounded(nz(2)), idle_ttl: Some(Duration::from_secs(2)), create: create.clone(), validate: |resource: &Resource| { let valid = resource.0 != usize::MAX; effect_sync! { body: move || valid, } }, dispose: move |resource| { let disposing = Arc::clone(&disposing); effect_sync! { once; body: move || { drop(resource); disposing.fetch_add(1,Ordering::SeqCst); }, } },  }?;
+                pool.ensure_size(2)?;
+                let idle = pool! { exists_idle; pool: pool, predicate: |_| true, }?; assert!(idle);
+                let lease = pool.acquire(scope.clone())?;
+                assert!(lease.with(|resource| resource.0 < 2).unwrap_or(false));
+                let status = lease.release()?; assert_eq!(status, PoolEndStatus::Clean);
+                assert!(lease.with(|_| ()).is_err());
+                effect_future! { with_env; body: |env: Arc<Env>, _| env.clock.advance(Duration::from_secs(2)), }?;
+                let replacement = pool.acquire(scope)?;
+                assert!(replacement.with(|resource| resource.0 >= 2).unwrap_or(false));
+                replacement.discard()?;
+                pool.set_capacity(PoolCapacity::Bounded(NonZeroUsize::MIN))?;
+            }
+        },
+    };
     let mut run = Box::pin(program.run(Arc::clone(&env)));
     drive::until(run.as_mut(), || created.load(Ordering::SeqCst) == 2);
     assert_eq!(
@@ -404,26 +421,23 @@ fn websocket_assembles_fragments_bounds_messages_and_disposes_after_close_timeou
         aborted: Arc::clone(&aborted),
         abort: Cancellation::new(),
     });
-    let program = with_socket(
-        WebSocketLimits {
-            max_message_bytes: nz(5),
-            receive_buffer_bytes: nz(2),
-            close_timeout: Duration::from_secs(2),
-        },
-        Effect::sync(move || Arc::clone(&socket)),
-        |connection| {
-            let connection = connection
-                .with(Clone::clone)
-                .unwrap_or_else(|_| unreachable_socket());
-            effect! {
-                let connection = connection.clone();
-                let received = connection.receive()?;
-                assert!(matches!(received,WebSocketReceive::Message(WebSocketMessage::Text(text)) if text.as_ref()=="hello"));
-                let oversized = Effect::from_future_with_env(move |env: Arc<Env>, _| { let connection = connection.clone(); async move { connection.send(WebSocketMessage::Text(Arc::from("too long"))).run(env).await } })?;
-                assert!(matches!(oversized,Exit::Fail(WebSocketError::MessageTooLarge { .. })));
-            }
-        },
-    );
+    let program = effect_socket! { limits: WebSocketLimits {
+        max_message_bytes: nz(5),
+        receive_buffer_bytes: nz(2),
+        close_timeout: Duration::from_secs(2),
+    }, acquire: effect_sync! { body: move || Arc::clone(&socket), }, body: |connection| {
+        let connection = match connection.with(Clone::clone) {
+            Ok(connection) => connection,
+            Err(defect) => return effect_die! { defect: defect, },
+        };
+        effect! {
+            let connection = connection.clone();
+            let received = connection.receive()?;
+            assert!(matches!(received,WebSocketReceive::Message(WebSocketMessage::Text(text)) if text.as_ref()=="hello"));
+            let oversized = effect_future! { with_env; body: move |env: Arc<Env>, _| { let connection = connection.clone(); async move { connection.send(WebSocketMessage::Text(Arc::from("too long"))).run(env).await } }, }?;
+            assert!(matches!(oversized,Exit::Fail(WebSocketError::MessageTooLarge { .. })));
+        }
+    }, };
     assert!(matches!(
         block_on(program.run(Arc::clone(&env))),
         Exit::Success(())
@@ -437,19 +451,15 @@ fn websocket_assembles_fragments_bounds_messages_and_disposes_after_close_timeou
         aborted: Arc::clone(&aborted),
         abort: Cancellation::new(),
     });
-    let program = with_socket(
-        WebSocketLimits {
-            max_message_bytes: nz(5),
-            receive_buffer_bytes: nz(2),
-            close_timeout: Duration::from_secs(2),
-        },
-        Effect::sync(move || Arc::clone(&socket)),
-        |connection| {
-            connection
-                .with(|connection| connection.close())
-                .unwrap_or_else(|_| Effect::fail_with(|| WebSocketError::Closed))
-        },
-    );
+    let program = effect_socket! { limits: WebSocketLimits {
+        max_message_bytes: nz(5),
+        receive_buffer_bytes: nz(2),
+        close_timeout: Duration::from_secs(2),
+    }, acquire: effect_sync! { body: move || Arc::clone(&socket), }, body: |connection| {
+        connection
+            .with(|connection| connection.close())
+            .unwrap_or_else(|_| effect_try_sync! { body: { let __dsl_error = || WebSocketError::Closed; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, })
+    }, };
     let mut run = Box::pin(program.run(Arc::clone(&env)));
     drive::until(run.as_mut(), || env.clock.pending() == 1);
     let (outcome, advanced) = block_on(futures_util::future::join(
@@ -461,14 +471,6 @@ fn websocket_assembles_fragments_bounds_messages_and_disposes_after_close_timeou
     assert_eq!(disposed.load(Ordering::SeqCst), 2);
     assert!(aborted.load(Ordering::SeqCst) >= 2);
 }
-#[allow(clippy::panic)]
-fn unreachable_socket<T>() -> T {
-    panic!("mock connection acquisition failed")
-}
-#[allow(clippy::panic)]
-fn missing_scoped_handle<T>() -> T {
-    panic!("scope did not expose its managed handle")
-}
 
 #[test]
 fn cache_waiter_interruption_preserves_producer_and_root_cancellation_joins_cleanup() {
@@ -477,24 +479,26 @@ fn cache_waiter_interruption_preserves_producer_and_root_cancellation_joins_clea
     let loaded = Arc::clone(&calls);
     let started = Latch::new();
     let released = Latch::new();
-    let program: Effect<(), SharedValue<()>, Env> = Scope::scoped(move |scope| {
-        let loaded = Arc::clone(&loaded);
-        let started = started.clone();
-        let released = released.clone();
-        effect! {
-            let scope=scope.clone(); let loaded=Arc::clone(&loaded); let started=started.clone(); let released=released.clone();
-            let load_started=started.clone(); let load_released=released.clone();
-            let cache=Cache::make(scope.clone(),CacheConfig { equal:Arc::new(|a:&usize,b|a==b), ttl:None,capacity:CacheCapacity::Unbounded,cache_failure:Arc::new(|_|false) },move |_| { let loaded=Arc::clone(&loaded); let started=load_started.clone(); let released=load_released.clone(); effect! { let loaded=Arc::clone(&loaded); let started=started.clone(); let released=released.clone(); Effect::sync(move|| { loaded.fetch_add(1,Ordering::SeqCst); })?; started.open()?; released.await_open()?; 7usize } })?;
-            let first=scope.fork(cache.get(1))?;
-            started.await_open()?;
-            let cancelled=first.interrupt()?;
-            assert!(matches!(cancelled,Exit::Interrupted));
-            let second=scope.fork(cache.get(1))?;
-            released.open()?;
-            let value=second.join()?;
-            assert_eq!(value.with(|value|*value),Ok(7));
-        }
-    });
+    let program: Effect<(), SharedValue<()>, Env> = effect_scope! {
+    body: move |scope| {
+            let loaded = Arc::clone(&loaded);
+            let started = started.clone();
+            let released = released.clone();
+            effect! {
+                let scope=scope.clone(); let loaded=Arc::clone(&loaded); let started=started.clone(); let released=released.clone();
+                let load_started=started.clone(); let load_released=released.clone();
+                let cache=Cache::make(scope.clone(),CacheConfig { equal:Arc::new(|a:&usize,b|a==b), ttl:None,capacity:CacheCapacity::Unbounded,cache_failure:Arc::new(|_|false) },move |_| { let loaded=Arc::clone(&loaded); let started=load_started.clone(); let released=load_released.clone(); effect! { let loaded=Arc::clone(&loaded); let started=started.clone(); let released=released.clone(); effect_sync! { body: move|| { loaded.fetch_add(1,Ordering::SeqCst); }, }?; started.open()?; released.await_open()?; 7usize } })?;
+                let first=scope.fork(cache.get(1))?;
+                started.await_open()?;
+                let cancelled=first.interrupt()?;
+                assert!(matches!(cancelled,Exit::Interrupted));
+                let second=scope.fork(cache.get(1))?;
+                released.open()?;
+                let value=second.join()?;
+                assert_eq!(value.with(|value|*value),Ok(7));
+            }
+        },
+    };
     assert!(matches!(
         block_on(program.run(Arc::clone(&env))),
         Exit::Success(())
@@ -506,33 +510,39 @@ fn cache_waiter_interruption_preserves_producer_and_root_cancellation_joins_clea
     let entered = Arc::clone(&started);
     let cleaned = count();
     let cleanup = Arc::clone(&cleaned);
-    let program: Effect<(), SharedValue<()>, Env> = Scope::scoped(move |scope| {
-        let entered = Arc::clone(&entered);
-        let cleanup = Arc::clone(&cleanup);
-        Cache::make(
-            scope,
-            CacheConfig {
-                equal: Arc::new(|a: &usize, b| a == b),
-                ttl: None,
-                capacity: CacheCapacity::Unbounded,
-                cache_failure: Arc::new(|_| false),
-            },
-            move |_| {
-                let entered = Arc::clone(&entered);
-                let cleanup = Arc::clone(&cleanup);
-                Effect::from_future(move |cancel| {
-                    entered.fetch_add(1, Ordering::SeqCst);
-                    async move {
-                        cancel.cancelled().await;
-                    }
-                })
-                .ensuring(Effect::sync(move || {
-                    cleanup.fetch_add(1, Ordering::SeqCst);
-                }))
-            },
-        )
-        .flat_map(|cache| cache.get(1).map(|_| ()))
-    });
+    let program: Effect<(), SharedValue<()>, Env> = effect_scope! {
+    body: move |scope| {
+            let entered = Arc::clone(&entered);
+            let cleanup = Arc::clone(&cleanup);
+            effect! {
+     bind;
+     program: Cache::make(
+                scope,
+                CacheConfig {
+                    equal: Arc::new(|a: &usize, b| a == b),
+                    ttl: None,
+                    capacity: CacheCapacity::Unbounded,
+                    cache_failure: Arc::new(|_| false),
+                },
+                move |_| {
+                    let entered = Arc::clone(&entered);
+                    let cleanup = Arc::clone(&cleanup);
+                    effect_resource! {
+    ensuring; program: effect_future! { body: move |cancel| {
+                        entered.fetch_add(1, Ordering::SeqCst);
+                        async move {
+                            cancel.cancelled().await;
+                        }
+                    }, }, release: { let __dsl_cleanup = effect_sync! { body: move || {
+                        cleanup.fetch_add(1, Ordering::SeqCst);
+                    }, }; move |_| __dsl_cleanup.clone() },
+    }
+                },
+            ),
+     body: |cache| effect_map! { program: cache.get(1), map: |_| (), },
+     }
+        },
+    };
     let mut run = Box::pin(program.run_cancellable(Arc::clone(&env)));
     drive::until(run.as_mut(), || started.load(Ordering::SeqCst) == 1);
     assert!(env.cancel.request());
@@ -548,29 +558,33 @@ fn pool_invalid_idle_replacement_and_discard_keep_canonical_cleanup_errors() {
     let disposals = count();
     let created = Arc::clone(&creates);
     let disposed = Arc::clone(&disposals);
-    let program: Effect<(), usize, Env> = Scope::scoped(move |scope| {
-        let created = Arc::clone(&created);
-        let disposed = Arc::clone(&disposed);
-        effect! {
-            let scope=scope.clone(); let created=Arc::clone(&created); let disposed=Arc::clone(&disposed);
-            let pool=Pool::make(scope.clone(),PoolCapacity::Bounded(NonZeroUsize::MIN),None,Effect::sync(move||created.fetch_add(1,Ordering::SeqCst)),|value:&usize| { let valid=*value!=0; Effect::sync(move||valid) },move |_| { let disposed=Arc::clone(&disposed); Effect::sync(move|| { disposed.fetch_add(1,Ordering::SeqCst); }) })?;
-            pool.ensure_size(1)?;
-            let lease=pool.acquire(scope)?;
-            assert_eq!(lease.with(|value|*value),Ok(1));
-        }
-    });
+    let program: Effect<(), usize, Env> = effect_scope! {
+    body: move |scope| {
+            let created = Arc::clone(&created);
+            let disposed = Arc::clone(&disposed);
+            effect! {
+                let scope=scope.clone(); let created=Arc::clone(&created); let disposed=Arc::clone(&disposed);
+                let pool=pool! { scope: scope.clone(), capacity: PoolCapacity::Bounded(NonZeroUsize::MIN), idle_ttl: None, create: effect_sync! { body: move||created.fetch_add(1,Ordering::SeqCst), }, validate: |value:&usize| { let valid=*value!=0; effect_sync! { body: move||valid, } }, dispose: move |_| { let disposed=Arc::clone(&disposed); effect_sync! { body: move|| { disposed.fetch_add(1,Ordering::SeqCst); }, } },  }?;
+                pool.ensure_size(1)?;
+                let lease=pool.acquire(scope)?;
+                assert_eq!(lease.with(|value|*value),Ok(1));
+            }
+        },
+    };
     assert_eq!(block_on(program.run(Arc::clone(&env))), Exit::Success(()));
     assert_eq!(creates.load(Ordering::SeqCst), 2);
     assert_eq!(disposals.load(Ordering::SeqCst), 2);
-    let program: Effect<(), usize, Env> = Scope::scoped(|scope| {
-        effect! {
-            let scope=scope.clone();
-            let pool=Pool::make(scope.clone(),PoolCapacity::Bounded(NonZeroUsize::MIN),None,Effect::sync(||()),|_|Effect::sync(||true),|_|Effect::fail_with(||7))?;
-            let lease=pool.acquire(scope)?;
-            let status=lease.discard()?;
-            assert_eq!(status,PoolEndStatus::Failed);
-        }
-    });
+    let program: Effect<(), usize, Env> = effect_scope! {
+    body: |scope| {
+            effect! {
+                let scope=scope.clone();
+                let pool=pool! { scope: scope.clone(), capacity: PoolCapacity::Bounded(NonZeroUsize::MIN), idle_ttl: None, create: effect_sync! { body: ||(), }, validate: |_|effect_sync! { body: ||true, }, dispose: |_|effect_try_sync! { body: { let __dsl_error = ||7; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, },  }?;
+                let lease=pool.acquire(scope)?;
+                let status=lease.discard()?;
+                assert_eq!(status,PoolEndStatus::Failed);
+            }
+        },
+    };
     assert_eq!(
         block_on(program.run(Arc::clone(&env))),
         Exit::FinalizationFailed(Finalization {
@@ -626,23 +640,26 @@ fn late_http_acquisition_is_closed_before_cancellation_publication() {
 }
 
 #[test]
-fn abandoned_pool_scope_invalidates_lease_closes_admission_and_recovery_drains_resource() {
+fn abandoned_pool_scope_invalidates_lease_closes_admission_and_recovery_drains_resource()
+-> Result<(), String> {
     let env = Arc::new(Env::default());
     let released = count();
     let disposed = Arc::clone(&released);
     let slot = Arc::new(Mutex::new(None::<(Pool<usize, ()>, PoolLease<usize, ()>)>));
     let exposed = Arc::clone(&slot);
-    let program: Effect<(), (), Env> = Scope::scoped(move |scope| {
-        let exposed = Arc::clone(&exposed);
-        let disposed = Arc::clone(&disposed);
-        effect! {
-            let scope=scope.clone(); let exposed=Arc::clone(&exposed); let disposed=Arc::clone(&disposed);
-            let pool=Pool::make(scope.clone(),PoolCapacity::Bounded(NonZeroUsize::MIN),None,Effect::sync(||7usize),|_|Effect::sync(||true),move |_| { let disposed=Arc::clone(&disposed); Effect::sync(move|| { disposed.fetch_add(1,Ordering::SeqCst); }) })?;
-            let lease=pool.acquire(scope)?;
-            *exposed.lock().unwrap_or_else(std::sync::PoisonError::into_inner)=Some((pool,lease));
-            Effect::from_future(|_|std::future::pending::<()>())?;
-        }
-    });
+    let program: Effect<(), (), Env> = effect_scope! {
+    body: move |scope| {
+            let exposed = Arc::clone(&exposed);
+            let disposed = Arc::clone(&disposed);
+            effect! {
+                let scope=scope.clone(); let exposed=Arc::clone(&exposed); let disposed=Arc::clone(&disposed);
+                let pool=pool! { scope: scope.clone(), capacity: PoolCapacity::Bounded(NonZeroUsize::MIN), idle_ttl: None, create: effect_sync! { body: ||7usize, }, validate: |_|effect_sync! { body: ||true, }, dispose: move |_| { let disposed=Arc::clone(&disposed); effect_sync! { body: move|| { disposed.fetch_add(1,Ordering::SeqCst); }, } },  }?;
+                let lease=pool.acquire(scope)?;
+                *exposed.lock().unwrap_or_else(std::sync::PoisonError::into_inner)=Some((pool,lease));
+                effect_future! { body: |_|std::future::pending::<()>(), }?;
+            }
+        },
+    };
     let mut run = Box::pin(program.run(Arc::clone(&env)));
     drive::until(run.as_mut(), || {
         slot.lock()
@@ -654,7 +671,7 @@ fn abandoned_pool_scope_invalidates_lease_closes_admission_and_recovery_drains_r
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
-    let (pool, lease) = stored.unwrap_or_else(missing_scoped_handle);
+    let (pool, lease) = stored.ok_or("scope did not expose its managed handle")?;
     assert!(lease.with(|value| *value).is_err());
     assert_eq!(released.load(Ordering::SeqCst), 0);
     assert_eq!(
@@ -663,31 +680,38 @@ fn abandoned_pool_scope_invalidates_lease_closes_admission_and_recovery_drains_r
     );
     assert_eq!(released.load(Ordering::SeqCst), 1);
     env.tasks.finish();
+    Ok(())
 }
 #[test]
-fn abandoned_cache_and_live_weak_association_reject_new_work_and_can_be_drained() {
+fn abandoned_cache_and_live_weak_association_reject_new_work_and_can_be_drained()
+-> Result<(), String> {
     let env = Arc::new(Env::default());
     let slot = Arc::new(Mutex::new(None::<Cache<usize, usize, ()>>));
     let exposed = Arc::clone(&slot);
-    let program: Effect<(), SharedValue<()>, Env> = Scope::scoped(move |scope| {
-        let exposed = Arc::clone(&exposed);
-        Cache::make(
-            scope,
-            CacheConfig {
-                equal: Arc::new(|a: &usize, b| a == b),
-                ttl: None,
-                capacity: CacheCapacity::Unbounded,
-                cache_failure: Arc::new(|_| false),
+    let program: Effect<(), SharedValue<()>, Env> = effect_scope! {
+    body: move |scope| {
+            let exposed = Arc::clone(&exposed);
+            effect! {
+     bind;
+     program: Cache::make(
+                scope,
+                CacheConfig {
+                    equal: Arc::new(|a: &usize, b| a == b),
+                    ttl: None,
+                    capacity: CacheCapacity::Unbounded,
+                    cache_failure: Arc::new(|_| false),
+                },
+                |_| effect_sync! { body: || 7usize, },
+            ),
+     body: move |cache| {
+                *exposed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cache);
+                effect_future! { body: |_| std::future::pending::<()>(), }
             },
-            |_| Effect::sync(|| 7usize),
-        )
-        .flat_map(move |cache| {
-            *exposed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cache);
-            Effect::from_future(|_| std::future::pending::<()>())
-        })
-    });
+     }
+        },
+    };
     let mut run = Box::pin(program.run(Arc::clone(&env)));
     drive::until(run.as_mut(), || {
         slot.lock()
@@ -699,7 +723,7 @@ fn abandoned_cache_and_live_weak_association_reject_new_work_and_can_be_drained(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
-    let cache = stored.unwrap_or_else(missing_scoped_handle);
+    let cache = stored.ok_or("scope did not expose its managed handle")?;
     assert!(
         matches!(block_on(cache.get::<Env>(1).run(Arc::clone(&env))),Exit::Die(defect) if defect.kind()==DefectKind::Library(LibraryDefect::CacheClosed))
     );
@@ -715,17 +739,19 @@ fn abandoned_cache_and_live_weak_association_reject_new_work_and_can_be_drained(
         )>,
     ));
     let exposed = Arc::clone(&slot);
-    let program: Effect<(), SharedValue<()>, Env> = Scope::scoped(move |scope| {
-        let exposed = Arc::clone(&exposed);
-        effect! {
-            let scope=scope.clone(); let exposed=Arc::clone(&exposed);
-            let cache=WeakCache::make(scope)?;
-            let key=Arc::new(String::from("live"));
-            let value=cache.get(&key,||Effect::sync(||7usize))?;
-            *exposed.lock().unwrap_or_else(std::sync::PoisonError::into_inner)=Some((cache,key,value));
-            Effect::from_future(|_|std::future::pending::<()>())?;
-        }
-    });
+    let program: Effect<(), SharedValue<()>, Env> = effect_scope! {
+    body: move |scope| {
+            let exposed = Arc::clone(&exposed);
+            effect! {
+                let scope=scope.clone(); let exposed=Arc::clone(&exposed);
+                let cache=WeakCache::make(scope)?;
+                let key=Arc::new(String::from("live"));
+                let value=weak_cache! { cache: cache, key: &key, load: ||effect_sync! { body: ||7usize, }, }?;
+                *exposed.lock().unwrap_or_else(std::sync::PoisonError::into_inner)=Some((cache,key,value));
+                effect_future! { body: |_|std::future::pending::<()>(), }?;
+            }
+        },
+    };
     let mut run = Box::pin(program.run(Arc::clone(&env)));
     drive::until(run.as_mut(), || {
         slot.lock()
@@ -737,61 +763,62 @@ fn abandoned_cache_and_live_weak_association_reject_new_work_and_can_be_drained(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
-    let (cache, key, _value) = stored.unwrap_or_else(missing_scoped_handle);
+    let (cache, key, _value) = stored.ok_or("scope did not expose its managed handle")?;
     assert!(
-        matches!(block_on(cache.get::<Env>(&key,||Effect::sync(||9usize)).run(Arc::clone(&env))),Exit::Die(defect) if defect.kind()==DefectKind::Library(LibraryDefect::CacheClosed))
+        matches!(block_on(weak_cache! { cache: cache, key: &key, load: ||effect_sync! { body: ||9usize, }, }.run(Arc::clone(&env))),Exit::Die(defect) if defect.kind()==DefectKind::Library(LibraryDefect::CacheClosed))
     );
     assert!(matches!(
         block_on(cache.shutdown::<Env>().run(Arc::clone(&env))),
         Exit::Success(PoolEndStatus::Failed)
     ));
     env.tasks.finish();
+    Ok(())
 }
 #[test]
 fn dependency_cache_observes_retention_sets_and_fences_dependencies() {
     let env = Arc::new(Env::default());
     let loads = count();
     let witness = Arc::clone(&loads);
-    let program: Effect<(), SharedValue<DependencyCacheError<()>>, Env> = Scope::scoped(
-        move |scope| {
-            let loads = Arc::clone(&loads);
-            effect! {
-                let loads=Arc::clone(&loads);
-                let cache=DependencyCache::make(scope.clone(),DependencyCachePolicy{retention:nz(2),maximum_active:nz(1),maximum_dependencies:nz(1),key_equal:Arc::new(|left:&usize,right|left==right),dependency_equal:Arc::new(|left:&usize,right|left==right),cache_failure:Arc::new(|_:&()|false),ttl:CacheTtl::Fixed(None)},move |key|{let key=*key;let loads=Arc::clone(&loads);Effect::sync(move ||{loads.fetch_add(1,Ordering::SeqCst);(key,vec![key])})})?;
-                let observed=cache.get_observed(1)?;assert_eq!(observed.observation,CacheObservation::Loaded);
-                let observed=cache.get_observed(1)?;assert_eq!(observed.observation,CacheObservation::Retained);
-                cache.set(1,7,vec![2])?;let value=cache.try_get(1)?;assert_eq!(value.unwrap().with(|value|*value),Ok(7));
-                cache.invalidate_dependency(2)?;let missing=cache.try_get(1)?;assert!(missing.is_none());
-                let observed=cache.get_observed(1)?;assert_eq!(observed.observation,CacheObservation::Loaded);
-                cache.clear()?;let missing=cache.try_get(1)?;assert!(missing.is_none());
-            }
-        },
-    );
+    let program: Effect<(), SharedValue<DependencyCacheError<()>>, Env> = effect_scope! {
+    body: move |scope| {
+                let loads = Arc::clone(&loads);
+                effect! {
+                    let loads=Arc::clone(&loads);
+                    let cache=dependency_cache! { scope: scope.clone(), policy: DependencyCachePolicy{retention:nz(2),maximum_active:nz(1),maximum_dependencies:nz(1),key_equal:Arc::new(|left:&usize,right|left==right),dependency_equal:Arc::new(|left:&usize,right|left==right),cache_failure:Arc::new(|_:&()|false),ttl:CacheTtl::Fixed(None)}, load: move |key|{let key=*key;let loads=Arc::clone(&loads);effect_sync! { body: move ||{loads.fetch_add(1,Ordering::SeqCst);(key,vec![key])}, }}, }?;
+                    let observed=cache.get_observed(1)?;assert_eq!(observed.observation,CacheObservation::Loaded);
+                    let observed=cache.get_observed(1)?;assert_eq!(observed.observation,CacheObservation::Retained);
+                    cache.set(1,7,vec![2])?;let value=cache.try_get(1)?;assert_eq!(value.as_ref().map(|value|value.with(|value|*value)),Some(Ok(7)));
+                    cache.invalidate_dependency(2)?;let missing=cache.try_get(1)?;assert!(missing.is_none());
+                    let observed=cache.get_observed(1)?;assert_eq!(observed.observation,CacheObservation::Loaded);
+                    cache.clear()?;let missing=cache.try_get(1)?;assert!(missing.is_none());
+                }
+            },
+    };
     assert!(matches!(block_on(program.run(env)), Exit::Success(())));
     assert_eq!(witness.load(Ordering::SeqCst), 2);
 }
 #[test]
 fn dynamic_cache_ttl_failure_settles_and_preserves_cleanup() {
     let env = Arc::new(Env::default());
-    let program: Effect<(), SharedValue<()>, Env> = Scope::scoped(|scope| {
-        Cache::make_with_options(
-            scope,
-            CacheConfig {
-                equal: Arc::new(|left: &usize, right| left == right),
-                ttl: None,
-                capacity: CacheCapacity::Bounded(NonZeroUsize::MIN),
-                cache_failure: Arc::new(|_: &()| false),
-            },
-            CacheOptions {
-                ttl: CacheTtl::Outcome(Arc::new(|_| {
-                    Err(Defect::from(LibraryDefect::ClockDeadlineOverflow))
-                })),
-                admission: CacheAdmission::Unbounded,
-            },
-            |_| Effect::succeed(1usize),
-        )
-        .flat_map(|cache| cache.get(1).map(|_| ()))
-    });
+    let program: Effect<(), SharedValue<()>, Env> = effect_scope! {
+    body: |scope| {
+            effect! {
+     bind;
+     program: cache! { scope: scope, config: CacheConfig {
+                    equal: Arc::new(|left: &usize, right| left == right),
+                    ttl: None,
+                    capacity: CacheCapacity::Bounded(NonZeroUsize::MIN),
+                    cache_failure: Arc::new(|_: &()| false),
+                }, options: CacheOptions {
+                    ttl: CacheTtl::Outcome(Arc::new(|_| {
+                        Err(Defect::from(LibraryDefect::ClockDeadlineOverflow))
+                    })),
+                    admission: CacheAdmission::Unbounded,
+                }, load: |_| effect_sync! { body: { let __dsl_value = 1usize; move || __dsl_value }, }, },
+     body: |cache| effect_map! { program: cache.get(1), map: |_| (), },
+     }
+        },
+    };
     assert!(matches!(
         block_on(program.run(env)),
         Exit::FinalizationFailed(_)
@@ -805,20 +832,22 @@ fn bounded_cache_admission_rejects_before_dispatch_and_recovers_after_retirement
     let loaded = Arc::clone(&calls);
     let started = Latch::new();
     let released = Latch::new();
-    let program: Effect<(), SharedValue<&'static str>, Env> = Scope::scoped(move |scope| {
-        let loaded = Arc::clone(&loaded);
-        let started = started.clone();
-        let released = released.clone();
-        effect! {
-            let scope=scope.clone();let loaded=Arc::clone(&loaded);let started=started.clone();let released=released.clone();
-            let load_started=started.clone();let load_released=released.clone();
-            let cache=Cache::make_with_options(scope.clone(),CacheConfig{equal:Arc::new(|a:&usize,b|a==b),ttl:None,capacity:CacheCapacity::NoRetention,cache_failure:Arc::new(|_|false)},CacheOptions{ttl:CacheTtl::Fixed(None),admission:CacheAdmission::Bounded{maximum:nz(1),capacity_error:Arc::new(||"full")}},move |_|{let loaded=Arc::clone(&loaded);let started=load_started.clone();let released=load_released.clone();effect!{let loaded=Arc::clone(&loaded);let started=started.clone();let released=released.clone();Effect::sync(move||{loaded.fetch_add(1,Ordering::SeqCst);})?;started.open()?;released.await_open()?;7usize}})?;
-            let first=scope.fork(cache.get_observed(1))?;started.await_open()?;
-            let denied=cache.get_observed(2).either()?;assert!(matches!(denied,Err(error) if error.with(|error|*error)==Ok("full")));
-            released.open()?;let observed=first.join()?;assert_eq!(observed.observation,CacheObservation::Loaded);
-            let observed=cache.get_observed(2)?;assert_eq!(observed.observation,CacheObservation::Loaded);
-        }
-    });
+    let program: Effect<(), SharedValue<&'static str>, Env> = effect_scope! {
+    body: move |scope| {
+            let loaded = Arc::clone(&loaded);
+            let started = started.clone();
+            let released = released.clone();
+            effect! {
+                let scope=scope.clone();let loaded=Arc::clone(&loaded);let started=started.clone();let released=released.clone();
+                let load_started=started.clone();let load_released=released.clone();
+                let cache=cache! { scope: scope.clone(), config: CacheConfig{equal:Arc::new(|a:&usize,b|a==b),ttl:None,capacity:CacheCapacity::NoRetention,cache_failure:Arc::new(|_|false)}, options: CacheOptions{ttl:CacheTtl::Fixed(None),admission:CacheAdmission::Bounded{maximum:nz(1),capacity_error:Arc::new(||"full")}}, load: move |_|{let loaded=Arc::clone(&loaded);let started=load_started.clone();let released=load_released.clone();effect!{let loaded=Arc::clone(&loaded);let started=started.clone();let released=released.clone();effect_sync! { body: move||{loaded.fetch_add(1,Ordering::SeqCst);}, }?;started.open()?;released.await_open()?;7usize}}, }?;
+                let first=scope.fork(cache.get_observed(1))?;started.await_open()?;
+                let denied=cache.get_observed(2).either()?;assert!(matches!(denied,Err(error) if error.with(|error|*error)==Ok("full")));
+                released.open()?;let observed=first.join()?;assert_eq!(observed.observation,CacheObservation::Loaded);
+                let observed=cache.get_observed(2)?;assert_eq!(observed.observation,CacheObservation::Loaded);
+            }
+        },
+    };
     assert!(matches!(
         block_on(program.run(Arc::clone(&env))),
         Exit::Success(())
@@ -828,7 +857,8 @@ fn bounded_cache_admission_rejects_before_dispatch_and_recovers_after_retirement
 }
 
 #[test]
-fn cache_observation_distinguishes_shared_loading_and_set_fences_active_generation() {
+fn cache_observation_distinguishes_shared_loading_and_set_fences_active_generation()
+-> Result<(), String> {
     let env = Arc::new(Env::default());
     let slot = Arc::new(Mutex::new(None::<Cache<usize, usize, ()>>));
     let exposed = Arc::clone(&slot);
@@ -839,46 +869,58 @@ fn cache_observation_distinguishes_shared_loading_and_set_fences_active_generati
     let released = Latch::new();
     let load_release = released.clone();
     let blocked_release = Latch::new();
-    let program: Effect<(), SharedValue<()>, Env> = Scope::scoped(move |scope| {
-        let exposed = Arc::clone(&exposed);
-        let entered = Arc::clone(&entered);
-        let matched = Arc::clone(&matched);
-        let load_release = load_release.clone();
-        let blocked_release = blocked_release.clone();
-        Cache::make(
-            scope,
-            CacheConfig {
-                equal: Arc::new(move |left: &usize, right| {
-                    matched.fetch_add(1, Ordering::SeqCst);
-                    left == right
-                }),
-                ttl: None,
-                capacity: CacheCapacity::Unbounded,
-                cache_failure: Arc::new(|_| false),
+    let program: Effect<(), SharedValue<()>, Env> = effect_scope! {
+    body: move |scope| {
+            let exposed = Arc::clone(&exposed);
+            let entered = Arc::clone(&entered);
+            let matched = Arc::clone(&matched);
+            let load_release = load_release.clone();
+            let blocked_release = blocked_release.clone();
+            effect! {
+     bind;
+     program: Cache::make(
+                scope,
+                CacheConfig {
+                    equal: Arc::new(move |left: &usize, right| {
+                        matched.fetch_add(1, Ordering::SeqCst);
+                        left == right
+                    }),
+                    ttl: None,
+                    capacity: CacheCapacity::Unbounded,
+                    cache_failure: Arc::new(|_| false),
+                },
+                move |key| {
+                    let key = *key;
+                    let entered = Arc::clone(&entered);
+                    let released = if key == 2 {
+                        blocked_release.clone()
+                    } else {
+                        load_release.clone()
+                    };
+                    effect_map! { program: { let __dsl_left_program = effect_sync! { body: move || {
+                        entered.fetch_add(1, Ordering::SeqCst);
+                    }, }; let __dsl_right_program = released.await_open(); effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }, map: move |_| key, }
+                },
+            ),
+     body: move |cache| {
+                match exposed.lock() {
+                    Ok(mut slot) => *slot = Some(cache),
+                    Err(error) => return effect_die! { defect: Defect::new(error.to_string()), },
+                }
+                effect_future! { body: |_| std::future::pending::<()>(), }
             },
-            move |key| {
-                let key = *key;
-                let entered = Arc::clone(&entered);
-                let released = if key == 2 {
-                    blocked_release.clone()
-                } else {
-                    load_release.clone()
-                };
-                Effect::sync(move || {
-                    entered.fetch_add(1, Ordering::SeqCst);
-                })
-                .zip(released.await_open())
-                .map(move |_| key)
-            },
-        )
-        .flat_map(move |cache| {
-            *exposed.lock().unwrap() = Some(cache);
-            Effect::from_future(|_| std::future::pending::<()>())
-        })
-    });
+     }
+        },
+    };
     let mut program = Box::pin(program.run(Arc::clone(&env)));
-    drive::until(program.as_mut(), || slot.lock().unwrap().is_some());
-    let cache = slot.lock().unwrap().take().unwrap();
+    drive::until(program.as_mut(), || {
+        slot.lock().map_or(true, |slot| slot.is_some())
+    });
+    let cache = slot
+        .lock()
+        .map_err(|error| format!("cache slot: {error}"))?
+        .take()
+        .ok_or("missing exposed cache")?;
     let first = cache.get_observed(1);
     let mut first = Box::pin(first.run(Arc::clone(&env)));
     drive::until(first.as_mut(), || loads.load(Ordering::SeqCst) == 1);
@@ -890,13 +932,11 @@ fn cache_observation_distinguishes_shared_loading_and_set_fences_active_generati
         block_on(released.open::<(), Env>().run(Arc::clone(&env))),
         Exit::Success(true)
     ));
-    let first = match block_on(first) {
-        Exit::Success(value) => value,
-        _ => panic!("loaded"),
+    let Exit::Success(first) = block_on(first) else {
+        return Err(String::from("first cache observation must load"));
     };
-    let second = match block_on(second) {
-        Exit::Success(value) => value,
-        _ => panic!("shared"),
+    let Exit::Success(second) = block_on(second) else {
+        return Err(String::from("second cache observation must share the load"));
     };
     assert_eq!(first.observation, CacheObservation::Loaded);
     assert_eq!(second.observation, CacheObservation::Shared);
@@ -921,4 +961,5 @@ fn cache_observation_distinguishes_shared_loading_and_set_fences_active_generati
         Exit::Success(_)
     ));
     env.tasks.finish();
+    Ok(())
 }

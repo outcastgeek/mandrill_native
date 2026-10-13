@@ -4,6 +4,7 @@ use super::{
     IssueSegment, JsonValue, ParseLimits, PureCodec, SchemaAst, SchemaIssue, SchemaIssueKind,
     ValueKind, value_kind,
 };
+use crate::codec;
 use crate::{CleanupFailure, Defect, DefectKind, Exit, Finalization, PrimaryOutcome};
 use serde::Deserialize;
 use serde_json::Map;
@@ -516,141 +517,137 @@ pub fn stored_outcome_codec<A: Send + 'static, E: Send + 'static>(
 ) -> PureCodec<StoredOutcome<A, E>, JsonValue> {
     let decode_success = success.clone();
     let decode_error = error.clone();
-    PureCodec::with_ast(
-        SchemaAst::opaque(),
-        move |encoded| {
-            super::internal::parser::check_limits(encoded, &limits)?;
-            let object = object(encoded)?;
-            let version = field(object, wire::VERSION_FIELD)?;
-            let actual = version.as_u64();
-            if actual != Some(wire::VERSION) {
-                return Err(SchemaIssue::new(SchemaIssueKind::VersionMismatch {
-                    expected: wire::VERSION,
-                    actual,
-                }));
+    codec! { pure; ast: SchemaAst::opaque(), decode: move |encoded| {
+        super::internal::parser::check_limits(encoded, &limits)?;
+        let object = object(encoded)?;
+        let version = field(object, wire::VERSION_FIELD)?;
+        let actual = version.as_u64();
+        if actual != Some(wire::VERSION) {
+            return Err(SchemaIssue::new(SchemaIssueKind::VersionMismatch {
+                expected: wire::VERSION,
+                actual,
+            }));
+        }
+        match tag(object)? {
+            wire::SUCCESS => {
+                exact_fields(object, &[wire::VERSION_FIELD, wire::KIND, wire::VALUE])?;
+                let value = decode_success
+                    .decode_ref(field(object, wire::VALUE)?)
+                    .map_err(|issue| issue.at(IssueSegment::Field(Arc::from(wire::VALUE))))?;
+                Ok(StoredOutcome::Success(value))
             }
-            match tag(object)? {
-                wire::SUCCESS => {
-                    exact_fields(object, &[wire::VERSION_FIELD, wire::KIND, wire::VALUE])?;
-                    let value = decode_success
-                        .decode_ref(field(object, wire::VALUE)?)
-                        .map_err(|issue| issue.at(IssueSegment::Field(Arc::from(wire::VALUE))))?;
-                    Ok(StoredOutcome::Success(value))
-                }
-                wire::FAILURE => {
-                    exact_fields(object, &[wire::VERSION_FIELD, wire::KIND, wire::ERROR])?;
-                    Ok(StoredOutcome::Failure(error_from_json(
-                        object,
-                        &decode_error,
-                    )?))
-                }
-                wire::DEFECTED => {
-                    exact_fields(object, &[wire::VERSION_FIELD, wire::KIND, wire::DEFECT])?;
-                    Ok(StoredOutcome::Defect(defect_from_json(field(
-                        object,
-                        wire::DEFECT,
-                    )?)?))
-                }
-                wire::INTERRUPTED => {
-                    exact_fields(object, &[wire::VERSION_FIELD, wire::KIND])?;
-                    Ok(StoredOutcome::Interrupted)
-                }
-                wire::FINALIZATION_FAILED => {
-                    exact_fields(
-                        object,
-                        &[
-                            wire::VERSION_FIELD,
-                            wire::KIND,
-                            wire::PRIMARY,
-                            wire::FIRST,
-                            wire::REST,
-                        ],
-                    )?;
-                    let primary = primary_from_json(field(object, wire::PRIMARY)?, &decode_error)
-                        .map_err(|issue| {
-                        issue.at(IssueSegment::Field(Arc::from(wire::PRIMARY)))
-                    })?;
-                    let first = cleanup_from_json(field(object, wire::FIRST)?, &decode_error)
-                        .map_err(|issue| issue.at(IssueSegment::Field(Arc::from(wire::FIRST))))?;
-                    let rest = field(object, wire::REST)?;
-                    let JsonValue::Array(rest) = rest else {
-                        return Err(wrong_type(ValueKind::Sequence, rest)
-                            .at(IssueSegment::Field(Arc::from(wire::REST))));
-                    };
-                    let rest = rest
-                        .iter()
-                        .enumerate()
-                        .map(|(index, value)| {
-                            cleanup_from_json(value, &decode_error).map_err(|issue| {
-                                issue
-                                    .at(IssueSegment::Index(index))
-                                    .at(IssueSegment::Field(Arc::from(wire::REST)))
-                            })
+            wire::FAILURE => {
+                exact_fields(object, &[wire::VERSION_FIELD, wire::KIND, wire::ERROR])?;
+                Ok(StoredOutcome::Failure(error_from_json(
+                    object,
+                    &decode_error,
+                )?))
+            }
+            wire::DEFECTED => {
+                exact_fields(object, &[wire::VERSION_FIELD, wire::KIND, wire::DEFECT])?;
+                Ok(StoredOutcome::Defect(defect_from_json(field(
+                    object,
+                    wire::DEFECT,
+                )?)?))
+            }
+            wire::INTERRUPTED => {
+                exact_fields(object, &[wire::VERSION_FIELD, wire::KIND])?;
+                Ok(StoredOutcome::Interrupted)
+            }
+            wire::FINALIZATION_FAILED => {
+                exact_fields(
+                    object,
+                    &[
+                        wire::VERSION_FIELD,
+                        wire::KIND,
+                        wire::PRIMARY,
+                        wire::FIRST,
+                        wire::REST,
+                    ],
+                )?;
+                let primary = primary_from_json(field(object, wire::PRIMARY)?, &decode_error)
+                    .map_err(|issue| {
+                    issue.at(IssueSegment::Field(Arc::from(wire::PRIMARY)))
+                })?;
+                let first = cleanup_from_json(field(object, wire::FIRST)?, &decode_error)
+                    .map_err(|issue| issue.at(IssueSegment::Field(Arc::from(wire::FIRST))))?;
+                let rest = field(object, wire::REST)?;
+                let JsonValue::Array(rest) = rest else {
+                    return Err(wrong_type(ValueKind::Sequence, rest)
+                        .at(IssueSegment::Field(Arc::from(wire::REST))));
+                };
+                let rest = rest
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        cleanup_from_json(value, &decode_error).map_err(|issue| {
+                            issue
+                                .at(IssueSegment::Index(index))
+                                .at(IssueSegment::Field(Arc::from(wire::REST)))
                         })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Ok(StoredOutcome::FinalizationFailed(StoredFinalization {
-                        primary,
-                        first,
-                        rest,
-                    }))
-                }
-                _ => Err(SchemaIssue::new(SchemaIssueKind::InvalidTag)),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(StoredOutcome::FinalizationFailed(StoredFinalization {
+                    primary,
+                    first,
+                    rest,
+                }))
             }
-        },
-        move |outcome| {
-            let mut encoded = match outcome {
-                StoredOutcome::Success(value) => encoded_object(
-                    wire::SUCCESS,
-                    [(
-                        wire::VALUE,
-                        success.encode_ref(value).map_err(|issue| {
-                            issue.at(IssueSegment::Field(Arc::from(wire::VALUE)))
-                        })?,
-                    )],
-                ),
-                StoredOutcome::Failure(value) => encoded_object(
-                    wire::FAILURE,
-                    [(wire::ERROR, error_to_json(value, &error)?)],
-                ),
-                StoredOutcome::Defect(value) => {
-                    encoded_object(wire::DEFECTED, [(wire::DEFECT, defect_to_json(value)?)])
-                }
-                StoredOutcome::Interrupted => encoded_object(wire::INTERRUPTED, []),
-                StoredOutcome::FinalizationFailed(details) => {
-                    let primary = primary_to_json(&details.primary, &error)
-                        .map_err(|issue| issue.at(IssueSegment::Field(Arc::from(wire::PRIMARY))))?;
-                    let first = cleanup_to_json(&details.first, &error)
-                        .map_err(|issue| issue.at(IssueSegment::Field(Arc::from(wire::FIRST))))?;
-                    let rest = details
-                        .rest
-                        .iter()
-                        .enumerate()
-                        .map(|(index, value)| {
-                            cleanup_to_json(value, &error).map_err(|issue| {
-                                issue
-                                    .at(IssueSegment::Index(index))
-                                    .at(IssueSegment::Field(Arc::from(wire::REST)))
-                            })
+            _ => Err(SchemaIssue::new(SchemaIssueKind::InvalidTag)),
+        }
+    }, encode: move |outcome| {
+        let mut encoded = match outcome {
+            StoredOutcome::Success(value) => encoded_object(
+                wire::SUCCESS,
+                [(
+                    wire::VALUE,
+                    success.encode_ref(value).map_err(|issue| {
+                        issue.at(IssueSegment::Field(Arc::from(wire::VALUE)))
+                    })?,
+                )],
+            ),
+            StoredOutcome::Failure(value) => encoded_object(
+                wire::FAILURE,
+                [(wire::ERROR, error_to_json(value, &error)?)],
+            ),
+            StoredOutcome::Defect(value) => {
+                encoded_object(wire::DEFECTED, [(wire::DEFECT, defect_to_json(value)?)])
+            }
+            StoredOutcome::Interrupted => encoded_object(wire::INTERRUPTED, []),
+            StoredOutcome::FinalizationFailed(details) => {
+                let primary = primary_to_json(&details.primary, &error)
+                    .map_err(|issue| issue.at(IssueSegment::Field(Arc::from(wire::PRIMARY))))?;
+                let first = cleanup_to_json(&details.first, &error)
+                    .map_err(|issue| issue.at(IssueSegment::Field(Arc::from(wire::FIRST))))?;
+                let rest = details
+                    .rest
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        cleanup_to_json(value, &error).map_err(|issue| {
+                            issue
+                                .at(IssueSegment::Index(index))
+                                .at(IssueSegment::Field(Arc::from(wire::REST)))
                         })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    encoded_object(
-                        wire::FINALIZATION_FAILED,
-                        [
-                            (wire::PRIMARY, primary),
-                            (wire::FIRST, first),
-                            (wire::REST, JsonValue::Array(rest)),
-                        ],
-                    )
-                }
-            };
-            if let JsonValue::Object(ref mut object) = encoded {
-                object.insert(
-                    wire::VERSION_FIELD.into(),
-                    JsonValue::Number(wire::VERSION.into()),
-                );
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                encoded_object(
+                    wire::FINALIZATION_FAILED,
+                    [
+                        (wire::PRIMARY, primary),
+                        (wire::FIRST, first),
+                        (wire::REST, JsonValue::Array(rest)),
+                    ],
+                )
             }
-            super::internal::parser::check_limits(&encoded, &limits)?;
-            Ok(encoded)
-        },
-    )
+        };
+        if let JsonValue::Object(ref mut object) = encoded {
+            object.insert(
+                wire::VERSION_FIELD.into(),
+                JsonValue::Number(wire::VERSION.into()),
+            );
+        }
+        super::internal::parser::check_limits(&encoded, &limits)?;
+        Ok(encoded)
+    }, }
 }

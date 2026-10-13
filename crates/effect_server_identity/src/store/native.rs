@@ -3,6 +3,7 @@
 //! still compose multiple separately committed operations. Persistence JSON is a
 //! private versioned security DTO, never a row conversion or public view codec.
 
+use super::schema::{collection_limit_sql, collection_lookahead_sql, recovery_lookahead_sql};
 use identity_rs::identity::{
     StoreError,
     models::{
@@ -702,7 +703,7 @@ impl UserRoleStore for SqlxIdentityStore {
 
         let inserted = connection
             .execute(
-                super::schema::collection_limit_sql!("
+                collection_limit_sql!("
                 INSERT INTO effect_identity_user_roles (user_id, role_id)
                 SELECT ?1, ?2 WHERE (SELECT COUNT(*) FROM effect_identity_user_roles WHERE user_id=?1)<","
                 "),
@@ -814,7 +815,7 @@ impl UserRoleStore for SqlxIdentityStore {
 
                     let mut rows = connection
                         .query(
-                            super::schema::collection_lookahead_sql!(
+                            collection_lookahead_sql!(
                                 "
                 SELECT r.normalized_name
                   FROM effect_identity_user_roles ur
@@ -999,7 +1000,7 @@ impl UserClaimStore for SqlxIdentityStore {
                     ensure_user_exists(&connection, id).await?;
                     let mut rows = connection
                         .query(
-                            super::schema::collection_lookahead_sql!(
+                            collection_lookahead_sql!(
                                 "
                 SELECT claim_type, claim_value
                   FROM effect_identity_user_claims
@@ -1313,7 +1314,7 @@ impl UserLoginStore for SqlxIdentityStore {
         ensure_user_exists(&connection, id).await?;
         let inserted = connection
             .execute(
-                super::schema::collection_limit_sql!("
+                collection_limit_sql!("
                 INSERT INTO effect_identity_user_logins (
                     user_id,
                     login_provider,
@@ -1438,7 +1439,7 @@ impl UserLoginStore for SqlxIdentityStore {
                     ensure_user_exists(&connection, id).await?;
                     let mut rows = connection
                         .query(
-                            super::schema::collection_lookahead_sql!(
+                            collection_lookahead_sql!(
                                 "
                 SELECT login_provider, provider_key, provider_display_name
                   FROM effect_identity_user_logins
@@ -1892,7 +1893,7 @@ impl UserPasskeyStore for SqlxIdentityStore {
         let payload = serialize_user_passkey(&user_passkey)?;
         let inserted = connection
             .execute(
-                super::schema::collection_limit_sql!("
+                collection_limit_sql!("
                 INSERT INTO effect_identity_user_passkeys (
                     user_id,
                     credential_id,
@@ -2058,7 +2059,7 @@ impl UserPasskeyStore for SqlxIdentityStore {
                     ensure_user_exists(&connection, id).await?;
                     let mut rows = connection
                         .query(
-                            super::schema::collection_lookahead_sql!(
+                            collection_lookahead_sql!(
                                 "
                 SELECT payload
                   FROM effect_identity_user_passkeys
@@ -2863,7 +2864,7 @@ impl UserTwoFactorRecoveryCodeStore for SqlxIdentityStore {
 
                     let rows = match connection
                         .query(
-                            super::schema::recovery_lookahead_sql!(
+                            recovery_lookahead_sql!(
                                 "
                 SELECT id, code_hash
                   FROM effect_identity_user_recovery_code_hashes
@@ -3291,7 +3292,7 @@ impl RoleClaimStore for SqlxIdentityStore {
                     ensure_role_exists(&connection, id).await?;
                     let mut rows = connection
                         .query(
-                            super::schema::collection_lookahead_sql!(
+                            collection_lookahead_sql!(
                                 "
                 SELECT claim_type, claim_value
                   FROM effect_identity_role_claims
@@ -3342,7 +3343,7 @@ impl RoleClaimStore for SqlxIdentityStore {
         ensure_role_exists(&connection, id).await?;
         let inserted = connection
             .execute(
-                super::schema::collection_limit_sql!("
+                collection_limit_sql!("
                 INSERT INTO effect_identity_role_claims (
                     role_id,
                     claim_type,

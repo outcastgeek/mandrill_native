@@ -4,7 +4,8 @@ use super::{
     BoundMessage, Catalog, CatalogDefinition, CultureId, CultureSet, LocalizationError,
     MessageContract, MissingMessage,
 };
-use effect::{Effect, Exit, HasClock, HasTaskSpawner, Scope, SynchronizedRef};
+use crate::{effect_future, effect_map, effect_map_error, effect_ref, effect_try_sync};
+use effect::{Effect, Exit, HasClock, HasTaskSpawner, Scope, SynchronizedRef, effect};
 use effect_server::Request;
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
@@ -105,61 +106,65 @@ impl<C: Send + Sync + 'static, R: Send + Sync + 'static> Localization<C, R> {
         let definition = self.clone();
         let inject = Arc::new(inject);
         let initial_inject = inject.clone();
-        self.catalogue
-            .load()
-            .map_error(move |error| initial_inject(error))
-            .flat_map(move |catalog| {
-                let runtime = CatalogRuntime {
-                    definition: definition.clone(),
-                    state: SynchronizedRef::new(State {
-                        catalog: Arc::new(catalog),
-                        status: CatalogStatus {
-                            generation: 0,
-                            failure: None,
-                        },
-                    }),
-                };
-                match definition.reload {
-                    None => Effect::from_result_once(Ok(runtime)),
-                    Some(interval) => {
-                        let worker_runtime = runtime.clone();
-                        let worker_inject = inject.clone();
-                        let worker =
-                            Effect::from_exit_future_with_context(move |env: Arc<R>, context| {
-                                let runtime = worker_runtime.clone();
-                                let inject = worker_inject.clone();
-                                async move {
-                                    loop {
-                                        match context
-                                            .run(Effect::<(), E, R>::sleep(interval), env.clone())
-                                            .await
-                                        {
-                                            Exit::Success(()) => {}
-                                            Exit::Fail(error) => return Exit::Fail(error),
-                                            Exit::Die(defect) => return Exit::Die(defect),
-                                            Exit::Interrupted => return Exit::Interrupted,
-                                            Exit::FinalizationFailed(failure) => {
-                                                return Exit::FinalizationFailed(failure);
-                                            }
-                                        }
-                                        let result =
-                                            context.run(runtime.reload(), env.clone()).await;
-                                        match result {
-                                            Exit::Success(()) | Exit::Fail(_) => {}
-                                            Exit::Die(defect) => return Exit::Die(defect),
-                                            Exit::Interrupted => return Exit::Interrupted,
-                                            Exit::FinalizationFailed(failure) => {
-                                                return Exit::<(), _>::FinalizationFailed(failure)
-                                                    .map_error(|error| inject(error));
-                                            }
-                                        }
-                                    }
-                                }
-                            });
-                        scope.fork(worker).map(move |_| runtime.clone())
-                    }
-                }
-            })
+        effect! {
+        bind;
+        program: effect_map_error! {
+            program: self.catalogue
+                   .load(), map: move |error| initial_inject(error), },
+        body: move |catalog| {
+                       let runtime = CatalogRuntime {
+                           definition: definition.clone(),
+                           state: SynchronizedRef::new(State {
+                               catalog: Arc::new(catalog),
+                               status: CatalogStatus {
+                                   generation: 0,
+                                   failure: None,
+                               },
+                           }),
+                       };
+                       match definition.reload {
+                           None => effect_try_sync! { once; body: { let __dsl_result = Ok(runtime); move || __dsl_result }, on_error: ::core::convert::identity, },
+                           Some(interval) => {
+                               let worker_runtime = runtime.clone();
+                               let worker_inject = inject.clone();
+                               let worker =
+                                   effect_future! {
+                                       exit_with_context; body: move |env: Arc<R>, context| {
+                                       let runtime = worker_runtime.clone();
+                                       let inject = worker_inject.clone();
+                                       async move {
+                                           loop {
+                                               match context
+                                                   .run(Effect::<(), E, R>::sleep(interval), env.clone())
+                                                   .await
+                                               {
+                                                   Exit::Success(()) => {}
+                                                   Exit::Fail(error) => return Exit::Fail(error),
+                                                   Exit::Die(defect) => return Exit::Die(defect),
+                                                   Exit::Interrupted => return Exit::Interrupted,
+                                                   Exit::FinalizationFailed(failure) => {
+                                                       return Exit::FinalizationFailed(failure);
+                                                   }
+                                               }
+                                               let result =
+                                                   context.run(runtime.reload(), env.clone()).await;
+                                               match result {
+                                                   Exit::Success(()) | Exit::Fail(_) => {}
+                                                   Exit::Die(defect) => return Exit::Die(defect),
+                                                   Exit::Interrupted => return Exit::Interrupted,
+                                                   Exit::FinalizationFailed(failure) => {
+                                                       return Exit::<(), _>::FinalizationFailed(failure)
+                                                           .map_error(|error| inject(error));
+                                                   }
+                                               }
+                                           }
+                                       }
+                                   }, };
+                               effect_map! { program: scope.fork(worker), map: move |_| runtime.clone(), }
+                           }
+                       }
+                   },
+        }
     }
 }
 /// Host-owned catalogue runtime. The core synchronized reference serializes
@@ -186,100 +191,104 @@ impl<C: Send + Sync + 'static, R: Send + Sync + 'static> CatalogRuntime<C, R> {
     /// Defect/interruption/cleanup remain their original Effect outcomes.
     pub fn reload(&self) -> Effect<(), LocalizationError, R> {
         let source = self.definition.catalogue.clone();
-        self.state
-            .modify_effect(
-                move |old| {
-                    let old_for_load = old.clone();
-                    source
-                        .load()
-                        .materialize_exit()
-                        .map_error(|never| match never {})
-                        .map(move |outcome| {
-                            let old = old_for_load.clone();
-                            match outcome {
-                                Exit::Success(catalog) => {
-                                    if old.catalog.same(&catalog) {
-                                        (
-                                            Exit::Success(()),
-                                            State {
-                                                catalog: old.catalog.clone(),
-                                                status: CatalogStatus {
-                                                    generation: old.status.generation,
-                                                    failure: None,
-                                                },
-                                            },
-                                        )
-                                    } else {
-                                        match old.status.generation.checked_add(1) {
-                                            Some(generation) => (
-                                                Exit::Success(()),
-                                                State {
-                                                    catalog: Arc::new(catalog),
-                                                    status: CatalogStatus {
-                                                        generation,
-                                                        failure: None,
-                                                    },
-                                                },
-                                            ),
-                                            None => (
-                                                Exit::Fail(LocalizationError::GenerationOverflow),
-                                                State {
-                                                    catalog: old.catalog.clone(),
-                                                    status: CatalogStatus {
-                                                        generation: old.status.generation,
-                                                        failure: Some(
-                                                            LocalizationError::GenerationOverflow,
-                                                        ),
-                                                    },
-                                                },
-                                            ),
-                                        }
-                                    }
-                                }
-                                Exit::Fail(error) => {
-                                    let status_error = error.clone();
-                                    (
-                                        Exit::Fail(error),
-                                        State {
-                                            catalog: old.catalog.clone(),
-                                            status: CatalogStatus {
-                                                generation: old.status.generation,
-                                                failure: Some(status_error),
-                                            },
-                                        },
-                                    )
-                                }
-                                Exit::Die(defect) => (
-                                    Exit::Die(defect),
-                                    State {
-                                        catalog: old.catalog.clone(),
-                                        status: old.status.clone(),
-                                    },
-                                ),
-                                Exit::Interrupted => (
-                                    Exit::Interrupted,
-                                    State {
-                                        catalog: old.catalog.clone(),
-                                        status: old.status.clone(),
-                                    },
-                                ),
-                                Exit::FinalizationFailed(failure) => (
-                                    Exit::FinalizationFailed(failure),
-                                    State {
-                                        catalog: old.catalog.clone(),
-                                        status: old.status.clone(),
-                                    },
-                                ),
-                            }
-                        })
-                },
-                |_| LocalizationError::Admission,
-            )
-            .flat_map(crate::restore_exit)
+        effect! {
+        bind;
+        program: effect_ref! {
+                       synchronized;
+                       reference: self.state,
+                       modify: move |old| {
+                           let old_for_load = old.clone();
+                           effect_map! {
+                               program: effect_map_error! {
+                               program: source
+                               .load()
+                               .materialize_exit(), map: |never| match never {}, }, map: move |outcome| {
+                                   let old = old_for_load.clone();
+                                   match outcome {
+                                       Exit::Success(catalog) => {
+                                           if old.catalog.same(&catalog) {
+                                               (
+                                                   Exit::Success(()),
+                                                   State {
+                                                       catalog: old.catalog.clone(),
+                                                       status: CatalogStatus {
+                                                           generation: old.status.generation,
+                                                           failure: None,
+                                                       },
+                                                   },
+                                               )
+                                           } else {
+                                               match old.status.generation.checked_add(1) {
+                                                   Some(generation) => (
+                                                       Exit::Success(()),
+                                                       State {
+                                                           catalog: Arc::new(catalog),
+                                                           status: CatalogStatus {
+                                                               generation,
+                                                               failure: None,
+                                                           },
+                                                       },
+                                                   ),
+                                                   None => (
+                                                       Exit::Fail(LocalizationError::GenerationOverflow),
+                                                       State {
+                                                           catalog: old.catalog.clone(),
+                                                           status: CatalogStatus {
+                                                               generation: old.status.generation,
+                                                               failure: Some(
+                                                                   LocalizationError::GenerationOverflow,
+                                                               ),
+                                                           },
+                                                       },
+                                                   ),
+                                               }
+                                           }
+                                       }
+                                       Exit::Fail(error) => {
+                                           let status_error = error.clone();
+                                           (
+                                               Exit::Fail(error),
+                                               State {
+                                                   catalog: old.catalog.clone(),
+                                                   status: CatalogStatus {
+                                                       generation: old.status.generation,
+                                                       failure: Some(status_error),
+                                                   },
+                                               },
+                                           )
+                                       }
+                                       Exit::Die(defect) => (
+                                           Exit::Die(defect),
+                                           State {
+                                               catalog: old.catalog.clone(),
+                                               status: old.status.clone(),
+                                           },
+                                       ),
+                                       Exit::Interrupted => (
+                                           Exit::Interrupted,
+                                           State {
+                                               catalog: old.catalog.clone(),
+                                               status: old.status.clone(),
+                                           },
+                                       ),
+                                       Exit::FinalizationFailed(failure) => (
+                                           Exit::FinalizationFailed(failure),
+                                           State {
+                                               catalog: old.catalog.clone(),
+                                               status: old.status.clone(),
+                                           },
+                                       ),
+                                   }
+                               }, }
+                       },
+                       on_error: |_| LocalizationError::Admission,
+                   },
+        body: crate::restore_exit,
+        }
     }
     /// Read protected refresh status without exposing or cloning source/catalogue payloads.
     pub fn status(&self) -> Effect<CatalogStatus, LocalizationError, R> {
-        self.state.read().map(|state| state.status.clone())
+        effect_map! { program: self.state.read(), map: |state| state.status.clone(), }
     }
     /// Select native cultures and pin one exact immutable generation before the
     /// application's request environment projection. The extension stores a handle,
@@ -288,29 +297,24 @@ impl<C: Send + Sync + 'static, R: Send + Sync + 'static> CatalogRuntime<C, R> {
         let state = self.state.clone();
         let cultures = self.definition.cultures.clone();
         let missing = self.definition.missing;
-        (self.definition.select_by)(request).flat_map(move |selection| {
-            let selection = Arc::new(selection);
+        let selected = (self.definition.select_by)(request);
+        effect! {
+            let state = state.clone();
             let cultures = cultures.clone();
-            state.read().flat_map(move |state| {
-                if !cultures.contains(&selection.ui) || !cultures.contains(&selection.formatting) {
-                    return Effect::from_result_once(Err(LocalizationError::Definition(
-                        "selected cultures".into(),
-                    )));
-                }
-                let precedence = match cultures.precedence(&selection.ui) {
-                    Ok(precedence) => precedence,
-                    Err(error) => return Effect::from_result_once(Err(error)),
-                };
-                Effect::from_result_once(Ok(PinnedCatalog {
-                    catalog: state.catalog.clone(),
-                    generation: state.status.generation,
-                    selection: selection.clone(),
-                    precedence: precedence.into(),
-                    missing,
-                    marker: PhantomData,
-                }))
-            })
-        })
+            let selection = selected.clone()?;
+            let selection = Arc::new(selection);
+            let state = state.read()?;
+            let precedence = effect_try_sync! {
+                once; body: {
+                let __dsl_result = if !cultures.contains(&selection.ui)
+                || !cultures.contains(&selection.formatting) {
+                Err(LocalizationError::Definition("selected cultures".into()))
+            } else { cultures.precedence(&selection.ui) }; move || __dsl_result }, on_error: ::core::convert::identity, }?;
+            PinnedCatalog {
+                catalog: state.catalog.clone(), generation: state.status.generation,
+                selection, precedence: precedence.into(), missing, marker: PhantomData,
+            }
+        }
     }
 }
 /// Request-local exact generation and language selection. Clone shares immutable

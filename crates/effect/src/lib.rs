@@ -24,7 +24,7 @@
 //!    application dependencies. Tokio tasks and Rayon CPU work may coexist
 //!    in the same `R`; no provider is selected by the core.
 //! 4. Feature modules explain their own authorities and guarantees:
-//!    [`Schema`], [`persistence`], [`rpc`], [`reactivity`], [`mod@cluster`],
+//!    [`Codec`], [`persistence`], [`rpc`], [`reactivity`], [`mod@cluster`],
 //!    [`mod@workflow`], [`eventlog`], and [`transactional`].
 //!
 //! `Effect<A, E, R>` is a reusable recipe: `A` is its success value, `E` its
@@ -54,6 +54,18 @@ pub use effect_macros::{
     reactive_source, rpc_middleware, rpc_operation, rpc_protocol, rpc_stream_middleware,
     rpc_stream_operation, rpc_stream_protocol, service, singleton, span, stream, transaction,
     workflow, workflow_definition,
+};
+
+pub use effect_macros::{
+    codec, effect_all, effect_all_concurrent, effect_blocking, effect_cpu, effect_die,
+    effect_finalizer, effect_for_each, effect_for_each_concurrent, effect_from_option,
+    effect_future, effect_map, effect_map_error, effect_on_interrupt, effect_permit,
+    effect_provide_some, effect_provided, effect_race, effect_recover, effect_ref, effect_repeat,
+    effect_resource, effect_retry, effect_sandbox, effect_schema_parse, effect_scope,
+    effect_scope_acquire, effect_socket, effect_stream_for_each, effect_sync, effect_timeout,
+    effect_try_blocking, effect_try_cpu, effect_try_future, effect_try_sync,
+    effect_uninterruptible, effect_using, effect_with_layer, layer, pool, request_resolver,
+    schedule, sink, weak_cache,
 };
 
 mod admission;
@@ -177,6 +189,8 @@ pub use sink::Sink;
 /// Safe construction bridge for procedural macro expansion.
 #[doc(hidden)]
 pub mod __private {
+    use crate::effect_sync;
+
     pub use crate::Exit;
     pub use crate::internal::macro_future::{AsyncBindable, MacroContext, async_workflow};
     pub use crate::internal::scoped_body::ScopedBody;
@@ -184,6 +198,44 @@ pub mod __private {
         Bindable, Workflow, bind, defer, defer_callback0, defer_callback1, defer_callback2, once,
         reusable, success,
     };
+
+    /// Adapt an extracted pure two-input recipe to a delayed sync-once Effect.
+    /// Sharing applies only to the reusable callback; both invocation inputs move once.
+    pub fn sync_callback2<A, B, C, E, R>(
+        callback: impl Fn(A, B) -> C + Send + Sync + 'static,
+    ) -> impl Fn(A, B) -> crate::Effect<C, E, R> + Send + Sync
+    where
+        A: Send + 'static,
+        B: Send + 'static,
+        C: Send + 'static,
+        E: Send + 'static,
+        R: Send + Sync + 'static,
+    {
+        let callback = std::sync::Arc::new(callback);
+        move |a, b| {
+            let callback = std::sync::Arc::clone(&callback);
+            effect_sync! { once; body: move || callback(a, b), }
+        }
+    }
+
+    /// Fix the borrowed-primary factory boundary before a macro stores its callback.
+    /// Each invocation may inspect any outcome lifetime and returns owned cleanup.
+    pub fn primary_release<T, E, R, C>(
+        callback: impl for<'outcome> Fn(T, crate::PrimaryOutcomeRef<'outcome, E>) -> C
+        + Send
+        + Sync
+        + 'static,
+    ) -> impl for<'outcome> Fn(T, crate::PrimaryOutcomeRef<'outcome, E>) -> crate::Release<E, R>
+    + Send
+    + Sync
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        R: Send + Sync + 'static,
+        C: Into<crate::Release<E, R>>,
+    {
+        move |resource, primary| callback(resource, primary).into()
+    }
 
     /// Transfer a scoped body's cleanup to its canonical owned cleanup Effect.
     ///

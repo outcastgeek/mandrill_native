@@ -44,25 +44,32 @@ impl Layout {
     /// Attribute arguments are opaque to syn's visitor; parse invocation-shaped token triples.
     fn attribute_macros(&mut self, tokens: TokenStream) {
         let tokens = tokens.into_iter().collect::<Vec<_>>();
-        let mut index = 0;
-        while index < tokens.len() {
+        let mut remaining = tokens.as_slice();
+        while let Some((first, rest)) = remaining.split_first() {
             if let [
-                TokenTree::Ident(_),
+                TokenTree::Ident(name),
                 TokenTree::Punct(bang),
-                TokenTree::Group(_),
-                ..,
-            ] = &tokens[index..]
+                TokenTree::Group(group),
+                tail @ ..,
+            ] = remaining
                 && bang.as_char() == '!'
-                && let Ok(invocation) =
-                    syn::parse2::<syn::Macro>(tokens[index..index + 3].iter().cloned().collect())
+                && let Ok(invocation) = syn::parse2::<syn::Macro>(
+                    [
+                        TokenTree::Ident(name.clone()),
+                        TokenTree::Punct(bang.clone()),
+                        TokenTree::Group(group.clone()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )
             {
                 self.visit_macro(&invocation);
-                index += 3;
+                remaining = tail;
             } else {
-                if let TokenTree::Group(group) = &tokens[index] {
+                if let TokenTree::Group(group) = first {
                     self.attribute_macros(group.stream());
                 }
-                index += 1;
+                remaining = rest;
             }
         }
     }
@@ -149,13 +156,27 @@ fn rust_sources(directory: &Path) -> io::Result<Vec<PathBuf>> {
 
 /// Normal package tests enforce this layout rule across the core stories and their support.
 #[test]
-fn cafe_examples_follow_macro_layout() {
-    let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../effect/examples");
+fn cafe_examples_follow_macro_layout() -> Result<(), Box<dyn std::error::Error>> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut diagnostics = Vec::new();
-    for file in rust_sources(&examples).expect("read café example directory") {
-        let source = fs::read_to_string(&file).expect("read UTF-8 example source");
-        let violations =
-            audit(&source).unwrap_or_else(|error| panic!("{}: {error}", file.display()));
+    let directories = [
+        "effect",
+        "effect_sql",
+        "effect_server",
+        "effect_server_identity",
+        "effect_server_web",
+        "effect_otel",
+    ];
+    let mut sources = Vec::new();
+    for directory in directories {
+        sources.extend(rust_sources(
+            &root.join(format!("../{directory}/examples")),
+        )?);
+    }
+    for file in sources {
+        let source =
+            fs::read_to_string(&file).map_err(|error| format!("{}: {error}", file.display()))?;
+        let violations = audit(&source).map_err(|error| format!("{}: {error}", file.display()))?;
         diagnostics.extend(
             violations
                 .iter()
@@ -163,33 +184,36 @@ fn cafe_examples_follow_macro_layout() {
         );
     }
     assert!(diagnostics.is_empty(), "{}", diagnostics.join("\n"));
+    Ok(())
 }
 
 /// Qualified invocations, aliases and nested input braces are all checked with exact locations.
 #[test]
-fn rejects_multiline_opening_line_code() {
+fn rejects_multiline_opening_line_code() -> Result<(), Box<dyn std::error::Error>> {
     let source = "use cafe::recipe as order;\nfn visit() {\n    cafe::schema! { struct Order { customer: string(),\n        quantity: integer() }\n    };\n    order!({ first_step();\n        next_step(); });\n}";
-    let violations = audit(source).expect("parse invalid-layout source");
+    let violations = audit(source)?;
     assert_eq!(violations.len(), 3);
     let attribute = "#[describe(qualified::recipe! { item,\n    next })] fn visit() {}";
-    assert_eq!(audit(attribute).expect("parse attribute argument").len(), 1);
+    assert_eq!(audit(attribute)?.len(), 1);
+    let first = violations.first().ok_or("missing opening-line violation")?;
     assert_eq!(
-        violations[0].opening,
+        first.opening,
         LineColumn {
             line: 3,
             column: 18
         }
     );
     assert!(
-        violations[0]
+        first
             .diagnostic(Path::new("example.rs"))
             .starts_with("example.rs:3:19: macro layout:")
     );
+    Ok(())
 }
 
 /// Comments, doc comments and fake macro/bracing text inside raw strings are not code tokens.
 #[test]
-fn accepts_comments_literals_and_one_line_groups() {
+fn accepts_comments_literals_and_one_line_groups() -> syn::Result<()> {
     let source = r####"fn visit() {
     recipe! { value }
     recipe! { /* comment with { and } across
@@ -211,16 +235,14 @@ fn accepts_comments_literals_and_one_line_groups() {
     recipe! { /* comment only
     */ }
 }"####;
-    assert!(audit(source).expect("parse valid-layout source").is_empty());
+    assert!(audit(source)?.is_empty());
+    Ok(())
 }
 
 /// Correct multiline nested bodies and true one-line inner groups remain permitted.
 #[test]
-fn accepts_nested_macro_input_groups() {
+fn accepts_nested_macro_input_groups() -> syn::Result<()> {
     let source = "fn visit() { qualified::recipe!(\n    {\n        run |shop| {\n            nested! { shop.name() }\n        }\n    }\n); }";
-    assert!(
-        audit(source)
-            .expect("parse nested-layout source")
-            .is_empty()
-    );
+    assert!(audit(source)?.is_empty());
+    Ok(())
 }

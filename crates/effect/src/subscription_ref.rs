@@ -4,7 +4,8 @@ use crate::internal::runtime;
 use crate::pub_sub::{
     PubSub, PubSubError, PubSubOverflow, PubSubShutdown, PublishReport, Subscription,
 };
-use crate::{Chunk, Effect, Exit, Release, ResourceValue, Scope, Stream, StreamReader};
+use crate::{Chunk, Effect, Exit, ResourceValue, Scope, Stream, StreamReader};
+use crate::{effect_map, effect_scope_acquire, effect_sync};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
@@ -81,7 +82,7 @@ impl<A: Send + Sync + 'static> SubscriptionRef<A> {
         capacity: NonZeroUsize,
         overflow: PubSubOverflow,
     ) -> Effect<Self, PubSubError, R> {
-        Effect::sync(move || Self::new(initial(), capacity, overflow))
+        effect_sync! { body: move || Self::new(initial(), capacity, overflow), }
     }
 
     /// Clones only the shared handle. The stored payload is never cloned.
@@ -201,12 +202,14 @@ impl<A: Send + Sync + 'static> SubscriptionRef<A> {
         &self,
         scope: &Scope<PubSubError>,
     ) -> Effect<ResourceValue<SubscriptionSnapshot<A>>, PubSubError, R> {
-        scope.acquire(self.subscribe(), |snapshot| {
-            Release::sync(move || {
-                snapshot.subscription.close_now();
-                drop(snapshot);
-            })
-        })
+        effect_scope_acquire! {
+        scope: scope, acquire: self.subscribe(), release: |snapshot| {
+                    crate::Release::sync(move || {
+                        snapshot.subscription.close_now();
+                        drop(snapshot);
+                    })
+                },
+        }
     }
 
     /// The first stream element is the atomic subscription snapshot. Later
@@ -222,7 +225,7 @@ impl<A: Send + Sync + 'static> SubscriptionRef<A> {
     pub fn stream<R: Send + Sync + 'static>(&self) -> Stream<Arc<A>, PubSubError, R> {
         let reference = self.clone();
         Stream::new(move |scope| {
-            reference.subscribe_scoped(&scope).map(|resource| {
+            effect_map! { program: reference.subscribe_scoped(&scope), map: |resource| {
                 let initial =
                     Mutex::new(Some(resource.with(|snapshot| Arc::clone(&snapshot.value))));
                 StreamReader::new(Effect::new(move |env, context, finish| {
@@ -247,7 +250,7 @@ impl<A: Send + Sync + 'static> SubscriptionRef<A> {
                         Err(defect) => runtime::finish(finish, Exit::Die(defect)),
                     }
                 }))
-            })
+            }, }
         })
     }
 

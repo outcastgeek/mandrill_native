@@ -12,6 +12,7 @@ use crate::{
 use event_listener::Event;
 use futures_util::future::select;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::pin::pin;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -702,7 +703,7 @@ impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
             }
             match mode {
                 ObservationMode::Await => {
-                    let cancelled = std::pin::pin!(cancellation.cancelled());
+                    let cancelled = pin!(cancellation.cancelled());
                     let _ = select(changed, cancelled).await;
                 }
                 ObservationMode::Interrupt | ObservationMode::Owner => changed.await,

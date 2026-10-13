@@ -77,9 +77,12 @@ impl WorkerPool {
         let result = self
             .sender
             .as_ref()
-            .expect("live worker pool")
-            .try_send(work)
-            .map_err(|error| Defect::new(error.to_string()));
+            .ok_or_else(|| Defect::new("worker pool is closed"))
+            .and_then(|sender| {
+                sender
+                    .try_send(work)
+                    .map_err(|error| Defect::new(error.to_string()))
+            });
         if result.is_err() {
             *count -= 1;
             changed.notify_all();

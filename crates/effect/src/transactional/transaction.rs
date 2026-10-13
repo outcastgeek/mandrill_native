@@ -3,6 +3,7 @@
 use super::HasTransactionDomain;
 use super::internal::journal::{JournalError, TxJournal};
 use crate::internal::runtime::{self, Step};
+use crate::transaction;
 use crate::{Defect, Effect, Exit};
 use futures_util::FutureExt;
 use futures_util::future::{poll_fn, select};
@@ -179,7 +180,9 @@ impl<A: Send + 'static, E: Send + 'static> Transaction<A, E> {
     /// # Returns
     /// Type: `Self`.
     pub fn succeed_with(value: impl Fn() -> A + Send + Sync + 'static) -> Self {
-        Self::new(move |_| TxStep::Success(value()))
+        transaction! {
+            value()
+        }
     }
 
     /// Create a fresh expected transaction error when this description runs.
@@ -232,6 +235,31 @@ impl<A: Send + 'static, E: Send + 'static> Transaction<A, E> {
             TxStep::Retry => TxStep::Retry,
             TxStep::Conflict => TxStep::Conflict,
             TxStep::Invalid(error) => TxStep::Invalid(error),
+        })
+    }
+
+    /// Map expected journal-body errors while preserving retries, conflicts and
+    /// invalid-domain failures. Evaluation still occurs in the same journal attempt;
+    /// the callback cannot suspend or execute an Effect inside that attempt.
+    pub fn map_error<F: Send + 'static>(
+        self,
+        map: impl Fn(E) -> F + Send + Sync + 'static,
+    ) -> Transaction<A, F> {
+        Transaction::new(move |journal| match (self.evaluate)(journal) {
+            TxStep::Success(value) => TxStep::Success(value),
+            TxStep::Failure(error) => TxStep::Failure(map(error)),
+            TxStep::Retry => TxStep::Retry,
+            TxStep::Conflict => TxStep::Conflict,
+            TxStep::Invalid(error) => TxStep::Invalid(match error {
+                TransactionError::Domain(error) => TransactionError::Domain(map(error)),
+                TransactionError::MixedDomain => TransactionError::MixedDomain,
+                TransactionError::MissingCell => TransactionError::MissingCell,
+                TransactionError::WrongValueType => TransactionError::WrongValueType,
+                TransactionError::VersionExhausted => TransactionError::VersionExhausted,
+                TransactionError::ConflictLimit => TransactionError::ConflictLimit,
+                TransactionError::RetryWithoutReads => TransactionError::RetryWithoutReads,
+                TransactionError::Cancelled => TransactionError::Cancelled,
+            }),
         })
     }
 

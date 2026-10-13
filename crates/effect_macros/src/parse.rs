@@ -1,8 +1,55 @@
 //! Parsing of Effect macro control flow.
 
+use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
 use syn::visit::Visit;
-use syn::{Expr, Stmt};
+use syn::{Expr, Ident, Stmt, Token};
+
+/// Ordinary computation statements or an explicitly selected continuation factory.
+pub(crate) enum EffectInput {
+    /// Existing Effect statements and macro-local binding syntax.
+    Statements(Vec<Stmt>),
+    /// `bind;` selects a native reusable Effect-returning continuation.
+    Continuation(crate::domain_expand::Fields),
+    /// Native guard/body factories retain their lazy loop boundary.
+    WhileLoop(crate::domain_expand::Fields),
+}
+
+impl Parse for EffectInput {
+    /// Require named fields after the mode, preserving ordinary `bind;` statements.
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let mode = input.fork();
+        if mode.parse::<Ident>().is_ok_and(|name| name == "while_loop")
+            && mode.parse::<Token![;]>().is_ok()
+            && mode
+                .parse::<Ident>()
+                .is_ok_and(|name| name == "guard" || name == "body")
+            && mode.peek(Token![:])
+        {
+            input.parse::<Ident>()?;
+            input.parse::<Token![;]>()?;
+            return Ok(Self::WhileLoop(input.parse()?));
+        }
+        let fork = input.fork();
+        let continuation = if fork.parse::<Ident>().is_ok_and(|name| name == "bind")
+            && fork.parse::<Token![;]>().is_ok()
+        {
+            fork.parse::<Ident>().is_ok_and(|name| {
+                (name == "program" && fork.peek(Token![:]))
+                    || (name == "body" && (fork.peek(Token![:]) || fork.peek(Token![|])))
+            })
+        } else {
+            false
+        };
+        if continuation {
+            input.parse::<Ident>()?;
+            input.parse::<Token![;]>()?;
+            Ok(Self::Continuation(input.parse()?))
+        } else {
+            Ok(Self::Statements(syn::Block::parse_within(input)?))
+        }
+    }
+}
 
 /// Variants of unsupported syntax used by parse.
 enum UnsupportedSyntax {

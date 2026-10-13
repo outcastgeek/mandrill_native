@@ -1,3 +1,4 @@
+use effect::{effect_for_each_concurrent, effect_future, effect_ref};
 extern crate effect as fx;
 
 use effect::{
@@ -28,35 +29,33 @@ fn external_synchronization_uses_only_public_apis_and_non_clone_payloads() {
 // Existing finite regression deadline; never a library scheduling policy.
 const DEADLOCK_DEADLINE: Duration = Duration::from_secs(5);
 
-#[allow(clippy::panic)] // A missing success is a harness failure, not a fabricated payload.
-fn success<A, E>(outcome: Exit<A, E>) -> A {
+fn success<A, E>(outcome: Exit<A, E>) -> Result<A, String> {
     match outcome {
-        Exit::Success(value) => value,
+        Exit::Success(value) => Ok(value),
         Exit::Fail(_) | Exit::Die(_) | Exit::Interrupted | Exit::FinalizationFailed(_) => {
-            panic!("fixture expected success")
+            Err("fixture expected success".to_owned())
         }
     }
 }
 
-#[allow(clippy::panic)] // Explicit deadlock detection for callbacks that re-enter a gate.
 fn run<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static>(
     program: Effect<A, E, R>,
     env: Arc<R>,
-) -> Exit<A, E> {
+) -> Result<Exit<A, E>, String> {
     let (send, receive) = mpsc::channel();
     let driver = std::thread::spawn(move || {
         assert!(send.send(block_on(program.run(env))).is_ok());
     });
     let outcome = receive
         .recv_timeout(DEADLOCK_DEADLINE)
-        .unwrap_or_else(|error| panic!("synchronization operation did not settle: {error}"));
+        .map_err(|error| format!("synchronization operation did not settle: {error}"))?;
     assert!(driver.join().is_ok());
-    outcome
+    Ok(outcome)
 }
 
-#[allow(clippy::panic)] // Validate explicit fixture policy; the library takes checked bounds.
 fn limit(value: usize) -> NonZeroUsize {
-    NonZeroUsize::new(value).unwrap_or_else(|| panic!("fixture concurrency must be positive"))
+    assert!(value > 0, "fixture concurrency must be positive");
+    NonZeroUsize::MIN.saturating_add(value - 1)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,7 +93,7 @@ fn cleanup_outcome() -> Exit<Payload, Payload> {
 }
 
 #[test]
-fn deferred_first_completion_preserves_every_outcome_and_ordered_cleanup() {
+fn deferred_first_completion_preserves_every_outcome_and_ordered_cleanup() -> Result<(), String> {
     // Each terminal category from Facilities.fs, with additional ordered cleanup.
     for outcome in [
         success_outcome,
@@ -116,7 +115,7 @@ fn deferred_first_completion_preserves_every_outcome_and_ordered_cleanup() {
             block_on(deferred.complete(success_outcome()).run(Arc::new(()))),
             Exit::Success(false)
         );
-        let polled = success(block_on(deferred.poll_shared().run(Arc::new(()))));
+        let polled = success(block_on(deferred.poll_shared().run(Arc::new(()))))?;
         assert!(polled.is_some());
         if let Some(polled) = polled {
             assert_eq!(polled.with(|stored| assert_eq!(*stored, outcome())), Ok(()));
@@ -141,6 +140,7 @@ fn deferred_first_completion_preserves_every_outcome_and_ordered_cleanup() {
             Exit::Success(false)
         );
     }
+    Ok(())
 }
 
 #[test]
@@ -166,7 +166,8 @@ fn deferred_completion_recipe_moves_once_and_precancel_does_not_consume_it() {
 }
 
 #[test]
-fn cancelling_or_dropping_deferred_waiters_leaves_completion_and_other_waiters_intact() {
+fn cancelling_or_dropping_deferred_waiters_leaves_completion_and_other_waiters_intact()
+-> Result<(), String> {
     let deferred: Deferred<Payload, Payload> = Deferred::new();
     let env = Arc::new(tasks::Environment::default());
     let mut cancelled = Box::pin(deferred.await_value().run_cancellable(Arc::clone(&env)));
@@ -190,12 +191,12 @@ fn cancelling_or_dropping_deferred_waiters_leaves_completion_and_other_waiters_i
         ),
         Exit::Success(true)
     );
-    let observed = success(block_on(surviving));
+    let observed = success(block_on(surviving))?;
     assert_eq!(
         observed.with(|exit| assert_eq!(*exit, failure_outcome())),
         Ok(())
     );
-    let later = success(block_on(deferred.await_shared().run(Arc::new(()))));
+    let later = success(block_on(deferred.await_shared().run(Arc::new(()))))?;
     assert_eq!(
         later.with(|exit| assert_eq!(*exit, failure_outcome())),
         Ok(())
@@ -205,6 +206,7 @@ fn cancelling_or_dropping_deferred_waiters_leaves_completion_and_other_waiters_i
         block_on(deferred.await_value().run(Arc::new(()))),
         failure_outcome()
     );
+    Ok(())
 }
 
 struct Tracked {
@@ -218,7 +220,8 @@ impl Drop for Tracked {
 }
 
 #[test]
-fn shared_deferred_views_retain_identical_data_and_allow_later_unique_owned_transfer() {
+fn shared_deferred_views_retain_identical_data_and_allow_later_unique_owned_transfer()
+-> Result<(), String> {
     let drops = Arc::new(AtomicUsize::new(0));
     let deferred: Deferred<Tracked, Payload> = Deferred::new();
     assert_eq!(
@@ -232,8 +235,8 @@ fn shared_deferred_views_retain_identical_data_and_allow_later_unique_owned_tran
         ),
         Exit::Success(true)
     );
-    let first = success(block_on(deferred.await_shared().run(Arc::new(()))));
-    let second = success(block_on(deferred.await_shared().run(Arc::new(()))));
+    let first = success(block_on(deferred.await_shared().run(Arc::new(()))))?;
+    let second = success(block_on(deferred.await_shared().run(Arc::new(()))))?;
     let address = |exit: &Exit<Tracked, Payload>| match exit {
         Exit::Success(value) => Some(std::ptr::from_ref(value)),
         Exit::Fail(_) | Exit::Die(_) | Exit::Interrupted | Exit::FinalizationFailed(_) => None,
@@ -254,15 +257,17 @@ fn shared_deferred_views_retain_identical_data_and_allow_later_unique_owned_tran
     );
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     drop((first, second));
-    let owned = success(block_on(deferred.await_value().run(Arc::new(()))));
+    let owned = success(block_on(deferred.await_value().run(Arc::new(()))))?;
     assert_eq!(owned.value.get(), Marker::Value);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     drop(owned);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
+    Ok(())
 }
 
 #[test]
-fn shared_deferred_data_outlives_its_handle_without_retaining_an_environment() {
+fn shared_deferred_data_outlives_its_handle_without_retaining_an_environment() -> Result<(), String>
+{
     let drops = Arc::new(AtomicUsize::new(0));
     let deferred: Deferred<Tracked, Payload> = Deferred::new();
     assert_eq!(
@@ -278,7 +283,7 @@ fn shared_deferred_data_outlives_its_handle_without_retaining_an_environment() {
     );
     let environment = Arc::new(tasks::Environment::default());
     let weak_environment = Arc::downgrade(&environment);
-    let shared = success(block_on(deferred.await_shared().run(environment)));
+    let shared = success(block_on(deferred.await_shared().run(environment)))?;
     assert!(weak_environment.upgrade().is_none());
     drop(deferred);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
@@ -288,23 +293,23 @@ fn shared_deferred_data_outlives_its_handle_without_retaining_an_environment() {
     ));
     drop(shared);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
+    Ok(())
 }
 
 #[test]
-#[allow(clippy::panic)] // Intentional callback unwind proves the canonical data survives.
-fn deferred_factory_and_shared_inspection_panics_preserve_state() {
+fn deferred_factory_and_shared_inspection_panics_preserve_state() -> Result<(), String> {
     let deferred: Deferred<Payload, Payload> = Deferred::new();
     assert!(matches!(
-        block_on(deferred.complete_with(|| panic!("factory fixture")).run(Arc::new(()))),
+        block_on(deferred.complete_with(|| std::panic::resume_unwind(Box::new("factory fixture"))).run(Arc::new(()))),
         Exit::Die(defect) if defect.kind() == DefectKind::CallbackPanic
     ));
     assert_eq!(
         block_on(deferred.complete(failure_outcome()).run(Arc::new(()))),
         Exit::Success(true)
     );
-    let shared = success(block_on(deferred.await_shared().run(Arc::new(()))));
+    let shared = success(block_on(deferred.await_shared().run(Arc::new(()))))?;
     assert!(
-        matches!(shared.with::<()>(|_| panic!("inspection fixture")), Err(defect)
+        matches!(shared.with::<()>(|_| std::panic::resume_unwind(Box::new("inspection fixture"))), Err(defect)
         if defect.kind() == DefectKind::CallbackPanic)
     );
     assert_eq!(
@@ -316,6 +321,7 @@ fn deferred_factory_and_shared_inspection_panics_preserve_state() {
         block_on(deferred.await_value().run(Arc::new(()))),
         failure_outcome()
     );
+    Ok(())
 }
 
 struct CountWake(AtomicUsize);
@@ -329,7 +335,7 @@ impl Wake for CountWake {
 }
 
 #[test]
-fn completion_broadcast_wakes_every_registered_deferred_waiter() {
+fn completion_broadcast_wakes_every_registered_deferred_waiter() -> Result<(), String> {
     const WAITERS: usize = 32; // Explicit broadcast coverage, not queue capacity.
     let deferred: Deferred<Payload, Payload> = Deferred::new();
     let mut waiters = Vec::new();
@@ -353,12 +359,13 @@ fn completion_broadcast_wakes_every_registered_deferred_waiter() {
     );
     for (waiter, wake) in waiters {
         assert!(wake.0.load(Ordering::SeqCst) > 0);
-        let shared = success(block_on(waiter));
+        let shared = success(block_on(waiter))?;
         assert_eq!(
             shared.with(|exit| assert_eq!(*exit, success_outcome())),
             Ok(())
         );
     }
+    Ok(())
 }
 
 struct InspectWake {
@@ -384,7 +391,7 @@ impl Wake for InspectWake {
 }
 
 #[test]
-fn deferred_completion_invokes_wakers_after_releasing_its_gate() {
+fn deferred_completion_invokes_wakers_after_releasing_its_gate() -> Result<(), String> {
     let deferred: Deferred<Payload, Payload> = Deferred::new();
     let mut waiter = Box::pin(deferred.await_shared().run(Arc::new(())));
     suspension::suspended(waiter.as_mut());
@@ -400,15 +407,16 @@ fn deferred_completion_invokes_wakers_after_releasing_its_gate() {
             .is_pending()
     );
     assert_eq!(
-        run(deferred.complete(success_outcome()), Arc::new(())),
+        run(deferred.complete(success_outcome()), Arc::new(()))?,
         Exit::Success(true)
     );
     assert!(wake.inspected.load(Ordering::SeqCst));
-    let _ = success(block_on(waiter));
+    let _ = success(block_on(waiter))?;
+    Ok(())
 }
 
 #[test]
-fn competing_completions_commit_exactly_one_candidate() {
+fn competing_completions_commit_exactly_one_candidate() -> Result<(), String> {
     const PARTICIPANTS: usize = 2; // Two actual completion callbacks meet at the barrier.
     const ATTEMPTS: usize = 32; // Finite race coverage of the source first-write contract.
     for _ in 0..ATTEMPTS {
@@ -416,28 +424,26 @@ fn competing_completions_commit_exactly_one_candidate() {
         let barrier = Arc::new(Barrier::new(PARTICIPANTS));
         let env = Arc::new(tasks::Environment::default());
         let completing = deferred.clone();
-        let operations = Effect::for_each_concurrent(
-            limit(PARTICIPANTS),
-            vec![Marker::Value, Marker::Later],
-            move |marker| {
-                let marker = *marker;
-                let barrier = Arc::clone(&barrier);
-                completing.complete_with(move || {
-                    let _ = barrier.wait();
-                    Exit::Success(Payload(Cell::new(marker)))
-                })
-            },
-        );
-        let accepted = success(run(operations, Arc::clone(&env)));
+        let operations = effect_for_each_concurrent! { concurrency: limit(PARTICIPANTS), values: vec![Marker::Value, Marker::Later], body: move |marker| {
+            let marker = *marker;
+            let barrier = Arc::clone(&barrier);
+            completing.complete_with(move || {
+                let _ = barrier.wait();
+                Exit::Success(Payload(Cell::new(marker)))
+            })
+        }, };
+        let accepted = success(run(operations, Arc::clone(&env))?)?;
         assert_eq!(accepted.iter().filter(|accepted| **accepted).count(), 1);
-        let stored = success(block_on(deferred.await_value().run(Arc::new(()))));
+        let stored = success(block_on(deferred.await_value().run(Arc::new(()))))?;
         assert!(matches!(stored.0.get(), Marker::Value | Marker::Later));
         env.tasks.finish();
     }
+    Ok(())
 }
 
 #[test]
-fn synchronization_factories_are_lazy_and_produce_independent_state_per_run() {
+fn synchronization_factories_are_lazy_and_produce_independent_state_per_run() -> Result<(), String>
+{
     let factory_calls = Arc::new(AtomicUsize::new(0));
     let calls = Arc::clone(&factory_calls);
     let references: Effect<AtomicRef<Payload>, Payload> = AtomicRef::make_with(move || {
@@ -445,8 +451,8 @@ fn synchronization_factories_are_lazy_and_produce_independent_state_per_run() {
         Payload(Cell::new(Marker::Value))
     });
     assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
-    let first = success(block_on(references.clone().run(Arc::new(()))));
-    let second = success(block_on(references.run(Arc::new(()))));
+    let first = success(block_on(references.clone().run(Arc::new(()))))?;
+    let second = success(block_on(references.run(Arc::new(()))))?;
     assert_eq!(factory_calls.load(Ordering::SeqCst), 2);
     let update: Effect<(), Payload> = first.set_with(|| Payload(Cell::new(Marker::Later)));
     assert_eq!(block_on(update.run(Arc::new(()))), Exit::Success(()));
@@ -457,8 +463,8 @@ fn synchronization_factories_are_lazy_and_produce_independent_state_per_run() {
     );
 
     let deferreds: Effect<Deferred<Payload, Payload>, Payload> = Deferred::make();
-    let first = success(block_on(deferreds.clone().run(Arc::new(()))));
-    let second = success(block_on(deferreds.run(Arc::new(()))));
+    let first = success(block_on(deferreds.clone().run(Arc::new(()))))?;
+    let second = success(block_on(deferreds.run(Arc::new(()))))?;
     assert_eq!(
         block_on(first.complete(success_outcome()).run(Arc::new(()))),
         Exit::Success(true)
@@ -469,13 +475,14 @@ fn synchronization_factories_are_lazy_and_produce_independent_state_per_run() {
     ));
 
     let latches: Effect<Latch, Payload> = Latch::make();
-    let first = success(block_on(latches.clone().run(Arc::new(()))));
-    let second = success(block_on(latches.run(Arc::new(()))));
+    let first = success(block_on(latches.clone().run(Arc::new(()))))?;
+    let second = success(block_on(latches.run(Arc::new(()))))?;
     let opening: Effect<bool, Payload> = first.open();
     assert_eq!(block_on(opening.run(Arc::new(()))), Exit::Success(true));
     let waiting: Effect<(), Payload> = second.await_open();
     let mut waiting = Box::pin(waiting.run(Arc::new(())));
     suspension::suspended(waiting.as_mut());
+    Ok(())
 }
 
 #[test]
@@ -534,7 +541,8 @@ fn opening_broadcast_wakes_every_registered_latch_waiter() {
 }
 
 #[test]
-fn atomic_reference_preserves_non_clone_storage_during_borrowed_and_in_place_operations() {
+fn atomic_reference_preserves_non_clone_storage_during_borrowed_and_in_place_operations()
+-> Result<(), String> {
     struct Buffer(Vec<Marker>);
     let reference = AtomicRef::new(Buffer(vec![Marker::Value, Marker::Later]));
     let inspect: Effect<(usize, Option<Marker>, Option<Marker>), Payload> =
@@ -545,10 +553,11 @@ fn atomic_reference_preserves_non_clone_storage_during_borrowed_and_in_place_ope
                 buffer.0.last().copied(),
             )
         });
-    let before = success(block_on(inspect.clone().run(Arc::new(()))));
-    let mutation: Effect<(), Payload> = reference.modify_in_place(|buffer| buffer.0.reverse());
+    let before = success(block_on(inspect.clone().run(Arc::new(()))))?;
+    let mutation: Effect<(), Payload> =
+        effect_ref! { in_place; reference: reference, modify: |buffer| buffer.0.reverse(), };
     assert_eq!(block_on(mutation.run(Arc::new(()))), Exit::Success(()));
-    let after = success(block_on(inspect.run(Arc::new(()))));
+    let after = success(block_on(inspect.run(Arc::new(()))))?;
     assert_eq!(before.0, after.0);
     assert_eq!(
         (before.1, before.2),
@@ -559,34 +568,37 @@ fn atomic_reference_preserves_non_clone_storage_during_borrowed_and_in_place_ope
         (Some(Marker::Later), Some(Marker::Value))
     );
 
-    let modify: Effect<Payload, Payload> = reference.modify(|buffer| {
+    let modify: Effect<Payload, Payload> = effect_ref! { modify; reference: reference, modify: |buffer| {
         (
             Payload(Cell::new(Marker::Value)),
             Buffer(buffer.0.iter().rev().copied().collect()),
         )
-    });
+    }, };
     assert_eq!(block_on(modify.run(Arc::new(()))), success_outcome());
-    let replacement: Effect<(), Payload> = reference.update(|_| Buffer(Vec::new()));
+    let replacement: Effect<(), Payload> =
+        effect_ref! { update; reference: reference, update: |_| Buffer(Vec::new()), };
     assert_eq!(block_on(replacement.run(Arc::new(()))), Exit::Success(()));
     let empty: Effect<bool, Payload> = reference.with(|buffer| buffer.0.is_empty());
     assert_eq!(block_on(empty.run(Arc::new(()))), Exit::Success(true));
+    Ok(())
 }
 
 #[test]
-#[allow(clippy::panic)] // Intentional callback panics exercise each documented mutation contract.
 fn atomic_reference_callback_panics_release_the_gate_and_preserve_replacement_boundaries() {
     let reference = AtomicRef::new(Payload(Cell::new(Marker::Value)));
-    let inspection: Effect<(), Payload> = reference.with(|_| panic!("read fixture"));
+    let inspection: Effect<(), Payload> =
+        reference.with(|_| std::panic::resume_unwind(Box::new("read fixture")));
     assert!(
         matches!(block_on(inspection.run(Arc::new(()))), Exit::Die(defect)
         if defect.kind() == DefectKind::CallbackPanic)
     );
-    let replacement: Effect<(), Payload> = reference.update(|_| panic!("replacement fixture"));
+    let replacement: Effect<(), Payload> = effect_ref! { update; reference: reference, update: |_| std::panic::resume_unwind(Box::new("replacement fixture")), };
     assert!(
         matches!(block_on(replacement.run(Arc::new(()))), Exit::Die(defect)
         if defect.kind() == DefectKind::CallbackPanic)
     );
-    let factory: Effect<(), Payload> = reference.set_with(|| panic!("set factory fixture"));
+    let factory: Effect<(), Payload> =
+        reference.set_with(|| std::panic::resume_unwind(Box::new("set factory fixture")));
     assert!(
         matches!(block_on(factory.run(Arc::new(()))), Exit::Die(defect)
         if defect.kind() == DefectKind::CallbackPanic)
@@ -596,10 +608,10 @@ fn atomic_reference_callback_panics_release_the_gate_and_preserve_replacement_bo
         block_on(current.clone().run(Arc::new(()))),
         Exit::Success(Marker::Value)
     );
-    let in_place: Effect<(), Payload> = reference.modify_in_place(|value| {
+    let in_place: Effect<(), Payload> = effect_ref! { in_place; reference: reference, modify: |value| {
         value.0.set(Marker::Later);
-        panic!("in-place fixture")
-    });
+        std::panic::resume_unwind(Box::new("in-place fixture"))
+    }, };
     assert!(
         matches!(block_on(in_place.run(Arc::new(()))), Exit::Die(defect)
         if defect.kind() == DefectKind::CallbackPanic)
@@ -611,23 +623,24 @@ fn atomic_reference_callback_panics_release_the_gate_and_preserve_replacement_bo
 }
 
 #[test]
-fn atomic_reference_updates_are_atomic_across_independent_workers() {
+fn atomic_reference_updates_are_atomic_across_independent_workers() -> Result<(), String> {
     // Exact source Concurrency.fs workload, explicitly supplied fixture policy.
     const UPDATES: usize = 10_000;
     const WORKERS: usize = 16;
     struct Counter(Cell<usize>);
     let reference = AtomicRef::new(Counter(Cell::new(0)));
     let updating = reference.clone();
-    let workers = Effect::for_each_concurrent(limit(WORKERS), (0..UPDATES).collect(), move |_| {
-        updating.update(|counter| Counter(Cell::new(counter.0.get() + 1)))
-    });
+    let workers = effect_for_each_concurrent! { concurrency: limit(WORKERS), values: (0..UPDATES).collect(), body: move |_| {
+        effect_ref! { update; reference: updating, update: |counter| Counter(Cell::new(counter.0.get() + 1)), }
+    }, };
     let env = Arc::new(tasks::Environment::default());
-    let result: Exit<Vec<()>, Payload> = run(workers, Arc::clone(&env));
-    assert_eq!(success(result).len(), UPDATES);
+    let result: Exit<Vec<()>, Payload> = run(workers, Arc::clone(&env))?;
+    assert_eq!(success(result)?.len(), UPDATES);
     let current: Effect<usize, Payload> = reference.with(|counter| counter.0.get());
     assert_eq!(block_on(current.run(Arc::new(()))), Exit::Success(UPDATES));
     assert_eq!(env.tasks.submitted(), WORKERS);
     env.tasks.finish();
+    Ok(())
 }
 
 struct DropGate {
@@ -660,7 +673,7 @@ impl Drop for ReleaseGate {
 }
 
 #[test]
-fn replaced_reference_payloads_are_destroyed_outside_the_value_gate() {
+fn replaced_reference_payloads_are_destroyed_outside_the_value_gate() -> Result<(), String> {
     struct State {
         marker: Marker,
         _drop: Option<DropGate>,
@@ -684,13 +697,13 @@ fn replaced_reference_payloads_are_destroyed_outside_the_value_gate() {
         assert!(send.send(block_on(replacement.run(Arc::new(())))).is_ok());
     });
     // An explicit destructor entry signal, with an external harness deadline.
-    let entered_wait: Effect<(), Payload> = Effect::from_future(move |_| {
+    let entered_wait: Effect<(), Payload> = effect_future! { body: move |_| {
         let entered = entered.clone();
         async move { entered.cancelled().await }
-    });
-    assert_eq!(run(entered_wait, Arc::new(())), Exit::Success(()));
+    }, };
+    assert_eq!(run(entered_wait, Arc::new(()))?, Exit::Success(()));
     let inspect: Effect<Marker, Payload> = reference.with(|state| state.marker);
-    assert_eq!(run(inspect, Arc::new(())), Exit::Success(Marker::Later));
+    assert_eq!(run(inspect, Arc::new(()))?, Exit::Success(Marker::Later));
     assert!(receive.try_recv().is_err());
     drop(release);
     assert_eq!(
@@ -698,10 +711,11 @@ fn replaced_reference_payloads_are_destroyed_outside_the_value_gate() {
         Ok(Exit::Success(()))
     );
     assert!(driver.join().is_ok());
+    Ok(())
 }
 
 #[test]
-fn rejected_deferred_candidates_are_destroyed_outside_the_completion_gate() {
+fn rejected_deferred_candidates_are_destroyed_outside_the_completion_gate() -> Result<(), String> {
     struct State {
         marker: Marker,
         _drop: Option<DropGate>,
@@ -732,12 +746,12 @@ fn rejected_deferred_candidates_are_destroyed_outside_the_completion_gate() {
     let driver = std::thread::spawn(move || {
         assert!(send.send(block_on(rejected.run(Arc::new(())))).is_ok());
     });
-    let entered_wait: Effect<(), Payload> = Effect::from_future(move |_| {
+    let entered_wait: Effect<(), Payload> = effect_future! { body: move |_| {
         let entered = entered.clone();
         async move { entered.cancelled().await }
-    });
-    assert_eq!(run(entered_wait, Arc::new(())), Exit::Success(()));
-    let shared = success(run(deferred.await_shared(), Arc::new(())));
+    }, };
+    assert_eq!(run(entered_wait, Arc::new(()))?, Exit::Success(()));
+    let shared = success(run(deferred.await_shared(), Arc::new(()))?)?;
     assert_eq!(
         shared.with(|exit| match exit {
             Exit::Success(state) => Some(state.marker),
@@ -752,13 +766,14 @@ fn rejected_deferred_candidates_are_destroyed_outside_the_completion_gate() {
         Ok(Exit::Success(false))
     );
     assert!(driver.join().is_ok());
+    Ok(())
 }
 
 #[test]
-fn explicit_reference_copying_constructors_and_snapshots_remain_reusable() {
+fn explicit_reference_copying_constructors_and_snapshots_remain_reusable() -> Result<(), String> {
     let factory: Effect<AtomicRef<String>, Payload> = AtomicRef::make(String::from("initial"));
-    let first = success(block_on(factory.clone().run(Arc::new(()))));
-    let second = success(block_on(factory.run(Arc::new(()))));
+    let first = success(block_on(factory.clone().run(Arc::new(()))))?;
+    let second = success(block_on(factory.run(Arc::new(()))))?;
     let set: Effect<(), Payload> = first.set(String::from("next"));
     assert_eq!(block_on(set.clone().run(Arc::new(()))), Exit::Success(()));
     assert_eq!(block_on(set.run(Arc::new(()))), Exit::Success(()));
@@ -776,6 +791,7 @@ fn explicit_reference_copying_constructors_and_snapshots_remain_reusable() {
         block_on(untouched.run(Arc::new(()))),
         Exit::Success(String::from("initial"))
     );
+    Ok(())
 }
 
 #[test]
@@ -801,10 +817,10 @@ fn precancelled_synchronization_operations_start_no_callbacks_or_state_changes()
     let calls = Arc::new(AtomicUsize::new(0));
     let witness = Arc::clone(&calls);
     let reference = AtomicRef::new(Payload(Cell::new(Marker::Value)));
-    let mutation: Effect<(), Payload, Cancellation> = reference.update(move |_| {
+    let mutation: Effect<(), Payload, Cancellation> = effect_ref! { update; reference: reference, update: move |_| {
         let _ = witness.fetch_add(1, Ordering::SeqCst);
         Payload(Cell::new(Marker::Later))
-    });
+    }, };
     assert_eq!(
         block_on(mutation.run_cancellable(Arc::clone(&cancelled))),
         Exit::Interrupted
@@ -832,21 +848,20 @@ struct PanickingDrop {
     panic_on_drop: bool,
 }
 impl Drop for PanickingDrop {
-    #[allow(clippy::panic)] // Deliberate destruction unwind at the ordinary callback boundary.
     fn drop(&mut self) {
         if self.panic_on_drop {
-            panic!("destruction fixture");
+            std::panic::resume_unwind(Box::new("destruction fixture"));
         }
     }
 }
 
 #[test]
-fn destruction_panics_report_defects_without_reverting_committed_state() {
+fn destruction_panics_report_defects_without_reverting_committed_state() -> Result<(), String> {
     let reference = AtomicRef::new(PanickingDrop {
         marker: Marker::Value,
         panic_on_drop: true,
     });
-    let replacement: Effect<(), Payload> = reference.modify(|_| {
+    let replacement: Effect<(), Payload> = effect_ref! { modify; reference: reference, modify: |_| {
         (
             (),
             PanickingDrop {
@@ -854,7 +869,7 @@ fn destruction_panics_report_defects_without_reverting_committed_state() {
                 panic_on_drop: false,
             },
         )
-    });
+    }, };
     assert!(
         matches!(block_on(replacement.run(Arc::new(()))), Exit::Die(defect)
         if defect.kind() == DefectKind::CallbackPanic)
@@ -882,6 +897,7 @@ fn destruction_panics_report_defects_without_reverting_committed_state() {
         panic_on_drop: true,
     }).run(Arc::new(()))), Exit::Die(defect)
         if defect.kind() == DefectKind::CallbackPanic));
-    let retained = success(block_on(deferred.await_value().run(Arc::new(()))));
+    let retained = success(block_on(deferred.await_value().run(Arc::new(()))))?;
     assert_eq!(retained.marker, Marker::Value);
+    Ok(())
 }

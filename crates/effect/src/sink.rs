@@ -2,7 +2,8 @@
 
 use crate::internal::runtime;
 use crate::internal::workflow::{self, bind, success};
-use crate::{Chunk, Defect, Effect, Exit, LibraryDefect, Scope, Stream, StreamReader};
+use crate::{Chunk, Defect, Effect, Exit, LibraryDefect, Stream, StreamReader};
+use crate::{effect_die, effect_scope, effect_sync, sink};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
@@ -82,12 +83,14 @@ impl<A: Send + 'static, B: Send + 'static, E: Send + 'static, R: Send + Sync + '
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn run(&self, stream: Stream<A, E, R>) -> Effect<B, E, R> {
         let sink = self.clone();
-        Scope::scoped(move |scope| {
+        effect_scope! {
+            body |scope| {
             let sink = sink.clone();
-            stream
-                .open(scope)
-                .flat_map(move |reader| (sink.consume)(reader))
-        })
+            let stream = stream.clone();
+            let reader = stream.open(scope)?;
+            (sink.consume)(reader)?
+            },
+        }
     }
 
     #[must_use]
@@ -214,14 +217,18 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Sink<A, Vec
     /// # Returns
     /// Type: `Self`.
     pub fn collect(limit: Option<usize>) -> Self {
-        Self::fold(Vec::new, move |mut values, value| {
+        sink! {
+            fold_effect;
+            initial: Vec::new,
+            step: move |mut values, value| {
             if limit.is_some_and(|limit| values.len() >= limit) {
-                Effect::die(Defect::from(LibraryDefect::StreamCollectionLimitExceeded))
+                effect_die! { defect: Defect::from(LibraryDefect::StreamCollectionLimitExceeded), }
             } else {
                 values.push(value);
-                Effect::sync_once(move || values)
+                effect_sync! { once; body: move || values, }
             }
-        })
+            },
+        }
     }
 }
 

@@ -6,6 +6,7 @@ use crate::rpc::{
     RpcClientMiddlewareError,
 };
 use crate::{Effect, Stream};
+use crate::{effect, effect_map_error, effect_try_sync, reactive_query};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -173,7 +174,9 @@ where
         + 'static,
     ) -> Self {
         Self {
-            query: ReactiveQuery::new(registry, dependencies, call),
+            query: reactive_query! {
+            registry: registry, dependencies: dependencies, evaluate: call,
+            },
         }
     }
 
@@ -373,22 +376,28 @@ where
     {
         let registry = self.registry.clone();
         let affected = Arc::clone(&self.affected);
-        self.client
-            .call(request, call, metadata)
-            .map_error(RpcMutationError::Client)
-            .flat_map(move |value| {
-                let value = Mutex::new(Some(value));
-                registry
-                    .invalidate(affected.iter().cloned().collect())
-                    .map_error(RpcMutationError::CommittedWithoutInvalidation)
-                    .flat_map(move |_| {
-                        let value = value
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take();
-                        Effect::from_result_once(value.ok_or(RpcMutationError::InputConsumed))
-                    })
-            })
+        {
+            let __dsl_program = effect_map_error! {
+            program: self.client
+            .call(request, call, metadata), map: RpcMutationError::Client, };
+            effect! {
+                           let affected = affected.clone(); let registry = registry.clone(); let value = __dsl_program.clone()?; {
+                           let value = Mutex::new(Some(value));
+                           effect! {
+            bind;
+            program: effect_map_error! {
+                program: registry
+                               .invalidate(affected.iter().cloned().collect()), map: RpcMutationError::CommittedWithoutInvalidation, },
+            body: move |_| {
+                                   let value = value
+                                       .lock()
+                                       .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                       .take();
+                                   effect_try_sync! { once; body: { let __dsl_result = value.ok_or(RpcMutationError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, }
+                               },
+            }
+                       }? }
+        }
     }
 }
 
@@ -514,29 +523,35 @@ where
         let registry = self.registry.clone();
         let affected = Arc::clone(&self.affected);
         let client = self.client.clone();
-        self.client
-            .call_raw(request, call, metadata)
-            .map_error(RpcMiddlewareMutationError::Client)
-            .flat_map(move |response| {
-                let response = Mutex::new(Some(response));
-                let client = client.clone();
-                registry
-                    .invalidate(affected.iter().cloned().collect())
-                    .map_error(RpcMiddlewareMutationError::CommittedWithoutInvalidation)
-                    .flat_map(move |_| {
-                        let response = response
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take();
-                        match response {
-                            Some(response) => client.apply_after(response).map_error(
-                                RpcMiddlewareMutationError::CommittedWithMiddlewareFailure,
-                            ),
-                            None => Effect::from_result_once(Err(
-                                RpcMiddlewareMutationError::InputConsumed,
-                            )),
-                        }
-                    })
-            })
+        {
+            let __dsl_program = effect_map_error! {
+            program: self.client
+            .call_raw(request, call, metadata), map: RpcMiddlewareMutationError::Client, };
+            effect! {
+                           let affected = affected.clone(); let client = client.clone(); let registry = registry.clone(); let response = __dsl_program.clone()?; {
+                           let response = Mutex::new(Some(response));
+                           let client = client.clone();
+                           effect! {
+            bind;
+            program: effect_map_error! {
+                program: registry
+                               .invalidate(affected.iter().cloned().collect()), map: RpcMiddlewareMutationError::CommittedWithoutInvalidation, },
+            body: move |_| {
+                                   let response = response
+                                       .lock()
+                                       .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                       .take();
+                                   match response {
+                                       Some(response) => effect_map_error! { program: client.apply_after(response), map: RpcMiddlewareMutationError::CommittedWithMiddlewareFailure, },
+                                       None => effect_try_sync! {
+                                           once; body: {
+                                           let __dsl_result = Err(
+                                           RpcMiddlewareMutationError::InputConsumed,
+                                       ); move || __dsl_result }, on_error: ::core::convert::identity, },
+                                   }
+                               },
+            }
+                       }? }
+        }
     }
 }

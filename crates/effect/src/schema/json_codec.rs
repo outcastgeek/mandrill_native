@@ -4,6 +4,7 @@ use super::{
     Decimal, IssueSegment, JsonValue, PrimitiveShape, PureCodec, SchemaAst, SchemaIssue,
     SchemaIssueKind, SchemaShape, StringPattern, ValueKind,
 };
+use crate::codec;
 use crate::duration::UtcMillis;
 use crate::primary_key::{KeyDomain, StableKey};
 use std::sync::Arc;
@@ -51,17 +52,13 @@ fn mismatch(expected: ValueKind, value: &JsonValue) -> SchemaIssue {
 /// Decode JSON null as unit and encode unit as null, with independent validation and direct writing.
 #[must_use]
 pub fn json_null() -> PureCodec<(), JsonValue> {
-    PureCodec::with_ast(
-        SchemaAst::primitive(PrimitiveShape::Null),
-        |value| {
-            if matches!(value, JsonValue::Null) {
-                Ok(())
-            } else {
-                Err(mismatch(ValueKind::Null, value))
-            }
-        },
-        |_| Ok(JsonValue::Null),
-    )
+    codec! { pure; ast: SchemaAst::primitive(PrimitiveShape::Null), decode: |value| {
+        if matches!(value, JsonValue::Null) {
+            Ok(())
+        } else {
+            Err(mismatch(ValueKind::Null, value))
+        }
+    }, encode: |_| Ok(JsonValue::Null), }
     .with_type_validator(|_| Ok(()))
     .with_writer(|_, writer| writer.null())
 }
@@ -69,17 +66,13 @@ pub fn json_null() -> PureCodec<(), JsonValue> {
 /// A boolean codec with independent borrowed validation, direct writing and semantic equality.
 #[must_use]
 pub fn json_bool() -> PureCodec<bool, JsonValue> {
-    PureCodec::with_ast(
-        SchemaAst::primitive(PrimitiveShape::Boolean),
-        |value| {
-            if let JsonValue::Bool(boolean) = value {
-                Ok(*boolean)
-            } else {
-                Err(mismatch(ValueKind::Boolean, value))
-            }
-        },
-        |value| Ok(JsonValue::Bool(*value)),
-    )
+    codec! { pure; ast: SchemaAst::primitive(PrimitiveShape::Boolean), decode: |value| {
+        if let JsonValue::Bool(boolean) = value {
+            Ok(*boolean)
+        } else {
+            Err(mismatch(ValueKind::Boolean, value))
+        }
+    }, encode: |value| Ok(JsonValue::Bool(*value)), }
     .with_type_validator(|_| Ok(()))
     .with_writer(|value, writer| writer.boolean(*value))
     .with_equivalence(|left, right| left == right)
@@ -246,24 +239,20 @@ pub fn json_u64() -> PureCodec<u64, JsonValue> {
 #[must_use]
 pub fn json_f64() -> PureCodec<f64, JsonValue> {
     let has_writer = true;
-    let codec = PureCodec::with_ast(
-        SchemaAst::primitive(PrimitiveShape::Number),
-        |value| {
-            if let JsonValue::Number(number) = value {
-                number
-                    .as_f64()
-                    .filter(|number| number.is_finite())
-                    .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::OutOfRange))
-            } else {
-                Err(mismatch(ValueKind::Number, value))
-            }
-        },
-        |value| {
-            serde_json::Number::from_f64(*value)
-                .map(JsonValue::Number)
-                .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::NonFinite))
-        },
-    );
+    let codec = codec! { pure; ast: SchemaAst::primitive(PrimitiveShape::Number), decode: |value| {
+        if let JsonValue::Number(number) = value {
+            number
+                .as_f64()
+                .filter(|number| number.is_finite())
+                .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::OutOfRange))
+        } else {
+            Err(mismatch(ValueKind::Number, value))
+        }
+    }, encode: |value| {
+        serde_json::Number::from_f64(*value)
+            .map(JsonValue::Number)
+            .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::NonFinite))
+    }, };
     let codec = codec.with_type_validator(|value: &f64| {
         if value.is_finite() {
             Ok(())
@@ -286,25 +275,21 @@ pub fn json_f64() -> PureCodec<f64, JsonValue> {
 #[must_use]
 pub fn json_decimal() -> PureCodec<Decimal, JsonValue> {
     let has_writer = true;
-    let codec = PureCodec::with_ast(
-        SchemaAst::new(SchemaShape::Checked {
-            source: SchemaAst::primitive(PrimitiveShape::String),
-            name: Arc::from(DECIMAL_SYNTAX),
+    let codec = codec! { pure; ast: SchemaAst::new(SchemaShape::Checked {
+        source: SchemaAst::primitive(PrimitiveShape::String),
+        name: Arc::from(DECIMAL_SYNTAX),
+    }), decode: |encoded| match encoded {
+        JsonValue::String(text) => Decimal::parse(text).map_err(|_| {
+            SchemaIssue::new(SchemaIssueKind::InvalidValue {
+                code: Arc::from(DECIMAL_SYNTAX),
+            })
         }),
-        |encoded| match encoded {
-            JsonValue::String(text) => Decimal::parse(text).map_err(|_| {
-                SchemaIssue::new(SchemaIssueKind::InvalidValue {
-                    code: Arc::from(DECIMAL_SYNTAX),
-                })
-            }),
-            JsonValue::Null
-            | JsonValue::Bool(_)
-            | JsonValue::Number(_)
-            | JsonValue::Array(_)
-            | JsonValue::Object(_) => Err(mismatch(ValueKind::String, encoded)),
-        },
-        |value| Ok(JsonValue::String(value.as_str().to_owned())),
-    );
+        JsonValue::Null
+        | JsonValue::Bool(_)
+        | JsonValue::Number(_)
+        | JsonValue::Array(_)
+        | JsonValue::Object(_) => Err(mismatch(ValueKind::String, encoded)),
+    }, encode: |value| Ok(JsonValue::String(value.as_str().to_owned())), };
     let codec = codec.with_type_validator(|_: &Decimal| Ok(()));
     if has_writer {
         codec.with_writer(|value: &Decimal, writer| writer.string(value.as_str()))
@@ -318,11 +303,7 @@ pub fn json_decimal() -> PureCodec<Decimal, JsonValue> {
 pub fn json_utc_millis() -> PureCodec<UtcMillis, JsonValue> {
     let integer = json_i64();
     let has_writer = true;
-    let codec = PureCodec::with_ast(
-        integer.ast().clone(),
-        move |encoded| integer.decode_ref(encoded).map(UtcMillis::new),
-        |value| Ok(JsonValue::Number(serde_json::Number::from(value.value()))),
-    );
+    let codec = codec! { pure; ast: integer.ast().clone(), decode: move |encoded| integer.decode_ref(encoded).map(UtcMillis::new), encode: |value| Ok(JsonValue::Number(serde_json::Number::from(value.value()))), };
     let codec = codec.with_type_validator(|_: &UtcMillis| Ok(()));
     if has_writer {
         codec.with_writer(|value: &UtcMillis, writer| writer.i64(value.value()))
@@ -338,29 +319,25 @@ pub fn json_utc_millis() -> PureCodec<UtcMillis, JsonValue> {
 #[must_use]
 pub fn json_stable_key<D: KeyDomain>() -> PureCodec<StableKey<D>, JsonValue> {
     let bytes = json_bytes(None);
-    PureCodec::with_ast(
-        SchemaAst::new(SchemaShape::Checked {
-            source: bytes.ast().clone(),
-            name: Arc::from(STABLE_KEY_ENCODING),
-        }),
-        move |encoded| {
-            let encoded = bytes.decode_ref(encoded)?;
-            StableKey::from_encoded(Arc::from(encoded)).map_err(|_| {
-                SchemaIssue::new(SchemaIssueKind::InvalidValue {
-                    code: Arc::from(STABLE_KEY_ENCODING),
-                })
+    codec! { pure; ast: SchemaAst::new(SchemaShape::Checked {
+        source: bytes.ast().clone(),
+        name: Arc::from(STABLE_KEY_ENCODING),
+    }), decode: move |encoded| {
+        let encoded = bytes.decode_ref(encoded)?;
+        StableKey::from_encoded(Arc::from(encoded)).map_err(|_| {
+            SchemaIssue::new(SchemaIssueKind::InvalidValue {
+                code: Arc::from(STABLE_KEY_ENCODING),
             })
-        },
-        |value| {
-            Ok(JsonValue::Array(
-                value
-                    .as_bytes()
-                    .iter()
-                    .map(|byte| JsonValue::Number(serde_json::Number::from(u64::from(*byte))))
-                    .collect(),
-            ))
-        },
-    )
+        })
+    }, encode: |value| {
+        Ok(JsonValue::Array(
+            value
+                .as_bytes()
+                .iter()
+                .map(|byte| JsonValue::Number(serde_json::Number::from(u64::from(*byte))))
+                .collect(),
+        ))
+    }, }
     .with_type_validator(|_: &StableKey<D>| Ok(()))
     .with_writer(|value: &StableKey<D>, writer| {
         writer.begin_array()?;
@@ -735,17 +712,13 @@ pub fn json_literal(value: Arc<JsonValue>) -> PureCodec<(), JsonValue> {
     let decode = Arc::clone(&value);
     let write = Arc::clone(&value);
     let has_writer = true;
-    let codec = PureCodec::with_ast(
-        ast,
-        move |input| {
-            if input == decode.as_ref() {
-                Ok(())
-            } else {
-                Err(SchemaIssue::new(SchemaIssueKind::LiteralMismatch))
-            }
-        },
-        move |_| Ok(value.as_ref().clone()),
-    );
+    let codec = codec! { pure; ast: ast, decode: move |input| {
+        if input == decode.as_ref() {
+            Ok(())
+        } else {
+            Err(SchemaIssue::new(SchemaIssueKind::LiteralMismatch))
+        }
+    }, encode: move |_| Ok(value.as_ref().clone()), };
     let codec = codec.with_type_validator(|_| Ok(()));
     if has_writer {
         codec.with_writer(move |_, writer| writer.tree(&write))

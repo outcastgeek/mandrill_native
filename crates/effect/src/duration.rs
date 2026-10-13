@@ -1,5 +1,6 @@
 //! Typed wall-clock instants, deadlines, and elapsed durations.
 
+use crate::effect_sync;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{
     Arc,
@@ -317,7 +318,7 @@ impl WallClock for TestWallClock {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn now(&self) -> Effect<UtcMillis, Self::Error> {
         let millis = Arc::clone(&self.millis);
-        Effect::sync(move || UtcMillis::new(millis.load(Ordering::Acquire)))
+        effect_sync! { body: move || UtcMillis::new(millis.load(Ordering::Acquire)), }
     }
 }
 

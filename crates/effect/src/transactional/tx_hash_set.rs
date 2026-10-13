@@ -1,6 +1,7 @@
 //! Transactional set membership.
 
 use super::{Transaction, TransactionDomain, TransactionDomainError, TxRef, TxValue};
+use crate::transaction;
 use std::collections::HashSet;
 use std::hash::Hash;
 use std::sync::Arc;
@@ -51,9 +52,12 @@ impl<T: TxValue + Eq + Hash> TxHashSet<T> {
     /// # Returns
     /// Type: `Transaction<bool, E>`.
     pub fn contains<E: Send + 'static>(&self, value: Arc<T>) -> Transaction<bool, E> {
-        self.cell
-            .read()
-            .map(move |set| set.contains(value.as_ref()))
+        {
+            let __dsl_transaction = self.cell.read();
+            transaction! {
+            let set = __dsl_transaction.clone()?; set.contains(value.as_ref())
+            }
+        }
     }
 
     /// Insert the selected value under the collection’s identity rules.
@@ -68,11 +72,13 @@ impl<T: TxValue + Eq + Hash> TxHashSet<T> {
     /// # Returns
     /// Type: `Transaction<bool, E>`.
     pub fn insert<E: Send + 'static>(&self, value: Arc<T>) -> Transaction<bool, E> {
-        self.cell.update(move |set| {
-            let mut next = set.clone();
-            let inserted = next.insert(Arc::clone(&value));
-            Ok((next, inserted))
-        })
+        transaction! {
+        modify; reference: self.cell, modify: move |set| {
+                    let mut next = set.clone();
+                    let inserted = next.insert(Arc::clone(&value));
+                    Ok((next, inserted))
+                },
+        }
     }
 
     /// Remove the selected entry through this collection or store contract.
@@ -87,10 +93,12 @@ impl<T: TxValue + Eq + Hash> TxHashSet<T> {
     /// # Returns
     /// Type: `Transaction<bool, E>`.
     pub fn remove<E: Send + 'static>(&self, value: Arc<T>) -> Transaction<bool, E> {
-        self.cell.update(move |set| {
-            let mut next = set.clone();
-            let removed = next.remove(value.as_ref());
-            Ok((next, removed))
-        })
+        transaction! {
+        modify; reference: self.cell, modify: move |set| {
+                    let mut next = set.clone();
+                    let removed = next.remove(value.as_ref());
+                    Ok((next, removed))
+                },
+        }
     }
 }

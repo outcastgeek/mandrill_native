@@ -15,14 +15,14 @@ use std::{
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 struct Directory(PathBuf);
 impl Directory {
-    fn new() -> Self {
+    fn new() -> Result<Self, String> {
         let path = std::env::temp_dir().join(format!(
             "effect-app-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::SeqCst)
         ));
-        std::fs::create_dir(&path).unwrap_or_else(fixture_failure);
-        Self(path)
+        std::fs::create_dir(&path).map_err(|error| format!("fixture failed: {error:?}"))?;
+        Ok(Self(path))
     }
 }
 impl Drop for Directory {
@@ -30,14 +30,11 @@ impl Drop for Directory {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
-#[allow(clippy::panic)]
-fn fixture_failure<T>(error: impl std::fmt::Debug) -> T {
-    panic!("fixture failed: {error:?}")
-}
 fn nz(value: usize) -> NonZeroUsize {
-    NonZeroUsize::new(value).unwrap_or_else(|| fixture_failure(value))
+    assert!(value > 0, "fixture capacity must be positive");
+    NonZeroUsize::MIN.saturating_add(value - 1)
 }
-fn app(directory: &Directory) -> LiveApp {
+fn app(directory: &Directory) -> Result<LiveApp, String> {
     LiveApp::new(AppConfig {
         files: Files {
             input: directory.0.join("input.json"),
@@ -58,7 +55,7 @@ fn app(directory: &Directory) -> LiveApp {
         retry_delay: Duration::ZERO,
         log_level: LogLevel::Error,
     })
-    .unwrap_or_else(fixture_failure)
+    .map_err(|error| format!("fixture failed: {error:?}"))
 }
 fn run(app: &LiveApp) -> Exit<effect_app::Report, effect::SharedValue<AppError>> {
     app.runtime.block_on(async {
@@ -68,16 +65,18 @@ fn run(app: &LiveApp) -> Exit<effect_app::Report, effect::SharedValue<AppError>>
     })
 }
 #[test]
-fn actual_file_application_commits_result_and_telemetry_failure_preserves_success() {
-    let directory = Directory::new();
-    let mut app = app(&directory);
-    std::fs::write(&app.env.files.input, r#"{"samples":[1,2,3]}"#).unwrap_or_else(fixture_failure);
+fn actual_file_application_commits_result_and_telemetry_failure_preserves_success()
+-> Result<(), String> {
+    let directory = Directory::new()?;
+    let mut app = app(&directory)?;
+    std::fs::write(&app.env.files.input, r#"{"samples":[1,2,3]}"#)
+        .map_err(|error| format!("fixture failed: {error:?}"))?;
     let diagnostics = Diagnostics::new(
         DiagnosticCapacity::Unbounded,
         DiagnosticOverflow::DiscardOldest,
     );
     Arc::get_mut(&mut app.env)
-        .unwrap_or_else(|| fixture_failure("unique environment"))
+        .ok_or("unique environment")?
         .logger = Logger::new(
         LogLevel::Debug,
         diagnostics.clone(),
@@ -85,7 +84,7 @@ fn actual_file_application_commits_result_and_telemetry_failure_preserves_succes
         |_| Err(Defect::from(LibraryDefect::ProviderClosed)),
     );
     Arc::get_mut(&mut app.env)
-        .unwrap_or_else(|| fixture_failure("unique environment"))
+        .ok_or("unique environment")?
         .tracer = effect::Tracer::new(
         diagnostics.clone(),
         |annotations| Ok(annotations.clone()),
@@ -95,7 +94,8 @@ fn actual_file_application_commits_result_and_telemetry_failure_preserves_succes
     let outcome = run(&app);
     assert!(matches!(outcome,Exit::Success(report) if report.sum==6));
     assert_eq!(
-        std::fs::read_to_string(&app.env.files.output).unwrap_or_else(fixture_failure),
+        std::fs::read_to_string(&app.env.files.output)
+            .map_err(|error| format!("fixture failed: {error:?}"))?,
         "6\n"
     );
     assert!(!app.env.files.staging.exists());
@@ -108,31 +108,35 @@ fn actual_file_application_commits_result_and_telemetry_failure_preserves_succes
         Exit::Success(())
     ));
     assert_eq!(diagnostics.drain().len(), 2);
+    Ok(())
 }
 #[test]
-fn malformed_domain_input_exhausted_io_and_precancellation_start_no_commit() {
+fn malformed_domain_input_exhausted_io_and_precancellation_start_no_commit() -> Result<(), String> {
     for text in [Some("{"), Some(r#"{"samples":[]}"#), None] {
-        let directory = Directory::new();
-        let app = app(&directory);
+        let directory = Directory::new()?;
+        let app = app(&directory)?;
         if let Some(text) = text {
-            std::fs::write(&app.env.files.input, text).unwrap_or_else(fixture_failure);
+            std::fs::write(&app.env.files.input, text)
+                .map_err(|error| format!("fixture failed: {error:?}"))?;
         }
         let outcome = run(&app);
         assert!(matches!(outcome, Exit::Fail(_)));
         assert!(!app.env.files.output.exists());
         assert!(!app.env.files.staging.exists());
     }
-    let directory = Directory::new();
-    let app = app(&directory);
+    let directory = Directory::new()?;
+    let app = app(&directory)?;
     assert!(app.env.cancellation.request());
     assert!(matches!(run(&app), Exit::Interrupted));
     assert!(!app.env.files.output.exists());
+    Ok(())
 }
 #[test]
-fn provider_child_failure_is_reported_and_every_cleanup_detail_is_rendered() {
-    let directory = Directory::new();
-    let app = app(&directory);
-    std::fs::write(&app.env.files.input, r#"{"samples":[1]}"#).unwrap_or_else(fixture_failure);
+fn provider_child_failure_is_reported_and_every_cleanup_detail_is_rendered() -> Result<(), String> {
+    let directory = Directory::new()?;
+    let app = app(&directory)?;
+    std::fs::write(&app.env.files.input, r#"{"samples":[1]}"#)
+        .map_err(|error| format!("fixture failed: {error:?}"))?;
     app.runtime.block_on(app.env.cpu.stop().wait());
     let outcome = run(&app);
     assert!(
@@ -157,4 +161,5 @@ fn provider_child_failure_is_reported_and_every_cleanup_detail_is_rendered() {
             && rendered.contains("EmptySamples")
             && rendered.contains("Interrupted")
     );
+    Ok(())
 }

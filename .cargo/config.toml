@@ -1,0 +1,3 @@
+[build]
+# Bootstrap once with the Rust-only command in tools/effect-dsl-lints/README.md.
+rustc-wrapper = "tools/effect-dsl-lints/target/debug/effect-dsl-lint"

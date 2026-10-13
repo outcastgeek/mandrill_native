@@ -1,6 +1,7 @@
 //! Transactional FIFO enqueue and dequeue.
 
 use super::{Transaction, TransactionDomain, TransactionDomainError, TxRef, TxValue};
+use crate::transaction;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -50,11 +51,13 @@ impl<T: TxValue> TxQueue<T> {
     /// # Returns
     /// Type: `Transaction<(), E>`.
     pub fn offer<E: Send + 'static>(&self, value: Arc<T>) -> Transaction<(), E> {
-        self.cell.update(move |queue| {
-            let mut next = queue.clone();
-            next.push_back(Arc::clone(&value));
-            Ok((next, ()))
-        })
+        transaction! {
+        modify; reference: self.cell, modify: move |queue| {
+                    let mut next = queue.clone();
+                    next.push_back(Arc::clone(&value));
+                    Ok((next, ()))
+                },
+        }
     }
 
     #[must_use]
@@ -68,16 +71,23 @@ impl<T: TxValue> TxQueue<T> {
     /// Type: `Transaction<Arc<T>, E>`.
     pub fn take<E: Send + 'static>(&self) -> Transaction<Arc<T>, E> {
         let cell = self.cell.clone();
-        self.cell.read().flat_map(move |queue| {
-            let mut next = queue.as_ref().clone();
-            match next.pop_front() {
-                Some(value) => cell.write(Arc::new(next)).flat_map(move |()| {
-                    let value = Arc::clone(&value);
-                    Transaction::succeed_with(move || Arc::clone(&value))
-                }),
-                None => Transaction::retry(),
+        {
+            let __dsl_transaction = self.cell.read();
+            transaction! {
+            let queue = __dsl_transaction.clone()?; {
+                        let mut next = queue.as_ref().clone();
+                        match next.pop_front() {
+                            Some(value) => { let __dsl_transaction = cell.write(Arc::new(next)); transaction! {
+            let () = __dsl_transaction.clone()?; {
+                                let value = Arc::clone(&value);
+                                Transaction::succeed_with(move || Arc::clone(&value))
+                            }?
+            } },
+                            None => Transaction::retry(),
+                        }
+                    }?
             }
-        })
+        }
     }
 
     #[must_use]
@@ -90,6 +100,11 @@ impl<T: TxValue> TxQueue<T> {
     /// # Returns
     /// Type: `Transaction<usize, E>`.
     pub fn len<E: Send + 'static>(&self) -> Transaction<usize, E> {
-        self.cell.read().map(|queue| queue.len())
+        {
+            let __dsl_transaction = self.cell.read();
+            transaction! {
+            let queue = __dsl_transaction.clone()?; queue.len()
+            }
+        }
     }
 }

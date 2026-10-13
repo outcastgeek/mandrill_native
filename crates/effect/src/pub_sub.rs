@@ -3,13 +3,15 @@
 use crate::internal::notification::notify_all;
 use crate::internal::runtime::{self, Step};
 use crate::{
-    Cancellation, Chunk, Defect, Effect, Exit, Release, ResourceValue, Scope, Stream, StreamReader,
+    Cancellation, Chunk, Defect, Effect, Exit, ResourceValue, Scope, Stream, StreamReader,
 };
+use crate::{effect, effect_die, effect_map, effect_scope_acquire, effect_sync, effect_try_sync};
 use event_listener::Event;
 use futures_util::{FutureExt, future::select};
 use std::collections::{BTreeMap, VecDeque};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::pin::pin;
 use std::sync::{Arc, Mutex};
 
 /// A bounded subscriber's response to a full buffer.
@@ -247,7 +249,7 @@ impl<A: Send + Sync + 'static> PubSub<A> {
     /// Type: `Effect<Self, PubSubError, R>`.
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn make<R: Send + Sync + 'static>(options: PubSubOptions) -> Effect<Self, PubSubError, R> {
-        Effect::try_sync(move || Self::new(options), |error| error)
+        effect_try_sync! { body: move || Self::new(options), on_error: |error| error, }
     }
 
     /// A fresh subscription is registered on each execution. Replay history
@@ -284,12 +286,14 @@ impl<A: Send + Sync + 'static> PubSub<A> {
         &self,
         scope: &Scope<PubSubError>,
     ) -> Effect<ResourceValue<Subscription<A>>, PubSubError, R> {
-        scope.acquire(self.subscribe(), |subscription| {
-            Release::sync(move || {
-                subscription.close_now();
-                drop(subscription);
-            })
-        })
+        effect_scope_acquire! {
+        scope: scope, acquire: self.subscribe(), release: |subscription| {
+                    crate::Release::sync(move || {
+                        subscription.close_now();
+                        drop(subscription);
+                    })
+                },
+        }
     }
 
     /// Convert one scoped subscription into a stream. A loss notification is
@@ -305,14 +309,14 @@ impl<A: Send + Sync + 'static> PubSub<A> {
     pub fn stream<R: Send + Sync + 'static>(&self) -> Stream<Arc<A>, PubSubError, R> {
         let hub = self.clone();
         Stream::new(move |scope| {
-            hub.subscribe_scoped(&scope).map(|resource| {
-                StreamReader::new(Effect::defer(move || {
+            effect_map! { program: hub.subscribe_scoped(&scope), map: |resource| {
+                StreamReader::new({ let __dsl_factory = move || {
                     match resource.with(|subscription| subscription.pull_chunk::<R>()) {
                         Ok(next) => next,
-                        Err(defect) => Effect::die(defect),
+                        Err(defect) => effect_die! { defect: defect, },
                     }
-                }))
-            })
+                }; effect! { __dsl_factory()? } })
+            }, }
         })
     }
 
@@ -742,8 +746,8 @@ impl<A: Send + Sync + 'static> Inner<A> {
             };
             match attempt {
                 PublishAttempt::Wait => {
-                    let changed = std::pin::pin!(changed);
-                    let cancelled = std::pin::pin!(cancellation.cancelled());
+                    let changed = pin!(changed);
+                    let cancelled = pin!(cancellation.cancelled());
                     let _ = select(changed, cancelled).await;
                 }
                 PublishAttempt::Complete(report, discarded, notifications) => {
@@ -835,13 +839,16 @@ impl<A: Send + Sync + 'static> Subscription<A> {
     /// Type: `Effect<Chunk<Arc<A>>, PubSubError, R>`.
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn pull_chunk<R: Send + Sync + 'static>(&self) -> Effect<Chunk<Arc<A>>, PubSubError, R> {
-        self.take().flat_map(|event| match event {
-            SubscriptionEvent::Item(value) => Effect::sync_once(move || Chunk::Values(vec![value])),
-            SubscriptionEvent::Lagged(dropped) => {
-                Effect::fail_with(move || PubSubError::Lagged { dropped })
-            }
-            SubscriptionEvent::End => Effect::sync(|| Chunk::End),
-        })
+        {
+            let __dsl_program = self.take();
+            effect! { let event = __dsl_program.clone()?; match event {
+                SubscriptionEvent::Item(value) => effect_sync! { once; body: move || Chunk::Values(vec![value]), },
+                SubscriptionEvent::Lagged(dropped) => {
+                    effect_try_sync! { body: { let __dsl_error = move || PubSubError::Lagged { dropped }; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }
+                }
+                SubscriptionEvent::End => effect_sync! { body: || Chunk::End, },
+            }? }
+        }
     }
 
     /// Remove this subscriber and release its retained delivery state.
@@ -855,7 +862,7 @@ impl<A: Send + Sync + 'static> Subscription<A> {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn unsubscribe<R: Send + Sync + 'static>(&self) -> Effect<bool, PubSubError, R> {
         let subscription = Arc::clone(&self.inner);
-        Effect::sync(move || subscription.close())
+        effect_sync! { body: move || subscription.close(), }
     }
 }
 
@@ -936,8 +943,8 @@ impl<A: Send + Sync + 'static> SubscriptionInner<A> {
                 }
                 return Exit::Success(event);
             }
-            let changed = std::pin::pin!(changed);
-            let cancelled = std::pin::pin!(cancellation.cancelled());
+            let changed = pin!(changed);
+            let cancelled = pin!(cancellation.cancelled());
             let _ = select(changed, cancelled).await;
         }
     }

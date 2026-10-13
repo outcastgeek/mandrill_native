@@ -1,4 +1,5 @@
 use super::tasks::{Environment, Marker, Payload};
+use fx::{effect_for_each_concurrent, effect_future, effect_race, effect_sync};
 use fx::{Effect, Exit};
 use std::cell::Cell;
 use std::num::NonZeroUsize;
@@ -11,8 +12,12 @@ struct Input(String); // Shared immutable input, without Clone.
 pub async fn parallel_cases() {
     let env = Arc::new(Environment::default());
     let descriptions: Arc<[_]> = vec![
-        Effect::<Payload, Payload, Environment>::sync(|| Payload(Cell::new(Marker::Value))),
-        Effect::sync(|| Payload(Cell::new(Marker::Value))),
+        {
+            let __dsl_program: Effect<Payload, Payload, Environment> =
+                effect_sync! { body: || Payload(Cell::new(Marker::Value)), };
+            __dsl_program
+        },
+        effect_sync! { body: || Payload(Cell::new(Marker::Value)), },
     ]
     .into();
     let count = descriptions.len();
@@ -39,12 +44,11 @@ pub async fn parallel_cases() {
         .collect();
     let expected: Vec<_> = inputs.iter().map(|input| input.0.len()).collect();
     let shared = Arc::clone(&inputs);
-    let values: Effect<Vec<Length>, Payload, Environment> =
-        Effect::for_each_concurrent_shared(NonZeroUsize::MIN, shared, move |input| {
-            assert!(addresses.contains(&(std::ptr::from_ref(input) as usize)));
-            let length = input.0.len();
-            Effect::sync(move || Length(Cell::new(length)))
-        });
+    let values: Effect<Vec<Length>, Payload, Environment> = effect_for_each_concurrent! { shared; concurrency: NonZeroUsize::MIN, values: shared, body: move |input| {
+        assert!(addresses.contains(&(std::ptr::from_ref(input) as usize)));
+        let length = input.0.len();
+        effect_sync! { body: move || Length(Cell::new(length)), }
+    }, };
     assert_eq!(
         values.run(Arc::clone(&env)).await,
         Exit::Success(
@@ -54,13 +58,19 @@ pub async fn parallel_cases() {
                 .collect()
         )
     );
-    let left = Effect::<Payload, Payload, Environment>::sync(|| Payload(Cell::new(Marker::Value)));
-    let right = Effect::from_future(|token| async move {
+    let left = {
+        let __dsl_program: Effect<Payload, Payload, Environment> =
+            effect_sync! { body: || Payload(Cell::new(Marker::Value)), };
+        __dsl_program
+    };
+    let right = effect_future! { body: |token| async move {
         token.cancelled().await;
         Payload(Cell::new(Marker::Value))
-    });
+    }, };
     assert_eq!(
-        left.race(right).run(Arc::clone(&env)).await,
+        effect_race! { program: left, right: right, }
+            .run(Arc::clone(&env))
+            .await,
         Exit::Success(Payload(Cell::new(Marker::Value)))
     );
     env.tasks.finish();

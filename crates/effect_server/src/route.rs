@@ -1,5 +1,6 @@
 //! Typed reversible routes and ordered registration descriptions.
 
+use crate::registered;
 use crate::{Endpoint, Pipeline, Registered, Registration, Request, Scalar, ServerError};
 use effect::Effect;
 use http::Method;
@@ -748,11 +749,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> RouteMount<E, R, Endpoint<E, R
         methods: HttpMethodSet,
         handler: Endpoint<E, R>,
     ) -> Result<Router<E, R>, ServerError> {
-        router.registered(
-            methods,
-            self,
-            Registered::new(handler, Registration::default()),
-        )
+        router.registered(methods, self, registered! { endpoint: handler, })
     }
 }
 impl<E: Send + 'static, R: Send + Sync + 'static> RouteMount<E, R, Registered<E, R>> for &str {

@@ -7,6 +7,10 @@ use super::{
     ReplicaSyncError,
 };
 use crate::{Effect, JsonValue, ParsePolicy, PureCodec, SchemaIssue, SchemaIssueKind};
+use crate::{
+    effect, effect_map, effect_map_error, effect_provide_some, effect_sync, effect_try_sync,
+    service,
+};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
@@ -167,20 +171,23 @@ impl ProtectedReplicaTransfer {
         R: HasEventJournal + HasReplicaProtection + Send + Sync + 'static,
     {
         let transfer = self.clone();
-        EventReplicator::export::<R>(source, stream, after, limit)
-            .map_error(ProtectedReplicaExportError::Journal)
-            .flat_map(move |page| match page {
-                ReplicaExport::Batch { batch, has_more } => transfer
-                    .seal::<R>(session.clone(), batch)
-                    .map_error(ProtectedReplicaExportError::Transfer)
-                    .map(move |payload| ProtectedReplicaExport::Payload { payload, has_more }),
-                ReplicaExport::HistoryTruncated { first_available } => Effect::sync(move || {
+        {
+            let __dsl_program = effect_map_error! { program: EventReplicator::export::<R>(source, stream, after, limit), map: ProtectedReplicaExportError::Journal, };
+            effect! {
+            let __dsl_program = __dsl_program.clone(); let session = session.clone(); let transfer = transfer.clone(); let page = __dsl_program?; match page {
+                ReplicaExport::Batch { batch, has_more } => effect_map! {
+                    program: effect_map_error! {
+                    program: transfer
+                    .seal::<R>(session.clone(), batch), map: ProtectedReplicaExportError::Transfer, }, map: move |payload| ProtectedReplicaExport::Payload { payload, has_more }, },
+                ReplicaExport::HistoryTruncated { first_available } => effect_sync! {
+                    body: move || {
                     ProtectedReplicaExport::HistoryTruncated { first_available }
-                }),
+                }, },
                 ReplicaExport::CursorAhead { head } => {
-                    Effect::sync(move || ProtectedReplicaExport::CursorAhead { head })
+                    effect_sync! { body: move || ProtectedReplicaExport::CursorAhead { head }, }
                 }
-            })
+            }? }
+        }
     }
 
     /// Lazily open and authenticate a protected replica batch, then import and acknowledge it.
@@ -196,15 +203,17 @@ impl ProtectedReplicaTransfer {
     where
         R: HasReplicaProtection + HasEventJournal + HasReplicaCursorStore + Send + Sync + 'static,
     {
-        self.open::<R>(expected_session, payload)
-            .map_error(ProtectedReplicaImportError::Transfer)
-            .flat_map(|batch| {
-                {
+        {
+            let __dsl_program = effect_map_error! { program: self.open::<R>(expected_session, payload), map: ProtectedReplicaImportError::Transfer, };
+            effect! {
+            let batch = __dsl_program.clone()?; {
+                effect_map_error! {
+                    program: {
                     let permit = super::ReplicaImportPermit::authenticated(&batch);
                     EventReplicator::import_and_ack::<R>(batch, permit)
-                }
-                .map_error(ProtectedReplicaImportError::Sync)
-            })
+                }, map: ProtectedReplicaImportError::Sync, }
+            }? }
+        }
     }
 
     /// Protect encoded replica bytes with the selected session metadata.
@@ -234,8 +243,9 @@ impl ProtectedReplicaTransfer {
         let codec = self.codec.clone();
         let policy = self.policy;
         let batch = Mutex::new(Some(batch));
-        Effect::try_sync(
-            move || {
+        {
+            let __dsl_program = effect_try_sync! {
+            body: move || {
                 let batch = batch
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -248,28 +258,30 @@ impl ProtectedReplicaTransfer {
                     crate::schema::internal::parser::encode_json_bytes(&encoded, &policy.limits)
                         .map_err(ReplicaTransferError::Schema)?;
                 Ok(Arc::<[u8]>::from(bytes))
-            },
-            std::convert::identity,
-        )
-        .flat_map(move |bytes| {
-            Effect::service(|env: &R| env.replica_protection()).flat_map({
-                let session = session.clone();
-                move |protection| {
-                    let expected = session.clone();
-                    protection
-                        .seal(session.clone(), Arc::clone(&bytes))
-                        .map_error(ReplicaTransferError::Protection)
-                        .provide_some(|_: &R| ())
-                        .flat_map(move |payload| {
-                            Effect::from_result_once(if payload.session == expected {
-                                Ok(payload)
-                            } else {
-                                Err(ReplicaTransferError::SessionMismatch)
-                            })
-                        })
-                }
-            })
-        })
+            }, on_error: std::convert::identity, };
+            effect! {
+                    let session = session.clone(); let bytes = __dsl_program.clone()?; {
+                {
+                    let __dsl_program = service! { env: |env: &R| env.replica_protection(), }; let session = session.clone(); effect! {
+                    let __dsl_program = __dsl_program.clone(); let bytes = bytes.clone(); let session = session.clone(); let protection = __dsl_program?; {
+                        let expected = session.clone();
+                        {
+                            let __dsl_program = effect_provide_some! {
+                            program: effect_map_error! {
+                            program: protection
+                            .seal(session.clone(), Arc::clone(&bytes)), map: ReplicaTransferError::Protection, }, project: |_: &R| (), }; effect! {
+                                let expected = expected.clone(); let payload = __dsl_program.clone()?; {
+                                effect_try_sync! {
+                                    once; body: {
+                                    let __dsl_result = if payload.session == expected {
+                                    Ok(payload)
+                                } else {
+                                    Err(ReplicaTransferError::SessionMismatch)
+                                }; move || __dsl_result }, on_error: ::core::convert::identity, }
+                            }? } }
+                    }? } }
+            }? }
+        }
     }
 
     /// Open the resource within its declared scope and ownership boundary.
@@ -293,44 +305,48 @@ impl ProtectedReplicaTransfer {
         R: HasReplicaProtection + Send + Sync + 'static,
     {
         if payload.session != expected {
-            return Effect::fail_with(|| ReplicaTransferError::SessionMismatch);
+            return effect_try_sync! { body: { let __dsl_error = || ReplicaTransferError::SessionMismatch; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
         }
         let payload = Mutex::new(Some(payload));
         let codec = self.codec.clone();
         let policy = self.policy;
-        Effect::service(|env: &R| env.replica_protection())
-            .flat_map(move |protection| {
-                let payload = payload
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
-                match payload {
-                    Some(payload) => protection
-                        .open(payload)
-                        .map_error(ReplicaTransferError::Protection)
-                        .provide_some(|_: &R| ()),
-                    None => Effect::from_result_once(Err(ReplicaTransferError::InputConsumed)),
-                }
-            })
-            .flat_map(move |bytes| {
-                let codec = codec.clone();
-                Effect::try_sync(
-                    move || {
-                        let text = std::str::from_utf8(&bytes).map_err(|error| {
-                            ReplicaTransferError::Schema(SchemaIssue::new(
-                                SchemaIssueKind::JsonSyntax {
-                                    detail: Arc::from(error.to_string()),
-                                },
-                            ))
-                        })?;
-                        let encoded = crate::schema::internal::parser::parse_json(text, policy)
-                            .map_err(ReplicaTransferError::Schema)?;
-                        codec
-                            .decode_ref(&encoded)
-                            .map_err(ReplicaTransferError::Schema)
-                    },
-                    std::convert::identity,
-                )
-            })
+        {
+            let __dsl_program = effect! {
+            bind;
+            program: service! { env: |env: &R| env.replica_protection(), },
+            body: move |protection| {
+                           let payload = payload
+                               .lock()
+                               .unwrap_or_else(std::sync::PoisonError::into_inner)
+                               .take();
+                           match payload {
+                               Some(payload) => effect_provide_some! {
+                                   program: effect_map_error! {
+                                   program: protection
+                                   .open(payload), map: ReplicaTransferError::Protection, }, project: |_: &R| (), },
+                               None => effect_try_sync! { once; body: { let __dsl_result = Err(ReplicaTransferError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, },
+                           }
+                       },
+            };
+            effect! {
+            let codec = codec.clone(); let bytes = __dsl_program.clone()?; {
+                       let codec = codec.clone();
+                       effect_try_sync! {
+                           body: move || {
+                               let text = std::str::from_utf8(&bytes).map_err(|error| {
+                                   ReplicaTransferError::Schema(SchemaIssue::new(
+                                       SchemaIssueKind::JsonSyntax {
+                                           detail: Arc::from(error.to_string()),
+                                       },
+                                   ))
+                               })?;
+                               let encoded = crate::schema::internal::parser::parse_json(text, policy)
+                                   .map_err(ReplicaTransferError::Schema)?;
+                               codec
+                                   .decode_ref(&encoded)
+                                   .map_err(ReplicaTransferError::Schema)
+                           }, on_error: std::convert::identity, }
+                   }? }
+        }
     }
 }

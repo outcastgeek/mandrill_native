@@ -8,6 +8,7 @@ use super::{
     WorkflowRunId,
 };
 use crate::{Effect, HasTaskSpawner, HasWallClock, WallClock};
+use crate::{effect, effect_map, effect_sync};
 use std::num::{NonZeroU32, NonZeroUsize};
 
 /// Type alias for engine error in workflow durable.
@@ -80,7 +81,10 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Durable<A, 
     /// Reconstruct a restricted durable description on each evaluation, including pre-bind locals.
     /// The factory must return Durable; this does not admit external Effects into replay.
     pub fn defer(factory: impl Fn() -> Self + Send + Sync + 'static) -> Self {
-        Self::from_effect(Effect::defer(move || factory().effect))
+        Self::from_effect({
+            let __dsl_factory = move || factory().effect;
+            effect! { __dsl_factory()? }
+        })
     }
 
     /// Construct a durable body whose Rust locals are fresh per evaluation.
@@ -124,6 +128,15 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Durable<A, 
         }))
     }
 
+    /// Consume an owned Result as a durable success or typed failure.
+    /// Construction is inert. A second execution retains the underlying once
+    /// operation's consumed-input defect; no payload or error is cloned.
+    /// This generated-code bridge accepts Result values, never arbitrary Effects.
+    #[doc(hidden)]
+    pub fn from_result_once(result: Result<A, E>) -> Self {
+        Self::from_effect(crate::Effect::from_result_once(result))
+    }
+
     /// Produce a fresh successful value when this description is executed.
     ///
     /// # Type parameters
@@ -137,7 +150,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Durable<A, 
     /// # Returns
     /// Type: `Self`.
     pub fn succeed_with(value: impl Fn() -> A + Send + Sync + 'static) -> Self {
-        Self::from_effect(Effect::sync(value))
+        Self::from_effect(effect_sync! { body: value, })
     }
 
     /// Consume an owned result produced within one workflow evaluation.
@@ -154,7 +167,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Durable<A, 
     /// # Returns
     /// Type: `Self`.
     pub fn succeed_once(value: impl FnOnce() -> A + Send + 'static) -> Self {
-        Self::from_effect(Effect::sync_once(value))
+        Self::from_effect(effect_sync! { once; body: value, })
     }
 
     /// Transform successful values while preserving other outcome channels.
@@ -174,7 +187,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Durable<A, 
         self,
         map: impl Fn(A) -> B + Send + Sync + 'static,
     ) -> Durable<B, E, R> {
-        Durable::from_effect(self.effect.map(map))
+        Durable::from_effect(effect_map! { program: self.effect, map: map, })
     }
 
     /// Transform the expected error channel without changing other workflow outcomes.
@@ -214,7 +227,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Durable<A, 
         self,
         next: impl Fn(A) -> Durable<B, E, R> + Send + Sync + 'static,
     ) -> Durable<B, E, R> {
-        Durable::from_effect(self.effect.flat_map(move |value| next(value).effect))
+        Durable::from_effect((self.effect).flat_map(move |value| next(value).effect))
     }
 }
 

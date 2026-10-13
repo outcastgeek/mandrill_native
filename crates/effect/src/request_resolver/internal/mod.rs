@@ -15,6 +15,7 @@ use futures_util::{
 };
 use std::collections::{BTreeMap, HashMap};
 use std::panic::AssertUnwindSafe;
+use std::pin::pin;
 use std::sync::{Arc, Mutex, Weak};
 
 /// Type alias for shared result in request resolver internal mod.
@@ -246,14 +247,14 @@ impl<A: Send + 'static, E: Send + 'static> Pending<A, E> {
                     self.complete(result.clone());
                     return result;
                 }
-                let finished = std::pin::pin!(fiber.settled());
-                let wake = std::pin::pin!(select(changed, finished));
-                let cancelled = std::pin::pin!(context.cancellation.cancelled());
+                let finished = pin!(fiber.settled());
+                let wake = pin!(select(changed, finished));
+                let cancelled = pin!(context.cancellation.cancelled());
                 if matches!(select(wake, cancelled).await, Either::Right(_)) {
                     return Exit::Interrupted;
                 }
             } else {
-                let cancelled = std::pin::pin!(context.cancellation.cancelled());
+                let cancelled = pin!(context.cancellation.cancelled());
                 if matches!(select(changed, cancelled).await, Either::Right(_)) {
                     return Exit::Interrupted;
                 }

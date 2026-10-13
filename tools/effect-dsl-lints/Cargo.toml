@@ -1,0 +1,11 @@
+[package]
+name = "effect-dsl-lints"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+
+[workspace]
+
+[[bin]]
+name = "effect-dsl-lint"
+path = "wrapper.rs"

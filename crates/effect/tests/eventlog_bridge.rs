@@ -2,9 +2,10 @@ use effect::eventlog::{
     AggregateId, AppendDecision, AppendReceipt, AtomicProjectionStore, EventEnvelope, EventGroupId,
     EventId, EventJournal, EventJournalId, EventObservation, EventTag, EventVersion,
     HasAtomicProjectionStore, HasEventJournal, JournalCursor, JournalStream, MemoryEventJournal,
-    MemoryJournalCapacity, MemoryProjectionStore, Projection, ProjectionAdvance, ProjectionId,
-    ProjectionKey, ProjectionVersion,
+    MemoryJournalCapacity, MemoryProjectionStore, ProjectionAdvance, ProjectionId, ProjectionKey,
+    ProjectionVersion,
 };
+use effect::projection;
 use effect::reactivity::{InvalidationKey, InvalidationRegistry};
 use effect::{
     Exit, KeyDomain, KeyNamespace, KeySegment, PubSubOptions, PubSubOverflow, PubSubShutdown,
@@ -40,8 +41,8 @@ impl HasAtomicProjectionStore<usize> for Environment {
 }
 
 #[test]
-fn append_projects_and_notifies_without_moving_authority_from_journal() {
-    let limit = NonZeroUsize::new(2).unwrap();
+fn append_projects_and_notifies_without_moving_authority_from_journal() -> Result<(), String> {
+    let limit = NonZeroUsize::MIN.saturating_add(1);
     let environment = Arc::new(Environment {
         journal: Arc::new(MemoryEventJournal::new(MemoryJournalCapacity {
             streams: limit,
@@ -50,21 +51,23 @@ fn append_projects_and_notifies_without_moving_authority_from_journal() {
         })),
         projections: Arc::new(MemoryProjectionStore::new(limit)),
     });
-    let namespace = KeyNamespace::<Domain>::new("events").unwrap();
+    let namespace = KeyNamespace::<Domain>::new("events")
+        .map_err(|error| format!("event namespace: {error:?}"))?;
     let key = |text: &'static str| {
-        StableKey::new(&namespace, [KeySegment::Text(Arc::from(text))]).unwrap()
+        StableKey::new(&namespace, [KeySegment::Text(Arc::from(text))])
+            .map_err(|error| format!("{text} identity: {error:?}"))
     };
-    let group = EventGroupId::new("orders").unwrap();
-    let tag = EventTag::new("placed").unwrap();
-    let version = EventVersion::new(NonZeroU32::new(1).unwrap());
+    let group = EventGroupId::new("orders").map_err(|error| format!("event group: {error:?}"))?;
+    let tag = EventTag::new("placed").map_err(|error| format!("event tag: {error:?}"))?;
+    let version = EventVersion::new(NonZeroU32::MIN);
     let stream = JournalStream {
-        journal: EventJournalId::from_stable(key("journal")),
-        aggregate: AggregateId::from_stable(key("aggregate")),
+        journal: EventJournalId::from_stable(key("journal")?),
+        aggregate: AggregateId::from_stable(key("aggregate")?),
     };
     let event = EventEnvelope {
         journal: stream.journal.clone(),
         aggregate: stream.aggregate.clone(),
-        id: EventId::from_stable(key("event")),
+        id: EventId::from_stable(key("event")?),
         group: group.clone(),
         tag: tag.clone(),
         version,
@@ -73,30 +76,23 @@ fn append_projects_and_notifies_without_moving_authority_from_journal() {
         occurred_at: UtcMillis::new(0),
     };
     let accepted = BTreeMap::from([((group, tag), version)]);
-    let projection = Projection::new(
-        ProjectionKey {
-            id: ProjectionId::from_stable(key("projection")),
-            stream: stream.clone(),
-        },
-        ProjectionVersion::new(NonZeroU32::new(1).unwrap()),
-        accepted.clone(),
-        || 0usize,
-        |count, _| Ok::<usize, ()>(count + 1),
-    );
-    let invalidation = InvalidationKey::from_stable(key("changed"));
+    let projection = projection! { key: ProjectionKey {
+        id: ProjectionId::from_stable(key("projection")?),
+        stream: stream.clone(),
+    }, version: ProjectionVersion::new(NonZeroU32::MIN), accepted: accepted.clone(), initial: || 0usize, fold: |count, _| Ok::<usize, ()>(count + 1),  };
+    let invalidation = InvalidationKey::from_stable(key("changed")?);
     let registry = InvalidationRegistry::new(PubSubOptions {
         capacity: limit,
         overflow: PubSubOverflow::Backpressure,
         replay: ReplayPolicy::None,
     })
-    .unwrap();
-    let subscriber = match block_on(
+    .map_err(|error| format!("invalidation registry: {error:?}"))?;
+    let Exit::Success(subscriber) = block_on(
         registry
             .subscribe::<Environment>()
             .run(Arc::clone(&environment)),
-    ) {
-        Exit::Success(value) => value,
-        _ => panic!("unable to subscribe"),
+    ) else {
+        return Err(String::from("invalidation subscription must succeed"));
     };
 
     let appended = block_on(
@@ -109,13 +105,7 @@ fn append_projects_and_notifies_without_moving_authority_from_journal() {
         appended,
         Exit::Success(AppendReceipt::Decided(AppendDecision::Committed(_)))
     ));
-    let failing = Projection::new(
-        projection.key.clone(),
-        projection.version,
-        accepted,
-        || 0usize,
-        |_, _| Err::<usize, &'static str>("fold failed"),
-    );
+    let failing = projection! { key: projection.key.clone(), version: projection.version, accepted: accepted, initial: || 0usize, fold: |_, _| Err::<usize, &'static str>("fold failed"),  };
     let failed = block_on(failing.advance(limit).run(Arc::clone(&environment)));
     assert!(matches!(
         failed,
@@ -173,7 +163,7 @@ fn append_projects_and_notifies_without_moving_authority_from_journal() {
         overflow: PubSubOverflow::DropNewest,
         replay: ReplayPolicy::None,
     })
-    .unwrap();
+    .map_err(|error| format!("dropping invalidation registry: {error:?}"))?;
     let _slow_subscriber = block_on(
         dropping_registry
             .subscribe::<Environment>()
@@ -209,4 +199,5 @@ fn append_projects_and_notifies_without_moving_authority_from_journal() {
             .run(Arc::new(())),
     );
     assert!(matches!(saved, Exit::Success(Some(snapshot)) if *snapshot.state == 1));
+    Ok(())
 }

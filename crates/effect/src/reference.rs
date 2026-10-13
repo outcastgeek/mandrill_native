@@ -1,6 +1,7 @@
 //! Atomic references that preserve owned values.
 
 use crate::Effect;
+use crate::effect_sync;
 use std::sync::{Arc, Mutex};
 
 /// Mutex-backed atomic compound operations over an owned value.
@@ -61,7 +62,7 @@ impl<A: Send + 'static> AtomicRef<A> {
     pub fn make_with<E: Send + 'static, R: Send + Sync + 'static>(
         initial: impl Fn() -> A + Send + Sync + 'static,
     ) -> Effect<Self, E, R> {
-        Effect::sync(move || Self::new(initial()))
+        effect_sync! { body: move || Self::new(initial()), }
     }
 
     /// Explicitly copy stored initial state per run. Prefer make_with for owned
@@ -104,13 +105,13 @@ impl<A: Send + 'static> AtomicRef<A> {
         inspect: impl Fn(&A) -> B + Send + Sync + 'static,
     ) -> Effect<B, E, R> {
         let reference = self.clone();
-        Effect::sync(move || {
+        effect_sync! { body: move || {
             let value = reference
                 .value
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             inspect(&value)
-        })
+        }, }
     }
 
     /// Explicit snapshot copying. Borrow with `with` when ownership is unneeded.
@@ -235,7 +236,7 @@ impl<A: Send + 'static> AtomicRef<A> {
         factory: impl Fn() -> A + Send + Sync + 'static,
     ) -> Effect<(), E, R> {
         let reference = self.clone();
-        Effect::sync(move || {
+        effect_sync! { body: move || {
             let next = factory();
             let old = {
                 let mut value = reference
@@ -245,7 +246,7 @@ impl<A: Send + 'static> AtomicRef<A> {
                 std::mem::replace(&mut *value, next)
             };
             drop(old);
-        })
+        }, }
     }
 
     /// Explicitly copy a stored replacement on each run. `set_with` avoids

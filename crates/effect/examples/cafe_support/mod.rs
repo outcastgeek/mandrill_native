@@ -4,7 +4,9 @@
 //! example application. The core selects no executor. Stores demonstrate logical
 //! recording and fencing in one process; they do not survive a process restart.
 
-/// Finite RPC transport plumbing, independent of the application DSL recipe.
+/// Wire models shared by the two related ticket examples.
+pub mod tickets;
+/// Finite RPC/socket transport plumbing, independent of the application DSL recipe.
 pub mod transport;
 
 use effect::cluster::{HasClusterActivationStore, MemoryClusterMessageStore, MessageStoreCapacity};
@@ -23,9 +25,9 @@ use effect::workflow::{HasWorkflowEngine, MemoryWorkflowEngine};
 use effect::{
     BlockingExecutor, Cancellation, CpuExecutor, Defect, DiagnosticCapacity, DiagnosticOverflow,
     Diagnostics, DuplicateFields, HasBlockingExecutor, HasCancellation, HasClock, HasCpuExecutor,
-    HasTaskSpawner, HasTracer, HasWallClock, KeyDomain, KeyNamespace, KeySegment, ParseLimits,
-    ParsePolicy, ScheduledJob, ScheduledTask, SchemaErrorMode, SpanId, StableKey, TaskSpawner,
-    TestClock, TestWallClock, Tracer, UnknownFields, UtcMillis,
+    HasRequestScope, HasTaskSpawner, HasTracer, HasWallClock, KeyDomain, KeyNamespace, KeySegment,
+    ParseLimits, ParsePolicy, RequestScope, ScheduledJob, ScheduledTask, SchemaErrorMode, SpanId,
+    StableKey, TaskSpawner, TestClock, TestWallClock, Tracer, UnknownFields, UtcMillis,
 };
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{
@@ -34,40 +36,40 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 
-/// Example bounds are explicit inputs, independent of production defaults.
-pub fn nz(value: usize) -> NonZeroUsize {
-    NonZeroUsize::new(value).expect("positive café story bound")
-}
 /// Retain explicit parsing bounds, including enough text width for the example stable identities.
+#[must_use]
 pub fn limits() -> ParseLimits {
     ParseLimits {
-        bytes: nz(4096),
-        depth: nz(16),
-        nodes: nz(128),
-        collection: nz(128),
-        issues: nz(8),
+        bytes: std::num::NonZeroUsize::MIN.saturating_add(4095),
+        depth: std::num::NonZeroUsize::MIN.saturating_add(15),
+        nodes: std::num::NonZeroUsize::MIN.saturating_add(127),
+        collection: std::num::NonZeroUsize::MIN.saturating_add(127),
+        issues: std::num::NonZeroUsize::MIN.saturating_add(7),
     }
 }
 /// Binary bounds match the example's small typed event and queue records.
+#[must_use]
 pub fn binary_limits() -> BinaryLimits {
     BinaryLimits {
-        bytes: nz(4096),
-        depth: nz(16),
-        nodes: nz(128),
-        collection: nz(16),
-        steps: nz(512),
+        bytes: std::num::NonZeroUsize::MIN.saturating_add(4095),
+        depth: std::num::NonZeroUsize::MIN.saturating_add(15),
+        nodes: std::num::NonZeroUsize::MIN.saturating_add(127),
+        collection: std::num::NonZeroUsize::MIN.saturating_add(15),
+        steps: std::num::NonZeroUsize::MIN.saturating_add(511),
     }
 }
 /// Explicit RPC framing policy used by unary, streaming and entity registration.
+#[must_use]
 pub fn rpc_policy() -> RpcEnvelopePolicy {
     RpcEnvelopePolicy {
         frame: FramePolicy {
-            maximum_payload: nz(4096),
+            maximum_payload: std::num::NonZeroUsize::MIN.saturating_add(4095),
         },
         json: limits(),
     }
 }
 /// Pure example codec policy retains rejection/first-error semantics.
+#[must_use]
 pub fn parse_policy() -> ParsePolicy {
     ParsePolicy {
         limits: limits(),
@@ -83,16 +85,16 @@ impl KeyDomain for CafeKeys {
     const TAG: &'static str = "neighborhood-cafe";
 }
 /// Names and segments are explicit application vocabulary for the example's stored identities.
-pub fn key(name: &str) -> StableKey<CafeKeys> {
-    StableKey::new(
-        &KeyNamespace::<CafeKeys>::new("neighborhood-cafe").expect("example namespace"),
-        [KeySegment::Text(name.into())],
-    )
-    .expect("example stable key")
+pub fn key(name: &str) -> Result<StableKey<CafeKeys>, Defect> {
+    let namespace = KeyNamespace::<CafeKeys>::new("neighborhood-cafe")
+        .map_err(|error| Defect::new(format!("example namespace: {error:?}")))?;
+    StableKey::new(&namespace, [KeySegment::Text(name.into())])
+        .map_err(|error| Defect::new(format!("example stable key: {error:?}")))
 }
 /// Binary wire identities remain explicit and independent of Rust type names.
-pub fn binary(name: &str) -> BinaryIdentity {
-    BinaryIdentity::new(name, NonZeroU64::MIN).expect("example binary identity")
+pub fn binary(name: &str) -> Result<BinaryIdentity, Defect> {
+    BinaryIdentity::new(name, NonZeroU64::MIN)
+        .map_err(|error| Defect::new(format!("example binary identity: {error:?}")))
 }
 /// Café environment: application services beside Effect provider capabilities.
 pub struct Cafe<Services: Send + Sync + 'static = (), Sales: Send + Sync + 'static = ()> {
@@ -110,6 +112,8 @@ pub struct Cafe<Services: Send + Sync + 'static = (), Sales: Send + Sync + 'stat
     pub wall: TestWallClock,
     /// Cancellation authority shared by tasks and atomic stock reservations.
     pub cancellation: Cancellation,
+    /// Process-local resolver identity shared by this café's finite request session.
+    pub requests: RequestScope,
     /// Journal authority shared by stock reservations in the café.
     pub transactions: Arc<TransactionDomain>,
     /// Existing in-memory activation authority.
@@ -191,6 +195,14 @@ impl<Services: Send + Sync + 'static, Sales: Send + Sync + 'static> HasCancellat
         &self.cancellation
     }
 }
+impl<Services: Send + Sync + 'static, Sales: Send + Sync + 'static> HasRequestScope
+    for Cafe<Services, Sales>
+{
+    /// Resolver sharing uses the consumer-selected session identity, not a global key.
+    fn request_scope(&self) -> &RequestScope {
+        &self.requests
+    }
+}
 impl<Services: Send + Sync + 'static, Sales: Send + Sync + 'static> HasTransactionDomain
     for Cafe<Services, Sales>
 {
@@ -254,14 +266,20 @@ pub struct Providers {
     /// Explicit maximum concurrently accepted workers.
     maximum: NonZeroUsize,
     /// Owned workers, joined after the domain scope closes.
-    workers: Mutex<Vec<JoinHandle<()>>>,
+    workers: Mutex<Vec<JoinHandle<Result<(), Defect>>>>,
     /// Deterministic monotonic clock; examples using timers advance it explicitly.
     clock: TestClock,
 }
 impl Providers {
     /// Accept an independent worker, or reject it before transferring the task.
-    fn submit(&self, work: impl FnOnce() + Send + 'static) -> Result<(), Defect> {
-        let mut workers = self.workers.lock().expect("worker ownership");
+    fn submit(
+        &self,
+        work: impl FnOnce() -> Result<(), Defect> + Send + 'static,
+    ) -> Result<(), Defect> {
+        let mut workers = self
+            .workers
+            .lock()
+            .map_err(|error| Defect::new(error.to_string()))?;
         let active = workers
             .iter()
             .filter(|worker| !worker.is_finished())
@@ -277,17 +295,33 @@ impl Providers {
         Ok(())
     }
     /// Join every worker after effects have settled their scopes.
-    pub fn finish(&self) {
-        let workers = std::mem::take(&mut *self.workers.lock().expect("worker ownership"));
+    pub fn finish(&self) -> Result<(), Defect> {
+        let workers = std::mem::take(
+            &mut *self
+                .workers
+                .lock()
+                .map_err(|error| Defect::new(error.to_string()))?,
+        );
+        let mut failure = None;
         for worker in workers {
-            worker.join().expect("example worker completed");
+            if let Err(error) = worker
+                .join()
+                .map_err(Defect::from_panic)
+                .and_then(|result| result)
+            {
+                failure.get_or_insert(error);
+            }
         }
+        failure.map_or(Ok(()), Err)
     }
 }
 impl TaskSpawner for Providers {
     /// Drive accepted tasks with the example's executor on an independent thread.
     fn spawn(&self, task: ScheduledTask) -> Result<(), Defect> {
-        self.submit(move || futures_executor::block_on(task))
+        self.submit(move || {
+            futures_executor::block_on(task);
+            Ok(())
+        })
     }
 }
 /// Concrete CPU provider, distinct from the task spawner and blocking provider.
@@ -298,8 +332,7 @@ pub struct CoffeeCpu {
 impl CpuExecutor for CoffeeCpu {
     /// Run the CPU job on an application-owned worker.
     fn submit(&self, job: ScheduledJob) -> Result<(), Defect> {
-        self.workers
-            .submit(move || job.run().expect("CPU job completed"))
+        self.workers.submit(move || job.run())
     }
 }
 /// Concrete blocking provider selected separately from CPU execution through R.
@@ -310,12 +343,12 @@ pub struct CoffeeBlocking {
 impl BlockingExecutor for CoffeeBlocking {
     /// Run the blocking job on an application-owned worker.
     fn submit(&self, job: ScheduledJob) -> Result<(), Defect> {
-        self.workers
-            .submit(move || job.run().expect("blocking job completed"))
+        self.workers.submit(move || job.run())
     }
 }
 impl<Services: Send + Sync + 'static, Sales: Send + Sync + 'static> Cafe<Services, Sales> {
     /// Open this local café with explicit order/storage capacity and worker admission.
+    #[must_use]
     pub fn open(services: Services, capacity: NonZeroUsize, workers: NonZeroUsize) -> Arc<Self> {
         let ids = Arc::new(AtomicUsize::new(0));
         let tracer = Tracer::new(
@@ -325,14 +358,27 @@ impl<Services: Send + Sync + 'static, Sales: Send + Sync + 'static> Cafe<Service
             ),
             |annotations| Ok(annotations.clone()),
             move |start| {
-                println!("[trace] {} parent={:?}", start.name, start.parent);
+                use std::io::Write;
+                writeln!(
+                    std::io::stdout().lock(),
+                    "[trace] {} parent={:?}",
+                    start.name,
+                    start.parent
+                )
+                .map_err(Defect::from_io)?;
                 Ok(Some(SpanId::new(format!(
                     "cafe-span-{}",
                     ids.fetch_add(1, Ordering::SeqCst)
                 ))))
             },
             |finish| {
-                println!("[trace] finished {:?}", finish.outcome);
+                use std::io::Write;
+                writeln!(
+                    std::io::stdout().lock(),
+                    "[trace] finished {:?}",
+                    finish.outcome
+                )
+                .map_err(Defect::from_io)?;
                 Ok(())
             },
         );
@@ -353,6 +399,7 @@ impl<Services: Send + Sync + 'static, Sales: Send + Sync + 'static> Cafe<Service
             tracer,
             wall: TestWallClock::new(UtcMillis::new(0)),
             cancellation: Cancellation::new(),
+            requests: RequestScope::new(),
             transactions: Arc::new(TransactionDomain::new(capacity)),
             activation: Arc::new(MemoryClusterMessageStore::new(
                 MessageStoreCapacity::Bounded(capacity),

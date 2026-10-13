@@ -1,3 +1,4 @@
+use serde_json::json;
 #[path = "support/campaign_report.rs"]
 mod campaign_report;
 #[path = "fixtures/shared/cluster_workflow_takeover.rs"]
@@ -67,13 +68,15 @@ impl HasCpuExecutor for Environment {
     }
 }
 
-fn number(config: &JsonValue, path: &[&str]) -> u64 {
+fn number(config: &JsonValue, path: &[&str]) -> Result<u64, String> {
     path.iter()
-        .fold(config, |value, field| {
-            value.get(*field).expect("campaign field")
-        })
+        .try_fold(config, |value, field| {
+            value
+                .get(*field)
+                .ok_or_else(|| format!("missing campaign field: {field}"))
+        })?
         .as_u64()
-        .expect("campaign integer")
+        .ok_or_else(|| format!("campaign integer: {}", path.join(".")))
 }
 
 fn next(state: &mut u64) -> u64 {
@@ -94,56 +97,62 @@ fn environment(tasks: &Arc<WorkerPool>, cpu: &Arc<WorkerPool>) -> Arc<Environmen
             NonZeroUsize::MIN,
         ))),
         workflow: Arc::new(MemoryWorkflowEngine::new()),
-        transactions: Arc::new(TransactionDomain::new(
-            NonZeroUsize::new(2).expect("two transaction/reactivity bridge sources"),
-        )),
+        transactions: Arc::new(TransactionDomain::new(NonZeroUsize::MIN.saturating_add(1))),
         tasks: Arc::clone(tasks),
         cpu: Arc::clone(cpu),
     })
 }
 
 #[test]
-fn configured_bridge_histories_preserve_authority_after_faults() {
+fn configured_bridge_histories_preserve_authority_after_faults() -> Result<(), String> {
     let configured = std::env::var_os("EFFECT_CAMPAIGN_CONFIG")
-        .map(|path| std::fs::read_to_string(path).expect("campaign configuration"))
+        .map(std::fs::read_to_string)
+        .transpose()
+        .map_err(|error| format!("campaign configuration: {error}"))?
         .unwrap_or_else(|| include_str!("feature_campaigns.json").to_owned());
-    let config: JsonValue = serde_json::from_str(&configured).expect("campaign JSON");
-    let seeds = number(&config, &["campaigns", "bridges", "seeds"]);
-    let transitions = number(&config, &["campaigns", "bridges", "transitions"]);
-    let workers = |name| {
+    let config: JsonValue =
+        serde_json::from_str(&configured).map_err(|error| format!("campaign JSON: {error}"))?;
+    let seeds = number(&config, &["campaigns", "bridges", "seeds"])?;
+    let transitions = number(&config, &["campaigns", "bridges", "transitions"])?;
+    let workers = |name| -> Result<NonZeroUsize, String> {
         NonZeroUsize::new(
-            usize::try_from(number(&config, &["campaigns", "bridges", name]))
-                .expect("worker policy fits usize"),
+            usize::try_from(number(&config, &["campaigns", "bridges", name])?)
+                .map_err(|error| format!("worker policy fits usize: {error}"))?,
         )
-        .expect("positive worker policy")
+        .ok_or_else(|| format!("positive worker policy: {name}"))
     };
-    let tasks = Arc::new(
-        WorkerPool::new(workers("task_workers"), workers("queued_jobs")).expect("task provider"),
-    );
-    let cpu = Arc::new(
-        WorkerPool::new(workers("cpu_workers"), workers("queued_jobs")).expect("CPU provider"),
-    );
+    let tasks = Arc::new(WorkerPool::new(
+        workers("task_workers")?,
+        workers("queued_jobs")?,
+    )?);
+    let cpu = Arc::new(WorkerPool::new(
+        workers("cpu_workers")?,
+        workers("queued_jobs")?,
+    )?);
     let mut counts = [0_u64; 5];
 
     for seed in 0..seeds {
-        let mut generator = number(&config, &["seed"]).wrapping_add(seed).max(1);
+        let mut generator = number(&config, &["seed"])?.wrapping_add(seed).max(1);
         let mut order = [0_usize, 1, 2, 3, 4];
         for step in 0..transitions {
             if step % order.len() as u64 == 0 {
                 for index in (1..order.len()).rev() {
                     let selection = usize::try_from(next(&mut generator) % (index as u64 + 1))
-                        .expect("selection fits usize");
+                        .map_err(|error| format!("selection fits usize: {error}"))?;
                     order.swap(index, selection);
                 }
             }
-            let case =
-                order[usize::try_from(step % order.len() as u64).expect("case index fits usize")];
+            let case_index = usize::try_from(step % order.len() as u64)
+                .map_err(|error| format!("case index fits usize: {error}"))?;
+            let case = *order
+                .get(case_index)
+                .ok_or("case index outside the bridge order")?;
             let env = environment(&tasks, &cpu);
             let preserved =
                 match case {
                     0 => {
                         let aborted = TxSubscriptionRef::new(&env.transactions, 41_i64)
-                            .expect("transactional abort source");
+                            .map_err(|error| format!("transactional abort source: {error:?}"))?;
                         let abort_preserved = matches!(
                             drive(
                                 provider_program::transactional_reactive::<Environment>(aborted)
@@ -151,8 +160,10 @@ fn configured_bridge_histories_preserve_authority_after_faults() {
                             ),
                             Exit::Success(true)
                         );
-                        let committed = TxSubscriptionRef::new(&env.transactions, 41_i64)
-                            .expect("transactional notification source");
+                        let committed =
+                            TxSubscriptionRef::new(&env.transactions, 41_i64).map_err(|error| {
+                                format!("transactional notification source: {error:?}")
+                            })?;
                         abort_preserved
                             && matches!(drive(
                         provider_program::notification_loss_after_commit::<Environment>(committed)
@@ -163,14 +174,14 @@ fn configured_bridge_histories_preserve_authority_after_faults() {
                     2 => drive(provider_program::queue_workflow_race(env)),
                     3 => drive(provider_program::replica_observer_restart(env)),
                     4 => drive(cluster_workflow_takeover::run(env)),
-                    _ => unreachable!(),
+                    other => return Err(format!("unexpected bridge case: {other}")),
                 };
             assert!(
                 preserved,
                 "bridge INT0{} failed at seed {seed}, step {step}",
                 case + 1
             );
-            counts[case] += 1;
+            *counts.get_mut(case).ok_or("missing bridge counter")? += 1;
         }
     }
     tasks.wait_idle();
@@ -179,16 +190,18 @@ fn configured_bridge_histories_preserve_authority_after_faults() {
     cpu.assert_healthy();
     assert!(counts.iter().all(|count| *count > 0));
     assert_eq!(counts.iter().sum::<u64>(), seeds * transitions);
+    let [int01, int02, int03, int04, int05] = counts;
     campaign_report::completed(
         "bridges",
-        serde_json::json!({
+        json!({
             "seeds": seeds,
             "transitions": transitions,
             "operations": counts,
             "bridges": {
-                "INT01": counts[0], "INT02": counts[1], "INT03": counts[2],
-                "INT04": counts[3], "INT05": counts[4],
+                "INT01": int01, "INT02": int02, "INT03": int03,
+                "INT04": int04, "INT05": int05,
             },
         }),
-    );
+    )?;
+    Ok(())
 }

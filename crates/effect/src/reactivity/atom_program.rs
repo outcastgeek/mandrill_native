@@ -3,6 +3,7 @@
 use super::{Atom, AtomDependencyError, AtomReadContext, AtomRef, AtomRefError};
 use crate::internal::macro_future::{AsyncBindable, MacroContext};
 use crate::{Effect, Exit, ResourceBinding, SharedValue};
+use crate::{effect, effect_map, effect_sync};
 use std::future::Future;
 use std::sync::Arc;
 
@@ -43,7 +44,10 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> AtomProgram
     /// Lazily execute with the supplied evaluation context, preserving dependency observations.
     pub fn evaluate(&self, context: AtomReadContext) -> Effect<A, E, R> {
         let run = Arc::clone(&self.run);
-        Effect::defer(move || run(context.clone()))
+        {
+            let __dsl_factory = move || run(context.clone());
+            effect! { __dsl_factory()? }
+        }
     }
     /// Lift an ordinary Effect; later tracked reads still use the current context.
     #[must_use]
@@ -52,7 +56,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> AtomProgram
     }
     /// Produce a fresh value per evaluation, avoiding a payload Clone requirement.
     pub fn succeed_with(value: impl Fn() -> A + Send + Sync + 'static) -> Self {
-        Self::from_effect(Effect::sync(value))
+        Self::from_effect(effect_sync! { body: value, })
     }
     /// Rebuild a helper description on each evaluation, including its captured local state.
     pub fn defer(factory: impl Fn() -> Self + Send + Sync + 'static) -> Self {
@@ -66,7 +70,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> AtomProgram
         let map = Arc::new(map);
         AtomProgram::new(move |context| {
             let map = Arc::clone(&map);
-            self.evaluate(context).map(move |value| map(value))
+            effect_map! { program: self.evaluate(context), map: move |value| map(value), }
         })
     }
     /// Map only expected errors, leaving defects, interruption and shared read observations intact.
@@ -88,8 +92,10 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> AtomProgram
         let next = Arc::new(next);
         AtomProgram::new(move |context| {
             let next = Arc::clone(&next);
-            self.evaluate(context.clone())
-                .flat_map(move |value| next(value).evaluate(context.clone()))
+            {
+                let __dsl_program = self.evaluate(context.clone());
+                effect! { let context = context.clone(); let next = next.clone(); let value = __dsl_program.clone()?; next(value).evaluate(context.clone())? }
+            }
         })
     }
     /// Generated native body bridge. Locals are fresh and resources remain owned by this evaluation.

@@ -21,6 +21,7 @@ use effect::{
     KeySegment, ParseLimits, ScheduledTask, SchemaIssue, SchemaIssueKind, StableKey, TaskSpawner,
     TestWallClock, UtcMillis, json_bytes, json_string,
 };
+use effect::{codec, effect_map, effect_try_sync, rpc_operation};
 use futures_executor::block_on;
 use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -53,16 +54,15 @@ impl ClusterExecutor<Environment> for WorkflowExecutor {
         encoded_request: Arc<[u8]>,
     ) -> Effect<SavedReply, Self::Error, Environment> {
         if address.entity.as_bytes() != self.handle.run.as_bytes() {
-            return Effect::fail_with(|| effect::cluster::ClusterWorkflowError::InputConsumed);
+            return effect_try_sync! { body: { let __dsl_error = || effect::cluster::ClusterWorkflowError::InputConsumed; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
         }
-        ClusterWorkflowEngine::dispatch(WorkflowCommand::Start {
+        effect_map! { program: ClusterWorkflowEngine::dispatch(WorkflowCommand::Start {
             handle: self.handle.clone(),
             input: encoded_request,
-        })
-        .map(|_| SavedReply {
+        }), map: |_| SavedReply {
             kind: ReplyKind::Success,
             payload: Arc::from(&b"accepted"[..]),
-        })
+        }, }
     }
 }
 
@@ -153,90 +153,91 @@ fn cancel_operation(
     effect::workflow::WorkflowReply,
     effect::cluster::ClusterWorkflowError<WorkflowEngineError>,
 > {
-    let request = json_bytes(None).transform(
-        |bytes| {
-            StableKey::<Domain>::from_encoded(Arc::from(bytes))
-                .map(WorkflowRunId::from_stable)
-                .map(|run| WorkflowCommand::Cancel { run })
-                .map_err(|_| SchemaIssue::new(SchemaIssueKind::InvalidTag))
-        },
-        |command| match command {
-            WorkflowCommand::Cancel { run } => Ok(run.as_bytes().to_vec()),
-            _ => Err(SchemaIssue::new(SchemaIssueKind::InvalidTag)),
-        },
-    );
-    let success = json_string().transform(
-        |name| {
-            let outcome = match name.as_str() {
-                "cancelled" => CancellationOutcome::Cancelled,
-                "already-cancelled" => CancellationOutcome::AlreadyCancelled,
-                "active" => CancellationOutcome::Active,
-                "already-completed" => CancellationOutcome::AlreadyCompleted,
-                _ => return Err(SchemaIssue::new(SchemaIssueKind::InvalidTag)),
-            };
-            Ok(effect::workflow::WorkflowReply::Cancellation(outcome))
-        },
-        |reply| match reply {
-            effect::workflow::WorkflowReply::Cancellation(outcome) => Ok(match outcome {
+    let request = codec! { transform_pure; source: json_bytes(None), decode: |bytes| {
+        StableKey::<Domain>::from_encoded(Arc::from(bytes))
+            .map(WorkflowRunId::from_stable)
+            .map(|run| WorkflowCommand::Cancel { run })
+            .map_err(|_| SchemaIssue::new(SchemaIssueKind::InvalidTag))
+    }, encode: |command| {
+        if let WorkflowCommand::Cancel { run } = command {
+            Ok(run.as_bytes().to_vec())
+        } else {
+            Err(SchemaIssue::new(SchemaIssueKind::InvalidTag))
+        }
+    }, };
+    let success = codec! { transform_pure; source: json_string(), decode: |name| {
+        let outcome = match name.as_str() {
+            "cancelled" => CancellationOutcome::Cancelled,
+            "already-cancelled" => CancellationOutcome::AlreadyCancelled,
+            "active" => CancellationOutcome::Active,
+            "already-completed" => CancellationOutcome::AlreadyCompleted,
+            _ => return Err(SchemaIssue::new(SchemaIssueKind::InvalidTag)),
+        };
+        Ok(effect::workflow::WorkflowReply::Cancellation(outcome))
+    }, encode: |reply| {
+        if let effect::workflow::WorkflowReply::Cancellation(outcome) = reply {
+            Ok(match outcome {
                 CancellationOutcome::Cancelled => "cancelled",
                 CancellationOutcome::AlreadyCancelled => "already-cancelled",
                 CancellationOutcome::Active => "active",
                 CancellationOutcome::AlreadyCompleted => "already-completed",
             }
-            .to_owned()),
-            _ => Err(SchemaIssue::new(SchemaIssueKind::InvalidTag)),
-        },
-    );
-    let domain_error = json_string().transform(
-        |name| {
-            use WorkflowEngineError as Error;
-            let error = match name.as_str() {
-                "InputConsumed" => return Ok(effect::cluster::ClusterWorkflowError::InputConsumed),
-                "Engine(DefinitionConflict)" => Error::DefinitionConflict,
-                "Engine(RunConflict)" => Error::RunConflict,
-                "Engine(MissingRun)" => Error::MissingRun,
-                "Engine(DefinitionMismatch)" => Error::DefinitionMismatch,
-                "Engine(TerminalRun)" => Error::TerminalRun,
-                "Engine(ActivityConflict)" => Error::ActivityConflict,
-                "Engine(ActivityAttemptConflict)" => Error::ActivityAttemptConflict,
-                "Engine(SignalConflict)" => Error::SignalConflict,
-                "Engine(CompensationConflict)" => Error::CompensationConflict,
-                "Engine(RaceConflict)" => Error::RaceConflict,
-                "Engine(RaceWinnerMissing)" => Error::RaceWinnerMissing,
-                "Engine(ChildConflict)" => Error::ChildConflict,
-                "Engine(StateConflict)" => Error::StateConflict,
-                "Engine(InputConsumed)" => Error::InputConsumed,
-                "Engine(InvalidTransition)" => Error::InvalidTransition,
-                "Engine(EngineShutdown)" => Error::EngineShutdown,
-                "Engine(MigrationConflict)" => Error::MigrationConflict,
-                _ => return Err(SchemaIssue::new(SchemaIssueKind::InvalidTag)),
-            };
-            Ok(effect::cluster::ClusterWorkflowError::Engine(error))
-        },
-        |error| Ok(format!("{error:?}")),
-    );
-    RpcOperation::unary(id, version, request, success, domain_error, limits)
+            .to_owned())
+        } else {
+            Err(SchemaIssue::new(SchemaIssueKind::InvalidTag))
+        }
+    }, };
+    let domain_error = codec! { transform_pure; source: json_string(), decode: |name| {
+        use WorkflowEngineError as Error;
+        let error = match name.as_str() {
+            "InputConsumed" => return Ok(effect::cluster::ClusterWorkflowError::InputConsumed),
+            "Engine(DefinitionConflict)" => Error::DefinitionConflict,
+            "Engine(RunConflict)" => Error::RunConflict,
+            "Engine(MissingRun)" => Error::MissingRun,
+            "Engine(DefinitionMismatch)" => Error::DefinitionMismatch,
+            "Engine(TerminalRun)" => Error::TerminalRun,
+            "Engine(ActivityConflict)" => Error::ActivityConflict,
+            "Engine(ActivityAttemptConflict)" => Error::ActivityAttemptConflict,
+            "Engine(SignalConflict)" => Error::SignalConflict,
+            "Engine(CompensationConflict)" => Error::CompensationConflict,
+            "Engine(RaceConflict)" => Error::RaceConflict,
+            "Engine(RaceWinnerMissing)" => Error::RaceWinnerMissing,
+            "Engine(ChildConflict)" => Error::ChildConflict,
+            "Engine(StateConflict)" => Error::StateConflict,
+            "Engine(InputConsumed)" => Error::InputConsumed,
+            "Engine(InvalidTransition)" => Error::InvalidTransition,
+            "Engine(EngineShutdown)" => Error::EngineShutdown,
+            "Engine(MigrationConflict)" => Error::MigrationConflict,
+            _ => return Err(SchemaIssue::new(SchemaIssueKind::InvalidTag)),
+        };
+        Ok(effect::cluster::ClusterWorkflowError::Engine(error))
+    }, encode: |error| Ok(format!("{error:?}")), };
+    rpc_operation! { id: id, version: version, request: request, success: success, error: domain_error, limits: limits,  }
 }
 
 #[test]
-fn accepted_cluster_request_drives_workflow_and_records_reply() {
-    let limit = NonZeroUsize::new(1).unwrap();
-    let namespace = KeyNamespace::<Domain>::new("workflow").unwrap();
+fn accepted_cluster_request_drives_workflow_and_records_reply() -> Result<(), String> {
+    let limit = NonZeroUsize::MIN;
+    let namespace = KeyNamespace::<Domain>::new("workflow")
+        .map_err(|error| format!("workflow namespace: {error:?}"))?;
     let key = |name: &'static str| {
-        StableKey::new(&namespace, [KeySegment::Text(Arc::from(name))]).unwrap()
+        StableKey::new(&namespace, [KeySegment::Text(Arc::from(name))])
+            .map_err(|error| format!("{name} identity: {error:?}"))
     };
-    let run = WorkflowRunId::from_stable(key("run"));
-    let definition = WorkflowDefinitionId::new("cluster-workflow").unwrap();
-    let version = WorkflowVersion::new(NonZeroU32::new(1).unwrap());
+    let run = WorkflowRunId::from_stable(key("run")?);
+    let definition = WorkflowDefinitionId::new("cluster-workflow")
+        .map_err(|error| format!("cluster workflow: {error:?}"))?;
+    let version = WorkflowVersion::new(NonZeroU32::MIN);
     let handle = WorkflowHandle {
         run: run.clone(),
         definition: definition.clone(),
         version,
     };
     let address = ClusterAddress {
-        entity_type: ClusterEntityType::new("workflow").unwrap(),
-        entity: ClusterEntityId::from_stable(key("run")),
-        shard: effect::cluster::ClusterShardId::from_stable(key("shard")),
+        entity_type: ClusterEntityType::new("workflow")
+            .map_err(|error| format!("workflow entity type: {error:?}"))?,
+        entity: ClusterEntityId::from_stable(key("run")?),
+        shard: effect::cluster::ClusterShardId::from_stable(key("shard")?),
     };
     let store = Arc::new(MemoryClusterMessageStore::new(
         MessageStoreCapacity::Bounded(limit),
@@ -254,7 +255,7 @@ fn accepted_cluster_request_drives_workflow_and_records_reply() {
         version,
         compatibility: Arc::from(&b"v1"[..]),
     };
-    let request_id = ClusterRequestId::from_stable(key("request"));
+    let request_id = ClusterRequestId::from_stable(key("request")?);
     let accepted = AcceptedRequest {
         address: address.clone(),
         id: request_id.clone(),
@@ -265,25 +266,24 @@ fn accepted_cluster_request_drives_workflow_and_records_reply() {
             dedup_retention: Duration::ZERO,
             reply_retention: Duration::ZERO,
             payload_conflict: PayloadConflictPolicy::Reject,
-            maximum_attempts: NonZeroU32::new(2).unwrap(),
+            maximum_attempts: NonZeroU32::MIN.saturating_add(1),
         },
     };
     assert!(matches!(
         block_on(store.accept(accepted).run(Arc::new(()))),
         Exit::Success(MessageAcceptance::Accepted { .. })
     ));
-    let lease = match block_on(
+    let Exit::Success(ActivationOutcome::Activated { lease, .. }) = block_on(
         store
             .activate(
                 address.clone(),
-                ActivationId::from_stable(key("activation")),
+                ActivationId::from_stable(key("activation")?),
                 UtcMillis::new(1),
                 UtcMillis::new(10),
             )
             .run(Arc::new(())),
-    ) {
-        Exit::Success(ActivationOutcome::Activated { lease, .. }) => lease,
-        _ => panic!("activation failed"),
+    ) else {
+        return Err(String::from("workflow activation must succeed"));
     };
     let claim = ClaimOptions {
         owner: lease.owner.clone(),
@@ -320,7 +320,7 @@ fn accepted_cluster_request_drives_workflow_and_records_reply() {
         matches!(block_on(store.inspect(address.clone(), request_id).run(Arc::new(()))), Exit::Success(Some(message)) if matches!(message.state, SavedMessageState::Completed { .. }))
     );
 
-    let wire_limit = NonZeroUsize::new(512).unwrap();
+    let wire_limit = NonZeroUsize::MIN.saturating_add(511);
     let wire_policy = RpcEnvelopePolicy {
         frame: FramePolicy {
             maximum_payload: wire_limit,
@@ -333,32 +333,33 @@ fn accepted_cluster_request_drives_workflow_and_records_reply() {
             issues: wire_limit,
         },
     };
-    let operation_id = OperationId::new("cancel-workflow").unwrap();
+    let operation_id = OperationId::new("cancel-workflow")
+        .map_err(|error| format!("cancel operation: {error:?}"))?;
     let rpc_version = RpcVersion::new(NonZeroU32::MIN);
     let operation = cancel_operation(operation_id.clone(), rpc_version, wire_policy.json);
     let request_payload = operation
         .request_codec()
         .encode_ref(&WorkflowCommand::Cancel { run: run.clone() })
-        .unwrap();
+        .map_err(|error| format!("cancel command encoding: {error:?}"))?;
     let encoded_request = RpcEnvelope {
         operation: operation_id,
         version: rpc_version,
-        call: RpcCallId::new("cancel-call").unwrap(),
+        call: RpcCallId::new("cancel-call").map_err(|error| format!("cancel call: {error:?}"))?,
         kind: RpcEnvelopeKind::Request,
         sequence: None,
         payload: request_payload,
         metadata: BTreeMap::new(),
     }
     .encode(wire_policy)
-    .unwrap()
+    .map_err(|error| format!("cancel envelope: {error:?}"))?
     .into_bytes()
-    .unwrap();
+    .map_err(|error| format!("cancel frame: {error:?}"))?;
     let dispatcher = ClusterWorkflowEngine::dispatcher::<EncodedEnvironment>(
         wire_policy,
         address.entity_type.clone(),
         operation,
     )
-    .unwrap();
+    .map_err(|error| format!("workflow dispatcher: {error:?}"))?;
     let encoded_store = Arc::new(MemoryClusterMessageStore::new(
         MessageStoreCapacity::Bounded(limit),
     ));
@@ -369,7 +370,7 @@ fn accepted_cluster_request_drives_workflow_and_records_reply() {
         tasks: Threads,
         clock: TestWallClock::new(UtcMillis::new(1)),
     });
-    let cancel_request = ClusterRequestId::from_stable(key("cancel-request"));
+    let cancel_request = ClusterRequestId::from_stable(key("cancel-request")?);
     assert!(matches!(
         block_on(
             encoded_store
@@ -390,18 +391,21 @@ fn accepted_cluster_request_drives_workflow_and_records_reply() {
         ),
         Exit::Success(MessageAcceptance::Accepted { .. })
     ));
-    let cancel_lease = match block_on(
+    let Exit::Success(ActivationOutcome::Activated {
+        lease: cancel_lease,
+        ..
+    }) = block_on(
         encoded_store
             .activate(
                 address.clone(),
-                ActivationId::from_stable(key("cancel-activation")),
+                ActivationId::from_stable(key("cancel-activation")?),
                 UtcMillis::new(1),
                 UtcMillis::new(10),
             )
             .run(Arc::new(())),
-    ) {
-        Exit::Success(ActivationOutcome::Activated { lease, .. }) => lease,
-        _ => panic!("encoded activation failed"),
+    )
+    else {
+        return Err(String::from("encoded activation must succeed"));
     };
     let cancel_claim = ClaimOptions {
         owner: cancel_lease.owner,
@@ -413,26 +417,32 @@ fn accepted_cluster_request_drives_workflow_and_records_reply() {
         block_on(ClusterRunner::run_once(cancel_claim, limit).run(encoded_environment)),
         Exit::Success(outcomes) if matches!(outcomes.as_slice(), [Ok(outcome)] if outcome.completion == StoreCompletion::Completed && outcome.request == cancel_request)
     ));
-    let saved = match block_on(
+    let Exit::Success(Some(saved)) = block_on(
         encoded_store
             .inspect(address, cancel_request)
             .run(Arc::new(())),
-    ) {
-        Exit::Success(Some(message)) => message,
-        _ => panic!("encoded reply missing"),
+    ) else {
+        return Err(String::from("encoded reply must be saved"));
     };
     let SavedMessageState::Completed { reply, .. } = saved.state else {
-        panic!("encoded reply not completed");
+        return Err(String::from("encoded reply must be completed"));
     };
     assert_eq!(reply.kind, ReplyKind::Success);
     let mut frames = FrameDecoder::new(wire_policy.frame);
-    let decoded_frames = frames.push(&reply.payload).unwrap();
-    frames.finish().unwrap();
-    let reply_envelope = RpcEnvelope::decode(&decoded_frames[0], wire_policy).unwrap();
+    let decoded_frames = frames
+        .push(&reply.payload)
+        .map_err(|error| format!("reply frames: {error:?}"))?;
+    frames
+        .finish()
+        .map_err(|error| format!("reply framing: {error:?}"))?;
+    let first = decoded_frames.first().ok_or("missing reply frame")?;
+    let reply_envelope = RpcEnvelope::decode(first, wire_policy)
+        .map_err(|error| format!("reply envelope: {error:?}"))?;
     assert_eq!(reply_envelope.kind, RpcEnvelopeKind::Success);
     assert_eq!(reply_envelope.payload, JsonValue::from("cancelled"));
     assert!(matches!(
         block_on(engine.inspect(run).run(Arc::new(()))),
         Exit::Success(Some(snapshot)) if snapshot.status == WorkflowStatus::Cancelled
     ));
+    Ok(())
 }

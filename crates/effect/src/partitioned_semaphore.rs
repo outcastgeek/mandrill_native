@@ -1,5 +1,6 @@
 //! Per-key admission with shared permit ownership.
 
+use crate::effect_sync;
 use crate::internal::runtime;
 use crate::{
     CleanupFailure, Defect, Effect, Exit, Finalization, PrimaryOutcome, Semaphore, SemaphoreError,
@@ -88,7 +89,7 @@ impl<K: Ord + Send + 'static> PartitionedSemaphore<K> {
     pub fn make<R: Send + Sync + 'static>(
         capacity_per_partition: NonZeroUsize,
     ) -> Effect<Self, SemaphoreError, R> {
-        Effect::sync(move || Self::new(capacity_per_partition))
+        effect_sync! { body: move || Self::new(capacity_per_partition), }
     }
 
     /// Move one key into the first started execution. A reusable recipe uses

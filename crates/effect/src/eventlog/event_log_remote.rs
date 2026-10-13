@@ -7,6 +7,10 @@ use super::{
     JournalStream, ReplicaCursorAdvance, ReplicaCursorKey, ReplicaCursorStore,
 };
 use crate::{Effect, KeyDomain, StableKey};
+use crate::{
+    effect, effect_map, effect_map_error, effect_provide_some, effect_sync, effect_try_sync,
+    service,
+};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -482,11 +486,15 @@ impl EventReplicator {
     where
         R: HasReplicaConflictHandler + Send + Sync + 'static,
     {
-        Effect::service(|env: &R| env.replica_conflict_handler()).flat_map(move |handler| {
-            handler
-                .handle(batch.clone(), conflict.clone())
-                .provide_some(|_: &R| ())
-        })
+        effect! {
+        bind;
+        program: service! { env: |env: &R| env.replica_conflict_handler(), },
+        body: move |handler| {
+                   effect_provide_some! {
+                       program: handler
+                       .handle(batch.clone(), conflict.clone()), project: |_: &R| (), }
+               },
+        }
     }
 
     /// Read one bounded page from a source journal. The receiver imports it
@@ -513,25 +521,32 @@ impl EventReplicator {
     where
         R: HasEventJournal + Send + Sync + 'static,
     {
-        Effect::service(|env: &R| env.event_journal()).flat_map(move |journal| {
+        effect! {
+            bind;
+            program: service! { env: |env: &R| env.event_journal(), },
+            body: move |journal| {
             let source = source.clone();
             let stream = stream.clone();
-            journal
-                .read(stream.clone(), after, limit)
-                .map_error(ReplicaExportError::Journal)
-                .provide_some(|_: &R| ())
-                .flat_map(move |read| match read {
+            effect! {
+                bind;
+                program: effect_provide_some! {
+                    program: effect_map_error! {
+                    program: journal
+                    .read(stream.clone(), after, limit), map: ReplicaExportError::Journal, }, project: |_: &R| (), },
+                body: move |read| match read {
                     JournalReadOutcome::HistoryTruncated { first_available } => {
-                        Effect::sync(move || ReplicaExport::HistoryTruncated { first_available })
+                        effect_sync! { body: move || ReplicaExport::HistoryTruncated { first_available }, }
                     }
                     JournalReadOutcome::CursorAhead { head } => {
-                        Effect::sync(move || ReplicaExport::CursorAhead { head })
+                        effect_sync! { body: move || ReplicaExport::CursorAhead { head }, }
                     }
                     JournalReadOutcome::Complete(read) => {
                         if let Err(issue) = validate_journal_read(&read, &stream, after, limit) {
-                            return Effect::from_result_once(Err(
+                            return effect_try_sync! {
+                                once; body: {
+                                let __dsl_result = Err(
                                 ReplicaExportError::InvalidJournalRead(issue),
-                            ));
+                            ); move || __dsl_result }, on_error: ::core::convert::identity, };
                         }
                         let batch = ReplicaBatch::new(
                             source.clone(),
@@ -541,13 +556,17 @@ impl EventReplicator {
                             limit,
                         )
                         .map_err(ReplicaExportError::InvalidJournalBatch);
-                        Effect::from_result_once(batch.map(|batch| ReplicaExport::Batch {
+                        effect_try_sync! {
+                            once; body: {
+                            let __dsl_result = batch.map(|batch| ReplicaExport::Batch {
                             batch,
                             has_more: read.has_more,
-                        }))
+                        }); move || __dsl_result }, on_error: ::core::convert::identity, }
                     }
-                })
-        })
+                },
+            }
+            },
+        }
     }
 
     /// Lazily import an authorized bounded batch and conditionally advance its source cursor.
@@ -564,9 +583,11 @@ impl EventReplicator {
         R: HasEventJournal + HasReplicaCursorStore + Send + Sync + 'static,
     {
         if !permit.accepts(&batch) {
-            return Effect::from_result_once(Err(ReplicaSyncError::Import(
+            return effect_try_sync! {
+                once; body: {
+                let __dsl_result = Err(ReplicaSyncError::Import(
                 ReplicaImportError::Unauthorized,
-            )));
+            )); move || __dsl_result }, on_error: ::core::convert::identity, };
         }
         let key = ReplicaCursorKey {
             source: batch.source.clone(),
@@ -578,38 +599,42 @@ impl EventReplicator {
             .last()
             .map(|entry| JournalCursor::new(entry.sequence.get()))
             .unwrap_or(expected);
-        Effect::service(|env: &R| env.replica_cursor_store()).flat_map(move |store| {
-            let key_for_read = key.clone();
-            let key_for_import = key.clone();
-            let batch = batch.clone();
-            let permit = permit.clone();
-            store
-                .load(key.clone())
-                .map_error(move |source| ReplicaSyncError::CursorRead {
-                    key: key_for_read.clone(),
-                    source,
-                })
-                .provide_some(|_: &R| ())
-                .flat_map(move |current| {
-                    if current == last {
-                        return Effect::sync(move || ReplicaSync::Applied {
-                            cursor: current,
-                            count: usize::default(),
-                        });
-                    }
-                    if current != expected {
-                        return Effect::sync(move || ReplicaSync::CursorConflict {
-                            actual: current,
-                        });
-                    }
-                    Self::import::<R>(batch.clone(), permit.clone())
-                        .map_error(ReplicaSyncError::Import)
-                        .flat_map({
-                            let key = key_for_import.clone();
-                            move |imported| acknowledge_import::<R>(key.clone(), expected, imported)
-                        })
-                })
-        })
+        effect! {
+        bind;
+        program: service! { env: |env: &R| env.replica_cursor_store(), },
+        body: move |store| {
+                   let key_for_read = key.clone();
+                   let key_for_import = key.clone();
+                   let batch = batch.clone();
+                   let permit = permit.clone();
+                   effect! {
+        bind;
+        program: effect_provide_some! {
+            program: effect_map_error! {
+            program: store
+                       .load(key.clone()), map: move |source| ReplicaSyncError::CursorRead {
+                           key: key_for_read.clone(),
+                           source,
+                       }, }, project: |_: &R| (), },
+        body: move |current| {
+                           if current == last {
+                               return effect_sync! {
+                                   body: move || ReplicaSync::Applied {
+                                   cursor: current,
+                                   count: usize::default(),
+                               }, };
+                           }
+                           if current != expected {
+                               return effect_sync! {
+                                   body: move || ReplicaSync::CursorConflict {
+                                   actual: current,
+                               }, };
+                           }
+                           { let __dsl_program = effect_map_error! { program: Self::import::<R>(batch.clone(), permit.clone()), map: ReplicaSyncError::Import, }; let key = key_for_import.clone(); effect! { let __dsl_program = __dsl_program.clone(); let key = key.clone(); let imported = __dsl_program?; acknowledge_import::<R>(key.clone(), expected, imported)? } }
+                       },
+        }
+               },
+        }
     }
 
     /// Lazily import an authorized ordered batch into the existing journal authority.
@@ -625,7 +650,7 @@ impl EventReplicator {
         R: HasEventJournal + Send + Sync + 'static,
     {
         if !permit.accepts(&batch) {
-            return Effect::from_result_once(Err(ReplicaImportError::Unauthorized));
+            return effect_try_sync! { once; body: { let __dsl_result = Err(ReplicaImportError::Unauthorized); move || __dsl_result }, on_error: ::core::convert::identity, };
         }
         if batch.entries.len() > batch.maximum_entries.get()
             || batch
@@ -633,21 +658,25 @@ impl EventReplicator {
                 .iter()
                 .any(|entry| entry.event.stream() != batch.stream)
         {
-            return Effect::sync(|| ReplicaImport::InvalidBatch);
+            return effect_sync! { body: || ReplicaImport::InvalidBatch, };
         }
         let mut expected = batch.after.value();
         for entry in batch.entries.iter() {
             let Some(next) = expected.checked_add(1) else {
-                return Effect::sync(|| ReplicaImport::InvalidBatch);
+                return effect_sync! { body: || ReplicaImport::InvalidBatch, };
             };
             if entry.sequence.get() != next {
-                return Effect::sync(|| ReplicaImport::InvalidBatch);
+                return effect_sync! { body: || ReplicaImport::InvalidBatch, };
             }
             expected = next;
         }
-        Effect::service(|env: &R| env.event_journal()).flat_map(move |journal| {
-            import_step(journal, Arc::clone(&batch.entries), 0, batch.after, 0)
-        })
+        effect! {
+        bind;
+        program: service! { env: |env: &R| env.event_journal(), },
+        body: move |journal| {
+                   import_step(journal, Arc::clone(&batch.entries), 0, batch.after, 0)
+               },
+        }
     }
 }
 
@@ -672,31 +701,35 @@ where
     R: HasReplicaCursorStore + HasEventJournal + Send + Sync + 'static,
 {
     if let ReplicaImport::Applied { cursor, count } = imported {
-        Effect::service(|env: &R| env.replica_cursor_store()).flat_map(move |store| {
-            store
-                .advance(key.clone(), expected, cursor)
-                .map_error({
-                    let error_key = key.clone();
-                    move |source| ReplicaSyncError::UncertainCursorAdvance {
-                        key: error_key.clone(),
-                        expected,
-                        next: cursor,
-                        source,
-                    }
-                })
-                .provide_some(|_: &R| ())
-                .map(move |result| match result {
-                    ReplicaCursorAdvance::Advanced(cursor)
-                    | ReplicaCursorAdvance::AlreadyAdvanced(cursor) => {
-                        ReplicaSync::Applied { cursor, count }
-                    }
-                    ReplicaCursorAdvance::Conflict(actual) => {
-                        ReplicaSync::CursorConflict { actual }
-                    }
-                })
-        })
+        {
+            let __dsl_program = service! { env: |env: &R| env.replica_cursor_store(), };
+            effect! {
+                let __dsl_program = __dsl_program.clone(); let key = key.clone(); let store = __dsl_program?; {
+                effect_map! {
+                    program: effect_provide_some! {
+                    program: effect_map_error! {
+                    program: store
+                    .advance(key.clone(), expected, cursor), map: {
+                        let error_key = key.clone();
+                        move |source| ReplicaSyncError::UncertainCursorAdvance {
+                            key: error_key.clone(),
+                            expected,
+                            next: cursor,
+                            source,
+                        }
+                    }, }, project: |_: &R| (), }, map: move |result| match result {
+                        ReplicaCursorAdvance::Advanced(cursor)
+                        | ReplicaCursorAdvance::AlreadyAdvanced(cursor) => {
+                            ReplicaSync::Applied { cursor, count }
+                        }
+                        ReplicaCursorAdvance::Conflict(actual) => {
+                            ReplicaSync::CursorConflict { actual }
+                        }
+                    }, }
+            }? }
+        }
     } else {
-        Effect::sync_once(move || ReplicaSync::Pending(imported))
+        effect_sync! { once; body: move || ReplicaSync::Pending(imported), }
     }
 }
 
@@ -725,88 +758,97 @@ where
     R: HasEventJournal + Send + Sync + 'static,
 {
     let Some(entry) = entries.get(index).cloned() else {
-        return Effect::sync(move || ReplicaImport::Applied { cursor, count });
+        return effect_sync! { body: move || ReplicaImport::Applied { cursor, count }, };
     };
     let predecessor = JournalCursor::new(entry.sequence.get() - 1);
     let event_id = entry.event.id.clone();
-    journal
-        .append(entry.event.clone(), predecessor)
-        .map_error(move |source| ReplicaImportError::UncertainAppend {
-            event: event_id.clone(),
-            source,
-        })
-        .provide_some(|_: &R| ())
-        .flat_map(move |receipt| match receipt {
-            AppendReceipt::Accepted { event } => {
-                if event != entry.event.id {
-                    let event = entry.event.id.clone();
-                    Effect::sync_once(move || ReplicaImport::ConflictingEvent { event })
-                } else {
-                    let inspect_event = event.clone();
-                    let journal_for_inspection = Arc::clone(&journal);
-                    let entries_for_inspection = Arc::clone(&entries);
-                    let entry_for_inspection = entry.clone();
-                    journal
-                        .inspect(entry.event.stream(), event.clone())
-                        .map_error(move |source| ReplicaImportError::UncertainInspection {
-                            event: inspect_event.clone(),
-                            source,
-                        })
-                        .provide_some(|_: &R| ())
-                        .flat_map(move |inspection| match inspection {
-                            EventInspection::Present(actual) => continue_import::<R>(
-                                Arc::clone(&journal_for_inspection),
-                                Arc::clone(&entries_for_inspection),
-                                index,
-                                count,
-                                entry_for_inspection.clone(),
-                                actual,
-                            ),
-                            EventInspection::Compacted => {
-                                let event = event.clone();
-                                Effect::sync_once(move || ReplicaImport::CompactedEvent { event })
-                            }
-                            EventInspection::Missing => {
-                                let event = event.clone();
-                                Effect::sync_once(move || ReplicaImport::AcceptedPending {
-                                    event,
-                                    cursor,
-                                })
-                            }
-                        })
-                }
-            }
-            AppendReceipt::Decided(AppendDecision::Committed(actual))
-            | AppendReceipt::Decided(AppendDecision::Duplicate(actual)) => continue_import::<R>(
-                Arc::clone(&journal),
-                Arc::clone(&entries),
-                index,
-                count,
-                entry.clone(),
-                actual,
-            ),
-            AppendReceipt::Decided(AppendDecision::ConflictingEventId) => {
-                let event = entry.event.id.clone();
-                Effect::sync_once(move || ReplicaImport::ConflictingEvent { event })
-            }
-            AppendReceipt::Decided(AppendDecision::CompactedEventId) => {
-                let event = entry.event.id.clone();
-                Effect::sync_once(move || ReplicaImport::CompactedEvent { event })
-            }
-            AppendReceipt::Decided(AppendDecision::StaleCursor { actual }) => {
-                if actual.value() < predecessor.value() {
-                    Effect::sync(move || ReplicaImport::Gap {
-                        expected: predecessor,
-                        actual,
-                    })
-                } else {
-                    Effect::sync(move || ReplicaImport::Diverged {
-                        expected: predecessor,
-                        actual,
-                    })
-                }
-            }
-        })
+    effect! {
+    bind;
+    program: effect_provide_some! {
+        program: effect_map_error! {
+        program: journal
+           .append(entry.event.clone(), predecessor), map: move |source| ReplicaImportError::UncertainAppend {
+               event: event_id.clone(),
+               source,
+           }, }, project: |_: &R| (), },
+    body: move |receipt| match receipt {
+               AppendReceipt::Accepted { event } => {
+                   if event != entry.event.id {
+                       let event = entry.event.id.clone();
+                       effect_sync! { once; body: move || ReplicaImport::ConflictingEvent { event }, }
+                   } else {
+                       let inspect_event = event.clone();
+                       let journal_for_inspection = Arc::clone(&journal);
+                       let entries_for_inspection = Arc::clone(&entries);
+                       let entry_for_inspection = entry.clone();
+                       effect! {
+    bind;
+    program: effect_provide_some! {
+        program: effect_map_error! {
+        program: journal
+                           .inspect(entry.event.stream(), event.clone()), map: move |source| ReplicaImportError::UncertainInspection {
+                               event: inspect_event.clone(),
+                               source,
+                           }, }, project: |_: &R| (), },
+    body: move |inspection| match inspection {
+                               EventInspection::Present(actual) => continue_import::<R>(
+                                   Arc::clone(&journal_for_inspection),
+                                   Arc::clone(&entries_for_inspection),
+                                   index,
+                                   count,
+                                   entry_for_inspection.clone(),
+                                   actual,
+                               ),
+                               EventInspection::Compacted => {
+                                   let event = event.clone();
+                                   effect_sync! { once; body: move || ReplicaImport::CompactedEvent { event }, }
+                               }
+                               EventInspection::Missing => {
+                                   let event = event.clone();
+                                   effect_sync! {
+                                       once; body: move || ReplicaImport::AcceptedPending {
+                                       event,
+                                       cursor,
+                                   }, }
+                               }
+                           },
+    }
+                   }
+               }
+               AppendReceipt::Decided(AppendDecision::Committed(actual))
+               | AppendReceipt::Decided(AppendDecision::Duplicate(actual)) => continue_import::<R>(
+                   Arc::clone(&journal),
+                   Arc::clone(&entries),
+                   index,
+                   count,
+                   entry.clone(),
+                   actual,
+               ),
+               AppendReceipt::Decided(AppendDecision::ConflictingEventId) => {
+                   let event = entry.event.id.clone();
+                   effect_sync! { once; body: move || ReplicaImport::ConflictingEvent { event }, }
+               }
+               AppendReceipt::Decided(AppendDecision::CompactedEventId) => {
+                   let event = entry.event.id.clone();
+                   effect_sync! { once; body: move || ReplicaImport::CompactedEvent { event }, }
+               }
+               AppendReceipt::Decided(AppendDecision::StaleCursor { actual }) => {
+                   if actual.value() < predecessor.value() {
+                       effect_sync! {
+                           body: move || ReplicaImport::Gap {
+                           expected: predecessor,
+                           actual,
+                       }, }
+                   } else {
+                       effect_sync! {
+                           body: move || ReplicaImport::Diverged {
+                           expected: predecessor,
+                           actual,
+                       }, }
+                   }
+               }
+           },
+    }
 }
 
 ///
@@ -837,17 +879,18 @@ where
 {
     if actual.event != expected.event {
         let event = expected.event.id.clone();
-        return Effect::sync_once(move || ReplicaImport::ConflictingEvent { event });
+        return effect_sync! { once; body: move || ReplicaImport::ConflictingEvent { event }, };
     }
     if actual.sequence != expected.sequence {
         let predecessor = JournalCursor::new(expected.sequence.get() - 1);
-        return Effect::sync(move || ReplicaImport::Diverged {
+        return effect_sync! {
+            body: move || ReplicaImport::Diverged {
             expected: predecessor,
             actual: JournalCursor::new(actual.sequence.get()),
-        });
+        }, };
     }
     let (Some(next_index), Some(next_count)) = (index.checked_add(1), count.checked_add(1)) else {
-        return Effect::sync(|| ReplicaImport::InvalidBatch);
+        return effect_sync! { body: || ReplicaImport::InvalidBatch, };
     };
     import_step::<R>(
         journal,

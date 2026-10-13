@@ -6,6 +6,7 @@ use super::{
     JournalEntry, JournalReadOutcome, JournalReadViolation, JournalStream,
 };
 use crate::{Effect, KeyDomain, StableKey};
+use crate::{effect, effect_map_error, effect_provide_some, effect_sync, effect_try_sync, service};
 use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
@@ -345,152 +346,184 @@ impl<S: Send + Sync + 'static, FoldError: Send + 'static> Projection<S, FoldErro
         R: HasEventJournal + HasAtomicProjectionStore<S> + Send + Sync + 'static,
     {
         let projection = self.clone();
-        Effect::service(|env: &R| env.atomic_projection_store()).flat_map(move |store| {
-            let projection = projection.clone();
-            store
-                .load(projection.key.clone())
-                .map_error(ProjectionAdvanceError::Store)
-                .provide_some(|_: &R| ())
-                .flat_map(move |current| {
-                    let projection = projection.clone();
-                    let store = Arc::clone(&store);
-                    if let Some(snapshot) = &current {
-                        if snapshot.key != projection.key {
-                            return Effect::from_result_once(Err(
-                                ProjectionAdvanceError::ProjectionKeyMismatch {
-                                    expected: projection.key.clone(),
-                                    actual: snapshot.key.clone(),
-                                },
-                            ));
-                        }
-                        if snapshot.version != projection.version {
-                            return Effect::from_result_once(Err(
-                                ProjectionAdvanceError::ProjectionVersionMismatch {
-                                    expected: projection.version,
-                                    actual: snapshot.version,
-                                },
-                            ));
-                        }
-                    }
-                    let stream = projection.key.stream.clone();
-                    let after = current
-                        .as_ref()
-                        .map_or(JournalCursor::new(0), |snapshot| snapshot.checkpoint);
-                    Effect::service(|env: &R| env.event_journal())
-                        .flat_map(move |journal| {
-                            journal
-                                .read(stream.clone(), after, limit)
-                                .map_error(ProjectionAdvanceError::Journal)
-                                .provide_some(|_: &R| ())
-                        })
-                        .flat_map(move |read| {
-                            let current = current.clone();
-                            let read = match read {
-                                JournalReadOutcome::Complete(read) => read,
-                                JournalReadOutcome::HistoryTruncated { first_available } => {
-                                    return Effect::from_result_once(Err(
-                                        ProjectionAdvanceError::HistoryTruncated {
-                                            first_available,
-                                        },
-                                    ));
-                                }
-                                JournalReadOutcome::CursorAhead { head } => {
-                                    return Effect::from_result_once(Err(
-                                        ProjectionAdvanceError::CursorAhead { head },
-                                    ));
-                                }
-                            };
-                            if let Err(issue) =
-                                validate_journal_read(&read, &projection.key.stream, after, limit)
-                            {
-                                return Effect::from_result_once(Err(
-                                    ProjectionAdvanceError::InvalidJournalRead(issue),
-                                ));
-                            }
-                            if read.entries.is_empty() {
-                                let snapshot = current.unwrap_or_else(|| ProjectionSnapshot {
-                                    key: projection.key.clone(),
-                                    version: projection.version,
-                                    checkpoint: after,
-                                    state: Arc::new((projection.initial)()),
-                                });
-                                return Effect::sync_once(move || {
-                                    ProjectionAdvance::Current(snapshot)
-                                });
-                            }
-                            let mut state = current.as_ref().map_or_else(
-                                || Arc::new((projection.initial)()),
-                                |snapshot| Arc::clone(&snapshot.state),
-                            );
-                            for entry in &read.entries {
-                                let key = (entry.event.group.clone(), entry.event.tag.clone());
-                                let Some(expected) = projection.accepted.get(&key) else {
-                                    return Effect::from_result_once(Err(
-                                        ProjectionAdvanceError::UnexpectedEvent {
-                                            group: key.0,
-                                            tag: key.1,
-                                        },
-                                    ));
-                                };
-                                if *expected != entry.event.version {
-                                    return Effect::from_result_once(Err(
-                                        ProjectionAdvanceError::EventVersionMismatch {
-                                            group: key.0,
-                                            tag: key.1,
-                                            expected: *expected,
-                                            actual: entry.event.version,
-                                        },
-                                    ));
-                                }
-                                state = match (projection.fold)(&state, entry) {
-                                    Ok(next) => Arc::new(next),
-                                    Err(error) => {
-                                        return Effect::from_result_once(Err(
-                                            ProjectionAdvanceError::Fold(error),
-                                        ));
-                                    }
-                                };
-                            }
-                            let next = ProjectionSnapshot {
-                                key: projection.key.clone(),
-                                version: projection.version,
-                                checkpoint: read.next,
-                                state,
-                            };
-                            store
-                                .compare_exchange(
-                                    projection.key.clone(),
-                                    current.map(|value| value.checkpoint),
-                                    next,
-                                )
-                                .map_error(ProjectionAdvanceError::Store)
-                                .provide_some(|_: &R| ())
-                                .flat_map({
-                                    let version = projection.version;
-                                    move |outcome| match outcome {
-                                        ProjectionWrite::Committed(snapshot) => {
-                                            Effect::sync_once(move || ProjectionAdvance::Advanced {
-                                                snapshot,
-                                                has_more: read.has_more,
-                                            })
-                                        }
-                                        ProjectionWrite::Conflict(current) => {
-                                            Effect::sync_once(move || {
-                                                ProjectionAdvance::Conflict(current)
-                                            })
-                                        }
-                                        ProjectionWrite::VersionConflict(actual) => {
-                                            Effect::from_result_once(Err(
-                                                ProjectionAdvanceError::ProjectionVersionMismatch {
-                                                    expected: version,
-                                                    actual,
-                                                },
-                                            ))
-                                        }
-                                    }
-                                })
-                        })
-                })
-        })
+        {
+            let __dsl_program = service! { env: |env: &R| env.atomic_projection_store(), };
+            effect! {
+                       let __dsl_program = __dsl_program.clone(); let projection = projection.clone(); let store = __dsl_program.clone()?; {
+                       let projection = projection.clone();
+                       {
+                           let __dsl_program = effect_provide_some! {
+                           program: effect_map_error! {
+                           program: store
+                           .load(projection.key.clone()), map: ProjectionAdvanceError::Store, }, project: |_: &R| (), }; effect! {
+                               let __dsl_program = __dsl_program.clone(); let projection = projection.clone(); let store = store.clone(); let current = __dsl_program.clone()?; (move || {
+                               let projection = projection.clone();
+                               let store = Arc::clone(&store);
+                               if let Some(snapshot) = &current {
+                                   if snapshot.key != projection.key {
+                                       return effect_try_sync! {
+                                           once; body: {
+                                           let __dsl_result = Err(
+                                           ProjectionAdvanceError::ProjectionKeyMismatch {
+                                               expected: projection.key.clone(),
+                                               actual: snapshot.key.clone(),
+                                           },
+                                       ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                   }
+                                   if snapshot.version != projection.version {
+                                       return effect_try_sync! {
+                                           once; body: {
+                                           let __dsl_result = Err(
+                                           ProjectionAdvanceError::ProjectionVersionMismatch {
+                                               expected: projection.version,
+                                               actual: snapshot.version,
+                                           },
+                                       ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                   }
+                               }
+                               let stream = projection.key.stream.clone();
+                               let after = current
+                                   .as_ref()
+                                   .map_or(JournalCursor::new(0), |snapshot| snapshot.checkpoint);
+                               {
+                                   let __dsl_program = {
+                                   let __dsl_program = service! { env: |env: &R| env.event_journal(), }; effect! {
+                                   let stream = stream.clone(); let journal = __dsl_program.clone()?; {
+                                       effect_provide_some! {
+                                           program: effect_map_error! {
+                                           program: journal
+                                           .read(stream.clone(), after, limit), map: ProjectionAdvanceError::Journal, }, project: |_: &R| (), }
+                                   }? } }; effect! {
+                                       let __dsl_program = __dsl_program.clone(); let current = current.clone(); let projection = projection.clone(); let store = store.clone(); let read = __dsl_program.clone()?; (move || {
+                                       let current = current.clone();
+                                       let read = match read {
+                                           JournalReadOutcome::Complete(read) => read,
+                                           JournalReadOutcome::HistoryTruncated { first_available } => {
+                                               return effect_try_sync! {
+                                                   once; body: {
+                                                   let __dsl_result = Err(
+                                                   ProjectionAdvanceError::HistoryTruncated {
+                                                       first_available,
+                                                   },
+                                               ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                           }
+                                           JournalReadOutcome::CursorAhead { head } => {
+                                               return effect_try_sync! {
+                                                   once; body: {
+                                                   let __dsl_result = Err(
+                                                   ProjectionAdvanceError::CursorAhead { head },
+                                               ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                           }
+                                       };
+                                       if let Err(issue) =
+                                           validate_journal_read(&read, &projection.key.stream, after, limit)
+                                       {
+                                           return effect_try_sync! {
+                                               once; body: {
+                                               let __dsl_result = Err(
+                                               ProjectionAdvanceError::InvalidJournalRead(issue),
+                                           ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                       }
+                                       if read.entries.is_empty() {
+                                           let snapshot = current.unwrap_or_else(|| ProjectionSnapshot {
+                                               key: projection.key.clone(),
+                                               version: projection.version,
+                                               checkpoint: after,
+                                               state: Arc::new((projection.initial)()),
+                                           });
+                                           return effect_sync! {
+                                               once; body: move || {
+                                               ProjectionAdvance::Current(snapshot)
+                                           }, };
+                                       }
+                                       let mut state = current.as_ref().map_or_else(
+                                           || Arc::new((projection.initial)()),
+                                           |snapshot| Arc::clone(&snapshot.state),
+                                       );
+                                       for entry in &read.entries {
+                                           let key = (entry.event.group.clone(), entry.event.tag.clone());
+                                           let Some(expected) = projection.accepted.get(&key) else {
+                                               return effect_try_sync! {
+                                                   once; body: {
+                                                   let __dsl_result = Err(
+                                                   ProjectionAdvanceError::UnexpectedEvent {
+                                                       group: key.0,
+                                                       tag: key.1,
+                                                   },
+                                               ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                           };
+                                           if *expected != entry.event.version {
+                                               return effect_try_sync! {
+                                                   once; body: {
+                                                   let __dsl_result = Err(
+                                                   ProjectionAdvanceError::EventVersionMismatch {
+                                                       group: key.0,
+                                                       tag: key.1,
+                                                       expected: *expected,
+                                                       actual: entry.event.version,
+                                                   },
+                                               ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                           }
+                                           state = match (projection.fold)(&state, entry) {
+                                               Ok(next) => Arc::new(next),
+                                               Err(error) => {
+                                                   return effect_try_sync! {
+                                                       once; body: {
+                                                       let __dsl_result = Err(
+                                                       ProjectionAdvanceError::Fold(error),
+                                                   ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                               }
+                                           };
+                                       }
+                                       let next = ProjectionSnapshot {
+                                           key: projection.key.clone(),
+                                           version: projection.version,
+                                           checkpoint: read.next,
+                                           state,
+                                       };
+                                       effect! {
+            bind;
+            program: effect_provide_some! {
+                program: effect_map_error! {
+                program: store
+                                           .compare_exchange(
+                                               projection.key.clone(),
+                                               current.map(|value| value.checkpoint),
+                                               next,
+                                           ), map: ProjectionAdvanceError::Store, }, project: |_: &R| (), },
+            body: {
+                                               let version = projection.version;
+                                               let has_more = read.has_more;
+                                               move |outcome| match outcome {
+                                                   ProjectionWrite::Committed(snapshot) => {
+                                                       effect_sync! {
+                                                           once; body: move || ProjectionAdvance::Advanced {
+                                                           snapshot,
+                                                           has_more,
+                                                       }, }
+                                                   }
+                                                   ProjectionWrite::Conflict(current) => {
+                                                       effect_sync! {
+                                                           once; body: move || {
+                                                           ProjectionAdvance::Conflict(current)
+                                                       }, }
+                                                   }
+                                                   ProjectionWrite::VersionConflict(actual) => {
+                                                       effect_try_sync! {
+                                                           once; body: {
+                                                           let __dsl_result = Err(
+                                                           ProjectionAdvanceError::ProjectionVersionMismatch {
+                                                               expected: version,
+                                                               actual,
+                                                           },
+                                                       ); move || __dsl_result }, on_error: ::core::convert::identity, }
+                                                   }
+                                               }
+                                           },
+            }
+                                   })()? } }
+                           })()? } }
+                   }? }
+        }
     }
 }

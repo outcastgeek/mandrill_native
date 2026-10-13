@@ -3,6 +3,7 @@
 use proc_macro2::TokenStream;
 use quote::quote;
 use std::collections::BTreeMap;
+use syn::bracketed;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::{Expr, Ident, Token};
@@ -25,30 +26,19 @@ impl Parse for Field {
         let name: Ident = input.parse()?;
         let colon = if input.peek(Token![:]) {
             Some(input.parse()?)
-        } else if matches!(
-            name.to_string().as_str(),
-            "body"
-                | "run"
-                | "handler"
-                | "load"
-                | "acquire"
-                | "before"
-                | "after"
-                | "chunk"
-                | "terminal"
-        ) {
+        } else if crate::domain_expand::inline_role(&name.to_string()) {
             None
         } else {
             return Err(input.error("expected `:` after descriptor field"));
         };
         let value = if name == "cases" || name == "bindings" {
             let content;
-            syn::bracketed!(content in input);
+            bracketed!(content in input);
             let tokens: proc_macro2::TokenStream = content.parse()?;
             Expr::Verbatim(quote!([#tokens]))
         } else if name == "handlers" && input.peek(syn::token::Bracket) {
             let content;
-            syn::bracketed!(content in input);
+            bracketed!(content in input);
             let tokens: TokenStream = content.parse()?;
             syn::parse2::<Expr>(quote!([#tokens]))
                 .unwrap_or_else(|_| Expr::Verbatim(quote!([#tokens])))

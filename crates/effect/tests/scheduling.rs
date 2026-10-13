@@ -1,6 +1,5 @@
-use effect::cluster::{
-    ClusterSchedule, ClusterScheduleId, ConcurrentOccurrencePolicy, ScheduleDisposition,
-};
+use effect::cluster::{ClusterScheduleId, ConcurrentOccurrencePolicy, ScheduleDisposition};
+use effect::cluster_schedule;
 use effect::{
     CalendarTransitionPolicy, Cron, CronSearchBudget, DayMatch, FixedOffsetZone, GapPolicy,
     KeyDomain, KeyNamespace, KeySegment, MissedOccurrencePolicy, OverlapPolicy, StableKey,
@@ -16,9 +15,11 @@ impl KeyDomain for Domain {
 }
 
 #[test]
-fn skip_ignores_missed_work_but_keeps_the_occurrence_due_now() {
-    let cron = Cron::parse("0 * * * * *", DayMatch::Both).unwrap();
-    let zone = FixedOffsetZone::east_seconds(0).unwrap();
+fn skip_ignores_missed_work_but_keeps_the_occurrence_due_now() -> Result<(), String> {
+    let cron = Cron::parse("0 * * * * *", DayMatch::Both)
+        .map_err(|error| format!("minute schedule: {error:?}"))?;
+    let zone =
+        FixedOffsetZone::east_seconds(0).map_err(|error| format!("UTC offset: {error:?}"))?;
     let transition = CalendarTransitionPolicy {
         gap: GapPolicy::Skip,
         overlap: OverlapPolicy::Earlier,
@@ -40,9 +41,9 @@ fn skip_ignores_missed_work_but_keeps_the_occurrence_due_now() {
             MissedOccurrencePolicy::Skip,
             budget,
         )
-        .unwrap();
+        .map_err(|error| format!("due occurrence: {error:?}"))?;
     assert_eq!(due.len(), 1);
-    assert_eq!(due[0].instant, due_at);
+    assert_eq!(due.first().ok_or("missing due occurrence")?.instant, due_at);
     assert!(
         cron.due(
             after,
@@ -52,24 +53,21 @@ fn skip_ignores_missed_work_but_keeps_the_occurrence_due_now() {
             MissedOccurrencePolicy::Skip,
             budget,
         )
-        .unwrap()
+        .map_err(|error| format!("missed occurrence: {error:?}"))?
         .is_empty()
     );
 
-    let namespace = KeyNamespace::<Domain>::new("schedules").unwrap();
-    let identity = StableKey::new(&namespace, [KeySegment::Text(Arc::from("one"))]).unwrap();
-    let schedule = ClusterSchedule::new(
-        ClusterScheduleId::from_stable(identity),
-        cron,
-        transition,
-        MissedOccurrencePolicy::Skip,
-        ConcurrentOccurrencePolicy::Allow,
-        Duration::ZERO,
-    );
+    let namespace = KeyNamespace::<Domain>::new("schedules")
+        .map_err(|error| format!("schedule namespace: {error:?}"))?;
+    let identity = StableKey::new(&namespace, [KeySegment::Text(Arc::from("one"))])
+        .map_err(|error| format!("schedule identity: {error:?}"))?;
+    let schedule = cluster_schedule! { id: ClusterScheduleId::from_stable(identity), cron: cron, transitions: transition, catch_up: MissedOccurrencePolicy::Skip, concurrent: ConcurrentOccurrencePolicy::Allow, deadline_after: Duration::ZERO,  };
     let planned = schedule
         .plan_due(after, due_at, &zone, budget, false)
-        .unwrap();
+        .map_err(|error| format!("planned occurrence: {error:?}"))?;
     assert_eq!(planned.len(), 1);
-    assert_eq!(planned[0].id.instant, due_at);
-    assert_eq!(planned[0].disposition, ScheduleDisposition::Dispatch);
+    let planned = planned.first().ok_or("missing planned occurrence")?;
+    assert_eq!(planned.id.instant, due_at);
+    assert_eq!(planned.disposition, ScheduleDisposition::Dispatch);
+    Ok(())
 }

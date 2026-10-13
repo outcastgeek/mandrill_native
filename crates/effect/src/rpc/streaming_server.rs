@@ -5,7 +5,11 @@ use super::{
     RpcStreamSession, RpcWireError,
 };
 use crate::encoding::{FrameDecodeFailure, FrameDecoder};
-use crate::{Effect, JsonValue, Release, SchemaIssue, Scope};
+use crate::{Effect, JsonValue, SchemaIssue};
+use crate::{
+    effect, effect_map_error, effect_provide_some, effect_scope, effect_scope_acquire, effect_sync,
+    effect_try_sync,
+};
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -219,6 +223,29 @@ where
     /// Type: `&RpcStreamOperation<Q, C, T, E>`.
     pub fn operation(&self) -> &RpcStreamOperation<Q, C, T, E> {
         &self.operation
+    }
+
+    /// Project opening and each producer pull through existing Effect provision.
+    /// The request, streaming call context and protocol identity move through their
+    /// original owners; no producer task or independent stream scope is introduced.
+    pub fn provide_some<Outer: Send + Sync + 'static>(
+        self,
+        project: impl Fn(&Outer) -> R + Send + Sync + 'static,
+    ) -> RpcStreamHandler<Q, C, T, E, Outer> {
+        let project = Arc::new(project);
+        RpcStreamHandler::new(self.operation, move |request, context| {
+            let for_open = Arc::clone(&project);
+            let for_pull = Arc::clone(&project);
+            (self.invoke)(request, context)
+                .map(move |producer| {
+                    let project = Arc::clone(&for_pull);
+                    RpcStreamProducer::new(move || {
+                        let project = Arc::clone(&project);
+                        producer.pull().provide_some(move |outer| project(outer))
+                    })
+                })
+                .provide_some(move |outer| for_open(outer))
+        })
     }
 
     /// Invoke the typed operation through its selected channel or handler.
@@ -442,89 +469,98 @@ where
     {
         let server = self.clone();
         let first = first.map(|bytes| Arc::new(Mutex::new(Some(bytes))));
-        Scope::scoped(move |scope| {
-            let accepted = Arc::clone(&accepted);
-            let server = server.clone();
-            let first = first.clone();
-            scope
-                .acquire(
-                    Effect::sync({
-                        let accepted = Arc::clone(&accepted);
-                        move || Arc::clone(&accepted)
-                    }),
-                    |session: Arc<Session>| {
-                        Release::from_effect(
-                            session
-                                .close()
-                                .map_error(RpcStreamServerError::Transport)
-                                .provide_some(|_: &R| ()),
-                        )
-                    },
-                )
-                .flat_map(move |resource| {
+        effect_scope! {
+        body: move |scope| {
+                    let accepted = Arc::clone(&accepted);
                     let server = server.clone();
                     let first = first.clone();
-                    resource.access(Arc::clone).flat_map(move |session| {
-                        let server = server.clone();
-                        let receive = match &first {
-                            Some(first) => match first
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .take()
-                            {
-                                Some(bytes) => Effect::sync_once(move || Some(bytes)),
-                                None => Effect::from_result_once(Err(
-                                    RpcStreamServerError::InputConsumed,
-                                )),
+                    {
+                        let __dsl_program = effect_scope_acquire! {
+        scope: scope, acquire: effect_sync! {
+            body: {
+                                let accepted = Arc::clone(&accepted);
+                                move || Arc::clone(&accepted)
+                            }, }, release: |session: Arc<Session>| {
+                                effect_provide_some! {
+                                    program: effect_map_error! {
+                                    program: session
+                                        .close(), map: RpcStreamServerError::Transport, }, project: |_: &R| (), }
                             },
-                            None => session
-                                .receive_frame()
-                                .map_error(RpcStreamServerError::Transport)
-                                .provide_some(|_: &R| ()),
-                        };
-                        receive.flat_map(move |bytes| {
-                            let Some(bytes) = bytes else {
-                                return Effect::from_result_once(Err(
-                                    RpcStreamServerError::Disconnected,
-                                ));
-                            };
-                            let request =
-                                decode_request(server.handler.operation(), &bytes, server.policy);
-                            match request {
-                                Ok((request, context)) => {
-                                    let call = context.call.clone();
-                                    let operation = server.handler.operation().clone();
-                                    let session = Arc::clone(&session);
-                                    let policy = server.policy;
-                                    server
-                                        .handler
-                                        .call(request, context)
-                                        .either()
-                                        .map_error(RpcStreamServerError::Handler)
-                                        .flat_map(move |result| match result {
-                                            Ok(producer) => serve_pulls(
-                                                Arc::clone(&session),
-                                                operation.clone(),
-                                                producer,
-                                                call.clone(),
-                                                Some(NonZeroU64::MIN),
-                                                policy,
-                                            ),
-                                            Err(error) => send_error(
-                                                Arc::clone(&session),
-                                                operation.clone(),
-                                                call.clone(),
-                                                error,
-                                                policy,
-                                            ),
-                                        })
-                                }
-                                Err(error) => Effect::from_result_once(Err(error)),
-                            }
-                        })
-                    })
-                })
-        })
+        }; effect! {
+            let __dsl_program = __dsl_program.clone(); let first = first.clone(); let server = server.clone(); let resource = __dsl_program.clone()?; {
+                            let server = server.clone();
+                            let first = first.clone();
+                            {
+                                let __dsl_program = resource.access(Arc::clone); effect! {
+                                let __dsl_program = __dsl_program.clone(); let first = first.clone(); let server = server.clone(); let session = __dsl_program.clone()?; {
+                                let server = server.clone();
+                                let receive = match &first {
+                                    Some(first) => match first
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .take()
+                                    {
+                                        Some(bytes) => effect_sync! { once; body: move || Some(bytes), },
+                                        None => effect_try_sync! {
+                                            once; body: {
+                                            let __dsl_result = Err(
+                                            RpcStreamServerError::InputConsumed,
+                                        ); move || __dsl_result }, on_error: ::core::convert::identity, },
+                                    },
+                                    None => effect_provide_some! {
+                                        program: effect_map_error! {
+                                        program: session
+                                        .receive_frame(), map: RpcStreamServerError::Transport, }, project: |_: &R| (), },
+                                };
+                                {
+                                    let __dsl_program = receive; effect! {
+                                    let __dsl_program = __dsl_program.clone(); let server = server.clone(); let session = session.clone(); let bytes = __dsl_program.clone()?; (move || {
+                                    let Some(bytes) = bytes else {
+                                        return effect_try_sync! {
+                                            once; body: {
+                                            let __dsl_result = Err(
+                                            RpcStreamServerError::Disconnected,
+                                        ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                    };
+                                    let request =
+                                        decode_request(server.handler.operation(), &bytes, server.policy);
+                                    match request {
+                                        Ok((request, context)) => {
+                                            let call = context.call.clone();
+                                            let operation = server.handler.operation().clone();
+                                            let session = Arc::clone(&session);
+                                            let policy = server.policy;
+                                            {
+                                                let __dsl_program = effect_map_error! {
+                                                program: server
+                                                .handler
+                                                .call(request, context)
+                                                .either(), map: RpcStreamServerError::Handler, }; effect! {
+                                                    let __dsl_program = __dsl_program.clone(); let call = call.clone(); let operation = operation.clone(); let session = session.clone(); let result = __dsl_program?; match result {
+                                                    Ok(producer) => serve_pulls(
+                                                        Arc::clone(&session),
+                                                        operation.clone(),
+                                                        producer,
+                                                        call.clone(),
+                                                        Some(NonZeroU64::MIN),
+                                                        policy,
+                                                    ),
+                                                    Err(error) => send_error(
+                                                        Arc::clone(&session),
+                                                        operation.clone(),
+                                                        call.clone(),
+                                                        error,
+                                                        policy,
+                                                    ),
+                                                }? } }
+                                        }
+                                        Err(error) => effect_try_sync! { once; body: { let __dsl_result = Err(error); move || __dsl_result }, on_error: ::core::convert::identity, },
+                                    }
+                                })()? } }
+                            }? } }
+                        }? } }
+                },
+        }
     }
 }
 
@@ -647,12 +683,12 @@ where
     let payload = match operation.error_codec().encode_ref(&error) {
         Ok(payload) => payload,
         Err(issue) => {
-            return Effect::from_result_once(Err(RpcStreamServerError::ErrorSchema(issue)));
+            return effect_try_sync! { once; body: { let __dsl_result = Err(RpcStreamServerError::ErrorSchema(issue)); move || __dsl_result }, on_error: ::core::convert::identity, };
         }
     };
     if let Err(issue) = crate::schema::internal::parser::check_limits(&payload, &operation.limits())
     {
-        return Effect::from_result_once(Err(RpcStreamServerError::ErrorSchema(issue)));
+        return effect_try_sync! { once; body: { let __dsl_result = Err(RpcStreamServerError::ErrorSchema(issue)); move || __dsl_result }, on_error: ::core::convert::identity, };
     }
     send_envelope(
         session,
@@ -695,12 +731,14 @@ where
 {
     let frame = match envelope.encode(policy) {
         Ok(frame) => frame,
-        Err(error) => return Effect::from_result_once(Err(RpcStreamServerError::Wire(error))),
+        Err(error) => {
+            return effect_try_sync! { once; body: { let __dsl_result = Err(RpcStreamServerError::Wire(error)); move || __dsl_result }, on_error: ::core::convert::identity, };
+        }
     };
-    session
-        .send(frame)
-        .map_error(RpcStreamServerError::Transport)
-        .provide_some(|_: &R| ())
+    effect_provide_some! {
+    program: effect_map_error! {
+    program: session
+    .send(frame), map: RpcStreamServerError::Transport, }, project: |_: &R| (), }
 }
 
 ///
@@ -739,122 +777,143 @@ where
     R: Send + Sync + 'static,
     Session: RpcStreamSession,
 {
-    Effect::defer(move || {
-        let session = Arc::clone(&session);
-        let operation = operation.clone();
-        let producer = producer.clone();
-        let call = call.clone();
-        producer
-            .pull()
-            .either()
-            .map_error(RpcStreamServerError::Handler)
-            .flat_map(move |result| match result {
-                Err(error) => send_error(
-                    Arc::clone(&session),
-                    operation.clone(),
-                    call.clone(),
-                    error,
-                    policy,
-                ),
-                Ok(RpcProduced::Terminal(value)) => {
-                    let payload = match operation.terminal_codec().encode_ref(&value) {
-                        Ok(payload) => payload,
-                        Err(issue) => {
-                            return Effect::from_result_once(Err(
-                                RpcStreamServerError::TerminalSchema(issue),
-                            ));
-                        }
-                    };
-                    if let Err(issue) =
-                        crate::schema::internal::parser::check_limits(&payload, &operation.limits())
-                    {
-                        return Effect::from_result_once(Err(
-                            RpcStreamServerError::TerminalSchema(issue),
-                        ));
-                    }
-                    send_envelope(
+    {
+        let __dsl_factory = move || {
+            let session = Arc::clone(&session);
+            let operation = operation.clone();
+            let producer = producer.clone();
+            let call = call.clone();
+            {
+                let __dsl_program = effect_map_error! {
+                program: producer
+                .pull()
+                .either(), map: RpcStreamServerError::Handler, };
+                effect! {
+                    let __dsl_program = __dsl_program.clone(); let call = call.clone(); let operation = operation.clone(); let producer = producer.clone(); let session = session.clone(); let result = __dsl_program?; (move || match result {
+                    Err(error) => send_error(
                         Arc::clone(&session),
-                        RpcEnvelope {
+                        operation.clone(),
+                        call.clone(),
+                        error,
+                        policy,
+                    ),
+                    Ok(RpcProduced::Terminal(value)) => {
+                        let payload = match operation.terminal_codec().encode_ref(&value) {
+                            Ok(payload) => payload,
+                            Err(issue) => {
+                                return effect_try_sync! {
+                                    once; body: {
+                                    let __dsl_result = Err(
+                                    RpcStreamServerError::TerminalSchema(issue),
+                                ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                            }
+                        };
+                        if let Err(issue) =
+                            crate::schema::internal::parser::check_limits(&payload, &operation.limits())
+                        {
+                            return effect_try_sync! {
+                                once; body: {
+                                let __dsl_result = Err(
+                                RpcStreamServerError::TerminalSchema(issue),
+                            ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                        }
+                        send_envelope(
+                            Arc::clone(&session),
+                            RpcEnvelope {
+                                operation: operation.spec().id.clone(),
+                                version: operation.spec().version,
+                                call: call.clone(),
+                                kind: RpcEnvelopeKind::StreamEnd,
+                                sequence: None,
+                                payload,
+                                metadata: BTreeMap::new(),
+                            },
+                            policy,
+                        )
+                    }
+                    Ok(RpcProduced::Chunk(value)) => {
+                        let Some(sequence) = sequence else {
+                            return effect_try_sync! {
+                                once; body: {
+                                let __dsl_result = Err(
+                                RpcStreamServerError::SequenceExhausted,
+                            ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                        };
+                        let payload = match operation.chunk_codec().encode_ref(&value) {
+                            Ok(payload) => payload,
+                            Err(issue) => {
+                                return effect_try_sync! {
+                                    once; body: {
+                                    let __dsl_result = Err(
+                                    RpcStreamServerError::ChunkSchema(issue),
+                                ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                            }
+                        };
+                        if let Err(issue) =
+                            crate::schema::internal::parser::check_limits(&payload, &operation.limits())
+                        {
+                            return effect_try_sync! {
+                                once; body: {
+                                let __dsl_result = Err(RpcStreamServerError::ChunkSchema(
+                                issue,
+                            )); move || __dsl_result }, on_error: ::core::convert::identity, };
+                        }
+                        let frame = RpcEnvelope {
                             operation: operation.spec().id.clone(),
                             version: operation.spec().version,
                             call: call.clone(),
-                            kind: RpcEnvelopeKind::StreamEnd,
-                            sequence: None,
+                            kind: RpcEnvelopeKind::StreamChunk,
+                            sequence: Some(sequence),
                             payload,
                             metadata: BTreeMap::new(),
-                        },
-                        policy,
-                    )
-                }
-                Ok(RpcProduced::Chunk(value)) => {
-                    let Some(sequence) = sequence else {
-                        return Effect::from_result_once(Err(
-                            RpcStreamServerError::SequenceExhausted,
-                        ));
-                    };
-                    let payload = match operation.chunk_codec().encode_ref(&value) {
-                        Ok(payload) => payload,
-                        Err(issue) => {
-                            return Effect::from_result_once(Err(
-                                RpcStreamServerError::ChunkSchema(issue),
-                            ));
-                        }
-                    };
-                    if let Err(issue) =
-                        crate::schema::internal::parser::check_limits(&payload, &operation.limits())
-                    {
-                        return Effect::from_result_once(Err(RpcStreamServerError::ChunkSchema(
-                            issue,
-                        )));
-                    }
-                    let frame = RpcEnvelope {
-                        operation: operation.spec().id.clone(),
-                        version: operation.spec().version,
-                        call: call.clone(),
-                        kind: RpcEnvelopeKind::StreamChunk,
-                        sequence: Some(sequence),
-                        payload,
-                        metadata: BTreeMap::new(),
-                    };
-                    let session_for_ack = Arc::clone(&session);
-                    let operation_for_ack = operation.clone();
-                    let producer_for_ack = producer.clone();
-                    let call_for_ack = call.clone();
-                    send_envelope(Arc::clone(&session), frame, policy).flat_map(move |_| {
-                        let session = Arc::clone(&session_for_ack);
-                        let operation = operation_for_ack.clone();
-                        let producer = producer_for_ack.clone();
-                        let call = call_for_ack.clone();
-                        session
-                            .receive_frame()
-                            .map_error(RpcStreamServerError::Transport)
-                            .provide_some(|_: &R| ())
-                            .flat_map(move |bytes| {
-                                let Some(bytes) = bytes else {
-                                    return Effect::from_result_once(Err(
-                                        RpcStreamServerError::Disconnected,
-                                    ));
-                                };
-                                match decode_ack(&operation, &call, sequence, &bytes, policy) {
-                                    Ok(()) => {
-                                        let next =
-                                            sequence.get().checked_add(1).and_then(NonZeroU64::new);
-                                        serve_pulls(
-                                            Arc::clone(&session),
-                                            operation.clone(),
-                                            producer.clone(),
-                                            call.clone(),
-                                            next,
-                                            policy,
-                                        )
+                        };
+                        let session_for_ack = Arc::clone(&session);
+                        let operation_for_ack = operation.clone();
+                        let producer_for_ack = producer.clone();
+                        let call_for_ack = call.clone();
+                        {
+                            let __dsl_program = send_envelope(Arc::clone(&session), frame, policy); effect! {
+                            let __dsl_program = __dsl_program.clone(); let call_for_ack = call_for_ack.clone(); let operation_for_ack = operation_for_ack.clone(); let producer_for_ack = producer_for_ack.clone(); let session_for_ack = session_for_ack.clone(); let _ = __dsl_program?; {
+                            let session = Arc::clone(&session_for_ack);
+                            let operation = operation_for_ack.clone();
+                            let producer = producer_for_ack.clone();
+                            let call = call_for_ack.clone();
+                            {
+                                let __dsl_program = effect_provide_some! {
+                                program: effect_map_error! {
+                                program: session
+                                .receive_frame(), map: RpcStreamServerError::Transport, }, project: |_: &R| (), }; effect! {
+                                    let __dsl_program = __dsl_program.clone(); let call = call.clone(); let operation = operation.clone(); let producer = producer.clone(); let session = session.clone(); let bytes = __dsl_program?; (move || {
+                                    let Some(bytes) = bytes else {
+                                        return effect_try_sync! {
+                                            once; body: {
+                                            let __dsl_result = Err(
+                                            RpcStreamServerError::Disconnected,
+                                        ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                    };
+                                    match decode_ack(&operation, &call, sequence, &bytes, policy) {
+                                        Ok(()) => {
+                                            let next =
+                                                sequence.get().checked_add(1).and_then(NonZeroU64::new);
+                                            serve_pulls(
+                                                Arc::clone(&session),
+                                                operation.clone(),
+                                                producer.clone(),
+                                                call.clone(),
+                                                next,
+                                                policy,
+                                            )
+                                        }
+                                        Err(error) => effect_try_sync! { once; body: { let __dsl_result = Err(error); move || __dsl_result }, on_error: ::core::convert::identity, },
                                     }
-                                    Err(error) => Effect::from_result_once(Err(error)),
-                                }
-                            })
-                    })
-                }
-            })
-    })
+                                })()? } }
+                        }? } }
+                    }
+                })()? }
+            }
+        };
+        effect! { __dsl_factory()? }
+    }
 }
 
 ///
@@ -923,6 +982,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::{effect_sync, effect_try_sync, rpc_stream_operation};
+
     use super::*;
     use crate::encoding::{FrameParts, FramePolicy};
     use crate::rpc::{OperationId, RpcVersion};
@@ -941,34 +1002,34 @@ mod tests {
 
         fn send(&self, frame: FrameParts) -> Effect<(), Self::Error> {
             let sent = Arc::clone(&self.sent);
-            Effect::try_sync_once(
-                move || {
-                    sent.lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(frame.into_bytes().map_err(|_| ())?);
-                    Ok(())
-                },
-                std::convert::identity,
-            )
+            effect_try_sync! {
+            once; body: move || {
+                sent.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(frame.into_bytes().map_err(|_| ())?);
+                Ok(())
+            }, on_error: std::convert::identity, }
         }
 
         fn receive_frame(&self) -> Effect<Option<Vec<u8>>, Self::Error> {
             let incoming = Arc::clone(&self.incoming);
-            Effect::sync(move || {
+            effect_sync! {
+                body: move || {
                 incoming
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take()
-            })
+            }, }
         }
 
         fn close(&self) -> Effect<(), Self::Error> {
-            Effect::sync(|| ())
+            effect_sync! { body: || (), }
         }
     }
 
     #[test]
-    fn final_sequence_can_be_acknowledged_before_terminal_but_not_another_chunk() {
+    fn final_sequence_can_be_acknowledged_before_terminal_but_not_another_chunk()
+    -> Result<(), String> {
         let limit = NonZeroUsize::MAX;
         let policy = RpcEnvelopePolicy {
             frame: FramePolicy {
@@ -982,18 +1043,20 @@ mod tests {
                 issues: limit,
             },
         };
-        let operation_id = OperationId::new("final-sequence").expect("operation identity");
+        let operation_id = OperationId::new("final-sequence")
+            .map_err(|error| format!("operation identity: {error:?}"))?;
         let version = RpcVersion::new(NonZeroU32::MIN);
-        let call = RpcCallId::new("final-sequence-call").expect("call identity");
-        let operation = RpcStreamOperation::new(
-            operation_id.clone(),
-            version,
-            json_i64(),
-            json_i64(),
-            json_i64(),
-            json_i64(),
-            policy.json,
-        );
+        let call = RpcCallId::new("final-sequence-call")
+            .map_err(|error| format!("call identity: {error:?}"))?;
+        let operation = rpc_stream_operation! {
+            id: operation_id.clone(),
+            version: version,
+            request: json_i64(),
+            chunk: json_i64(),
+            terminal: json_i64(),
+            error: json_i64(),
+            limits: policy.json,
+        };
         let ack = RpcEnvelope {
             operation: operation_id.clone(),
             version,
@@ -1004,9 +1067,9 @@ mod tests {
             metadata: BTreeMap::new(),
         }
         .encode(policy)
-        .expect("acknowledgement envelope")
+        .map_err(|error| format!("acknowledgement envelope: {error:?}"))?
         .into_bytes()
-        .expect("acknowledgement frame");
+        .map_err(|error| format!("acknowledgement frame: {error:?}"))?;
         let session = || {
             Arc::new(BoundarySession {
                 incoming: Arc::new(Mutex::new(Some(ack.clone()))),
@@ -1019,13 +1082,17 @@ mod tests {
             let pulls = Arc::clone(&pulls);
             move || {
                 let pulls = Arc::clone(&pulls);
-                Effect::<RpcProduced<i64, i64>, i64>::sync(move || {
-                    if pulls.fetch_add(1, Ordering::SeqCst) == 0 {
-                        RpcProduced::Chunk(42)
-                    } else {
-                        RpcProduced::Terminal(43)
-                    }
-                })
+                {
+                    let __dsl_program: Effect<RpcProduced<i64, i64>, i64> = effect_sync! {
+                        body: move || {
+                        if pulls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            RpcProduced::Chunk(42)
+                        } else {
+                            RpcProduced::Terminal(43)
+                        }
+                    }, };
+                    __dsl_program
+                }
             }
         });
         let terminal_session = session();
@@ -1047,8 +1114,13 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(sent.len(), 2);
-        let first = decode_frame::<i64, ()>(&sent[0], policy).expect("final chunk");
-        let last = decode_frame::<i64, ()>(&sent[1], policy).expect("terminal result");
+        let [first, last] = sent.as_slice() else {
+            return Err(String::from("expected a final chunk and terminal result"));
+        };
+        let first = decode_frame::<i64, ()>(first, policy)
+            .map_err(|error| format!("final chunk: {error:?}"))?;
+        let last = decode_frame::<i64, ()>(last, policy)
+            .map_err(|error| format!("terminal result: {error:?}"))?;
         assert_eq!(first.kind, RpcEnvelopeKind::StreamChunk);
         assert_eq!(first.sequence, Some(NonZeroU64::MAX));
         assert_eq!(last.kind, RpcEnvelopeKind::StreamEnd);
@@ -1056,7 +1128,9 @@ mod tests {
         drop(sent);
 
         let extra_chunk = RpcStreamProducer::new(|| {
-            Effect::<RpcProduced<i64, i64>, i64>::sync(|| RpcProduced::Chunk(42))
+            let __dsl_program: Effect<RpcProduced<i64, i64>, i64> =
+                effect_sync! { body: || RpcProduced::Chunk(42), };
+            __dsl_program
         });
         let exhausted_session = session();
         let exhausted = block_on(
@@ -1082,5 +1156,6 @@ mod tests {
                 .len(),
             1
         );
+        Ok(())
     }
 }

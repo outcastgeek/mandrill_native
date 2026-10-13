@@ -6,6 +6,10 @@ use crate::{
     Effect, JsonValue, ParseLimits, PubSubError, PublishReport, PureCodec, SchemaIssue,
     SchemaIssueKind, SchemaResource,
 };
+use crate::{
+    effect, effect_all, effect_map, effect_map_error, effect_resource, effect_sync,
+    effect_try_sync, effect_uninterruptible,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Mutex};
@@ -388,7 +392,7 @@ impl<R: Send + Sync + 'static> HydrationSet<R> {
             .values()
             .map(|binding| (binding.export)())
             .collect();
-        Effect::all(programs)
+        effect_all! { items: programs, }
     }
 
     /// Validate routing identities and duplicates for the entire batch before
@@ -413,8 +417,9 @@ impl<R: Send + Sync + 'static> HydrationSet<R> {
         let records = Mutex::new(Some(records));
         let bindings = self.bindings.clone();
         let limits = self.routing_limits;
-        Effect::try_sync(
-            move || {
+        {
+            let __dsl_program = effect_try_sync! {
+            body: move || {
                 let records = records
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -431,24 +436,24 @@ impl<R: Send + Sync + 'static> HydrationSet<R> {
                     selected.push((binding.clone(), record));
                 }
                 Ok(selected)
-            },
-            std::convert::identity,
-        )
-        .flat_map(move |selected| {
-            let programs = selected
-                .into_iter()
-                .map(|(binding, record)| {
-                    let atom = binding.atom.clone();
-                    (binding.import)(record, policy)
-                        .either()
-                        .map(move |outcome| HydrationRecordResult {
-                            atom: atom.clone(),
-                            outcome,
-                        })
-                })
-                .collect();
-            Effect::all(programs)
-        })
+            }, on_error: std::convert::identity, };
+            effect! {
+                    let selected = __dsl_program.clone()?; {
+                let programs = selected
+                    .into_iter()
+                    .map(|(binding, record)| {
+                        let atom = binding.atom.clone();
+                        effect_map! {
+                            program: (binding.import)(record, policy)
+                            .either(), map: move |outcome| HydrationRecordResult {
+                                atom: atom.clone(),
+                                outcome,
+                            }, }
+                    })
+                    .collect();
+                effect_all! { items: programs, }
+            }? }
+        }
     }
 }
 
@@ -507,28 +512,32 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
         schema: HydrationSchema<A>,
     ) -> Effect<Arc<[u8]>, HydrationError, R> {
         if schema.atom != self.id {
-            return Effect::from_result_once(Err(HydrationError::WrongAtom));
+            return effect_try_sync! { once; body: { let __dsl_result = Err(HydrationError::WrongAtom); move || __dsl_result }, on_error: ::core::convert::identity, };
         }
         let source = self.clone();
-        self.mutation
-            .acquire(NonZeroUsize::MIN)
-            .map_error(|error| HydrationError::Source(AtomRefError::Admission(error)))
-            .flat_map(move |permit| {
+        {
+            let __dsl_program = effect_map_error! {
+            program: self.mutation
+            .acquire(NonZeroUsize::MIN), map: |error| HydrationError::Source(AtomRefError::Admission(error)), };
+            effect! {
+                let __dsl_program = __dsl_program.clone(); let schema = schema.clone(); let source = source.clone(); let permit = __dsl_program?; {
                 let source = source.clone();
                 let schema = schema.clone();
-                let snapshot = source
+                let snapshot = {
+                    let __dsl_program = effect_map_error! {
+                    program: source
                     .value
-                    .read()
-                    .map_error(|error| HydrationError::Source(AtomRefError::Publication(error)))
-                    .flat_map(move |value| {
+                    .read(), map: |error| HydrationError::Source(AtomRefError::Publication(error)), }; effect! {
+                        let __dsl_program = __dsl_program.clone(); let schema = schema.clone(); let source = source.clone(); let value = __dsl_program?; {
                         let revision = *source
                             .revision
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        Effect::from_result_once(schema.encode(&value, revision))
-                    });
-                snapshot.ensuring(Effect::sync_once(move || drop(permit)))
-            })
+                        effect_try_sync! { once; body: { let __dsl_result = schema.encode(&value, revision); move || __dsl_result }, on_error: ::core::convert::identity, }
+                    }? } };
+                { let __dsl_program = snapshot; let __dsl_cleanup = effect_sync! { once; body: move || drop(permit), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } }
+            }? }
+        }
     }
 
     /// Decode and apply hydration records under the selected conflict policy.
@@ -552,93 +561,100 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
         policy: HydrationConflictPolicy,
     ) -> Effect<HydrationImportOutcome, HydrationError, R> {
         if schema.atom != self.id {
-            return Effect::from_result_once(Err(HydrationError::WrongAtom));
+            return effect_try_sync! { once; body: { let __dsl_result = Err(HydrationError::WrongAtom); move || __dsl_result }, on_error: ::core::convert::identity, };
         }
         let source = self.clone();
         let bytes = Mutex::new(Some(bytes));
-        Effect::try_sync(
-            move || {
+        {
+            let __dsl_program = effect_try_sync! {
+            body: move || {
                 let bytes = bytes
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take()
                     .ok_or(HydrationError::InputConsumed)?;
                 schema.decode(&bytes)
-            },
-            std::convert::identity,
-        )
-        .flat_map(move |(value, incoming)| {
-            let source = source.clone();
-            let value = Mutex::new(Some(value));
-            source
-                .mutation
-                .acquire(NonZeroUsize::MIN)
-                .map_error(|error| HydrationError::Source(AtomRefError::Admission(error)))
-                .flat_map(move |permit| {
-                    let value = value
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take();
-                    let Some(value) = value else {
-                        return Effect::from_result_once(Err(HydrationError::InputConsumed));
-                    };
-                    let current = *source
-                        .revision
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let (revision, forced) = match policy {
-                        HydrationConflictPolicy::OnlyIfNewer if incoming <= current => {
-                            return Effect::from_result_once(Err(HydrationError::Stale {
-                                current,
-                                incoming,
-                            }));
-                        }
-                        HydrationConflictPolicy::OnlyIfNewer => (incoming, false),
-                        HydrationConflictPolicy::ForceMonotonic if incoming > current => {
-                            (incoming, true)
-                        }
-                        HydrationConflictPolicy::ForceMonotonic => {
-                            let Some(revision) =
-                                current.get().checked_add(1).and_then(NonZeroU64::new)
-                            else {
-                                return Effect::from_result_once(Err(
-                                    HydrationError::RevisionExhausted,
-                                ));
-                            };
-                            (revision, true)
-                        }
-                    };
-                    let revision_state = Arc::clone(&source.revision);
-                    let registry = source.registry.clone();
-                    let id = source.id.clone();
-                    let imported = source
-                        .value
-                        .set_with_commit(value, move |_| {
-                            *revision_state
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) = revision;
-                        })
-                        .map_error(|error: PubSubError| {
-                            HydrationError::Source(AtomRefError::Publication(error))
-                        })
-                        .flat_map(move |publication| {
-                            registry
-                                .changed(id.clone())
-                                .map_error(|error| {
-                                    HydrationError::Source(
-                                        AtomRefError::CommittedWithoutInvalidation(error),
-                                    )
-                                })
-                                .map(move |_| HydrationImportOutcome {
-                                    revision,
-                                    forced,
-                                    publication,
-                                })
-                        });
-                    imported
-                        .uninterruptible()
-                        .ensuring(Effect::sync_once(move || drop(permit)))
-                })
-        })
+            }, on_error: std::convert::identity, };
+            effect! {
+                           let __dsl_program = __dsl_program.clone(); let source = source.clone(); let (value , incoming) = __dsl_program.clone()?; {
+                       let source = source.clone();
+                       let value = Mutex::new(Some(value));
+                       effect! {
+            bind;
+            program: effect_map_error! {
+                program: source
+                           .mutation
+                           .acquire(NonZeroUsize::MIN), map: |error| HydrationError::Source(AtomRefError::Admission(error)), },
+            body: move |permit| {
+                               let value = value
+                                   .lock()
+                                   .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                   .take();
+                               let Some(value) = value else {
+                                   return effect_try_sync! { once; body: { let __dsl_result = Err(HydrationError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, };
+                               };
+                               let current = *source
+                                   .revision
+                                   .lock()
+                                   .unwrap_or_else(std::sync::PoisonError::into_inner);
+                               let (revision, forced) = match policy {
+                                   HydrationConflictPolicy::OnlyIfNewer if incoming <= current => {
+                                       return effect_try_sync! {
+                                           once; body: {
+                                           let __dsl_result = Err(HydrationError::Stale {
+                                           current,
+                                           incoming,
+                                       }); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                   }
+                                   HydrationConflictPolicy::OnlyIfNewer => (incoming, false),
+                                   HydrationConflictPolicy::ForceMonotonic if incoming > current => {
+                                       (incoming, true)
+                                   }
+                                   HydrationConflictPolicy::ForceMonotonic => {
+                                       let Some(revision) =
+                                           current.get().checked_add(1).and_then(NonZeroU64::new)
+                                       else {
+                                           return effect_try_sync! {
+                                               once; body: {
+                                               let __dsl_result = Err(
+                                               HydrationError::RevisionExhausted,
+                                           ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                       };
+                                       (revision, true)
+                                   }
+                               };
+                               let revision_state = Arc::clone(&source.revision);
+                               let registry = source.registry.clone();
+                               let id = source.id.clone();
+                               let imported = {
+                                   let __dsl_program = effect_map_error! {
+                                   program: source
+                                   .value
+                                   .set_with_commit(value, move |_| {
+                                       *revision_state
+                                           .lock()
+                                           .unwrap_or_else(std::sync::PoisonError::into_inner) = revision;
+                                   }), map: |error: PubSubError| {
+                                       HydrationError::Source(AtomRefError::Publication(error))
+                                   }, }; effect! {
+                                       let __dsl_program = __dsl_program.clone(); let id = id.clone(); let registry = registry.clone(); let publication = __dsl_program?; {
+                                       effect_map! {
+                                           program: effect_map_error! {
+                                           program: registry
+                                           .changed(id.clone()), map: |error| {
+                                               HydrationError::Source(
+                                                   AtomRefError::CommittedWithoutInvalidation(error),
+                                               )
+                                           }, }, map: move |_| HydrationImportOutcome {
+                                               revision,
+                                               forced,
+                                               publication,
+                                           }, }
+                                   }? } };
+                               { let __dsl_program = effect_uninterruptible! { program: imported, }; let __dsl_cleanup = effect_sync! { once; body: move || drop(permit), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } }
+                           },
+            }
+                   }? }
+        }
     }
 }

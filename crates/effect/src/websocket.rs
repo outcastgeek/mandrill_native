@@ -4,7 +4,10 @@ use crate::internal::gate::{Gate, GateError};
 use crate::internal::runtime::{self, Step};
 use crate::{
     AdmissionCapacity, Cancellation, Clock, ClockError, Defect, Effect, Exit, HasClock,
-    ProviderAdmission, Release, ResourceBinding, ResourceValue, TransportFuture,
+    ProviderAdmission, Release, ResourceValue, TransportFuture,
+};
+use crate::{
+    effect_resource, effect_socket, effect_try_future, effect_try_sync, effect_uninterruptible,
 };
 use futures_util::{
     FutureExt,
@@ -299,7 +302,7 @@ impl WebSocketConnection {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn abort<R: Send + Sync + 'static>(&self) -> Effect<(), WebSocketError, R> {
         let connection = self.clone();
-        Effect::try_sync(move || connection.abort_now(), |error| error).uninterruptible()
+        effect_uninterruptible! { program: effect_try_sync! { body: move || connection.abort_now(), on_error: |error| error, }, }
     }
     /// Send one message through the connection’s serialized send path.
     ///
@@ -600,10 +603,11 @@ pub fn with_socket<A: Send + 'static, R: Send + Sync + 'static>(
     + Sync
     + 'static,
 ) -> Effect<A, WebSocketError, R> {
-    ResourceBinding::new(own_socket(acquire, limits), |connection, _| {
-        Release::from_exit_future(move |_| connection.release())
-    })
-    .use_with(use_connection)
+    effect_resource! {
+    acquire: own_socket(acquire, limits), release: |connection, _| {
+            Release::from_exit_future(move |_| connection.release())
+        }, body: use_connection,
+    }
 }
 /// Run scoped work using an already established connection.
 ///
@@ -626,14 +630,15 @@ pub fn with_connection<A: Send + 'static, R: HasWebSocketTransport + Send + Sync
     + 'static,
 ) -> Effect<A, WebSocketError, R> {
     let limits = options.limits;
-    let acquire = Effect::try_future_with_env(
-        move |env: Arc<R>, cancellation| {
-            env.websocket_transport()
-                .connect(options.clone(), cancellation)
-        },
-        |cause| WebSocketConnection::transport(WebSocketOperation::Connect, cause),
-    );
-    with_socket(limits, acquire, use_connection)
+    let acquire = effect_try_future! { with_env; body: move |env: Arc<R>, cancellation| {
+        env.websocket_transport()
+            .connect(options.clone(), cancellation)
+    }, on_error: |cause| WebSocketConnection::transport(WebSocketOperation::Connect, cause), };
+    effect_socket! {
+        limits: limits,
+        acquire: acquire,
+        body: use_connection,
+    }
 }
 /// Acquire and use a scoped socket while mapping transport errors into the caller’s domain.
 ///
@@ -661,16 +666,17 @@ pub fn with_socket_map_error<A: Send + 'static, E: Send + 'static, R: Send + Syn
     + 'static,
 ) -> Effect<A, E, R> {
     let map_error = Arc::new(map_error);
-    ResourceBinding::new(own_socket(acquire, limits), move |connection, _| {
-        let map_error = Arc::clone(&map_error);
-        Release::from_exit_future(move |_| async move {
-            connection
-                .release()
-                .await
-                .map_error(move |error| map_error(error))
-        })
-    })
-    .use_with(use_connection)
+    effect_resource! {
+    acquire: own_socket(acquire, limits), release: move |connection, _| {
+            let map_error = Arc::clone(&map_error);
+            Release::from_exit_future(move |_| async move {
+                connection
+                    .release()
+                    .await
+                    .map_error(move |error| map_error(error))
+            })
+        }, body: use_connection,
+    }
 }
 /// Use an existing scoped connection while mapping transport errors.
 ///
@@ -702,24 +708,21 @@ pub fn with_connection_map_error<
     let map_error = Arc::new(map_error);
     let connect_error = Arc::clone(&map_error);
     let limits = options.limits;
-    let acquire = Effect::try_future_with_env(
-        move |env: Arc<R>, cancellation| {
-            env.websocket_transport()
-                .connect(options.clone(), cancellation)
-        },
-        move |cause| {
-            connect_error(WebSocketConnection::transport(
-                WebSocketOperation::Connect,
-                cause,
-            ))
-        },
-    );
-    with_socket_map_error(
-        limits,
-        acquire,
-        move |error| map_error(error),
-        use_connection,
-    )
+    let acquire = effect_try_future! { with_env; body: move |env: Arc<R>, cancellation| {
+        env.websocket_transport()
+            .connect(options.clone(), cancellation)
+    }, on_error: move |cause| {
+        connect_error(WebSocketConnection::transport(
+            WebSocketOperation::Connect,
+            cause,
+        ))
+    }, };
+    effect_socket! {
+        limits: limits,
+        acquire: acquire,
+        on_error: move |error| map_error(error),
+        body: use_connection,
+    }
 }
 
 ///

@@ -6,6 +6,7 @@ use super::{
     WorkflowOutcomeKind, WorkflowRunId,
 };
 use crate::{Effect, JsonValue, ParseLimits, PureCodec, SchemaIssue};
+use crate::{effect, effect_map_error, effect_provide_some, effect_try_sync, service};
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 
@@ -150,77 +151,70 @@ impl<A: Send + 'static, E: Send + 'static> WorkflowActivity<A, E> {
     {
         let description = self.clone();
         let body = Arc::new(body);
-        Effect::service(|env: &R| env.workflow_engine()).flat_map(move |engine| {
-            let description = description.clone();
-            let body = Arc::clone(&body);
-            let encoded_input = Arc::clone(&encoded_input);
-            let activity = description.id.clone();
-            let run_for_record = run.clone();
-            engine
-                .inspect_activity(run.clone(), activity.clone(), attempt)
-                .map_error(ActivityRunError::Engine)
-                .provide_some(|_: &R| ())
-                .flat_map(move |recorded| match recorded {
-                    Some(recorded) if recorded.encoded_input != encoded_input => {
-                        Effect::from_result_once(Err(ActivityRunError::RecordedActivityMismatch))
-                    }
-                    Some(recorded) => Effect::from_result_once(
-                        description
-                            .decode(&recorded.outcome)
-                            .map_err(ActivityRunError::Codec),
-                    ),
-                    None => {
-                        let description = description.clone();
-                        let engine = Arc::clone(&engine);
-                        let activity = activity.clone();
-                        let run = run_for_record.clone();
-                        let encoded_input = Arc::clone(&encoded_input);
-                        body()
-                            .map_error(ActivityRunError::Body)
-                            .flat_map(move |outcome| {
-                                let encoded = match description.encode(&outcome) {
-                                    Ok(encoded) => encoded,
-                                    Err(error) => {
-                                        return Effect::from_result_once(Err(
-                                            ActivityRunError::Codec(error),
-                                        ));
-                                    }
-                                };
-                                let outcome = Arc::new(Mutex::new(Some(outcome)));
-                                let expected = encoded.clone();
-                                let expected_activity = activity.clone();
-                                let expected_input = Arc::clone(&encoded_input);
-                                engine
-                                    .record_activity(
-                                        run.clone(),
-                                        activity.clone(),
-                                        attempt,
-                                        Arc::clone(&encoded_input),
-                                        encoded,
-                                    )
-                                    .map_error(ActivityRunError::Engine)
-                                    .provide_some(|_: &R| ())
-                                    .flat_map(move |record| {
-                                        if record.identity != expected_activity
-                                            || record.attempt != attempt
-                                            || record.encoded_input != expected_input
-                                            || record.outcome != expected
-                                        {
-                                            return Effect::from_result_once(Err(
-                                                ActivityRunError::RecordedActivityMismatch,
-                                            ));
+        {
+            let __dsl_program = service! { env: |env: &R| env.workflow_engine(), };
+            effect! { let __dsl_program = __dsl_program.clone(); let body = body.clone(); let description = description.clone(); let encoded_input = encoded_input.clone(); let run = run.clone(); let engine = __dsl_program.clone()?; {
+                let description = description.clone();
+                let body = Arc::clone(&body);
+                let encoded_input = Arc::clone(&encoded_input);
+                let activity = description.id.clone();
+                let run_for_record = run.clone();
+                { let __dsl_program = effect_provide_some! { program: effect_map_error! { program: engine
+                    .inspect_activity(run.clone(), activity.clone(), attempt), map: ActivityRunError::Engine, }, project: |_: &R| (), }; effect! { let __dsl_program = __dsl_program.clone(); let activity = activity.clone(); let body = body.clone(); let description = description.clone(); let encoded_input = encoded_input.clone(); let engine = engine.clone(); let run_for_record = run_for_record.clone(); let recorded = __dsl_program.clone()?; match recorded {
+                        Some(recorded) if recorded.encoded_input != encoded_input => {
+                            effect_try_sync! { once; body: { let __dsl_result = Err(ActivityRunError::RecordedActivityMismatch); move || __dsl_result }, on_error: ::core::convert::identity, }
+                        }
+                        Some(recorded) => effect_try_sync! { once; body: { let __dsl_result = description
+                                .decode(&recorded.outcome)
+                                .map_err(ActivityRunError::Codec); move || __dsl_result }, on_error: ::core::convert::identity, },
+                        None => {
+                            let description = description.clone();
+                            let engine = Arc::clone(&engine);
+                            let activity = activity.clone();
+                            let run = run_for_record.clone();
+                            let encoded_input = Arc::clone(&encoded_input);
+                            { let __dsl_program = effect_map_error! { program: body(), map: ActivityRunError::Body, }; effect! { let __dsl_program = __dsl_program.clone(); let activity = activity.clone(); let description = description.clone(); let encoded_input = encoded_input.clone(); let engine = engine.clone(); let run = run.clone(); let outcome = __dsl_program.clone()?; (move || {
+                                    let encoded = match description.encode(&outcome) {
+                                        Ok(encoded) => encoded,
+                                        Err(error) => {
+                                            return effect_try_sync! { once; body: { let __dsl_result = Err(
+                                                ActivityRunError::Codec(error),
+                                            ); move || __dsl_result }, on_error: ::core::convert::identity, };
                                         }
-                                        let result = outcome
-                                            .lock()
-                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                            .take()
-                                            .ok_or(ActivityRunError::InputConsumed);
-                                        Effect::from_result_once(result)
-                                    })
-                            })
-                    }
-                })
-        })
+                                    };
+                                    let outcome = Arc::new(Mutex::new(Some(outcome)));
+                                    let expected = encoded.clone();
+                                    let expected_activity = activity.clone();
+                                    let expected_input = Arc::clone(&encoded_input);
+                                    { let __dsl_program = effect_provide_some! { program: effect_map_error! { program: engine
+                                        .record_activity(
+                                            run.clone(),
+                                            activity.clone(),
+                                            attempt,
+                                            Arc::clone(&encoded_input),
+                                            encoded,
+                                        ), map: ActivityRunError::Engine, }, project: |_: &R| (), }; effect! { let __dsl_program = __dsl_program.clone(); let expected = expected.clone(); let expected_activity = expected_activity.clone(); let expected_input = expected_input.clone(); let outcome = outcome.clone(); let record = __dsl_program?; (move || {
+                                            if record.identity != expected_activity
+                                                || record.attempt != attempt
+                                                || record.encoded_input != expected_input
+                                                || record.outcome != expected
+                                            {
+                                                return effect_try_sync! { once; body: { let __dsl_result = Err(
+                                                    ActivityRunError::RecordedActivityMismatch,
+                                                ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                            }
+                                            let result = outcome
+                                                .lock()
+                                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                .take()
+                                                .ok_or(ActivityRunError::InputConsumed);
+                                            effect_try_sync! { once; body: { let __dsl_result = result; move || __dsl_result }, on_error: ::core::convert::identity, }
+                                        })()? } }
+                                })()? } }
+                        }
+                    }? } }
+            }? }
+        }
     }
 
     /// Encode the typed value using this definition’s declared representation.
@@ -407,8 +401,8 @@ where
         let limits = self.description.limits;
         let description = self.description.clone();
         let body = Arc::clone(&self.body);
-        let effect = Effect::try_sync(
-            {
+        let effect = {
+            let __dsl_program = effect_try_sync! { body: {
                 let input = Arc::clone(&input);
                 move || {
                     let encoded = codec
@@ -416,16 +410,15 @@ where
                         .map_err(WorkflowCodecError::Schema)?;
                     encode_json(&encoded, limits)
                 }
-            },
-            ActivityRunError::Codec,
-        )
-        .flat_map(move |encoded_input| {
-            let input = Arc::clone(&input);
-            let body = Arc::clone(&body);
-            description.run_bound(run.clone(), attempt, encoded_input, move || {
-                body(Arc::clone(&input))
-            })
-        });
+            }, on_error: ActivityRunError::Codec, };
+            effect! { let body = body.clone(); let description = description.clone(); let input = input.clone(); let run = run.clone(); let encoded_input = __dsl_program.clone()?; {
+                let input = Arc::clone(&input);
+                let body = Arc::clone(&body);
+                description.run_bound(run.clone(), attempt, encoded_input, move || {
+                    body(Arc::clone(&input))
+                })
+            }? }
+        };
         Durable::from_effect(effect)
     }
 }

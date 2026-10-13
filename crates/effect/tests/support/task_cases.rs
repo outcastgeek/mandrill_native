@@ -1,6 +1,7 @@
+use fx::{effect, effect_map, effect_scope, effect_sync, effect_try_sync};
 use fx::{
     BlockingExecutor, Cancellation, CpuExecutor, Defect, Effect, Exit, HasCancellation,
-    HasTaskSpawner, ScheduledJob, ScheduledTask, Scope, TaskSpawner,
+    HasTaskSpawner, ScheduledJob, ScheduledTask, TaskSpawner,
 };
 use std::cell::Cell;
 use std::sync::{Arc, Mutex};
@@ -109,11 +110,16 @@ pub enum Marker {
 
 pub async fn task_cases() {
     let env = Arc::new(Environment::default());
-    let owned: Effect<Payload, Payload, Environment> = Scope::scoped(|scope| {
-        scope
-            .fork(Effect::sync(|| Payload(Cell::new(Marker::Value))))
-            .flat_map(|fiber| fiber.join())
-    });
+    let owned: Effect<Payload, Payload, Environment> = effect_scope! {
+    body: |scope| {
+            effect! {
+     bind;
+     program: scope
+                .fork(effect_sync! { body: || Payload(Cell::new(Marker::Value)), }),
+     body: |fiber| fiber.join(),
+     }
+        },
+    };
     for _ in 0..2 {
         // Two executions verify fresh outcomes, not copies of a stored payload.
         assert_eq!(
@@ -121,35 +127,44 @@ pub async fn task_cases() {
             Exit::Success(Payload(Cell::new(Marker::Value)))
         );
     }
-    let shared: Effect<(), Payload, Environment> = Scope::scoped(|scope| {
-        scope
-            .fork(Effect::<(), Payload, Environment>::fail_with(|| {
-                Payload(Cell::new(Marker::Error))
-            }))
-            .flat_map(|fiber| {
-                let repeated = fiber.clone();
-                fiber.await_exit_shared().flat_map(move |first| {
-                    repeated.await_exit_shared().map(move |second| {
-                        let first_address = first.with(|exit| match exit {
-                            Exit::Fail(error) => Some(std::ptr::from_ref(error)),
-                            Exit::Success(())
-                            | Exit::Die(_)
-                            | Exit::Interrupted
-                            | Exit::FinalizationFailed(_) => None,
-                        });
-                        let second_address = second.with(|exit| match exit {
-                            Exit::Fail(error) => Some(std::ptr::from_ref(error)),
-                            Exit::Success(())
-                            | Exit::Die(_)
-                            | Exit::Interrupted
-                            | Exit::FinalizationFailed(_) => None,
-                        });
-                        assert!(matches!(first_address, Ok(Some(_))));
-                        assert_eq!(first_address, second_address);
-                    })
-                })
-            })
-    });
+    let shared: Effect<(), Payload, Environment> = effect_scope! {
+    body: |scope| {
+            effect! {
+     bind;
+     program: scope
+                .fork({ let __dsl_program: Effect < () , Payload , Environment > = effect_try_sync! { body: { let __dsl_error = || {
+                    Payload(Cell::new(Marker::Error))
+                }; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }; __dsl_program }),
+     body: |fiber| {
+                    let repeated = fiber.clone();
+                    effect! {
+     bind;
+     program: fiber.await_exit_shared(),
+     body: move |first| {
+                        effect_map! { program: repeated.await_exit_shared(), map: move |second| {
+                            let first_address = first.with(|exit| match exit {
+                                Exit::Fail(error) => Some(std::ptr::from_ref(error)),
+                                Exit::Success(())
+                                | Exit::Die(_)
+                                | Exit::Interrupted
+                                | Exit::FinalizationFailed(_) => None,
+                            });
+                            let second_address = second.with(|exit| match exit {
+                                Exit::Fail(error) => Some(std::ptr::from_ref(error)),
+                                Exit::Success(())
+                                | Exit::Die(_)
+                                | Exit::Interrupted
+                                | Exit::FinalizationFailed(_) => None,
+                            });
+                            assert!(matches!(first_address, Ok(Some(_))));
+                            assert_eq!(first_address, second_address);
+                        }, }
+                    },
+     }
+                },
+     }
+        },
+    };
     // Observed expected failure is handled here, not reported again at close.
     assert_eq!(shared.run(Arc::clone(&env)).await, Exit::Success(()));
     // Two owned runs and one shared workflow each submit exactly one child.

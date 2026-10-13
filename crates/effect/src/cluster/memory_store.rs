@@ -9,6 +9,7 @@ use super::{
     ObserverCursor, OwnershipGeneration, PassivationOutcome, PayloadConflictPolicy, SavedChunk,
     SavedMessage, SavedMessageState, SavedReply, StoreCompletion, StoreMutation, StoreObservation,
 };
+use crate::effect_try_sync;
 use crate::{Effect, Layer, UtcMillis};
 use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
@@ -128,20 +129,17 @@ impl MemoryClusterMessageStore {
     ) -> Effect<O, ClusterStoreError> {
         let state = Arc::clone(&self.state);
         let pending = Mutex::new(Some((input, mutate)));
-        Effect::try_sync(
-            move || {
-                let (input, mutate) = pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-                    .ok_or(ClusterStoreError::InputConsumed)?;
-                let mut state = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                mutate(&mut state, input)
-            },
-            std::convert::identity,
-        )
+        effect_try_sync! { body: move || {
+            let (input, mutate) = pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .ok_or(ClusterStoreError::InputConsumed)?;
+            let mut state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            mutate(&mut state, input)
+        }, on_error: std::convert::identity, }
     }
 }
 

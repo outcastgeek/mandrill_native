@@ -5,6 +5,7 @@
 //! whole snapshot cannot silently lose a claim/token/passkey/membership update.
 //! Snapshot operations own their transaction and do not enroll ambient business SQL.
 
+use super::schema::{collection_lookahead_sql, recovery_lookahead_sql};
 use super::{
     SqlxIdentityStore,
     error::{command_error, provider_category},
@@ -432,7 +433,7 @@ async fn load(
         AccountState::Plain(Box::new(user))
     };
     let revision = revision(c, id).await?;
-    let mut rows=c.query(super::schema::collection_lookahead_sql!("SELECT role_id FROM effect_identity_user_roles WHERE user_id=?1 ORDER BY role_id LIMIT ",""),(id.to_string(),)).await.map_err(provider_category)?;
+    let mut rows=c.query(collection_lookahead_sql!("SELECT role_id FROM effect_identity_user_roles WHERE user_id=?1 ORDER BY role_id LIMIT ",""),(id.to_string(),)).await.map_err(provider_category)?;
     let mut roles = Vec::new();
     while let Some(row) = rows.next().await.map_err(provider_category)? {
         if roles.len() >= super::schema::NATIVE_COLLECTION_LIMIT {
@@ -440,9 +441,9 @@ async fn load(
         }
         roles.push(RoleId::parse(row_text(&row)?).map_err(|_| StoreError::CorruptStoredData)?);
     }
-    let mut rows=c.query(super::schema::collection_lookahead_sql!("SELECT claim_type,claim_value FROM effect_identity_user_claims WHERE user_id=?1 ORDER BY id LIMIT ",""),(id.to_string(),)).await.map_err(provider_category)?;
+    let mut rows=c.query(collection_lookahead_sql!("SELECT claim_type,claim_value FROM effect_identity_user_claims WHERE user_id=?1 ORDER BY id LIMIT ",""),(id.to_string(),)).await.map_err(provider_category)?;
     let claims = read_claims(&mut rows).await?;
-    let mut rows=c.query(super::schema::collection_lookahead_sql!("SELECT login_provider,provider_key,provider_display_name FROM effect_identity_user_logins WHERE user_id=?1 ORDER BY login_provider,provider_key LIMIT ",""),(id.to_string(),)).await.map_err(provider_category)?;
+    let mut rows=c.query(collection_lookahead_sql!("SELECT login_provider,provider_key,provider_display_name FROM effect_identity_user_logins WHERE user_id=?1 ORDER BY login_provider,provider_key LIMIT ",""),(id.to_string(),)).await.map_err(provider_category)?;
     let logins = read_logins(&mut rows).await?;
     let mut rows=c.query("SELECT login_provider,name,value FROM effect_identity_user_tokens WHERE user_id=?1 AND value IS NOT NULL ORDER BY login_provider,name LIMIT ?2",(id.to_string(),i64::try_from(token_capacity).map_err(|_|StoreError::ConstraintViolation)?.checked_add(1).ok_or(StoreError::ConstraintViolation)?)).await.map_err(provider_category)?;
     let mut tokens = Vec::new();
@@ -461,7 +462,7 @@ async fn load(
             });
         }
     }
-    let mut rows=c.query(super::schema::recovery_lookahead_sql!("SELECT code_hash FROM effect_identity_user_recovery_code_hashes WHERE user_id=?1 ORDER BY id LIMIT ",""),(id.to_string(),)).await.map_err(provider_category)?;
+    let mut rows=c.query(recovery_lookahead_sql!("SELECT code_hash FROM effect_identity_user_recovery_code_hashes WHERE user_id=?1 ORDER BY id LIMIT ",""),(id.to_string(),)).await.map_err(provider_category)?;
     let mut recovery_hashes = Vec::new();
     while let Some(row) = rows.next().await.map_err(provider_category)? {
         if recovery_hashes.len() >= super::schema::NATIVE_RECOVERY_LIMIT {
@@ -469,7 +470,7 @@ async fn load(
         }
         recovery_hashes.push(deserialize_recovery_code_hash(&row_text(&row)?)?);
     }
-    let mut rows=c.query(super::schema::collection_lookahead_sql!("SELECT payload FROM effect_identity_user_passkeys WHERE user_id=?1 ORDER BY credential_id LIMIT ",""),(id.to_string(),)).await.map_err(provider_category)?;
+    let mut rows=c.query(collection_lookahead_sql!("SELECT payload FROM effect_identity_user_passkeys WHERE user_id=?1 ORDER BY credential_id LIMIT ",""),(id.to_string(),)).await.map_err(provider_category)?;
     let passkeys = read_user_passkeys(&mut rows, id).await?;
     Ok(Some(VersionedAccount {
         revision,

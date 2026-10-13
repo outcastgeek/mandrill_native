@@ -1,5 +1,10 @@
 //! Compile-time and runtime coverage for ordinary `sqlx::query*` macros on Turso.
 
+use sqlx::{
+    query, query_as, query_as_unchecked, query_file, query_file_as, query_file_as_unchecked,
+    query_file_scalar, query_file_scalar_unchecked, query_file_unchecked, query_scalar,
+    query_scalar_unchecked, query_unchecked,
+};
 use std::str::FromStr;
 
 use sqlx::ConnectOptions;
@@ -49,62 +54,62 @@ async fn facade_query_macros_select_turso() -> TestResult {
         .connect()
         .await?;
 
-    let row = sqlx::query!("SELECT CAST(41 AS INTEGER) AS `value!: i64`")
+    let row = query!("SELECT CAST(41 AS INTEGER) AS `value!: i64`")
         .fetch_one(&mut conn)
         .await?;
     assert_eq!(row.value, 41);
 
-    let row = sqlx::query_as!(MacroValue, "SELECT CAST(42 AS INTEGER) AS `value!: i64`")
+    let row = query_as!(MacroValue, "SELECT CAST(42 AS INTEGER) AS `value!: i64`")
         .fetch_one(&mut conn)
         .await?;
     assert_eq!(row.value, 42);
 
-    let value = sqlx::query_scalar!("SELECT CAST(43 AS INTEGER) AS `value!: i64`")
+    let value = query_scalar!("SELECT CAST(43 AS INTEGER) AS `value!: i64`")
         .fetch_one(&mut conn)
         .await?;
     assert_eq!(value, 43);
 
-    let row = sqlx::query_file!("tests/stock_literal.sql")
+    let row = query_file!("tests/stock_literal.sql")
         .fetch_one(&mut conn)
         .await?;
     assert_eq!(row.value, 43);
 
-    let row = sqlx::query_file_as!(MacroValue, "tests/stock_literal.sql")
+    let row = query_file_as!(MacroValue, "tests/stock_literal.sql")
         .fetch_one(&mut conn)
         .await?;
     assert_eq!(row.value, 43);
 
-    let value = sqlx::query_file_scalar!("tests/stock_literal.sql")
+    let value = query_file_scalar!("tests/stock_literal.sql")
         .fetch_one(&mut conn)
         .await?;
     assert_eq!(value, 43);
 
-    let row = sqlx::query_unchecked!("SELECT CAST(44 AS INTEGER) AS `value!: i64`")
+    let row = query_unchecked!("SELECT CAST(44 AS INTEGER) AS `value!: i64`")
         .fetch_one(&mut conn)
         .await?;
     assert_eq!(row.value, 44);
 
-    let row = sqlx::query_as_unchecked!(MacroValue, "SELECT CAST(45 AS INTEGER) AS `value!: i64`")
+    let row = query_as_unchecked!(MacroValue, "SELECT CAST(45 AS INTEGER) AS `value!: i64`")
         .fetch_one(&mut conn)
         .await?;
     assert_eq!(row.value, 45);
 
-    let value = sqlx::query_scalar_unchecked!("SELECT CAST(46 AS INTEGER) AS `value!: i64`")
+    let value = query_scalar_unchecked!("SELECT CAST(46 AS INTEGER) AS `value!: i64`")
         .fetch_one(&mut conn)
         .await?;
     assert_eq!(value, 46);
 
-    let row = sqlx::query_file_unchecked!("tests/stock_literal.sql")
+    let row = query_file_unchecked!("tests/stock_literal.sql")
         .fetch_one(&mut conn)
         .await?;
     assert_eq!(row.value, 43);
 
-    let row = sqlx::query_file_as_unchecked!(MacroValue, "tests/stock_literal.sql")
+    let row = query_file_as_unchecked!(MacroValue, "tests/stock_literal.sql")
         .fetch_one(&mut conn)
         .await?;
     assert_eq!(row.value, 43);
 
-    let value = sqlx::query_file_scalar_unchecked!("tests/stock_literal.sql")
+    let value = query_file_scalar_unchecked!("tests/stock_literal.sql")
         .fetch_one(&mut conn)
         .await?;
     assert_eq!(value, 43);

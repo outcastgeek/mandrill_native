@@ -1,6 +1,7 @@
 //! Per-key coordination of cache lookup and invalidation.
 
 use crate::{Effect, Semaphore, SemaphoreError, SemaphorePermit};
+use crate::{effect, effect_map};
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, Weak};
@@ -112,16 +113,18 @@ impl CacheGate {
         key: Arc<[u8]>,
     ) -> Effect<CacheGatePermit, SemaphoreError, R> {
         let gate = self.clone();
-        Effect::defer(move || {
-            let handle = gate.handle(Arc::clone(&key));
-            handle
+        {
+            let __dsl_factory = move || {
+                let handle = gate.handle(Arc::clone(&key));
+                effect_map! { program: handle
                 .semaphore
-                .acquire(NonZeroUsize::MIN)
-                .map(move |permit| CacheGatePermit {
+                .acquire(NonZeroUsize::MIN), map: move |permit| CacheGatePermit {
                     _permit: permit,
                     _handle: handle.clone(),
-                })
-        })
+                }, }
+            };
+            effect! { __dsl_factory()? }
+        }
     }
 }
 
@@ -131,12 +134,7 @@ mod tests {
     use crate::{Cancellation, Exit};
     use futures_executor::block_on;
     use std::future::Future;
-    use std::task::{Context, Wake, Waker};
-
-    struct Noop;
-    impl Wake for Noop {
-        fn wake(self: Arc<Self>) {}
-    }
+    use std::task::{Context, Waker};
 
     #[test]
     fn same_key_shares_one_gate_and_last_handle_releases_identity() {
@@ -171,12 +169,13 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_waiter_does_not_retain_the_key_or_permit() {
+    fn cancelled_waiter_does_not_retain_the_key_or_permit() -> Result<(), &'static str> {
         let registry = CacheGate::new();
         let key: Arc<[u8]> = Arc::from([]);
-        let held = match block_on(registry.acquire::<()>(Arc::clone(&key)).run(Arc::new(()))) {
-            Exit::Success(permit) => permit,
-            _ => panic!(),
+        let Exit::Success(held) =
+            block_on(registry.acquire::<()>(Arc::clone(&key)).run(Arc::new(())))
+        else {
+            return Err("expected the first waiter to acquire the gate");
         };
         let cancellation = Arc::new(Cancellation::new());
         let mut waiter = Box::pin(
@@ -184,8 +183,7 @@ mod tests {
                 .acquire::<Cancellation>(Arc::clone(&key))
                 .run_cancellable(Arc::clone(&cancellation)),
         );
-        let waker = Waker::from(Arc::new(Noop));
-        let mut context = Context::from_waker(&waker);
+        let mut context = Context::from_waker(Waker::noop());
         assert!(waiter.as_mut().poll(&mut context).is_pending());
         assert!(cancellation.request());
         assert!(matches!(block_on(waiter), Exit::Interrupted));
@@ -201,5 +199,6 @@ mod tests {
             block_on(registry.acquire::<()>(key).run(Arc::new(()))),
             Exit::Success(_)
         ));
+        Ok(())
     }
 }

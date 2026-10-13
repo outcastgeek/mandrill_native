@@ -1,3 +1,8 @@
+use effect::{
+    effect, effect_all_concurrent, effect_for_each_concurrent, effect_future, effect_map,
+    effect_provide_some, effect_race, effect_resource, effect_scope, effect_sync,
+    effect_try_future, effect_try_sync, effect_uninterruptible, service,
+};
 extern crate effect as fx;
 
 use effect::{
@@ -21,24 +26,25 @@ use tasks::Environment;
 
 // Fixture deadlock detection, not a production scheduling/latency policy.
 const DEADLOCK_DEADLINE: Duration = Duration::from_secs(5);
-#[allow(clippy::panic)] // Fail the harness directly rather than fabricate an Effect outcome.
+
 fn run<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static>(
     program: Effect<A, E, R>,
     env: Arc<R>,
-) -> Exit<A, E> {
+) -> Result<Exit<A, E>, String> {
     let (send, receive) = mpsc::channel();
     let owner = std::thread::spawn(move || {
         assert!(send.send(block_on(program.run(env))).is_ok());
     });
     let outcome = receive
         .recv_timeout(DEADLOCK_DEADLINE)
-        .unwrap_or_else(|error| panic!("parallel operation did not settle: {error}"));
+        .map_err(|error| format!("parallel operation did not settle: {error}"))?;
     assert!(owner.join().is_ok());
-    outcome
+    Ok(outcome)
 }
-#[allow(clippy::panic)] // Explicit positive fixture policy; an invalid fixture is a test failure.
+
 fn limit(value: usize) -> NonZeroUsize {
-    NonZeroUsize::new(value).unwrap_or_else(|| panic!("fixture concurrency must be positive"))
+    assert!(value > 0, "fixture concurrency must be positive");
+    NonZeroUsize::MIN.saturating_add(value - 1)
 }
 
 // Result and expected-error payloads deliberately implement neither Clone nor Sync.
@@ -51,22 +57,21 @@ enum Error {
 }
 
 #[test]
-fn fixed_workers_run_synchronous_bodies_independently_and_keep_input_order() {
+fn fixed_workers_run_synchronous_bodies_independently_and_keep_input_order() -> Result<(), String> {
     const WORKERS: usize = 4; // Four actual barrier participants, as in the source regression.
     const WAVES: usize = 2; // Reuse the same worker set for two complete barrier rounds.
     let inputs: Vec<_> = (0..WORKERS * WAVES).collect();
     let barrier = Arc::new(Barrier::new(WORKERS));
     let env = Arc::new(Environment::default());
-    let program: Effect<Vec<(Value, std::thread::ThreadId)>, Error, Environment> =
-        Effect::for_each_concurrent(limit(WORKERS), inputs, move |input| {
-            let input = *input;
-            let barrier = Arc::clone(&barrier);
-            Effect::sync(move || {
-                let _ = barrier.wait();
-                (Value(Cell::new(input)), std::thread::current().id())
-            })
-        });
-    let outcome = run(program, Arc::clone(&env));
+    let program: Effect<Vec<(Value, std::thread::ThreadId)>, Error, Environment> = effect_for_each_concurrent! { concurrency: limit(WORKERS), values: inputs, body: move |input| {
+        let input = *input;
+        let barrier = Arc::clone(&barrier);
+        effect_sync! { body: move || {
+            let _ = barrier.wait();
+            (Value(Cell::new(input)), std::thread::current().id())
+        }, }
+    }, };
+    let outcome = run(program, Arc::clone(&env))?;
     assert!(matches!(outcome, Exit::Success(_)));
     if let Exit::Success(values) = outcome {
         assert_eq!(
@@ -82,6 +87,7 @@ fn fixed_workers_run_synchronous_bodies_independently_and_keep_input_order() {
     }
     assert_eq!(env.tasks.submitted(), WORKERS);
     env.tasks.finish();
+    Ok(())
 }
 
 #[test]
@@ -98,32 +104,31 @@ fn bounded_reservations_do_not_exceed_limit_and_late_results_keep_order() {
     let a = Arc::clone(&active);
     let m = Arc::clone(&maximum);
     let s = Arc::clone(&started);
-    let program: Effect<Vec<Value>, Error, Environment> =
-        Effect::for_each_concurrent(limit(WORKERS), vec![0, 1, 2, 3], move |input| {
-            let input = *input;
-            let e = Arc::clone(&e);
-            let g = Arc::clone(&g);
+    let program: Effect<Vec<Value>, Error, Environment> = effect_for_each_concurrent! { concurrency: limit(WORKERS), values: vec![0, 1, 2, 3], body: move |input| {
+        let input = *input;
+        let e = Arc::clone(&e);
+        let g = Arc::clone(&g);
+        let a = Arc::clone(&a);
+        let m = Arc::clone(&m);
+        let s = Arc::clone(&s);
+        effect_future! { body: move |_| {
+            let _ = s.fetch_add(1, Ordering::SeqCst);
+            let now = a.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = m.fetch_max(now, Ordering::SeqCst);
             let a = Arc::clone(&a);
-            let m = Arc::clone(&m);
-            let s = Arc::clone(&s);
-            Effect::from_future(move |_| {
-                let _ = s.fetch_add(1, Ordering::SeqCst);
-                let now = a.fetch_add(1, Ordering::SeqCst) + 1;
-                let _ = m.fetch_max(now, Ordering::SeqCst);
-                let a = Arc::clone(&a);
-                let gate = g.get(input).cloned();
-                if let Some(entered) = e.get(input) {
-                    let _ = entered.request();
+            let gate = g.get(input).cloned();
+            if let Some(entered) = e.get(input) {
+                let _ = entered.request();
+            }
+            async move {
+                if let Some(gate) = gate {
+                    gate.cancelled().await;
                 }
-                async move {
-                    if let Some(gate) = gate {
-                        gate.cancelled().await;
-                    }
-                    let _ = a.fetch_sub(1, Ordering::SeqCst);
-                    Value(Cell::new(input))
-                }
-            })
-        });
+                let _ = a.fetch_sub(1, Ordering::SeqCst);
+                Value(Cell::new(input))
+            }
+        }, }
+    }, };
     let (mut driver, observer) = program.owned_run(Arc::clone(&env));
     drive::until(std::pin::Pin::new(&mut driver), || {
         entered.iter().all(Cancellation::is_requested)
@@ -147,26 +152,26 @@ fn bounded_reservations_do_not_exceed_limit_and_late_results_keep_order() {
 }
 
 #[test]
-fn shared_non_clone_inputs_are_borrowed_and_runs_create_fresh_owned_results() {
+fn shared_non_clone_inputs_are_borrowed_and_runs_create_fresh_owned_results() -> Result<(), String>
+{
     struct Input(String); // No Clone: callbacks must borrow the shared collection.
     let env = Arc::new(Environment::default());
     let inputs = vec![Input(String::from("one")), Input(String::from("second"))];
     let expected: Vec<_> = inputs.iter().map(|input| input.0.len()).collect();
     let addresses = Arc::new(Mutex::new(Vec::new()));
     let witness = Arc::clone(&addresses);
-    let program: Effect<Vec<Value>, Error, Environment> =
-        Effect::for_each_concurrent(NonZeroUsize::MIN, inputs, move |input| {
-            witness
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(std::ptr::from_ref(input) as usize);
-            let length = input.0.len();
-            Effect::sync(move || Value(Cell::new(length)))
-        });
+    let program: Effect<Vec<Value>, Error, Environment> = effect_for_each_concurrent! { concurrency: NonZeroUsize::MIN, values: inputs, body: move |input| {
+        witness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(std::ptr::from_ref(input) as usize);
+        let length = input.0.len();
+        effect_sync! { body: move || Value(Cell::new(length)), }
+    }, };
     for _ in 0..2 {
         // Two executions must refer to the same immutable inputs.
         assert_eq!(
-            run(program.clone(), Arc::clone(&env)),
+            run(program.clone(), Arc::clone(&env))?,
             Exit::Success(
                 expected
                     .iter()
@@ -181,28 +186,28 @@ fn shared_non_clone_inputs_are_borrowed_and_runs_create_fresh_owned_results() {
     let mut runs = addresses.chunks_exact(expected.len());
     assert_eq!(runs.next(), runs.next());
     env.tasks.finish();
+    Ok(())
 }
 
 #[test]
-fn first_failure_stops_reservation_without_creating_later_callbacks() {
+fn first_failure_stops_reservation_without_creating_later_callbacks() -> Result<(), String> {
     let called = Arc::new(Mutex::new(Vec::new()));
     let witness = Arc::clone(&called);
     let env = Arc::new(Environment::default());
-    let program: Effect<Vec<Value>, Error, Environment> =
-        Effect::for_each_concurrent(NonZeroUsize::MIN, vec![0, 1, 2], move |input| {
-            witness
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(*input);
-            let input = *input;
-            if input == 1 {
-                Effect::fail_with(move || Error::Body(Cell::new(input)))
-            } else {
-                Effect::sync(move || Value(Cell::new(input)))
-            }
-        });
+    let program: Effect<Vec<Value>, Error, Environment> = effect_for_each_concurrent! { concurrency: NonZeroUsize::MIN, values: vec![0, 1, 2], body: move |input| {
+        witness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(*input);
+        let input = *input;
+        if input == 1 {
+            effect_try_sync! { body: { let __dsl_error = move || Error::Body(Cell::new(input)); move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }
+        } else {
+            effect_sync! { body: move || Value(Cell::new(input)), }
+        }
+    }, };
     assert_eq!(
-        run(program, Arc::clone(&env)),
+        run(program, Arc::clone(&env))?,
         Exit::Fail(Error::Body(Cell::new(1)))
     );
     assert_eq!(
@@ -212,6 +217,7 @@ fn first_failure_stops_reservation_without_creating_later_callbacks() {
         vec![0, 1]
     );
     env.tasks.finish();
+    Ok(())
 }
 
 #[test]
@@ -224,36 +230,32 @@ fn concurrent_failure_cancels_and_joins_started_sibling_release() {
     let start = entered.clone();
     let release = releasing.clone();
     let gate = finish.clone();
-    let sibling: Effect<Value, Error, Environment> = Effect::from_future(move |token| {
-        let _ = start.request();
-        async move {
-            token.cancelled().await;
-            Value(Cell::new(1))
-        }
-    })
-    .ensuring(Effect::try_future(
-        move |_| {
-            let _ = release.request();
-            let gate = gate.clone();
+    let sibling: Effect<Value, Error, Environment> = effect_resource! {
+    ensuring; program: effect_future! { body: move |token| {
+            let _ = start.request();
             async move {
-                gate.cancelled().await;
-                Err::<(), _>(Error::Release(Cell::new(2)))
+                token.cancelled().await;
+                Value(Cell::new(1))
             }
-        },
-        |error| error,
-    ));
+        }, }, release: { let __dsl_cleanup = effect_try_future! { body: move |_| {
+                let _ = release.request();
+                let gate = gate.clone();
+                async move {
+                    gate.cancelled().await;
+                    Err::<(), _>(Error::Release(Cell::new(2)))
+                }
+            }, on_error: |error| error, }; move |_| __dsl_cleanup.clone() },
+    };
     let start = entered.clone();
-    let failure: Effect<Value, Error, Environment> = Effect::try_future(
-        move |_| {
-            let start = start.clone();
-            async move {
-                start.cancelled().await;
-                Err::<Value, _>(Error::Body(Cell::new(3)))
-            }
-        },
-        |error| error,
-    );
-    let program = Effect::all_concurrent(limit(WORKERS), vec![sibling, failure]);
+    let failure: Effect<Value, Error, Environment> = effect_try_future! { body: move |_| {
+        let start = start.clone();
+        async move {
+            start.cancelled().await;
+            Err::<Value, _>(Error::Body(Cell::new(3)))
+        }
+    }, on_error: |error| error, };
+    let program =
+        effect_all_concurrent! { concurrency: limit(WORKERS), items: vec![sibling, failure], };
     let (mut driver, observer) = program.owned_run(Arc::clone(&env));
     drive::until(std::pin::Pin::new(&mut driver), || releasing.is_requested());
     suspension::suspended(std::pin::Pin::new(&mut driver));
@@ -282,30 +284,30 @@ fn parent_cancellation_joins_all_concurrent_resources() {
     let release = Arc::clone(&releasing);
     let done = Arc::clone(&released);
     let gate = finish.clone();
-    let program: Effect<Vec<Value>, Error, Environment> =
-        Effect::for_each_concurrent(limit(WORKERS), (0..WORKERS).collect(), move |input| {
-            let input = *input;
-            let start = Arc::clone(&start);
-            let release = Arc::clone(&release);
-            let done = Arc::clone(&done);
-            let gate = gate.clone();
-            Effect::from_future(move |token| {
-                let _ = start.fetch_add(1, Ordering::SeqCst);
-                async move {
-                    token.cancelled().await;
-                    Value(Cell::new(input))
-                }
-            })
-            .ensuring(Effect::from_future(move |_| {
-                let _ = release.fetch_add(1, Ordering::SeqCst);
-                let gate = gate.clone();
+    let program: Effect<Vec<Value>, Error, Environment> = effect_for_each_concurrent! { concurrency: limit(WORKERS), values: (0..WORKERS).collect(), body: move |input| {
+                let input = *input;
+                let start = Arc::clone(&start);
+                let release = Arc::clone(&release);
                 let done = Arc::clone(&done);
-                async move {
-                    gate.cancelled().await;
-                    let _ = done.fetch_add(1, Ordering::SeqCst);
-                }
-            }))
-        });
+                let gate = gate.clone();
+                effect_resource! {
+    ensuring; program: effect_future! { body: move |token| {
+                    let _ = start.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        token.cancelled().await;
+                        Value(Cell::new(input))
+                    }
+                }, }, release: { let __dsl_cleanup = effect_future! { body: move |_| {
+                    let _ = release.fetch_add(1, Ordering::SeqCst);
+                    let gate = gate.clone();
+                    let done = Arc::clone(&done);
+                    async move {
+                        gate.cancelled().await;
+                        let _ = done.fetch_add(1, Ordering::SeqCst);
+                    }
+                }, }; move |_| __dsl_cleanup.clone() },
+    }
+            }, };
     let (mut driver, observer) = program.owned_run_cancellable(Arc::clone(&env));
     drive::until(std::pin::Pin::new(&mut driver), || {
         entered.load(Ordering::SeqCst) == WORKERS
@@ -323,7 +325,7 @@ fn parent_cancellation_joins_all_concurrent_resources() {
 }
 
 #[test]
-fn synchronous_race_competitors_progress_on_independent_workers() {
+fn synchronous_race_competitors_progress_on_independent_workers() -> Result<(), String> {
     const COMPETITORS: usize = 2;
     let env = Arc::new(Environment::default());
     let barrier = Arc::new(Barrier::new(COMPETITORS));
@@ -331,15 +333,21 @@ fn synchronous_race_competitors_progress_on_independent_workers() {
     let contender = |input| {
         let barrier = Arc::clone(&barrier);
         let seen = Arc::clone(&seen);
-        Effect::<Value, Error, Environment>::sync(move || {
-            seen.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(std::thread::current().id());
-            let _ = barrier.wait();
-            Value(Cell::new(input))
-        })
+        {
+            let __dsl_program: Effect<Value, Error, Environment> = effect_sync! { body: move || {
+                seen.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(std::thread::current().id());
+                let _ = barrier.wait();
+                Value(Cell::new(input))
+            }, };
+            __dsl_program
+        }
     };
-    let outcome = run(contender(1).race(contender(2)), Arc::clone(&env));
+    let outcome = run(
+        effect_race! { program: contender(1), right: contender(2), },
+        Arc::clone(&env),
+    )?;
     assert!(matches!(outcome, Exit::Success(ref value) if [1, 2].contains(&value.0.get())));
     let seen = seen
         .lock()
@@ -347,6 +355,7 @@ fn synchronous_race_competitors_progress_on_independent_workers() {
     assert_eq!(seen.len(), COMPETITORS);
     assert_ne!(seen.first(), seen.last());
     env.tasks.finish();
+    Ok(())
 }
 
 #[test]
@@ -358,36 +367,31 @@ fn race_selects_terminal_failure_then_joins_loser_before_returning() {
     let start = entered.clone();
     let release = releasing.clone();
     let gate = finish.clone();
-    let loser: Effect<Value, Error, Environment> = Effect::from_future(move |token| {
-        let _ = start.request();
-        async move {
-            token.cancelled().await;
-            Value(Cell::new(1))
-        }
-    })
-    .ensuring(Effect::try_future(
-        move |_| {
-            let _ = release.request();
-            let gate = gate.clone();
+    let loser: Effect<Value, Error, Environment> = effect_resource! {
+    ensuring; program: effect_future! { body: move |token| {
+            let _ = start.request();
             async move {
-                gate.cancelled().await;
-                Err::<(), _>(Error::Release(Cell::new(2)))
+                token.cancelled().await;
+                Value(Cell::new(1))
             }
-        },
-        |error| error,
-    ));
+        }, }, release: { let __dsl_cleanup = effect_try_future! { body: move |_| {
+                let _ = release.request();
+                let gate = gate.clone();
+                async move {
+                    gate.cancelled().await;
+                    Err::<(), _>(Error::Release(Cell::new(2)))
+                }
+            }, on_error: |error| error, }; move |_| __dsl_cleanup.clone() },
+    };
     let start = entered.clone();
-    let winner: Effect<Value, Error, Environment> = Effect::try_future(
-        move |_| {
-            let start = start.clone();
-            async move {
-                start.cancelled().await;
-                Err::<Value, _>(Error::Body(Cell::new(3)))
-            }
-        },
-        |error| error,
-    );
-    let program = loser.race(winner);
+    let winner: Effect<Value, Error, Environment> = effect_try_future! { body: move |_| {
+        let start = start.clone();
+        async move {
+            start.cancelled().await;
+            Err::<Value, _>(Error::Body(Cell::new(3)))
+        }
+    }, on_error: |error| error, };
+    let program = effect_race! { program: loser, right: winner, };
     let (mut driver, observer) = program.owned_run(Arc::clone(&env));
     drive::until(std::pin::Pin::new(&mut driver), || releasing.is_requested());
     suspension::suspended(std::pin::Pin::new(&mut driver));
@@ -413,35 +417,35 @@ fn race_discards_loser_ordinary_error_but_retains_its_cleanup_error() {
     let child_token = Arc::new(Mutex::new(None::<Cancellation>));
     let token_witness = Arc::clone(&child_token);
     let start = entered.clone();
-    let loser: Effect<Value, Error, Environment> = Effect::try_future(
-        move |_| {
-            let _ = start.request();
-            let finish = finish.clone();
-            async move {
-                finish.cancelled().await;
-                Err::<Value, _>(Error::Body(Cell::new(1)))
-            }
-        },
-        |error| error,
-    )
-    .uninterruptible()
-    .ensuring(Effect::fail_with(|| Error::Release(Cell::new(2))));
-    let loser = Effect::<(), Error, Environment>::from_future(move |token| {
-        *token_witness
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
-        std::future::ready(())
-    })
-    .flat_map(move |()| loser.clone());
+    let loser: Effect<Value, Error, Environment> = effect_resource! {
+    ensuring; program: effect_uninterruptible! { program: effect_try_future! { body: move |_| {
+                let _ = start.request();
+                let finish = finish.clone();
+                async move {
+                    finish.cancelled().await;
+                    Err::<Value, _>(Error::Body(Cell::new(1)))
+                }
+            }, on_error: |error| error, }, }, release: { let __dsl_cleanup = effect_try_sync! { body: { let __dsl_error = || Error::Release(Cell::new(2)); move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }; move |_| __dsl_cleanup.clone() },
+    };
+    let loser = effect! {
+    bind;
+    program: { let __dsl_program: Effect < () , Error , Environment > = effect_future! { body: move |token| {
+           *token_witness
+               .lock()
+               .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
+           std::future::ready(())
+       }, }; __dsl_program },
+    body: move |()| loser.clone(),
+    };
     let start = entered.clone();
-    let winner = Effect::from_future(move |_| {
+    let winner = effect_future! { body: move |_| {
         let start = start.clone();
         async move {
             start.cancelled().await;
             Value(Cell::new(3))
         }
-    });
-    let program = winner.race(loser);
+    }, };
+    let program = effect_race! { program: winner, right: loser, };
     let (mut driver, observer) = program.owned_run(Arc::clone(&env));
     drive::until(std::pin::Pin::new(&mut driver), || {
         child_token
@@ -487,17 +491,22 @@ impl HasTaskSpawner for Faulty {
 }
 
 #[test]
-fn accepted_worker_loss_settles_traversal_and_preserves_every_ownership_defect() {
+fn accepted_worker_loss_settles_traversal_and_preserves_every_ownership_defect()
+-> Result<(), String> {
     const WORKERS: usize = 2;
     let programs = vec![
-        Effect::<Value, Error, Faulty>::sync(|| Value(Cell::new(1))),
-        Effect::sync(|| Value(Cell::new(2))),
+        {
+            let __dsl_program: Effect<Value, Error, Faulty> =
+                effect_sync! { body: || Value(Cell::new(1)), };
+            __dsl_program
+        },
+        effect_sync! { body: || Value(Cell::new(2)), },
     ];
     assert_eq!(
         run(
-            Effect::all_concurrent(limit(WORKERS), programs),
+            effect_all_concurrent! { concurrency: limit(WORKERS), items: programs, },
             Arc::new(Faulty(Fault::Lose))
-        ),
+        )?,
         Exit::FinalizationFailed(Finalization {
             primary: PrimaryOutcome::Defected(Defect::library(LibraryDefect::ScheduledTaskDropped)),
             first: CleanupFailure::ReleaseDefect(Defect::library(
@@ -506,71 +515,88 @@ fn accepted_worker_loss_settles_traversal_and_preserves_every_ownership_defect()
             rest: Vec::new(),
         })
     );
+    Ok(())
 }
 
 #[test]
-fn race_driver_loss_wakes_selection_and_retains_loser_ownership_failure() {
-    let left = Effect::<Value, Error, Faulty>::sync(|| Value(Cell::new(1)));
-    let right = Effect::sync(|| Value(Cell::new(2)));
-    assert_eq!(
-        run(left.race(right), Arc::new(Faulty(Fault::Lose))),
-        Exit::FinalizationFailed(Finalization {
-            primary: PrimaryOutcome::Defected(Defect::library(LibraryDefect::ScheduledTaskDropped)),
-            first: CleanupFailure::ReleaseDefect(Defect::library(
-                LibraryDefect::ScheduledTaskDropped
-            )),
-            rest: Vec::new(),
-        })
-    );
-}
-
-#[test]
-fn rejected_submission_reports_one_primary_failure_without_running_jobs() {
-    let called = Arc::new(AtomicBool::new(false));
-    let witness = Arc::clone(&called);
-    let job: Effect<Value, Error, Faulty> = Effect::sync(move || {
-        witness.store(true, Ordering::SeqCst);
-        Value(Cell::new(1))
-    });
+fn race_driver_loss_wakes_selection_and_retains_loser_ownership_failure() -> Result<(), String> {
+    let left = {
+        let __dsl_program: Effect<Value, Error, Faulty> =
+            effect_sync! { body: || Value(Cell::new(1)), };
+        __dsl_program
+    };
+    let right = effect_sync! { body: || Value(Cell::new(2)), };
     assert_eq!(
         run(
-            Effect::all_concurrent(NonZeroUsize::MIN, vec![job.clone()]),
+            effect_race! { program: left, right: right, },
+            Arc::new(Faulty(Fault::Lose))
+        )?,
+        Exit::FinalizationFailed(Finalization {
+            primary: PrimaryOutcome::Defected(Defect::library(LibraryDefect::ScheduledTaskDropped)),
+            first: CleanupFailure::ReleaseDefect(Defect::library(
+                LibraryDefect::ScheduledTaskDropped
+            )),
+            rest: Vec::new(),
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn rejected_submission_reports_one_primary_failure_without_running_jobs() -> Result<(), String> {
+    let called = Arc::new(AtomicBool::new(false));
+    let witness = Arc::clone(&called);
+    let job: Effect<Value, Error, Faulty> = effect_sync! { body: move || {
+        witness.store(true, Ordering::SeqCst);
+        Value(Cell::new(1))
+    }, };
+    assert_eq!(
+        run(
+            effect_all_concurrent! { concurrency: NonZeroUsize::MIN, items: vec![job.clone()], },
             Arc::new(Faulty(Fault::Reject))
-        ),
+        )?,
         Exit::Die(Defect::library(LibraryDefect::TaskSubmissionRejected))
     );
     assert_eq!(
-        run(job.clone().race(job), Arc::new(Faulty(Fault::Reject))),
+        run(
+            effect_race! { program: job.clone(), right: job, },
+            Arc::new(Faulty(Fault::Reject))
+        )?,
         Exit::Die(Defect::library(LibraryDefect::TaskSubmissionRejected))
     );
     assert!(!called.load(Ordering::SeqCst));
+    Ok(())
 }
 
 #[test]
-#[allow(clippy::panic)] // User transform panic is an ordinary defect, not successful traversal.
-fn transform_panics_are_defects_and_skip_unreserved_inputs() {
+fn transform_panics_are_defects_and_skip_unreserved_inputs() -> Result<(), String> {
     let env = Arc::new(Environment::default());
     let called = Arc::new(AtomicUsize::new(0));
     let witness = Arc::clone(&called);
-    let program: Effect<Vec<Value>, Error, Environment> =
-        Effect::for_each_concurrent(NonZeroUsize::MIN, vec![1, 2], move |_| {
-            let _ = witness.fetch_add(1, Ordering::SeqCst);
-            panic!("intentional transform panic")
-        });
+    let program: Effect<Vec<Value>, Error, Environment> = effect_for_each_concurrent! { concurrency: NonZeroUsize::MIN, values: vec![1, 2], body: move |_| {
+        let _ = witness.fetch_add(1, Ordering::SeqCst);
+        std::panic::resume_unwind(Box::new("intentional transform panic"))
+    }, };
     assert!(
-        matches!(run(program, Arc::clone(&env)), Exit::Die(ref defect) if defect.kind() == DefectKind::CallbackPanic)
+        matches!(run(program, Arc::clone(&env))?, Exit::Die(ref defect) if defect.kind() == DefectKind::CallbackPanic)
     );
     assert_eq!(called.load(Ordering::SeqCst), 1);
     env.tasks.finish();
+    Ok(())
 }
 
 #[test]
-fn empty_traversal_needs_no_task_submission_even_with_rejecting_provider() {
-    let program = Effect::<Value, Error, Faulty>::all_concurrent(NonZeroUsize::MIN, Vec::new());
+fn empty_traversal_needs_no_task_submission_even_with_rejecting_provider() -> Result<(), String> {
+    let program = {
+        let __dsl_program: Effect<Vec<Value>, Error, Faulty> =
+            effect_all_concurrent! { concurrency: NonZeroUsize::MIN, items: Vec::new(), };
+        __dsl_program
+    };
     assert_eq!(
-        run(program, Arc::new(Faulty(Fault::Reject))),
+        run(program, Arc::new(Faulty(Fault::Reject)))?,
         Exit::Success(Vec::new())
     );
+    Ok(())
 }
 
 #[path = "support/parallel_cases.rs"]
@@ -594,38 +620,40 @@ fn cancel_after_winner(boundary: Boundary) -> Exit<(), Error> {
     let start = entered.clone();
     let release = releasing.clone();
     let gate = finish.clone();
-    let loser: Effect<Value, Error, Environment> = Effect::from_future(move |token| {
-        let _ = start.request();
-        async move {
-            token.cancelled().await;
-            Value(Cell::new(1))
-        }
-    })
-    .ensuring(Effect::from_future(move |_| {
-        let _ = release.request();
-        let gate = gate.clone();
-        async move { gate.cancelled().await }
-    }));
-    let start = entered.clone();
-    let winner: Effect<Value, Error, Environment> = Effect::try_future(
-        move |_| {
-            let start = start.clone();
+    let loser: Effect<Value, Error, Environment> = effect_resource! {
+    ensuring; program: effect_future! { body: move |token| {
+            let _ = start.request();
             async move {
-                start.cancelled().await;
-                Err::<Value, _>(Error::Body(Cell::new(2)))
+                token.cancelled().await;
+                Value(Cell::new(1))
             }
-        },
-        |error| error,
-    )
-    .uninterruptible();
-    let race = winner.race(loser);
+        }, }, release: { let __dsl_cleanup = effect_future! { body: move |_| {
+            let _ = release.request();
+            let gate = gate.clone();
+            async move { gate.cancelled().await }
+        }, }; move |_| __dsl_cleanup.clone() },
+    };
+    let start = entered.clone();
+    let winner: Effect<Value, Error, Environment> = effect_uninterruptible! { program: effect_try_future! { body: move |_| {
+        let start = start.clone();
+        async move {
+            start.cancelled().await;
+            Err::<Value, _>(Error::Body(Cell::new(2)))
+        }
+    }, on_error: |error| error, }, };
+    let race = effect_race! { program: winner, right: loser, };
     let program = match boundary {
-        Boundary::Root => race.map(drop),
-        Boundary::ScopedFiber => effect::Scope::scoped(move |scope| {
-            scope
-                .fork(race.clone())
-                .flat_map(|_| Effect::from_future(|token| async move { token.cancelled().await }))
-        }),
+        Boundary::Root => effect_map! { program: race, map: drop, },
+        Boundary::ScopedFiber => effect_scope! {
+        body: move |scope| {
+                    effect! {
+         bind;
+         program: scope
+                        .fork(race.clone()),
+         body: |_| effect_future! { body: |token| async move { token.cancelled().await }, },
+         }
+                },
+        },
     };
     let (mut driver, observer) = program.owned_run_cancellable(Arc::clone(&env));
     drive::until(std::pin::Pin::new(&mut driver), || releasing.is_requested());
@@ -679,9 +707,13 @@ fn committed_right_winner_is_not_replaced_by_left_biased_status_polling() {
     }
     const COMPETITORS: usize = 2;
     let env = Arc::new(Paused::default());
-    let left = Effect::<Value, Error, Paused>::sync(|| Value(Cell::new(1)));
-    let right = Effect::sync(|| Value(Cell::new(2)));
-    let program = left.race(right);
+    let left = {
+        let __dsl_program: Effect<Value, Error, Paused> =
+            effect_sync! { body: || Value(Cell::new(1)), };
+        __dsl_program
+    };
+    let right = effect_sync! { body: || Value(Cell::new(2)), };
+    let program = effect_race! { program: left, right: right, };
     let (mut driver, observer) = program.owned_run(Arc::clone(&env));
     drive::until(std::pin::Pin::new(&mut driver), || {
         env.0
@@ -777,72 +809,74 @@ fn cleanup_groups_commit_in_order_before_discarded_primary_destructors() {
     let second_gate = second.clone();
     let third_gate = third.clone();
     let blocked = Arc::clone(&drop_gate);
-    let jobs: Effect<Vec<Value>, Failure, Environment> = Effect::for_each_concurrent(
-        limit(WORKERS),
-        vec![Label::FirstBody, Label::SecondBody, Label::ThirdBody],
-        move |label| {
-            let label = *label;
-            let count = Arc::clone(&count);
-            let ready = ready.clone();
-            let second = second_gate.clone();
-            let third = third_gate.clone();
-            let blocked = Arc::clone(&blocked);
-            let body: Effect<Value, Failure, Environment> = Effect::try_future(
-                move |_| {
-                    if count.fetch_add(1, Ordering::SeqCst) + 1 == WORKERS {
-                        let _ = ready.request();
-                    }
-                    let ready = ready.clone();
-                    let second = second.clone();
-                    let third = third.clone();
-                    let blocked = Arc::clone(&blocked);
-                    async move {
-                        match label {
-                            Label::FirstBody => ready.cancelled().await,
-                            Label::SecondBody => second.cancelled().await,
-                            Label::ThirdBody => third.cancelled().await,
-                            Label::SecondCleanup | Label::ThirdCleanup => {}
+    let jobs: Effect<Vec<Value>, Failure, Environment> = effect_for_each_concurrent! { concurrency: limit(WORKERS), values: vec![Label::FirstBody, Label::SecondBody, Label::ThirdBody], body: move |label| {
+                let label = *label;
+                let count = Arc::clone(&count);
+                let ready = ready.clone();
+                let second = second_gate.clone();
+                let third = third_gate.clone();
+                let blocked = Arc::clone(&blocked);
+                let body: Effect<Value, Failure, Environment> = effect_uninterruptible! { program: effect_try_future! { body: move |_| {
+                        if count.fetch_add(1, Ordering::SeqCst) + 1 == WORKERS {
+                            let _ = ready.request();
                         }
-                        Err::<Value, _>(Failure {
-                            label,
-                            gate: if label == Label::SecondBody {
-                                Some(blocked)
+                        let ready = ready.clone();
+                        let second = second.clone();
+                        let third = third.clone();
+                        let blocked = Arc::clone(&blocked);
+                        async move {
+                            match label {
+                                Label::FirstBody => ready.cancelled().await,
+                                Label::SecondBody => second.cancelled().await,
+                                Label::ThirdBody => third.cancelled().await,
+                                Label::SecondCleanup | Label::ThirdCleanup => {}
+                            }
+                            Err::<Value, _>(Failure {
+                                label,
+                                gate: if label == Label::SecondBody {
+                                    Some(blocked)
+                                } else {
+                                    None
+                                },
+                            })
+                        }
+                    }, on_error: |error| error, }, };
+                let body = match label {
+                    Label::FirstBody => body,
+                    Label::SecondBody | Label::ThirdBody => {
+                        effect_resource! {
+    ensuring; program: body, release: { let __dsl_cleanup = effect_try_sync! { body: { let __dsl_error = move || Failure {
+                            label: if label == Label::SecondBody {
+                                Label::SecondCleanup
                             } else {
-                                None
+                                Label::ThirdCleanup
                             },
-                        })
+                            gate: None,
+                        }; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }; move |_| __dsl_cleanup.clone() },
+    }
                     }
-                },
-                |error| error,
-            )
-            .uninterruptible();
-            let body = match label {
-                Label::FirstBody => body,
-                Label::SecondBody | Label::ThirdBody => {
-                    body.ensuring(Effect::fail_with(move || Failure {
-                        label: if label == Label::SecondBody {
-                            Label::SecondCleanup
-                        } else {
-                            Label::ThirdCleanup
-                        },
-                        gate: None,
-                    }))
-                }
-                Label::SecondCleanup | Label::ThirdCleanup => body,
-            };
-            let token = Arc::clone(&token);
-            Effect::from_future(move |cancellation| {
-                *token
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cancellation);
-                std::future::ready(())
-            })
-            .flat_map(move |()| body.clone())
-        },
-    );
+                    Label::SecondCleanup | Label::ThirdCleanup => body,
+                };
+                let token = Arc::clone(&token);
+                effect! {
+     bind;
+     program: effect_future! { body: move |cancellation| {
+                    *token
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cancellation);
+                    std::future::ready(())
+                }, },
+     body: move |()| body.clone(),
+     }
+            }, };
     // Fiber publication preserves protected expected errors after group cancel.
-    let program =
-        effect::Scope::scoped(move |scope| scope.fork(jobs.clone()).flat_map(|fiber| fiber.join()));
+    let program = effect_scope! {
+    body: move |scope| effect! {
+     bind;
+     program: scope.fork(jobs.clone()),
+     body: |fiber| fiber.join(),
+     },
+    };
     let (mut driver, observer) = program.owned_run(Arc::clone(&env));
     drive::until(std::pin::Pin::new(&mut driver), || {
         all_entered.is_requested()
@@ -957,21 +991,20 @@ fn projected_task_provider_overrides_one_subtree_without_replacing_root_cancella
         projected_reads: Arc::new(AtomicUsize::new(0)),
     });
     assert!(env.projected_cancellation.request());
-    let parent: Effect<Tag, Error, Parent> = Effect::service(|_| Tag::Parent);
-    let projected: Effect<Tag, Error, Projected> = Effect::service(|_| Tag::Projected);
-    let loser = Effect::from_future(|token| async move {
+    let parent: Effect<Tag, Error, Parent> = service! { env: |_| Tag::Parent, };
+    let projected: Effect<Tag, Error, Projected> = service! { env: |_| Tag::Projected, };
+    let loser = effect_future! { body: |token| async move {
         token.cancelled().await;
         Tag::Projected
-    });
-    let projected = projected
-        .race(loser)
-        .provide_some(|parent: &Parent| Projected {
-            tasks: Arc::clone(&parent.projected_tasks),
-            cancellation: parent.projected_cancellation.clone(),
-            reads: Arc::clone(&parent.projected_reads),
-        });
+    }, };
+    let projected = effect_provide_some! { program: effect_race! { program: projected, right: loser, }, project: |parent: &Parent| Projected {
+        tasks: Arc::clone(&parent.projected_tasks),
+        cancellation: parent.projected_cancellation.clone(),
+        reads: Arc::clone(&parent.projected_reads),
+    }, };
     const BRANCHES: usize = 2; // One parent branch and one projected race subtree.
-    let program = Effect::all_concurrent(limit(BRANCHES), vec![parent, projected]);
+    let program =
+        effect_all_concurrent! { concurrency: limit(BRANCHES), items: vec![parent, projected], };
     assert_eq!(
         block_on(program.run_cancellable(Arc::clone(&env))),
         Exit::Success(vec![Tag::Parent, Tag::Projected])

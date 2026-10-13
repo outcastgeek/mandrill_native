@@ -83,8 +83,10 @@ fn reference_update_with_renamed_dependency() {
         tasks: tasks::Threads::default(),
         clock: fx::TestClock::default(),
     });
-    futures_executor::block_on(reference_update::exercise(std::sync::Arc::clone(&env)));
+    let outcome =
+        futures_executor::block_on(reference_update::exercise(std::sync::Arc::clone(&env)));
     env.tasks.finish();
+    assert!(outcome.is_ok(), "{outcome:?}");
 }
 
 /// Shared composition scenario consumes the renamed dependency and independent providers.
@@ -138,6 +140,7 @@ fn macro_composition() {
         tasks: tasks::Threads::default(),
         clock: fx::TestClock::default(),
     });
-    futures_executor::block_on(composition::exercise(std::sync::Arc::clone(&env)));
+    let outcome = futures_executor::block_on(composition::exercise(std::sync::Arc::clone(&env)));
     env.tasks.finish();
+    assert!(outcome.is_ok(), "{outcome:?}");
 }

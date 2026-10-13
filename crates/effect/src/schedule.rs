@@ -3,6 +3,7 @@
 use crate::internal::destruction::FlatDrop;
 use crate::internal::outcome;
 use crate::internal::runtime::{self, Context, Finish, Step};
+use crate::schedule;
 use crate::{
     Clock, Defect, Effect, Exit, HasClock, HasRandom, LibraryDefect, Random, UnitInterval,
 };
@@ -464,17 +465,19 @@ impl<I: 'static> Schedule<I, usize> {
     /// # Returns
     /// Type: `Self`.
     pub fn recurs(count: usize) -> Self {
-        Self::unfold(usize::default(), move |index, _, _, _| {
-            let next = if *index < count {
-                let index = index
-                    .checked_add(NonZeroUsize::MIN.get())
-                    .ok_or_else(|| Defect::from(LibraryDefect::ScheduleCountOverflow))?;
-                Some((Duration::ZERO, index))
-            } else {
-                None
-            };
-            Ok((*index, next))
-        })
+        schedule! {
+        state: usize::default(), step: move |index, _, _, _| {
+                    let next = if *index < count {
+                        let index = index
+                            .checked_add(NonZeroUsize::MIN.get())
+                            .ok_or_else(|| Defect::from(LibraryDefect::ScheduleCountOverflow))?;
+                        Some((Duration::ZERO, index))
+                    } else {
+                        None
+                    };
+                    Ok((*index, next))
+                },
+        }
     }
     #[must_use]
     /// Continue with the caller-specified delay between decisions.
@@ -488,12 +491,14 @@ impl<I: 'static> Schedule<I, usize> {
     /// # Returns
     /// Type: `Self`.
     pub fn spaced(delay: Duration) -> Self {
-        Self::unfold(usize::default(), move |index, _, _, _| {
-            let next = index
-                .checked_add(NonZeroUsize::MIN.get())
-                .ok_or_else(|| Defect::from(LibraryDefect::ScheduleCountOverflow))?;
-            Ok((*index, Some((delay, next))))
-        })
+        schedule! {
+        state: usize::default(), step: move |index, _, _, _| {
+                    let next = index
+                        .checked_add(NonZeroUsize::MIN.get())
+                        .ok_or_else(|| Defect::from(LibraryDefect::ScheduleCountOverflow))?;
+                    Ok((*index, Some((delay, next))))
+                },
+        }
     }
     #[must_use]
     /// Grow each delay by a validated factor until the schedule stops.
@@ -508,17 +513,16 @@ impl<I: 'static> Schedule<I, usize> {
     /// # Returns
     /// Type: `Self`.
     pub fn exponential(initial: Duration, factor: GrowthFactor) -> Self {
-        Self::unfold(
-            (usize::default(), initial),
-            move |(index, delay), _, _, _| {
-                let next_index = index
-                    .checked_add(NonZeroUsize::MIN.get())
-                    .ok_or_else(|| Defect::from(LibraryDefect::ScheduleCountOverflow))?;
-                let next_delay = Duration::try_from_secs_f64(delay.as_secs_f64() * factor.get())
-                    .map_err(|_| Defect::from(LibraryDefect::ClockDeadlineOverflow))?;
-                Ok((*index, Some((*delay, (next_index, next_delay)))))
-            },
-        )
+        schedule! {
+        state: (usize::default(), initial), step: move |(index, delay), _, _, _| {
+                        let next_index = index
+                            .checked_add(NonZeroUsize::MIN.get())
+                            .ok_or_else(|| Defect::from(LibraryDefect::ScheduleCountOverflow))?;
+                        let next_delay = Duration::try_from_secs_f64(delay.as_secs_f64() * factor.get())
+                            .map_err(|_| Defect::from(LibraryDefect::ClockDeadlineOverflow))?;
+                        Ok((*index, Some((*delay, (next_index, next_delay)))))
+                    },
+        }
     }
 }
 

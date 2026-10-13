@@ -6,6 +6,7 @@
 //! is fenced to the selected account-store configuration.
 
 use super::SqlxIdentityStore;
+use crate::{effect_future, effect_uninterruptible};
 use effect::Effect;
 use effect_sql::{NativeOperation, SqlError};
 use sqlx::{AssertSqlSafe, Row};
@@ -646,7 +647,9 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
         let adapter = self.clone();
         let owner = Arc::new(owner);
         let now = Arc::new(now);
-        Effect::from_exit_future_with_context(move |env: Arc<R>, _| {
+        effect_uninterruptible! {
+            program: effect_future! {
+            exit_with_context; body: move |env: Arc<R>, _| {
             let adapter = adapter.clone();
             let owner = owner(&env);
             let now = now(&env);
@@ -656,8 +659,7 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
                     Err(error) => error.into_exit(),
                 }
             }
-        })
-        .uninterruptible()
+        }, }, }
     }
     /// Move one write payload into its Effect. Re-execution follows core one-shot
     /// semantics instead of cloning secrets; terminal native settlement is shielded.
@@ -670,7 +672,9 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
     ) -> Effect<Uuid, RecordError, R> {
         let adapter = self.clone();
         let pending = std::sync::Mutex::new(Some((owner, value)));
-        Effect::from_exit_future_with_context(move |_: Arc<R>, _| {
+        effect_uninterruptible! {
+            program: effect_future! {
+            exit_with_context; body: move |_: Arc<R>, _| {
             let candidate = pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -689,8 +693,7 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
                     )),
                 }
             }
-        })
-        .uninterruptible()
+        }, }, }
     }
 }
 

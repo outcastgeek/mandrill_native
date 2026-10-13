@@ -1,3 +1,4 @@
+use serde_json::json;
 #[path = "support/campaign_report.rs"]
 mod campaign_report;
 
@@ -21,8 +22,12 @@ impl KeyDomain for CampaignDomain {
     const TAG: &'static str = "cluster-delivery-campaign";
 }
 
-fn key(namespace: &KeyNamespace<CampaignDomain>, value: KeySegment) -> StableKey<CampaignDomain> {
-    StableKey::new(namespace, [value]).expect("stable campaign identity")
+fn key(
+    namespace: &KeyNamespace<CampaignDomain>,
+    value: KeySegment,
+) -> Result<StableKey<CampaignDomain>, String> {
+    StableKey::new(namespace, [value])
+        .map_err(|error| format!("stable campaign identity: {error:?}"))
 }
 
 fn next(state: &mut u64) -> u64 {
@@ -36,20 +41,27 @@ fn run<A: Send + 'static, E: Send + 'static>(program: Effect<A, E>) -> Exit<A, E
     block_on(program.run(Arc::new(())))
 }
 
-fn success<A: Send + 'static, E: Send + 'static>(program: Effect<A, E>) -> A {
+fn success<A: Send + 'static, E: std::fmt::Debug + Send + 'static>(
+    program: Effect<A, E>,
+) -> Result<A, String> {
     match run(program) {
-        Exit::Success(value) => value,
-        _ => panic!("cluster operation failed"),
+        Exit::Success(value) => Ok(value),
+        Exit::Fail(error) => Err(format!("cluster failure: {error:?}")),
+        Exit::Die(defect) => Err(format!("cluster defect: {defect:?}")),
+        Exit::Interrupted => Err("cluster interrupted".into()),
+        Exit::FinalizationFailed(error) => Err(format!("cluster finalization: {error:?}")),
     }
 }
 
-fn number(config: &JsonValue, path: &[&str]) -> u64 {
+fn number(config: &JsonValue, path: &[&str]) -> Result<u64, String> {
     path.iter()
-        .fold(config, |value, field| {
-            value.get(*field).expect("campaign field")
-        })
+        .try_fold(config, |value, field| {
+            value
+                .get(*field)
+                .ok_or_else(|| format!("campaign field: {field}"))
+        })?
         .as_u64()
-        .expect("campaign integer")
+        .ok_or_else(|| format!("campaign integer: {path:?}"))
 }
 
 enum Phase {
@@ -82,8 +94,8 @@ fn inspect(
     address: &ClusterAddress,
     request: &ClusterRequestId,
     model: &Option<Model>,
-) {
-    let observed = success(store.inspect(address.clone(), request.clone()));
+) -> Result<(), String> {
+    let observed = success(store.inspect(address.clone(), request.clone()))?;
     match (model, observed) {
         (None, None) => {}
         (Some(expected), Some(actual)) => {
@@ -112,44 +124,50 @@ fn inspect(
             };
             assert_eq!(disposition, expected.phase.disposition());
         }
-        _ => panic!("cluster inspection differs from independent model"),
+        _ => return Err("cluster inspection differs from independent model".into()),
     }
+    Ok(())
 }
 
 #[test]
-fn configured_delivery_histories_match_acceptance_and_fencing_model() {
+fn configured_delivery_histories_match_acceptance_and_fencing_model() -> Result<(), String> {
     let configured = std::env::var_os("EFFECT_CAMPAIGN_CONFIG")
-        .map(|path| std::fs::read_to_string(path).expect("campaign configuration"))
+        .map(std::fs::read_to_string)
+        .transpose()
+        .map_err(|error| format!("campaign configuration: {error}"))?
         .unwrap_or_else(|| include_str!("feature_campaigns.json").to_owned());
-    let config: JsonValue = serde_json::from_str(&configured).expect("campaign JSON");
-    let seeds = number(&config, &["campaigns", "delivery", "seeds"]);
-    let transitions = number(&config, &["campaigns", "delivery", "transitions"]);
+    let config: JsonValue =
+        serde_json::from_str(&configured).map_err(|error| format!("campaign JSON: {error}"))?;
+    let seeds = number(&config, &["campaigns", "delivery", "seeds"])?;
+    let transitions = number(&config, &["campaigns", "delivery", "transitions"])?;
     let lease = i64::try_from(number(
         &config,
         &["campaigns", "delivery", "claim_lease_millis"],
-    ))
-    .expect("claim lease fits time");
-    let retention = number(&config, &["campaigns", "delivery", "retention_millis"]);
+    )?)
+    .map_err(|error| format!("claim lease: {error}"))?;
+    let retention = number(&config, &["campaigns", "delivery", "retention_millis"])?;
     let max_attempts = NonZeroU32::new(
         u32::try_from(number(
             &config,
             &["campaigns", "delivery", "maximum_attempts"],
-        ))
-        .expect("attempt policy fits u32"),
+        )?)
+        .map_err(|error| format!("attempt policy: {error}"))?,
     )
-    .expect("positive attempt policy");
+    .ok_or("zero attempt policy")?;
     assert!(lease > 0);
-    let namespace = KeyNamespace::<CampaignDomain>::new("delivery").expect("namespace");
+    let namespace = KeyNamespace::<CampaignDomain>::new("delivery")
+        .map_err(|error| format!("namespace: {error:?}"))?;
     let address = ClusterAddress {
-        entity_type: ClusterEntityType::new("counter").expect("entity type"),
+        entity_type: ClusterEntityType::new("counter")
+            .map_err(|error| format!("entity type: {error:?}"))?,
         entity: ClusterEntityId::from_stable(key(
             &namespace,
             KeySegment::Text(Arc::from("entity")),
-        )),
-        shard: ClusterShardId::from_stable(key(&namespace, KeySegment::Text(Arc::from("shard")))),
+        )?),
+        shard: ClusterShardId::from_stable(key(&namespace, KeySegment::Text(Arc::from("shard")))?),
     };
     let request =
-        ClusterRequestId::from_stable(key(&namespace, KeySegment::Text(Arc::from("request"))));
+        ClusterRequestId::from_stable(key(&namespace, KeySegment::Text(Arc::from("request")))?);
     let policy = AcceptancePolicy {
         dedup_retention: Duration::from_millis(retention),
         reply_retention: Duration::from_millis(retention),
@@ -160,34 +178,36 @@ fn configured_delivery_histories_match_acceptance_and_fencing_model() {
 
     for seed in 0..seeds {
         let store = MemoryClusterMessageStore::new(MessageStoreCapacity::Unbounded);
-        let mut generator = number(&config, &["seed"]).wrapping_add(seed).max(1);
+        let mut generator = number(&config, &["seed"])?.wrapping_add(seed).max(1);
         let mut owner_serial = 0_u64;
         let initial_activation =
-            ActivationId::from_stable(key(&namespace, KeySegment::Unsigned(owner_serial)));
+            ActivationId::from_stable(key(&namespace, KeySegment::Unsigned(owner_serial))?);
         let horizon = i64::try_from(transitions)
-            .expect("history fits time")
+            .map_err(|error| format!("history time: {error}"))?
             .checked_add(lease)
-            .expect("activation horizon");
+            .ok_or("activation horizon overflow")?;
         let activated = success(store.activate(
             address.clone(),
             initial_activation,
             UtcMillis::new(0),
             UtcMillis::new(horizon),
-        ));
+        ))?;
         let ActivationOutcome::Activated {
             lease: activation, ..
         } = activated
         else {
-            panic!("initial activation must acquire ownership");
+            return Err("initial activation must acquire ownership".into());
         };
         let mut owner: ClusterOwner = activation.owner;
         let mut model: Option<Model> = None;
         let mut accepted_count = 0_u64;
 
         for now in 0..transitions {
-            let now = i64::try_from(now).expect("history time fits i64");
+            let now = i64::try_from(now).map_err(|error| format!("history time: {error}"))?;
             let choice = (next(&mut generator) % operations.len() as u64) as usize;
-            operations[choice] += 1;
+            *operations
+                .get_mut(choice)
+                .ok_or("operation outside history table")? += 1;
             match choice {
                 0 | 1 => {
                     let payload = if choice == 0 {
@@ -227,12 +247,24 @@ fn configured_delivery_histories_match_acceptance_and_fencing_model() {
                         {
                             assert_eq!(
                                 disposition,
-                                model.as_ref().expect("record").phase.disposition()
+                                model
+                                    .as_ref()
+                                    .ok_or("missing duplicate record")?
+                                    .phase
+                                    .disposition()
                             );
                         }
                         Exit::Fail(ClusterStoreError::PayloadConflict)
                             if choice == 1 && !replace => {}
-                        _ => panic!("cluster acceptance differs from independent model"),
+                        outcome @ (Exit::Success(_)
+                        | Exit::Fail(_)
+                        | Exit::Die(_)
+                        | Exit::Interrupted
+                        | Exit::FinalizationFailed(_)) => {
+                            return Err(format!(
+                                "cluster acceptance differs from independent model: {outcome:?}"
+                            ));
+                        }
                     }
                 }
                 2 => {
@@ -241,7 +273,7 @@ fn configured_delivery_histories_match_acceptance_and_fencing_model() {
                         now: UtcMillis::new(now),
                         lease_until: UtcMillis::new(now + lease),
                         limit: NonZeroUsize::MIN,
-                    }));
+                    }))?;
                     let eligible = model.as_ref().is_some_and(|entry| match &entry.phase {
                         Phase::Pending => true,
                         Phase::Claimed(token) => {
@@ -250,13 +282,13 @@ fn configured_delivery_histories_match_acceptance_and_fencing_model() {
                         Phase::Completed { .. } | Phase::DeadLetter => false,
                     });
                     if eligible {
-                        let entry = model.as_mut().expect("eligible record");
+                        let entry = model.as_mut().ok_or("missing eligible record")?;
                         if entry.attempts >= max_attempts.get() {
                             assert!(claims.is_empty());
                             entry.phase = Phase::DeadLetter;
                         } else {
                             assert_eq!(claims.len(), 1);
-                            let claim = claims.pop().expect("one bounded claim");
+                            let claim = claims.pop().ok_or("missing bounded claim")?;
                             entry.attempts += 1;
                             assert_eq!(claim.token.attempt.get(), entry.attempts);
                             assert_eq!(claim.token.owner, owner);
@@ -291,17 +323,24 @@ fn configured_delivery_histories_match_acceptance_and_fencing_model() {
                         };
                         match (run(store.complete(completion)), expected) {
                             (Exit::Success(actual), Ok(expected)) if actual == expected => {
-                                model.as_mut().expect("claimed record").phase = Phase::Completed {
-                                    retained_until: now
-                                        + i64::try_from(retention).expect("retention fits time"),
-                                };
+                                model.as_mut().ok_or("missing claimed record")?.phase =
+                                    Phase::Completed {
+                                        retained_until: now
+                                            + i64::try_from(retention).map_err(|error| {
+                                                format!("retention time: {error}")
+                                            })?,
+                                    };
                             }
                             (Exit::Fail(actual), Err(expected)) if actual == expected => {}
-                            _ => panic!("cluster completion differs from independent model"),
+                            _ => {
+                                return Err(
+                                    "cluster completion differs from independent model".into()
+                                );
+                            }
                         }
                     }
                 }
-                4 => inspect(&store, &address, &request, &model),
+                4 => inspect(&store, &address, &request, &model)?,
                 5 => {
                     let expired = model.as_ref().is_some_and(|entry| {
                         matches!(
@@ -309,41 +348,42 @@ fn configured_delivery_histories_match_acceptance_and_fencing_model() {
                                 if retained_until <= now
                         )
                     });
-                    let removed = success(store.cleanup(UtcMillis::new(now)));
+                    let removed = success(store.cleanup(UtcMillis::new(now)))?;
                     assert_eq!(removed, usize::from(expired));
                     if expired {
                         model = None;
                     }
                 }
                 6 => {
-                    assert!(success(store.abandon(owner.clone(), UtcMillis::new(now))));
+                    assert!(success(store.abandon(owner.clone(), UtcMillis::new(now)))?);
                     owner_serial += 1;
                     let activation = ActivationId::from_stable(key(
                         &namespace,
                         KeySegment::Unsigned(owner_serial),
-                    ));
+                    )?);
                     let acquired = success(store.activate(
                         address.clone(),
                         activation,
                         UtcMillis::new(now),
                         UtcMillis::new(now + horizon),
-                    ));
+                    ))?;
                     let ActivationOutcome::Activated { lease, .. } = acquired else {
-                        panic!("abandoned owner must be replaceable");
+                        return Err("abandoned owner must be replaceable".into());
                     };
                     assert!(lease.owner.generation.value().get() > owner.generation.value().get());
                     owner = lease.owner;
                 }
-                _ => unreachable!("operation selected from history table"),
+                _ => return Err("operation outside history table".into()),
             }
-            inspect(&store, &address, &request, &model);
+            inspect(&store, &address, &request, &model)?;
         }
     }
     assert!(operations.into_iter().all(|count| count > 0));
     campaign_report::completed(
         "delivery",
-        serde_json::json!({
+        json!({
             "seeds": seeds, "transitions": transitions, "operations": operations,
         }),
-    );
+    )?;
+    Ok(())
 }

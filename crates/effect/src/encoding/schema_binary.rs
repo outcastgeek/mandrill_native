@@ -1,6 +1,7 @@
 //! Schema-derived binary payload encoding.
 
 use crate::schema::{JsonValue, PureCodec, SchemaAst, SchemaIssue, SchemaResource};
+use crate::{effect, effect_map_error, effect_try_sync};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
@@ -307,26 +308,37 @@ impl SchemaBinary {
             move |bytes: Vec<u8>| {
                 let binary = binary.clone();
                 let decode = decode.clone();
-                crate::Effect::try_sync_once(
-                    move || binary.decode_json(&bytes),
-                    std::convert::identity,
-                )
-                .flat_map(move |value| decode.decode_once(value).map_error(BinaryError::from))
+                let parsed = effect_try_sync! {
+                    once;
+                    body: move || binary.decode_json(&bytes),
+                    on_error: std::convert::identity,
+                };
+                effect! {
+                    let decode = decode.clone();
+                    let value = parsed.clone()?;
+                    effect_map_error! {
+                        program: decode.decode_once(value),
+                        map: BinaryError::from,
+                    }?
+                }
             },
             move |value| {
                 let binary = encoder.clone();
-                codec
-                    .encode_once(value)
-                    .map_error(BinaryError::from)
-                    .flat_map(move |value| {
-                        let binary = binary.clone();
-                        crate::Effect::try_sync_once(
-                            move || binary.encode_json(&value),
-                            std::convert::identity,
-                        )
-                    })
+                let encoded = effect_map_error! {
+                    program: codec.encode_once(value),
+                    map: BinaryError::from,
+                };
+                effect! {
+                    let binary = binary.clone();
+                    let value = encoded.clone()?;
+                    effect_try_sync! {
+                        once;
+                        body: move || binary.encode_json(&value),
+                        on_error: std::convert::identity,
+                    }?
+                }
             },
-            move |value| validate.validate_once(value).map_error(BinaryError::from),
+            move |value| effect_map_error! { program: validate.validate_once(value), map: BinaryError::from, },
         ))
     }
 

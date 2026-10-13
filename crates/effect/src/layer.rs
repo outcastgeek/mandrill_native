@@ -2,6 +2,7 @@
 
 use crate::internal::workflow::{self, bind, success};
 use crate::{Effect, Release, ResourceValue, Scope};
+use crate::{effect, effect_sync, layer};
 use std::sync::Arc;
 
 /// A scoped constructor for dependencies that are provided to an Effect subtree.
@@ -38,7 +39,9 @@ impl<I: Send + Sync + 'static, E: Send + 'static, O: Send + 'static> Layer<I, E,
     /// # Returns
     /// Type: `Self`.
     pub fn from_effect(program: Effect<O, E, I>) -> Self {
-        Self::new(move |_| program.clone())
+        layer! {
+            build: move |_| program.clone(),
+        }
     }
     #[must_use]
     /// Create a `Layer` using the supplied factory and capability environment.
@@ -54,7 +57,10 @@ impl<I: Send + Sync + 'static, E: Send + 'static, O: Send + 'static> Layer<I, E,
     /// # Returns
     /// Type: `Self`.
     pub fn make_with(factory: impl Fn() -> O + Send + Sync + 'static) -> Self {
-        Self::from_effect(Effect::sync(factory))
+        let program = effect_sync! { body: factory, };
+        layer! {
+            build: move |_| program.clone(),
+        }
     }
     #[must_use]
     /// Construct a `Layer` from its required inputs and explicit policies.
@@ -89,7 +95,10 @@ impl<I: Send + Sync + 'static, E: Send + 'static, O: Send + 'static> Layer<I, E,
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn build(&self, scope: Scope<E>) -> Effect<O, E, I> {
         let build = Arc::clone(&self.build);
-        Effect::defer(move || build(scope.clone()))
+        {
+            let __dsl_factory = move || build(scope.clone());
+            effect! { __dsl_factory()? }
+        }
     }
     #[must_use]
     /// Build two layers in one scope and combine their environments.

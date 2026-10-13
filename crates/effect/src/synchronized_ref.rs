@@ -1,5 +1,6 @@
 //! Effectful updates serialized through one reference.
 
+use crate::effect_sync;
 use crate::{Effect, Release, ResourceBinding, Semaphore, SemaphoreError};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
@@ -72,7 +73,7 @@ impl<A: Send + Sync + 'static> SynchronizedRef<A> {
     pub fn make_with<E: Send + 'static, R: Send + Sync + 'static>(
         initial: impl Fn() -> A + Send + Sync + 'static,
     ) -> Effect<Self, E, R> {
-        Effect::sync(move || Self::new(initial()))
+        effect_sync! { body: move || Self::new(initial()), }
     }
 
     /// Sharing the current snapshot never clones A and does not wait for a
@@ -88,7 +89,7 @@ impl<A: Send + Sync + 'static> SynchronizedRef<A> {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn read<E: Send + 'static, R: Send + Sync + 'static>(&self) -> Effect<Arc<A>, E, R> {
         let reference = self.clone();
-        Effect::sync(move || {
+        effect_sync! { body: move || {
             Arc::clone(
                 &reference
                     .inner
@@ -96,7 +97,7 @@ impl<A: Send + Sync + 'static> SynchronizedRef<A> {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             )
-        })
+        }, }
     }
 
     /// Compute and commit a replacement reference value through an Effect.

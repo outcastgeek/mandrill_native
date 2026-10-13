@@ -113,16 +113,19 @@ fn configured_dispatch_survives_threads_with_explicit_parent_redaction_and_retir
         logger: backend.logger(LogLevel::Info, redact),
         tracer: backend.tracer(redact),
     });
-    let program: Effect<(), (), Env> = Scope::scoped(|scope| {
-        scope
-            .fork(Effect::log(LogLevel::Info, "child event").with_span("child"))
-            .flat_map(|fiber| fiber.join())
-    })
-    .with_span("root")
-    .annotate(Annotations::from([(
-        Arc::from("secret"),
-        Arc::from("private"),
-    )]));
+    let program: Effect<(), (), Env> = span! { annotations: Annotations::from([(
+            Arc::from("secret"),
+            Arc::from("private"),
+        )]), effect: span! { name: "root", effect: effect_scope! {
+    body: |scope| {
+            effect! {
+     bind;
+     program: scope
+                .fork(span! { name: "child", effect: Effect::log(LogLevel::Info, "child event"), }),
+     body: |fiber| fiber.join(),
+     }
+        },
+    }, }, };
     assert_eq!(
         futures_executor::block_on(program.run(Arc::clone(&env))),
         Exit::Success(())

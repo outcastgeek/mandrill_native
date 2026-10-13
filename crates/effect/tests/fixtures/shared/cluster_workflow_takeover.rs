@@ -16,6 +16,9 @@ use effect::{
     Effect, Exit, HasCpuExecutor, HasTaskSpawner, HasWallClock, KeyDomain, KeyNamespace,
     KeySegment, StableKey, TestWallClock, UtcMillis,
 };
+use effect::{
+    effect, effect_cpu, effect_map_error, effect_provide_some, effect_sync, effect_try_sync,
+};
 use std::marker::PhantomData;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::{
@@ -30,9 +33,11 @@ impl KeyDomain for Domain {
     const TAG: &'static str = "provider-cluster-workflow-takeover";
 }
 
-fn key(namespace: &KeyNamespace<Domain>, part: &'static str) -> StableKey<Domain> {
+fn key(
+    namespace: &KeyNamespace<Domain>,
+    part: &'static str,
+) -> Result<StableKey<Domain>, effect::KeyError> {
     StableKey::new(namespace, [KeySegment::Text(part.into())])
-        .expect("valid cluster workflow identity")
 }
 
 struct Environment<R> {
@@ -131,13 +136,13 @@ fn finish_reply<R>(
 where
     R: HasCpuExecutor + Send + Sync + 'static,
 {
-    Effect::cpu_once(move |_| {
+    effect_cpu! { once; body: move |_| {
         executions.fetch_add(1, Ordering::AcqRel);
         SavedReply {
             kind: ReplyKind::Success,
             payload,
         }
-    })
+    }, }
 }
 
 fn change_owner<R>(
@@ -150,28 +155,33 @@ where
     R: Send + Sync + 'static,
 {
     let activating = Arc::clone(&store);
-    store
-        .abandon(old_owner, UtcMillis::new(2))
-        .map_error(ExecutionError::Store)
-        .provide_some(|_: &Environment<R>| ())
-        .flat_map(move |abandoned| {
-            if !abandoned {
-                return Effect::fail_with(|| ExecutionError::UnexpectedActivation);
-            }
-            activating
-                .activate(
-                    address.clone(),
-                    replacement.clone(),
-                    UtcMillis::new(2),
-                    UtcMillis::new(4),
-                )
-                .map_error(ExecutionError::Store)
-                .provide_some(|_: &Environment<R>| ())
-                .flat_map(|activation| match activation {
-                    ActivationOutcome::Activated { .. } => Effect::sync(|| ()),
-                    _ => Effect::fail_with(|| ExecutionError::UnexpectedActivation),
-                })
-        })
+    effect! {
+    bind;
+    program: effect_provide_some! { program: effect_map_error! { program: store
+           .abandon(old_owner, UtcMillis::new(2)), map: ExecutionError::Store, }, project: |_: &Environment<R>| (), },
+    body: move |abandoned| {
+               if !abandoned {
+                   return effect_try_sync! { body: { let __dsl_error = || ExecutionError::UnexpectedActivation; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
+               }
+               effect! {
+    bind;
+    program: effect_provide_some! { program: effect_map_error! { program: activating
+                   .activate(
+                       address.clone(),
+                       replacement.clone(),
+                       UtcMillis::new(2),
+                       UtcMillis::new(4),
+                   ), map: ExecutionError::Store, }, project: |_: &Environment<R>| (), },
+    body: |activation| {
+                       if matches!(activation, ActivationOutcome::Activated { .. }) {
+                           effect_sync! { body: || (), }
+                       } else {
+                           effect_try_sync! { body: { let __dsl_error = || ExecutionError::UnexpectedActivation; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }
+                       }
+                   },
+    }
+           },
+    }
 }
 
 impl<R> ClusterExecutor<Environment<R>> for TakeoverExecutor<R>
@@ -196,31 +206,36 @@ where
         let replacement = self.replacement.clone();
         let handle = self.handle.clone();
         let executions = Arc::clone(&self.executions);
-        ClusterWorkflowEngine::dispatch::<Environment<R>>(WorkflowCommand::Start {
-            handle,
-            input: Arc::from(&b"workflow-input"[..]),
-        })
-        .map_error(ExecutionError::Workflow)
-        .flat_map(move |started| {
-            if !matches!(started, WorkflowReply::Snapshot(Some(snapshot))
-                if snapshot.status == WorkflowStatus::Ready)
-            {
-                return Effect::fail_with(|| ExecutionError::UnexpectedWorkflowReply);
-            }
-            if takeover {
-                let payload = Arc::clone(&payload);
-                let executions = Arc::clone(&executions);
-                change_owner::<R>(
-                    Arc::clone(&store),
-                    old_owner.clone(),
-                    address.clone(),
-                    replacement.clone(),
-                )
-                .flat_map(move |_| finish_reply::<R>(Arc::clone(&payload), Arc::clone(&executions)))
-            } else {
-                finish_reply::<R>(Arc::clone(&payload), Arc::clone(&executions))
-            }
-        })
+        effect! {
+        bind;
+        program: effect_map_error! { program: ClusterWorkflowEngine::dispatch::<Environment<R>>(WorkflowCommand::Start {
+                   handle,
+                   input: Arc::from(&b"workflow-input"[..]),
+               }), map: ExecutionError::Workflow, },
+        body: move |started| {
+                   if !matches!(started, WorkflowReply::Snapshot(Some(snapshot))
+                       if snapshot.status == WorkflowStatus::Ready)
+                   {
+                       return effect_try_sync! { body: { let __dsl_error = || ExecutionError::UnexpectedWorkflowReply; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
+                   }
+                   if takeover {
+                       let payload = Arc::clone(&payload);
+                       let executions = Arc::clone(&executions);
+                       effect! {
+        bind;
+        program: change_owner::<R>(
+                           Arc::clone(&store),
+                           old_owner.clone(),
+                           address.clone(),
+                           replacement.clone(),
+                       ),
+        body: move |_| finish_reply::<R>(Arc::clone(&payload), Arc::clone(&executions)),
+        }
+                   } else {
+                       finish_reply::<R>(Arc::clone(&payload), Arc::clone(&executions))
+                   }
+               },
+        }
     }
 }
 
@@ -235,12 +250,34 @@ where
         + Sync
         + 'static,
 {
-    let namespace = KeyNamespace::<Domain>::new("handoff").expect("valid handoff namespace");
-    let run = WorkflowRunId::from_stable(key(&namespace, "run"));
+    let Ok(namespace) = KeyNamespace::<Domain>::new("handoff") else {
+        return false;
+    };
+    let Ok(run_key) = key(&namespace, "run") else {
+        return false;
+    };
+    let Ok(shard_key) = key(&namespace, "shard") else {
+        return false;
+    };
+    let Ok(request_key) = key(&namespace, "request") else {
+        return false;
+    };
+    let Ok(old_key) = key(&namespace, "old") else {
+        return false;
+    };
+    let Ok(new_key) = key(&namespace, "new") else {
+        return false;
+    };
+    let Ok(definition) = WorkflowDefinitionId::new("provider-handoff-workflow") else {
+        return false;
+    };
+    let Ok(entity_type) = ClusterEntityType::new("provider-workflow") else {
+        return false;
+    };
+    let run = WorkflowRunId::from_stable(run_key.clone());
     let handle = WorkflowHandle {
         run: run.clone(),
-        definition: WorkflowDefinitionId::new("provider-handoff-workflow")
-            .expect("valid workflow definition"),
+        definition,
         version: WorkflowVersion::new(NonZeroU32::MIN),
     };
     let registration = WorkflowRegistration {
@@ -261,11 +298,11 @@ where
         MessageStoreCapacity::Bounded(NonZeroUsize::MIN),
     ));
     let address = ClusterAddress {
-        entity_type: ClusterEntityType::new("provider-workflow").expect("valid entity type"),
-        entity: ClusterEntityId::from_stable(key(&namespace, "run")),
-        shard: ClusterShardId::from_stable(key(&namespace, "shard")),
+        entity_type,
+        entity: ClusterEntityId::from_stable(run_key),
+        shard: ClusterShardId::from_stable(shard_key),
     };
-    let request = ClusterRequestId::from_stable(key(&namespace, "request"));
+    let request = ClusterRequestId::from_stable(request_key);
     let accepted = store
         .accept(AcceptedRequest {
             address: address.clone(),
@@ -277,7 +314,7 @@ where
                 dedup_retention: Duration::ZERO,
                 reply_retention: Duration::ZERO,
                 payload_conflict: PayloadConflictPolicy::Reject,
-                maximum_attempts: NonZeroU32::new(2).expect("original and replacement claims"),
+                maximum_attempts: NonZeroU32::MIN.saturating_add(1),
             },
         })
         .run(Arc::new(()))
@@ -288,7 +325,7 @@ where
     let initial = store
         .activate(
             address.clone(),
-            ActivationId::from_stable(key(&namespace, "old")),
+            ActivationId::from_stable(old_key),
             UtcMillis::new(1),
             UtcMillis::new(3),
         )
@@ -300,7 +337,7 @@ where
     let executor = Arc::new(TakeoverExecutor {
         store: Arc::clone(&store),
         old_owner: lease.owner.clone(),
-        replacement: ActivationId::from_stable(key(&namespace, "new")),
+        replacement: ActivationId::from_stable(new_key),
         handle,
         first: AtomicBool::new(true),
         executions: Arc::new(AtomicUsize::new(0)),

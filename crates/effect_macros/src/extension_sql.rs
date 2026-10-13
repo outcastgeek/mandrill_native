@@ -9,13 +9,14 @@ use syn::{
     parse::{Parse, ParseStream},
     punctuated::Punctuated,
 };
+use syn::{parenthesized, parse_quote};
 
 /// One ordered descriptor operation, retaining caller spans and evaluation order.
 enum Entry {
     /// Pure local bindings stay in the inert description's ordinary Rust block.
-    Local(Stmt),
+    Local(Box<Stmt>),
     /// Named configuration is evaluated once at its declared position.
-    Field(Ident, Expr),
+    Field(Ident, Box<Expr>),
     /// Ordered call-shaped operation with native typed expressions.
     Call(Ident, Vec<Expr>),
 }
@@ -27,20 +28,20 @@ impl Parse for Description {
         let mut entries = Vec::new();
         while !input.is_empty() {
             if input.peek(Token![let]) {
-                entries.push(Entry::Local(input.parse()?));
+                entries.push(Entry::Local(Box::new(input.parse()?)));
                 continue;
             }
             let name = Ident::parse_any(input)?;
             if input.peek(Token![:]) {
                 input.parse::<Token![:]>()?;
                 let value = input.parse()?;
-                entries.push(Entry::Field(name, value));
+                entries.push(Entry::Field(name, Box::new(value)));
                 if !input.is_empty() {
                     input.parse::<Token![,]>()?;
                 }
             } else {
                 let content;
-                syn::parenthesized!(content in input);
+                parenthesized!(content in input);
                 let values = Punctuated::<Expr, Token![,]>::parse_terminated(&content)?
                     .into_iter()
                     .collect();
@@ -100,13 +101,15 @@ fn statement(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream>
                     return Err(syn::Error::new(name.span(), "expected one argument"));
                 };
                 let operation = match name.to_string().as_str() {
-                    "text" => Ident::new("text", name.span()),
+                    "text" => Ident::new("text", name.span().resolved_at(Span::mixed_site())),
                     "identifier" => {
                         literal_identifier(value)?;
-                        Ident::new("identifier", name.span())
+                        Ident::new("identifier", name.span().resolved_at(Span::mixed_site()))
                     }
-                    "fragment" => Ident::new("fragment", name.span()),
-                    "param" => Ident::new("param", name.span()),
+                    "fragment" => {
+                        Ident::new("fragment", name.span().resolved_at(Span::mixed_site()))
+                    }
+                    "param" => Ident::new("param", name.span().resolved_at(Span::mixed_site())),
                     "where" => {
                         if predicate {
                             return Err(syn::Error::new(
@@ -115,7 +118,7 @@ fn statement(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream>
                             ));
                         }
                         predicate = true;
-                        Ident::new("predicate", name.span())
+                        Ident::new("predicate", name.span().resolved_at(Span::mixed_site()))
                     }
                     _ => {
                         return Err(syn::Error::new(
@@ -246,47 +249,43 @@ struct RowLocals {
 }
 impl Fold for RowLocals {
     /// Give native reads/refinements a typed row binding; arbitrary Results remain ordinary Rust.
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "Unselected syn expressions retain their ordinary Rust syntax and source spans"
-    )]
     fn fold_expr(&mut self, expr: Expr) -> Expr {
-        match expr {
-            Expr::Closure(_) | Expr::Async(_) => expr,
-            Expr::Call(mut call) => {
-                call.args = call
-                    .args
-                    .into_iter()
-                    .map(|expr| self.fold_expr(expr))
-                    .collect();
-                if let Expr::Path(function) = call.func.as_ref()
-                    && function.path.segments.len() == 1
-                {
+        if matches!(&expr, Expr::Closure(_) | Expr::Async(_)) {
+            expr
+        } else if let Expr::Call(mut call) = expr {
+            call.args = call
+                .args
+                .into_iter()
+                .map(|expr| self.fold_expr(expr))
+                .collect();
+            if let Expr::Path(function) = call.func.as_ref()
+                && function.path.segments.len() == 1
+            {
+                let Some(segment) = function.path.segments.first() else {
+                    return Expr::Call(call);
+                };
+                let name = segment.ident.to_string();
+                if matches!(
+                    name.as_str(),
+                    "column"
+                        | "optional_column"
+                        | "native_column"
+                        | "refine"
+                        | "validate"
+                        | "choice_text"
+                ) {
+                    let path = &self.path;
                     let Some(segment) = function.path.segments.first() else {
                         return Expr::Call(call);
                     };
-                    let name = segment.ident.to_string();
-                    if matches!(
-                        name.as_str(),
-                        "column"
-                            | "optional_column"
-                            | "native_column"
-                            | "refine"
-                            | "validate"
-                            | "choice_text"
-                    ) {
-                        let path = &self.path;
-                        let Some(segment) = function.path.segments.first() else {
-                            return Expr::Call(call);
-                        };
-                        let name = &segment.ident;
-                        let arguments = &segment.arguments;
-                        call.func = Box::new(syn::parse_quote!(#path::__private::#name #arguments));
-                    }
+                    let name = &segment.ident;
+                    let arguments = &segment.arguments;
+                    call.func = Box::new(parse_quote!(#path::__private::#name #arguments));
                 }
-                Expr::Call(call)
             }
-            other => syn::fold::fold_expr(self, other),
+            Expr::Call(call)
+        } else {
+            syn::fold::fold_expr(self, expr)
         }
     }
     /// Nested items retain their own reader/error/lifetime language boundary.
@@ -296,6 +295,24 @@ impl Fold for RowLocals {
 }
 /// Lower D05 row bodies through the shared context callback and owned row-program carrier.
 fn row_program(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> {
+    let mut tokens = input.clone().into_iter();
+    if matches!((tokens.next(), tokens.next()),
+        (Some(proc_macro2::TokenTree::Ident(name)), Some(proc_macro2::TokenTree::Punct(colon)))
+        if name == "project" && colon.as_char() == ':')
+    {
+        let input = syn::parse2::<crate::callback_expand::Input>(input)?;
+        input.mode(&[], "default")?;
+        let mut fields = input.fields;
+        let project = fields.role("project", 1, crate::domain_expand::BodyCategory::Native)?;
+        return fields.finish_inferred(
+            quote!(A, R, F),
+            &[("project", quote!(F))],
+            quote!(#path::RowDecoder<A, R>),
+            quote!(A: Send + 'static, R: Send + Sync + 'static,
+                F: Fn(&#path::sqlx::TursoRow) -> ::core::result::Result<A, #path::RowError> + Send + Sync + 'static),
+            quote!(#path::RowDecoder::pure(#project)),
+        );
+    }
     let statements = syn::parse::Parser::parse2(syn::Block::parse_within, input)?;
     let mut locals = RowLocals { path: path.clone() };
     let statements = statements
@@ -426,7 +443,7 @@ fn with_sql(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> 
         // The body has the reference's explicit SqlClient environment, while
         // provide_some retains the caller's outer R and execution context.
         // Its captures move once through the existing core callback lowering.
-        let selection: Stmt = syn::parse_quote!(let #arg = #path::__private::effect::Effect::service(|client: &#path::SqlClient| client.clone())?;);
+        let selection: Stmt = parse_quote!(let #arg = #path::__private::effect::Effect::service(|client: &#path::SqlClient| client.clone())?;);
         let statements = std::iter::once(selection).chain(statements).collect();
         let program = crate::async_expand::expand_once(
             statements,

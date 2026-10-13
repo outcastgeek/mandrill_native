@@ -5,6 +5,10 @@ use super::{
 };
 use crate::rpc::RpcEnvelopePolicy;
 use crate::{Effect, Scope};
+use crate::{
+    effect, effect_map, effect_map_error, effect_provide_some, effect_sync, effect_try_sync,
+    service,
+};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -58,17 +62,18 @@ impl<S: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
         policy: RpcEnvelopePolicy,
     ) -> Effect<EntityDispatcher<R>, EntityDefinitionError<E>, R> {
         if owner.address.entity_type != self.entity_type {
-            return Effect::fail_with(|| EntityDefinitionError::AddressMismatch);
+            return effect_try_sync! { body: { let __dsl_error = || EntityDefinitionError::AddressMismatch; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
         }
         let register = Arc::clone(&self.register);
-        self.resources
-            .acquire(scope, owner)
-            .map_error(EntityDefinitionError::Resource)
-            .flat_map(move |state| {
-                Effect::from_result_once(
-                    register(Arc::new(state), policy).map_err(EntityDefinitionError::Registration),
-                )
-            })
+        {
+            let __dsl_program = effect_map_error! {
+            program: self.resources
+            .acquire(scope, owner), map: EntityDefinitionError::Resource, };
+            effect! {
+                let register = register.clone(); let state = __dsl_program.clone()?; {
+                effect_try_sync! { once; body: { let __dsl_result = register(Arc::new(state), policy).map_err(EntityDefinitionError::Registration); move || __dsl_result }, on_error: ::core::convert::identity, }
+            }? }
+        }
     }
 }
 /// Failure before a resource-aware activation can publish a dispatcher.
@@ -145,10 +150,10 @@ impl<E: Send + 'static, R: Send + Sync + 'static> ClusterDefinition<E, R> {
             identity.clone(),
             Arc::new(move |_, owner, _| {
                 if owner.address.entity_type != identity {
-                    return Effect::fail_with(|| EntityDefinitionError::AddressMismatch);
+                    return effect_try_sync! { body: { let __dsl_error = || EntityDefinitionError::AddressMismatch; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
                 }
                 let dispatcher = dispatcher.clone();
-                Effect::sync(move || dispatcher.clone())
+                effect_sync! { body: move || dispatcher.clone(), }
             }),
         );
         Ok(())
@@ -169,7 +174,9 @@ impl<E: Send + 'static, R: Send + Sync + 'static> ClusterDefinition<E, R> {
     ) -> Effect<EntityDispatcher<R>, EntityDefinitionError<E>, R> {
         match self.entities.get(&owner.address.entity_type) {
             Some(activate) => activate(scope, owner, self.policy),
-            None => Effect::fail_with(|| EntityDefinitionError::UnknownEntity),
+            None => {
+                effect_try_sync! { body: { let __dsl_error = || EntityDefinitionError::UnknownEntity; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }
+            }
         }
     }
 }
@@ -266,23 +273,25 @@ where
     fn validate<E: Send + 'static>(&self) -> EntityActivationEffect<(), E, R> {
         use super::ClusterActivationStore;
         let owner = self.owner.clone();
-        Effect::wall_now()
-            .map_error(EntityActivationError::Clock)
-            .flat_map(move |now| {
+        {
+            let __dsl_program = effect_map_error! { program: Effect::wall_now(), map: EntityActivationError::Clock, };
+            effect! {
+            let owner = owner.clone(); let now = __dsl_program.clone()?; {
                 let owner = owner.clone();
                 let inspect_owner = owner.clone();
-                Effect::service(|environment: &R| environment.cluster_activation_store())
-                    .flat_map(move |store| {
-                        store
-                            .inspect_activation(inspect_owner.address.clone())
-                            .provide_some(|_: &R| ())
-                    })
-                    .map_error(EntityActivationError::Store)
-                    .flat_map({
-                        let owner = owner.clone();
-                        move |status| {
-                            Effect::from_result_once(
-                                if status.is_some_and(|status| {
+                {
+                    let __dsl_program = effect_map_error! {
+                    program: {
+                    let __dsl_program = service! { env: |environment: &R| environment.cluster_activation_store(), }; effect! {
+                    let inspect_owner = inspect_owner.clone(); let store = __dsl_program.clone()?; {
+                        effect_provide_some! {
+                            program: store
+                            .inspect_activation(inspect_owner.address.clone()), project: |_: &R| (), }
+                    }? } }, map: EntityActivationError::Store, }; let owner = owner.clone(); effect! {
+                        let __dsl_program = __dsl_program.clone(); let owner = owner.clone(); let status = __dsl_program?; {
+                            effect_try_sync! {
+                                once; body: {
+                                let __dsl_result = if status.is_some_and(|status| {
                                     status.phase == super::ActivationPhase::Active
                                         && status.lease.owner == owner
                                         && now < status.lease.lease_until
@@ -290,11 +299,10 @@ where
                                     Ok(())
                                 } else {
                                     Err(EntityActivationError::StaleOwnership)
-                                },
-                            )
-                        }
-                    })
-            })
+                                }; move || __dsl_result }, on_error: ::core::convert::identity, }
+                        }? } }
+            }? }
+        }
     }
     /// Execute an addressed request after checking the exact owner fence under the same R.
     pub fn execute(
@@ -304,14 +312,18 @@ where
     ) -> EntityActivationEffect<super::SavedReply, std::convert::Infallible, R> {
         use super::ClusterExecutor;
         if address != self.owner.address {
-            return Effect::fail_with(|| EntityActivationError::AddressMismatch);
+            return effect_try_sync! { body: { let __dsl_error = || EntityActivationError::AddressMismatch; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
         }
         let dispatcher = self.dispatcher.clone();
-        self.validate().flat_map(move |()| {
-            dispatcher
-                .execute(address.clone(), Arc::clone(&request))
-                .map_error(EntityActivationError::Dispatch)
-        })
+        {
+            let __dsl_program = self.validate();
+            effect! {
+                let __dsl_program = __dsl_program.clone(); let address = address.clone(); let dispatcher = dispatcher.clone(); let request = request.clone(); let () = __dsl_program?; {
+                effect_map_error! {
+                    program: dispatcher
+                    .execute(address.clone(), Arc::clone(&request)), map: EntityActivationError::Dispatch, }
+            }? }
+        }
     }
 }
 impl<S: Send + Sync + 'static, E: Send + 'static, R> EntityDefinition<S, E, R>
@@ -327,16 +339,18 @@ where
         policy: RpcEnvelopePolicy,
     ) -> EntityActivationEffect<ActivatedEntity<R>, E, R> {
         let live_owner = owner.clone();
-        self.build(scope, owner, policy)
-            .map_error(EntityActivationError::Definition)
-            .flat_map(move |dispatcher| {
+        {
+            let __dsl_program = effect_map_error! { program: self.build(scope, owner, policy), map: EntityActivationError::Definition, };
+            effect! {
+            let live_owner = live_owner.clone(); let dispatcher = __dsl_program.clone()?; {
                 let active = ActivatedEntity {
                     dispatcher,
                     owner: live_owner.clone(),
                 };
                 let result = active.clone();
-                active.validate().map(move |()| result.clone())
-            })
+                effect_map! { program: active.validate(), map: move |()| result.clone(), }
+            }? }
+        }
     }
 }
 impl<E: Send + 'static, R> ClusterDefinition<E, R>
@@ -350,16 +364,18 @@ where
         owner: ClusterOwner,
     ) -> EntityActivationEffect<ActivatedEntity<R>, E, R> {
         let live_owner = owner.clone();
-        self.build(scope, owner)
-            .map_error(EntityActivationError::Definition)
-            .flat_map(move |dispatcher| {
+        {
+            let __dsl_program = effect_map_error! { program: self.build(scope, owner), map: EntityActivationError::Definition, };
+            effect! {
+            let live_owner = live_owner.clone(); let dispatcher = __dsl_program.clone()?; {
                 let active = ActivatedEntity {
                     dispatcher,
                     owner: live_owner.clone(),
                 };
                 let result = active.clone();
-                active.validate().map(move |()| result.clone())
-            })
+                effect_map! { program: active.validate(), map: move |()| result.clone(), }
+            }? }
+        }
     }
 }
 impl<R> super::ClusterExecutor<R> for ActivatedEntity<R>

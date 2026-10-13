@@ -5,6 +5,10 @@ use super::{
     WorkflowEngine, WorkflowRaceId, WorkflowRunId,
 };
 use crate::{Effect, HasTaskSpawner};
+use crate::{
+    effect, effect_all_concurrent, effect_map, effect_map_error, effect_provide_some, effect_race,
+    effect_sync, effect_try_sync, service,
+};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 
@@ -156,28 +160,34 @@ where
     BodyError: Send + 'static,
     R: HasWorkflowEngine + Send + Sync + 'static,
 {
-    Effect::defer(move || {
-        let run = run.clone();
-        let branch = branch.clone();
-        let next_branch = branch.clone();
-        let activity = branch.id().clone();
-        branch
-            .into_effect(run.clone(), attempt)
-            .map_error(move |source| DurableRetryError::Branch {
-                activity: activity.clone(),
-                source,
-            })
-            .flat_map(move |result| match result {
-                Err(_) if policy.retry_domain_errors && attempt < policy.max_attempts => {
-                    let next = attempt.get().checked_add(1).and_then(NonZeroU32::new);
-                    match next {
-                        Some(next) => retry_step(run.clone(), next_branch.clone(), policy, next),
-                        None => Effect::from_result_once(Err(DurableRetryError::AttemptExhausted)),
+    {
+        let __dsl_factory = move || {
+            let run = run.clone();
+            let branch = branch.clone();
+            let next_branch = branch.clone();
+            let activity = branch.id().clone();
+            {
+                let __dsl_program = effect_map_error! {
+                program: branch
+                .into_effect(run.clone(), attempt), map: move |source| DurableRetryError::Branch {
+                    activity: activity.clone(),
+                    source,
+                }, };
+                effect! {
+                    let __dsl_program = __dsl_program.clone(); let next_branch = next_branch.clone(); let run = run.clone(); let result = __dsl_program?; match result {
+                    Err(_) if policy.retry_domain_errors && attempt < policy.max_attempts => {
+                        let next = attempt.get().checked_add(1).and_then(NonZeroU32::new);
+                        match next {
+                            Some(next) => retry_step(run.clone(), next_branch.clone(), policy, next),
+                            None => effect_try_sync! { once; body: { let __dsl_result = Err(DurableRetryError::AttemptExhausted); move || __dsl_result }, on_error: ::core::convert::identity, },
+                        }
                     }
-                }
-                other => Effect::sync_once(move || other),
-            })
-    })
+                    other => effect_sync! { once; body: move || other, },
+                }? }
+            }
+        };
+        effect! { __dsl_factory()? }
+    }
 }
 
 impl<A, E, BodyError, R> DurableBranch<A, E, BodyError, R>
@@ -306,7 +316,7 @@ impl DurableParallel {
             .into_iter()
             .map(|branch| DurableRetry::run(run.clone(), branch, policy))
             .collect();
-        Effect::all_concurrent(concurrency, programs)
+        effect_all_concurrent! { concurrency: concurrency, items: programs, }
     }
 
     /// Run bounded branches through the user's task-spawning capability.
@@ -344,15 +354,15 @@ impl DurableParallel {
             .into_iter()
             .map(|branch| {
                 let activity = branch.id().clone();
-                branch
-                    .into_effect(run.clone(), attempt)
-                    .map_error(move |source| DurableParallelError::Branch {
+                effect_map_error! {
+                    program: branch
+                    .into_effect(run.clone(), attempt), map: move |source| DurableParallelError::Branch {
                         activity: activity.clone(),
                         source,
-                    })
+                    }, }
             })
             .collect();
-        Effect::all_concurrent(concurrency, programs)
+        effect_all_concurrent! { concurrency: concurrency, items: programs, }
     }
 }
 
@@ -428,94 +438,102 @@ impl DurableRace {
     {
         let left_id = left.id().clone();
         let right_id = right.id().clone();
-        let left_program = left
-            .into_effect(run.clone(), attempt)
-            .map_error({
-                let id = left_id.clone();
-                move |source| DurableRaceError::Branch {
-                    activity: id.clone(),
-                    source,
-                }
-            })
-            .map({
-                let id = left_id.clone();
-                move |result| (id.clone(), result)
-            });
-        let right_program = right
-            .into_effect(run.clone(), attempt)
-            .map_error({
-                let id = right_id.clone();
-                move |source| DurableRaceError::Branch {
-                    activity: id.clone(),
-                    source,
-                }
-            })
-            .map({
-                let id = right_id.clone();
-                move |result| (id.clone(), result)
-            });
-        Effect::service(|env: &R| env.workflow_engine()).flat_map(move |engine| {
-            let left = left_program.clone();
-            let right = right_program.clone();
-            let run = run.clone();
-            let race = race.clone();
-            let left_id = left_id.clone();
-            let right_id = right_id.clone();
-            engine
-                .inspect_race(run.clone(), race.clone())
-                .map_error(DurableRaceError::Engine)
-                .provide_some(|_: &R| ())
-                .flat_map(move |recorded| match recorded {
-                    Some(recorded) if recorded.attempt != attempt => {
-                        Effect::from_result_once(Err(DurableRaceError::RecordedAttemptMismatch))
-                    }
-                    Some(recorded) if recorded.winner == left_id => {
-                        left.clone().map(|(_, result)| result)
-                    }
-                    Some(recorded) if recorded.winner == right_id => {
-                        right.clone().map(|(_, result)| result)
-                    }
-                    Some(_) => {
-                        Effect::from_result_once(Err(DurableRaceError::RecordedWinnerUnknown))
-                    }
-                    None => {
-                        let engine = Arc::clone(&engine);
-                        let run = run.clone();
-                        let race = race.clone();
-                        left.clone()
-                            .race(right.clone())
-                            .flat_map(move |(winner, result)| {
-                                let record = RecordedRace {
-                                    identity: race.clone(),
-                                    winner,
-                                    attempt,
-                                };
-                                let result = Arc::new(Mutex::new(Some(result)));
-                                let race_on_error = race.clone();
-                                let expected = record.clone();
-                                engine
-                                    .record_race(run.clone(), record)
-                                    .map_error(move |source| DurableRaceError::UncertainWinner {
-                                        race: race_on_error.clone(),
-                                        source,
-                                    })
-                                    .provide_some(|_: &R| ())
-                                    .flat_map(move |stored| {
-                                        if stored != expected {
-                                            return Effect::from_result_once(Err(
-                                                DurableRaceError::RecordedWinnerMismatch,
-                                            ));
-                                        }
-                                        let result = result
-                                            .lock()
-                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                            .take()
-                                            .ok_or(DurableRaceError::InputConsumed);
-                                        Effect::from_result_once(result)
-                                    })
-                            })
-                    }
-                })
-        })
+        let left_program = effect_map! {
+        program: effect_map_error! {
+        program: left
+        .into_effect(run.clone(), attempt), map: {
+            let id = left_id.clone();
+            move |source| DurableRaceError::Branch {
+                activity: id.clone(),
+                source,
+            }
+        }, }, map: {
+            let id = left_id.clone();
+            move |result| (id.clone(), result)
+        }, };
+        let right_program = effect_map! {
+        program: effect_map_error! {
+        program: right
+        .into_effect(run.clone(), attempt), map: {
+            let id = right_id.clone();
+            move |source| DurableRaceError::Branch {
+                activity: id.clone(),
+                source,
+            }
+        }, }, map: {
+            let id = right_id.clone();
+            move |result| (id.clone(), result)
+        }, };
+        {
+            let __dsl_program = service! { env: |env: &R| env.workflow_engine(), };
+            effect! {
+                let __dsl_program = __dsl_program.clone(); let left_id = left_id.clone(); let left_program = left_program.clone(); let race = race.clone(); let right_id = right_id.clone(); let right_program = right_program.clone(); let run = run.clone(); let engine = __dsl_program.clone()?; {
+                let left = left_program.clone();
+                let right = right_program.clone();
+                let run = run.clone();
+                let race = race.clone();
+                let left_id = left_id.clone();
+                let right_id = right_id.clone();
+                {
+                    let __dsl_program = effect_provide_some! {
+                    program: effect_map_error! {
+                    program: engine
+                    .inspect_race(run.clone(), race.clone()), map: DurableRaceError::Engine, }, project: |_: &R| (), }; effect! {
+                        let __dsl_program = __dsl_program.clone(); let engine = engine.clone(); let left = left.clone(); let left_id = left_id.clone(); let race = race.clone(); let right = right.clone(); let right_id = right_id.clone(); let run = run.clone(); let recorded = __dsl_program.clone()?; match recorded {
+                        Some(recorded) if recorded.attempt != attempt => {
+                            effect_try_sync! { once; body: { let __dsl_result = Err(DurableRaceError::RecordedAttemptMismatch); move || __dsl_result }, on_error: ::core::convert::identity, }
+                        }
+                        Some(recorded) if recorded.winner == left_id => {
+                            effect_map! { program: left.clone(), map: |(_, result)| result, }
+                        }
+                        Some(recorded) if recorded.winner == right_id => {
+                            effect_map! { program: right.clone(), map: |(_, result)| result, }
+                        }
+                        Some(_) => {
+                            effect_try_sync! { once; body: { let __dsl_result = Err(DurableRaceError::RecordedWinnerUnknown); move || __dsl_result }, on_error: ::core::convert::identity, }
+                        }
+                        None => {
+                            let engine = Arc::clone(&engine);
+                            let run = run.clone();
+                            let race = race.clone();
+                            {
+                                let __dsl_program = effect_race! { program: left.clone(), right: right.clone(), }; effect! {
+                                let __dsl_program = __dsl_program.clone(); let engine = engine.clone(); let race = race.clone(); let run = run.clone(); let (winner , result) = __dsl_program.clone()?; {
+                                    let record = RecordedRace {
+                                        identity: race.clone(),
+                                        winner,
+                                        attempt,
+                                    };
+                                    let result = Arc::new(Mutex::new(Some(result)));
+                                    let race_on_error = race.clone();
+                                    let expected = record.clone();
+                                    {
+                                        let __dsl_program = effect_provide_some! {
+                                        program: effect_map_error! {
+                                        program: engine
+                                        .record_race(run.clone(), record), map: move |source| DurableRaceError::UncertainWinner {
+                                            race: race_on_error.clone(),
+                                            source,
+                                        }, }, project: |_: &R| (), }; effect! {
+                                            let __dsl_program = __dsl_program.clone(); let expected = expected.clone(); let result = result.clone(); let stored = __dsl_program.clone()?; (move || {
+                                            if stored != expected {
+                                                return effect_try_sync! {
+                                                    once; body: {
+                                                    let __dsl_result = Err(
+                                                    DurableRaceError::RecordedWinnerMismatch,
+                                                ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                            }
+                                            let result = result
+                                                .lock()
+                                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                .take()
+                                                .ok_or(DurableRaceError::InputConsumed);
+                                            effect_try_sync! { once; body: { let __dsl_result = result; move || __dsl_result }, on_error: ::core::convert::identity, }
+                                        })()? } }
+                                }? } }
+                        }
+                    }? } }
+            }? }
+        }
     }
 }

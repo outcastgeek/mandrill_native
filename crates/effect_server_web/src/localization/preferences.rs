@@ -1,10 +1,15 @@
 //! Best-effort bounded locale preference persistence through one core queue/worker.
 
 use super::{CultureId, LocalizationError};
+use crate::{
+    effect_finalizer, effect_future, effect_map, effect_map_error, effect_recover, effect_sync,
+    effect_try_sync,
+};
 use effect::{
     AdmissionCapacity, AdmissionError, AsyncQueue, Effect, Exit, HasClock, HasTaskSpawner,
     ProviderAdmission, QueueCapacity, QueueError, QueueShutdown, Scope, SharedValue,
 };
+use effect::{effect, effect_timeout};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -132,102 +137,107 @@ impl<U: Send + Sync + 'static, W: Send + 'static> LocalePreferences<U, W> {
         let writer = Arc::new(writer);
         let inject = Arc::new(inject);
         let validation_inject = inject.clone();
-        Effect::try_sync(
-            move || policy.validate(),
-            move |error| validation_inject(PreferenceError::Definition(error)),
-        )
-        .flat_map(move |policy| {
-            let preferences = Self {
-                queue: AsyncQueue::new(QueueCapacity::Bounded(policy.buffered)),
-                offers: ProviderAdmission::new(AdmissionCapacity::Bounded(policy.maximum_offers)),
-                status: Arc::new(Mutex::new(PreferenceStatus {
-                    persisted: None,
-                    failure: None,
-                })),
-                policy,
-            };
-            let queue = preferences.queue.clone();
-            let shutdown_inject = inject.clone();
-            let close = scope.add_finalizer(
-                queue
-                    .shutdown(match policy.shutdown {
-                        PreferenceShutdown::DiscardPending => QueueShutdown::Discard,
-                    })
-                    .map_error(move |error| shutdown_inject(PreferenceError::Queue(error))),
-            );
-            let worker_preferences = preferences.clone();
-            let writer = writer.clone();
-            let same_user = same_user.clone();
-            let worker_inject = inject.clone();
-            let worker = Effect::from_exit_future_with_context(move |env: Arc<R>, context| {
-                let preferences = worker_preferences.clone();
-                let writer = writer.clone();
-                let same_user = same_user.clone();
-                let inject = worker_inject.clone();
-                async move {
-                    loop {
-                        let job = match context.run(preferences.queue.take(), env.clone()).await {
-                            Exit::Success(job) => job,
-                            Exit::Fail(QueueError::Shutdown) => return Exit::Success(()),
-                            Exit::Die(defect) => return Exit::Die(defect),
-                            Exit::Interrupted => return Exit::Interrupted,
-                            Exit::FinalizationFailed(failure) => {
-                                return Exit::<(), _>::FinalizationFailed(failure)
-                                    .map_error(|error| inject(PreferenceError::Queue(error)));
+        effect! {
+         bind;
+         program: effect_try_sync! { body: move || policy.validate(), on_error: move |error| validation_inject(PreferenceError::Definition(error)), },
+         body: move |policy| {
+                    let preferences = Self {
+                        queue: AsyncQueue::new(QueueCapacity::Bounded(policy.buffered)),
+                        offers: ProviderAdmission::new(AdmissionCapacity::Bounded(policy.maximum_offers)),
+                        status: Arc::new(Mutex::new(PreferenceStatus {
+                            persisted: None,
+                            failure: None,
+                        })),
+                        policy,
+                    };
+                    let queue = preferences.queue.clone();
+                    let shutdown_inject = inject.clone();
+                    let close = effect_finalizer! {
+        scope: scope, body: effect_map_error! {
+            program: queue
+                            .shutdown(match policy.shutdown {
+                                PreferenceShutdown::DiscardPending => QueueShutdown::Discard,
+                            }), map: move |error| shutdown_inject(PreferenceError::Queue(error)), },
+        };
+                    let worker_preferences = preferences.clone();
+                    let writer = writer.clone();
+                    let same_user = same_user.clone();
+                    let worker_inject = inject.clone();
+                    let worker = effect_future! {
+                        exit_with_context; body: move |env: Arc<R>, context| {
+                        let preferences = worker_preferences.clone();
+                        let writer = writer.clone();
+                        let same_user = same_user.clone();
+                        let inject = worker_inject.clone();
+                        async move {
+                            loop {
+                                let job = match context.run(preferences.queue.take(), env.clone()).await {
+                                    Exit::Success(job) => job,
+                                    Exit::Fail(QueueError::Shutdown) => return Exit::Success(()),
+                                    Exit::Die(defect) => return Exit::Die(defect),
+                                    Exit::Interrupted => return Exit::Interrupted,
+                                    Exit::FinalizationFailed(failure) => {
+                                        return Exit::<(), _>::FinalizationFailed(failure)
+                                            .map_error(|error| inject(PreferenceError::Queue(error)));
+                                    }
+                                };
+                                let duplicate = {
+                                    let status = preferences
+                                        .status
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    status.failure.is_none()
+                                        && status.persisted.as_ref().is_some_and(|previous| {
+                                            previous.culture == job.culture
+                                                && same_user(&previous.user, &job.user)
+                                        })
+                                };
+                                if duplicate {
+                                    continue;
+                                }
+                                match context
+                                    .run(writer(job.user.clone(), job.culture.clone()), env.clone())
+                                    .await
+                                {
+                                    Exit::Success(()) => {
+                                        let mut status = preferences
+                                            .status
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                        status.persisted = Some(job);
+                                        status.failure = None;
+                                    }
+                                    Exit::Fail(error) => {
+                                        preferences
+                                            .status
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                            .failure = Some(SharedValue::new(error))
+                                    }
+                                    Exit::Die(defect) => return Exit::Die(defect),
+                                    Exit::Interrupted => return Exit::Interrupted,
+                                    Exit::FinalizationFailed(failure) => {
+                                        return Exit::<(), _>::FinalizationFailed(failure).map_error(
+                                            |error| {
+                                                inject(PreferenceError::Writer(SharedValue::new(error)))
+                                            },
+                                        );
+                                    }
+                                }
                             }
-                        };
-                        let duplicate = {
-                            let status = preferences
-                                .status
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            status.failure.is_none()
-                                && status.persisted.as_ref().is_some_and(|previous| {
-                                    previous.culture == job.culture
-                                        && same_user(&previous.user, &job.user)
-                                })
-                        };
-                        if duplicate {
-                            continue;
                         }
-                        match context
-                            .run(writer(job.user.clone(), job.culture.clone()), env.clone())
-                            .await
-                        {
-                            Exit::Success(()) => {
-                                let mut status = preferences
-                                    .status
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                status.persisted = Some(job);
-                                status.failure = None;
-                            }
-                            Exit::Fail(error) => {
-                                preferences
-                                    .status
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .failure = Some(SharedValue::new(error))
-                            }
-                            Exit::Die(defect) => return Exit::Die(defect),
-                            Exit::Interrupted => return Exit::Interrupted,
-                            Exit::FinalizationFailed(failure) => {
-                                return Exit::<(), _>::FinalizationFailed(failure).map_error(
-                                    |error| {
-                                        inject(PreferenceError::Writer(SharedValue::new(error)))
-                                    },
-                                );
-                            }
-                        }
-                    }
-                }
-            });
-            let scope = scope.clone();
-            close.flat_map(move |()| {
-                let preferences = preferences.clone();
-                scope.fork(worker.clone()).map(move |_| preferences.clone())
-            })
-        })
+                    }, };
+                    let scope = scope.clone();
+                    effect! {
+         bind;
+         program: close,
+         body: move |()| {
+                        let preferences = preferences.clone();
+                        effect_map! { program: scope.fork(worker.clone()), map: move |_| preferences.clone(), }
+                    },
+         }
+                },
+         }
     }
     /// Move one immutable job through bounded immediate/queue admission. Busy is
     /// never presented as a persisted preference; queue shutdown stays typed.
@@ -239,31 +249,34 @@ impl<U: Send + Sync + 'static, W: Send + 'static> LocalePreferences<U, W> {
         let queue = self.queue.clone();
         let job = Arc::new(PreferenceJob { user, culture });
         let deadline = self.policy.offer_deadline;
-        crate::admission::independent(
+        effect_recover! {
+            program: crate::admission::independent(
             self.offers.clone(),
             move || {
-                queue
+                effect_map! {
+                    program: effect_timeout! {
+                    program: effect_map_error! {
+                    program: queue
                     .offer_with({
                         let job = job.clone();
                         move || job.clone()
-                    })
-                    .map_error(PreferenceError::Queue)
-                    .timeout(deadline, || PreferenceError::TimedOut)
-                    .map(|()| PreferenceSubmission::Accepted)
+                    }), map: PreferenceError::Queue, },
+                    duration: deadline,
+                    on_timeout: || PreferenceError::TimedOut,
+                    }, map: |()| PreferenceSubmission::Accepted, }
             },
             PreferenceError::Admission,
-        )
-        .catch_all(|error| match error {
+        ), recover: |error| match error {
             PreferenceError::TimedOut | PreferenceError::Admission(AdmissionError::Full) => {
-                Effect::succeed(PreferenceSubmission::Busy)
+                effect_sync! { body { PreferenceSubmission::Busy }, }
             }
             error @ (PreferenceError::Writer(_)
             | PreferenceError::Queue(_)
             | PreferenceError::Admission(
                 AdmissionError::Closed | AdmissionError::Overflow,
             )
-            | PreferenceError::Definition(_)) => Effect::from_result_once(Err(error)),
-        })
+            | PreferenceError::Definition(_)) => effect_try_sync! { once; body: { let __dsl_result = Err(error); move || __dsl_result }, on_error: ::core::convert::identity, },
+        }, }
     }
     /// Read protected immutable status without retaining request-scoped capabilities.
     pub fn status(&self) -> PreferenceStatus<U, W> {

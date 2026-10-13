@@ -8,12 +8,18 @@
 //! respective domains. Expansion does not create a runtime or choose a
 //! provider. Consult the `effect` crate's `guide` and feature modules for the
 //! resulting contracts and examples.
+
+use quote::quote;
 mod async_expand;
+mod callback_expand;
+mod codec_expand;
 mod descriptor_expand;
 mod durable_expand;
 mod expand;
+mod ownership_expand;
 mod parse;
 mod persistable_expand;
+mod restricted_expand;
 mod schema_enum_expand;
 mod schema_expand;
 mod transaction_expand;
@@ -22,6 +28,13 @@ use proc_macro::TokenStream;
 use syn::parse_macro_input;
 
 /// Construct a lazy reusable Effect with macro-local `?` binding.
+///
+/// `bind; program: source, body: factory,` composes an existing Effect-returning
+/// factory without an additional body scope. `body |value| { ... }` is the inline
+/// spelling of that same factory: ordinary Rust returns an Effect description,
+/// and nested DSL macros construct its steps. The factory runs only after source
+/// success and remains reusable; captured owned slots retain their typed reuse
+/// errors. No payload is cloned or wrapped by this form.
 #[proc_macro]
 /// # Parameters
 /// - `input` (`TokenStream`): The input value or factory consumed by this operation.
@@ -30,8 +43,13 @@ use syn::parse_macro_input;
 /// Type: `TokenStream`.
 /// Returns the expanded Rust tokens.
 pub fn effect(input: TokenStream) -> TokenStream {
-    let statements = parse_macro_input!(input with syn::Block::parse_within);
-    match expand::expand(statements) {
+    let input = parse_macro_input!(input as parse::EffectInput);
+    let expanded = match input {
+        parse::EffectInput::Statements(statements) => expand::expand(statements),
+        parse::EffectInput::Continuation(fields) => callback_expand::continuation(fields),
+        parse::EffectInput::WhileLoop(fields) => callback_expand::while_loop(fields),
+    };
+    match expanded {
         Ok(output) => output.into(),
         Err(error) => error.into_compile_error().into(),
     }
@@ -99,6 +117,9 @@ pub fn persistable(input: TokenStream) -> TokenStream {
 /// with `?`. An effectful loop reevaluates its iterable for each conflict
 /// retry; clone an owned source explicitly only when its ownership requires it.
 /// A bound step must be a Transaction; Effect and Future values do not typecheck.
+/// Named `map_error;` maps expected journal errors. `modify;` receives a borrowed snapshot
+/// and returns Result<(replacement, result), E>; `update;` returns Result<replacement,E>.
+/// Both delegate TxRef::update in the same journal. No native Future or Effect is admitted.
 #[proc_macro]
 /// # Parameters
 /// - `input` (`TokenStream`): The input value or factory consumed by this operation.
@@ -107,11 +128,14 @@ pub fn persistable(input: TokenStream) -> TokenStream {
 /// Type: `TokenStream`.
 /// Returns the expanded Rust tokens.
 pub fn transaction(input: TokenStream) -> TokenStream {
-    let statements = parse_macro_input!(input with syn::Block::parse_within);
-    match transaction_expand::expand(statements) {
-        Ok(output) => output.into(),
-        Err(error) => error.into_compile_error().into(),
-    }
+    let tokens: proc_macro2::TokenStream = input.into();
+    let result = if restricted_expand::has_mode(&tokens, &["map_error", "modify", "update"]) {
+        syn::parse2(tokens).and_then(restricted_expand::transaction)
+    } else {
+        syn::parse::Parser::parse2(syn::Block::parse_within, tokens)
+            .and_then(transaction_expand::expand)
+    };
+    result.unwrap_or_else(syn::Error::into_compile_error).into()
 }
 
 /// Declare event identity, pure codecs and explicit binary formats.
@@ -140,6 +164,8 @@ pub fn event_group(input: TokenStream) -> TokenStream {
 /// Cases derive accepted identities and typed payload/outcome decoding together. Decode,
 /// version and fold failures remain distinct; `advance` is the existing Effect boundary
 /// and checkpoints do not advance on failure. This adds no effectful-fold engine.
+/// Raw `fold |state, record| { Result }` is pure; typed case callbacks keep their
+/// existing borrowed payload/outcome inputs. No Effect projection is constructed.
 #[proc_macro]
 pub fn projection(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as descriptor_expand::NamedFields);
@@ -150,6 +176,12 @@ pub fn projection(input: TokenStream) -> TokenStream {
 
 /// Compose durable operations, or define a typed workflow with `id`, codecs,
 /// compatibility, limits and a durable `run` closure.
+/// Named map_error/for_each modes preserve Durable coordination. Retry uses explicit
+/// run/branch/policy; compensate uses existing WorkflowCompensation run/on_failure
+/// with its named activity body. Ordinary Effects remain confined to activity boundaries.
+/// `result; value: result,` consumes one owned native Result as a durable success
+/// or typed failure. It accepts values rather than Effects or Futures; construction
+/// does not execute work, and repeated execution retains the native consumed-input defect.
 #[proc_macro]
 /// # Parameters
 /// - `input` (`TokenStream`): The input value or factory consumed by this operation.
@@ -159,12 +191,19 @@ pub fn projection(input: TokenStream) -> TokenStream {
 /// Returns the expanded Rust tokens.
 pub fn workflow(input: TokenStream) -> TokenStream {
     let tokens: proc_macro2::TokenStream = input.into();
-    let result = match syn::parse2::<descriptor_expand::NamedFields>(tokens.clone()) {
-        Ok(fields) if fields.contains("id") || fields.contains("name") => {
-            descriptor_expand::workflow(fields)
+    let result = if restricted_expand::has_mode(
+        &tokens,
+        &["map_error", "for_each", "retry", "compensate", "result"],
+    ) {
+        syn::parse2(tokens).and_then(restricted_expand::workflow)
+    } else {
+        match syn::parse2::<descriptor_expand::NamedFields>(tokens.clone()) {
+            Ok(fields) if fields.contains("id") || fields.contains("name") => {
+                descriptor_expand::workflow(fields)
+            }
+            _ => syn::parse::Parser::parse2(syn::Block::parse_within, tokens)
+                .and_then(durable_expand::expand),
         }
-        _ => syn::parse::Parser::parse2(syn::Block::parse_within, tokens)
-            .and_then(durable_expand::expand),
     };
     result.unwrap_or_else(syn::Error::into_compile_error).into()
 }
@@ -222,6 +261,8 @@ pub fn activity_definition(input: TokenStream) -> TokenStream {
 /// Optional `handler |request| { ... }` composes nested Effects and returns RpcHandler;
 /// `handler: callback` reuses a typed function. Descriptor-only forms remain supported.
 /// Calling the handler returns an Effect under the original application environment.
+/// Optional pure `project |outer| { Inner }` projects each handler Effect through
+/// existing provision while retaining request ownership and operation identity.
 #[proc_macro]
 pub fn rpc_operation(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as descriptor_expand::NamedFields);
@@ -233,6 +274,8 @@ pub fn rpc_operation(input: TokenStream) -> TokenStream {
 /// Declare streaming request/chunk/terminal/error codecs with explicit limits.
 /// Optional `handler |request, context| { ... }` returns the existing producer Effect;
 /// typed callbacks reuse the same contract. No unary result or shared transport is inferred.
+/// Optional pure project transforms opening and every producer pull under the outer
+/// environment; the existing RpcStreamContext and transport ownership remain intact.
 #[proc_macro]
 pub fn rpc_stream_operation(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as descriptor_expand::NamedFields);
@@ -288,7 +331,7 @@ pub fn rpc_stream_middleware(input: TokenStream) -> TokenStream {
         .into()
 }
 
-/// Declare a checked single dispatcher registration, or an inert resource-aware entity.
+/// Declare an inert resource-aware entity with typed activation-scoped handlers.
 /// Resource form supplies `entity_type`, `resources` and `handlers: [operation =>
 /// |state, request| { ... }, ...]`, plus optional address acceptance. `cluster!` supplies
 /// the registration policy; activation acquires into its owner scope and publishes only
@@ -378,6 +421,10 @@ pub fn span(input: TokenStream) -> TokenStream {
 /// `run |service| { ... }` under the original R. `on_error` maps typed ServiceOperation
 /// and ServiceResource failures only. `project` with `body`/`effect` explicitly changes
 /// the environment view using typed provision, retaining the outer runtime context.
+/// `env |outer|` selects a pure value; `operation |receiver|` returns a provider Effect.
+/// Native `sync`/`future` receiver roles return `Result`/`Future<Result>` and may map native
+/// errors with on_error. `acquire`/`release` construct the existing ServiceResource.
+/// Borrowed receivers cannot escape; capture owned data before returning deferred work.
 #[proc_macro]
 pub fn service(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as domain_expand::Fields);
@@ -387,8 +434,9 @@ pub fn service(input: TokenStream) -> TokenStream {
 }
 /// Create a cache through its existing scoped Effect boundary. Required `scope`, `config`
 /// and `options` retain caller-chosen equality, TTL, admission and retention. An inline
-/// `load |key| { ... }` composes Effects; `load: callback` reuses a typed loader. Lookup
-/// and invalidation return existing Effects under the same environment capabilities.
+/// `load |key| { ... }` composes Effects; `load: callback` reuses an owned-key loader.
+/// `load_shared: callback` retains the native Arc-key callback without cloning its key.
+/// Lookup and invalidation return existing Effects under the same environment capabilities.
 #[proc_macro]
 pub fn cache(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as domain_expand::Fields);
@@ -410,15 +458,24 @@ pub fn dependency_cache(input: TokenStream) -> TokenStream {
 /// `AtomProgram::read`/`read_derived` carry the active context through nested helpers and
 /// branches. `reactive_derived! { program: ... }` supplies a fresh evaluation context;
 /// refreshing the resulting Atom is the ordinary Effect execution boundary.
+/// `map_error; program: tracked, map |error| { E2 }` maps a standalone AtomProgram
+/// before registration. It retains the evaluation read context and never retypes a
+/// registered atom or introduces a second publication/dependency mechanism.
 #[proc_macro]
 pub fn atom(input: TokenStream) -> TokenStream {
-    let statements = parse_macro_input!(input with syn::Block::parse_within);
-    let result = crate::expand::effect_crate_path().map(|path| {
-        context_expand::expand(
-            statements,
-            quote::quote!(#path::reactivity::AtomProgram::from_body),
-        )
-    });
+    let tokens: proc_macro2::TokenStream = input.into();
+    let result = if restricted_expand::has_mode(&tokens, &["map_error"]) {
+        syn::parse2(tokens).and_then(restricted_expand::atom)
+    } else {
+        syn::parse::Parser::parse2(syn::Block::parse_within, tokens).and_then(|statements| {
+            crate::expand::effect_crate_path().map(|path| {
+                context_expand::expand(
+                    statements,
+                    quote!(#path::reactivity::AtomProgram::from_body),
+                )
+            })
+        })
+    };
     result.unwrap_or_else(syn::Error::into_compile_error).into()
 }
 /// Build checked heterogeneous hydration bindings with `registry`, `limits` and
@@ -437,15 +494,23 @@ pub fn hydration(input: TokenStream) -> TokenStream {
 /// acquires nothing; acquiring the plan returns an Effect and resources survive its
 /// lexical body until the activation owner closes the scope. Explicit error mappings
 /// must cover both acquisition and registered finalizers.
+/// `acquire |context| { ... }` exposes a borrowed EntityPlanContext inside the
+/// activation future while binding through its original externally owned scope.
+/// `acquire: helper` accepts the same typed context-to-Future factory.
 #[proc_macro]
 pub fn entity_resource(input: TokenStream) -> TokenStream {
-    let statements = parse_macro_input!(input with syn::Block::parse_within);
-    let result = crate::expand::effect_crate_path().map(|path| {
-        context_expand::expand(
-            statements,
-            quote::quote!(#path::cluster::EntityResourcePlan::from_body),
-        )
-    });
+    let tokens: proc_macro2::TokenStream = input.into();
+    let result = match syn::parse2::<callback_expand::Input>(tokens.clone()) {
+        Ok(input) if input.fields.contains("acquire") => restricted_expand::entity_resource(input),
+        _ => syn::parse::Parser::parse2(syn::Block::parse_within, tokens).and_then(|statements| {
+            crate::expand::effect_crate_path().map(|path| {
+                context_expand::expand(
+                    statements,
+                    quote!(#path::cluster::EntityResourcePlan::from_body),
+                )
+            })
+        }),
+    };
     result.unwrap_or_else(syn::Error::into_compile_error).into()
 }
 /// Run a singleton through its existing lazy Effect boundary, with explicit singleton,
@@ -499,12 +564,21 @@ mod stream_expand;
 /// has no standalone export. Effects inside a yield run before emission; resource binds
 /// remain owned across yields until the stream scope closes, including early consumption
 /// failure. `open`, `pull` and consume operations remain typed Effects under the same R.
+/// Named iterable/async_iterable/async_iterable_effect and pull/read/release forms
+/// construct scoped sources. An extracted `read: callback` retains the native pull factory;
+/// inline reads construct fresh work for the next pull, sharing the checked resource handle.
+/// map_effect/map_error/project transform an explicit stream.
+/// Native async factories return owned iterators; release is mandatory. Mapped opening,
+/// pull and cleanup errors stay owned by the existing scope; no second stream engine.
 #[proc_macro]
 pub fn stream(input: TokenStream) -> TokenStream {
-    let statements = parse_macro_input!(input with syn::Block::parse_within);
-    stream_expand::expand(statements)
-        .unwrap_or_else(syn::Error::into_compile_error)
-        .into()
+    let tokens: proc_macro2::TokenStream = input.into();
+    let result = match syn::parse2::<callback_expand::Input>(tokens.clone()) {
+        Ok(input) => ownership_expand::demand("stream", input),
+        Err(_) => syn::parse::Parser::parse2(syn::Block::parse_within, tokens)
+            .and_then(stream_expand::expand),
+    };
+    result.unwrap_or_else(syn::Error::into_compile_error).into()
 }
 
 /// Associate a definition, aggregate selector, explicit commit policy and Effect handler.
@@ -521,8 +595,7 @@ pub fn handled_event(input: TokenStream) -> TokenStream {
 }
 
 /// Build a checked catalog with explicit `policy` and `entities: [...]`. Resource-aware
-/// entity definitions acquire only at activation; legacy entries use explicit
-/// `(entity_type, dispatcher)` pairs. Activation returns an Effect using the supplied
+/// entity definitions acquire only at activation. Activation returns an Effect using the supplied
 /// owner/scope and the existing dispatcher, preserving typed acquisition/registration
 /// failures and accepted-address checks. This creates no cluster runner or store.
 #[proc_macro]
@@ -758,6 +831,455 @@ pub fn localization(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn otel(input: TokenStream) -> TokenStream {
     extension_otel::expand("otel", input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Delay `body { value }` with the reusable sync factory. `once;` consumes owned captures without Clone. Ordinary Rust statements and Result boundaries are unchanged; panics remain defects.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_sync(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::leaf("effect_sync", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Delay a native Result body and map its expected error with optional `on_error |problem| { E }`. `once;` consumes owned input once. Native `?` propagates Result errors and never binds an Effect; panics remain defects.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_try_sync(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::leaf("effect_try_sync", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Delay `body |cancel| { future }` with the native Future owner. Use an explicit `async move` tail for awaits. `once;` owns captures once; `with_env;` receives `Arc<R>`, Cancellation on every run. R selects capabilities.
+/// `exit_with_context;` receives `Arc<R>` and NativeContext and returns a future of the complete typed Exit.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_future(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::leaf("effect_future", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Construct `Die` from `defect: expression`, evaluated once without reclassifying it as an expected error.
+#[proc_macro]
+pub fn effect_die(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::defect(definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Delay a `Future<Result<A, P>>` factory with explicit Cancellation and optional P-to-E mapping. Native awaits/Result `?` stay inside its async block. `once;` owns captures once; `with_env;` receives `Arc<R>`, Cancellation. Cancellation remains the existing Future-owner protocol.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_try_future(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::leaf("effect_try_future", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Submit `body |cancel| { value }` through R's CPU provider, joining accepted work on cancellation. Reusable by default; `once;` moves captures. `with_context;` and `once_with_context;` additionally receive the existing TraceContext.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_cpu(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::leaf("effect_cpu", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Submit a native Result body through R's CPU provider, with optional `on_error` mapping. Supports reusable, `once;`, and reusable `with_context;` contracts. Accepted work is joined; panics stay defects.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_try_cpu(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::leaf("effect_try_cpu", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Submit `body |cancel| { value }` through R's separate blocking provider. Reusable, `once;`, `with_context;` and `once_with_context;` retain cancellation/join and trace context. No executor is constructed.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_blocking(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::leaf("effect_blocking", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Submit a native Result body through R's blocking provider, with optional `on_error`. Reusable, `once;` and reusable `with_context;` preserve native errors, defects and accepted-work settlement.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_try_blocking(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::leaf("effect_try_blocking", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Transform the owned success of `program` with pure `map |value| { B }`; execution is delayed and all failure/cleanup channels retain their owners.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_map(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::operator("effect_map", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Transform only expected errors of `program` with pure `map |error| { E2 }`. Defects and interruption remain distinct, including retained cleanup outcomes.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_map_error(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::operator("effect_map_error", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Project borrowed outer R with `project |outer| { Inner }` for `program`. Existing provision preserves trace/runtime context; inputs do not define an alternate environment.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_provide_some(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::operator("effect_provide_some", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Explicitly convert a defect from `program` using `defect |defect| { E }`. Expected errors and interruption retain their existing channels; no implicit panic-to-domain conversion.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_sandbox(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::operator("effect_sandbox", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Map absence lazily using `missing { E }`. `once; value: option` consumes non-Clone payloads; reusable `value { option }` creates fresh input on each execution. Colon values retain the existing constructor's Clone bound.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_from_option(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::operator("effect_from_option", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Apply explicit `duration: Duration` and lazy `on_timeout { E }` to `program` or an Effect `body`. The existing timeout owns cancellation and join; construction runs no body.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_timeout(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::operator("effect_timeout", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Recover expected errors with `recover |error| { Effect-bound body }` or an extracted typed factory. Each owned error feeds one fresh one-shot Effect; defects/interruption are not caught.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_recover(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::operator("effect_recover", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Traverse `values` through the existing owned collection contract, or supply reusable `produce { iterable }` for fresh inputs. `body |item|` binds Effects; producer traversal returns unit and rebuilds on execution.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_for_each(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::operator("effect_for_each", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Traverse with mandatory `concurrency: NonZeroUsize` and borrowed item callback. `shared;` accepts the existing Arc slice variant. Capture owned data explicitly before a delayed body; no payload Clone is added.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_for_each_concurrent(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::operator("effect_for_each_concurrent", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Provide the explicit `environment: Arc<R>` to `program` or an Effect `body`, retaining the existing context. The returned Effect requires unit environment.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_provided(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::operator("effect_provided", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Race `right` against `program` or an Effect `body` with the existing loser cancellation/join and retained cleanup rules.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_race(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::operator("effect_race", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Mask interruption for `program` or an Effect `body` with the existing operator. Braces construct a reusable description and do not execute a nested run.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_uninterruptible(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::operator("effect_uninterruptible", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Attach `finalizer: effect` or inline `finalizer { Effect body }` to `program`/`body`. Cleanup runs only under the existing interruption boundary and retains cleanup failures.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_on_interrupt(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::operator("effect_on_interrupt", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Assemble ordered inert `items: Vec<Effect>` or `items { item!(effect); items_from!(effects); }` with ordinary Rust control flow. Local markers are consumed here; effects execute only when the resulting description runs.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_all(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::operator("effect_all", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Assemble ordered inert items using the same owner-local markers as effect_all, then run with mandatory `concurrency: NonZeroUsize`. Existing admission/cancellation/ordered cleanup remain authoritative.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_all_concurrent(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::operator("effect_all_concurrent", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Retry `program` or reusable Effect `body` with an explicit typed `schedule`. R supplies the clock and schedule sampling capability; one-shot payloads are not made replayable.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_retry(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::operator("effect_retry", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Repeat successful execution of `program` or reusable Effect `body` with an explicit typed `schedule`. R supplies clock/sampling; failures/interruption and cleanup retain existing semantics.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_repeat(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::operator("effect_repeat", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Acquire through ResourceBinding, pass checked `ResourceValue<T>` to Effect `body |handle|`, and consume T in cleanup. One-input `release` binds Effects; two-input `release |resource, primary|` synchronously inspects borrowed PrimaryOutcomeRef and returns `Effect<(), E, R>` or Release. Colon release helpers use the factory boundary; the primary borrow cannot escape.
+/// `ensuring; program: effect, release: callback` attaches a primary-aware Effect cleanup through the native ensuring operator.
+/// `release_exit_future; body: callback` constructs a one-shot native Release whose future returns the complete Exit.
+/// `release_sync; body: callback` defers a one-shot synchronous native disposal without an Effect wrapper.
+/// `release_try_sync`, `release_future`, and `release_try_future` retain the native one-shot release boundaries.
+/// `release_effect; program: effect` adapts an existing cleanup description into a Release.
+/// `ensuring_release; program: effect, release: callback` retains a primary-aware native Release factory.
+/// `use; binding: resource, body: callback` consumes an existing ResourceBinding without reacquisition.
+/// `binding; acquire: effect, release: callback` returns the inert ResourceBinding for an existing scoped binder.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_resource(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    ownership_expand::ownership("effect_resource", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Use a checked resource handle with Drop-backed cleanup by default, or an explicit release role with the same factory/Effect distinction as effect_resource. ResourceBinding owns protected release; no AsyncDrop protocol is invented.
+/// `binding; acquire: effect` returns its inert Drop-backed binding without acquiring or opening a scope.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_using(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    ownership_expand::ownership("effect_using", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Create a fresh owner per run with Effect `body |scope|`. Its existing close joins ordered finalizers and retains primary/cleanup failures; construction registers nothing.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_scope(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    ownership_expand::ownership("effect_scope", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Acquire into explicit `scope`, returning checked `ResourceValue<T>`. Resource-only `release |resource|` binds Effects; colon release factories return Effect/Release. Existing scope owns close and late acquisition.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_scope_acquire(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    ownership_expand::ownership("effect_scope_acquire", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Register `program` or Effect `body` in explicit `scope`. `release; release { Release }` registers a fresh factory. The scope retains the registration environment and owns protected close/late-registration behavior.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_finalizer(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    ownership_expand::ownership("effect_finalizer", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Construct a Layer with Effect `build |scope|`. `scoped;` uses acquire/release ResourceBinding roles; `merge;` requires left/right and pure two-input combine; `provide;` composes typed input/output Layers. Acquisition remains deferred to its owner.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn layer(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    ownership_expand::ownership("layer", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Provide the explicit `layer` to `program` or Effect `body`. Existing Layer ownership retains services until application cleanup and keeps typed input/output environments.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_with_layer(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    ownership_expand::ownership("effect_with_layer", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Acquire explicit `permits: NonZeroUsize` from `semaphore`, run `program`/Effect `body`, and release the owned permit through ResourceBinding. Optional on_error maps admission and release. `partitioned;` requires key or reusable key_factory; no default capacity is inferred.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_permit(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    ownership_expand::ownership("effect_permit", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Unfold explicit `state` through pure `step |state, input, elapsed, sample|`. Inputs borrow State/I and receive Duration/`Option<UnitInterval>`; output is the existing transition Result. State and sampling policy retain current semantics.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn schedule(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    ownership_expand::state("schedule", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Require modify/update/in_place/synchronized/synchronized_pure mode and explicit reference. Pure roles use existing Ref transitions; synchronized roles use modify_effect and mandatory on_error admission mapping. Owned snapshots may feed delayed work; publication is not replaced by read-then-set.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_ref(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    ownership_expand::state("effect_ref", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Create a scoped pool with explicit capacity/idle_ttl, Effect create, borrowed validate and owned dispose roles. Borrowed validation is inspected before returning owned delayed work. `exists_idle;` supplies pool/predicate. Existing admission, TTL and protected disposal remain authoritative.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn pool(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    ownership_expand::state("pool", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Load explicit cache/key through zero-input Effect load with optional partition. The existing weak index owns key lifetime; expansion captures no implicit strong key. Extracted loaders keep the same reusable factory contract.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn weak_cache(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    ownership_expand::state("weak_cache", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Construct the existing scoped grouped resolver with Effect `run |group, requests|`. Return ordered `Vec<Exit<A, E>>` with one outcome per request; whole-batch E remains separate. R supplies sharing; no timed batching policy is added.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn request_resolver(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    ownership_expand::state("request_resolver", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Require for_each/fold/fold_effect mode. Effect body consumes owned items; folds require native initial factory and two-input step. Pure fold executes via delayed sync-once step over the existing fold engine; construction opens no stream.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn sink(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    ownership_expand::demand("sink", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Consume explicit stream with Effect `body |item|`. Stream scope owns opening, pulls and release on success/failure/interruption; the callback consumes each item once.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_stream_for_each(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    ownership_expand::demand("effect_stream_for_each", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Use explicit socket acquire/limits or connection options with Effect `body |connection|` and optional on_error. The checked connection handle retains existing native transport/cleanup ownership. No WebSocket runtime or policy defaults are added.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_socket(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    ownership_expand::demand("effect_socket", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Construct paired directions with pure/effectful/contextual modes. Pure inputs borrow and return Result; effectful inputs own and bind Effects under separate decode/encode environments. Contextual mode requires ast and forwards optional ParseContext. Transform modes use source; recursive modes require name/shape/build; lazy returns a standard LazyLock description. No validator/writer witness is inferred.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn codec(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    codec_expand::codec(definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Parse text using explicit ConfiguredCodec in `codec`, preserving its directional decode environment and configured schema/JSON/pattern/issue budgets. Optional on_error maps SchemaIssue; parsing remains lazy.
+/// Inline roles are braced; `role: helper` reuses the same typed boundary.
+#[proc_macro]
+pub fn effect_schema_parse(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    codec_expand::parse(definition)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }

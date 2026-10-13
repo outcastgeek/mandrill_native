@@ -3,6 +3,7 @@
 use super::internal::journal::JournalError;
 use super::{Transaction, TransactionDomain, TransactionDomainError, TxRef, TxValue};
 use crate::{Chunk, Effect, Release, Stream};
+use crate::{effect, effect_map, effect_sync, effect_try_future, effect_try_sync};
 use event_listener::Event;
 use futures_util::future::select;
 use std::sync::{
@@ -116,14 +117,11 @@ impl<T: TxValue> TxSubscriptionRef<T> {
         &self,
     ) -> Effect<Arc<T>, TxSubscriptionError, R> {
         let cell = self.cell.clone();
-        Effect::try_sync(
-            move || {
-                cell.inspect_committed()
-                    .map(|(_, value)| value)
-                    .map_err(map_error)
-            },
-            std::convert::identity,
-        )
+        effect_try_sync! { body: move || {
+            cell.inspect_committed()
+                .map(|(_, value)| value)
+                .map_err(map_error)
+        }, on_error: std::convert::identity, }
     }
 
     /// Capture initial value and version under the same commit gate. `next`
@@ -141,23 +139,20 @@ impl<T: TxValue> TxSubscriptionRef<T> {
         &self,
     ) -> Effect<(Arc<T>, TxSubscription<T>), TxSubscriptionError, R> {
         let cell = self.cell.clone();
-        Effect::try_sync(
-            move || {
-                let (version, value) = cell.inspect_committed().map_err(map_error)?;
-                Ok((
-                    value,
-                    TxSubscription {
-                        inner: Arc::new(SubscriptionInner {
-                            cell: cell.clone(),
-                            cursor: Mutex::new(version),
-                            disposed: AtomicBool::new(false),
-                            closed: Event::new(),
-                        }),
-                    },
-                ))
-            },
-            std::convert::identity,
-        )
+        effect_try_sync! { body: move || {
+            let (version, value) = cell.inspect_committed().map_err(map_error)?;
+            Ok((
+                value,
+                TxSubscription {
+                    inner: Arc::new(SubscriptionInner {
+                        cell: cell.clone(),
+                        cursor: Mutex::new(version),
+                        disposed: AtomicBool::new(false),
+                        closed: Event::new(),
+                    }),
+                },
+            ))
+        }, on_error: std::convert::identity, }
     }
 
     #[must_use]
@@ -171,24 +166,22 @@ impl<T: TxValue> TxSubscriptionRef<T> {
     /// Type: `Stream<Arc<T>, TxSubscriptionError, R>`.
     /// Returns a scoped stream with the declared item, error, and environment types.
     pub fn stream<R: Send + Sync + 'static>(&self) -> Stream<Arc<T>, TxSubscriptionError, R> {
-        let acquire = self
-            .subscribe::<R>()
-            .map(|(initial, subscription)| (Mutex::new(Some(initial)), subscription));
+        let acquire = effect_map! { program: self
+        .subscribe::<R>(), map: |(initial, subscription)| (Mutex::new(Some(initial)), subscription), };
         Stream::from_pull(
             acquire,
             |resource| {
-                resource
-                    .access(|(initial, subscription)| {
-                        let first = initial
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take();
-                        (first, subscription.clone())
-                    })
-                    .flat_map(|(first, subscription)| match first {
-                        Some(value) => Effect::sync_once(move || Chunk::Values(vec![value])),
-                        None => subscription.next().map(|value| Chunk::Values(vec![value])),
-                    })
+                let __dsl_program = resource.access(|(initial, subscription)| {
+                    let first = initial
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    (first, subscription.clone())
+                });
+                effect! { let (first , subscription) = __dsl_program.clone()?; match first {
+                    Some(value) => effect_sync! { once; body: move || Chunk::Values(vec![value]), },
+                    None => effect_map! { program: subscription.next(), map: |value| Chunk::Values(vec![value]), },
+                }? }
             },
             |(_, subscription)| {
                 Release::sync(move || {
@@ -258,47 +251,44 @@ impl<T: TxValue> TxSubscription<T> {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn next<R: Send + Sync + 'static>(&self) -> Effect<Arc<T>, TxSubscriptionError, R> {
         let subscription = self.clone();
-        Effect::try_future(
-            move |cancellation| {
-                let subscription = subscription.clone();
-                async move {
-                    loop {
-                        if subscription.inner.disposed.load(Ordering::Acquire) {
-                            return Err(TxSubscriptionError::Disposed);
-                        }
-                        let listener = subscription.inner.cell.changed().listen();
-                        let closed = subscription.inner.closed.listen();
-                        let (version, value) = subscription
+        effect_try_future! { body: move |cancellation| {
+            let subscription = subscription.clone();
+            async move {
+                loop {
+                    if subscription.inner.disposed.load(Ordering::Acquire) {
+                        return Err(TxSubscriptionError::Disposed);
+                    }
+                    let listener = subscription.inner.cell.changed().listen();
+                    let closed = subscription.inner.closed.listen();
+                    let (version, value) = subscription
+                        .inner
+                        .cell
+                        .inspect_committed()
+                        .map_err(map_error)?;
+                    {
+                        let mut cursor = subscription
                             .inner
-                            .cell
-                            .inspect_committed()
-                            .map_err(map_error)?;
-                        {
-                            let mut cursor = subscription
-                                .inner
-                                .cursor
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            if version > *cursor {
-                                *cursor = version;
-                                return Ok(value);
-                            }
-                        }
-                        if subscription.inner.disposed.load(Ordering::Acquire) {
-                            return Err(TxSubscriptionError::Disposed);
-                        }
-                        let _ = select(
-                            Box::pin(listener),
-                            Box::pin(select(Box::pin(closed), Box::pin(cancellation.cancelled()))),
-                        )
-                        .await;
-                        if cancellation.is_requested() {
-                            return Err(TxSubscriptionError::Cancelled);
+                            .cursor
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if version > *cursor {
+                            *cursor = version;
+                            return Ok(value);
                         }
                     }
+                    if subscription.inner.disposed.load(Ordering::Acquire) {
+                        return Err(TxSubscriptionError::Disposed);
+                    }
+                    let _ = select(
+                        Box::pin(listener),
+                        Box::pin(select(Box::pin(closed), Box::pin(cancellation.cancelled()))),
+                    )
+                    .await;
+                    if cancellation.is_requested() {
+                        return Err(TxSubscriptionError::Cancelled);
+                    }
                 }
-            },
-            std::convert::identity,
-        )
+            }
+        }, on_error: std::convert::identity, }
     }
 }

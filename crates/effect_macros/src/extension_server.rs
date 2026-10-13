@@ -4,6 +4,7 @@ use proc_macro2::{Ident, Span, TokenStream};
 use quote::quote;
 use syn::parse::{Parse, ParseStream, Parser};
 use syn::{Expr, Token};
+use syn::{parenthesized, parse_quote};
 
 /// One source-ordered descriptor operation, configuration field or inline Effect callback.
 struct Entry {
@@ -30,7 +31,7 @@ impl Parse for Entries {
                 (vec![input.parse()?], None)
             } else if input.peek(syn::token::Paren) {
                 let content;
-                syn::parenthesized!(content in input);
+                parenthesized!(content in input);
                 let args =
                     syn::punctuated::Punctuated::<Expr, Token![,]>::parse_terminated(&content)?
                         .into_iter()
@@ -147,22 +148,36 @@ pub(crate) fn expand(name: &str, input: TokenStream) -> syn::Result<TokenStream>
         _ => Err(syn::Error::new(Span::call_site(), "unknown HTTP macro")),
     }
 }
-/// Lower direct endpoint statements or one explicitly selected inline/extracted body.
+/// Lower direct endpoint statements, an existing source, or one inline/extracted body.
 fn endpoint(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> {
     let endpoint_ident = Ident::new("__endpoint", Span::mixed_site());
     let endpoint_body_ident = Ident::new("__endpoint_body", Span::mixed_site());
 
     let descriptor = syn::parse2::<Entries>(input.clone());
     if let Ok(Entries(entries)) = descriptor
-        && entries
-            .iter()
-            .any(|entry| matches!(entry.name.to_string().as_str(), "body" | "effect"))
+        && entries.iter().any(|entry| {
+            matches!(
+                entry.name.to_string().as_str(),
+                "body" | "effect" | "source"
+            )
+        })
     {
         let mut body = None;
         let mut config = Vec::new();
         let mut bindings = Vec::new();
         for entry in entries {
             match entry.name.to_string().as_str() {
+                "source" => {
+                    if body.is_some() {
+                        return Err(syn::Error::new(
+                            entry.name.span(),
+                            "endpoint source/body/effect are mutually exclusive",
+                        ));
+                    }
+                    let source = entry.value()?;
+                    bindings.push(quote!(let #endpoint_body_ident=#source;));
+                    body = Some(quote!(#endpoint_body_ident));
+                }
                 "body" => {
                     if body.is_some() {
                         return Err(syn::Error::new(
@@ -170,11 +185,13 @@ fn endpoint(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> 
                             "endpoint body/effect are mutually exclusive",
                         ));
                     }
-                    let Some((patterns, block)) = entry.inline else {
-                        return Err(syn::Error::new(
-                            entry.name.span(),
-                            "endpoint body must be braced",
-                        ));
+                    let Some((patterns, block)) = &entry.inline else {
+                        let callback = entry.value()?;
+                        bindings.push(
+                            quote!(let #endpoint_body_ident=#path::Endpoint::from_body(#callback);),
+                        );
+                        body = Some(quote!(#endpoint_body_ident));
+                        continue;
                     };
                     if !patterns.is_empty() {
                         return Err(syn::Error::new(
@@ -182,7 +199,7 @@ fn endpoint(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> 
                             "endpoint body has no callback parameters",
                         ));
                     }
-                    let callback = crate::context_expand::reusable_callback(block.stmts);
+                    let callback = crate::context_expand::reusable_callback(block.stmts.clone());
                     bindings.push(
                         quote!(let #endpoint_body_ident=#path::Endpoint::from_body(#callback);),
                     );
@@ -274,12 +291,15 @@ fn reply(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStre
                 if name == "trailer" {
                     has_trailers = true;
                 }
-                let method = &entry.name;
+                let method = Ident::new(
+                    &entry.name.to_string(),
+                    entry.name.span().resolved_at(Span::mixed_site()),
+                );
                 operations.push(quote!(let #draft_ident=#draft_ident.#method(#(#args),*);));
             }
             "text" | "html" | "render" | "json" | "json_codec" | "problem" | "validation"
             | "bytes" | "stream" | "sse" | "negotiate" | "native" | "redirect" | "file_path"
-            | "no_content" | "empty" => {
+            | "no_content" | "empty" | "source" | "finite" => {
                 if terminal.is_some() {
                     return Err(syn::Error::new(
                         entry.name.span(),
@@ -294,8 +314,19 @@ fn reply(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStre
                 };
                 let args = entry.arguments(count)?;
                 bodyless = matches!(name.as_str(), "no_content" | "redirect");
-                let method = &entry.name;
-                terminal = Some(quote!(#path::Reply::#method(#(#args),*)));
+                let method = Ident::new(
+                    if name == "finite" {
+                        "from_finite"
+                    } else {
+                        &name
+                    },
+                    entry.name.span().resolved_at(Span::mixed_site()),
+                );
+                terminal = Some(if name == "source" {
+                    quote!(#(#args)*)
+                } else {
+                    quote!(#path::Reply::#method(#(#args),*))
+                });
             }
             _ => return Err(unknown(&entry)),
         }
@@ -407,7 +438,7 @@ fn route(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStre
                     ("catch_all", true) => "catch_all",
                     _ => return Err(unknown(&entry)),
                 };
-                let method = Ident::new(method, entry.name.span());
+                let method = Ident::new(method, entry.name.span().resolved_at(Span::mixed_site()));
                 operations.push(quote!(let #route_ident=#route_ident.#method(#(#args),*)?;));
                 captured = true;
                 optional = matches!(
@@ -417,7 +448,10 @@ fn route(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStre
             }
             "name" | "tags" | "configure" => {
                 let value = entry.value()?;
-                let method = &entry.name;
+                let method = Ident::new(
+                    &entry.name.to_string(),
+                    entry.name.span().resolved_at(Span::mixed_site()),
+                );
                 let local = Ident::new(
                     &format!("__route_metadata_{}", metadata.len()),
                     Span::mixed_site(),
@@ -446,8 +480,19 @@ fn router(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStr
     let make_ident = Ident::new("__make", Span::mixed_site());
 
     let mut operations = Vec::new();
+    let mut source = None;
     for entry in entries {
         match entry.name.to_string().as_str() {
+            "source" => {
+                if source.is_some() || !operations.is_empty() {
+                    return Err(syn::Error::new(
+                        entry.name.span(),
+                        "router source must appear once before routes",
+                    ));
+                }
+                let value = entry.value()?;
+                source = Some(quote!(#value));
+            }
             "get" | "post" | "put" | "patch" | "delete" | "head" | "options" => {
                 let args = entry.arguments(2)?;
                 let route = args.first().ok_or_else(|| unknown(&entry))?;
@@ -484,7 +529,10 @@ fn router(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStr
                     let value = entry.value()?;
                     quote!(#value)
                 };
-                let method = &entry.name;
+                let method = Ident::new(
+                    &entry.name.to_string(),
+                    entry.name.span().resolved_at(Span::mixed_site()),
+                );
                 operations.push(quote!(let #router_ident=#router_ident.#method(#value);));
             }
             "websocket" => {
@@ -506,21 +554,37 @@ fn router(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStr
             _ => return Err(unknown(&entry)),
         }
     }
+    let source = source.unwrap_or_else(|| quote!(#path::Router::new()));
     Ok(
-        quote!((move || {let #router_ident=#path::Router::new();#(#operations)* ::core::result::Result::<_,#path::ServerError>::Ok(#router_ident)})()),
+        quote!((|| {let #router_ident=#source;#(#operations)* ::core::result::Result::<_,#path::ServerError>::Ok(#router_ident)})()),
     )
 }
 
-/// Preserve ordered before/after/guard/on-exit/respond/header stages and inline/extracted Effects.
+/// Preserve ordered middleware stages, optionally extending an existing owned source.
+/// A source precedes stages and is evaluated once; it adds no empty pipeline allocation.
 fn pipeline(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStream> {
     let pipeline_ident = Ident::new("__pipeline", Span::mixed_site());
 
     let mut operations = Vec::new();
+    let mut source = None;
     for entry in entries {
         match entry.name.to_string().as_str() {
+            "source" => {
+                if source.is_some() || !operations.is_empty() {
+                    return Err(syn::Error::new(
+                        entry.name.span(),
+                        "pipeline source must appear once before stages",
+                    ));
+                }
+                let value = entry.value()?;
+                source = Some(quote!(#value));
+            }
             "before" | "after" | "respond" => {
                 let callback = entry.callback(path, 1)?;
-                let method = &entry.name;
+                let method = Ident::new(
+                    &entry.name.to_string(),
+                    entry.name.span().resolved_at(Span::mixed_site()),
+                );
                 operations.push(quote!(let #pipeline_ident=#pipeline_ident.#method(#callback);));
             }
             "on_exit" => {
@@ -564,7 +628,8 @@ fn pipeline(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenS
             _ => return Err(unknown(&entry)),
         }
     }
-    Ok(quote!({let #pipeline_ident=#path::Pipeline::new();#(#operations)* #pipeline_ident}))
+    let source = source.map_or_else(|| quote!(#path::Pipeline::new()), |value| quote!(#value));
+    Ok(quote!({let #pipeline_ident=#source;#(#operations)* #pipeline_ident}))
 }
 /// Build registration metadata separately from the endpoint's per-request values.
 fn registered(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStream> {
@@ -675,7 +740,10 @@ fn representations(Entries(entries): Entries, path: &TokenStream) -> syn::Result
             }
             "text" | "html" => {
                 let args = entry.arguments(1)?;
-                let method = &entry.name;
+                let method = Ident::new(
+                    &entry.name.to_string(),
+                    entry.name.span().resolved_at(Span::mixed_site()),
+                );
                 quote!(#path::Representation::#method(#(#args),*))
             }
             "stream" => {
@@ -707,6 +775,7 @@ fn server(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStr
     let mut fields = std::collections::BTreeMap::new();
     let mut bindings = Vec::new();
     let mut operations = Vec::new();
+    let mut source = None;
     for entry in entries {
         let name = entry.name.to_string();
         let local = Ident::new(
@@ -715,6 +784,16 @@ fn server(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStr
         );
         let value = entry.value()?;
         match name.as_str() {
+            "source" => {
+                if source.is_some() || !bindings.is_empty() {
+                    return Err(syn::Error::new(
+                        entry.name.span(),
+                        "server source must appear once before configuration",
+                    ));
+                }
+                source = Some(local.clone());
+                bindings.push(quote!(let #local=#value;));
+            }
             "policy" | "environment" | "listen" | "protocols" | "routes" => {
                 if fields.insert(name, local.clone()).is_some() {
                     return Err(syn::Error::new(entry.name.span(), "duplicate server field"));
@@ -724,12 +803,30 @@ fn server(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStr
             "configure_app" | "configure_builder" | "middleware" | "before_environment"
             | "before_routing" | "after_response" | "around_request" | "around_selection"
             | "websockets" => {
-                bindings.push(quote!(let #local=#value;));
-                let method = &entry.name;
-                operations.push(quote!(let #server_ident=#server_ident.#method(#local);));
+                let method = Ident::new(
+                    &entry.name.to_string(),
+                    entry.name.span().resolved_at(Span::mixed_site()),
+                );
+                if source.is_some() {
+                    // The existing Server supplies E/R at the native callback
+                    // boundary; an untyped closure local would lose inference.
+                    operations.push(quote!(let #server_ident=#server_ident.#method(#value);));
+                } else {
+                    bindings.push(quote!(let #local=#value;));
+                    operations.push(quote!(let #server_ident=#server_ident.#method(#local);));
+                }
             }
             _ => return Err(unknown(&entry)),
         }
+    }
+    if let Some(source) = source {
+        if !fields.is_empty() {
+            return Err(syn::Error::new(
+                Span::call_site(),
+                "server source conflicts with construction fields",
+            ));
+        }
+        return Ok(quote!({#(#bindings)* let #server_ident=#source;#(#operations)* #server_ident}));
     }
     let mut required = Vec::new();
     for name in ["policy", "environment", "listen", "protocols", "routes"] {
@@ -753,7 +850,7 @@ fn server(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStr
         .get(4)
         .ok_or_else(|| syn::Error::new(Span::call_site(), "missing routes"))?;
     Ok(
-        quote!((move || {#(#bindings)* let #server_ident=#path::Server::new(#policy,#path::IntoRequestBinding::into_binding(#environment),#listen,#protocols,#path::IntoRouter::into_router(#routes)?);#(#operations)* ::core::result::Result::<_,#path::ServerError>::Ok(#server_ident)})()),
+        quote!((|| {#(#bindings)* let #server_ident=#path::Server::new(#policy,#path::IntoRequestBinding::into_binding(#environment),#listen,#protocols,#path::IntoRouter::into_router(#routes)?);#(#operations)* ::core::result::Result::<_,#path::ServerError>::Ok(#server_ident)})()),
     )
 }
 /// Connect inline/extracted writer callbacks to common Effect and scoped stream production semantics.
@@ -771,6 +868,8 @@ fn stream(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> {
     let mut writer = None;
     let mut body = None;
     let mut bindings = Vec::new();
+    let mut source_parameters = Vec::new();
+    let mut source_values = Vec::new();
     for entry in entries {
         match entry.name.to_string().as_str() {
             "source" => {
@@ -782,6 +881,9 @@ fn stream(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> {
                 }
                 let value = entry.value()?;
                 bindings.push(quote!(let #source_ident=#value;));
+                source_parameters
+                    .push(quote!(#source_ident: #path::__private::effect::Stream<A, E, R>));
+                source_values.push(quote!(#value));
                 source = Some(quote!(#source_ident));
             }
             "write" => {
@@ -793,6 +895,8 @@ fn stream(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> {
                 }
                 let callback = entry.callback(path, 2)?;
                 bindings.push(quote!(let #writer_ident=#callback;));
+                source_parameters.push(quote!(#writer_ident: F));
+                source_values.push(callback);
                 writer = Some(quote!(#writer_ident));
             }
             "body" => {
@@ -801,8 +905,18 @@ fn stream(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> {
                 }
                 let Some((patterns, block)) = entry.inline else {
                     let value = entry.value()?;
-                    bindings.push(quote!(let #body_ident=#value;));
-                    body = Some(quote!(#path::BodyProgram::new(#body_ident)));
+                    // Keep the extracted callback at the native writer boundary,
+                    // evaluating it once in the entry's written position.
+                    bindings.push(quote! {
+                        fn __server_native_body<E, R>(
+                            body: impl Fn(#path::BodyWriter<E, R>) -> #path::__private::effect::Effect<(), E, R> + Send + Sync + 'static,
+                        ) -> #path::BodyProgram<E, R>
+                        where E: Send + 'static, R: Send + Sync + 'static {
+                            #path::BodyProgram::new(body)
+                        }
+                        let #body_ident = __server_native_body(#value);
+                    });
+                    body = Some(quote!(#body_ident));
                     continue;
                 };
                 if patterns.len() != 1 {
@@ -824,7 +938,7 @@ fn stream(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> {
                     attrs: Vec::new(),
                     pat: Box::new(argument.clone()),
                     colon_token: Default::default(),
-                    ty: Box::new(syn::parse_quote!(
+                    ty: Box::new(parse_quote!(
                         #path::__private::effect::__private::MacroContext<_,_>
                     )),
                 });
@@ -836,9 +950,14 @@ fn stream(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> {
         }
     }
     match (source, writer, body) {
-        (Some(source), Some(writer), None) => {
-            Ok(quote!({#(#bindings)* #path::BodyProgram::source(#source,#writer)}))
-        }
+        (Some(source), Some(writer), None) => Ok(quote!({
+            fn __server_native_source<A, E, R, F>(#(#source_parameters),*) -> #path::BodyProgram<E, R>
+            where A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static,
+                F: Fn(A, #path::BodyWriter<E, R>) -> #path::__private::effect::Effect<(), E, R> + Send + Sync + 'static {
+                #path::BodyProgram::source(#source, #writer)
+            }
+            __server_native_source(#(#source_values),*)
+        })),
         (None, None, Some(body)) => Ok(quote!({#(#bindings)* #body})),
         _ => Err(syn::Error::new(
             Span::call_site(),

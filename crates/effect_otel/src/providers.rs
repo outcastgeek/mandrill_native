@@ -1,7 +1,11 @@
 //! SDK ownership and joined shutdown using core scopes and selected blocking work.
 
 use crate::NativeError;
-use effect::{Deferred, Effect, Exit, HasBlockingExecutor, Release, ResourceValue, Scope};
+use crate::{
+    effect_future, effect_map_error, effect_scope_acquire, effect_try_blocking,
+    effect_uninterruptible,
+};
+use effect::{Deferred, Effect, Exit, HasBlockingExecutor, ResourceValue, Scope};
 use opentelemetry_sdk::logs::{LoggerProviderBuilder, SdkLoggerProvider};
 use opentelemetry_sdk::metrics::{MeterProviderBuilder, SdkMeterProvider};
 use opentelemetry_sdk::trace::{SdkTracerProvider, TracerProviderBuilder};
@@ -206,21 +210,19 @@ impl BorrowedProviders {
         R: HasBlockingExecutor + Send + Sync + 'static,
     {
         let providers = self.clone();
-        Effect::try_blocking(
-            move |_| {
-                let _permit = providers.admit().map_err(|error| {
-                    LifecycleError::from_failures(vec![LifecycleFailure {
-                        signal: Signal::Traces,
-                        phase: LifecyclePhase::Flush,
-                        cause: LifecycleCause::Native(error),
-                    }])
-                })?;
-                let mut failures = Vec::new();
-                flush_all(&providers, &mut failures);
-                result(failures)
-            },
-            std::convert::identity,
-        )
+        effect_try_blocking! {
+        body: move |_| {
+            let _permit = providers.admit().map_err(|error| {
+                LifecycleError::from_failures(vec![LifecycleFailure {
+                    signal: Signal::Traces,
+                    phase: LifecyclePhase::Flush,
+                    cause: LifecycleCause::Native(error),
+                }])
+            })?;
+            let mut failures = Vec::new();
+            flush_all(&providers, &mut failures);
+            result(failures)
+        }, on_error: std::convert::identity, }
     }
 }
 
@@ -284,8 +286,7 @@ impl OwnedProviders {
     where
         R: HasBlockingExecutor + Send + Sync + 'static,
     {
-        Effect::try_blocking(move |_| build(&factories, policy), std::convert::identity)
-            .uninterruptible()
+        effect_uninterruptible! { program: effect_try_blocking! { body: move |_| build(&factories, policy), on_error: std::convert::identity, }, }
     }
 
     /// Acquire into an existing core scope; release is registered before acquisition.
@@ -298,9 +299,11 @@ impl OwnedProviders {
     where
         R: HasBlockingExecutor + Send + Sync + 'static,
     {
-        scope.acquire(Self::start(factories, policy), |providers| {
-            Release::from_effect(providers.close())
-        })
+        effect_scope_acquire! {
+        scope: scope, acquire: Self::start(factories, policy), release: |providers| {
+                    providers.close()
+                },
+        }
     }
 
     /// Acquire in an application's existing typed scope with explicit error mapping.
@@ -318,12 +321,13 @@ impl OwnedProviders {
     {
         let on_error = Arc::new(on_error);
         let acquire_error = Arc::clone(&on_error);
-        let acquisition =
-            Self::start(factories, policy).map_error(move |error| acquire_error(error));
-        scope.acquire(acquisition, move |providers| {
-            let on_error = Arc::clone(&on_error);
-            Release::from_effect(providers.close().map_error(move |error| on_error(error)))
-        })
+        let acquisition = effect_map_error! { program: Self::start(factories, policy), map: move |error| acquire_error(error), };
+        effect_scope_acquire! {
+        scope: scope, acquire: acquisition, release: move |providers| {
+                    let on_error = Arc::clone(&on_error);
+                    effect_map_error! { program: providers.close(), map: move |error| on_error(error), }
+                },
+        }
     }
 
     /// Share checked native handles with a scoped application environment.
@@ -344,7 +348,9 @@ impl OwnedProviders {
         R: HasBlockingExecutor + Send + Sync + 'static,
     {
         let owned = self.clone();
-        Effect::from_exit_future_with_context(move |env: Arc<R>, context| {
+        effect_uninterruptible! {
+            program: effect_future! {
+            exit_with_context; body: move |env: Arc<R>, context| {
             let owned = owned.clone();
             async move {
                 let (completion, first) = {
@@ -368,8 +374,8 @@ impl OwnedProviders {
                     owned.providers.admission.stop().wait().await;
                     let providers = owned.providers.clone();
                     let policy = owned.policy;
-                    let close = Effect::try_blocking(
-                        move |_| {
+                    let close = effect_try_blocking! {
+                        body: move |_| {
                             let mut failures = Vec::new();
                             let started = Instant::now();
                             if policy.flush {
@@ -377,9 +383,7 @@ impl OwnedProviders {
                             }
                             shutdown_all(&providers, started, policy, &mut failures);
                             result(failures)
-                        },
-                        std::convert::identity,
-                    );
+                        }, on_error: std::convert::identity, };
                     let outcome = context.run(close, Arc::clone(&env)).await;
                     // Publish even a provider-admission defect so every waiter joins it.
                     let published = context
@@ -397,8 +401,7 @@ impl OwnedProviders {
                     Exit::FinalizationFailed(errors) => Exit::FinalizationFailed(errors),
                 }
             }
-        })
-        .uninterruptible()
+        }, }, }
     }
 }
 

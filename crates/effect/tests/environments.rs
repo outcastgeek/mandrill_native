@@ -1,4 +1,5 @@
 use effect::{Cancellation, Defect, Effect, Exit, HasCancellation, effect};
+use effect::{effect_future, effect_provide_some, effect_sync, service};
 use futures_executor::block_on;
 use futures_util::future::join;
 use std::sync::Arc;
@@ -30,10 +31,10 @@ fn cancellation_capability_is_read_lazily_once_per_run() {
     let env = environment(7);
     let calls = Arc::new(AtomicUsize::new(0));
     let witness = Arc::clone(&calls);
-    let program: Effect<usize, (), Environment> = Effect::sync(move || {
+    let program: Effect<usize, (), Environment> = effect_sync! { body: move || {
         let _ = witness.fetch_add(1, Ordering::SeqCst);
         42
-    });
+    }, };
     let pending = program.run_cancellable(Arc::clone(&env));
     assert_eq!(env.accesses.load(Ordering::SeqCst), 0);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -49,8 +50,8 @@ fn concurrent_runs_share_recipe_without_sharing_cancellation() {
     let entered_witness = entered.clone();
     let program: Effect<usize, (), Environment> = effect! {
         let entered_witness = entered_witness.clone();
-        let value = Effect::service(|env: &Environment| env.value)?;
-        Effect::from_future(move |cancel| {
+        let value = service! { env: |env: &Environment| env.value, }?;
+        effect_future! { body: move |cancel| {
             let entered_witness = entered_witness.clone();
             async move {
                 if value == 1 {
@@ -59,7 +60,7 @@ fn concurrent_runs_share_recipe_without_sharing_cancellation() {
                 }
                 value
             }
-        })?
+        }, }?
     };
     let first = environment(1);
     let second = environment(2);
@@ -98,8 +99,8 @@ fn projection_preserves_the_current_run_token_instead_of_restarting_it() {
         let entered_witness = entered_witness.clone();
         let witnessed = Arc::clone(&witnessed);
         let finished = Arc::clone(&finished);
-        let value = Effect::service(|env: &Environment| env.value)?;
-        Effect::from_future(move |cancel| {
+        let value = service! { env: |env: &Environment| env.value, }?;
+        effect_future! { body: move |cancel| {
             let witnessed = Arc::clone(&witnessed);
             let finished = Arc::clone(&finished);
             let entered_witness = entered_witness.clone();
@@ -110,13 +111,13 @@ fn projection_preserves_the_current_run_token_instead_of_restarting_it() {
                 finished.store(true, Ordering::SeqCst);
                 value
             }
-        })?
+        }, }?
     };
-    let projected = program.provide_some(move |env: &Environment| Environment {
+    let projected = effect_provide_some! { program: program, project: move |env: &Environment| Environment {
         value: env.value + 1,
         cancellation: other.clone(),
         accesses: Arc::clone(&accesses),
-    });
+    }, };
     let request = root.cancellation.clone();
     let (outcome, ()) = block_on(join(
         projected.run_cancellable(Arc::clone(&root)),
@@ -137,7 +138,7 @@ fn uncancellable_boundary_requires_no_capability_and_does_not_probe_one() {
     struct Config {
         value: usize,
     }
-    let plain: Effect<usize, (), Config> = Effect::service(|config: &Config| config.value);
+    let plain: Effect<usize, (), Config> = service! { env: |config: &Config| config.value, };
     assert_eq!(
         block_on(plain.run(Arc::new(Config { value: 42 }))),
         Exit::Success(42)
@@ -145,21 +146,21 @@ fn uncancellable_boundary_requires_no_capability_and_does_not_probe_one() {
 
     let env = environment(7);
     assert!(env.cancellation.request());
-    let program: Effect<usize, (), Environment> = Effect::service(|env: &Environment| env.value);
+    let program: Effect<usize, (), Environment> = service! { env: |env: &Environment| env.value, };
     assert_eq!(block_on(program.run(Arc::clone(&env))), Exit::Success(7));
     assert_eq!(env.accesses.load(Ordering::SeqCst), 0);
 }
 
 #[test]
-#[allow(clippy::panic)] // An application-supplied capability accessor is a user-code boundary.
 fn accessor_panics_are_reported_as_defects() {
     struct Broken;
     impl HasCancellation for Broken {
         fn cancellation(&self) -> &Cancellation {
-            panic!("broken accessor")
+            std::panic::resume_unwind(Box::new("broken accessor"))
         }
     }
-    let program: Effect<usize, (), Broken> = Effect::succeed(42);
+    let program: Effect<usize, (), Broken> =
+        effect_sync! { body: { let __dsl_value = 42; move || __dsl_value }, };
     assert_eq!(
         block_on(program.run_cancellable(Arc::new(Broken))),
         Exit::Die(Defect::from_panic(Box::new("broken accessor")))

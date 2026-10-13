@@ -57,14 +57,14 @@ pub enum IdentityError {
     Native(IdentityResult),
     /// Narrow native store category outside an invocation diagnostic scope.
     Store(StoreError),
-    /// Full SQL primary/cleanup/uncertain acknowledgment diagnostic tree.
+    /// Retained owned SQL primary/cleanup/uncertain acknowledgment diagnostic tree.
     #[cfg(feature = "sqlx-turso")]
-    Sql(SqlError),
+    Sql(Box<SqlError>),
     /// Native browser/protocol policy rejected the request before application work.
     Policy(http::StatusCode),
-    /// Selected auxiliary persistence/codec failed with its original diagnostics.
+    /// Retained owned auxiliary persistence/codec failure with its original diagnostics.
     #[cfg(feature = "sqlx-turso")]
-    Record(crate::store::records::RecordError),
+    Record(Box<crate::store::records::RecordError>),
     /// Native Server input/body ownership failure, preserving its actual diagnostics.
     Input(effect_server::ServerError),
     /// Native token verification/provider failure; outages remain distinct from rejection.
@@ -103,9 +103,9 @@ impl std::error::Error for IdentityError {
         match self {
             Self::Store(error) => Some(error),
             #[cfg(feature = "sqlx-turso")]
-            Self::Sql(error) => Some(error),
+            Self::Sql(error) => Some(error.as_ref()),
             #[cfg(feature = "sqlx-turso")]
-            Self::Record(error) => Some(error),
+            Self::Record(error) => Some(error.as_ref()),
             Self::Input(error) => Some(error),
             Self::Bearer(error) => Some(error),
             Self::Ticket(error) => Some(error),
@@ -122,18 +122,23 @@ pub(crate) fn restore_sql_result<A>(
     result: Result<A, IdentityError>,
 ) -> Result<A, IdentityError> {
     match failure {
-        Some(error) => Err(IdentityError::Sql(error)),
+        Some(error) => Err(IdentityError::Sql(Box::new(error))),
         None => result,
     }
 }
 impl IdentityError {
     /// Restore native defects/interruption/finalization at the outer Effect boundary.
+    #[must_use]
     pub fn into_exit<A>(self) -> effect::Exit<A, Self> {
         match self {
             #[cfg(feature = "sqlx-turso")]
-            Self::Sql(error) => error.into_exit().map_error(Self::Sql),
+            Self::Sql(error) => (*error)
+                .into_exit()
+                .map_error(|error| Self::Sql(Box::new(error))),
             #[cfg(feature = "sqlx-turso")]
-            Self::Record(error) => error.into_exit().map_error(Self::Record),
+            Self::Record(error) => (*error)
+                .into_exit()
+                .map_error(|error| Self::Record(Box::new(error))),
             error => effect::Exit::Fail(error),
         }
     }
@@ -150,7 +155,7 @@ impl From<crate::store::components::SessionError> for IdentityError {
     fn from(error: crate::store::components::SessionError) -> Self {
         match error {
             crate::store::components::SessionError::Ticket(error) => Self::Ticket(error),
-            crate::store::components::SessionError::Storage(error) => Self::Record(error),
+            crate::store::components::SessionError::Storage(error) => Self::Record(Box::new(error)),
         }
     }
 }
@@ -158,6 +163,6 @@ impl From<crate::store::components::SessionError> for IdentityError {
 impl From<crate::store::records::RecordError> for IdentityError {
     /// Retain the selected codec/provider error, including acknowledgment uncertainty.
     fn from(error: crate::store::records::RecordError) -> Self {
-        Self::Record(error)
+        Self::Record(Box::new(error))
     }
 }

@@ -6,6 +6,10 @@ use crate::rpc::{RpcHandler, RpcOperation};
 use crate::workflow::{
     DeadlineWake, HasWorkflowEngine, WorkflowCommand, WorkflowEngine, WorkflowReply, WorkflowStatus,
 };
+use crate::{
+    effect, effect_map, effect_map_error, effect_provide_some, effect_sync, effect_try_sync,
+    service,
+};
 use std::sync::Mutex;
 
 #[derive(Debug)]
@@ -131,185 +135,127 @@ impl ClusterWorkflowEngine {
         R: HasWorkflowEngine + Send + Sync + 'static,
     {
         let command = Mutex::new(Some(command));
-        Effect::service(|env: &R| env.workflow_engine()).flat_map(move |engine| {
-            let command = command
+        let command = effect_try_sync! {
+            body: move || command
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            let Some(command) = command else {
-                return Effect::from_result_once(Err(ClusterWorkflowError::InputConsumed));
-            };
-            match command {
-                WorkflowCommand::Start { handle, input } => engine
-                    .start(handle, input)
-                    .map_error(ClusterWorkflowError::Engine)
-                    .provide_some(|_: &R| ())
-                    .map(|snapshot| WorkflowReply::snapshot(Some(snapshot))),
-                WorkflowCommand::Activity { run, record } => engine
+                .take()
+                .ok_or(ClusterWorkflowError::InputConsumed),
+        };
+        effect! {
+            let command = command.clone();
+            let engine = service! {
+                env: |env: &R| env.workflow_engine(),
+            }?;
+            let command = command?;
+            let response = match command {
+                WorkflowCommand::Start { handle, input } => effect_map! { program: effect_provide_some! { program: effect_map_error! { program: engine
+                    .start(handle, input), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), }, map: |snapshot| WorkflowReply::snapshot(Some(snapshot)), },
+                WorkflowCommand::Activity { run, record } => effect_map! { program: effect_provide_some! { program: effect_map_error! { program: engine
                     .record_activity(
                         run,
                         record.identity,
                         record.attempt,
                         record.encoded_input,
                         record.outcome,
-                    )
-                    .map_error(ClusterWorkflowError::Engine)
-                    .provide_some(|_: &R| ())
-                    .map(|_| WorkflowReply::Accepted),
-                WorkflowCommand::Child { parent, record } => engine
-                    .link_child(parent, record)
-                    .map_error(ClusterWorkflowError::Engine)
-                    .provide_some(|_: &R| ())
-                    .map(|_| WorkflowReply::Accepted),
-                WorkflowCommand::WaitChild { parent, child } => engine
-                    .wait_child(parent, child)
-                    .map_error(ClusterWorkflowError::Engine)
-                    .provide_some(|_: &R| ())
-                    .map(WorkflowReply::ChildWait),
+                    ), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), }, map: |_| WorkflowReply::Accepted, },
+                WorkflowCommand::Child { parent, record } => effect_map! { program: effect_provide_some! { program: effect_map_error! { program: engine
+                    .link_child(parent, record), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), }, map: |_| WorkflowReply::Accepted, },
+                WorkflowCommand::WaitChild { parent, child } => effect_map! { program: effect_provide_some! { program: effect_map_error! { program: engine
+                    .wait_child(parent, child), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), }, map: WorkflowReply::ChildWait, },
                 WorkflowCommand::InspectActivity {
                     run,
                     activity,
                     attempt,
-                } => engine
-                    .inspect_activity(run, activity, attempt)
-                    .map_error(ClusterWorkflowError::Engine)
-                    .provide_some(|_: &R| ())
-                    .map(WorkflowReply::Activity),
-                WorkflowCommand::Signal { run, record } => engine
-                    .deliver_signal(run, record)
-                    .map_error(ClusterWorkflowError::Engine)
-                    .provide_some(|_: &R| ())
-                    .map(|_| WorkflowReply::Accepted),
+                } => effect_map! { program: effect_provide_some! { program: effect_map_error! { program: engine
+                    .inspect_activity(run, activity, attempt), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), }, map: WorkflowReply::Activity, },
+                WorkflowCommand::Signal { run, record } => effect_map! { program: effect_provide_some! { program: effect_map_error! { program: engine
+                    .deliver_signal(run, record), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), }, map: |_| WorkflowReply::Accepted, },
                 WorkflowCommand::InspectSignal {
                     run,
                     signal,
                     version,
-                } => engine
-                    .inspect_signal(run, signal, version)
-                    .map_error(ClusterWorkflowError::Engine)
-                    .provide_some(|_: &R| ())
-                    .map(WorkflowReply::Signal),
+                } => effect_map! { program: effect_provide_some! { program: effect_map_error! { program: engine
+                    .inspect_signal(run, signal, version), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), }, map: WorkflowReply::Signal, },
                 WorkflowCommand::WaitSignal {
                     run,
                     signal,
                     version,
-                } => engine
-                    .wait_signal(run, signal, version)
-                    .map_error(ClusterWorkflowError::Engine)
-                    .provide_some(|_: &R| ())
-                    .map(WorkflowReply::SignalWait),
+                } => effect_map! { program: effect_provide_some! { program: effect_map_error! { program: engine
+                    .wait_signal(run, signal, version), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), }, map: WorkflowReply::SignalWait, },
                 WorkflowCommand::Resume { run, checkpoint } => {
                     let resume_engine = engine.clone();
-                    engine
-                        .inspect(run.clone())
-                        .map_error(ClusterWorkflowError::Engine)
-                        .provide_some(|_: &R| ())
-                        .flat_map(move |snapshot| match snapshot {
+                    let inspection = effect_provide_some! { program: effect_map_error! { program: engine
+                        .inspect(run.clone()), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), };
+                    effect! {
+                        let run = run.clone();
+                        let checkpoint = checkpoint.clone();
+                        let resume_engine = resume_engine.clone();
+                        let snapshot = inspection.clone()?;
+                        let response = match snapshot {
                             Some(snapshot)
                                 if snapshot.status == WorkflowStatus::Suspended
                                     || (snapshot.status == WorkflowStatus::Running
                                         && checkpoint.is_some()) =>
                             {
-                                resume_engine
+                                effect_map! { program: effect_provide_some! { program: effect_map_error! { program: resume_engine
                                     .transition(
                                         run.clone(),
                                         checkpoint.clone().unwrap_or_else(|| snapshot.checkpoint()),
                                         WorkflowStatus::Ready,
-                                    )
-                                    .map_error(ClusterWorkflowError::Engine)
-                                    .provide_some(|_: &R| ())
-                                    .map(|snapshot| WorkflowReply::snapshot(Some(snapshot)))
+                                    ), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), }, map: |snapshot| WorkflowReply::snapshot(Some(snapshot)), }
                             }
-                            other => Effect::sync_once(move || WorkflowReply::snapshot(other)),
-                        })
+                            other => effect_sync! { once; body: move || WorkflowReply::snapshot(other), },
+                        };
+                        response?
+                    }
                 }
                 WorkflowCommand::Transition {
                     run,
                     expected,
                     next,
-                } => engine
-                    .transition(run, expected, next)
-                    .map_error(ClusterWorkflowError::Engine)
-                    .provide_some(|_: &R| ())
-                    .map(|snapshot| WorkflowReply::snapshot(Some(snapshot))),
-                WorkflowCommand::Cancel { run } => engine
-                    .cancel(run)
-                    .map_error(ClusterWorkflowError::Engine)
-                    .provide_some(|_: &R| ())
-                    .map(WorkflowReply::Cancellation),
-                WorkflowCommand::ForceInterrupt { run } => engine
-                    .force_interrupt(run)
-                    .map_error(ClusterWorkflowError::Engine)
-                    .provide_some(|_: &R| ())
-                    .map(WorkflowReply::Cancellation),
-                WorkflowCommand::Deadline { run, deadline } => engine
-                    .set_deadline(run, deadline)
-                    .map_error(ClusterWorkflowError::Engine)
-                    .provide_some(|_: &R| ())
-                    .map(|snapshot| WorkflowReply::snapshot(Some(snapshot))),
-                WorkflowCommand::ClearDeadline { run, expected } => engine
-                    .clear_deadline(run, expected)
-                    .map_error(ClusterWorkflowError::Engine)
-                    .provide_some(|_: &R| ())
-                    .map(|outcome| WorkflowReply::DeadlineClear(Box::new(outcome))),
-                WorkflowCommand::WaitDeadline { run, deadline, now } => engine
-                    .wait_deadline(run, deadline, now)
-                    .map_error(ClusterWorkflowError::Engine)
-                    .provide_some(|_: &R| ())
-                    .map(WorkflowReply::DeadlineWait),
-                WorkflowCommand::WakeDue { run, expected, now } => engine
-                    .wake_deadline(run, expected, now)
-                    .map_error(ClusterWorkflowError::Engine)
-                    .provide_some(|_: &R| ())
-                    .map(|wake| match wake {
+                } => effect_map! { program: effect_provide_some! { program: effect_map_error! { program: engine
+                    .transition(run, expected, next), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), }, map: |snapshot| WorkflowReply::snapshot(Some(snapshot)), },
+                WorkflowCommand::Cancel { run } => effect_map! { program: effect_provide_some! { program: effect_map_error! { program: engine
+                    .cancel(run), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), }, map: WorkflowReply::Cancellation, },
+                WorkflowCommand::ForceInterrupt { run } => effect_map! { program: effect_provide_some! { program: effect_map_error! { program: engine
+                    .force_interrupt(run), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), }, map: WorkflowReply::Cancellation, },
+                WorkflowCommand::Deadline { run, deadline } => effect_map! { program: effect_provide_some! { program: effect_map_error! { program: engine
+                    .set_deadline(run, deadline), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), }, map: |snapshot| WorkflowReply::snapshot(Some(snapshot)), },
+                WorkflowCommand::ClearDeadline { run, expected } => effect_map! { program: effect_provide_some! { program: effect_map_error! { program: engine
+                    .clear_deadline(run, expected), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), }, map: |outcome| WorkflowReply::DeadlineClear(Box::new(outcome)), },
+                WorkflowCommand::WaitDeadline { run, deadline, now } => effect_map! { program: effect_provide_some! { program: effect_map_error! { program: engine
+                    .wait_deadline(run, deadline, now), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), }, map: WorkflowReply::DeadlineWait, },
+                WorkflowCommand::WakeDue { run, expected, now } => effect_map! { program: effect_provide_some! { program: effect_map_error! { program: engine
+                    .wake_deadline(run, expected, now), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), }, map: |wake| match wake {
                         DeadlineWake::Woken(snapshot) | DeadlineWake::Unchanged(snapshot) => {
                             WorkflowReply::snapshot(Some(snapshot))
                         }
-                    }),
+                    }, },
                 WorkflowCommand::RegisterCompensation {
                     run,
                     identity,
                     order,
-                } => engine
-                    .register_compensation(run, identity, order)
-                    .map_error(ClusterWorkflowError::Engine)
-                    .provide_some(|_: &R| ())
-                    .map(WorkflowReply::Compensation),
+                } => effect_map! { program: effect_provide_some! { program: effect_map_error! { program: engine
+                    .register_compensation(run, identity, order), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), }, map: WorkflowReply::Compensation, },
                 WorkflowCommand::FinishCompensation {
                     run,
                     identity,
                     outcome,
-                } => engine
-                    .finish_compensation(run, identity, outcome)
-                    .map_error(ClusterWorkflowError::Engine)
-                    .provide_some(|_: &R| ())
-                    .map(WorkflowReply::Compensation),
-                WorkflowCommand::PendingCompensations { run } => engine
-                    .pending_compensations(run)
-                    .map_error(ClusterWorkflowError::Engine)
-                    .provide_some(|_: &R| ())
-                    .map(WorkflowReply::Compensations),
-                WorkflowCommand::InspectRace { run, identity } => engine
-                    .inspect_race(run, identity)
-                    .map_error(ClusterWorkflowError::Engine)
-                    .provide_some(|_: &R| ())
-                    .map(WorkflowReply::Race),
-                WorkflowCommand::RecordRace { run, record } => engine
-                    .record_race(run, record)
-                    .map_error(ClusterWorkflowError::Engine)
-                    .provide_some(|_: &R| ())
-                    .map(|record| WorkflowReply::Race(Some(record))),
-                WorkflowCommand::Inspect { run } => engine
-                    .inspect(run)
-                    .map_error(ClusterWorkflowError::Engine)
-                    .provide_some(|_: &R| ())
-                    .map(WorkflowReply::snapshot),
-                WorkflowCommand::Complete { run, outcome } => engine
-                    .complete(run, outcome)
-                    .map_error(ClusterWorkflowError::Engine)
-                    .provide_some(|_: &R| ())
-                    .map(|snapshot| WorkflowReply::snapshot(Some(snapshot))),
-            }
-        })
+                } => effect_map! { program: effect_provide_some! { program: effect_map_error! { program: engine
+                    .finish_compensation(run, identity, outcome), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), }, map: WorkflowReply::Compensation, },
+                WorkflowCommand::PendingCompensations { run } => effect_map! { program: effect_provide_some! { program: effect_map_error! { program: engine
+                    .pending_compensations(run), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), }, map: WorkflowReply::Compensations, },
+                WorkflowCommand::InspectRace { run, identity } => effect_map! { program: effect_provide_some! { program: effect_map_error! { program: engine
+                    .inspect_race(run, identity), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), }, map: WorkflowReply::Race, },
+                WorkflowCommand::RecordRace { run, record } => effect_map! { program: effect_provide_some! { program: effect_map_error! { program: engine
+                    .record_race(run, record), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), }, map: |record| WorkflowReply::Race(Some(record)), },
+                WorkflowCommand::Inspect { run } => effect_map! { program: effect_provide_some! { program: effect_map_error! { program: engine
+                    .inspect(run), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), }, map: WorkflowReply::snapshot, },
+                WorkflowCommand::Complete { run, outcome } => effect_map! { program: effect_provide_some! { program: effect_map_error! { program: engine
+                    .complete(run, outcome), map: ClusterWorkflowError::Engine, }, project: |_: &R| (), }, map: |snapshot| WorkflowReply::snapshot(Some(snapshot)), },
+            };
+            response?
+        }
     }
 }

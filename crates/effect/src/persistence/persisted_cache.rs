@@ -6,8 +6,12 @@ use super::{
 };
 use crate::{
     Cache, CacheCapacity, CacheConfig, Effect, HasClock, HasTaskSpawner, HasWallClock, KeyDomain,
-    KeyError, Release, ResourceBinding, SchemaIssue, Scope, SemaphoreError, SharedValue,
-    StoredOutcome, TimeError, WallClock,
+    KeyError, Release, SchemaIssue, Scope, SemaphoreError, SharedValue, StoredOutcome, TimeError,
+    WallClock,
+};
+use crate::{
+    effect, effect_map, effect_map_error, effect_provide_some, effect_resource, effect_sync,
+    effect_try_sync, service,
 };
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -204,19 +208,19 @@ where
             cache_failure: memory.cache_failure,
         };
         let load_definition = definition.clone();
-        Cache::make(scope, memory, move |request: &CacheKey<K>| {
+        effect_map! {
+            program: Cache::make(scope, memory, move |request: &CacheKey<K>| {
             let key = Arc::clone(&request.identity);
             let definition = load_definition.clone();
             let loader = Arc::clone(&loader);
             let application = loader(&request.request);
             load_persisted(application, key, definition, policy)
-        })
-        .map(move |memory| Self {
+        }), map: move |memory| Self {
             memory,
             definition: definition.clone(),
             gate: CacheGate::new(),
             _errors: PhantomData,
-        })
+        }, }
     }
 
     /// Read the current value through the declared storage or state capability.
@@ -245,26 +249,23 @@ where
         let definition = self.definition.clone();
         let memory = self.memory.clone();
         let gate = self.gate.clone();
-        Effect::try_sync(
-            move || definition.key(&identity_key).map(|key| key.into_bytes()),
-            |error| SharedValue::new(PersistedCacheError::Identity(error)),
-        )
-        .flat_map(move |identity| {
-            let memory = memory.clone();
-            let key = Arc::clone(&key);
-            let identity_for_memory = Arc::clone(&identity);
-            ResourceBinding::new(
-                gate.acquire(identity)
-                    .map_error(|error| SharedValue::new(PersistedCacheError::Coordination(error))),
-                |permit, _| Release::sync(move || drop(permit)),
-            )
-            .use_with(move |_| {
-                memory.get_shared(Arc::new(CacheKey {
-                    request: Arc::clone(&key),
-                    identity: Arc::clone(&identity_for_memory),
-                }))
-            })
-        })
+        {
+            let __dsl_program = effect_try_sync! { body: move || definition.key(&identity_key).map(|key| key.into_bytes()), on_error: |error| SharedValue::new(PersistedCacheError::Identity(error)), };
+            effect! {
+                        let __dsl_program = __dsl_program.clone(); let gate = gate.clone(); let key = key.clone(); let memory = memory.clone(); let identity = __dsl_program?; {
+                        let memory = memory.clone();
+                        let key = Arc::clone(&key);
+                        let identity_for_memory = Arc::clone(&identity);
+                        effect_resource! {
+            acquire: effect_map_error! { program: gate.acquire(identity), map: |error| SharedValue::new(PersistedCacheError::Coordination(error)), }, release: |permit, _| Release::sync(move || drop(permit)), body: move |_| {
+                            memory.get_shared(Arc::new(CacheKey {
+                                request: Arc::clone(&key),
+                                identity: Arc::clone(&identity_for_memory),
+                            }))
+                        },
+            }
+                    }? }
+        }
     }
 
     /// Invalidate this cache instance before removing the backing record.
@@ -300,49 +301,50 @@ where
         let definition = self.definition.clone();
         let memory = self.memory.clone();
         let gate = self.gate.clone();
-        Effect::try_sync(
-            move || {
+        {
+            let __dsl_program = effect_try_sync! {
+            body: move || {
                 definition
                     .key(&identity_key)
                     .map(|value| value.into_bytes())
-            },
-            |error| SharedValue::new(PersistedCacheError::Identity(error)),
-        )
-        .flat_map(move |identity| {
-            let key = Arc::clone(&key);
-            let memory = memory.clone();
-            let removal_key = Arc::clone(&identity);
-            let identity_for_memory = Arc::clone(&identity);
-            ResourceBinding::new(
-                gate.acquire(identity)
-                    .map_error(|error| SharedValue::new(PersistedCacheError::Coordination(error))),
-                |permit, _| Release::sync(move || drop(permit)),
-            )
-            .use_with(move |_| {
-                let removal_key = Arc::clone(&removal_key);
-                memory
-                    .invalidate_shared(Arc::new(CacheKey {
-                        request: Arc::clone(&key),
-                        identity: Arc::clone(&identity_for_memory),
-                    }))
-                    .flat_map(move |_| {
-                        let key = Arc::clone(&removal_key);
-                        Effect::service(|env: &R| env.key_value_store()).flat_map(move |store| {
-                            let error_key = Arc::clone(&key);
-                            store
-                                .remove(Arc::clone(&key))
-                                .map(|_| ())
-                                .map_error(move |source| {
-                                    SharedValue::new(PersistedCacheError::UncertainRemoval {
-                                        key: Arc::clone(&error_key),
-                                        source,
-                                    })
-                                })
-                                .provide_some(|_: &R| ())
-                        })
-                    })
-            })
-        })
+            }, on_error: |error| SharedValue::new(PersistedCacheError::Identity(error)), };
+            effect! {
+                            let __dsl_program = __dsl_program.clone(); let gate = gate.clone(); let key = key.clone(); let memory = memory.clone(); let identity = __dsl_program?; {
+                        let key = Arc::clone(&key);
+                        let memory = memory.clone();
+                        let removal_key = Arc::clone(&identity);
+                        let identity_for_memory = Arc::clone(&identity);
+                        effect_resource! {
+            acquire: effect_map_error! { program: gate.acquire(identity), map: |error| SharedValue::new(PersistedCacheError::Coordination(error)), }, release: |permit, _| Release::sync(move || drop(permit)), body: move |_| {
+                            let removal_key = Arc::clone(&removal_key);
+                            {
+                                let __dsl_program = memory
+                                .invalidate_shared(Arc::new(CacheKey {
+                                    request: Arc::clone(&key),
+                                    identity: Arc::clone(&identity_for_memory),
+                                })); effect! {
+                                    let removal_key = removal_key.clone(); let _ = __dsl_program.clone()?; {
+                                    let key = Arc::clone(&removal_key);
+                                    {
+                                        let __dsl_program = service! { env: |env: &R| env.key_value_store(), }; effect! {
+                                        let key = key.clone(); let store = __dsl_program.clone()?; {
+                                        let error_key = Arc::clone(&key);
+                                        effect_provide_some! {
+                                            program: effect_map_error! {
+                                            program: effect_map! {
+                                            program: store
+                                            .remove(Arc::clone(&key)), map: |_| (), }, map: move |source| {
+                                                SharedValue::new(PersistedCacheError::UncertainRemoval {
+                                                    key: Arc::clone(&error_key),
+                                                    source,
+                                                })
+                                            }, }, project: |_: &R| (), }
+                                    }? } }
+                                }? } }
+                        },
+            }
+                    }? }
+        }
     }
 
     /// Stop accepting new work and describe the settlement of owned work.
@@ -403,22 +405,27 @@ where
     R::Store: KeyValueStore<Error = B>,
     R::Clock: WallClock<Error = W>,
 {
-    Effect::wall_now()
-        .map_error(PersistedCacheError::Clock)
-        .flat_map(move |now| {
+    {
+        let __dsl_program =
+            effect_map_error! { program: Effect::wall_now(), map: PersistedCacheError::Clock, };
+        effect! {
+        let application = application.clone(); let definition = definition.clone(); let key = key.clone(); let now = __dsl_program.clone()?; {
             let key_for_read = Arc::clone(&key);
             let key_for_result = Arc::clone(&key);
             let definition = definition.clone();
             let application = application.clone();
-            Effect::service(|env: &R| env.key_value_store()).flat_map(move |store| {
+            {
+                let __dsl_program = service! { env: |env: &R| env.key_value_store(), }; effect! {
+                let application = application.clone(); let definition = definition.clone(); let key_for_read = key_for_read.clone(); let key_for_result = key_for_result.clone(); let store = __dsl_program.clone()?; {
                 let key = Arc::clone(&key_for_result);
                 let definition = definition.clone();
                 let application = application.clone();
-                store
-                    .get(Arc::clone(&key_for_read), now)
-                    .map_error(PersistedCacheError::Read)
-                    .provide_some(|_: &R| ())
-                    .flat_map(move |read| match read {
+                {
+                    let __dsl_program = effect_provide_some! {
+                    program: effect_map_error! {
+                    program: store
+                    .get(Arc::clone(&key_for_read), now), map: PersistedCacheError::Read, }, project: |_: &R| (), }; effect! {
+                        let application = application.clone(); let definition = definition.clone(); let key = key.clone(); let read = __dsl_program.clone()?; match read {
                         StoreRead::Missing | StoreRead::Expired(_) => load_and_store(
                             application.clone(),
                             Arc::clone(&key),
@@ -426,9 +433,9 @@ where
                             policy,
                         ),
                         StoreRead::Found(entry) => match definition.decode(&entry.value.bytes) {
-                            Ok(StoredOutcome::Success(value)) => Effect::sync_once(move || value),
+                            Ok(StoredOutcome::Success(value)) => effect_sync! { once; body: move || value, },
                             Ok(StoredOutcome::Failure(error)) => {
-                                Effect::from_result_once(Err(PersistedCacheError::Domain(error)))
+                                effect_try_sync! { once; body: { let __dsl_result = Err(PersistedCacheError::Domain(error)); move || __dsl_result }, on_error: ::core::convert::identity, }
                             }
                             Ok(
                                 StoredOutcome::Defect(_)
@@ -456,9 +463,10 @@ where
                                 policy,
                             ),
                         },
-                    })
-            })
-        })
+                    }? } }
+            }? } }
+        }? }
+    }
 }
 
 ///
@@ -500,30 +508,36 @@ where
     R::Clock: WallClock<Error = W>,
 {
     match policy.corrupt_record {
-        CorruptCacheRecord::Reject => Effect::from_result_once(Err(error)),
-        CorruptCacheRecord::EvictAndReload => Effect::service(|env: &R| env.key_value_store())
-            .flat_map(move |store| {
+        CorruptCacheRecord::Reject => {
+            effect_try_sync! { once; body: { let __dsl_result = Err(error); move || __dsl_result }, on_error: ::core::convert::identity, }
+        }
+        CorruptCacheRecord::EvictAndReload => {
+            let __dsl_program = service! { env: |env: &R| env.key_value_store(), };
+            effect! {
+            let application = application.clone(); let definition = definition.clone(); let key = key.clone(); let store = __dsl_program.clone()?; {
                 let remove_key = Arc::clone(&key);
                 let error_key = Arc::clone(&key);
                 let load_key = Arc::clone(&key);
                 let definition = definition.clone();
                 let application = application.clone();
-                store
-                    .remove(remove_key)
-                    .map_error(move |source| PersistedCacheError::UncertainRemoval {
+                {
+                    let __dsl_program = effect_provide_some! {
+                    program: effect_map_error! {
+                    program: store
+                    .remove(remove_key), map: move |source| PersistedCacheError::UncertainRemoval {
                         key: Arc::clone(&error_key),
                         source,
-                    })
-                    .provide_some(|_: &R| ())
-                    .flat_map(move |_| {
+                    }, }, project: |_: &R| (), }; effect! {
+                        let application = application.clone(); let definition = definition.clone(); let load_key = load_key.clone(); let _ = __dsl_program.clone()?; {
                         load_and_store(
                             application.clone(),
                             Arc::clone(&load_key),
                             definition.clone(),
                             policy,
                         )
-                    })
-            }),
+                    }? } }
+            }? }
+        }
     }
 }
 
@@ -563,102 +577,118 @@ where
     R::Store: KeyValueStore<Error = B>,
     R::Clock: WallClock<Error = W>,
 {
-    application
-        .either()
-        .map_error(PersistedCacheError::Domain)
-        .flat_map(move |outcome| {
-            if outcome.is_err() && !policy.persist_failures {
-                return Effect::from_result_once(outcome.map_err(PersistedCacheError::Domain));
-            }
-            let key = Arc::clone(&key);
-            let definition = definition.clone();
-            let pending = std::sync::Mutex::new(Some(outcome));
-            Effect::wall_now()
-                .map_error(PersistedCacheError::Clock)
-                .flat_map(move |now| {
-                    let outcome = pending
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take();
-                    let Some(outcome) = outcome else {
-                        return Effect::from_result_once(Err(PersistedCacheError::InputConsumed));
-                    };
-                    let stored = match outcome {
-                        Ok(value) => StoredOutcome::Success(value),
-                        Err(error) => StoredOutcome::Failure(error),
-                    };
-                    let encoded = match definition.encode(&stored) {
-                        Ok(bytes) => bytes,
-                        Err(issue) => {
-                            return Effect::from_result_once(Err(PersistedCacheError::Encode(
-                                issue,
-                            )));
-                        }
-                    };
-                    let outcome = match stored {
-                        StoredOutcome::Success(value) => Ok(value),
-                        StoredOutcome::Failure(error) => Err(error),
-                        StoredOutcome::Defect(_)
-                        | StoredOutcome::Interrupted
-                        | StoredOutcome::FinalizationFailed(_) => {
-                            return Effect::from_result_once(Err(
-                                PersistedCacheError::UnsupportedStoredOutcome,
-                            ));
-                        }
-                    };
-                    let expires_at = match policy
-                        .persistent_ttl
-                        .map(|ttl| now.checked_add(ttl))
-                        .transpose()
-                    {
-                        Ok(value) => value,
-                        Err(error) => {
-                            return Effect::from_result_once(Err(PersistedCacheError::Time(error)));
-                        }
-                    };
-                    let outcome = std::sync::Mutex::new(Some(outcome));
-                    let key_for_store = Arc::clone(&key);
-                    Effect::service(|env: &R| env.key_value_store()).flat_map(move |store| {
-                        let value = StoredValue {
-                            bytes: Arc::clone(&encoded),
-                            expires_at,
-                        };
-                        let write_key = Arc::clone(&key_for_store);
-                        let error_key = Arc::clone(&key_for_store);
-                        let outcome = outcome
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take();
-                        match outcome {
-                            Some(outcome) => {
-                                let completed = std::sync::Mutex::new(Some(outcome));
-                                store
-                                    .put(write_key, value)
-                                    .map_error(move |source| PersistedCacheError::UncertainWrite {
-                                        key: Arc::clone(&error_key),
-                                        source,
-                                    })
-                                    .provide_some(|_: &R| ())
-                                    .flat_map(move |_| {
-                                        let result = completed
-                                            .lock()
-                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                            .take();
-                                        match result {
-                                            Some(result) => Effect::from_result_once(
-                                                result.map_err(PersistedCacheError::Domain),
-                                            ),
-                                            None => Effect::from_result_once(Err(
-                                                PersistedCacheError::InputConsumed,
-                                            )),
-                                        }
-                                    })
-                            }
-                            None => {
-                                Effect::from_result_once(Err(PersistedCacheError::InputConsumed))
-                            }
-                        }
-                    })
-                })
-        })
+    {
+        let __dsl_program = effect_map_error! {
+        program: application
+        .either(), map: PersistedCacheError::Domain, };
+        effect! {
+                   let __dsl_program = __dsl_program.clone(); let definition = definition.clone(); let key = key.clone(); let outcome = __dsl_program.clone()?; (move || {
+                   if outcome.is_err() && !policy.persist_failures {
+                       return effect_try_sync! { once; body: { let __dsl_result = outcome.map_err(PersistedCacheError::Domain); move || __dsl_result }, on_error: ::core::convert::identity, };
+                   }
+                   let key = Arc::clone(&key);
+                   let definition = definition.clone();
+                   let pending = std::sync::Mutex::new(Some(outcome));
+                   effect! {
+        bind;
+        program: effect_map_error! { program: Effect::wall_now(), map: PersistedCacheError::Clock, },
+        body: move |now| {
+                           let outcome = pending
+                               .lock()
+                               .unwrap_or_else(std::sync::PoisonError::into_inner)
+                               .take();
+                           let Some(outcome) = outcome else {
+                               return effect_try_sync! { once; body: { let __dsl_result = Err(PersistedCacheError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, };
+                           };
+                           let stored = match outcome {
+                               Ok(value) => StoredOutcome::Success(value),
+                               Err(error) => StoredOutcome::Failure(error),
+                           };
+                           let encoded = match definition.encode(&stored) {
+                               Ok(bytes) => bytes,
+                               Err(issue) => {
+                                   return effect_try_sync! {
+                                       once; body: {
+                                       let __dsl_result = Err(PersistedCacheError::Encode(
+                                       issue,
+                                   )); move || __dsl_result }, on_error: ::core::convert::identity, };
+                               }
+                           };
+                           let outcome = match stored {
+                               StoredOutcome::Success(value) => Ok(value),
+                               StoredOutcome::Failure(error) => Err(error),
+                               StoredOutcome::Defect(_)
+                               | StoredOutcome::Interrupted
+                               | StoredOutcome::FinalizationFailed(_) => {
+                                   return effect_try_sync! {
+                                       once; body: {
+                                       let __dsl_result = Err(
+                                       PersistedCacheError::UnsupportedStoredOutcome,
+                                   ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                               }
+                           };
+                           let expires_at = match policy
+                               .persistent_ttl
+                               .map(|ttl| now.checked_add(ttl))
+                               .transpose()
+                           {
+                               Ok(value) => value,
+                               Err(error) => {
+                                   return effect_try_sync! { once; body: { let __dsl_result = Err(PersistedCacheError::Time(error)); move || __dsl_result }, on_error: ::core::convert::identity, };
+                               }
+                           };
+                           let outcome = std::sync::Mutex::new(Some(outcome));
+                           let key_for_store = Arc::clone(&key);
+                           effect! {
+        bind;
+        program: service! { env: |env: &R| env.key_value_store(), },
+        body: move |store| {
+                               let value = StoredValue {
+                                   bytes: Arc::clone(&encoded),
+                                   expires_at,
+                               };
+                               let write_key = Arc::clone(&key_for_store);
+                               let error_key = Arc::clone(&key_for_store);
+                               let outcome = outcome
+                                   .lock()
+                                   .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                   .take();
+                               match outcome {
+                                   Some(outcome) => {
+                                       let completed = std::sync::Mutex::new(Some(outcome));
+                                       effect! {
+        bind;
+        program: effect_provide_some! {
+            program: effect_map_error! {
+            program: store
+                                           .put(write_key, value), map: move |source| PersistedCacheError::UncertainWrite {
+                                               key: Arc::clone(&error_key),
+                                               source,
+                                           }, }, project: |_: &R| (), },
+        body: move |_| {
+                                               let result = completed
+                                                   .lock()
+                                                   .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                   .take();
+                                               match result {
+                                                   Some(result) => effect_try_sync! { once; body: { let __dsl_result = result.map_err(PersistedCacheError::Domain); move || __dsl_result }, on_error: ::core::convert::identity, },
+                                                   None => effect_try_sync! {
+                                                       once; body: {
+                                                       let __dsl_result = Err(
+                                                       PersistedCacheError::InputConsumed,
+                                                   ); move || __dsl_result }, on_error: ::core::convert::identity, },
+                                               }
+                                           },
+        }
+                                   }
+                                   None => {
+                                       effect_try_sync! { once; body: { let __dsl_result = Err(PersistedCacheError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, }
+                                   }
+                               }
+                           },
+        }
+                       },
+        }
+               })()? }
+    }
 }

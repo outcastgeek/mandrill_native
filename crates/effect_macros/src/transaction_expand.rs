@@ -4,6 +4,7 @@ use proc_macro2::{Ident, Span, TokenStream};
 use quote::quote;
 use syn::fold::Fold;
 use syn::{Expr, Stmt};
+use syn::{parse_quote, parse_quote_spanned};
 
 /// Rewrites only the transaction body; nested callbacks and items keep their own `?`.
 struct Lower {
@@ -12,52 +13,44 @@ struct Lower {
 }
 impl Fold for Lower {
     /// Bind transactions through the typed journal and preserve native guards and moves.
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "Other syn expression variants retain native Rust syntax"
-    )]
     fn fold_expr(&mut self, expr: Expr) -> Expr {
-        match expr {
-            Expr::Closure(_) | Expr::Async(_) => expr,
-            Expr::Try(step) => {
-                let program = self.fold_expr(*step.expr);
-                let context = &self.context;
-                syn::parse_quote_spanned!(step.question_token.span=> #context.bind(#program)?)
-            }
-            Expr::Return(step) => {
-                let value = step
-                    .expr
-                    .map(|value| self.fold_expr(*value))
-                    .unwrap_or_else(|| syn::parse_quote!(()));
-                syn::parse_quote!(return Ok(#value))
-            }
-            Expr::While(mut step) => {
-                step.cond = Box::new(self.fold_expr(*step.cond));
-                step.body = self.fold_block(step.body);
-                let context = &self.context;
-                step.body
-                    .stmts
-                    .insert(0, syn::parse_quote!(#context.checkpoint()?;));
-                Expr::While(step)
-            }
-            Expr::ForLoop(mut step) => {
-                step.expr = Box::new(self.fold_expr(*step.expr));
-                step.body = self.fold_block(step.body);
-                let context = &self.context;
-                step.body
-                    .stmts
-                    .insert(0, syn::parse_quote!(#context.checkpoint()?;));
-                Expr::ForLoop(step)
-            }
-            Expr::Loop(mut step) => {
-                step.body = self.fold_block(step.body);
-                let context = &self.context;
-                step.body
-                    .stmts
-                    .insert(0, syn::parse_quote!(#context.checkpoint()?;));
-                Expr::Loop(step)
-            }
-            other => syn::fold::fold_expr(self, other),
+        if matches!(&expr, Expr::Closure(_) | Expr::Async(_)) {
+            expr
+        } else if let Expr::Try(step) = expr {
+            let program = self.fold_expr(*step.expr);
+            let context = &self.context;
+            parse_quote_spanned!(step.question_token.span.resolved_at(proc_macro2::Span::mixed_site())=> #context.bind(#program)?)
+        } else if let Expr::Return(step) = expr {
+            let value = step
+                .expr
+                .map(|value| self.fold_expr(*value))
+                .unwrap_or_else(|| parse_quote!(()));
+            parse_quote!(return Ok(#value))
+        } else if let Expr::While(mut step) = expr {
+            step.cond = Box::new(self.fold_expr(*step.cond));
+            step.body = self.fold_block(step.body);
+            let context = &self.context;
+            step.body
+                .stmts
+                .insert(0, parse_quote!(#context.checkpoint()?;));
+            Expr::While(step)
+        } else if let Expr::ForLoop(mut step) = expr {
+            step.expr = Box::new(self.fold_expr(*step.expr));
+            step.body = self.fold_block(step.body);
+            let context = &self.context;
+            step.body
+                .stmts
+                .insert(0, parse_quote!(#context.checkpoint()?;));
+            Expr::ForLoop(step)
+        } else if let Expr::Loop(mut step) = expr {
+            step.body = self.fold_block(step.body);
+            let context = &self.context;
+            step.body
+                .stmts
+                .insert(0, parse_quote!(#context.checkpoint()?;));
+            Expr::Loop(step)
+        } else {
+            syn::fold::fold_expr(self, expr)
         }
     }
     /// Item bodies are separate language and lifetime boundaries.
@@ -91,8 +84,11 @@ mod tests {
     use super::*;
     /// Generated binds retain guards and native callback boundaries while enforcing the domain bridge.
     #[test]
-    fn native_lowering_contract() {
-        let statements=syn::parse::Parser::parse_str(syn::Block::parse_within,"let value=step()?; match value {v if v>0=>v,_=>0}; while ready() {step()?;} let callback=||nested()?;").expect("Rust statements");
+    fn native_lowering_contract() -> syn::Result<()> {
+        let statements = syn::parse::Parser::parse_str(
+            syn::Block::parse_within,
+            "let value=step()?; match value {v if v>0=>v,_=>0}; while ready() {step()?;} let callback=||nested()?;",
+        )?;
         let mut lower = Lower {
             context: Ident::new("transaction_context", Span::mixed_site()),
         };
@@ -104,5 +100,6 @@ mod tests {
         assert!(output.contains("if v > 0"));
         assert!(output.contains("checkpoint"));
         assert!(output.contains("nested () ?"));
+        Ok(())
     }
 }

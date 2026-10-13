@@ -1,25 +1,29 @@
-//! Maya watches an oat latte move from accepted to preparing to ready.
+//! Replay a ticket's recorded status timeline to the customer's phone, with native tracing.
 //!
-//! Run with explicit address, preparation milliseconds, SSE frame bytes, cursor
-//! bytes, active span slots, metric descriptors, label sets per descriptor, and
-//! a shared host-drain/SDK-shutdown timeout in positive milliseconds:
-//! `cargo run -p effect-otel --features server --example watch_order_progress -- 127.0.0.1:8080 400 256 32 32 16 8 5000`.
-//! Zero capacities or timeout fail argument parsing. `/orders/104/events` uses an inline
-//! writer, `/orders/104/notifications` reuses an extracted writer, and
-//! `/orders/104/progress` owns its writes in a body Effect. All three emit the
-//! same accepted/preparing/ready sequence without collecting it.
-//! Open a route with `curl -N`; send a `traceparent`/`baggage`
-//! header to carry an existing distributed parent. The server writes each event
-//! only after the consumer pulls the previous frame. Disconnect interrupts the
-//! producer and its request scope unregisters the subscription before observation.
-//! Providers use official in-memory exporters for this local story; replace the
-//! factory builder hooks with your exporter configuration to send real telemetry.
-//! The host owns SDK shutdown. Borrowed setup is documented in `cafe_telemetry`.
+//! Supply a UTF-8 CSV with no header: `elapsed_ms,status`, in increasing time order.
+//! Accepted statuses: `accepted`, `preparing`, `ready`. For example, rows
+//! `0,accepted`, `400,preparing`, `800,ready` produce those three SSE updates.
+//! Run: `cargo +1.99.0 run -p effect-otel --features server --example watch_order_progress -- 127.0.0.1:8080 HISTORY.csv 256 32 32 16 8 5000 inline`.
+//! Read: `curl -N http://127.0.0.1:8080/orders/104/events`. The final argument
+//! selects one writer (`inline`, `extracted`, or `body`) for the same route.
+//! The timeline is input data; this example does not prepare physical drinks.
+//! Frame/cursor bytes, active spans, metric descriptors, series and drain/shutdown
+//! milliseconds are positive caller-selected limits. Disconnect releases the
+//! subscription. Ctrl-C drains the host and shuts down its owned native exporters.
+//! Optional traceparent/baggage headers carry the caller's distributed context.
 
+use effect::{
+    effect_future, effect_map_error, effect_scope, effect_stream_for_each, effect_try_future,
+};
 mod cafe_telemetry;
 use cafe_telemetry::{CafeError, Environment, TelemetryCapacity};
-use effect::{Effect, Exit, LogLevel, Release, Scope, Stream};
+use effect::span;
+use effect::stream;
+use effect::{Effect, Exit, LogLevel, Stream, effect, effect_scope_acquire};
+use effect_otel::effect_sync;
+use effect_otel::effect_try_sync;
 use effect_otel::{Otel, OwnedProviders, Propagation, ProviderFactories, ShutdownPolicy, otel};
+use effect_server::stream as server_stream;
 use effect_server::{
     BodyPolicy, BodyWriter, Endpoint, HostPolicy, HttpProtocols, ServerPolicy, SsePolicy,
     SseRecord, endpoint, reply, router, server,
@@ -37,7 +41,7 @@ fn publish_status(
     status: &'static str,
     event: &'static str,
 ) -> Effect<String, CafeError, Environment> {
-    effect::effect! {
+    effect! {
         Otel::tag("order.status", status)?;
         Otel::event(event)?;
         status.to_owned()
@@ -46,59 +50,70 @@ fn publish_status(
 
 /// Open subscriptions are real scope-owned registrations, not response construction counters.
 fn order_updates(
-    wait: Duration,
+    history: Arc<[StatusRecord]>,
     subscriptions: Arc<AtomicUsize>,
 ) -> Stream<String, CafeError, Environment> {
-    Stream::new(move |scope| {
+    stream! {
+        open: move |scope| {
         let opened = subscriptions.clone();
-        let acquired = Effect::sync(move || {
+        let acquired = effect_sync! {
+            body {
             opened.fetch_add(1, Ordering::AcqRel);
             opened.clone()
-        });
-        let source: Stream<String, CafeError, Environment> = effect::stream! {
-            Otel::event("order.accepted")?;
-            yield "accepted".to_owned();
-            Effect::sleep(wait)?;
-            let preparing = otel! { name: "cafe.order.prepare", effect: publish_status("preparing", "barista.started") }?;
-            yield preparing;
-            Effect::sleep(wait)?;
-            let ready = otel! { name: "cafe.order.ready", effect: publish_status("ready", "pickup.ready") }?;
-            yield ready;
+            },
+        };
+        let timeline = history.clone();
+        let source: Stream<String, CafeError, Environment> = stream! {
+            let timeline = timeline.clone();
+            let mut previous = Duration::ZERO;
+            for record in timeline.iter() {
+                Effect::sleep(record.elapsed - previous)?;
+                previous = record.elapsed;
+                let status = record.status;
+                let update = otel! { name: "cafe.order.recorded-status", effect: publish_status(status.label(), status.event()) }?;
+                yield update;
+            }
         };
         let source_scope = scope.clone();
-        effect::effect! {
+        effect! {
             let source_scope = source_scope.clone();
             let acquired = acquired.clone();
             let source = source.clone();
-            source_scope.acquire(acquired, |registered| Release::from_effect(Effect::sync(move || {
-                registered.fetch_sub(1, Ordering::AcqRel);
-            })))?;
+            effect_scope_acquire! {
+                scope: source_scope.clone(), acquire: acquired,
+                release |registered: Arc<AtomicUsize>| {
+                    effect_sync! { body { registered.fetch_sub(1, Ordering::AcqRel); }, }?;
+                },
+            }?;
             source.open(source_scope)?
         }
-    })
+    }, }
 }
 
-/// Inline D16 writing uses the core pull-driven source and awaited SSE/flush boundaries.
+/// Inline writing uses the core pull-driven source and awaited SSE/flush boundaries.
 fn watch_order(
-    wait: Duration,
+    history: Arc<[StatusRecord]>,
     subscriptions: Arc<AtomicUsize>,
     sse: SsePolicy,
 ) -> Endpoint<CafeError, Environment> {
     endpoint! {
-        let body = effect_server::stream! {
-            source: order_updates(wait, subscriptions.clone()),
+        let body = server_stream! {
+            source: order_updates(history.clone(), subscriptions.clone()),
             write |update, writer| {
                 let update: String = update;
                 let writer: effect_server::BodyWriter<CafeError, Environment> = writer;
                 // Transfer the payload once; only descriptions and sink handles are shared.
-                let update_once: Effect<String, CafeError, Environment> = Effect::sync_once(move || update);
-                otel! { name: "cafe.order.update", body {
+                let update_once: Effect<String, CafeError, Environment> = effect_sync! {
+                    once; body { update },
+                };
+                otel! {
+                    name: "cafe.order.update", body {
                     let writer = writer.clone();
                     let update_once = update_once.clone();
                     let update = update_once?;
                     Otel::tag("order.id", "104")?;
                     writer.sse(SseRecord { event: Some("order-status".into()), id: None, retry: None, data: update }, sse)?;
-                    effect::span! { name: "cafe.flush-status", effect: writer.flush() }?;
+                    span! { name: "cafe.flush-status", effect: writer.flush() }?;
                 }}?;
             }
         };
@@ -121,7 +136,7 @@ fn write_status(
         },
         sse,
     );
-    effect::effect! {
+    effect! {
         let frame = frame.clone();
         let writer = writer.clone();
         frame?;
@@ -129,15 +144,15 @@ fn write_status(
     }
 }
 
-/// Extracted D16 callback keeps the same pull, write and subscription ownership.
+/// Extracted writer callback keeps the same pull, write and subscription ownership.
 fn watch_notifications(
-    wait: Duration,
+    history: Arc<[StatusRecord]>,
     subscriptions: Arc<AtomicUsize>,
     sse: SsePolicy,
 ) -> Endpoint<CafeError, Environment> {
     endpoint! {
-        let body = effect_server::stream! {
-            source: order_updates(wait, subscriptions.clone()),
+        let body = server_stream! {
+            source: order_updates(history.clone(), subscriptions.clone()),
             write: move |update, writer| write_status(update, writer, sse),
         };
         reply! { sse(body); }
@@ -147,33 +162,101 @@ fn watch_notifications(
 /// Body form runs the same scoped source; the Effect owns each awaited write/flush.
 /// Core run_for_each releases the subscription on exhaustion or interruption.
 fn watch_progress(
-    wait: Duration,
+    history: Arc<[StatusRecord]>,
     subscriptions: Arc<AtomicUsize>,
     sse: SsePolicy,
 ) -> Endpoint<CafeError, Environment> {
     endpoint! {
-        let subscriptions = subscriptions.clone();
-        let body = effect_server::stream! {
+        let subscriptions = subscriptions.clone(); let history = history.clone();
+        let body = server_stream! {
             body |writer| {
                 let writer: BodyWriter<CafeError, Environment> = writer.clone();
-                let subscriptions = subscriptions.clone();
-                let updates = order_updates(wait, subscriptions);
-                updates.run_for_each(move |update| write_status(update, writer.clone(), sse))?;
+                let subscriptions = subscriptions.clone(); let history = history.clone();
+                let updates = order_updates(history.clone(), subscriptions);
+                effect_stream_for_each! { stream: updates, body: move |update| write_status(update, writer.clone(), sse), }?;
             }
         };
         reply! { sse(body); }
     }
 }
 
+/// Caller-selected writer form; only one endpoint is mounted in each run.
+#[derive(Clone, Copy)]
+enum WriterMode {
+    /// Write each update in the stream callback.
+    Inline,
+    /// Reuse the extracted typed frame writer.
+    Extracted,
+    /// The body Effect owns traversal and its writes.
+    Body,
+}
+/// One actual recorded state and its elapsed timestamp.
+struct StatusRecord {
+    /// Time since this ticket's recorded acceptance.
+    elapsed: Duration,
+    /// State reported by the stored timeline.
+    status: Status,
+}
+/// Stored vocabulary, separate from the runtime or tracing configuration.
+#[derive(Clone, Copy)]
+enum Status {
+    /// Counter accepted the ticket.
+    Accepted,
+    /// Preparation started.
+    Preparing,
+    /// Cups reached pickup.
+    Ready,
+}
+impl Status {
+    /// Customer-facing status value in the SSE record.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Preparing => "preparing",
+            Self::Ready => "ready",
+        }
+    }
+    /// Native span event describes the supplied recorded phase.
+    fn event(self) -> &'static str {
+        match self {
+            Self::Accepted => "order.accepted",
+            Self::Preparing => "barista.started",
+            Self::Ready => "pickup.ready",
+        }
+    }
+}
+/// Reject malformed or reordered input before creating request subscriptions.
+fn read_history(path: &str) -> Result<Arc<[StatusRecord]>, Box<dyn std::error::Error>> {
+    let csv = std::fs::read_to_string(path)?;
+    let mut history = Vec::<StatusRecord>::new();
+    for line in csv.lines() {
+        let (elapsed, status) = line.split_once(',').ok_or("expected elapsed_ms,status")?;
+        let elapsed = Duration::from_millis(elapsed.parse()?);
+        let status = match status {
+            "accepted" => Status::Accepted,
+            "preparing" => Status::Preparing,
+            "ready" => Status::Ready,
+            _ => return Err("unknown recorded status".into()),
+        };
+        if history
+            .last()
+            .is_some_and(|previous| previous.elapsed > elapsed)
+        {
+            return Err("recorded times must not go backwards".into());
+        }
+        history.push(StatusRecord { elapsed, status });
+    }
+    if history.is_empty() {
+        return Err("provide at least one recorded status".into());
+    }
+    Ok(history.into())
+}
 /// A finite native host remains owned until Ctrl-C, then joins requests and SDK cleanup.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let address: std::net::SocketAddr =
         args.next().ok_or("provide the listener address")?.parse()?;
-    let millis: u64 = args
-        .next()
-        .ok_or("provide preparation milliseconds")?
-        .parse()?;
+    let history = read_history(&args.next().ok_or("provide recorded history CSV")?)?;
     let sse = SsePolicy {
         frame_bytes: args
             .next()
@@ -203,7 +286,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("provide positive host-drain/SDK-shutdown milliseconds")?
         .parse()?;
     let drain = Duration::from_millis(drain_millis.get());
-    let wait = Duration::from_millis(millis);
+    let writer = match args.next().as_deref() {
+        Some("inline") => WriterMode::Inline,
+        Some("extracted") => WriterMode::Extracted,
+        Some("body") => WriterMode::Body,
+        _ => return Err("choose inline, extracted or body writer".into()),
+    };
+    if args.next().is_some() {
+        return Err("unexpected argument".into());
+    }
     let shutdown = ShutdownPolicy::new(drain, true)?;
     // Two workers are required by the selected independent-child task provider.
     let runtime = Arc::new(
@@ -241,61 +332,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscriptions = Arc::new(AtomicUsize::new(0));
     let watched = subscriptions.clone();
     let provider_runtime = runtime.clone();
-    let program: Effect<(), CafeError, Environment> = Scope::scoped(move |scope| {
-        let factories = factories.clone();
-        let provider_runtime = provider_runtime.clone();
-        let watched = watched.clone();
-        effect::effect! {
-        let factories = factories.clone();
-        let provider_runtime = provider_runtime.clone();
-        let watched = watched.clone();
-        let scope = scope.clone();
-        let owned = OwnedProviders::acquire_with_error(scope, factories, shutdown, CafeError::Lifecycle)?;
-        let providers = Effect::try_sync_once(move || owned.with(|owner| owner.borrowed()),
-            |error| CafeError::Otel(effect_otel::NativeError::Native(error)))?;
-        let environment = Effect::from_result_once(Environment::new(provider_runtime, providers, capacity))
-            .map_error(|error| CafeError::Otel(effect_otel::NativeError::Native(effect::Defect::new(error))))?;
-        let environment = Arc::new(environment);
-        let selected = environment.clone();
-        let events = watch_order(wait, watched.clone(), sse);
-        let notifications = watch_notifications(wait, watched.clone(), sse);
-        let progress = watch_progress(wait, watched, sse);
-        let routes = router! {
-            get("/orders/104/events", events);
-            get("/orders/104/notifications", notifications);
-            get("/orders/104/progress", progress);
-        };
-        // Each source awaits its writer, so one pending frame slot is sufficient;
-        // the caller's encoded-frame limit also bounds each native body chunk.
-        let policy = ServerPolicy::new(BodyPolicy { frames: NonZeroUsize::MIN, chunk_bytes: sse.frame_bytes },
-            HostPolicy { drain }, CafeError::Server,
-            |_| Effect::sync(|| reply! { text("Order tracking failed".into()); }));
-        let server = Effect::from_result_once(server! {
-            policy: policy,
-            environment: move |request: effect_server::Request| {
-                let mut projected = selected.as_ref().clone();
-                projected.cancellation = request.cancellation().clone();
-                Effect::sync(move || Arc::new(projected.clone()))
-            },
-            listen: address,
-            protocols: HttpProtocols::Http1,
-            routes: routes,
-        }).map_error(CafeError::Server)?;
-        let propagation = Propagation::new(opentelemetry::propagation::TextMapCompositePropagator::new(vec![Box::new(opentelemetry_sdk::propagation::TraceContextPropagator::new()), Box::new(opentelemetry_sdk::propagation::BaggagePropagator::new())]));
-        let server = effect_otel::server::install(server, propagation,
-            |_| effect_otel::server::RequestSpan { name: Arc::from("cafe.watch-order"), attributes: vec![] },
-            |summary| Otel::log(LogLevel::Info, format!("order stream {:?}; cleanup_failed={}", summary.body, summary.cleanup_failed)), CafeError::Otel);
-        // Explicit typed R handoff: host/request polls use the acquired native bridge.
-        Effect::from_exit_future_with_context(move |_, context| {
-            let server = server.clone();
-            let environment = environment.clone();
-            async move {
-                context.run(server.with_host(|_| Effect::try_future_with_env(|_, _| async { tokio::signal::ctrl_c().await },
-                    |error| CafeError::Server(effect_server::ServerError::Io(error)))), environment).await
+    let program: Effect<(), CafeError, Environment> = effect_scope! {
+    body: move |scope| {
+            let factories = factories.clone();
+            let provider_runtime = provider_runtime.clone();
+            let watched = watched.clone();
+            let history = history.clone();
+            effect! {
+            let factories = factories.clone();
+            let provider_runtime = provider_runtime.clone();
+            let watched = watched.clone(); let history = history.clone();
+            let scope = scope.clone();
+            let owned = OwnedProviders::acquire_with_error(scope, factories, shutdown, CafeError::Lifecycle)?;
+            let providers = effect_try_sync! {
+                once;
+                on_error |error| { CafeError::Otel(effect_otel::NativeError::Native(error)) },
+                body { owned.with(|owner| owner.borrowed()) },
+            }?;
+            let environment = effect_map_error! { program: effect_try_sync! { once; body: { let __dsl_result = Environment::new(provider_runtime, providers, capacity); move || __dsl_result }, on_error: ::core::convert::identity, }, map: |error| CafeError::Otel(effect_otel::NativeError::Native(effect::Defect::new(error))), }?;
+            let environment = Arc::new(environment);
+            let selected = environment.clone();
+            let history = history.clone();
+            let events = match writer {
+                WriterMode::Inline => watch_order(history, watched, sse),
+                WriterMode::Extracted => watch_notifications(history, watched, sse),
+                WriterMode::Body => watch_progress(history, watched, sse),
+            };
+            let routes = router! { get("/orders/104/events", events); };
+            // Each source awaits its writer, so one pending frame slot is sufficient;
+            // the caller's encoded-frame limit also bounds each native body chunk.
+            let policy = ServerPolicy::new(BodyPolicy { frames: NonZeroUsize::MIN, chunk_bytes: sse.frame_bytes },
+                HostPolicy { drain }, CafeError::Server,
+                |_| effect_sync! { body: || reply! { text("Order tracking failed".into()); }, });
+            let server = effect_map_error! {
+                program: effect_try_sync! {
+                once; body: {
+                let __dsl_result = server! {
+                policy: policy,
+                environment: move |request: effect_server::Request| {
+                    let mut projected = selected.as_ref().clone();
+                    projected.cancellation = request.cancellation().clone();
+                    effect_sync! { body: move || Arc::new(projected.clone()), }
+                },
+                listen: address,
+                protocols: HttpProtocols::Http1,
+                routes: routes,
+            }; move || __dsl_result }, on_error: ::core::convert::identity, }, map: CafeError::Server, }?;
+            let propagation = Propagation::new(opentelemetry::propagation::TextMapCompositePropagator::new(vec![Box::new(opentelemetry_sdk::propagation::TraceContextPropagator::new()), Box::new(opentelemetry_sdk::propagation::BaggagePropagator::new())]));
+            let server = effect_otel::server::install(server, propagation,
+                |_| effect_otel::server::RequestSpan { name: Arc::from("cafe.watch-order"), attributes: vec![] },
+                |summary| Otel::log(LogLevel::Info, format!("order stream {:?}; cleanup_failed={}", summary.body, summary.cleanup_failed)), CafeError::Otel);
+            // Explicit typed R handoff: host/request polls use the acquired native bridge.
+            effect_future! {
+                exit_with_context; body: move |_, context| {
+                let server = server.clone();
+                let environment = environment.clone();
+                async move {
+                    context.run(server.with_host(|_| effect_try_future! { with_env; body: |_, _| async { tokio::signal::ctrl_c().await }, on_error: |error| CafeError::Server(effect_server::ServerError::Io(error)), }), environment).await
+                }
+            }, }?;
             }
-        })?;
-        }
-    });
+        },
+    };
     let exit = runtime.block_on(program.run(root.clone()));
     runtime.block_on(root.tasks.stop().wait());
     runtime.block_on(root.blocking.stop().wait());
@@ -303,11 +401,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bootstrap_traces.shutdown()?;
     bootstrap_metrics.shutdown()?;
     match exit {
-        Exit::Success(()) => Ok(()),
-        other => Err(format!(
-            "order host exited: {other:?}; active subscriptions={}",
-            subscriptions.load(Ordering::Acquire)
-        )
-        .into()),
+        Exit::Success(()) => {
+            assert_eq!(subscriptions.load(Ordering::Acquire), 0);
+            use std::io::Write;
+            writeln!(
+                std::io::stdout().lock(),
+                "Order timeline host closed; all subscriptions released."
+            )?;
+            Ok(())
+        }
+        other
+        @ (Exit::Fail(_) | Exit::Die(_) | Exit::Interrupted | Exit::FinalizationFailed(_)) => {
+            Err(format!(
+                "order host exited: {other:?}; active subscriptions={}",
+                subscriptions.load(Ordering::Acquire)
+            )
+            .into())
+        }
     }
 }

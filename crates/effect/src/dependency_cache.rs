@@ -1,9 +1,11 @@
 //! Dependency indexing over the existing scoped cache engine. Active entries
 //! with unknown dependencies and retained failures are conservatively fenced.
+
 use crate::{
     Cache, CacheAdmission, CacheCapacity, CacheConfig, CacheLookup, CacheOptions, CacheTtl, Effect,
     HasClock, HasTaskSpawner, Scope, SharedValue,
 };
+use crate::{cache, effect, effect_die, effect_map, effect_map_error, effect_try_sync};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 type Equal<A> = Arc<dyn Fn(&A, &A) -> bool + Send + Sync>;
@@ -203,28 +205,35 @@ impl<K: Send + Sync + 'static, D: Send + Sync + 'static, A: Send + 'static, E: S
         equal: Equal<D>,
         load: impl Fn(Arc<K>) -> Effect<(A, Vec<D>), E, R> + Send + Sync + 'static,
     ) -> Effect<Self, SharedValue<DependencyCacheError<E>>, R> {
-        Cache::make_with_shared_key(scope, config, options, move |key| {
-            load(key).map_error(DependencyCacheError::Load).flat_map(
-                move |(value, dependencies)| {
+        let load = Arc::new(load);
+        let cache = cache! {
+            scope: scope,
+            config: config,
+            options: options,
+            load |key: Arc<K>| {
+                let load = Arc::clone(&load);
+                let (value, dependencies) = effect_map_error! {
+                    program: load(key),
+                    map: DependencyCacheError::Load,
+                }?;
                     if dependencies.len() > maximum_dependencies.get() {
-                        Effect::from_result_once(Err(DependencyCacheError::DependencyCapacity {
+                        effect_try_sync! { once; body: { let __dsl_result = Err(DependencyCacheError::DependencyCapacity {
                             maximum: maximum_dependencies.get(),
                             observed: dependencies.len(),
-                        }))
+                        }); move || __dsl_result }, on_error: ::core::convert::identity, }?
                     } else {
-                        Effect::from_result_once(Ok(DependencyValue {
+                        DependencyValue {
                             value: SharedValue::new(value),
                             dependencies: dependencies.into(),
-                        }))
+                        }
                     }
-                },
-            )
-        })
-        .map(move |cache| Self {
+            },
+        };
+        effect_map! { program: cache, map: move |cache| Self {
             cache,
             equal: Arc::clone(&equal),
             maximum_dependencies,
-        })
+        }, }
     }
     /// Lazily get or load a value and report whether it was retained, shared or newly loaded.
     ///
@@ -235,15 +244,18 @@ impl<K: Send + Sync + 'static, D: Send + Sync + 'static, A: Send + 'static, E: S
         &self,
         key: K,
     ) -> Effect<CacheLookup<A>, SharedValue<DependencyCacheError<E>>, R> {
-        self.cache.get_observed(key).flat_map(|lookup| {
+        let lookup = self.cache.get_observed(key);
+        effect! {
+            let lookup = lookup.clone();
+            let lookup = lookup?;
             match lookup.value.with(|value| value.value.clone()) {
-                Ok(value) => Effect::from_result_once(Ok(CacheLookup {
+                Ok(value) => CacheLookup {
                     value,
                     observation: lookup.observation,
-                })),
-                Err(defect) => Effect::die(defect),
+                },
+                Err(defect) => effect_die! { defect: defect, }?,
             }
-        })
+        }
     }
     /// Lazily get or load one key, sharing existing producer work and payload ownership.
     ///
@@ -252,7 +264,7 @@ impl<K: Send + Sync + 'static, D: Send + Sync + 'static, A: Send + 'static, E: S
         &self,
         key: K,
     ) -> Effect<SharedValue<A>, SharedValue<DependencyCacheError<E>>, R> {
-        self.get_observed(key).map(|lookup| lookup.value)
+        effect_map! { program: self.get_observed(key), map: |lookup| lookup.value, }
     }
     /// Read only a fresh retained success without starting or joining a load.
     ///
@@ -262,15 +274,18 @@ impl<K: Send + Sync + 'static, D: Send + Sync + 'static, A: Send + 'static, E: S
         &self,
         key: K,
     ) -> Effect<Option<SharedValue<A>>, SharedValue<DependencyCacheError<E>>, R> {
-        self.cache.try_get(key).flat_map(|value| {
+        let lookup = self.cache.try_get(key);
+        effect! {
+            let lookup = lookup.clone();
+            let value = lookup?;
             match value
                 .map(|value| value.with(|value| value.value.clone()))
                 .transpose()
             {
-                Ok(value) => Effect::from_result_once(Ok(value)),
-                Err(defect) => Effect::die(defect),
+                Ok(value) => value,
+                Err(defect) => effect_die! { defect: defect, }?,
             }
-        })
+        }
     }
     /// Lazily replace a key with an owned value and explicit dependency identities.
     ///
@@ -283,12 +298,12 @@ impl<K: Send + Sync + 'static, D: Send + Sync + 'static, A: Send + 'static, E: S
         dependencies: Vec<D>,
     ) -> Effect<(), SharedValue<DependencyCacheError<E>>, R> {
         if dependencies.len() > self.maximum_dependencies.get() {
-            return Effect::from_result_once(Err(SharedValue::new(
+            return effect_try_sync! { once; body: { let __dsl_result = Err(SharedValue::new(
                 DependencyCacheError::DependencyCapacity {
                     maximum: self.maximum_dependencies.get(),
                     observed: dependencies.len(),
                 },
-            )));
+            )); move || __dsl_result }, on_error: ::core::convert::identity, };
         }
         self.cache.set(
             key,

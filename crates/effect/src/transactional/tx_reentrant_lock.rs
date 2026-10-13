@@ -4,8 +4,9 @@ use super::{
     HasTransactionDomain, Transaction, TransactionDomain, TransactionDomainError, TransactionError,
     TransactionPolicy, TxRef, TxValue,
 };
-use crate::{Effect, Release, ResourceValue, Scope};
+use crate::{Effect, ResourceValue, Scope};
 use crate::{KeyDomain, StableKey};
+use crate::{effect_scope_acquire, transaction};
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -102,16 +103,21 @@ impl TxReentrantLock {
     /// Type: `Transaction<(), TxLockError>`.
     pub fn acquire(&self, owner: TxExecutionId) -> Transaction<(), TxLockError> {
         let cell = self.cell.clone();
-        self.cell.read().flat_map(move |state| match &state.owner {
-            Some(current) if current != &owner => Transaction::retry(),
-            _ => match state.depth.checked_add(1) {
-                Some(depth) => cell.write(Arc::new(LockState {
-                    owner: Some(owner.clone()),
-                    depth,
-                })),
-                None => Transaction::fail_with(|| TxLockError::DepthExhausted),
-            },
-        })
+        {
+            let __dsl_transaction = self.cell.read();
+            transaction! {
+            let state = __dsl_transaction.clone()?; match &state.owner {
+                        Some(current) if current != &owner => Transaction::retry(),
+                        _ => match state.depth.checked_add(1) {
+                            Some(depth) => cell.write(Arc::new(LockState {
+                                owner: Some(owner.clone()),
+                                depth,
+                            })),
+                            None => Transaction::fail_with(|| TxLockError::DepthExhausted),
+                        },
+                    }?
+            }
+        }
     }
 
     #[must_use]
@@ -124,26 +130,31 @@ impl TxReentrantLock {
     /// Type: `Transaction<(), TxLockError>`.
     pub fn release(&self, owner: TxExecutionId) -> Transaction<(), TxLockError> {
         let cell = self.cell.clone();
-        self.cell.read().flat_map(move |state| match &state.owner {
-            None => Transaction::fail_with(|| TxLockError::NotHeld),
-            Some(current) if current != &owner => {
-                Transaction::fail_with(|| TxLockError::WrongOwner)
+        {
+            let __dsl_transaction = self.cell.read();
+            transaction! {
+            let state = __dsl_transaction.clone()?; (|| { match &state.owner {
+                        None => Transaction::fail_with(|| TxLockError::NotHeld),
+                        Some(current) if current != &owner => {
+                            Transaction::fail_with(|| TxLockError::WrongOwner)
+                        }
+                        Some(_) => {
+                            let Some(depth) = state.depth.checked_sub(1) else {
+                                return Transaction::fail_with(|| TxLockError::NotHeld);
+                            };
+                            let next_owner = if depth == 0 {
+                                None
+                            } else {
+                                Some(owner.clone())
+                            };
+                            cell.write(Arc::new(LockState {
+                                owner: next_owner,
+                                depth,
+                            }))
+                        }
+                    } })()?
             }
-            Some(_) => {
-                let Some(depth) = state.depth.checked_sub(1) else {
-                    return Transaction::fail_with(|| TxLockError::NotHeld);
-                };
-                let next_owner = if depth == 0 {
-                    None
-                } else {
-                    Some(owner.clone())
-                };
-                cell.write(Arc::new(LockState {
-                    owner: next_owner,
-                    depth,
-                }))
-            }
-        })
+        }
     }
 
     #[must_use]
@@ -158,9 +169,12 @@ impl TxReentrantLock {
     /// # Returns
     /// Type: `Transaction<bool, E>`.
     pub fn held_by<E: Send + 'static>(&self, owner: TxExecutionId) -> Transaction<bool, E> {
-        self.cell
-            .read()
-            .map(move |state| state.owner.as_ref() == Some(&owner))
+        {
+            let __dsl_transaction = self.cell.read();
+            transaction! {
+            let state = __dsl_transaction.clone()?; state.owner.as_ref() == Some(&owner)
+            }
+        }
     }
 
     /// Acquire the resource under a scope that owns its release.
@@ -187,8 +201,10 @@ impl TxReentrantLock {
     {
         let lock = self.clone();
         let release_owner = owner.clone();
-        scope.acquire(self.acquire(owner).atomically(policy), move |()| {
-            Release::from_effect(lock.release(release_owner.clone()).atomically(policy))
-        })
+        effect_scope_acquire! {
+        scope: scope, acquire: self.acquire(owner).atomically(policy), release: move |()| {
+                    lock.release(release_owner.clone()).atomically(policy)
+                },
+        }
     }
 }

@@ -119,6 +119,9 @@ and should be mapped before public HTTP responses or logs.
 
 ## Café consumer and fixed SQL fixtures
 
+See the [example build/run guide](examples/README.md) for explicit build and run
+commands, compile-time database configuration, and expected output.
+
 `examples/cafe_orders.rs` covers D02–D06 together: it moves a non-Clone order
 through a transaction and nested savepoint, decodes/refines native rows, extracts
 an update helper, projects the outer application environment and maps SQL errors
@@ -126,7 +129,14 @@ explicitly. Its native checked query uses the local SQLx facade. The owning host
 selects Tokio once; `examples/support/cafe_database.rs` documents the temporary
 file, pool admission, lock-wait and migration policy. Required features are
 `turso,macros`; the literal checked query can be prepared with
-`DATABASE_URL=sqlite::memory:` during the coordinated check.
+`DATABASE_URL=turso::memory:` for compilation. Run:
+
+```sh
+DATABASE_URL=turso::memory: cargo +1.99.0 run -p effect-sql --features turso,macros --example cafe_orders
+```
+
+The story saves a 400-cent flat white, corrects its price to 425 cents inside the
+checked transaction, then reloads the same order with `ready=false`.
 
 D02 builds the read statement in `load_order_program`; D03 inserts the moved
 payload in `save_order`; D04 updates it in the extracted `mark_ready` savepoint

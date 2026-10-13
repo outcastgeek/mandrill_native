@@ -1,5 +1,6 @@
 //! Asynchronous queue transfer and shutdown behavior.
 
+use crate::effect_sync;
 use crate::internal::notification::notify_all;
 use crate::internal::runtime::{self, Step};
 use crate::internal::waiting::{Position, Waiting};
@@ -11,6 +12,7 @@ use futures_util::future::select;
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::pin::pin;
 use std::sync::{Arc, Mutex};
 
 /// Explicit admission policy, with no default capacity or hidden worker pool.
@@ -466,7 +468,7 @@ impl<A: Send + 'static> AsyncQueue<A> {
     /// Type: `Effect<Self, QueueError, R>`.
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn make<R: Send + Sync + 'static>(capacity: QueueCapacity) -> Effect<Self, QueueError, R> {
-        Effect::sync(move || Self::new(capacity))
+        effect_sync! { body: move || Self::new(capacity), }
     }
 
     /// Move one owned candidate on the first started execution. Reuse reports
@@ -625,14 +627,14 @@ impl<A: Send + 'static> AsyncQueue<A> {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn size<R: Send + Sync + 'static>(&self) -> Effect<usize, QueueError, R> {
         let queue = self.clone();
-        Effect::sync(move || {
+        effect_sync! { body: move || {
             queue
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .buffer
                 .len()
-        })
+        }, }
     }
 
     /// Stop accepting new work and describe the settlement of owned work.
@@ -902,8 +904,8 @@ impl<A: Send + 'static, K: Registration<A>> Registered<A, K> {
                     return changes.finish(outcome);
                 }
             }
-            let changed = std::pin::pin!(changed);
-            let cancelled = std::pin::pin!(cancellation.cancelled());
+            let changed = pin!(changed);
+            let cancelled = pin!(cancellation.cancelled());
             let _ = select(changed, cancelled).await;
         }
     }

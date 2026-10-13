@@ -6,10 +6,13 @@
 //! acquire a finite witness through this constructor.
 
 use crate::WebError;
+use crate::{effect_die, effect_map, effect_map_error, effect_try_sync};
+use effect::cache;
 use effect::{
     Cache, CacheAdmission, CacheCapacity, CacheConfig, CacheOptions, CacheTtl, Effect, HasClock,
-    HasTaskSpawner, Scope, SharedValue,
+    HasTaskSpawner, Scope, SharedValue, effect, service,
 };
+use effect_server::reply;
 use effect_server::{FiniteReply, HasRequest, Reply, Request, ResourceValidators};
 use http::{HeaderName, HeaderValue, Method};
 use std::num::NonZeroUsize;
@@ -161,7 +164,8 @@ impl<E: Send + 'static, R: Send + Sync + 'static> FiniteSource<E, R> {
         Ok(Self {
             render: Arc::new(move |key| {
                 let headers = headers.clone();
-                render(key).map(move |text| {
+                effect_map! {
+                    program: render(key), map: move |text| {
                     let mut reply = FiniteReply {
                         status: http::StatusCode::OK,
                         headers: headers.clone(),
@@ -172,7 +176,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> FiniteSource<E, R> {
                         HeaderValue::from_static("text/plain; charset=utf-8"),
                     );
                     reply
-                })
+                }, }
             }),
             cacheable: true,
             vary: vary.into(),
@@ -212,11 +216,12 @@ impl<E: Send + 'static, R: Send + Sync + 'static> FiniteSource<E, R> {
         Ok(Self {
             render: Arc::new(move |key| {
                 let headers = headers.clone();
-                render(key).map(move |bytes| FiniteReply {
+                effect_map! {
+                    program: render(key), map: move |bytes| FiniteReply {
                     status: http::StatusCode::OK,
                     headers: headers.clone(),
                     bytes,
-                })
+                }, }
             }),
             cacheable: true,
             vary: vary.into(),
@@ -278,128 +283,120 @@ impl<E: Send + 'static, R: HasClock + HasTaskSpawner + HasRequest + Send + Sync 
         let gate = Arc::new(gate);
         let authenticated = Arc::new(authenticated);
         let partition = Arc::new(partition);
-        Effect::from_result_once(valid).flat_map(move |policy| {
-            if source
-                .vary
-                .iter()
-                .any(|name| !policy.vary_headers.contains(name))
-            {
-                return Effect::from_result_once(Err(SharedValue::new(errors(
-                    WebError::Configuration("output Vary missing key dimension".into()),
-                ))));
-            }
-            let render = source.render.clone();
-            let maximum = policy.response_bytes.get();
-            let check_error = errors.clone();
-            let admission_error = errors.clone();
-            let maximum_active = policy.maximum_active;
-            Cache::make_with_shared_key(
-                scope.clone(),
-                CacheConfig {
-                    equal: Arc::new(|left, right| left == right),
-                    ttl: Some(policy.retain),
-                    capacity: CacheCapacity::Bounded(policy.entries),
-                    cache_failure: Arc::new(|_| false),
-                },
-                CacheOptions {
-                    ttl: CacheTtl::Fixed(Some(policy.retain)),
-                    admission: CacheAdmission::Bounded {
-                        maximum: maximum_active,
-                        capacity_error: Arc::new(move || {
-                            admission_error(WebError::Configuration(
-                                "output renderer active capacity".into(),
-                            ))
-                        }),
-                    },
-                },
-                move |key| {
-                    let errors = check_error.clone();
-                    render(key).flat_map(move |reply| {
-                        if reply.bytes.len() > maximum {
-                            Effect::from_result_once(Err(errors(WebError::ResponseLimit {
-                                maximum,
-                                observed: reply.bytes.len(),
-                            })))
-                        } else {
-                            Effect::from_result_once(Ok(reply))
-                        }
-                    })
-                },
-            )
-            .map({
-                let source = source.clone();
-                let gate = gate.clone();
-                let authenticated = authenticated.clone();
-                let partition = partition.clone();
-                let errors = errors.clone();
-                move |cache| Self {
-                    cache,
-                    policy: policy.clone(),
-                    source: source.as_ref().clone(),
-                    gate: gate.clone(),
-                    authenticated: authenticated.clone(),
-                    partition: partition.clone(),
-                    errors: errors.clone(),
-                }
-            })
-        })
+        effect! {
+        bind;
+        program: effect_try_sync! { once; body: { let __dsl_result = valid; move || __dsl_result }, on_error: ::core::convert::identity, },
+        body: move |policy| {
+                   if source
+                       .vary
+                       .iter()
+                       .any(|name| !policy.vary_headers.contains(name))
+                   {
+                       return effect_try_sync! {
+                           once; body: {
+                           let __dsl_result = Err(SharedValue::new(errors(
+                           WebError::Configuration("output Vary missing key dimension".into()),
+                       ))); move || __dsl_result }, on_error: ::core::convert::identity, };
+                   }
+                   let render = source.render.clone();
+                   let maximum = policy.response_bytes.get();
+                   let check_error = errors.clone();
+                   let admission_error = errors.clone();
+                   let maximum_active = policy.maximum_active;
+                   effect_map! {
+                       program: cache! {
+                       scope: scope.clone(),
+                       config: CacheConfig {
+                           equal: Arc::new(|left, right| left == right),
+                           ttl: Some(policy.retain),
+                           capacity: CacheCapacity::Bounded(policy.entries),
+                           cache_failure: Arc::new(|_| false),
+                       },
+                       options: CacheOptions {
+                           ttl: CacheTtl::Fixed(Some(policy.retain)),
+                           admission: CacheAdmission::Bounded {
+                               maximum: maximum_active,
+                               capacity_error: Arc::new(move || {
+                                   admission_error(WebError::Configuration(
+                                       "output renderer active capacity".into(),
+                                   ))
+                               }),
+                           },
+                       },
+                       load_shared: move |key| {
+                           let errors = check_error.clone();
+                           effect! {
+        bind;
+        program: render(key),
+        body: move |reply| {
+                               if reply.bytes.len() > maximum {
+                                   effect_try_sync! {
+                                       once; body: {
+                                       let __dsl_result = Err(errors(WebError::ResponseLimit {
+                                       maximum,
+                                       observed: reply.bytes.len(),
+                                   })); move || __dsl_result }, on_error: ::core::convert::identity, }
+                               } else {
+                                   effect_try_sync! { once; body: { let __dsl_result = Ok(reply); move || __dsl_result }, on_error: ::core::convert::identity, }
+                               }
+                           },
+        }
+                       },
+                   }, map: {
+                       let source = source.clone();
+                       let gate = gate.clone();
+                       let authenticated = authenticated.clone();
+                       let partition = partition.clone();
+                       let errors = errors.clone();
+                       move |cache| Self {
+                           cache,
+                           policy: policy.clone(),
+                           source: source.as_ref().clone(),
+                           gate: gate.clone(),
+                           authenticated: authenticated.clone(),
+                           partition: partition.clone(),
+                           errors: errors.clone(),
+                       }
+                   }, }
+               },
+        }
     }
     /// Authorize/evaluate mutation preconditions on every invocation, then consult
     /// finite cache only for eligible GET/HEAD unauthenticated cookie-free requests.
     pub fn reply(&self) -> Effect<Reply<SharedValue<E>, R>, SharedValue<E>, R> {
         let owner = self.clone();
-        Effect::service(|env: &R| env.request().clone()).flat_map(move |request| {
+        effect! {
             let owner = owner.clone();
-            let request_after_gate = request.clone();
-            (owner.gate)(request)
-                .map_error(SharedValue::new)
-                .flat_map(move |()| {
-                    let owner = owner.clone();
-                    let request = request_after_gate.clone();
-                    let key_owner = owner.clone();
-                    Effect::service(move |env: &R| key_owner.key(env, &request)).flat_map({
-                        let owner = owner.clone();
-                        move |key| match key {
-                            Err(error) => Effect::from_result_once(Err(SharedValue::new((owner
-                                .errors)(
-                                error
-                            )))),
-                            Ok(AuthorizedKey {
-                                key,
-                                cacheable: true,
-                            }) => owner.cache.get(key).flat_map(|value| {
-                                match value.with(Clone::clone) {
-                                    Ok(reply) => {
-                                        Effect::from_result_once(Ok(Reply::from_finite(reply)))
-                                    }
-                                    Err(defect) => Effect::die(defect),
-                                }
-                            }),
-                            Ok(AuthorizedKey {
-                                key,
-                                cacheable: false,
-                            }) => (owner.source.render)(Arc::new(key))
-                                .map_error(SharedValue::new)
-                                .flat_map({
-                                    let owner = owner.clone();
-                                    move |reply| {
-                                        if reply.bytes.len() > owner.policy.response_bytes.get() {
-                                            Effect::from_result_once(Err(SharedValue::new((owner
-                                                .errors)(
-                                                WebError::ResponseLimit {
-                                                    maximum: owner.policy.response_bytes.get(),
-                                                    observed: reply.bytes.len(),
-                                                },
-                                            ))))
-                                        } else {
-                                            Effect::from_result_once(Ok(Reply::from_finite(reply)))
-                                        }
-                                    }
-                                }),
-                        }
-                    })
-                })
-        })
+            let request = service! { env |env: &R| { env.request().clone() }, }?;
+            effect_map_error! { program: (owner.gate)(request.clone()), map: SharedValue::new, }?;
+            let key_owner = owner.clone();
+            let request_for_key = request.clone();
+            let selected = service! {
+                env |env: &R| { key_owner.key(env, &request_for_key) },
+            }?;
+            let errors = owner.errors.clone();
+            let selected = effect_map_error! { program: effect_try_sync! { once; body: { let __dsl_result = selected; move || __dsl_result }, on_error: ::core::convert::identity, }, map: move |error| SharedValue::new(errors(error)), }?;
+            match selected {
+                AuthorizedKey { key, cacheable: true } => {
+                    let value = owner.cache.get(key)?;
+                    match value.with(Clone::clone) {
+                        Ok(reply) => reply! { finite(reply) },
+                        Err(defect) => effect_die! { defect: defect, }?,
+                    }
+                }
+                AuthorizedKey { key, cacheable: false } => {
+                    let reply = effect_map_error! { program: (owner.source.render)(Arc::new(key)), map: SharedValue::new, }?;
+                    let reply = effect_try_sync! {
+                        once; body: {
+                        let __dsl_result = if reply.bytes.len() > owner.policy.response_bytes.get() {
+                        Err(SharedValue::new((owner.errors)(WebError::ResponseLimit {
+                            maximum: owner.policy.response_bytes.get(), observed: reply.bytes.len(),
+                        })))
+                    } else { Ok(reply) }; move || __dsl_result }, on_error: ::core::convert::identity, }?;
+                    reply! { finite(reply) }
+                }
+            }
+        }
     }
     /// Produce a bounded exact key only after gate success; native authorization/
     /// cookie metadata and selected principal state impose conservative bypass.
@@ -479,9 +476,10 @@ impl<E: Send + 'static, R: HasClock + HasTaskSpawner + HasRequest + Send + Sync 
         reply: Reply<SharedValue<E>, R>,
         validators: ResourceValidators,
     ) -> Reply<SharedValue<E>, R> {
-        effect_server::ReplyDraft::new()
-            .validators(validators)
-            .finish(reply)
+        reply! {
+            validators(validators);
+            source(reply);
+        }
     }
 }
 /// Native conservative fixed-metadata eligibility. Dynamic native metadata uses

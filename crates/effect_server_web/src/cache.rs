@@ -5,11 +5,14 @@
 //! arbitrary object stringification. This module owns no replacement cache map.
 
 use crate::{WebError, admission::independent};
+use crate::{
+    effect_die, effect_future, effect_map, effect_map_error, effect_sync, effect_try_sync,
+};
 use effect::{
     AdmissionCapacity, AdmissionError, Cache, CacheAdmission, CacheCapacity, CacheConfig,
     CacheLookup, CacheObservation, CacheOptions, CacheTtl, DependencyCache, DependencyCacheError,
     DependencyCachePolicy, Effect, Exit, HasClock, HasTaskSpawner, ProviderAdmission, Scope,
-    SharedValue,
+    SharedValue, effect,
 };
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -123,29 +126,29 @@ impl<
         match retain.mode {
             Retention::Disabled => {
                 let loader: Arc<dyn Fn(Arc<K>) -> Effect<A, E, R> + Send + Sync> = loader;
-                Effect::sync(move || {
-                    ProviderAdmission::new(AdmissionCapacity::Bounded(admission.maximum))
-                })
-                .flat_map(move |owner| {
-                    let release_owner = owner.clone();
+                let maximum = admission.maximum;
+                let on_full = admission.on_full;
+                effect! {
+                    let scope = scope.clone();
                     let loader = loader.clone();
-                    let on_full = admission.on_full.clone();
-                    scope
-                        .add_finalizer(Effect::from_exit_future_with_context(move |_, _| {
-                            let drain = release_owner.stop();
-                            async move {
-                                drain.wait().await;
-                                Exit::Success(())
-                            }
-                        }))
-                        .map(move |()| Self {
-                            origin: Arc::new(Origin::Disabled {
-                                owner: owner.clone(),
-                                load: loader.clone(),
-                                on_full: on_full.clone(),
-                            }),
-                        })
-                })
+                    let on_full = on_full.clone();
+                    let owner = effect_sync! {
+                        body { ProviderAdmission::new(AdmissionCapacity::Bounded(maximum)) },
+                    }?;
+                    let release_owner = owner.clone();
+                    scope.add_finalizer(Effect::from_exit_future_with_context(move |_, _| {
+                        let drain = release_owner.stop();
+                        async move {
+                            drain.wait().await;
+                            Exit::Success(())
+                        }
+                    }))?;
+                    Self {
+                        origin: Arc::new(Origin::Disabled {
+                            owner, load: loader, on_full,
+                        }),
+                    }
+                }
             }
             Retention::Coalescing | Retention::Bounded(_) => {
                 let capacity = match retain.mode {
@@ -188,22 +191,22 @@ impl<
                 let key = Arc::new(key);
                 let load = load.clone();
                 let on_full = on_full.clone();
-                independent(
+                effect_map! {
+                    program: effect_map_error! {
+                    program: independent(
                     owner.clone(),
                     move || load(key.clone()),
                     move |error| on_full(error),
-                )
-                .map_error(SharedValue::new)
-                .map(|value| CacheLookup {
+                ), map: SharedValue::new, }, map: |value| CacheLookup {
                     value: SharedValue::new(value),
                     observation: CacheObservation::Loaded,
-                })
+                }, }
             }
         }
     }
     /// Return the shared value without copying its application payload.
     pub fn get(&self, key: K) -> Effect<SharedValue<A>, SharedValue<E>, R> {
-        self.get_observed(key).map(|lookup| lookup.value)
+        effect_map! { program: self.get_observed(key), map: |lookup| lookup.value, }
     }
     /// Project a borrowed cache payload while the core shared owner is retained.
     /// References cannot escape the callback; poisoning remains an Effect defect.
@@ -212,17 +215,22 @@ impl<
         key: K,
         inspect: impl Fn(&A) -> B + Send + Sync + 'static,
     ) -> Effect<B, SharedValue<E>, R> {
-        self.get(key)
-            .flat_map(move |value| match value.with(&inspect) {
-                Ok(value) => Effect::from_result_once(Ok(value)),
-                Err(defect) => Effect::die(defect),
-            })
+        effect! {
+        bind;
+        program: self.get(key),
+        body: move |value| match value.with(&inspect) {
+                       Ok(value) => effect_try_sync! { once; body: { let __dsl_result = Ok(value); move || __dsl_result }, on_error: ::core::convert::identity, },
+                       Err(defect) => effect_die! { defect: defect, },
+                   },
+        }
     }
     /// Read a retained success only. Disabled/coalescing policies have no settled value.
     pub fn try_get(&self, key: K) -> Effect<Option<SharedValue<A>>, SharedValue<E>, R> {
         match self.origin.as_ref() {
             Origin::Cached(cache) => cache.try_get(key),
-            Origin::Disabled { .. } => Effect::succeed(None),
+            Origin::Disabled { .. } => {
+                effect_sync! { body: { let __dsl_value = None; move || __dsl_value.clone() }, }
+            }
         }
     }
     /// Fence and join any earlier core producer for this key. Disabled calls are
@@ -230,36 +238,39 @@ impl<
     pub fn invalidate(&self, key: K) -> Effect<(), SharedValue<E>, R> {
         match self.origin.as_ref() {
             Origin::Cached(cache) => cache.invalidate(key),
-            Origin::Disabled { .. } => Effect::succeed(()),
+            Origin::Disabled { .. } => effect_sync! { body { () }, },
         }
     }
     /// Replace through the same core owner; disabled mode deliberately retains nothing.
     pub fn set(&self, key: K, value: A) -> Effect<(), SharedValue<E>, R> {
         match self.origin.as_ref() {
             Origin::Cached(cache) => cache.set(key, value),
-            Origin::Disabled { .. } => Effect::from_result_once(Ok(value)).map(|_| ()),
+            Origin::Disabled { .. } => {
+                effect_map! { program: effect_try_sync! { once; body: { let __dsl_result = Ok(value); move || __dsl_result }, on_error: ::core::convert::identity, }, map: |_| (), }
+            }
         }
     }
     /// Fence/join all active core cache producers and remove retained entries.
     pub fn clear(&self) -> Effect<(), SharedValue<E>, R> {
         match self.origin.as_ref() {
             Origin::Cached(cache) => cache.clear(),
-            Origin::Disabled { .. } => Effect::succeed(()),
+            Origin::Disabled { .. } => effect_sync! { body { () }, },
         }
     }
     /// Close and join the selected core owner. No native task is detached on drop.
     pub fn shutdown(&self) -> Effect<(), SharedValue<E>, R> {
         match self.origin.as_ref() {
-            Origin::Cached(cache) => cache.shutdown().map(|_| ()),
+            Origin::Cached(cache) => effect_map! { program: cache.shutdown(), map: |_| (), },
             Origin::Disabled { owner, .. } => {
                 let owner = owner.clone();
-                Effect::from_exit_future_with_context(move |_, _| {
+                effect_future! {
+                    exit_with_context; body: move |_, _| {
                     let drain = owner.stop();
                     async move {
                         drain.wait().await;
                         Exit::Success(())
                     }
-                })
+                }, }
             }
         }
     }
@@ -383,32 +394,31 @@ impl<
             }),
             Retention::Disabled => {
                 let loader: DependencyLoader<K, D, A, E, R> = loader;
-                Effect::sync(move || {
-                    ProviderAdmission::new(AdmissionCapacity::Bounded(admission.maximum))
-                })
-                .flat_map(move |owner| {
-                    let release_owner = owner.clone();
+                let maximum = admission.maximum;
+                let on_full = admission.on_full;
+                effect! {
+                    let scope = scope.clone();
                     let loader = loader.clone();
-                    let on_full = admission.on_full.clone();
+                    let on_full = on_full.clone();
                     let admission_error = admission_error.clone();
-                    scope
-                        .add_finalizer(Effect::from_exit_future_with_context(move |_, _| {
-                            let drain = release_owner.stop();
-                            async move {
-                                drain.wait().await;
-                                Exit::Success(())
-                            }
-                        }))
-                        .map(move |()| Self {
-                            origin: Arc::new(DependentOrigin::Disabled {
-                                owner: owner.clone(),
-                                load: loader.clone(),
-                                on_full: on_full.clone(),
-                                maximum_dependencies,
-                            }),
-                            admission_error: admission_error.clone(),
-                        })
-                })
+                    let owner = effect_sync! {
+                        body { ProviderAdmission::new(AdmissionCapacity::Bounded(maximum)) },
+                    }?;
+                    let release_owner = owner.clone();
+                    scope.add_finalizer(Effect::from_exit_future_with_context(move |_, _| {
+                        let drain = release_owner.stop();
+                        async move {
+                            drain.wait().await;
+                            Exit::Success(())
+                        }
+                    }))?;
+                    Self {
+                        origin: Arc::new(DependentOrigin::Disabled {
+                            owner, load: loader, on_full, maximum_dependencies,
+                        }),
+                        admission_error,
+                    }
+                }
             }
         }
     }
@@ -456,7 +466,8 @@ impl<
         match self.origin.as_ref() {
             DependentOrigin::Core(cache) => {
                 let injection = self.admission_error.clone();
-                cache.get_observed(key).map_error(move |error| {
+                effect_map_error! {
+                    program: cache.get_observed(key), map: move |error| {
                     if error
                         .with(|error| matches!(error, DependencyCacheError::ActiveCapacity { .. }))
                         .is_ok_and(|capacity| capacity)
@@ -467,7 +478,7 @@ impl<
                     } else {
                         error
                     }
-                })
+                }, }
             }
             DependentOrigin::Disabled {
                 owner,
@@ -479,32 +490,39 @@ impl<
                 let load = load.clone();
                 let on_full = on_full.clone();
                 let maximum = *maximum_dependencies;
-                independent(
-                    owner.clone(),
-                    move || load(key.clone()),
-                    move |error| on_full(error),
-                )
-                .map_error(DependencyCacheError::Load)
-                .flat_map(move |(value, dependencies)| {
-                    if dependencies.len() > maximum.get() {
-                        Effect::from_result_once(Err(DependencyCacheError::DependencyCapacity {
-                            maximum: maximum.get(),
-                            observed: dependencies.len(),
-                        }))
-                    } else {
-                        Effect::from_result_once(Ok(CacheLookup {
-                            value: SharedValue::new(value),
-                            observation: CacheObservation::Loaded,
-                        }))
-                    }
-                })
-                .map_error(SharedValue::new)
+                effect_map_error! {
+                                   program: effect! {
+                bind;
+                program: effect_map_error! {
+                    program: independent(
+                                   owner.clone(),
+                                   move || load(key.clone()),
+                                   move |error| on_full(error),
+                               ), map: DependencyCacheError::Load, },
+                body: move |(value, dependencies)| {
+                                   if dependencies.len() > maximum.get() {
+                                       effect_try_sync! {
+                                           once; body: {
+                                           let __dsl_result = Err(DependencyCacheError::DependencyCapacity {
+                                           maximum: maximum.get(),
+                                           observed: dependencies.len(),
+                                       }); move || __dsl_result }, on_error: ::core::convert::identity, }
+                                   } else {
+                                       effect_try_sync! {
+                                           once; body: {
+                                           let __dsl_result = Ok(CacheLookup {
+                                           value: SharedValue::new(value),
+                                           observation: CacheObservation::Loaded,
+                                       }); move || __dsl_result }, on_error: ::core::convert::identity, }
+                                   }
+                               },
+                }, map: SharedValue::new, }
             }
         }
     }
     /// Get/load payload ownership without copying A.
     pub fn get(&self, key: K) -> Effect<SharedValue<A>, SharedValue<DependencyCacheError<E>>, R> {
-        self.get_observed(key).map(|lookup| lookup.value)
+        effect_map! { program: self.get_observed(key), map: |lookup| lookup.value, }
     }
     /// Project a borrowed dependency-cache payload without copying A or retaining
     /// a temporary reference. The same typed core acquisition failures are preserved.
@@ -513,11 +531,14 @@ impl<
         key: K,
         inspect: impl Fn(&A) -> B + Send + Sync + 'static,
     ) -> Effect<B, SharedValue<DependencyCacheError<E>>, R> {
-        self.get(key)
-            .flat_map(move |value| match value.with(&inspect) {
-                Ok(value) => Effect::from_result_once(Ok(value)),
-                Err(defect) => Effect::die(defect),
-            })
+        effect! {
+        bind;
+        program: self.get(key),
+        body: move |value| match value.with(&inspect) {
+                       Ok(value) => effect_try_sync! { once; body: { let __dsl_result = Ok(value); move || __dsl_result }, on_error: ::core::convert::identity, },
+                       Err(defect) => effect_die! { defect: defect, },
+                   },
+        }
     }
     /// Read only a settled retained success; disabled mode has none by contract.
     pub fn try_get(
@@ -526,7 +547,9 @@ impl<
     ) -> Effect<Option<SharedValue<A>>, SharedValue<DependencyCacheError<E>>, R> {
         match self.origin.as_ref() {
             DependentOrigin::Core(cache) => cache.try_get(key),
-            DependentOrigin::Disabled { .. } => Effect::succeed(None),
+            DependentOrigin::Disabled { .. } => {
+                effect_sync! { body: { let __dsl_value = None; move || __dsl_value.clone() }, }
+            }
         }
     }
     /// Fence and join earlier associated core loads before owned replacement.
@@ -543,20 +566,24 @@ impl<
                 ..
             } => {
                 let maximum = maximum_dependencies.get();
-                Effect::from_result_once(Ok((value, dependencies))).flat_map(
-                    move |(_, dependencies)| {
-                        if dependencies.len() > maximum {
-                            Effect::from_result_once(Err(SharedValue::new(
-                                DependencyCacheError::DependencyCapacity {
-                                    maximum,
-                                    observed: dependencies.len(),
-                                },
-                            )))
-                        } else {
-                            Effect::succeed(())
-                        }
-                    },
-                )
+                effect! {
+                bind;
+                program: effect_try_sync! { once; body: { let __dsl_result = Ok((value, dependencies)); move || __dsl_result }, on_error: ::core::convert::identity, },
+                body: move |(_, dependencies)| {
+                                       if dependencies.len() > maximum {
+                                           effect_try_sync! {
+                                               once; body: {
+                                               let __dsl_result = Err(SharedValue::new(
+                                               DependencyCacheError::DependencyCapacity {
+                                                   maximum,
+                                                   observed: dependencies.len(),
+                                               },
+                                           )); move || __dsl_result }, on_error: ::core::convert::identity, }
+                                       } else {
+                                           effect_sync! { body { () }, }
+                                       }
+                                   },
+                }
             }
         }
     }
@@ -564,7 +591,7 @@ impl<
     pub fn invalidate(&self, key: K) -> Effect<(), SharedValue<DependencyCacheError<E>>, R> {
         match self.origin.as_ref() {
             DependentOrigin::Core(cache) => cache.invalidate(key),
-            DependentOrigin::Disabled { .. } => Effect::succeed(()),
+            DependentOrigin::Disabled { .. } => effect_sync! { body { () }, },
         }
     }
     /// Core dependency invalidation conservatively fences/cancels/joins earlier
@@ -575,29 +602,30 @@ impl<
     ) -> Effect<(), SharedValue<DependencyCacheError<E>>, R> {
         match self.origin.as_ref() {
             DependentOrigin::Core(cache) => cache.invalidate_dependency(dependency),
-            DependentOrigin::Disabled { .. } => Effect::succeed(()),
+            DependentOrigin::Disabled { .. } => effect_sync! { body { () }, },
         }
     }
     /// Remove retained associations and fence/join earlier active core producers.
     pub fn clear(&self) -> Effect<(), SharedValue<DependencyCacheError<E>>, R> {
         match self.origin.as_ref() {
             DependentOrigin::Core(cache) => cache.clear(),
-            DependentOrigin::Disabled { .. } => Effect::succeed(()),
+            DependentOrigin::Disabled { .. } => effect_sync! { body { () }, },
         }
     }
     /// Close selected admission and join producer cleanup through the original owner.
     pub fn shutdown(&self) -> Effect<(), SharedValue<DependencyCacheError<E>>, R> {
         match self.origin.as_ref() {
-            DependentOrigin::Core(cache) => cache.shutdown().map(|_| ()),
+            DependentOrigin::Core(cache) => effect_map! { program: cache.shutdown(), map: |_| (), },
             DependentOrigin::Disabled { owner, .. } => {
                 let owner = owner.clone();
-                Effect::from_exit_future_with_context(move |_, _| {
+                effect_future! {
+                    exit_with_context; body: move |_, _| {
                     let drain = owner.stop();
                     async move {
                         drain.wait().await;
                         Exit::Success(())
                     }
-                })
+                }, }
             }
         }
     }

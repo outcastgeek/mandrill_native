@@ -3,46 +3,29 @@
 //! Required environment: CAFE_LISTEN, CAFE_DATABASE, CAFE_KEY_RING (native XML),
 //! CAFE_ORIGIN, CAFE_COOKIE, CAFE_COOKIE_SECURE, CAFE_CULTURE, CAFE_CATALOG,
 //! CAFE_WORKERS, CAFE_CAPACITY, CAFE_BYTES, CAFE_DEPTH, CAFE_HASH_ITERATIONS,
-//! CAFE_WINDOW_SECONDS, CAFE_RECENT_SECONDS and CAFE_RETRY_SECONDS.
+//! CAFE_WINDOW_SECONDS, CAFE_SESSION_SECONDS, CAFE_RECENT_SECONDS and CAFE_RETRY_SECONDS.
 //! CAPACITY bounds this small example's counts, including active spans, metric
 //! descriptors and series per descriptor in both telemetry setups. BYTES bounds each finite resource,
 //! key and response; WINDOW_SECONDS supplies its explicit TTL/reload/drain budget.
 //! `/menu` and availability are public; `/pickup` requires the selected native
-//! customer cookie. Native account workflows use the same database/key selection.
-//! Edit the supplied catalogue file to observe complete generation reloads.
+//! customer cookie issued by native sign-in. See `../README.md` for browser login,
+//! owner-bound collection and observable localized pickup text.
+
+use effect::effect_scope;
+/// Concrete account, session and request-policy composition.
+mod customer_identity;
+/// Native account entry points and local pickup fixtures.
+mod customer_routes;
 
 use super::cafe_telemetry;
 use super::*;
-use effect::{Cancellation, HasBlockingExecutor, HasTracer, Scope, Tracer};
+use effect::{Cancellation, HasBlockingExecutor, HasTracer, Tracer, effect_try_future};
 use effect_otel::{
     BorrowedProviders, HasOtel, Otel, OtelBackend, OwnedProviders, Propagation, ProviderFactories,
     ShutdownPolicy,
 };
 use effect_server::{BodyPolicy, HostPolicy};
-use effect_server_identity::authority::{GrantPolicy, IdentityClock};
-use effect_server_identity::components::{
-    NativeBrowserPolicy, NativeCookiePolicy, NativePrincipalPolicy, Retained,
-};
-use effect_server_identity::native::identity::{
-    IdentityOptions, IdentityResult,
-    error::DefaultIdentityErrorDescriber,
-    manager::{SignInManager, SignInPolicy, UserManager},
-    models::IdentityUser,
-    normalization::UpperInvariantLookupNormalizer,
-    password::{
-        DefaultPasswordHasher, DefaultPasswordValidator, OsRandomBytes, PasswordHasherOptions,
-    },
-    principal::ClaimsIdentityOptions,
-    ticket::{
-        CookieSameSite, CookieSessionManager, CookieSessionOptions, DataProtectionTicketFormat,
-        TicketDataFormatOptions, default_ticket_purposes,
-    },
-    tokens::{AuthenticatorTokenProvider, data_protection::DataProtectionKeyRing},
-    validation::DefaultUserValidator,
-};
-use effect_server_identity::{
-    ConfiguredComponents, IdentityStoragePolicy, SqlxIdentityStore, identity, identity_store,
-};
+use effect_server_identity::native::identity::tokens::data_protection::DataProtectionKeyRing;
 use effect_sql::{SqlClient, sqlx};
 use effect_tokio::{TokioBlocking, TokioClock, TokioTasks};
 use std::{fs::File, io::Read, str::FromStr};
@@ -111,15 +94,6 @@ impl effect_server::HasTokio for Environment {
         self.base.runtime.handle()
     }
 }
-/// Native sign-in admission cannot waive password, factor or current-user checks.
-#[derive(Debug)]
-struct CafeAdmission;
-impl SignInPolicy for CafeAdmission {
-    /// This café accepts named accounts after native credential verification.
-    fn allows(&self, user: &IdentityUser) -> Result<bool, IdentityResult> {
-        Ok(user.user_name().is_some())
-    }
-}
 /// Read typed caller policy with no fabricated default or secret printing.
 fn configured<T: FromStr>(name: &str) -> Result<T, Box<dyn std::error::Error>>
 where
@@ -143,6 +117,7 @@ fn key_ring(maximum: NonZeroUsize) -> Result<DataProtectionKeyRing, Box<dyn std:
     Ok(DataProtectionKeyRing::parse_xml(&text)?)
 }
 /// Run one configured SQLx-backed native Identity host and join its scoped providers.
+/// Ctrl-C requests selected cancellation; request cleanup precedes provider drain.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let address: SocketAddr = configured("CAFE_LISTEN")?;
     let capacity: NonZeroUsize = configured("CAFE_CAPACITY")?;
@@ -155,31 +130,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let depth: NonZeroUsize = configured("CAFE_DEPTH")?;
     let seconds: NonZeroU64 = configured("CAFE_WINDOW_SECONDS")?;
     let window = Duration::from_secs(seconds.get());
-    let native_window = time::Duration::seconds(i64::try_from(seconds.get())?);
+    let session_seconds: NonZeroU64 = configured("CAFE_SESSION_SECONDS")?;
     let culture = CultureId::new(&std::env::var("CAFE_CULTURE")?)?;
     let cookie = std::env::var("CAFE_COOKIE")?;
     let origin = std::env::var("CAFE_ORIGIN")?;
     let secure: bool = configured("CAFE_COOKIE_SECURE")?;
-    let ticket_format = DataProtectionTicketFormat::with_options(
-        key_ring(bytes)?,
-        TicketDataFormatOptions::new()
-            .with_purposes(default_ticket_purposes("Cafe.Customer"))
-            .with_ticket_lifespan(window)
-            .with_utc_now(OffsetDateTime::now_utc),
-    );
-    let tickets = NativeCookiePolicy::new(
-        CookieSessionManager::with_options(
-            ticket_format,
-            CookieSessionOptions::new()
-                .with_name(cookie.clone())
-                .with_secure(secure)
-                .with_http_only(true)
-                .with_same_site(CookieSameSite::Strict)
-                .with_utc_now(OffsetDateTime::now_utc),
-        ),
-        native_window,
-        true,
-    )?;
     let runtime = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(configured("CAFE_WORKERS")?)
@@ -192,70 +147,30 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .pragma("foreign_keys", Some("ON".into()));
     let pool = runtime.block_on(sqlx::TursoPool::connect_with(options))?;
     let sql = SqlClient::new(pool.clone());
-    let backend = SqlxIdentityStore::from_kernel(
-        sql.kernel().clone(),
-        IdentityStoragePolicy {
-            challenge_capacity: capacity,
-            utc_now: OffsetDateTime::now_utc,
+    let customers = runtime.block_on(customer_identity::configure(
+        sql.clone(),
+        customer_identity::CustomerPolicy {
+            capacity,
+            ring: key_ring(bytes)?,
+            cookie,
+            origin,
+            secure,
+            session_seconds,
+            recent_seconds: configured("CAFE_RECENT_SECONDS")?,
+            hash_iterations: configured("CAFE_HASH_ITERATIONS")?,
+            bytes,
         },
-    )?;
-    runtime.block_on(backend.initialize())?;
-    let browser = NativeBrowserPolicy::new(&backend, vec![origin], cookie)?;
-    let validator = Retained::new(DefaultUserValidator::new());
-    let passwords = Retained::new(DefaultPasswordValidator::new());
-    let hasher = Retained::new(DefaultPasswordHasher::with_options_and_random(
-        PasswordHasherOptions::new(configured("CAFE_HASH_ITERATIONS")?)?,
-        OsRandomBytes,
-    ));
-    let normalizer = Retained::new(UpperInvariantLookupNormalizer::new());
-    let authenticator = Retained::new(AuthenticatorTokenProvider::new());
-    let admission = Retained::new(CafeAdmission);
-    let components = ConfiguredComponents::new(
-        (),
-        move |_: Arc<()>, backend: SqlxIdentityStore, clock: IdentityClock, _: Arc<_>| {
-            let users = UserManager::with_components_and_error_describer(
-                backend,
-                validator.clone(),
-                hasher.clone(),
-                passwords.clone(),
-                normalizer.clone(),
-                DefaultIdentityErrorDescriber,
-            )
-            .with_utc_now(clock.callable())
-            .with_password_work_limit(capacity)
-            .map_err(IdentityError::Native)?
-            .with_options(IdentityOptions::default())
-            .map_err(IdentityError::Native)?;
-            Ok(SignInManager::new(users)
-                .with_authenticator_token_provider(authenticator.clone())
-                .with_sign_in_policy(admission.clone())
-                .with_authentication_scheme("Cafe.Customer"))
-        },
-    );
-    let recent_window = time::Duration::seconds(configured("CAFE_RECENT_SECONDS")?);
-    let definition = identity! {
-        storage: identity_store! { backend: backend }?, configure_native: components,
-        tickets: tickets, browser: browser, principal_factory: NativePrincipalPolicy::new(ClaimsIdentityOptions::default()),
-        errors: |error| cafe_error(CafeProblem::Identity(error)), clock: IdentityClock::new(OffsetDateTime::now_utc),
-        grant_policy: GrantPolicy { self_lifetime: native_window, recent_lifetime: recent_window }, admission: capacity,
-    }?;
-    let mut selected_security = customer_security(&definition, || {
-        Effect::try_sync(
-            || ResponseNonce::new(uuid::Uuid::new_v4().simple().to_string()),
-            |error| cafe_error(CafeProblem::Web(error)),
-        )
-    })?;
-    let verify = selected_security
-        .authentication
-        .take()
-        .ok_or("selected native authentication stage")?;
-    selected_security.authentication = Some(Arc::new(move |request| {
-        let public = matches!(
-            request.uri().path(),
-            "/menu" | "/health" | "/healthz" | "/ready" | "/readyz" | "/live" | "/livez"
-        );
-        verify(request).map(move |authenticated| public || authenticated)
-    }));
+    ))?;
+    match runtime.block_on(customers.fixture.run(Arc::new(()))) {
+        effect::Exit::Success(()) => (),
+        other @ (effect::Exit::Fail(_)
+        | effect::Exit::Die(_)
+        | effect::Exit::Interrupted
+        | effect::Exit::FinalizationFailed(_)) => {
+            runtime.block_on(pool.close());
+            return Err(format!("café fixture acquisition: {other:?}").into());
+        }
+    }
     let traces = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
     let metrics = opentelemetry_sdk::metrics::SdkMeterProvider::builder().build();
     let logs = opentelemetry_sdk::logs::SdkLoggerProvider::builder().build();
@@ -303,11 +218,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             },
             HostPolicy { drain: window },
             |error| cafe_error(CafeProblem::Http(error)),
-            |_| {
-                Effect::sync(
-                    || reply! { text(String::from("The café cannot complete this request.")); },
-                )
-            },
+            customer_routes::error_reply,
         ),
         listen: address,
         protocols: HttpProtocols::Http1,
@@ -352,14 +263,19 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cultures = CultureSet::new(vec![culture.clone()], Vec::new(), culture.clone())?;
     let selected = culture.clone();
     let app = cafe_application(
-        policy,
-        Arc::new(MenuBoard {
-            seasonal_available: AtomicBool::new(false),
-        }),
-        sql,
-        selected_security,
-        observation,
-        Effect::service(|env: &Environment| !env.cancellation().is_requested()),
+        (
+            policy,
+            Arc::new(MenuBoard {
+                seasonal_available: AtomicBool::new(false),
+            }),
+            sql,
+        ),
+        (
+            customers.security,
+            observation,
+            service! { env |env: &Environment| { !env.cancellation().is_requested() }, },
+            customers.routes,
+        ),
         vec![resource],
         cultures,
         move |request| {
@@ -369,10 +285,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 vary: Arc::from([]),
             };
             request.insert_extension(selection.clone());
-            Effect::from_result_once(Ok(selection))
+            effect_sync! { once; body { selection }, }
         },
         |_, request| {
-            Effect::service(move |env: &Environment| {
+            service! {
+                env |env: &Environment| {
                 Arc::new(Environment {
                     base: env.base.clone(),
                     culture: request
@@ -384,7 +301,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap_or_else(|| env.culture.clone()),
                     request: request.clone(),
                 })
-            })
+            }, }
         },
         |env| MenuKey {
             cafe: Arc::from("neighborhood-cafe"),
@@ -401,7 +318,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown = ShutdownPolicy::new(window, true)?;
     let provider_runtime = runtime.clone();
     let root_for_run = root.clone();
-    let program = Scope::scoped(move |scope| {
+    let program = effect_scope! {
+        body: move |scope| {
         let app = app.clone();
         let root = root_for_run.clone();
         let provider_runtime = provider_runtime.clone();
@@ -410,19 +328,24 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             let scope = scope.clone(); let app = app.clone(); let root = root.clone();
             let provider_runtime = provider_runtime.clone(); let factories = factories.clone();
             let providers = OwnedProviders::acquire_with_error(scope.clone(), factories, shutdown, |error| cafe_error(CafeProblem::Lifecycle(error)))?;
-            let native = Effect::try_sync(move || providers.with(|owner| owner.borrowed()), |error| cafe_error(CafeProblem::Otel(effect_otel::NativeError::Native(error))))?;
-            let mut base = Effect::from_result_once(cafe_telemetry::Environment::new(provider_runtime, native, telemetry_capacity).map_err(|error| cafe_error(CafeProblem::Otel(effect_otel::NativeError::Native(effect::Defect::new(error))))))?;
+            let native = effect_try_sync! { body { providers.with(|owner| owner.borrowed()) }, on_error |error| { cafe_error(CafeProblem::Otel(effect_otel::NativeError::Native(error))) }, }?;
+            let mut base = effect_try_sync! { once; body { cafe_telemetry::Environment::new(provider_runtime, native, telemetry_capacity) }, on_error |error| { cafe_error(CafeProblem::Otel(effect_otel::NativeError::Native(effect::Defect::new(error)))) }, }?;
             // The signal backend changes; the inert constructor's unused providers
             // are replaced before work starts, preserving the original service owners.
             base.tasks = root.base.tasks.clone(); base.blocking = root.base.blocking.clone();
             base.clock = root.base.clock.clone(); base.cancellation = root.base.cancellation.clone();
             let environment = Arc::new(Environment { base: Arc::new(base), request: root.request.clone(), culture: root.culture.clone() });
             let cancellation = environment.cancellation().clone();
-            scope.fork(Effect::try_future_once(move |_| async move { tokio::signal::ctrl_c().await?; let _ = cancellation.request(); Ok::<(), std::io::Error>(()) }, |error| cafe_error(CafeProblem::Http(ServerError::Io(error)))))?;
+            scope.fork(effect_try_future! { once; body |_cancel| { async move { tokio::signal::ctrl_c().await?; let _ = cancellation.request(); Ok::<(), std::io::Error>(()) } }, on_error |error| { cafe_error(CafeProblem::Http(ServerError::Io(error))) }, })?;
             run_cafe_application(app, environment)?;
         }
-    });
-    println!("Starting café at {address}; Ctrl-C drains requests and native providers.");
+        },
+    };
+    use std::io::Write;
+    writeln!(
+        std::io::stdout().lock(),
+        "Café pickup demo: open http://{address}/ to sign in and collect your order. Ctrl-C drains requests and native providers."
+    )?;
     let outcome = runtime.block_on(program.run(root.clone()));
     runtime.block_on(root.base.tasks.stop().wait());
     runtime.block_on(root.base.blocking.stop().wait());
@@ -437,6 +360,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         effect::Exit::Die(error) => Err(error.message().into()),
         effect::Exit::Interrupted => Err("café host interrupted".into()),
-        effect::Exit::FinalizationFailed(_) => Err("café host cleanup failed".into()),
+        effect::Exit::FinalizationFailed(failure) => {
+            Err(format!("café host cleanup failed: {failure:?}").into())
+        }
     }
 }

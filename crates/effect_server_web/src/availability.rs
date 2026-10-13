@@ -5,7 +5,13 @@
 //! Effect outcomes. Completed observations survive an overall collection timeout.
 
 use crate::WebError;
+use crate::{
+    effect_all_concurrent, effect_die, effect_future, effect_map, effect_map_error, effect_sync,
+    effect_try_sync,
+};
 use effect::{Effect, Exit, HasClock, HasTaskSpawner};
+use effect::{effect, effect_timeout};
+use effect_server::{endpoint, registered, reply, router};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -243,7 +249,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Availability<E, R> {
         R: HasClock + HasTaskSpawner + effect_server::HasRequest,
     {
         let methods = effect_server::HttpMethodSet::new(vec![http::Method::GET])?;
-        let mut router = effect_server::Router::new();
+        let mut router = router! {}?;
         for (path, role) in [
             ("/health", ProbeRole::Health),
             ("/healthz", ProbeRole::Health),
@@ -252,17 +258,18 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Availability<E, R> {
             ("/live", ProbeRole::Liveness),
             ("/livez", ProbeRole::Liveness),
         ] {
-            router = router.registered(
-                methods.clone(),
-                path,
-                effect_server::Registered::new(
-                    effect_server::Endpoint::from_effect(self.reply(role)),
-                    effect_server::Registration::default(),
-                ),
-            )?;
+            router = router! {
+                source: router,
+                methods(methods.clone(), path, registered! {
+                    endpoint(endpoint! { effect(self.reply(role)) }),
+                }),
+            }?;
         }
         if let Some(dashboard) = &self.dashboard {
-            router = router.include(dashboard.clone().routes());
+            router = router! {
+                source: router,
+                include(dashboard.clone().routes()),
+            }?;
         }
         Ok(router)
     }
@@ -273,121 +280,128 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Availability<E, R> {
         R: HasClock + HasTaskSpawner,
     {
         let definition = self.clone();
-        Effect::from_exit_future_with_context(move |env: Arc<R>, context| {
-            let definition = definition.clone();
-            async move {
-                let mut selected = definition
-                    .probes
-                    .iter()
-                    .filter(|probe| probe.role == role)
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if role == ProbeRole::Readiness
-                    && let Some(traffic) = &definition.traffic_ready
-                {
-                    selected.push(Probe {
-                        name: Arc::from("traffic readiness"),
-                        role,
-                        required: true,
-                        sample: traffic.clone(),
-                    });
-                }
-                let reports = Arc::new(Mutex::new(
-                    selected
-                        .iter()
-                        .map(|probe| SignalReport {
-                            name: probe.name.clone(),
-                            required: probe.required,
-                            state: SignalState::TimedOut,
-                        })
-                        .collect::<Vec<_>>(),
-                ));
-                let mut programs = Vec::new();
-                for (index, probe) in selected.into_iter().enumerate() {
-                    let signal_reports = reports.clone();
-                    let name = probe.name.clone();
-                    let deadline_name = name.clone();
-                    let errors = definition.errors.clone();
-                    let program = probe
-                        .sample
-                        .map_error(ProbeFailure::Expected)
-                        .timeout(definition.deadlines.per_probe, move || {
-                            ProbeFailure::Deadline(deadline_name.clone())
-                        });
-                    programs.push(
-                        program
-                            .materialize_exit()
-                            .map_error(|never| match never {})
-                            .flat_map(move |exit| {
-                                let state = match exit {
-                                    Exit::Success(true) => SignalState::Available,
-                                    Exit::Success(false)
-                                    | Exit::Fail(ProbeFailure::Expected(_)) => {
-                                        SignalState::Unavailable
-                                    }
-                                    Exit::Fail(ProbeFailure::Deadline(_)) => SignalState::TimedOut,
-                                    Exit::Die(defect) => return Effect::die(defect),
-                                    Exit::Interrupted => {
-                                        return crate::restore_exit(Exit::Interrupted);
-                                    }
-                                    Exit::FinalizationFailed(failure) => {
-                                        let errors = errors.clone();
-                                        return crate::restore_exit(
-                                            Exit::<(), _>::FinalizationFailed(failure).map_error(
-                                                move |error| match error {
-                                                    ProbeFailure::Expected(error) => error,
-                                                    ProbeFailure::Deadline(name) => {
-                                                        errors(AvailabilityError::ProbeDeadline(
-                                                            name.to_string(),
-                                                        ))
-                                                    }
-                                                },
-                                            ),
-                                        );
-                                    }
-                                };
-                                if let Some(report) = signal_reports
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .get_mut(index)
-                                {
-                                    report.state = state;
-                                }
-                                Effect::succeed(())
-                            }),
-                    );
-                }
-                let errors = definition.errors.clone();
-                let collection = Effect::all_concurrent(definition.parallelism, programs)
-                    .map(|_| ())
-                    .timeout(definition.deadlines.overall, move || {
-                        errors(AvailabilityError::CollectionDeadline)
-                    });
-                match context.run(collection, env.clone()).await {
-                    Exit::Success(()) | Exit::Fail(_) => {}
-                    Exit::Die(defect) => return Exit::Die(defect),
-                    Exit::Interrupted => return Exit::Interrupted,
-                    Exit::FinalizationFailed(failure) => return Exit::FinalizationFailed(failure),
-                }
-                let signals = reports
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
-                let accepting_traffic = signals
-                    .iter()
-                    .all(|signal| !signal.required || signal.state == SignalState::Available);
-                let degraded = signals
-                    .iter()
-                    .any(|signal| signal.state != SignalState::Available);
-                Exit::Success(ProbeReport {
-                    service: definition.service.clone(),
-                    role,
-                    accepting_traffic,
-                    degraded,
-                    signals,
-                })
-            }
-        })
+        effect_future! {
+                   exit_with_context; body: move |env: Arc<R>, context| {
+                   let definition = definition.clone();
+                   async move {
+                       let mut selected = definition
+                           .probes
+                           .iter()
+                           .filter(|probe| probe.role == role)
+                           .cloned()
+                           .collect::<Vec<_>>();
+                       if role == ProbeRole::Readiness
+                           && let Some(traffic) = &definition.traffic_ready
+                       {
+                           selected.push(Probe {
+                               name: Arc::from("traffic readiness"),
+                               role,
+                               required: true,
+                               sample: traffic.clone(),
+                           });
+                       }
+                       let reports = Arc::new(Mutex::new(
+                           selected
+                               .iter()
+                               .map(|probe| SignalReport {
+                                   name: probe.name.clone(),
+                                   required: probe.required,
+                                   state: SignalState::TimedOut,
+                               })
+                               .collect::<Vec<_>>(),
+                       ));
+                       let mut programs = Vec::new();
+                       for (index, probe) in selected.into_iter().enumerate() {
+                           let signal_reports = reports.clone();
+                           let name = probe.name.clone();
+                           let deadline_name = name.clone();
+                           let errors = definition.errors.clone();
+                           let program = effect_timeout! {
+                               program: effect_map_error! { program: probe.sample, map: ProbeFailure::Expected, },
+                               duration: definition.deadlines.per_probe,
+                               on_timeout: move || {
+                                   ProbeFailure::Deadline(deadline_name.clone())
+                               },
+                           };
+                           programs.push(
+                               effect! {
+        bind;
+        program: effect_map_error! {
+            program: program
+                                   .materialize_exit(), map: |never| match never {}, },
+        body: move |exit| {
+                                       let state = match exit {
+                                           Exit::Success(true) => SignalState::Available,
+                                           Exit::Success(false)
+                                           | Exit::Fail(ProbeFailure::Expected(_)) => {
+                                               SignalState::Unavailable
+                                           }
+                                           Exit::Fail(ProbeFailure::Deadline(_)) => SignalState::TimedOut,
+                                           Exit::Die(defect) => return effect_die! { defect: defect, },
+                                           Exit::Interrupted => {
+                                               return crate::restore_exit(Exit::Interrupted);
+                                           }
+                                           Exit::FinalizationFailed(failure) => {
+                                               let errors = errors.clone();
+                                               return crate::restore_exit(
+                                                   Exit::<(), _>::FinalizationFailed(failure).map_error(
+                                                       move |error| match error {
+                                                           ProbeFailure::Expected(error) => error,
+                                                           ProbeFailure::Deadline(name) => {
+                                                               errors(AvailabilityError::ProbeDeadline(
+                                                                   name.to_string(),
+                                                               ))
+                                                           }
+                                                       },
+                                                   ),
+                                               );
+                                           }
+                                       };
+                                       if let Some(report) = signal_reports
+                                           .lock()
+                                           .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                           .get_mut(index)
+                                       {
+                                           report.state = state;
+                                       }
+                                       effect_sync! { body { () }, }
+                                   },
+        },
+                           );
+                       }
+                       let errors = definition.errors.clone();
+                       let collection = effect_timeout! {
+                           program: effect_map! { program: effect_all_concurrent! { concurrency: definition.parallelism, items: programs, }, map: |_| (), },
+                           duration: definition.deadlines.overall,
+                           on_timeout: move || {
+                               errors(AvailabilityError::CollectionDeadline)
+                           },
+                       };
+                       match context.run(collection, env.clone()).await {
+                           Exit::Success(()) | Exit::Fail(_) => {}
+                           Exit::Die(defect) => return Exit::Die(defect),
+                           Exit::Interrupted => return Exit::Interrupted,
+                           Exit::FinalizationFailed(failure) => return Exit::FinalizationFailed(failure),
+                       }
+                       let signals = reports
+                           .lock()
+                           .unwrap_or_else(std::sync::PoisonError::into_inner)
+                           .clone();
+                       let accepting_traffic = signals
+                           .iter()
+                           .all(|signal| !signal.required || signal.state == SignalState::Available);
+                       let degraded = signals
+                           .iter()
+                           .any(|signal| signal.state != SignalState::Available);
+                       Exit::Success(ProbeReport {
+                           service: definition.service.clone(),
+                           role,
+                           accepting_traffic,
+                           degraded,
+                           signals,
+                       })
+                   }
+               }, }
     }
     /// Native finite reply uses a direct safe JSON writer. Only prepared identities,
     /// roles/states/booleans enter the response; no serde serialization of E occurs.
@@ -396,83 +410,91 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Availability<E, R> {
         R: HasClock + HasTaskSpawner,
     {
         let errors = self.errors.clone();
-        self.collect(role).flat_map(move |report| {
-            let mut output = Vec::new();
-            // Writing to Vec cannot fail except allocation; string escaping uses serde's native writer.
-            let write = (|| -> Result<(), serde_json::Error> {
-                output.extend_from_slice(b"{\"service\":");
-                serde_json::to_writer(&mut output, report.service.as_ref())?;
-                output.extend_from_slice(b",\"role\":");
-                serde_json::to_writer(
-                    &mut output,
-                    match report.role {
-                        ProbeRole::Health => "health",
-                        ProbeRole::Readiness => "readiness",
-                        ProbeRole::Liveness => "liveness",
-                    },
-                )?;
-                output.extend_from_slice(b",\"acceptingTraffic\":");
-                output.extend_from_slice(if report.accepting_traffic {
-                    b"true"
-                } else {
-                    b"false"
-                });
-                output.extend_from_slice(b",\"degraded\":");
-                output.extend_from_slice(if report.degraded { b"true" } else { b"false" });
-                output.extend_from_slice(b",\"signals\":[");
-                let mut first = true;
-                for signal in &report.signals {
-                    if !first {
-                        output.push(b',');
-                    }
-                    first = false;
-                    output.extend_from_slice(b"{\"name\":");
-                    serde_json::to_writer(&mut output, signal.name.as_ref())?;
-                    output.extend_from_slice(b",\"required\":");
-                    output.extend_from_slice(if signal.required { b"true" } else { b"false" });
-                    output.extend_from_slice(b",\"state\":");
-                    serde_json::to_writer(
-                        &mut output,
-                        match signal.state {
-                            SignalState::Available => "available",
-                            SignalState::Unavailable => "unavailable",
-                            SignalState::TimedOut => "timedOut",
-                        },
-                    )?;
-                    output.push(b'}');
-                }
-                output.extend_from_slice(b"]}");
-                Ok(())
-            })();
-            match write {
-                Ok(()) => {
-                    let reply = effect_server::Reply::bytes(
-                        output.into(),
-                        http::HeaderValue::from_static("application/json"),
-                    );
-                    let status = match effect_server::BodyStatus::new(if report.accepting_traffic {
-                        http::StatusCode::OK
-                    } else {
-                        http::StatusCode::SERVICE_UNAVAILABLE
-                    }) {
-                        Ok(status) => status,
-                        Err(_) => {
-                            return Effect::from_result_once(Err(errors(
-                                AvailabilityError::Output,
-                            )));
-                        }
-                    };
-                    Effect::from_result_once(Ok(effect_server::ReplyDraft::new()
-                        .status(status)
-                        .header(
-                            http::header::CACHE_CONTROL,
-                            http::HeaderValue::from_static("no-store"),
-                        )
-                        .finish(reply)))
-                }
-                Err(_) => Effect::from_result_once(Err(errors(AvailabilityError::Output))),
-            }
-        })
+        effect! {
+        bind;
+        program: self.collect(role),
+        body: move |report| {
+                   let mut output = Vec::new();
+                   // Writing to Vec cannot fail except allocation; string escaping uses serde's native writer.
+                   let write = (|| -> Result<(), serde_json::Error> {
+                       output.extend_from_slice(b"{\"service\":");
+                       serde_json::to_writer(&mut output, report.service.as_ref())?;
+                       output.extend_from_slice(b",\"role\":");
+                       serde_json::to_writer(
+                           &mut output,
+                           match report.role {
+                               ProbeRole::Health => "health",
+                               ProbeRole::Readiness => "readiness",
+                               ProbeRole::Liveness => "liveness",
+                           },
+                       )?;
+                       output.extend_from_slice(b",\"acceptingTraffic\":");
+                       output.extend_from_slice(if report.accepting_traffic {
+                           b"true"
+                       } else {
+                           b"false"
+                       });
+                       output.extend_from_slice(b",\"degraded\":");
+                       output.extend_from_slice(if report.degraded { b"true" } else { b"false" });
+                       output.extend_from_slice(b",\"signals\":[");
+                       let mut first = true;
+                       for signal in &report.signals {
+                           if !first {
+                               output.push(b',');
+                           }
+                           first = false;
+                           output.extend_from_slice(b"{\"name\":");
+                           serde_json::to_writer(&mut output, signal.name.as_ref())?;
+                           output.extend_from_slice(b",\"required\":");
+                           output.extend_from_slice(if signal.required { b"true" } else { b"false" });
+                           output.extend_from_slice(b",\"state\":");
+                           serde_json::to_writer(
+                               &mut output,
+                               match signal.state {
+                                   SignalState::Available => "available",
+                                   SignalState::Unavailable => "unavailable",
+                                   SignalState::TimedOut => "timedOut",
+                               },
+                           )?;
+                           output.push(b'}');
+                       }
+                       output.extend_from_slice(b"]}");
+                       Ok(())
+                   })();
+                   match write {
+                       Ok(()) => {
+                           let reply = reply! {
+                               bytes(output.into(), http::HeaderValue::from_static("application/json")),
+                           };
+                           let status = match effect_server::BodyStatus::new(if report.accepting_traffic {
+                               http::StatusCode::OK
+                           } else {
+                               http::StatusCode::SERVICE_UNAVAILABLE
+                           }) {
+                               Ok(status) => status,
+                               Err(_) => {
+                                   return effect_try_sync! {
+                                       once; body: {
+                                       let __dsl_result = Err(errors(
+                                       AvailabilityError::Output,
+                                   )); move || __dsl_result }, on_error: ::core::convert::identity, };
+                               }
+                           };
+                           effect_try_sync! {
+                               once; body: {
+                               let __dsl_result = Ok(reply! {
+                               status(status),
+                               header(
+                                   http::header::CACHE_CONTROL,
+                                   http::HeaderValue::from_static("no-store"),
+                               ),
+                               source(reply),
+                           }); move || __dsl_result }, on_error: ::core::convert::identity, }
+                       }
+                       Err(_) => effect_try_sync! { once; body: { let __dsl_result = Err(errors(AvailabilityError::Output)); move || __dsl_result }, on_error: ::core::convert::identity, },
+                   }
+               },
+        }
     }
 }
 /// Map static web configuration failures without selecting another error/runtime engine.

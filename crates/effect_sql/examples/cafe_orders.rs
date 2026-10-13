@@ -1,15 +1,22 @@
-//! Save and load a café order through D02–D06, with one moved application payload.
+//! Save a flat-white order, correct its price, and reload the saved customer record.
+//!
+//! Run: `DATABASE_URL=turso::memory: cargo +1.99.0 run -p effect-sql --features turso,macros --example cafe_orders`.
+//! Input: ticket 1 for customer 7, entered at 400 cents. Expected output:
+//! `Order 1: flat white, 425 cents, ready=false; 1 saved order.`
 //!
 //! Requires `turso,macros`. The static checked query describes only a literal,
-//! so the compiler's `DATABASE_URL=sqlite::memory:` needs no application schema.
+//! so the compiler's `DATABASE_URL=turso::memory:` needs no application schema.
 //! The support module owns an explicit temporary database/pool policy. The host
 //! supplies Tokio once; SQL and Effect create no runtime of their own.
 
+use effect::{effect_die, effect_map_error, service};
 #[path = "support/cafe_database.rs"]
 /// Native setup and teardown for the temporary café database.
 mod cafe_database;
 
 use effect::{Effect, Exit, SchemaIssue, SchemaIssueKind, effect};
+use effect_sql::effect_from_option;
+use effect_sql::effect_try_sync;
 use effect_sql::{
     CellCodec, RowDecoder, SqlClient, SqlError, SqlPredicate, SqlTransaction, row, sql, sql_insert,
     sql_update, sql_with,
@@ -93,13 +100,13 @@ fn order_row() -> RowDecoder<CoffeeOrder, SqlClient> {
     }
 }
 
-/// Extracted native savepoint body; a scoped handle remains fenced after this returns.
+/// Update the operator-corrected price using the transaction's checked handle.
 /// Each invocation shares the checked transaction owner through a handle clone.
-fn mark_ready(tx: SqlTransaction, id: i64) -> Effect<u64, SqlError, SqlClient> {
+fn correct_price(tx: SqlTransaction, id: i64) -> Effect<u64, SqlError, SqlClient> {
     effect! {
         let tx = tx.clone();
-        let predicate = Effect::from_result_once(SqlPredicate::equal("id", id))?;
-        let statement = sql_update! { table: "coffee_orders", set("ready", true); where(predicate); };
+        let predicate = effect_try_sync! { once; body: { let __dsl_result = SqlPredicate::equal("id", id); move || __dsl_result }, on_error: ::core::convert::identity, }?;
+        let statement = sql_update! { table: "coffee_orders", set("price_cents", 425i64); where(predicate); };
         tx.execute(statement)?
     }
 }
@@ -110,25 +117,20 @@ fn save_order(order: NewOrder) -> Effect<OrderId, CafeError, CafeEnv> {
         select: |env: &CafeEnv| Arc::clone(&env.sql),
         on_error: CafeError::Sql,
         run |sql| {
-            let order = Effect::from_result_once(if order.price_cents >= 0 && !order.drink.is_empty() { Ok(order) } else { Err(SqlError::Configuration("invalid café order".into())) })?;
-            let selected = sql.clone();
-            sql.transaction_once(move |tx| sql_with! {
-                handle: selected,
-                run |_sql| {
-                    let id = order.id.0;
-                    let insert = sql_insert! {
-                        table: "coffee_orders",
-                        value("id", id);
-                        value("customer_id", order.customer.0);
-                        value("drink", order.drink);
-                        value("price_cents", order.price_cents);
-                        value("ready", false);
-                    };
-                    tx.execute(insert)?;
-                    tx.savepoint(move |nested| mark_ready(nested, id))?;
-                    OrderId(id)
-                }
-            })?
+            let order = effect_try_sync! {
+                once;
+                body {
+                    if order.price_cents >= 0 && !order.drink.is_empty() { Ok(order) }
+                    else { Err(SqlError::Configuration("invalid café order".into())) }
+                },
+            }?;
+            let id = order.id.0;
+            let insert = sql_insert! {
+                table: "coffee_orders", value("id", id); value("customer_id", order.customer.0);
+                value("drink", order.drink); value("price_cents", order.price_cents); value("ready", false);
+            };
+            sql.execute(insert)?;
+            OrderId(id)
         }
     }
 }
@@ -136,7 +138,7 @@ fn save_order(order: NewOrder) -> Effect<OrderId, CafeError, CafeEnv> {
 /// Extract the typed read program; its moved identity is consumed during execution.
 fn load_order_program(id: OrderId) -> Effect<Option<CoffeeOrder>, SqlError, SqlClient> {
     effect! {
-        let sql = Effect::service(|client: &SqlClient| client.clone())?;
+        let sql = service! { env: |client: &SqlClient| client.clone(), }?;
         let statement = sql! {
             text("SELECT id,drink,price_cents,ready FROM ");
             identifier("coffee_orders");
@@ -156,17 +158,9 @@ fn load_order(id: OrderId) -> Effect<Option<CoffeeOrder>, CafeError, CafeEnv> {
     }
 }
 
-/// Extract a client callback, selected by D06's `run: ready_count` form in the workflow.
-fn ready_count(sql: SqlClient) -> Effect<i64, SqlError, SqlClient> {
-    sql.scalar(|| sql! { text("SELECT COUNT(*) FROM coffee_orders WHERE ready=1"); })
-}
-
-/// Exercise the local SQLx checked macro directly beside the domain DSL.
-async fn checked_native(client: &SqlClient) -> Result<i64, SqlError> {
-    let value = effect_sql::sqlx::query_scalar!("SELECT 1 AS \"schema_version!: i64\"")
-        .fetch_one(client.kernel().pool())
-        .await?;
-    Ok(value)
+/// Extract a client callback, selected by D06's `run: order_count` form in the workflow.
+fn order_count(sql: SqlClient) -> Effect<i64, SqlError, SqlClient> {
+    sql.scalar(|| sql! { text("SELECT COUNT(*) FROM coffee_orders"); })
 }
 
 /// Run the finite café story on the caller's Tokio reactor and retain complete exits.
@@ -178,15 +172,29 @@ async fn main() -> Result<(), CafeError> {
     let env = Arc::new(CafeEnv {
         sql: Arc::new(database.client.clone()),
     });
+    let selected_sql = env.sql.as_ref().clone();
     let workflow = effect! {
-        let id = save_order(NewOrder { id: OrderId(1), customer: CustomerId(7), drink: String::from("flat white"), price_cents: 425 })?;
+        let selected_sql = selected_sql.clone();
+        let id = save_order(NewOrder { id: OrderId(1), customer: CustomerId(7), drink: String::from("flat white"), price_cents: 400 })?;
+        effect_map_error! {
+            program: sql_with! {
+            handle: selected_sql,
+            run |sql| { sql.transaction_once(move |tx| correct_price(tx, 1))? },
+        }, map: CafeError::Sql, }?;
         let order = load_order(id)?;
-        let order = Effect::from_result_once(order.ok_or(CafeError::MissingOrder))?;
-        let count = sql_with! { select: |env: &CafeEnv| env.sql.clone(), on_error: CafeError::Sql, run: ready_count }?;
-        Effect::from_result_once(if order.id.0 == 1 && order.ready && order.drink == "flat white" && order.price_cents == 425 && count == 1 { Ok(()) } else { Err(CafeError::InvalidOrder) })?
+        let order = effect_from_option! {
+            once; value: order, missing { CafeError::MissingOrder },
+        }?;
+        let count = sql_with! { select: |env: &CafeEnv| env.sql.clone(), on_error: CafeError::Sql, run: order_count }?;
+        use std::io::Write;
+        let (order, written) = {
+            let written = writeln!(std::io::stdout().lock(), "Order {}: {}, {} cents, ready={}; {count} saved order.", order.id.0, order.drink, order.price_cents, order.ready);
+            (order, written)
+        };
+        match written { Ok(()) => (), Err(error) => effect_die! { defect: effect::Defect::from_io(error), }?, };
+        effect_try_sync! { once; body: { let __dsl_result = if order.id.0 == 1 && !order.ready && order.drink == "flat white" && order.price_cents == 425 && count == 1 { Ok(()) } else { Err(CafeError::InvalidOrder) }; move || __dsl_result }, on_error: ::core::convert::identity, }?
     };
     let outcome = workflow.run(env.clone()).await;
-    let native = checked_native(&database.client).await;
     let close = database.close().await;
     match outcome {
         Exit::Success(()) => {}
@@ -195,6 +203,5 @@ async fn main() -> Result<(), CafeError> {
             return Err(CafeError::Execution(Box::new(failure)));
         }
     }
-    native.map_err(CafeError::Sql)?;
     close.map_err(CafeError::Sql)
 }

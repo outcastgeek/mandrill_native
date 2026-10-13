@@ -4,6 +4,7 @@ use super::{Chunk, Stream, StreamReader};
 use crate::internal::macro_future::{AsyncBindable, MacroContext};
 use crate::internal::runtime::{self, Step};
 use crate::{Defect, Effect, Exit, LibraryDefect, Release, ResourceValue, Scope};
+use crate::{effect_finalizer, effect_uninterruptible};
 use futures_util::FutureExt;
 use std::future::{Future, poll_fn};
 use std::panic::AssertUnwindSafe;
@@ -99,33 +100,45 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> StreamConte
         }
     }
     /// Append a compatible stream under the same outer owner, pulling only on consumer demand.
-    pub async fn append(&self, source: Stream<A, E, R>) -> Result<(), Exit<(), E>> {
-        let child = Scope::new();
-        let close = child.close_owned().uninterruptible();
-        self.context
-            .bind(self.context.scope().add_finalizer(close.clone()))
-            .await?;
-        let result = async {
-            let reader = self.context.bind(source.open(child)).await?;
-            loop {
-                match self.context.bind(reader.pull()).await? {
-                    Chunk::Values(values) => {
-                        for value in values {
-                            self.emit(value).await;
+    pub fn append(
+        &self,
+        source: Stream<A, E, R>,
+    ) -> impl Future<Output = Result<(), Exit<(), E>>> + Send + 'static {
+        let bridge = Self {
+            context: self.context.share(),
+            slot: Arc::clone(&self.slot),
+        };
+        async move {
+            let child = Scope::new();
+            let close = effect_uninterruptible! { program: child.close_owned(), };
+            bridge
+                .context
+                .bind(effect_finalizer! {
+                scope: bridge.context.scope(), body: close.clone(),
+                })
+                .await?;
+            let result = async {
+                let reader = bridge.context.bind(source.open(child)).await?;
+                loop {
+                    match bridge.context.bind(reader.pull()).await? {
+                        Chunk::Values(values) => {
+                            for value in values {
+                                bridge.emit(value).await;
+                            }
                         }
+                        Chunk::End => return Ok(()),
                     }
-                    Chunk::End => return Ok(()),
                 }
             }
-        }
-        .await;
-        let cleanup = self.context.bind(close).await;
-        match (result, cleanup) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Ok(()), Err(failure)) => Err(failure),
-            (Err(failure), Ok(())) => Err(failure),
-            (Err(failure), Err(cleanup)) => {
-                Err(crate::internal::outcome::append_cleanup(failure, cleanup))
+            .await;
+            let cleanup = bridge.context.bind(close).await;
+            match (result, cleanup) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Ok(()), Err(failure)) => Err(failure),
+                (Err(failure), Ok(())) => Err(failure),
+                (Err(failure), Err(cleanup)) => {
+                    Err(crate::internal::outcome::append_cleanup(failure, cleanup))
+                }
             }
         }
     }
@@ -258,7 +271,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Stream<A, E
     /// into the mapper; no synchronous Iterator implementation or payload copying is required.
     ///
     /// ```
-    /// use effect::{Effect, Stream, stream};
+    /// use effect::{Effect, Stream, effect, stream};
     /// fn increment(value: i32) -> Effect<i32, (), ()> {
     ///     Effect::sync_once(move || value + 1)
     /// }
@@ -266,7 +279,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Stream<A, E
     ///     for value in 0..3 { yield increment(value)?; }
     /// };
     /// let nested = source.flat_map(|value| stream! { yield value; });
-    /// let program = effect::effect! { nested.run_collect(Some(3))? };
+    /// let program = effect! { nested.run_collect(Some(3))? };
     /// # let _ = program;
     /// ```
     pub fn flat_map<B: Send + 'static>(

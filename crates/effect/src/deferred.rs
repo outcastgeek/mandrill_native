@@ -1,10 +1,12 @@
 //! Single-assignment completion and cancellation-aware observation.
 
+use crate::effect_sync;
 use crate::internal::notification::notify_all;
 use crate::internal::runtime::{self, Step};
 use crate::{Cancellation, Defect, Effect, Exit, LibraryDefect, SharedExit};
 use event_listener::Event;
 use futures_util::future::select;
+use std::pin::pin;
 use std::sync::{Arc, Mutex};
 
 /// Variants of completion used by deferred.
@@ -92,7 +94,7 @@ impl<A: Send + 'static, E: Send + 'static> Deferred<A, E> {
     /// Type: `Effect<Self, E, R>`.
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn make<R: Send + Sync + 'static>() -> Effect<Self, E, R> {
-        Effect::sync(Self::new)
+        effect_sync! { body: Self::new, }
     }
 
     /// Move a supplied outcome into this Deferred on the first execution.
@@ -113,13 +115,13 @@ impl<A: Send + 'static, E: Send + 'static> Deferred<A, E> {
     pub fn complete<R: Send + Sync + 'static>(&self, outcome: Exit<A, E>) -> Effect<bool, E, R> {
         let deferred = self.clone();
         let outcome = Mutex::new(Some(outcome));
-        Effect::sync(move || {
+        effect_sync! { body: move || {
             let outcome = outcome
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
             outcome.is_some_and(|outcome| deferred.publish(outcome))
-        })
+        }, }
     }
 
     /// Produce a fresh owned candidate per execution. Only the first completion
@@ -141,7 +143,7 @@ impl<A: Send + 'static, E: Send + 'static> Deferred<A, E> {
         factory: impl Fn() -> Exit<A, E> + Send + Sync + 'static,
     ) -> Effect<bool, E, R> {
         let deferred = self.clone();
-        Effect::sync(move || deferred.publish(factory()))
+        effect_sync! { body: move || deferred.publish(factory()), }
     }
 
     /// Complete the deferred value successfully if it is still pending.
@@ -373,8 +375,8 @@ impl<A: Send + 'static, E: Send + 'static> Deferred<A, E> {
             if let Some(outcome) = observe(self)? {
                 return Ok(Some(outcome));
             }
-            let changed = std::pin::pin!(changed);
-            let cancelled = std::pin::pin!(cancellation.cancelled());
+            let changed = pin!(changed);
+            let cancelled = pin!(cancellation.cancelled());
             let _ = select(changed, cancelled).await;
         }
     }

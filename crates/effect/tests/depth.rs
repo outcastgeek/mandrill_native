@@ -1,4 +1,8 @@
-use effect::{Cancellation, Effect, Exit, Release, ResourceBinding, Scope};
+use effect::{Cancellation, Effect, Exit};
+use effect::{
+    effect, effect_finalizer, effect_future, effect_map, effect_map_error, effect_provide_some,
+    effect_resource, effect_scope, effect_sync, effect_try_sync,
+};
 use futures_executor::block_on;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -6,21 +10,28 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 mod drive;
 
 fn recursion(remaining: usize) -> Effect<usize, ()> {
-    Effect::defer(move || {
-        if remaining == 0 {
-            Effect::succeed(42)
-        } else {
-            recursion(remaining - 1)
-        }
-    })
+    {
+        let __dsl_factory = move || {
+            if remaining == 0 {
+                effect_sync! { body: { let __dsl_value = 42; move || __dsl_value }, }
+            } else {
+                recursion(remaining - 1)
+            }
+        };
+        effect! { __dsl_factory()? }
+    }
 }
 
 thread_local! { static THREAD_GRAPH: std::cell::RefCell<Option<Effect<usize, ()>>> = const { std::cell::RefCell::new(None) }; }
 
 fn graph() -> Effect<usize, ()> {
-    let mut program = Effect::succeed(0);
+    let mut program = effect_sync! { body: { let __dsl_value = 0; move || __dsl_value }, };
     for _ in 0..100_000 {
-        program = program.flat_map(|value| Effect::succeed(value + 1));
+        program = effect! {
+        bind;
+        program: program,
+        body: |value| effect_sync! { body: { let __dsl_value = value + 1; move || __dsl_value }, },
+        };
     }
     program
 }
@@ -57,21 +68,24 @@ fn deep_graphs_in_subprocess() -> Result<(), Box<dyn std::error::Error>> {
         assert!(token.request());
         assert_eq!(
             block_on(
-                graph()
-                    .provide_some(|_: &Cancellation| ())
+                effect_provide_some! { program: graph(), project: |_: &Cancellation| (), }
                     .run_cancellable(Arc::new(token))
             ),
             Exit::Interrupted
         );
-        let mut failed: Effect<usize, usize> = Effect::fail(42);
+        let mut failed: Effect<usize, usize> = effect_try_sync! { body: { let __dsl_error = 42; move || Err(__dsl_error) }, on_error: ::core::convert::identity, };
         for _ in 0..100_000 {
-            failed = failed.flat_map(|value| Effect::succeed(value + 1));
+            failed = effect! {
+            bind;
+            program: failed,
+            body: |value| effect_sync! { body: { let __dsl_value = value + 1; move || __dsl_value }, },
+            };
         }
         assert_eq!(block_on(failed.run(Arc::new(()))), Exit::Fail(42));
         drop(failed);
-        let mut recovery: Effect<usize, usize> = Effect::fail(0);
+        let mut recovery: Effect<usize, usize> = effect_try_sync! { body: { let __dsl_error = 0; move || Err(__dsl_error) }, on_error: ::core::convert::identity, };
         for _ in 0..100_000 {
-            recovery = recovery.map_error(|error| error + 1);
+            recovery = effect_map_error! { program: recovery, map: |error| error + 1, };
         }
         assert_eq!(block_on(recovery.run(Arc::new(()))), Exit::Fail(100_000));
         drop(recovery);
@@ -80,12 +94,12 @@ fn deep_graphs_in_subprocess() -> Result<(), Box<dyn std::error::Error>> {
         // continuation chain, rather than only destroying an unpolled future.
         let entered = Arc::new(AtomicBool::new(false));
         let witness = Arc::clone(&entered);
-        let mut pending: Effect<usize, ()> = Effect::from_future(move |_| {
+        let mut pending: Effect<usize, ()> = effect_future! { body: move |_| {
             witness.store(true, Ordering::SeqCst);
             std::future::pending()
-        });
+        }, };
         for _ in 0..100_000 {
-            pending = pending.map(|value| value + 1);
+            pending = effect_map! { program: pending, map: |value| value + 1, };
         }
         let mut running = Box::pin(pending.run(Arc::new(())));
         drive::until(running.as_mut(), || entered.load(Ordering::SeqCst));
@@ -99,13 +113,18 @@ fn deep_graphs_in_subprocess() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         let destroyed = Arc::new(AtomicUsize::new(0));
-        let mut observed: Effect<usize, ()> = Effect::succeed(0);
+        let mut observed: Effect<usize, ()> =
+            effect_sync! { body: { let __dsl_value = 0; move || __dsl_value }, };
         for _ in 0..100_000 {
             let probe = Probe(Arc::clone(&destroyed));
-            observed = observed.flat_map(move |value| {
-                let _ = &probe;
-                Effect::succeed(value + 1)
-            });
+            observed = effect! {
+            bind;
+            program: observed,
+            body: move |value| {
+                           let _ = &probe;
+                           effect_sync! { body: { let __dsl_value = value + 1; move || __dsl_value }, }
+                       },
+            };
         }
         let shared = observed.clone();
         drop(observed);
@@ -114,38 +133,47 @@ fn deep_graphs_in_subprocess() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(destroyed.load(Ordering::SeqCst), 100_000);
 
         let released = Arc::new(AtomicUsize::new(0));
-        let mut bracketed: Effect<usize, ()> = Effect::succeed(42);
+        let mut bracketed: Effect<usize, ()> =
+            effect_sync! { body: { let __dsl_value = 42; move || __dsl_value }, };
         for _ in 0..10_000 {
             let inner = bracketed;
             let witness = Arc::clone(&released);
-            bracketed = ResourceBinding::new(Effect::succeed(()), move |(), _| {
-                let witness = Arc::clone(&witness);
-                Release::sync(move || {
-                    let _ = witness.fetch_add(1, Ordering::SeqCst);
-                })
-            })
-            .use_with(move |_| inner.clone());
+            bracketed = effect_resource! {
+            acquire: effect_sync! { body: { let __dsl_value = (); move || __dsl_value }, }, release: move |(), _| {
+                            let witness = Arc::clone(&witness);
+                            effect_resource! { release_sync; body: move || {
+                                let _ = witness.fetch_add(1, Ordering::SeqCst);
+                            }, }
+                        }, body: move |_| inner.clone(),
+            };
         }
         assert_eq!(block_on(bracketed.run(Arc::new(()))), Exit::Success(42));
         assert_eq!(released.load(Ordering::SeqCst), 10_000);
         drop(bracketed);
 
         let scoped_releases = Arc::new(AtomicUsize::new(0));
-        let mut scoped: Effect<usize, ()> = Effect::succeed(42);
+        let mut scoped: Effect<usize, ()> =
+            effect_sync! { body: { let __dsl_value = 42; move || __dsl_value }, };
         for _ in 0..10_000 {
             let inner = scoped;
             let witness = Arc::clone(&scoped_releases);
-            scoped = Scope::scoped(move |scope| {
-                let witness = Arc::clone(&witness);
-                let registration = scope.add_release(move || {
-                    let witness = Arc::clone(&witness);
-                    Release::sync(move || {
-                        let _ = witness.fetch_add(1, Ordering::SeqCst);
-                    })
-                });
-                let inner = inner.clone();
-                registration.flat_map(move |()| inner.clone())
-            });
+            scoped = effect_scope! {
+            body: move |scope| {
+                            let witness = Arc::clone(&witness);
+                            let registration = effect_finalizer! { release; scope: scope, release: move || {
+                                let witness = Arc::clone(&witness);
+                                effect_resource! { release_sync; body: move || {
+                                    let _ = witness.fetch_add(1, Ordering::SeqCst);
+                                }, }
+                            }, };
+                            let inner = inner.clone();
+                            effect! {
+             bind;
+             program: registration,
+             body: move |()| inner.clone(),
+             }
+                        },
+            };
         }
         assert_eq!(block_on(scoped.run(Arc::new(()))), Exit::Success(42));
         assert_eq!(scoped_releases.load(Ordering::SeqCst), 10_000);
@@ -154,15 +182,12 @@ fn deep_graphs_in_subprocess() -> Result<(), Box<dyn std::error::Error>> {
         let iterations = Arc::new(AtomicUsize::new(0));
         let guard = Arc::clone(&iterations);
         let witness = Arc::clone(&iterations);
-        let repeated: Effect<(), ()> = Effect::while_loop(
-            move || guard.load(Ordering::SeqCst) < 100_000,
-            move || {
-                let witness = Arc::clone(&witness);
-                Effect::sync(move || {
-                    let _ = witness.fetch_add(1, Ordering::SeqCst);
-                })
-            },
-        );
+        let repeated: Effect<(), ()> = effect! { while_loop; guard: move || guard.load(Ordering::SeqCst) < 100_000, body: move || {
+            let witness = Arc::clone(&witness);
+            effect_sync! { body: move || {
+                let _ = witness.fetch_add(1, Ordering::SeqCst);
+            }, }
+        }, };
         assert_eq!(block_on(repeated.run(Arc::new(()))), Exit::Success(()));
         assert_eq!(iterations.load(Ordering::SeqCst), 100_000);
 
@@ -173,15 +198,12 @@ fn deep_graphs_in_subprocess() -> Result<(), Box<dyn std::error::Error>> {
         let request = Arc::clone(&token);
         let entered = Cancellation::new();
         let witness = entered.clone();
-        let forever: Effect<(), (), Cancellation> = Effect::while_loop(
-            || true,
-            move || {
-                let witness = witness.clone();
-                Effect::sync(move || {
-                    let _ = witness.request();
-                })
-            },
-        );
+        let forever: Effect<(), (), Cancellation> = effect! { while_loop; guard: || true, body: move || {
+            let witness = witness.clone();
+            effect_sync! { body: move || {
+                let _ = witness.request();
+            }, }
+        }, };
         let (outcome, ()) = block_on(futures_util::future::join(
             forever.run_cancellable(token),
             async move {

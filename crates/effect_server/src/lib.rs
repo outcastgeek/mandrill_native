@@ -9,6 +9,19 @@
 //! may coexist in the same environment. No runtime is constructed by this crate.
 extern crate self as effect_server;
 
+/// Typed callback blocks using this facade's existing Effect dependency.
+pub use effect::{
+    codec, effect_all, effect_all_concurrent, effect_blocking, effect_cpu, effect_die,
+    effect_finalizer, effect_for_each, effect_for_each_concurrent, effect_from_option,
+    effect_future, effect_map, effect_map_error, effect_on_interrupt, effect_permit,
+    effect_provide_some, effect_provided, effect_race, effect_recover, effect_ref, effect_repeat,
+    effect_resource, effect_retry, effect_sandbox, effect_schema_parse, effect_scope,
+    effect_scope_acquire, effect_socket, effect_stream_for_each, effect_sync, effect_timeout,
+    effect_try_blocking, effect_try_cpu, effect_try_future, effect_try_sync,
+    effect_uninterruptible, effect_using, effect_with_layer, layer, pool, request_resolver,
+    schedule, sink, weak_cache,
+};
+
 mod body;
 mod endpoint;
 mod host;
@@ -23,15 +36,17 @@ pub use body::*;
 /// Describe a reusable endpoint using core Effect/resource binds and ordinary Rust
 /// control flow. Inline resources bind to the endpoint owner and survive until native
 /// body delivery/disconnect and asynchronous cleanup. Descriptor form accepts exactly
-/// one `body { ... }` or `effect(extracted_effect)`, followed by `pipe_through`,
+/// one `body { ... }`, `effect(extracted_effect)`, or `source(existing_endpoint)`, followed by `pipe_through`,
 /// `on_error |error| { ... }`/`on_error(callback)`, and `preconditions(callback, mapper)`.
 /// Extracted Effects keep their own explicit resource ownership; no payload is cloned.
+/// `body: callback` retains a native scoped future factory and its complete Exit errors.
 ///
 /// ```
-/// use effect_server::{Endpoint,ServerError};
-/// let endpoint: Endpoint<ServerError,()> = effect_server::endpoint! {
-///     let greeting = effect::Effect::sync(|| String::from("ready"))?;
-///     effect_server::reply! { text(greeting) }
+/// use effect::effect_sync;
+/// use effect_server::{Endpoint,ServerError,endpoint,reply};
+/// let endpoint: Endpoint<ServerError,()> = endpoint! {
+///     let greeting = effect_sync! { body { String::from("ready") } }?;
+///     reply! { text(greeting) }
 /// };
 /// let _ = endpoint;
 /// ```
@@ -47,8 +62,8 @@ pub use effect_macros::endpoint;
 /// renderer is never recursively invoked, and failures after commitment cannot replace bytes.
 ///
 /// ```
-/// use effect_server::{Pipeline,ServerError};
-/// let pipeline: Pipeline<ServerError,()> = effect_server::pipeline! {
+/// use effect_server::{Pipeline,ServerError,pipeline};
+/// let pipeline: Pipeline<ServerError,()> = pipeline! {
 ///     before |request| { let _method=request.method().clone(); () }
 ///     on_exit |_request, outcome| {
 ///         let _succeeded=matches!(outcome,effect::PrimaryOutcomeRef::Succeeded);
@@ -57,6 +72,7 @@ pub use effect_macros::endpoint;
 /// };
 /// let _ = pipeline;
 /// ```
+/// `source(existing_pipeline)` must precede stages and reuses that owned description.
 pub use effect_macros::pipeline;
 /// Attach registration metadata to a completed endpoint without running its body.
 /// Required `endpoint` is separate from `name`, `tags`, `summary`, `description`,
@@ -67,11 +83,11 @@ pub use effect_macros::pipeline;
 /// by the caller's trusted policy rather than granting access by itself.
 ///
 /// ```
-/// use effect_server::{Endpoint,ServerError};
-/// let endpoint: Endpoint<ServerError,()> = effect_server::endpoint! {
-///     effect_server::reply! { text(String::from("ready")) }
+/// use effect_server::{Endpoint,ServerError,endpoint,reply,registered};
+/// let endpoint: Endpoint<ServerError,()> = endpoint! {
+///     reply! { text(String::from("ready")) }
 /// };
-/// let registered = effect_server::registered! { endpoint: endpoint,
+/// let registered = registered! { endpoint: endpoint,
 ///     name: "readiness", summary: "Application readiness",
 ///     produces: vec![effect_server::native::http::HeaderValue::from_static("text/plain")] };
 /// let _ = registered;
@@ -84,12 +100,14 @@ pub use effect_macros::registered;
 /// status. Missing/multiple bodies and bodyless status/trailer combinations are errors.
 /// Terminals cover text, HTML, render, JSON/writer codecs, problem/validation, bytes,
 /// stream/SSE, negotiate, native, redirect, file path, no-content, and empty.
+/// `source(reply)` applies metadata to an existing Reply; `finite(reply)` transfers
+/// an owned FiniteReply through the native constructor without collecting a body.
 /// HTML strings require `HtmlContent::text` or the explicit trusted-markup constructor.
 /// Codec JSON requires `JsonWriterCodec::require` and an explicit writer policy.
 ///
 /// ```
-/// use effect_server::{Reply,HtmlContent,ServerError};
-/// let reply: Reply<ServerError,()> = effect_server::reply! {
+/// use effect_server::{Reply,HtmlContent,ServerError,reply};
+/// let reply: Reply<ServerError,()> = reply! {
 ///     html(HtmlContent::text("<user supplied>"))
 /// };
 /// let _ = reply;
@@ -104,8 +122,8 @@ pub use effect_macros::reply;
 /// selected renderer. HEAD retains selected fields without invoking that renderer.
 ///
 /// ```
-/// use effect_server::ServerError;
-/// let choices = effect_server::representations! {
+/// use effect_server::{ServerError,representations};
+/// let choices = representations! {
 ///     text(|text: String| effect::Effect::<String,ServerError,()>::from_result_once(Ok(text)))
 /// };
 /// let _ = choices;
@@ -120,10 +138,10 @@ pub use effect_macros::representations;
 /// Construction returns `Result<Route<A>,ServerError>` and validates dynamic syntax.
 ///
 /// ```
-/// use effect_server::{Route,Scalar,ServerError};
+/// use effect_server::{Route,Scalar,ServerError,route};
 /// fn user_route() -> Result<Route<u64>,ServerError> {
 ///     let id=Scalar::new(|text: &str| text.parse::<u64>().map_err(|_| ServerError::Invalid("id".into())), |id: &u64| Ok(id.to_string()));
-///     effect_server::route! { name("user"), literal("/users"), capture("id", id) }
+///     route! { name("user"), literal("/users"), capture("id", id) }
 /// }
 /// ```
 pub use effect_macros::route;
@@ -137,15 +155,16 @@ pub use effect_macros::route;
 /// GET fallback, and native 404/405 semantics include the appropriate Allow field.
 ///
 /// ```
-/// use effect_server::{Endpoint,Router,ServerError};
-/// let endpoint: Endpoint<ServerError,()> = effect_server::endpoint! {
-///     effect_server::reply! { text(String::from("ready")) }
+/// use effect_server::{Endpoint,Router,ServerError,endpoint,reply,router};
+/// let endpoint: Endpoint<ServerError,()> = endpoint! {
+///     reply! { text(String::from("ready")) }
 /// };
-/// let routes: Result<Router<ServerError,()>,ServerError> = effect_server::router! {
+/// let routes: Result<Router<ServerError,()>,ServerError> = router! {
 ///     get("/ready", endpoint)
 /// };
 /// let _ = routes;
 /// ```
+/// Start from an existing owned router with `source(existing_router)` before adding routes.
 pub use effect_macros::router;
 /// Reusable route-module syntax with the same checked grammar and result as `router!`.
 /// Include the returned description using `include(module)`; request bodies remain lazy.
@@ -154,6 +173,7 @@ pub use effect_macros::routes;
 /// `protocols`, and `routes` fields. Extracted expressions evaluate once in written
 /// order; neither endpoint bodies nor listening run during construction. The result
 /// is `Result<Server<E,R>, ServerError>` and starts only with `run` or `with_host`.
+/// `source(existing_server)` replaces the construction fields and returns the configured Server directly.
 /// Optional calls are `configure_app`, `configure_builder`, `before_routing`,
 /// `after_response`, `before_environment`,
 /// `middleware`, `around_request`, `around_selection`, and feature-gated `websockets`.
@@ -161,12 +181,12 @@ pub use effect_macros::routes;
 /// `around_request` begins under selected R after environment resolution.
 ///
 /// ```
-/// use effect_server::{Server, ServerError, ServerPolicy, RequestBinding, Router, HttpProtocols};
+/// use effect_server::{Server, ServerError, ServerPolicy, RequestBinding, Router, HttpProtocols, server};
 /// fn describe<E: Send + 'static,R: Send + Sync + 'static>(
 ///     policy: ServerPolicy<E,R>, environment: RequestBinding<E,R>,
 ///     listen: std::net::SocketAddr, routes: Router<E,R>,
 /// ) -> Result<Server<E,R>,ServerError> {
-///     effect_server::server! { policy: policy, environment: environment,
+///     server! { policy: policy, environment: environment,
 ///         listen: listen, protocols: HttpProtocols::Http1, routes: routes }
 /// }
 /// ```
@@ -180,8 +200,8 @@ pub use effect_macros::server;
 /// separately selected framing/cursor policy; no detached writer is started.
 ///
 /// ```
-/// use effect_server::{BodyProgram,ServerError};
-/// let body: BodyProgram<ServerError,()> = effect_server::stream! {
+/// use effect_server::{BodyProgram,ServerError,stream};
+/// let body: BodyProgram<ServerError,()> = stream! {
 ///     body |writer| { writer.write(effect_server::native::bytes::Bytes::from_static(b"ready"))?; () }
 /// };
 /// let _ = body;
