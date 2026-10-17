@@ -2,6 +2,7 @@
 const diagnostics = @import("internal/diagnostics.zig");
 const std = @import("std");
 const Defect = @import("outcome.zig").Defect;
+const ownership = @import("dsl/ownership.zig");
 
 /// Specialize the typed decision outcome for schedule operations.
 /// Parameters:
@@ -171,6 +172,7 @@ pub fn upTo(limit: std.Io.Duration, schedule: anytype) UpTo(@TypeOf(schedule)) {
 /// Returns (`type`): schedule stopping at the supplied elapsed-time bound.
 pub fn UpTo(comptime Inner: type) type {
     return struct {
+        pub const effect_owned_payload = ownership.containsOwned(Inner);
         /// Input value type accepted by this Schedule.
         pub const Input = Inner.Input;
         /// Typed result value produced by this definition.
@@ -179,6 +181,9 @@ pub fn UpTo(comptime Inner: type) type {
         pub const uses_random = Inner.uses_random;
         limit: std.Io.Duration,
         inner: Inner,
+        pub fn deinit(self: *@This()) void {
+            ownership.discard(&self.inner);
+        }
 
         /// Advance the schedule or state machine by one decision.
         /// Parameters:
@@ -217,6 +222,7 @@ pub fn jitter(min_factor: f64, max_factor: f64, schedule: anytype) Jitter(@TypeO
 /// Returns (`type`): schedule applying bounded randomness to each selected delay.
 pub fn Jitter(comptime Inner: type) type {
     return struct {
+        pub const effect_owned_payload = ownership.containsOwned(Inner);
         /// Input value type accepted by this Schedule.
         pub const Input = Inner.Input;
         /// Typed result value produced by this definition.
@@ -226,6 +232,9 @@ pub fn Jitter(comptime Inner: type) type {
         min_factor: f64,
         max_factor: f64,
         inner: Inner,
+        pub fn deinit(self: *@This()) void {
+            ownership.discard(&self.inner);
+        }
 
         /// Advance the schedule or state machine by one decision.
         /// Parameters:
@@ -241,7 +250,11 @@ pub fn Jitter(comptime Inner: type) type {
             return switch (self.inner.step(input, elapsed, sample)) {
                 .continue_with => |next| blk: {
                     const nanos: f64 = @floatFromInt(next.delay.nanoseconds);
-                    const delayed = duration(nanos * (self.min_factor + sample * (self.max_factor - self.min_factor))) orelse break :blk .{ .invalid = invalid(delay_contract) };
+                    const delayed = duration(nanos * (self.min_factor + sample * (self.max_factor - self.min_factor))) orelse {
+                        var discarded = next.output;
+                        ownership.discard(&discarded);
+                        break :blk .{ .invalid = invalid(delay_contract) };
+                    };
                     break :blk .{ .continue_with = .{ .output = next.output, .delay = delayed } };
                 },
                 .stop => |output| .{ .stop = output },
@@ -268,6 +281,7 @@ pub fn intersect(left: anytype, right: anytype) Intersection(@TypeOf(left), @Typ
 pub fn Intersection(comptime Left: type, comptime Right: type) type {
     if (Left.Input != Right.Input) @compileError(diagnostics.intersected_schedules_must_accept_the_same_input_type);
     return struct {
+        pub const effect_owned_payload = ownership.containsOwned(Left) or ownership.containsOwned(Right);
         /// Input value type accepted by this Schedule.
         pub const Input = Left.Input;
         /// Typed result value produced by this definition.
@@ -276,6 +290,10 @@ pub fn Intersection(comptime Left: type, comptime Right: type) type {
         pub const uses_random = Left.uses_random or Right.uses_random;
         left: Left,
         right: Right,
+        pub fn deinit(self: *@This()) void {
+            ownership.discard(&self.right);
+            ownership.discard(&self.left);
+        }
 
         /// Advance the schedule or state machine by one decision.
         /// Parameters:
@@ -287,8 +305,16 @@ pub fn Intersection(comptime Left: type, comptime Right: type) type {
         pub fn step(self: *@This(), input: Input, elapsed: std.Io.Duration, sample: f64) Decision(Output) {
             const a = self.left.step(input, elapsed, sample);
             const b = self.right.step(input, elapsed, sample);
-            if (a == .invalid) return .{ .invalid = a.invalid };
-            if (b == .invalid) return .{ .invalid = b.invalid };
+            if (a == .invalid) {
+                var discarded = b;
+                ownership.discard(&discarded);
+                return .{ .invalid = a.invalid };
+            }
+            if (b == .invalid) {
+                var discarded = a;
+                ownership.discard(&discarded);
+                return .{ .invalid = b.invalid };
+            }
             const output: Output = .{ if (a == .stop) a.stop else a.continue_with.output, if (b == .stop) b.stop else b.continue_with.output };
             if (a == .stop or b == .stop) return .{ .stop = output };
             return .{ .continue_with = .{ .output = output, .delay = .{ .nanoseconds = @max(a.continue_with.delay.nanoseconds, b.continue_with.delay.nanoseconds) } } };
@@ -320,6 +346,7 @@ pub fn unfold(comptime InputType: type, comptime OutputType: type, state: anytyp
 /// Returns (`type`): stateful schedule driven by the supplied typed transition callback.
 pub fn Unfold(comptime InputType: type, comptime OutputType: type, comptime State: type, comptime random: bool, comptime next: fn (*State, InputType, std.Io.Duration, f64) Decision(OutputType)) type {
     return struct {
+        pub const effect_owned_payload = ownership.containsOwned(State);
         /// Input value type accepted by this Schedule.
         pub const Input = InputType;
         /// Typed result value produced by this definition.
@@ -327,6 +354,9 @@ pub fn Unfold(comptime InputType: type, comptime OutputType: type, comptime Stat
         /// Compile-time indication that this Schedule consumes the environment’s random source.
         pub const uses_random = random;
         state: State,
+        pub fn deinit(self: *@This()) void {
+            ownership.discard(&self.state);
+        }
 
         /// Advance the schedule or state machine by one decision.
         /// Parameters:
@@ -337,8 +367,11 @@ pub fn Unfold(comptime InputType: type, comptime OutputType: type, comptime Stat
         /// Returns (`Decision(Output)`): A schedule decision to continue with an output and delay, or stop.
         pub fn step(self: *@This(), input: Input, elapsed: std.Io.Duration, sample: f64) Decision(Output) {
             const decision = next(&self.state, input, elapsed, sample);
-            if (decision == .continue_with and decision.continue_with.delay.nanoseconds < 0)
+            if (decision == .continue_with and decision.continue_with.delay.nanoseconds < 0) {
+                var discarded = decision.continue_with.output;
+                ownership.discard(&discarded);
                 return .{ .invalid = invalid(delay_contract) };
+            }
             return decision;
         }
     };

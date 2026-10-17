@@ -158,10 +158,18 @@ pub const Services = struct {
 /// std.mem.Allocator`, `destroy: *const fn (*DescriptionNode) void`, `origin: ServiceOrigin`; release
 /// its owned state with `deinit`.
 pub const DescriptionNode = struct {
+    // Known retained capture evidence survives Effect type erasure.
+    concurrent_safe: bool = true,
     previous: ?*DescriptionNode,
     allocator: std.mem.Allocator,
     destroy: *const fn (*DescriptionNode) void,
     origin: ServiceOrigin,
+    references: std.atomic.Value(usize) = .init(1),
+
+    /// Retain this chain while deferred work borrows its typed storage.
+    pub fn retain(self: *DescriptionNode) void {
+        _ = self.references.fetchAdd(1, .monotonic);
+    }
 
     /// `ServiceOrigin` is a callback interface with `data: *const anyopaque`, `resolve: *const fn
     /// (*const anyopaque, *const anyopaque) Services`.
@@ -187,8 +195,37 @@ pub const DescriptionNode = struct {
     pub fn deinit(head: ?*DescriptionNode) void {
         var current = head;
         while (current) |node| {
+            if (node.references.fetchSub(1, .acq_rel) != 1) return;
             current = node.previous;
             node.destroy(node);
+        }
+    }
+};
+
+/// Per-job retained description roots. These survive every factory replacement
+/// until the complete returned computation and its description cleanup finish.
+/// Links are independent from DescriptionNode.previous, preserving its iterative
+/// release and allowing one borrowed ancestor to support overlapping runs.
+pub const RetainedDescription = struct {
+    owner: *DescriptionNode,
+    next: ?*RetainedDescription,
+
+    pub fn create(owner: *DescriptionNode, next: ?*RetainedDescription) error{OutOfMemory}!*RetainedDescription {
+        const held = try owner.allocator.create(RetainedDescription);
+        owner.retain();
+        held.* = .{ .owner = owner, .next = next };
+        return held;
+    }
+
+    pub fn deinit(head: ?*RetainedDescription) void {
+        var current = head;
+        while (current) |held| {
+            const next = held.next;
+            const owner = held.owner;
+            const allocator = owner.allocator;
+            allocator.destroy(held);
+            DescriptionNode.deinit(owner);
+            current = next;
         }
     }
 };
@@ -205,6 +242,9 @@ pub const State = struct {
     span: ?providers.SpanId = null,
     fiber: bool = false,
     protected_failure: bool = false,
+    // An acknowledged domain publication must survive its protected cleanup.
+    // Starting subsequent ordinary work clears this delivery obligation.
+    committed_delivery: bool = false,
     ignore_environment_cancellation: bool = false,
 
     /// Check whether this state has no pending work or terminal outcome.
@@ -217,7 +257,7 @@ pub const State = struct {
         // retain the ordinary evaluator and its supplied runtime dependencies.
         return self.services.allocator == null and self.services.io == null and
             self.services.cancellation == null and self.services.poll == null and
-            self.origin_cancellation == null and self.branch_cancellation == null and self.interruption == .clear and self.protection == 0 and self.annotations.len == 0 and self.span == null and !self.fiber and !self.protected_failure and !self.ignore_environment_cancellation;
+            self.origin_cancellation == null and self.branch_cancellation == null and self.interruption == .clear and self.protection == 0 and self.annotations.len == 0 and self.span == null and !self.fiber and !self.protected_failure and !self.committed_delivery and !self.ignore_environment_cancellation;
     }
 
     /// Observe whether cancellation has been requested.
@@ -260,7 +300,7 @@ pub const State = struct {
     /// - `value: anytype`: Caller-supplied input used by this operation.
     /// Returns (`@TypeOf(value)`): The published value.
     pub inline fn publish(self: *State, value: anytype) @TypeOf(value) {
-        if (!self.cancelled()) return value;
+        if (self.committed_delivery or !self.cancelled()) return value;
         return switch (value) {
             .success => blk: {
                 var discarded = value;

@@ -78,6 +78,10 @@ pub const CleanupFailure = @import("outcome.zig").CleanupFailure;
 pub const Cancellation = @import("internal/runtime.zig").Cancellation;
 /// Lazy program specialized by success `A`, error `E`, and environment `R`.
 pub const Effect = @import("effect.zig").Effect;
+/// Contextual role adapters returning the exact existing Effect type.
+pub const Dsl = @import("dsl.zig").Dsl;
+/// Source-driven inference, typed captures, selectors, and pipeline stages.
+pub const dsl = @import("dsl.zig");
 /// Comptime sequencing helpers for effects sharing `E` and `R`.
 pub const EffectBuilder = @import("effect.zig").EffectBuilder;
 /// Scoped resource value paired with its release contract.
@@ -100,6 +104,8 @@ pub const Stream = @import("effect.zig").Stream;
 pub const StreamPubSub = @import("stream_pubsub.zig");
 /// Typed consumer that folds a stream into one result.
 pub const Sink = @import("sink.zig").Sink;
+/// Inferred stateful pure/effectful result folds on the ordinary Effect kernel.
+pub const SinkBuilder = @import("sink_builder.zig");
 /// Bounded, incremental NDJSON records. Each returned record owns its bytes; the transport may release
 /// a fed chunk immediately. The JSON value itself is decoded by the caller's typed Schema codec.
 pub const Ndjson = @import("encoding/ndjson.zig");
@@ -510,6 +516,7 @@ pub const EventGroup = @import("eventlog/event.zig").Group;
 /// Typed replay over authoritative journal pages. Pure folds are separate from event handlers and never
 /// publish a checkpoint on partial failure.
 pub const EventProjection = @import("eventlog/projection.zig");
+pub const EventProjectionCases = @import("eventlog/projection_cases.zig");
 /// Data-only replica protocol. A batch carries journal cursors and original event identities;
 /// notifications are never treated as history authority.
 pub const EventReplicaMessage = @import("eventlog/event_log_message.zig");
@@ -636,6 +643,7 @@ pub const ClusterOwnership = @import("cluster/cluster_capabilities.zig").Ownersh
 pub const MemoryClusterOwnership = @import("cluster/memory_cluster.zig").MemoryOwnership;
 /// Scoped entity resource acquisition and release.
 pub const ClusterEntityResource = @import("cluster/entity_resource.zig").EntityResource;
+pub const ClusterEntityResourcePlan = @import("cluster/entity_resource_plan.zig");
 /// Run work under a fenced singleton lease.
 pub const ClusterWithSingletonLease = @import("cluster/singleton.zig").withLease;
 /// Versioned recurring cluster schedule with explicit calendar and search policy.
@@ -648,8 +656,12 @@ pub const AtomRef = @import("reactivity/atom_ref.zig").AtomRef;
 pub const ReactiveDependencyGraph = @import("reactivity/internal/dependency_graph.zig").Graph;
 /// Explicit limits on graph nodes and dependencies per node.
 pub const ReactiveGraphLimits = @import("reactivity/internal/dependency_graph.zig").Limits;
+/// Restricted actual-read programs with atomic generation/revision publication.
+pub const AtomProgram = @import("reactivity/atom_program.zig");
 /// Registry of typed atom definitions and their subscription state.
 pub const AtomRegistry = @import("reactivity/atom_registry.zig").Registry;
+/// Checked registry, graph, and invalidation failures.
+pub const AtomRegistryError = @import("reactivity/atom_registry.zig").Error;
 /// Typed reactive atom definition.
 pub const Atom = @import("reactivity/atom.zig").Atom;
 /// Comptime reactive atom definition.
@@ -773,6 +785,12 @@ pub const MemoryEventJournal = @import("eventlog/memory_event_journal.zig").Memo
 /// and cursor indivisibly. The caller does not infer this guarantee from a key/value store or from a
 /// notification channel. Missing/compacted journal history remains a typed EventLog failure.
 pub const AtomicProjectionCheckpoint = @import("eventlog/projection_checkpoint.zig").AtomicCheckpointStore;
+/// Owned state and cursor read from an atomic projection checkpoint store.
+pub const ProjectionCheckpoint = @import("eventlog/projection_checkpoint.zig").Checkpoint;
+/// Expected cursor revision used by atomic projection publication.
+pub const ProjectionCheckpointRevision = @import("eventlog/projection_checkpoint.zig").Revision;
+/// Atomic publication acknowledgement, including conflict and uncertainty.
+pub const ProjectionCheckpointCommit = @import("eventlog/projection_checkpoint.zig").CommitResult;
 /// In-memory projection checkpoint provider.
 pub const MemoryProjectionCheckpoint = @import("eventlog/memory_projection_checkpoint.zig").MemoryProjectionCheckpoint;
 /// Logical identities and ownership data, independent of physical topology.

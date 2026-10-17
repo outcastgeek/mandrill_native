@@ -11,6 +11,7 @@ pub const Error = union(enum) {
     graph: graph_module.Error,
     invalidation: invalidation.Error,
     closed,
+    evaluation_generation_exhausted,
 };
 
 /// Change in an atom’s declared dependency relationships.
@@ -53,6 +54,7 @@ pub const Registry = struct {
     graph: graph_module.Graph,
     invalidations: invalidation.Registry,
     closed: bool = false,
+    evaluations: std.StringHashMap(u64),
 
     /// Construct the selected resource or definition.
     /// Parameters:
@@ -99,7 +101,7 @@ pub const Registry = struct {
             },
             .finalization_failed => unreachable,
         };
-        owner.* = .{ .allocator = env.allocator, .io = env.io, .graph = graph, .invalidations = invalidations };
+        owner.* = .{ .allocator = env.allocator, .io = env.io, .graph = graph, .invalidations = invalidations, .evaluations = std.StringHashMap(u64).init(env.allocator) };
         return .{ .success = owner };
     }
 
@@ -212,6 +214,92 @@ pub const Registry = struct {
         return .{ .success = .{ .graph_generation = generation, .invalidation = notice } };
     }
 
+    /// Evaluation identity and owner revision captured at admission.
+    pub const EvaluationTicket = struct { generation: u64, revision: u64 };
+    pub const Observation = struct { key: []const u8, revision: u64 };
+    pub const Publication = union(enum) {
+        pub const effect_owned_payload = true;
+        stale,
+        committed: DependencyUpdate,
+        pub fn deinit(self: *@This()) void {
+            if (self.* == .committed) self.committed.deinit();
+        }
+        pub fn clone(self: *const @This()) error{OutOfMemory}!@This() {
+            return switch (self.*) {
+                .stale => .stale,
+                .committed => |value| .{ .committed = try value.clone() },
+            };
+        }
+    };
+
+    pub fn beginEvaluation(self: *Self, key: []const u8) outcomes.Exit(EvaluationTicket, Error) {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.closed) return .{ .fail = .closed };
+        const current = self.evaluations.get(key) orelse 0;
+        if (current == std.math.maxInt(u64)) return .{ .fail = .evaluation_generation_exhausted };
+        if (self.evaluations.getPtr(key)) |generation| generation.* = current + 1 else {
+            const copied = self.allocator.dupe(u8, key) catch return .{ .die = outcomes.Defect.out_of_memory };
+            self.evaluations.put(copied, current + 1) catch {
+                self.allocator.free(copied);
+                return .{ .die = outcomes.Defect.out_of_memory };
+            };
+        }
+        const revision = self.invalidations.generation(key);
+        return switch (revision) {
+            .success => |value| .{ .success = .{ .generation = current + 1, .revision = value } },
+            .fail => |e| .{ .fail = .{ .invalidation = e } },
+            .die => |e| .{ .die = e },
+            .interrupted => .interrupted,
+            .finalization_failed => unreachable,
+        };
+    }
+
+    pub fn observedRevision(self: *Self, key: []const u8) outcomes.Exit(u64, Error) {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.closed) return .{ .fail = .closed };
+        return switch (self.invalidations.generation(key)) {
+            .success => |v| .{ .success = v },
+            .fail => |e| .{ .fail = .{ .invalidation = e } },
+            .die => |e| .{ .die = e },
+            .interrupted => .interrupted,
+            .finalization_failed => unreachable,
+        };
+    }
+
+    /// Generation, dependency revisions and graph replacement share one commit
+    /// guard. Notification occurs after that committed transition and retains
+    /// its independent outcome, exactly as replaceDependencies does.
+    pub fn publishEvaluation(self: *Self, key: []const u8, ticket: EvaluationTicket, observations: []const Observation) outcomes.Exit(Publication, Error) {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.closed) return .{ .fail = .closed };
+        self.invalidations.mutex.lockUncancelable(self.io);
+        var guarded = true;
+        defer if (guarded) self.invalidations.mutex.unlock(self.io);
+        if (self.invalidations.closed) return .{ .fail = .closed };
+        if (self.evaluations.get(key) != ticket.generation or (self.invalidations.generations.get(key) orelse 0) != ticket.revision) return .{ .success = .stale };
+        for (observations) |observed| if ((self.invalidations.generations.get(observed.key) orelse 0) != observed.revision) return .{ .success = .stale };
+        if (ticket.generation == std.math.maxInt(u64)) return .{ .fail = .evaluation_generation_exhausted };
+        const dependencies = self.allocator.alloc([]const u8, observations.len) catch return .{ .die = outcomes.Defect.out_of_memory };
+        defer self.allocator.free(dependencies);
+        for (observations, dependencies) |observed, *slot| slot.* = observed.key;
+        const replaced = self.graph.replace(key, dependencies);
+        const generation = switch (replaced) {
+            .success => |g| g,
+            .fail => |e| return .{ .fail = .{ .graph = e } },
+            .die => |e| return .{ .die = e },
+            .interrupted => return .interrupted,
+            .finalization_failed => unreachable,
+        };
+        // Consuming this generation makes duplicate/copy publication stale.
+        self.evaluations.getPtr(key).?.* = ticket.generation + 1;
+        self.invalidations.mutex.unlock(self.io);
+        guarded = false;
+        return .{ .success = .{ .committed = .{ .graph_generation = generation, .invalidation = self.invalidateLocked(key) } } };
+    }
+
     /// Subscribe to invalidation or atom changes.
     /// Parameters:
     /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
@@ -258,6 +346,9 @@ pub const Registry = struct {
         self.shutdown();
         self.graph.deinit();
         self.invalidations.deinit();
+        var evaluations = self.evaluations.keyIterator();
+        while (evaluations.next()) |key| self.allocator.free(key.*);
+        self.evaluations.deinit();
         const allocator = self.allocator;
         self.* = undefined;
         allocator.destroy(self);

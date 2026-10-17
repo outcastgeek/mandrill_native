@@ -119,7 +119,7 @@ pub const Semaphore = struct {
         comptime E: type,
         comptime select: fn (*const R) *Self,
         comptime map_error: fn (Error) E,
-        comptime use: fn (void) effects.Effect(A, E, R),
+        comptime use: anytype,
     ) effects.Effect(A, E, R) {
         const Acquire = effects.Effect(void, Error, R);
         const acquire = Acquire.fromNativeCancellableBorrowed(void, &{}, struct {
@@ -129,11 +129,11 @@ pub const Semaphore = struct {
         }.run).mapError(map_error);
         return acquire.acquireRelease(use, struct {
             fn finish(_: void, _: outcomes.PrimaryOutcome(E)) effects.Effect(void, E, R) {
-                return effects.Effect(void, Error, R).fromOutcome(struct {
+                return (comptime effects.Effect(void, Error, R).fromOutcome(struct {
                     fn run(env: *const R) outcomes.Exit(void, Error) {
                         return select(env).release();
                     }
-                }.run).mapError(map_error);
+                }.run)).mapError(map_error);
             }
         }.finish);
     }
@@ -149,6 +149,30 @@ pub const Semaphore = struct {
         defer self.mutex.unlock(self.io);
         self.closed = true;
         Waiter.signalAll(self.waiters);
+    }
+
+    /// The same permit authority with application inputs retained by its
+    /// bracket description until the body and protected release finish.
+    pub fn withPermitCaptured(comptime R: type, comptime A: type, comptime E: type, env: *const R, capture: anytype, comptime select: fn (*const R) *Self, comptime map_error: fn (Error) E, comptime use: fn (*const @TypeOf(capture), *const R) effects.Effect(A, E, R)) effects.Effect(A, E, R) {
+        const Capture = @TypeOf(capture);
+        var acquire = comptime effects.Effect(void, Error, R).fromNativeCancellableBorrowed(void, &{}, struct {
+            fn run(_: *const void, current: *const R, token: ?*const Cancellation) outcomes.Exit(void, Error) {
+                return select(current).acquireToken(token);
+            }
+        }.run).mapError(map_error);
+        return acquire.acquireReleaseCapturedOwned(env, capture, struct {
+            fn body(stored: *const Capture, _: void, current: *const R) effects.Effect(A, E, R) {
+                return use(stored, current);
+            }
+        }.body, struct {
+            fn release(_: *const Capture, _: void, _: outcomes.PrimaryOutcome(E), _: *const R) effects.Effect(void, E, R) {
+                return (comptime effects.Effect(void, Error, R).fromOutcome(struct {
+                    fn run(current: *const R) outcomes.Exit(void, Error) {
+                        return select(current).release();
+                    }
+                }.run)).mapError(map_error);
+            }
+        }.release);
     }
 
     /// Release resources owned by this value.
@@ -348,7 +372,7 @@ pub const PartitionedSemaphore = struct {
         comptime select: fn (*const R) *Self,
         comptime select_key: fn (*const R) []const u8,
         comptime map_error: fn (PartitionError) E,
-        comptime use: fn (void) effects.Effect(A, E, R),
+        comptime use: anytype,
     ) effects.Effect(A, E, R) {
         const Acquire = effects.Effect(*Entry, PartitionError, R);
         const acquire = Acquire.fromNativeCancellableBorrowed(void, &{}, struct {
@@ -357,8 +381,8 @@ pub const PartitionedSemaphore = struct {
             }
         }.run).mapError(map_error);
         return acquire.acquireRelease(struct {
-            fn body(_: *Entry) effects.Effect(A, E, R) {
-                return use({});
+            fn body(_: *Entry, env: *const R) effects.Effect(A, E, R) {
+                return @import("dsl/inference.zig").call(use, @as(void, {}), env);
             }
         }.body, struct {
             fn finish(entry: *Entry, _: outcomes.PrimaryOutcome(E)) effects.Effect(void, E, R) {
@@ -379,6 +403,38 @@ pub const PartitionedSemaphore = struct {
                 }.release);
             }
         }.finish);
+    }
+
+    pub fn withPermitCaptured(comptime R: type, comptime A: type, comptime E: type, env: *const R, capture: anytype, comptime select: fn (*const R) *Self, comptime select_key: fn (*const R) []const u8, comptime map_error: fn (PartitionError) E, comptime use: fn (*const @TypeOf(capture), *const R) effects.Effect(A, E, R)) effects.Effect(A, E, R) {
+        const Capture = @TypeOf(capture);
+        var acquire = comptime effects.Effect(*Entry, PartitionError, R).fromNativeCancellableBorrowed(void, &{}, struct {
+            fn run(_: *const void, current: *const R, token: ?*const Cancellation) outcomes.Exit(*Entry, PartitionError) {
+                return select(current).acquireToken(select_key(current), token);
+            }
+        }.run).mapError(map_error);
+        return acquire.acquireReleaseCapturedOwned(env, capture, struct {
+            fn body(stored: *const Capture, _: *Entry, current: *const R) effects.Effect(A, E, R) {
+                return use(stored, current);
+            }
+        }.body, struct {
+            fn release(_: *const Capture, entry: *Entry, _: outcomes.PrimaryOutcome(E), _: *const R) effects.Effect(void, E, R) {
+                return effects.Effect(void, E, R).fromBorrowed(Entry, entry, struct {
+                    fn run(owner: *const Entry, _: *const R) outcomes.Exit(void, E) {
+                        const active = @constCast(owner);
+                        const released = active.semaphore.release();
+                        const result: outcomes.Exit(void, E) = switch (released) {
+                            .success => .{ .success = {} },
+                            .fail => |problem| .{ .fail = map_error(.{ .semaphore = problem }) },
+                            .die => |defect| .{ .die = defect },
+                            .interrupted => .interrupted,
+                            .finalization_failed => unreachable,
+                        };
+                        active.owner.releaseEntry(active);
+                        return result;
+                    }
+                }.run);
+            }
+        }.release);
     }
 
     /// Stop the capability and release its retained resources.

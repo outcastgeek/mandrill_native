@@ -476,20 +476,31 @@ pub fn Pair(comptime A: type, comptime B: type) type {
 /// - `transform: comptime fn (@TypeOf(value).Error) F`: Compile-time typed callback; its signature is checked at comptime where static.
 /// Returns (`Exit(@TypeOf(value).Success, F)`): Carries `@TypeOf(value).Success` on `.success` or `F` on `.fail`; `.die`, `.interrupt`, and `.cleanup` preserve other terminal causes.
 pub fn mapError(comptime F: type, value: anytype, allocator: ?std.mem.Allocator, comptime transform: fn (@TypeOf(value).Error) F) Exit(@TypeOf(value).Success, F) {
+    return mapErrorCaptured(F, value, allocator, @as(void, {}), struct {
+        fn apply(_: void, err: @TypeOf(value).Error) F {
+            return transform(err);
+        }
+    }.apply);
+}
+
+/// Map an error and its cleanup records with explicitly borrowed context.
+/// Context is used synchronously; every mapped owning error transfers to the
+/// returned Exit through the same metadata conversion as mapError.
+pub fn mapErrorCaptured(comptime F: type, value: anytype, allocator: ?std.mem.Allocator, capture: anytype, comptime transform: fn (@TypeOf(capture), @TypeOf(value).Error) F) Exit(@TypeOf(value).Success, F) {
     const A = @TypeOf(value).Success;
     const Mapping = struct {
-        fn primary(source: PrimaryOutcome(@TypeOf(value).Error)) PrimaryOutcome(F) {
+        fn primary(context: @TypeOf(capture), source: PrimaryOutcome(@TypeOf(value).Error)) PrimaryOutcome(F) {
             return switch (source) {
                 .succeeded => .succeeded,
-                .failed => |err| .{ .failed = transform(err) },
+                .failed => |err| .{ .failed = transform(context, err) },
                 .defected => |defect| .{ .defected = defect },
                 .was_interrupted => .was_interrupted,
             };
         }
 
-        fn cleanup(source: CleanupFailure(@TypeOf(value).Error)) CleanupFailure(F) {
+        fn cleanup(context: @TypeOf(capture), source: CleanupFailure(@TypeOf(value).Error)) CleanupFailure(F) {
             return switch (source) {
-                .release_failure => |err| .{ .release_failure = transform(err) },
+                .release_failure => |err| .{ .release_failure = transform(context, err) },
                 .release_defect => |defect| .{ .release_defect = defect },
                 .release_interrupted => .release_interrupted,
             };
@@ -497,13 +508,13 @@ pub fn mapError(comptime F: type, value: anytype, allocator: ?std.mem.Allocator,
     };
     return switch (value) {
         .success => |result| .{ .success = result },
-        .fail => |err| .{ .fail = transform(err) },
+        .fail => |err| .{ .fail = transform(capture, err) },
         .die => |defect| .{ .die = defect },
         .interrupted => .interrupted,
         .finalization_failed => |details| blk: {
             var mapped: Exit(A, F) = .{ .finalization_failed = .{
-                .primary = Mapping.primary(details.primary),
-                .first = Mapping.cleanup(details.first),
+                .primary = Mapping.primary(capture, details.primary),
+                .first = Mapping.cleanup(capture, details.first),
             } };
             var remaining = details.rest;
             var failed = false;
@@ -511,7 +522,7 @@ pub fn mapError(comptime F: type, value: anytype, allocator: ?std.mem.Allocator,
                 remaining = node.next;
                 // Conversion is eager, including when metadata allocation has
                 // failed. Never defer application mapper calls to iteration.
-                var failure = Mapping.cleanup(node.failure);
+                var failure = Mapping.cleanup(capture, node.failure);
                 var transferred = false;
                 if (!failed) {
                     const allocated = if (allocator) |a| a.create(CleanupNode(F)) catch null else null;

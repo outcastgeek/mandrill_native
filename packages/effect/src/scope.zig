@@ -31,6 +31,7 @@ pub fn Scope(comptime E: type) type {
         active: ?*Finalizer = null,
         cleanup: outcomes.Exit(void, E) = undefined,
         restore_services: rt.Services = undefined,
+        restore_committed_delivery: bool = false,
         finish_data: ?*anyopaque = null,
         finish: ?*const fn (*rt.State, ?*anyopaque, outcomes.Exit(void, E)) rt.Step = null,
 
@@ -104,6 +105,8 @@ pub fn Scope(comptime E: type) type {
         /// Returns (`rt.Step`): The next interpreter step, including suspension or completion.
         pub fn drain(self: *Self, state: *rt.State, data: ?*anyopaque, finish: *const fn (*rt.State, ?*anyopaque, outcomes.Exit(void, E)) rt.Step) rt.Step {
             self.restore_services = state.services;
+            self.restore_committed_delivery = state.committed_delivery;
+            state.committed_delivery = false;
             self.finish_data = data;
             self.finish = finish;
             state.protection += 1;
@@ -119,6 +122,7 @@ pub fn Scope(comptime E: type) type {
             }
             state.protection -= 1;
             state.services = self.restore_services;
+            state.committed_delivery = self.restore_committed_delivery;
             self.mutex.lockUncancelable(self.io);
             self.phase = .closed;
             const value = self.result.clone();

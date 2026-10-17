@@ -1,4 +1,6 @@
 """Verify the declared static-cost proofs share LLVM's optimized functions."""
+from dsl_gate_evidence import fingerprint, completed
+_gate_before = fingerprint('codegen')
 from pathlib import Path
 import re
 import sys
@@ -49,10 +51,11 @@ for baseline, consumers in (
     ("handwritten_write_boolean", ("pure_write_boolean",)),
     ("handwritten_tagged_integer", ("specialized_tagged_integer",)),
     ("handwritten_validate_u8", ("pure_validate_u8",)),
-    ("handwritten", ("effect_map", "effect_bind", "effect_environment_bind")),
-    ("handwritten_two_binds", ("effect_two_binds",)),
+    ("handwritten", ("effect_map", "effect_bind", "effect_environment_bind", "dsl_role", "dsl_selector")),
+    ("handwritten_two_binds", ("effect_two_binds", "dsl_pipeline", "dsl_structured")),
     ("handwritten_eight_binds", ("effect_eight_binds",)),
     ("handwritten_recovery", ("effect_recovery",)),
+    ("handwritten_sixteen", ("dsl_structured_sixteen",)),
 ):
     expected = resolve(baseline)
     for consumer in consumers:
@@ -63,3 +66,5 @@ for baseline, consumers in (
             print(f"{consumer}: same optimized instructions as {baseline}")
 if failures:
     sys.exit("\n".join(failures))
+
+completed('codegen', 'fast', _gate_before)

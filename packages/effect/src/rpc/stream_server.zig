@@ -41,6 +41,9 @@ pub fn StreamServer(
     comptime {
         if (!@hasDecl(Op, "Chunk") or !@hasDecl(Op, "Terminal"))
             @compileError("StreamServer requires a streaming RPC handler");
+        protocol.requireDefinition(Op);
+        handler.operation.validate();
+        if (@TypeOf(handler) != protocol.StreamHandler(Op, R)) @compileError("StreamServer requires a canonical streaming RPC handler");
         if (!@hasField(R, "allocator") or @FieldType(R, "allocator") != std.mem.Allocator or
             !@hasField(R, "io") or @FieldType(R, "io") != std.Io)
             @compileError("StreamServer requires allocator and io in R");
@@ -49,6 +52,17 @@ pub fn StreamServer(
         const Self = @This();
         /// RPC operation type served by this dispatcher.
         pub const Operation = Op;
+        pub const Environment = R;
+        pub const server_definition = struct {
+            pub const Handler = handler;
+            pub const RequestWire = request_wire;
+            pub const ChunkWire = chunk_wire;
+            pub const TerminalWire = terminal_wire;
+            pub const FailureWire = failure_wire;
+            pub const Provider = ProviderError;
+            pub const SelectSession = select_session;
+            pub const SelectPolicy = select_policy;
+        };
         /// Domain-specific error type carried by the operation.
         pub const DomainError = Op.DomainError;
         /// Typed session error variant or error channel described by `transport.Error(ProviderError)`.
@@ -404,7 +418,11 @@ pub fn StreamServer(
                     call.request_envelope = copied;
                     call.context_entries = entries;
                     call.mutex.unlock(supplied.io);
-                    var opening = openInto(select_call, struct {
+                    // A failed opening can already have admitted stream finalizers
+                    // into the request scope. Those finalizers may still borrow
+                    // the decoded request and metadata. Keep both in Call until
+                    // its owner has drained the scope and destroys the call.
+                    return openInto(select_call, struct {
                         fn requestValue(context: *const R) *const Op.Request {
                             return &select_call(context).request.?;
                         }
@@ -414,27 +432,6 @@ pub fn StreamServer(
                             return .{ .correlation = current.correlation, .metadata = current.context_entries.? };
                         }
                     }.contextValue);
-                    var settled = opening.materializeOwned(supplied);
-                    var aligned = settled.mapErrorOwned(supplied, struct {
-                        fn impossible(_: void) Failure {
-                            unreachable;
-                        }
-                    }.impossible);
-                    return aligned.flatMapCapturedOwned(supplied, void, call, struct {
-                        fn finish(current: *const *Call, result: outcomes.Exit(void, Failure), context: *const R) Unit {
-                            if (result != .success) {
-                                current.*.mutex.lockUncancelable(context.io);
-                                if (current.*.request) |*value| outcomes.discardPayload(value);
-                                current.*.request = null;
-                                if (current.*.context_entries) |owned_entries| context.allocator.free(owned_entries);
-                                current.*.context_entries = null;
-                                if (current.*.request_envelope) |*value| value.deinit();
-                                current.*.request_envelope = null;
-                                current.*.mutex.unlock(context.io);
-                            }
-                            return Unit.fromOwnedOutcome(context, result);
-                        }
-                    }.finish);
                 }
             }.decodedRequest);
         }
@@ -606,7 +603,7 @@ pub fn StreamServer(
         /// Returns (`Drive`): The typed operation result or description selected by this API.
         pub fn driveOne(comptime select_call: fn (*const R) *Call) Drive {
             const Acquire = effects.Effect(*Call, Failure, R);
-            const entered = Acquire.fromOutcome(struct {
+            const entered = comptime Acquire.fromOutcome(struct {
                 fn enter(env: *const R) outcomes.Exit(*Call, Failure) {
                     const call = select_call(env);
                     call.mutex.lockUncancelable(env.io);
@@ -774,7 +771,7 @@ pub fn StreamServer(
             return mapped.flatMapCapturedOwned(env, void, SentFrame{ .frame = frame }, afterSend);
         }
 
-        fn pack(comptime kind: envelope.Kind, call: *Call, sequence: ?envelope.Sequence, payload: Bytes, env: *const R) Unit {
+        fn pack(kind: envelope.Kind, call: *Call, sequence: ?envelope.Sequence, payload: Bytes, env: *const R) Unit {
             var owned = payload;
             defer owned.deinit();
             const policy = select_policy(env);
@@ -927,4 +924,11 @@ pub fn StreamServer(
             }.start);
         }
     };
+}
+
+/// Exact constructor identity keeps managed serving tied to this dispatcher.
+pub fn requireServer(comptime T: type) void {
+    if (@typeInfo(T) != .@"struct" or !@hasDecl(T, "server_definition")) @compileError("withRpcSession requires a canonical RPC StreamServer");
+    const D = T.server_definition;
+    if (T != StreamServer(D.Handler, D.RequestWire, D.ChunkWire, D.TerminalWire, D.FailureWire, D.Provider, D.SelectSession, D.SelectPolicy)) @compileError("withRpcSession rejects forged RPC StreamServer evidence");
 }

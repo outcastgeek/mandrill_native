@@ -148,49 +148,85 @@ pub fn Middleware(comptime Service: type, comptime MiddlewareError: type, compti
             env: *const R,
         ) effects.Effect(Output, Failure(DomainError, MiddlewareError), R) {
             const Combined = Failure(DomainError, MiddlewareError);
+            var acquired = self.acquire.mapError(struct {
+                fn middlewareError(problem: MiddlewareError) Combined {
+                    return .{ .middleware = problem };
+                }
+            }.middlewareError);
+            return applyPreparedTo(Request, Output, DomainError, HandlerEnv, &acquired, struct {
+                fn project(_: *const Request, service: *const Service, current: *const R) HandlerEnv {
+                    return connect(service, current);
+                }
+            }.project, handler, null, request, env);
+        }
+
+        /// Consume a runtime acquisition through the same service/environment
+        /// owner used by applyTo. The input may carry invocation configuration;
+        /// its enclosing owner must cover the returned Effect's execution.
+        pub fn applyOwnedTo(
+            self: *Self,
+            comptime Request: type,
+            comptime Output: type,
+            comptime DomainError: type,
+            comptime HandlerEnv: type,
+            comptime connect: anytype,
+            comptime handler: fn (*const Request, *const HandlerEnv) effects.Effect(Output, DomainError, HandlerEnv),
+            request: *const Request,
+            env: *const R,
+        ) effects.Effect(Output, Failure(DomainError, MiddlewareError), R) {
+            const Combined = Failure(DomainError, MiddlewareError);
+            var acquired = self.acquire.mapErrorOwned(env, struct {
+                fn middlewareError(problem: MiddlewareError) Combined {
+                    return .{ .middleware = problem };
+                }
+            }.middlewareError);
+            self.* = undefined;
+            return applyPreparedTo(Request, Output, DomainError, HandlerEnv, &acquired, connect, handler, null, request, env);
+        }
+
+        /// Run an effectful release under the existing resource bracket. Native
+        /// environment cleanup precedes release; native service cleanup follows
+        /// its complete drain, including failure or cancellation.
+        pub fn applyManagedTo(
+            self: *Self,
+            comptime Request: type,
+            comptime Output: type,
+            comptime DomainError: type,
+            comptime HandlerEnv: type,
+            comptime connect: anytype,
+            comptime handler: fn (*const Request, *const HandlerEnv) effects.Effect(Output, DomainError, HandlerEnv),
+            comptime release: fn (*const Request, *const Service, *const outcomes.PrimaryOutcome(Failure(DomainError, MiddlewareError)), *const R) effects.Effect(void, MiddlewareError, R),
+            request: *const Request,
+            env: *const R,
+        ) effects.Effect(Output, Failure(DomainError, MiddlewareError), R) {
+            const Combined = Failure(DomainError, MiddlewareError);
+            var acquired = self.acquire.mapErrorOwned(env, struct {
+                fn middlewareError(problem: MiddlewareError) Combined {
+                    return .{ .middleware = problem };
+                }
+            }.middlewareError);
+            self.* = undefined;
+            return applyPreparedTo(Request, Output, DomainError, HandlerEnv, &acquired, connect, handler, release, request, env);
+        }
+
+        fn applyPreparedTo(
+            comptime Request: type,
+            comptime Output: type,
+            comptime DomainError: type,
+            comptime HandlerEnv: type,
+            acquired: *effects.Effect(Service, Failure(DomainError, MiddlewareError), R),
+            comptime connect: anytype,
+            comptime handler: fn (*const Request, *const HandlerEnv) effects.Effect(Output, DomainError, HandlerEnv),
+            comptime release: anytype,
+            request: *const Request,
+            env: *const R,
+        ) effects.Effect(Output, Failure(DomainError, MiddlewareError), R) {
+            const Combined = Failure(DomainError, MiddlewareError);
             const Program = effects.Effect(Output, Combined, R);
-            const Owner = struct {
-                /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements
-                /// `deinit` and must be released after use.
-                pub const effect_owned_payload = true;
-                const Owned = @This();
-                const Inner = struct { service: Service, projected: HandlerEnv };
-                allocator: std.mem.Allocator,
-                parent: *const R,
-                request: *const Request,
-                inner: *Inner,
-
-                fn init(current_env: *const R, request_value: *const Request, service: Service) error{OutOfMemory}!Owned {
-                    const pointer = current_env.allocator.create(Inner) catch {
-                        var abandoned = service;
-                        outcomes.discardPayload(&abandoned);
-                        return error.OutOfMemory;
-                    };
-                    pointer.service = service;
-                    pointer.projected = connect(&pointer.service, current_env);
-                    return .{ .allocator = current_env.allocator, .parent = current_env, .request = request_value, .inner = pointer };
-                }
-
-                /// Release resources owned by this value.
-                /// Parameters:
-                /// - `owner: *Owned`: Owner identity used for claim and fencing checks.
-                /// Returns (`void`): no value.
-                pub fn deinit(owner: *Owned) void {
-                    outcomes.discardPayload(&owner.inner.projected);
-                    outcomes.discardPayload(&owner.inner.service);
-                    owner.allocator.destroy(owner.inner);
-                    owner.* = undefined;
-                }
-
-                /// Duplicate this value; marked owning payloads are cloned, while ordinary
-                /// borrowed fields retain their original lifetime.
-                /// Parameters:
-                /// - `owner: *const Owned`: Owner identity used for claim and fencing checks.
-                /// Returns (`error{OutOfMemory}!Owned`): A `Owned` on success; `OutOfMemory` if required allocation fails.
-                pub fn clone(owner: *const Owned) error{OutOfMemory}!Owned {
-                    return init(owner.parent, owner.request, try outcomes.clonePayload(owner.inner.service));
-                }
-            };
+            const Acquisition = effects.Effect(Service, Combined, R);
+            const Unit = effects.Effect(void, Combined, R);
+            const Projection = @import("../dsl/inference.zig").result(connect, &.{ *const Request, *const Service, *const R }, "RPC middleware.project");
+            if (Projection != HandlerEnv and Projection != outcomes.Result(HandlerEnv, MiddlewareError) and Projection != effects.Effect(HandlerEnv, MiddlewareError, R)) @compileError("RPC middleware.project requires HandlerEnv, exact Result(HandlerEnv,MiddlewareError), or exact Effect(HandlerEnv,MiddlewareError,R)");
             comptime {
                 if (!@hasField(R, "allocator") or @FieldType(R, "allocator") != std.mem.Allocator or
                     !@hasField(R, "io") or @FieldType(R, "io") != std.Io)
@@ -199,29 +235,93 @@ pub fn Middleware(comptime Service: type, comptime MiddlewareError: type, compti
                     !@hasField(HandlerEnv, "io") or @FieldType(HandlerEnv, "io") != std.Io)
                     @compileError("RPC handler environment must preserve allocator and io capabilities");
             }
-            var acquired = self.acquire.mapError(struct {
-                fn middlewareError(problem: MiddlewareError) Combined {
-                    return .{ .middleware = problem };
+            const Source = struct {
+                pub const effect_owned_payload = true;
+                acquisition: Acquisition,
+                request: *const Request,
+                pub fn deinit(self: *@This()) void {
+                    self.acquisition.deinit();
                 }
-            }.middlewareError);
-            return acquired.flatMapCapturedOwned(env, Output, request, struct {
-                fn afterAcquire(request_ref: *const *const Request, service: Service, supplied: *const R) Program {
-                    const owner = Owner.init(supplied, request_ref.*, service) catch return Program.die(outcomes.Defect.out_of_memory);
-                    const Unit = effects.Effect(void, Combined, R);
-                    var ready = Unit.fromOwnedSuccess(supplied, {});
-                    return ready.flatMapCapturedOwned(supplied, Output, owner, struct {
-                        fn run(capture: *const Owner, _: void, current: *const R) Program {
-                            var handled = handler(capture.request, &capture.inner.projected);
-                            var provided = handled.provideOwned(&capture.inner.projected, R, current);
-                            return provided.mapErrorOwned(current, struct {
-                                fn domainError(problem: DomainError) Combined {
-                                    return .{ .domain = problem };
-                                }
-                            }.domainError);
+            };
+            const Region = struct {
+                const RetainedRegion = @This();
+                pub const effect_owned_payload = true;
+                const Inner = struct { service: ?Service = null, projected: ?HandlerEnv = null };
+                allocator: std.mem.Allocator,
+                request: *const Request,
+                acquisition: Acquisition,
+                inner: *Inner,
+
+                fn dropProjection(self: *const @This()) void {
+                    if (self.inner.projected) |*projected| outcomes.discardPayload(projected);
+                    self.inner.projected = null;
+                }
+                pub fn deinit(self: *@This()) void {
+                    self.dropProjection();
+                    if (self.inner.service) |*service| outcomes.discardPayload(service);
+                    self.allocator.destroy(self.inner);
+                }
+                fn acquire(self: *const @This(), _: *const R) Acquisition {
+                    return self.acquisition.borrow();
+                }
+                fn use(self: *const @This(), service: Service, current: *const R) Program {
+                    self.inner.service = service;
+                    if (comptime Projection == effects.Effect(HandlerEnv, MiddlewareError, R)) {
+                        var projected = connect(self.request, &self.inner.service.?, current);
+                        var checked = projected.mapErrorOwned(current, struct {
+                            fn middlewareError(problem: MiddlewareError) Combined {
+                                return .{ .middleware = problem };
+                            }
+                        }.middlewareError);
+                        return checked.flatMapCapturedOwned(current, Output, self, struct {
+                            fn installed(stored: *const *const RetainedRegion, environment: HandlerEnv, supplied: *const R) Program {
+                                stored.*.inner.projected = environment;
+                                return stored.*.handle(supplied);
+                            }
+                        }.installed);
+                    }
+                    if (comptime Projection == HandlerEnv) {
+                        self.inner.projected = connect(self.request, &self.inner.service.?, current);
+                    } else switch (connect(self.request, &self.inner.service.?, current)) {
+                        .ok => |projected| self.inner.projected = projected,
+                        .err => |problem| return Program.fromOwnedOutcome(current, .{ .fail = .{ .middleware = problem } }),
+                    }
+                    return self.handle(current);
+                }
+                fn handle(self: *const @This(), current: *const R) Program {
+                    var handled = handler(self.request, &self.inner.projected.?);
+                    var provided = handled.provideOwned(&self.inner.projected.?, R, current);
+                    return provided.mapErrorOwned(current, struct {
+                        fn domainError(problem: DomainError) Combined {
+                            return .{ .domain = problem };
                         }
-                    }.run);
+                    }.domainError);
                 }
-            }.afterAcquire);
+                fn close(self: *const @This(), service: Service, primary: *const outcomes.PrimaryOutcome(Combined), current: *const R) Unit {
+                    // The bracket also calls release after a successful late
+                    // acquisition when cancellation skipped the body.
+                    if (self.inner.service == null) self.inner.service = service;
+                    self.dropProjection();
+                    if (comptime @TypeOf(release) == @TypeOf(null)) return Unit.succeed({});
+                    var cleanup = release(self.request, &self.inner.service.?, primary, current);
+                    return cleanup.mapErrorOwned(current, struct {
+                        fn middlewareError(problem: MiddlewareError) Combined {
+                            return .{ .middleware = problem };
+                        }
+                    }.middlewareError);
+                }
+            };
+            const source: Source = .{ .acquisition = acquired.*, .request = request };
+            acquired.* = undefined;
+            var seed = Unit.succeed({});
+            return seed.flatMapCapturedOwned(env, Output, source, struct {
+                fn run(stored: *const Source, _: void, current: *const R) Program {
+                    const pointer = current.allocator.create(Region.Inner) catch return Program.die(outcomes.Defect.out_of_memory);
+                    pointer.* = .{};
+                    const region: Region = .{ .allocator = current.allocator, .request = stored.request, .acquisition = stored.acquisition.borrow(), .inner = pointer };
+                    return Acquisition.acquireReleaseFactoryCapturedOwned(current, region, Region.acquire, Region.use, Region.close);
+                }
+            }.run);
         }
 
         /// Wrap the RPC service with typed middleware.

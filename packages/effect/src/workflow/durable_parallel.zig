@@ -449,9 +449,9 @@ pub fn runRecorded(
                         break :blk Out.die(outcomes.Defect.out_of_memory);
                     break :blk Out.fromOwnedSuccess(env, .{ .source = .executed, .exit = copy });
                 },
-                .conflicting_result => Out.fail(.conflicting_result),
-                .stale_attempt => Out.fail(.stale_attempt),
-                .possibly_recorded => Out.fail(.uncertain_commit),
+                .conflicting_result => Out.fromOwnedOutcome(env, .{ .fail = .conflicting_result }),
+                .stale_attempt => Out.fromOwnedOutcome(env, .{ .fail = .stale_attempt }),
+                .possibly_recorded => Out.fromOwnedOutcome(env, .{ .fail = .uncertain_commit }),
             };
         }
 
@@ -486,7 +486,7 @@ pub fn runRecorded(
         fn start(env: *const R) Out {
             const branch = select_branch(env);
             if (!branch.valid() or select_attempt(env) == 0)
-                return Out.fail(.invalid_branch);
+                return Out.fromOwnedOutcome(env, .{ .fail = .invalid_branch });
             const store = select_journal(env);
             var reading = store.vtable.lookup_branch(store.userdata, env, branch);
             var mapped = reading.mapErrorOwned(env, Adapter.journalError);
@@ -731,7 +731,7 @@ pub fn durableRace(
                 std.mem.eql(u8, owned.branch_name.items, right_branch.name);
             if (!matches_left and !matches_right) {
                 owned.deinit();
-                return Out.fail(.conflicting_winner);
+                return Out.fromOwnedOutcome(env, .{ .fail = .conflicting_winner });
             }
             const decoded = decode_exit(owned.encoded_exit.items, env);
             const mapped = outcomes.mapError(Failure, decoded, env.allocator, codecError);
@@ -768,9 +768,9 @@ pub fn durableRace(
                         .exit = exit,
                     });
                 },
-                .conflicting_result => Out.fail(.conflicting_winner),
-                .possibly_recorded => Out.fail(.uncertain_commit),
-                .stale_attempt => Out.fail(.conflicting_winner),
+                .conflicting_result => Out.fromOwnedOutcome(env, .{ .fail = .conflicting_winner }),
+                .possibly_recorded => Out.fromOwnedOutcome(env, .{ .fail = .uncertain_commit }),
+                .stale_attempt => Out.fromOwnedOutcome(env, .{ .fail = .conflicting_winner }),
             };
         }
 
@@ -816,7 +816,7 @@ pub fn durableRace(
                 !std.mem.eql(u8, right_branch.execution.encoded, execution.encoded) or
                 (left_branch.version == right_branch.version and
                     std.mem.eql(u8, left_branch.name, right_branch.name)) or
-                select_attempt(env) == 0) return Out.fail(.invalid_race);
+                select_attempt(env) == 0) return Out.fromOwnedOutcome(env, .{ .fail = .invalid_race });
             const store = select_journal(env);
             var finding = store.vtable.lookup_winner(store.userdata, env, execution, race_name);
             var mapped = finding.mapErrorOwned(env, Adapter.journalError);

@@ -150,3 +150,50 @@ export fn specialized_tagged_integer(value: i64) i64 {
     const tagged = TaggedSchema.make("integer", value);
     return TaggedSchema.project("integer", &tagged).?.*;
 }
+
+export fn dsl_role(input: u32) u32 {
+    const env: Env = .{ .input = input };
+    const described = comptime fx.Dsl(void, Env).sync(.{ .run = read }).map(double);
+    return fx.run(&env, described).success;
+}
+export fn dsl_selector(input: u32) u32 {
+    const env: Env = .{ .input = input };
+    const described = comptime fx.Dsl(void, Env).field("input").map(struct {
+        fn project(value: *const u32) u32 {
+            return double(value.*);
+        }
+    }.project);
+    return fx.run(&env, described).success;
+}
+export fn dsl_pipeline(input: u32) u32 {
+    const env: Env = .{ .input = input };
+    const p = fx.dsl.pipeline;
+    const described = comptime p.pipe(P.sync(read), .{ p.map(double), p.map(double) });
+    return fx.run(&env, described).success;
+}
+export fn dsl_structured(input: u32) u32 {
+    const env: Env = .{ .input = input };
+    const p = fx.dsl.program;
+    const Steps = struct {
+        fn twice(value: *const u32, _: *const Env) u32 {
+            return double(value.*);
+        }
+    };
+    const described = comptime p.describe(.{ p.native("a", .{}, read), p.native("b", .{"a"}, Steps.twice), p.native("result", .{"b"}, Steps.twice) });
+    return fx.run(&env, described).success;
+}
+
+export fn handwritten_sixteen(input: u32) u32 {
+    return input *% 32768;
+}
+export fn dsl_structured_sixteen(input: u32) u32 {
+    const env: Env = .{ .input = input };
+    const p = fx.dsl.program;
+    const Steps = struct {
+        fn twice(value: *const u32, _: *const Env) u32 {
+            return double(value.*);
+        }
+    };
+    const described = comptime p.describe(.{ p.native("s0", .{}, read), p.native("s1", .{"s0"}, Steps.twice), p.native("s2", .{"s1"}, Steps.twice), p.native("s3", .{"s2"}, Steps.twice), p.native("s4", .{"s3"}, Steps.twice), p.native("s5", .{"s4"}, Steps.twice), p.native("s6", .{"s5"}, Steps.twice), p.native("s7", .{"s6"}, Steps.twice), p.native("s8", .{"s7"}, Steps.twice), p.native("s9", .{"s8"}, Steps.twice), p.native("s10", .{"s9"}, Steps.twice), p.native("s11", .{"s10"}, Steps.twice), p.native("s12", .{"s11"}, Steps.twice), p.native("s13", .{"s12"}, Steps.twice), p.native("s14", .{"s13"}, Steps.twice), p.native("s15", .{"s14"}, Steps.twice) });
+    return fx.run(&env, described).success;
+}

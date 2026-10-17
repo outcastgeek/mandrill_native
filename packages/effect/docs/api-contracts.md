@@ -111,3 +111,49 @@ and finite-float spelling may differ while denoting the same JSON value; exact
 Source API comments document units, inclusive bounds, borrowing, destruction,
 direction environments and callback ownership. Complete public-module examples
 remain in `proofs/reference-update.zig` and `tests/capabilities/consumer/src/main.zig`.
+
+## Inferred composition and domain adapters
+
+| Entry | Contract |
+| --- | --- |
+| `dsl.program.captured(env, inputs, nodes)` | Moves one runtime input record into the existing capture owner. Reserved binding `inputs` provides its inferred pointer to callbacks. Native-only descriptions reuse immediate lowering; effectful descriptions have independent initialized slots per run. Resources register with the existing Scope. No capture callback runs at construction. Construction failure consumes initialized inputs. The description remains alive through joined execution. |
+| `dsl.streams.from/borrowed/scoped` | Infer item/resource/E/R from exact Effect roles. Scope is the acquisition/release authority. Borrowed configuration retains original pointer qualifiers and its caller lifetime; scoped configuration is disposed after reader work and protected cleanup. Returned Effect bodies remain ordinary composition. |
+| `dsl.streams.append/bind/branch/yieldEffect/unfold/loop` | Exact compatible Stream descriptions only. Children open on demand, each reader has independent state, and an exhausted child closes before the next opens. Cancellation drains pending pulls before release. Native loop conditions/advances are explicit; effectful selection uses unfold. |
+| `dsl.streams.map/mapError/project/consume` | Capture configuration once for the body's runtime stream. Error mapping includes source scope cleanup failures. Projection changes the required execution environment explicitly; it does not replace the source resource owner. Consume delegates to fold and preserves early stop/close. |
+| `SinkBuilder.fold(...).runWith(env, source)` | Runtime source description is retained by the generated scope. State, pending transitions, final-result transfers and unconsumed chunk contents follow the same native fold authority as static run. |
+| `TransactionBuilder.context(E)` | E is the unresolved domain anchor. Ref value types come from canonical cell handles, and map/bind/zip/orElse retain the native journal and rollback/retry boundary. Atomic execution returns the exact existing Effect. Native callback purity and source pointer validity remain native obligations. |
+| `dsl.activation.acquire/use/bind/bindCaptured/branch/run` | Only exact generated activation plans compose. Native resource providers, token/fence and scope remain authoritative. Check token generation before acquisition/use; each activation creates fresh resources. Native provider mutations still fence their commit. The fence guard is not held during user work. Partial/late acquisition and primary-plus-release failures use existing protected cleanup. Known ResourceValue wrappers cannot escape as root results or persisted data. |
+| `dsl.entity/entityDefinition/event/eventDefinition` | Codec evidence determines application payload/result/error channels. Handler signatures determine R, with an explicit anchor only for missing evidence. Native definition version and identity validators remain authoritative. |
+| `dsl.eventCase/events.caseWith/projection` | Cases associate one completed native event with its pure `void`/`Result(void,F)` fold. Duplicate/foreign cases and incompatible state/fold types reject at construction. Contextual decoders require their own directional environment projection when R differs. Unknown JSON duplicate policy needs an explicit policy; conflicting codec metadata rejects. |
+| `projection.replayPage` | Borrows input state/page until join, clones private state, and decodes/folds in native cursor order. Suspended decoding retains its parse document. Failure/interruption disposes partial state without publishing a cursor. Atomic checkpoint publication remains a distinct native provider operation. |
+| `dsl.persistence.payloadCodec/from/scoped/declared` | Channels derive from exact native codec callbacks; decode and encode environments stay independent. Version, limits, PrimaryKey bytes and expiry are explicit application policy. Scoped keys/configuration outlive native provider work; outcome ownership and write uncertainty stay native. |
+| `dsl.queues.scoped/declared` | Requires canonical PersistedQueue and PureSchemaBinary evidence, native guarantee, explicit key/offer identity, visibility, retention, owner/generation and claim policy. Offer/claim/decode/retry/acknowledge return exact Effects. Decoded results retain claimed bytes through payload cleanup and final shared-owner disposal, including OOM. Payload code owns its declared resources; arbitrary unmarked native pointers keep their original lifetime obligations. |
+
+Every effectful boundary above returns the exact existing `Effect(A,E,R)`.
+Descriptors, pure codecs/folds, and definitions remain inert/pure domain values.
+No adapter inserts a root evaluation to connect domains. Native root runners and
+provider/domain-owned child execution retain their existing execution contracts.
+
+The executable `examples/dsl` recipes cover native file/CPU/blocking work,
+structured orders, scoped cache/fold consumption, managed unary/streaming RPC,
+recorded business-key workflow traversal, transactional withdrawal, tracked
+prices, and activation-owned projection checkpoints. `composition.zig` connects
+these existing Effect boundaries with explicit error/environment adapters. It
+keeps RPC consumption inside the activation bracket through checkpoint and
+reader completion. Each recipe handles the root Exit and releases its result.
+
+`WorkflowBuilder.forEach(env, inputs, roles)` admits only the builder's Step or
+OwnedStep returned by `body`. Its explicit name/version/execution and selected
+business key determine replay identity, independently of array reorder or
+allocation address. Static duplicate keys are compilation errors; dynamic keys
+are validated before any child is admitted. `activityCaptured` infers the native
+engine, activity channels and recording codec from its roles. Both return a
+consuming OwnedStep; `intoEffect` is their ordinary Effect boundary. Raw Effects
+remain confined to native recorded activity handlers. Providers still determine
+volatility/recoverability, retry attempts, compensation order, and uncertainty.
+
+Known `single_thread` retained captures cannot enter concurrent traversal. Types
+that expose retained configuration reject at compilation. Effect descriptions
+retain this evidence in their existing owner chain after type erasure and reject
+at runtime before worker admission. This check does not infer synchronization
+for arbitrary borrowed pointers or prove behavior of native callback code.

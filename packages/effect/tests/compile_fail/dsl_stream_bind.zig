@@ -1,0 +1,14 @@
+const std = @import("std");
+const fx = @import("effect");
+const E = enum { expected };
+const R = struct { allocator: std.mem.Allocator, io: std.Io };
+const Number = fx.Effect(u32, E, R);
+const source = fx.dsl.streams.yieldEffect(Number.succeed(1));
+pub fn main() void {
+    const C = struct {
+        fn next(_: *const u32, _: *const R) Number {
+            return Number.succeed(2);
+        }
+    };
+    _ = fx.dsl.streams.bind(Number.succeed(1), C.next);
+}

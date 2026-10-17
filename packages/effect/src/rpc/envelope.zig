@@ -268,7 +268,7 @@ pub fn decode(allocator: std.mem.Allocator, input: []const u8, limits: Limits) o
     var cursor: usize = 0;
     const version = readInteger(input, &cursor, Version) orelse return .{ .fail = .malformed_envelope };
     const raw_kind = readInteger(input, &cursor, u8) orelse return .{ .fail = .malformed_envelope };
-    const kind = std.meta.intToEnum(Kind, raw_kind) catch return .{ .fail = .malformed_envelope };
+    const kind = std.enums.fromInt(Kind, raw_kind) orelse return .{ .fail = .malformed_envelope };
     const correlation = readInteger(input, &cursor, Correlation) orelse return .{ .fail = .malformed_envelope };
     const sequence: ?Sequence = if (carriesSequence(kind))
         (readInteger(input, &cursor, Sequence) orelse return .{ .fail = .malformed_envelope })

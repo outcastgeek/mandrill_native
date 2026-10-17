@@ -9,6 +9,7 @@ const structural = @import("internal/structural.zig");
 const parser = @import("internal/parser.zig");
 const legacy = @import("../schema.zig");
 const ast = @import("schema_ast.zig");
+const ownership = @import("../dsl/ownership.zig");
 
 /// Specialize an owned box or recursive schema with a checked depth bound.
 /// Parameters:
@@ -68,6 +69,39 @@ pub fn OwnedBox(comptime T: type) type {
     };
 }
 
+/// Derive member ownership for a recursive application record. Storage and
+/// rollback use the existing OwnedBox with a canonical generated capture.
+/// The public pointer continues to borrow the logical application value.
+pub fn InferredOwnedBox(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        pub const effect_owned_payload = true;
+        value: *T,
+        allocator: std.mem.Allocator,
+
+        fn borrowedOwner(self: *const Self) OwnedBox(ownership.Capture(T)) {
+            return .{ .value = @fieldParentPtr("value", self.value), .allocator = self.allocator };
+        }
+        pub fn init(env: anytype, item: T) outcomes.Exit(Self, Issue) {
+            const Storage = ownership.Capture(T);
+            const made = OwnedBox(Storage).init(env, Storage{ .value = item });
+            return switch (made) {
+                .success => |owner| .{ .success = .{ .value = &owner.value.value, .allocator = owner.allocator } },
+                else => outcomes.castFailure(Self, made),
+            };
+        }
+        pub fn deinit(self: *Self) void {
+            var owner = self.borrowedOwner();
+            owner.deinit();
+            self.* = undefined;
+        }
+        pub fn clone(self: *const Self) error{OutOfMemory}!Self {
+            const owner = try self.borrowedOwner().clone();
+            return .{ .value = &owner.value.value, .allocator = owner.allocator };
+        }
+    };
+}
+
 /// `max_depth` is an explicit caller-authored schema policy. Each box consumes
 /// one depth unit in invocation-local state, so cycles fail as typed issues.
 ///
@@ -80,6 +114,16 @@ pub fn OwnedBox(comptime T: type) type {
 ///   types.
 /// Returns (`type`): recursive schema with explicit depth bound and typed child representation.
 pub fn Box(comptime T: type, comptime R: type, comptime max_depth: usize, comptime reference_name: []const u8, comptime schema: fn () type) type {
+    return BoxWithOwner(T, R, max_depth, reference_name, schema, OwnedBox(T), false);
+}
+
+/// Run the same bounded structural engine with generated composite node
+/// ownership and a child schema whose value is the exact inferred move type.
+pub fn InferredBox(comptime T: type, comptime R: type, comptime max_depth: usize, comptime reference_name: []const u8, comptime schema: fn () type) type {
+    return BoxWithOwner(T, R, max_depth, reference_name, schema, InferredOwnedBox(T), true);
+}
+
+fn BoxWithOwner(comptime T: type, comptime R: type, comptime max_depth: usize, comptime reference_name: []const u8, comptime schema: fn () type, comptime Owner: type, comptime inferred: bool) type {
     comptime {
         if (max_depth == 0) @compileError("recursive schema depth must permit at least one box");
         if (reference_name.len == 0 or !std.unicode.utf8ValidateSlice(reference_name))
@@ -90,7 +134,7 @@ pub fn Box(comptime T: type, comptime R: type, comptime max_depth: usize, compti
     return struct {
         const Self = @This();
         /// Application value type produced by this codec.
-        pub const Decoded = OwnedBox(T);
+        pub const Decoded = Owner;
         /// Exact caller environment type required when the description runs.
         pub const Environment = R;
 
@@ -105,7 +149,8 @@ pub fn Box(comptime T: type, comptime R: type, comptime max_depth: usize, compti
 
         fn child() type {
             const C = schema();
-            if (!@hasDecl(C, "Decoded") or C.Decoded != T or
+            const Expected = if (inferred) ownership.Moved(T) else T;
+            if (!@hasDecl(C, "Decoded") or C.Decoded != Expected or
                 !@hasDecl(C, "Environment") or C.Environment != R or
                 !@hasDecl(C, "decodeWithin") or !@hasDecl(C, "encodeWithin"))
                 @compileError("recursive schema factory must return a structural schema for T in R");
@@ -128,7 +173,7 @@ pub fn Box(comptime T: type, comptime R: type, comptime max_depth: usize, compti
                 .success => |item| item,
                 else => return outcomes.castFailure(Decoded, decoded),
             };
-            return OwnedBox(T).init(env, value);
+            return Decoded.init(env, if (comptime C.Decoded == T) value else value.value);
         }
 
         /// Decode immediately and return the typed validation outcome.
@@ -166,7 +211,9 @@ pub fn Box(comptime T: type, comptime R: type, comptime max_depth: usize, compti
             if (!state.enter(max_depth)) return .{ .fail = Issue.init(env, .encode, .depth_limit) };
             defer state.leave();
             const C = comptime child();
-            return C.encodeWithin(env, value.value, state);
+            if (comptime C.Decoded == T) return C.encodeWithin(env, value.value, state);
+            const view: C.Decoded = .{ .value = value.value.* };
+            return C.encodeWithin(env, &view, state);
         }
 
         /// Encode directly into owned bytes.

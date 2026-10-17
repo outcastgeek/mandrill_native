@@ -9,6 +9,7 @@ const legacy = @import("../schema.zig");
 const parser = @import("internal/parser.zig");
 const structural = @import("internal/structural.zig");
 const representation = @import("internal/representation.zig");
+const record_value = @import("record_value.zig");
 
 /// Resource bounds accepted by the schema parser.
 pub const ParseLimits = parser.Limits;
@@ -214,9 +215,10 @@ fn codecType(comptime field: anytype) type {
 ///   default is installed.
 /// Returns (`type`): bidirectional schema for `T` with the supplied field codecs, environment, and parse policy.
 pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comptime policy: RecordPolicy) type {
+    const Fields = record_value.Fields(T);
     comptime {
         if (!policy.valid()) @compileError("record issue policy requires an explicit positive bound only when accumulating");
-        const info = @typeInfo(T);
+        const info = @typeInfo(Fields);
         if (info != .@"struct" or info.@"struct".is_tuple) @compileError("SchemaBuilder.Record requires a named Zig struct");
         if (@typeInfo(@TypeOf(fields)) != .@"struct" or !@typeInfo(@TypeOf(fields)).@"struct".is_tuple)
             @compileError("SchemaBuilder.Record fields must be a tuple");
@@ -228,14 +230,14 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
         for (fields, 0..) |field, index| {
             if (field.name.len == 0 or !std.unicode.utf8ValidateSlice(field.name))
                 @compileError("schema field names must be nonempty UTF-8");
-            if (!@hasField(T, field.name)) @compileError("schema field does not exist in the Zig struct");
+            if (!@hasField(Fields, field.name)) @compileError("schema field does not exist in the Zig struct");
             for (fields, 0..) |previous, previous_index| {
                 if (previous_index < index and std.mem.eql(u8, previous.name, field.name))
                     @compileError("duplicate schema field");
             }
             if (field.extension) {
                 extensions_count += 1;
-                if (@FieldType(T, field.name) != UnknownFields)
+                if (@FieldType(Fields, field.name) != UnknownFields)
                     @compileError("extension field must have SchemaBuilder.UnknownFields type");
                 if (!outcomes.ownsPayload(T))
                     @compileError("a record preserving unknown fields must own and release its extension field");
@@ -253,7 +255,7 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
                     @compileError("record fields require pure JSON codecs");
             }
             const expected = if (field.presence == .optional) ?C.Decoded else C.Decoded;
-            if (@FieldType(T, field.name) != expected) @compileError("schema field decoded type does not match Zig field type");
+            if (@FieldType(Fields, field.name) != expected) @compileError("schema field decoded type does not match Zig field type");
             if (outcomes.ownsPayload(expected) and !outcomes.ownsPayload(T))
                 @compileError("a record with owned fields must declare its own deinit/clone ownership contract");
             if (field.presence == .defaulted) {
@@ -288,7 +290,7 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
             var first = true;
             inline for (fields) |field| {
                 if (comptime field.extension) {
-                    const extras = &@field(value.*, field.name);
+                    const extras = &@field(record_value.get(value).*, field.name);
                     for (extras.values.keys(), extras.values.values()) |key, json_value| {
                         inline for (fields) |known| if (!known.extension and std.mem.eql(u8, key, known.name)) return .{ .fail = Issue.init(env, .encode, .duplicate_field) };
                         if (!first) writer.write(",") catch |problem| return outcomes.castFailure(void, @import("json_writer.zig").failureWith(env, .encode, problem, writer));
@@ -299,13 +301,13 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
                     }
                     continue;
                 }
-                const present = if (comptime field.presence == .optional) @field(value.*, field.name) != null else true;
+                const present = if (comptime field.presence == .optional) @field(record_value.get(value).*, field.name) != null else true;
                 if (present) {
                     if (!first) writer.write(",") catch |problem| return outcomes.castFailure(void, @import("json_writer.zig").failureWith(env, .encode, problem, writer));
                     first = false;
                     writer.quoted(field.name) catch |problem| return outcomes.castFailure(void, @import("json_writer.zig").failureWith(env, .encode, problem, writer));
                     writer.write(":") catch |problem| return outcomes.castFailure(void, @import("json_writer.zig").failureWith(env, .encode, problem, writer));
-                    const input = if (comptime field.presence == .optional) &@field(value.*, field.name).? else &@field(value.*, field.name);
+                    const input = if (comptime field.presence == .optional) &@field(record_value.get(value).*, field.name).? else &@field(record_value.get(value).*, field.name);
                     const result = if (comptime field.nested) field.codec.writeJson(env, input, writer) else field.codec.writeJson(input, writer);
                     switch (result) {
                         .success => {},
@@ -349,18 +351,22 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
             return &Metadata.node;
         }
 
-        /// Retrieve  from the current typed state.
+        fn GetField(comptime name: []const u8) type {
+            if (!@hasField(Fields, name)) @compileError("unknown schema record field");
+            return @FieldType(Fields, name);
+        }
+
+        /// Retrieve a declared field from the logical record value.
         ///
         /// Parameters:
         /// - `name: comptime []const u8`: Compile-time stable, nonempty identity component validated at definition
         ///   time.
         /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
         ///   joined it.
-        /// Returns (`*const @FieldType(T, name)`): A borrowed read-only pointer; keep its owner alive while using it.
-        pub fn get(comptime name: []const u8, value: *const T) *const @FieldType(T, name) {
-            if (!@hasField(T, name)) @compileError("unknown schema record field");
+        /// Returns (`*const @FieldType(Fields, name)`): A borrowed read-only pointer; keep its owner alive while using it.
+        pub fn get(comptime name: []const u8, value: *const T) *const GetField(name) {
             inline for (fields) |field| {
-                if (std.mem.eql(u8, field.name, name)) return &@field(value.*, name);
+                if (comptime std.mem.eql(u8, field.name, name)) return &@field(record_value.get(value).*, name);
             }
             @compileError("Zig field is not part of this record schema");
         }
@@ -484,7 +490,7 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
                     const collected = collectExtensions(env, json);
                     switch (collected) {
                         .success => |value| {
-                            @field(result, field.name) = value;
+                            @field(record_value.get(&result).*, field.name) = value;
                             initialized[index] = true;
                         },
                         else => {
@@ -499,7 +505,7 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
                     const decoded = decodeField(field, env, &encoded, state);
                     switch (decoded) {
                         .success => |value| {
-                            @field(result, field.name) = value;
+                            @field(record_value.get(&result).*, field.name) = value;
                             initialized[index] = true;
                         },
                         .fail => |issue| {
@@ -522,7 +528,7 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
                             }
                         },
                         .optional => {
-                            @field(result, field.name) = null;
+                            @field(record_value.get(&result).*, field.name) = null;
                             initialized[index] = true;
                         },
                         .defaulted => {
@@ -551,7 +557,7 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
                                             return outcomes.castFailure(T, checked);
                                         }
                                     } else {
-                                        @field(result, field.name) = value;
+                                        @field(record_value.get(&result).*, field.name) = value;
                                         initialized[index] = true;
                                     }
                                 },
@@ -579,7 +585,7 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
 
         fn releasePartial(value: *T, initialized: *[fields.len]bool) void {
             inline for (fields, 0..) |field, index| {
-                if (initialized[index]) outcomes.discardPayload(&@field(value.*, field.name));
+                if (initialized[index]) outcomes.discardPayload(&@field(record_value.get(value).*, field.name));
             }
         }
 
@@ -651,7 +657,7 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
             var object: std.json.ObjectMap = .{};
             inline for (fields) |field| {
                 if (comptime field.extension) {
-                    const extra = &@field(value.*, field.name);
+                    const extra = &@field(record_value.get(value).*, field.name);
                     for (extra.values.keys(), extra.values.values()) |key, json_value| {
                         if (key.len == 0 or !std.unicode.utf8ValidateSlice(key))
                             return .{ .fail = Issue.init(env, .encode, .invalid_utf8) };
@@ -664,9 +670,9 @@ pub fn Record(comptime T: type, comptime R: type, comptime fields: anytype, comp
                     }
                     continue;
                 }
-                const present = if (comptime field.presence == .optional) @field(value.*, field.name) != null else true;
+                const present = if (comptime field.presence == .optional) @field(record_value.get(value).*, field.name) != null else true;
                 if (present) {
-                    const field_value = if (comptime field.presence == .optional) @field(value.*, field.name).? else @field(value.*, field.name);
+                    const field_value = if (comptime field.presence == .optional) @field(record_value.get(value).*, field.name).? else @field(record_value.get(value).*, field.name);
                     const encoded = encodeField(field, env, &field_value, state);
                     switch (encoded) {
                         .success => |json_value| object.put(state.scratch, field.name, json_value) catch return .{ .die = outcomes.Defect.out_of_memory },

@@ -21,6 +21,19 @@ pub const Context = struct {
 /// Reserved transport-neutral metadata key for a validated PrimaryKey value.
 pub const idempotency_metadata_key = "effect-idempotency-key";
 
+pub fn requireDefinition(comptime Operation: type) void {
+    if (@typeInfo(Operation) != .@"struct" or !@hasField(Operation, "request") or !@hasField(Operation, "failure")) @compileError("RPC handler requires a canonical unary or streaming operation definition");
+    const Request = @FieldType(Operation, "request");
+    const Failure = @FieldType(Operation, "failure");
+    const Expected = if (@hasField(Operation, "success"))
+        Unary(Request, @FieldType(Operation, "success"), Failure)
+    else if (@hasField(Operation, "chunk") and @hasField(Operation, "terminal"))
+        Streaming(Request, @FieldType(Operation, "chunk"), @FieldType(Operation, "terminal"), Failure)
+    else
+        @compileError("RPC handler requires a canonical unary or streaming operation definition");
+    if (Operation != Expected) @compileError("RPC handler rejects a fabricated operation definition");
+}
+
 /// Define a unary RPC operation from three codecs. Each codec must satisfy
 /// `codec_contract.require` at comptime; the decoded types become the request,
 /// success, and domain-error channels of the operation.
@@ -153,6 +166,7 @@ pub fn Unary(comptime RequestCodec: type, comptime SuccessCodec: type, comptime 
 /// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
 /// Returns (`type`): handler binding for one unary operation with a matching `Effect` result.
 pub fn UnaryHandler(comptime Operation: type, comptime R: type) type {
+    requireDefinition(Operation);
     return struct {
         const Self = @This();
         /// Typed operation descriptor attached to this handler.
@@ -398,6 +412,7 @@ pub fn Streaming(comptime RequestCodec: type, comptime ChunkCodec: type, comptim
 /// - `R: comptime type`: Caller-defined environment type that supplies dependencies and runtime capabilities when work executes.
 /// Returns (`type`): handler binding for one streaming operation with a matching `Stream` result.
 pub fn StreamHandler(comptime Operation: type, comptime R: type) type {
+    requireDefinition(Operation);
     return struct {
         const Self = @This();
         /// Typed operation descriptor attached to this handler.
@@ -466,10 +481,10 @@ pub fn Protocol(comptime handlers: anytype) type {
         if (Operation != @TypeOf(handler.operation))
             @compileError("RPC handler descriptor must match its operation");
         if (@hasDecl(Operation, "Success")) {
-            if (H != UnaryHandler(Operation, H.Environment))
+            if (H != UnaryHandler(Operation, H.Environment) and !@import("captured_handler.zig").isCanonical(H) and !@import("static_binding.zig").isCanonical(H))
                 @compileError("unary RPC operation needs a completed unary handler");
         } else if (@hasDecl(Operation, "Chunk")) {
-            if (H != StreamHandler(Operation, H.Environment))
+            if (H != StreamHandler(Operation, H.Environment) and !@import("captured_stream_handler.zig").isCanonical(H) and !@import("static_binding.zig").isCanonical(H))
                 @compileError("streaming RPC operation needs a completed stream handler");
         } else {
             @compileError("RPC operation needs a typed unary or streaming descriptor");
@@ -559,11 +574,11 @@ pub fn Protocol(comptime handlers: anytype) type {
             comptime select_request: fn (*const R) *const @TypeOf(operation).Request,
         ) effects.Effect(@TypeOf(operation).Success, @TypeOf(operation).DomainError, R) {
             inline for (handlers) |handler| {
-                if (@TypeOf(handler.operation) == @TypeOf(operation) and
+                if (comptime @TypeOf(handler.operation) == @TypeOf(operation) and
                     std.mem.eql(u8, handler.operation.name, operation.name) and
                     handler.operation.version == operation.version)
                 {
-                    if (!std.meta.eql(handler.operation, operation))
+                    if (comptime !std.meta.eql(handler.operation, operation))
                         @compileError("RPC operation identity has incompatible codec definitions");
                     if (!@hasDecl(@TypeOf(handler.operation), "Success"))
                         @compileError("a streaming operation needs the streaming call path");
@@ -584,11 +599,11 @@ pub fn Protocol(comptime handlers: anytype) type {
             request_value: *const @TypeOf(operation).Request,
         ) effects.Effect(@TypeOf(operation).Success, @TypeOf(operation).DomainError, R) {
             inline for (handlers) |handler| {
-                if (@TypeOf(handler.operation) == @TypeOf(operation) and
+                if (comptime @TypeOf(handler.operation) == @TypeOf(operation) and
                     std.mem.eql(u8, handler.operation.name, operation.name) and
                     handler.operation.version == operation.version)
                 {
-                    if (!std.meta.eql(handler.operation, operation))
+                    if (comptime !std.meta.eql(handler.operation, operation))
                         @compileError("RPC operation identity has incompatible codec definitions");
                     if (!@hasDecl(@TypeOf(handler.operation), "Success"))
                         @compileError("streaming operations need the streaming invocation path");
@@ -614,11 +629,11 @@ pub fn Protocol(comptime handlers: anytype) type {
             env: *const R,
         ) effects.Effect(@TypeOf(operation).Success, @TypeOf(operation).DomainError, R) {
             inline for (handlers) |handler| {
-                if (@TypeOf(handler.operation) == @TypeOf(operation) and
+                if (comptime @TypeOf(handler.operation) == @TypeOf(operation) and
                     std.mem.eql(u8, handler.operation.name, operation.name) and
                     handler.operation.version == operation.version)
                 {
-                    if (!std.meta.eql(handler.operation, operation))
+                    if (comptime !std.meta.eql(handler.operation, operation))
                         @compileError("RPC operation identity has incompatible codec definitions");
                     if (!@hasDecl(@TypeOf(handler.operation), "Success"))
                         @compileError("streaming operations need the streaming invocation path");
@@ -643,11 +658,11 @@ pub fn Protocol(comptime handlers: anytype) type {
             env: *const R,
         ) effects.Stream(@TypeOf(operation).Event, @TypeOf(operation).DomainError, R) {
             inline for (handlers) |handler| {
-                if (@TypeOf(handler.operation) == @TypeOf(operation) and
+                if (comptime @TypeOf(handler.operation) == @TypeOf(operation) and
                     std.mem.eql(u8, handler.operation.name, operation.name) and
                     handler.operation.version == operation.version)
                 {
-                    if (!std.meta.eql(handler.operation, operation))
+                    if (comptime !std.meta.eql(handler.operation, operation))
                         @compileError("RPC operation identity has incompatible codec definitions");
                     if (!@hasDecl(@TypeOf(handler.operation), "Chunk"))
                         @compileError("a unary operation needs the unary call path");

@@ -679,14 +679,13 @@ pub fn Pool(comptime A: type, comptime E: type) type {
                     }
                     borrower = item.next;
                 }
-                for (relevant.items) |observation| if (!observation.job.settled) {
-                    pending = true;
-                    break;
-                };
-                for (borrowers.items) |observation| if (!observation.job.settled) {
-                    pending = true;
-                    break;
-                };
+                var creation_failed = false;
+                for (relevant.items) |observation| {
+                    if (!observation.job.settled) pending = true else if (observation.job.outcome != .success) creation_failed = true;
+                }
+                for (borrowers.items) |observation| {
+                    if (!observation.job.settled) pending = true else if (observation.job.outcome != .success) creation_failed = true;
+                }
                 if (!pending) for (relevant.items) |observation| {
                     const item = observation.job;
                     if (item.outcome != .success) {
@@ -727,7 +726,11 @@ pub fn Pool(comptime A: type, comptime E: type) type {
                     return .{ .die = .{ .kind = .invalid_configuration, .message = diagnostics.pool_population_target_exceeds_capacity_or_pool_is_closed } };
                 }
                 const beyond = self.config.capacity != null and target > self.config.capacity.?;
-                const needed = if (beyond) 0 else target -| self.allocated;
+                // An observed failure may release a reservation while a sibling
+                // is still pending. Drain that admitted group before deciding
+                // whether more creation is needed; otherwise its failure is
+                // replaced by new attempts before it can be returned.
+                const needed = if (beyond or creation_failed) 0 else target -| self.allocated;
                 var committed: ?*Population = null;
                 var remaining = needed;
                 // Reserve every structural object and every slot before the first
@@ -829,7 +832,7 @@ pub fn Pool(comptime A: type, comptime E: type) type {
                     settled = false;
                     break;
                 };
-                const changed = cancelled or self.closed or (settled and (self.live >= target or beyond)) or (!beyond and self.allocated < target);
+                const changed = cancelled or self.closed or (settled and (self.live >= target or beyond or relevant.items.len != 0 or borrowers.items.len != 0)) or (!beyond and !creation_failed and self.allocated < target);
                 self.mutex.unlock(self.io);
                 if (!changed) observer.wake.wait(self.io) catch return .interrupted;
             }
@@ -854,13 +857,18 @@ pub fn Pool(comptime A: type, comptime E: type) type {
                     borrower_link = &creation.next;
                 }
                 var link = &self.populations;
-                while (link.*) |job| {
-                    if (job.settled and job.observed) {
-                        link.* = job.next;
-                        retired = job;
-                        break;
+                // Detach only the owner this pass will process. Borrower
+                // retirement has priority; removing a population or idle
+                // resource as well would lose it when that branch continues.
+                if (retired_borrower == null) {
+                    while (link.*) |job| {
+                        if (job.settled and job.observed) {
+                            link.* = job.next;
+                            retired = job;
+                            break;
+                        }
+                        link = &job.next;
                     }
-                    link = &job.next;
                 }
                 var current = self.populations;
                 while (current) |job| {
@@ -870,7 +878,7 @@ pub fn Pool(comptime A: type, comptime E: type) type {
                     }
                     current = job.next;
                 }
-                const idle = if (self.closed) self.idle else null;
+                const idle = if (self.closed and retired_borrower == null and retired == null) self.idle else null;
                 if (idle) |resource| self.idle = resource.next;
                 const done = self.closed and self.operations == 0 and self.leases == 0 and selected == null and idle == null;
                 if (selected == null and idle == null and retired == null and retired_borrower == null) self.wake.reset();

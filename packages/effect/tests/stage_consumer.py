@@ -1,4 +1,6 @@
 """Stage the exported package below an independent consumer package root."""
+from dsl_gate_evidence import fingerprint, completed
+_gate_before = fingerprint('consumer')
 from pathlib import Path
 import shutil
 import subprocess
@@ -26,3 +28,5 @@ with tempfile.TemporaryDirectory(prefix="effect-consumer-") as directory:
         else:
             shutil.copy2(origin, target)
     subprocess.run([zig, "build", "run", f"-Doptimize={mode}"], cwd=staged, check=True)
+
+completed('consumer', mode, _gate_before)

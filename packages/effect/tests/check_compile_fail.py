@@ -1,5 +1,10 @@
 """Instantiate negative consumers and require their intended diagnostic."""
+from dsl_gate_evidence import fingerprint, completed
+_gate_before = fingerprint('compile-fail')
 from pathlib import Path
+import tempfile
+import json
+import re
 import subprocess
 import sys
 
@@ -35,6 +40,21 @@ cases = {
     "forged_rpc_descriptor": "an RPC operation needs a stable name",
     "transaction_rejects_effect": "transaction composition accepts only a typed transaction description",
 }
+dsl_cases = json.loads((package / "tests/dsl_compile_cases.json").read_text())
+cases.update({name: entry["diagnostic"] for name, entry in dsl_cases.items()})
+def intended_diagnostic(stderr, diagnostic):
+    messages = re.findall(r"^.*?: (?:error|note): (.*)$", stderr, re.MULTILINE)
+    return any(diagnostic in message for message in messages)
+
+# HAR-03: an unrelated syntax failure is a harness failure, even when the
+# expected words appear in source. This is part of the existing negative gate.
+with tempfile.TemporaryDirectory(prefix="effect-negative-harness-") as temporary:
+    malformed = Path(temporary) / "unrelated.zig"
+    malformed.write_text("// " + next(iter(cases.values())) + "\npub fn main( {\n")
+    unrelated = subprocess.run([zig, "build-exe", "-fno-emit-bin", str(malformed)], cwd=package, capture_output=True, text=True)
+    if unrelated.returncode == 0 or intended_diagnostic(unrelated.stderr, next(iter(cases.values()))):
+        raise SystemExit("negative harness accepted an unrelated syntax failure")
+
 for name, diagnostic in cases.items():
     checked = subprocess.run(
         [zig, "build-exe", "-fno-emit-bin", "--dep", "effect",
@@ -42,6 +62,15 @@ for name, diagnostic in cases.items():
          f"-Meffect={package / 'src' / 'root.zig'}"],
         cwd=package, capture_output=True, text=True,
     )
-    if checked.returncode == 0 or diagnostic not in checked.stderr:
+    if checked.returncode == 0 or not intended_diagnostic(checked.stderr, diagnostic):
         sys.exit(f"{name}: expected compiler rejection containing {diagnostic!r}\n{checked.stderr}")
     print(f"{name}: rejected for the intended reason")
+
+for name, entry in dsl_cases.items():
+    companion = package / entry["valid_companion"]
+    checked = subprocess.run([zig, "build-exe", "-fno-emit-bin", "--dep", "effect", f"-Mroot={companion}", f"-Meffect={package / 'src/root.zig'}"], cwd=package, capture_output=True, text=True)
+    if checked.returncode != 0:
+        sys.exit(f"{name}: valid companion failed independently\n{checked.stderr}")
+    print(f"{name}: valid companion compiled independently")
+
+completed('compile-fail', 'shared', _gate_before)

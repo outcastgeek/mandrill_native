@@ -95,8 +95,19 @@ const CompletedWorkflow = fx.WorkflowBuilder(Error, Env).begin(.{
     .payload_schema_version = 1,
     .success_schema_version = 1,
     .error_schema_version = 1,
-}).payload(EventValueCodec).success(EventValueCodec).failure(EventErrorCodec).handledBy(EventFixture.handle);
+}).payload(EventValueCodec).success(EventValueCodec).failure(EventErrorCodec).handledByEffect(EventFixture.handle);
 const WorkflowRegistry = fx.WorkflowBuilder(Error, Env).registry(.{CompletedWorkflow});
+const NamedWorkflow = fx.dsl.workflow(.{
+    .description = .{ .name = "consumer.dsl-workflow", .version = 1, .payload_schema_version = 1, .success_schema_version = 1, .error_schema_version = 1 },
+    .payload = EventValueCodec,
+    .success = EventValueCodec,
+    .failure = EventErrorCodec,
+    .handler = struct {
+        fn handle(input: *const u8, _: *const Env) fx.WorkflowBuilder(Error, Env).Step(u8) {
+            return fx.WorkflowBuilder(Error, Env).succeed(input.*);
+        }
+    }.handle,
+});
 const CompletedActivity = fx.WorkflowActivityBuilder(Error, Env).begin("consumer.activity", 1)
     .payload(EventValueCodec)
     .success(EventValueCodec)
@@ -109,11 +120,14 @@ const RecordedActivityFixture = struct {
         return fx.Effect(u8, void, Env).succeed(value.*);
     }
 };
-const RecordedActivity = fx.WorkflowActivityBuilder(void, Env).begin("consumer.recorded-activity", 1)
-    .payload(EventValueCodec)
-    .success(EventValueCodec)
-    .failure(fx.JsonCodec.null_value)
-    .handledBy(RecordedActivityFixture.handle);
+const RecordedActivity = fx.dsl.activity(.{
+    .name = "consumer.recorded-activity",
+    .version = 1,
+    .payload = EventValueCodec,
+    .success = EventValueCodec,
+    .failure = fx.JsonCodec.null_value,
+    .handler = RecordedActivityFixture.handle,
+});
 const InterruptedActivity = RecordedActivity.definition.handledBy(Env, struct {
     fn handle(_: *const u8, _: *const Env) fx.Effect(u8, void, Env) {
         return fx.Effect(u8, void, Env).interrupted();
@@ -414,6 +428,7 @@ pub fn main(init: std.process.Init) void {
     // This defer runs after all program, provider and outcome owners below.
     defer std.debug.assert(checked.deinit() == 0);
     const allocator = checked.allocator();
+    @import("rpc_dsl.zig").exercise(allocator, init.io);
     _ = ConsumerRecordSchema.encodedNode();
     const event_resolution = EventGroup.resolve("consumer.created", 1);
     std.debug.assert(event_resolution == .ok and event_resolution.ok == 0);
@@ -657,6 +672,9 @@ pub fn main(init: std.process.Init) void {
     defer reply.deinit();
     std.debug.assert(reply == .success and reply.success == request);
 
+    var named_workflow = fx.run(&env, comptime NamedWorkflow.run(eventValue));
+    std.debug.assert(named_workflow == .success and named_workflow.success == env.value);
+    named_workflow.deinit();
     var workflow_identity = fx.PrimaryKey.encodeDirect(&env, "consumer-workflow", &.{.{ .text = "run" }});
     defer workflow_identity.deinit();
     std.debug.assert(workflow_identity == .success);

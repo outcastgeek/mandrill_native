@@ -256,6 +256,18 @@ pub fn Ref(comptime T: type) type {
             self.value = next.value;
             return next.result;
         }
+
+        /// The same atomic modification authority with explicitly borrowed
+        /// callback context. The caller owns the returned result.
+        pub fn modifyContext(self: *Self, capture: anytype, env: anytype, comptime updater: anytype) @FieldType(@import("dsl/inference.zig").result(updater, &.{ @TypeOf(capture), T, @TypeOf(env) }, "Ref.modify"), "result") {
+            const Change = @import("dsl/inference.zig").result(updater, &.{ @TypeOf(capture), T, @TypeOf(env) }, "Ref.modify");
+            if (@typeInfo(Change) != .@"struct" or !@hasField(Change, "result") or !@hasField(Change, "value") or @FieldType(Change, "value") != T) @compileError(diagnostics.ref_modifier_contract);
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            const next = updater(capture, self.value, env);
+            self.value = next.value;
+            return next.result;
+        }
         /// Apply a typed update callback to the current reference value.
         /// Parameters:
         /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.

@@ -1,5 +1,8 @@
 //! Checked workflow-body syntax built on the same Effect continuation kernel.
 //! This adds no second scheduler, error channel or environment convention.
+const std = @import("std");
+const ownership = @import("../dsl/ownership.zig");
+const inference = @import("../dsl/inference.zig");
 const effects = @import("../effect.zig");
 const workflows = @import("workflow.zig");
 const types = @import("workflow_types.zig");
@@ -28,7 +31,7 @@ pub fn WorkflowBuilder(comptime E: type, comptime R: type) type {
     return struct {
         const Core = effects.EffectBuilder(E, R);
 
-        fn Step(comptime A: type) type {
+        pub fn Step(comptime A: type) type {
             return struct {
                 /// Value type carried by the successful channel.
                 pub const Success = A;
@@ -36,20 +39,213 @@ pub fn WorkflowBuilder(comptime E: type, comptime R: type) type {
                 pub const Error = E;
                 /// Exact caller environment type required when the description runs.
                 pub const Environment = R;
-                program: effects.Effect(A, E, R),
+                storage: union(enum) { success: if (outcomes.ownsPayload(A)) void else A, description: *const Token(A), runtime: *const RuntimeToken(A) },
             };
         }
 
+        fn Token(comptime A: type) type {
+            _ = A;
+            return opaque {};
+        }
+
+        // Only a checked constructor can create the nominal opaque pointer.
+        // Static token copies refer to the same immutable generated description;
+        // replacing it with a raw Effect requires an explicit unsafe cast.
+        fn described(comptime program: anytype) Step(@TypeOf(program).Success) {
+            const Stored = struct {
+                const value = program;
+            };
+            return .{ .storage = .{ .description = @ptrCast(&Stored.value) } };
+        }
+        fn lower(step: anytype) effects.Effect(@TypeOf(step).Success, E, R) {
+            const T = @TypeOf(step);
+            requireStep(T);
+            return switch (step.storage) {
+                .success => |value| if (comptime outcomes.ownsPayload(T.Success)) effects.Effect(T.Success, E, R).die(.{ .kind = .invalid_configuration, .message = "owning workflow values require a recorded or fresh factory description" }) else effects.Effect(T.Success, E, R).succeed(value),
+                .description => |pointer| @as(*const effects.Effect(T.Success, E, R), @ptrCast(@alignCast(pointer))).*,
+                .runtime => |pointer| OwnedStep(T.Success).take(pointer),
+            };
+        }
+
+        fn RuntimeToken(comptime A: type) type {
+            _ = A;
+            return opaque {};
+        }
+        /// Explicit escaping owner. Step handles borrow this live control
+        /// storage; consuming a handle moves the Effect once and leaves a
+        /// checked tombstone until the owner is released.
+        pub fn OwnedStep(comptime A: type) type {
+            return struct {
+                const Owner = @This();
+                pub const effect_owned_payload = true;
+                pub const Success = A;
+                pub const Error = E;
+                pub const Environment = R;
+                const Out = effects.Effect(A, E, R);
+                pub fn clone(self: *const Owner) error{OutOfMemory}!Owner {
+                    return self.retain();
+                }
+                pub fn intoEffect(self: *Owner) Out {
+                    const program = take(self.control);
+                    self.deinit();
+                    return program;
+                }
+                const Control = struct {
+                    pub const effect_owned_payload = true;
+                    claimed: std.atomic.Value(bool) = .init(false),
+                    program: Out,
+                    pub fn deinit(self: *@This()) void {
+                        if (!self.claimed.load(.acquire)) self.program.deinit();
+                    }
+                };
+                const Storage = @import("../internal/capture_owner.zig").Owner(Control);
+                control: *const RuntimeToken(A),
+                fn store(env: *const R, program: Out) Owner {
+                    const owner = Storage.create(env.allocator, .{ .program = program }) catch
+                        return .{ .control = @ptrCast(failedControl()) };
+                    return .{ .control = @ptrCast(owner.state) };
+                }
+                // Allocation failure is represented by an immutable nominal token,
+                // recognized before any control memory or ownership is accessed.
+                const failed_token: u8 = 0;
+                fn failedControl() *const u8 {
+                    return &failed_token;
+                }
+                fn failed(pointer: *const RuntimeToken(A)) bool {
+                    return @intFromPtr(pointer) == @intFromPtr(failedControl());
+                }
+                pub fn step(self: Owner) Step(A) {
+                    return .{ .storage = .{ .runtime = self.control } };
+                }
+                fn ownerView(pointer: *const RuntimeToken(A)) Storage {
+                    return .{ .state = @ptrCast(@alignCast(@constCast(pointer))) };
+                }
+                fn take(pointer: *const RuntimeToken(A)) Out {
+                    if (failed(pointer)) return Out.die(outcomes.Defect.out_of_memory);
+                    const control = @constCast(ownerView(pointer).borrow());
+                    if (control.claimed.swap(true, .acq_rel)) return Out.die(.{ .kind = .invalid_configuration, .message = "runtime workflow Step has already been consumed" });
+                    const program = control.program;
+                    control.program = undefined;
+                    return program;
+                }
+                pub fn retain(self: Owner) Owner {
+                    if (!failed(self.control)) _ = ownerView(self.control).retain();
+                    return self;
+                }
+                pub fn deinit(self: *Owner) void {
+                    if (!failed(self.control)) {
+                        var owner = ownerView(self.control);
+                        owner.deinit();
+                    }
+                    self.* = undefined;
+                }
+            };
+        }
+        fn stored(env: *const R, program: anytype) OwnedStep(@TypeOf(program).Success) {
+            return OwnedStep(@TypeOf(program).Success).store(env, program);
+        }
+
+        /// Store runtime inputs once, generate their owner/bridge, and admit
+        /// only a continuation returning this builder's exact durable Step.
+        pub fn captureOwner(env: *const R, capture: anytype, comptime callback: anytype) OwnedStep(inference.result(callback, &.{ *const @TypeOf(capture), *const R }, "workflow.captured").Success) {
+            const Next = inference.result(callback, &.{ *const @TypeOf(capture), *const R }, "workflow.captured");
+            comptime requireStep(Next);
+            const C = @TypeOf(capture);
+            const Out = effects.Effect(Next.Success, E, R);
+            const program = @import("../dsl.zig").Dsl(E, R).owned(env, capture, struct {
+                fn build(input: *const C, current: *const R) Out {
+                    return lower(callback(input, current));
+                }
+            }.build);
+            return stored(env, program);
+        }
+        /// Ordinary scoped capture boundary: returns exact Effect and owns
+        /// capture storage through all returned durable work and cleanup.
+        pub fn captured(env: *const R, capture: anytype, comptime callback: anytype) effects.Effect(inference.result(callback, &.{ *const @TypeOf(capture), *const R }, "workflow.captured").Success, E, R) {
+            const Next = inference.result(callback, &.{ *const @TypeOf(capture), *const R }, "workflow.captured");
+            comptime requireStep(Next);
+            const C = @TypeOf(capture);
+            const Out = effects.Effect(Next.Success, E, R);
+            return @import("../dsl.zig").Dsl(E, R).owned(env, capture, struct {
+                fn build(input: *const C, current: *const R) Out {
+                    return lower(callback(input, current));
+                }
+            }.build);
+        }
+        /// Consume a runtime Step at its ordinary Effect execution boundary.
+        pub fn runOwned(step: anytype) effects.Effect(@TypeOf(step.*).Success, E, R) {
+            comptime requireStep(@TypeOf(step.*));
+            if (@typeInfo(@TypeOf(step)).pointer.attrs.@"const") @compileError("workflow runOwned requires a mutable consuming Step");
+            const program = lower(step.*);
+            step.* = undefined;
+            return program;
+        }
+        pub fn bindOwned(env: *const R, step: anytype, capture: anytype, comptime callback: anytype) OwnedStep(inference.result(callback, &.{ *const @TypeOf(capture), @TypeOf(step.*).Success, *const R }, "workflow.bindOwned").Success) {
+            const Current = @TypeOf(step.*);
+            comptime requireStep(Current);
+            const Next = inference.result(callback, &.{ *const @TypeOf(capture), Current.Success, *const R }, "workflow.bindOwned");
+            comptime requireStep(Next);
+            const C = @TypeOf(capture);
+            const Stored = ownership.Capture(C);
+            const Out = effects.Effect(Next.Success, E, R);
+            var source = runOwned(step);
+            const program = source.flatMapCapturedOwned(env, Next.Success, Stored{ .value = capture }, struct {
+                fn next(input: *const Stored, value: Current.Success, current: *const R) Out {
+                    return lower(callback(&input.value, value, current));
+                }
+            }.next);
+            return stored(env, program);
+        }
+        pub fn map(comptime step: anytype, comptime callback: anytype) Step(inference.unary(callback, @TypeOf(step).Success, "workflow.map")) {
+            comptime requireStep(@TypeOf(step));
+            return described(lower(step).map(callback));
+        }
+        pub fn mapError(comptime step: anytype, comptime callback: anytype) WorkflowBuilder(inference.unary(callback, E, "workflow.mapError"), R).Step(@TypeOf(step).Success) {
+            comptime requireStep(@TypeOf(step));
+            return WorkflowBuilder(inference.unary(callback, E, "workflow.mapError"), R).described(lower(step).mapError(callback));
+        }
+        pub fn delayInferred(comptime callback: anytype) inference.unary(callback, *const R, "workflow.delay") {
+            const Next = inference.unary(callback, *const R, "workflow.delay");
+            comptime requireStep(Next);
+            return described(effects.Effect(Next.Success, E, R).deferEffect(struct {
+                fn build(env: *const R) effects.Effect(Next.Success, E, R) {
+                    return lower(callback(env));
+                }
+            }.build));
+        }
+
+        pub const Iteration = @import("traversal.zig").Iteration;
+        pub const TraversalError = @import("traversal.zig").Error;
+        fn requireReturned(comptime Candidate: type) void {
+            if (@typeInfo(Candidate) == .@"struct" and @hasDecl(Candidate, "Success") and Candidate == OwnedStep(Candidate.Success)) return;
+            requireStep(Candidate);
+        }
+        fn lowerReturned(value: anytype) effects.Effect(@TypeOf(value).Success, E, R) {
+            comptime requireReturned(@TypeOf(value));
+            if (comptime @TypeOf(value) == OwnedStep(@TypeOf(value).Success)) {
+                var owner = value;
+                return owner.intoEffect();
+            }
+            return lower(value);
+        }
+        /// Static rows validate collisions at compilation; runtime rows validate
+        /// the complete set before admission. Row keys derive from one business
+        /// identity field and the explicit execution/name/version definition.
+        pub fn forEach(env: *const R, capture: anytype, comptime supplied: anytype) OwnedStep(@import("traversal.zig").Description(@TypeOf(capture), R, E, supplied, requireReturned, lowerReturned).Success) {
+            const D = @import("traversal.zig").Description(@TypeOf(capture), R, E, supplied, requireReturned, lowerReturned);
+            return stored(env, @import("../dsl.zig").owned(env, capture, D.run));
+        }
+        pub fn activityCaptured(env: *const R, capture: anytype, comptime supplied: anytype) OwnedStep(@import("captured_activity.zig").Declaration(@TypeOf(capture), R, E, supplied).Success) {
+            const D = @import("captured_activity.zig").Declaration(@TypeOf(capture), R, E, supplied);
+            return stored(env, @import("../dsl.zig").owned(env, capture, D.run));
+        }
         fn requireStep(comptime Candidate: type) void {
-            if (!@hasDecl(Candidate, "Success") or Candidate != Step(Candidate.Success))
+            if (@typeInfo(Candidate) != .@"struct" or !@hasDecl(Candidate, "Success") or Candidate != Step(Candidate.Success))
                 @compileError("WorkflowBuilder accepts only its described durable steps; place ordinary Effects inside a recorded activity");
         }
 
-        fn nextType(comptime next: anytype) type {
-            const Info = @typeInfo(@TypeOf(next));
-            if (Info != .@"fn" or Info.@"fn".return_type == null)
-                @compileError("WorkflowBuilder continuation must return a described durable step");
-            const Next = Info.@"fn".return_type.?;
+        fn nextType(comptime Input: type, comptime next: anytype) type {
+            const Next = inference.continuation(next, Input, R, "WorkflowBuilder.bind");
             requireStep(Next);
             return Next;
         }
@@ -57,12 +253,12 @@ pub fn WorkflowBuilder(comptime E: type, comptime R: type) type {
         fn mappedStep(comptime operation: anytype, comptime map_error: anytype) Step(@TypeOf(operation).Success) {
             const A = @TypeOf(operation).Success;
             const Out = effects.Effect(A, E, R);
-            return .{ .program = Out.deferEffect(struct {
+            return described(Out.deferEffect(struct {
                 fn start(env: *const R) Out {
                     var current = operation;
                     return current.mapErrorOwned(env, map_error);
                 }
-            }.start) };
+            }.start));
         }
 
         /// Begins a versioned workflow definition after validating its identity and schema versions.
@@ -118,13 +314,24 @@ pub fn WorkflowBuilder(comptime E: type, comptime R: type) type {
                                         /// Completed definition carried by this builder or handler.
                                         pub const definition = defined;
 
-                                        /// Completes the workflow with a handler returning Effect(Success, E, R).
+                                        /// Completes the workflow with an exact durable Step handler.
                                         ///
                                         /// Parameters:
-                                        /// - `handler: comptime fn (*const Definition.Payload, *const R) effects.Effect(Definition.Success, E, R)`: Compile-time typed callback; its signature
+                                        /// - `handler`: Compile-time callback returning this builder's exact `Step(Definition.Success)`; its signature
                                         ///   is checked at comptime where static.
                                         /// Returns (`workflows.Handler(Definition, R)`): A completed typed handler binding its operation to the selected environment.
-                                        pub fn handledBy(
+                                        pub fn handledBy(comptime handler: anytype) workflows.Handler(Definition, R) {
+                                            const Returned = inference.result(handler, &.{ *const Definition.Payload, *const R }, "workflow.handledBy");
+                                            requireStep(Returned);
+                                            if (Returned.Success != Definition.Success) @compileError("workflow.handledBy Step success must match definition codec");
+                                            return defined.handledBy(R, struct {
+                                                fn invoke(input: *const Definition.Payload, env: *const R) effects.Effect(Definition.Success, E, R) {
+                                                    return lower(handler(input, env));
+                                                }
+                                            }.invoke);
+                                        }
+
+                                        pub fn handledByEffect(
                                             comptime handler: fn (*const Definition.Payload, *const R) effects.Effect(Definition.Success, E, R),
                                         ) workflows.Handler(Definition, R) {
                                             return defined.handledBy(R, handler);
@@ -153,7 +360,7 @@ pub fn WorkflowBuilder(comptime E: type, comptime R: type) type {
         /// - `value: anytype`: success value returned by this workflow description.
         /// Returns (`Step(@TypeOf(value))`): A typed workflow step description; execution is deferred to the engine.
         pub fn succeed(value: anytype) Step(@TypeOf(value)) {
-            return .{ .program = Core.succeed(value) };
+            return .{ .storage = .{ .success = value } };
         }
 
         /// The selector must return an owned value when A owns payload data.
@@ -164,11 +371,11 @@ pub fn WorkflowBuilder(comptime E: type, comptime R: type) type {
         ///   must remain valid through use.
         /// Returns (`Step(A)`): A typed workflow step description; execution is deferred to the engine.
         pub fn succeedFrom(comptime A: type, comptime select_value: fn (*const R) A) Step(A) {
-            return .{ .program = effects.Effect(A, E, R).fromOutcome(struct {
+            return described(effects.Effect(A, E, R).fromOutcome(struct {
                 fn run(env: *const R) outcomes.Exit(A, E) {
                     return .{ .success = select_value(env) };
                 }
-            }.run) };
+            }.run));
         }
 
         /// Creates a described durable step that fails in the expected E channel.
@@ -178,11 +385,11 @@ pub fn WorkflowBuilder(comptime E: type, comptime R: type) type {
         /// - `err: comptime E`: Typed error value propagated through the failure channel.
         /// Returns (`Step(A)`): A typed workflow step description; execution is deferred to the engine.
         pub fn fail(comptime A: type, comptime err: E) Step(A) {
-            return .{ .program = effects.Effect(A, E, R).fromOutcome(struct {
+            return described(effects.Effect(A, E, R).fromOutcome(struct {
                 fn run(_: *const R) outcomes.Exit(A, E) {
                     return .{ .fail = outcomes.clonePayload(err) catch return .{ .die = outcomes.Defect.out_of_memory } };
                 }
-            }.run) };
+            }.run));
         }
 
         /// The selector must return an owned error when E owns payload data.
@@ -193,11 +400,11 @@ pub fn WorkflowBuilder(comptime E: type, comptime R: type) type {
         ///   must remain valid through use.
         /// Returns (`Step(A)`): A typed workflow step description; execution is deferred to the engine.
         pub fn failFrom(comptime A: type, comptime select_error: fn (*const R) E) Step(A) {
-            return .{ .program = effects.Effect(A, E, R).fromOutcome(struct {
+            return described(effects.Effect(A, E, R).fromOutcome(struct {
                 fn run(env: *const R) outcomes.Exit(A, E) {
                     return .{ .fail = select_error(env) };
                 }
-            }.run) };
+            }.run));
         }
 
         /// Sequences described durable steps; an ordinary Effect is not accepted here.
@@ -207,16 +414,16 @@ pub fn WorkflowBuilder(comptime E: type, comptime R: type) type {
         ///   instantiated.
         /// - `next: comptime anytype`: Compile-time typed callback; its signature is checked at comptime where
         ///   static.
-        /// Returns (`Step(nextType(next).Success)`): A typed workflow step description; execution is deferred to the engine.
-        pub fn bind(comptime step: anytype, comptime next: anytype) Step(nextType(next).Success) {
+        /// Returns (`Step(nextType(@TypeOf(step).Success, next).Success)`): A typed workflow step description; execution is deferred to the engine.
+        pub fn bind(comptime step: anytype, comptime next: anytype) Step(nextType(@TypeOf(step).Success, next).Success) {
             const Current = @TypeOf(step);
             requireStep(Current);
-            const Next = nextType(next);
-            return .{ .program = Core.bind(step.program, struct {
-                fn advance(value: Current.Success) effects.Effect(Next.Success, E, R) {
-                    return next(value).program;
+            const Next = nextType(Current.Success, next);
+            return described(Core.bind(lower(step), struct {
+                fn advance(value: Current.Success, env: *const R) effects.Effect(Next.Success, E, R) {
+                    return lower(inference.call(next, value, env));
                 }
-            }.advance) };
+            }.advance));
         }
 
         /// Lift an existing typed description into this builder.
@@ -237,11 +444,11 @@ pub fn WorkflowBuilder(comptime E: type, comptime R: type) type {
         ///   static.
         /// Returns (`Step(A)`): A typed workflow step description; execution is deferred to the engine.
         pub fn delay(comptime A: type, comptime factory: fn (*const R) Step(A)) Step(A) {
-            return .{ .program = effects.Effect(A, E, R).deferEffect(struct {
+            return described(effects.Effect(A, E, R).deferEffect(struct {
                 fn start(env: *const R) effects.Effect(A, E, R) {
-                    return factory(env).program;
+                    return lower(factory(env));
                 }
-            }.start) };
+            }.start));
         }
 
         /// Sequences a void durable step before another described step.
@@ -269,7 +476,7 @@ pub fn WorkflowBuilder(comptime E: type, comptime R: type) type {
         /// Returns (`effects.Effect(@TypeOf(step).Success, E, R)`): typed execution of the completed workflow definition through the selected engine.
         pub fn run(comptime step: anytype) effects.Effect(@TypeOf(step).Success, E, R) {
             requireStep(@TypeOf(step));
-            return step.program;
+            return lower(step);
         }
 
         /// Runs a typed activity through the engine and records its completed Exit for replay.
@@ -320,7 +527,7 @@ pub fn WorkflowBuilder(comptime E: type, comptime R: type) type {
             );
             if (@TypeOf(program).Error != E)
                 @compileError("recorded activity error must match WorkflowBuilder error; map it explicitly before composition");
-            return .{ .program = program };
+            return described(program);
         }
 
         /// Runs a recorded activity while explicitly mapping provider failure into E.
@@ -789,7 +996,7 @@ pub fn WorkflowBuilder(comptime E: type, comptime R: type) type {
             comptime decode_exit: fn ([]const u8, *const R) outcomes.Exit(outcomes.Exit(A, E), CodecError),
             comptime map_error: fn (parallel.RunError(parallel.Journal(R, ProviderError, guarantee).Failure, CodecError)) E,
         ) Step(parallel.Recorded(A, E)) {
-            const Raw = parallel.runRecorded(A, E, R, ProviderError, CodecError, guarantee, branch.program, select_journal, select_branch, select_attempt, encode_exit, decode_exit);
+            const Raw = parallel.runRecorded(A, E, R, ProviderError, CodecError, guarantee, lower(branch), select_journal, select_branch, select_attempt, encode_exit, decode_exit);
             return mappedStep(Raw, map_error);
         }
 
@@ -802,7 +1009,7 @@ pub fn WorkflowBuilder(comptime E: type, comptime R: type) type {
         /// - `branch: comptime Step(A)`: Typed workflow branch to record or compose.
         /// Returns (`Step(A)`): A typed workflow step description; execution is deferred to the engine.
         pub fn retryBranch(comptime A: type, comptime policy: parallel.Policy, comptime branch: Step(A)) Step(A) {
-            return .{ .program = parallel.retryBranch(A, E, R, policy, branch.program) };
+            return described(parallel.retryBranch(A, E, R, policy, lower(branch)));
         }
 
         /// Records a winning branch outcome before reporting race completion.
@@ -850,7 +1057,7 @@ pub fn WorkflowBuilder(comptime E: type, comptime R: type) type {
             comptime decode_exit: fn ([]const u8, *const R) outcomes.Exit(outcomes.Exit(A, E), CodecError),
             comptime map_error: fn (parallel.RaceError(parallel.RunError(parallel.Journal(R, ProviderError, guarantee).Failure, CodecError), parallel.Journal(R, ProviderError, guarantee).Failure, CodecError)) E,
         ) Step(parallel.RaceOutcome(A, E)) {
-            const Raw = parallel.durableRace(A, E, R, ProviderError, CodecError, guarantee, left.program, right.program, select_journal, select_execution, select_race_name, select_left, select_right, select_attempt, encode_exit, decode_exit);
+            const Raw = parallel.durableRace(A, E, R, ProviderError, CodecError, guarantee, lower(left), lower(right), select_journal, select_execution, select_race_name, select_left, select_right, select_attempt, encode_exit, decode_exit);
             return mappedStep(Raw, map_error);
         }
 
@@ -884,7 +1091,7 @@ pub fn WorkflowBuilder(comptime E: type, comptime R: type) type {
             comptime decode_exit: fn ([]const u8, *const R) outcomes.Exit(outcomes.Exit(void, E), CodecError),
             comptime map_error: fn (compensation.RunError(compensation.Journal(R, ProviderError, guarantee).Failure, CodecError)) E,
         ) Step(compensation.Completed(E)) {
-            const Raw = compensation.runRecorded(E, R, ProviderError, CodecError, guarantee, body.program, select_journal, select_attempt, encode_exit, decode_exit);
+            const Raw = compensation.runRecorded(E, R, ProviderError, CodecError, guarantee, lower(body), select_journal, select_attempt, encode_exit, decode_exit);
             return mappedStep(Raw, map_error);
         }
 

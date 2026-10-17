@@ -7,6 +7,7 @@ const legacy = @import("../schema.zig");
 const structural = @import("internal/structural.zig");
 const ast = @import("schema_ast.zig");
 const representation = @import("internal/representation.zig");
+const record_value = @import("record_value.zig");
 
 /// The wire tag is explicit metadata; renaming a Zig field cannot silently
 /// change data already stored or exchanged with another process.
@@ -60,8 +61,9 @@ pub fn Variant(
     comptime payload_name: []const u8,
     comptime cases: anytype,
 ) type {
+    const Fields = record_value.Fields(T);
     comptime {
-        const info = @typeInfo(T);
+        const info = @typeInfo(Fields);
         if (info != .@"union" or info.@"union".tag_type == null)
             @compileError("Variant requires a tagged Zig union");
         if (@typeInfo(@TypeOf(cases)) != .@"struct" or !@typeInfo(@TypeOf(cases)).@"struct".is_tuple)
@@ -75,7 +77,7 @@ pub fn Variant(
         if (!@hasField(R, "allocator") or @FieldType(R, "allocator") != std.mem.Allocator)
             @compileError("Variant requires R.allocator");
         for (cases, 0..) |item, index| {
-            if (!@hasField(T, item.field_name)) @compileError("Variant case is not a Zig union field");
+            if (!@hasField(Fields, item.field_name)) @compileError("Variant case is not a Zig union field");
             if (item.wire_tag.len == 0 or !std.unicode.utf8ValidateSlice(item.wire_tag))
                 @compileError("Variant wire tags must be nonempty UTF-8");
             for (cases, 0..) |earlier, earlier_index| {
@@ -93,7 +95,7 @@ pub fn Variant(
                 if (C.Representation != std.json.Value or C.DecodingEnvironment != void or C.EncodingEnvironment != void)
                     @compileError("Variant cases require pure JSON codecs");
             }
-            if (C.Decoded != @FieldType(T, item.field_name))
+            if (C.Decoded != @FieldType(Fields, item.field_name))
                 @compileError("Variant case codec does not match its Zig payload");
             if (outcomes.ownsPayload(C.Decoded) and !outcomes.ownsPayload(T))
                 @compileError("a variant with an owned case must declare its own deinit/clone ownership contract");
@@ -115,7 +117,7 @@ pub fn Variant(
             const W = @import("json_writer.zig");
             writer.enter() catch |problem| return outcomes.castFailure(void, W.failureWith(env, .encode, problem, writer));
             defer writer.leave();
-            const active = @tagName(std.meta.activeTag(value.*));
+            const active = @tagName(std.meta.activeTag(record_value.get(value).*));
             inline for (cases) |item| if (std.mem.eql(u8, active, item.field_name)) {
                 writer.write("{") catch |problem| return outcomes.castFailure(void, W.failureWith(env, .encode, problem, writer));
                 writer.quoted(discriminator) catch |problem| return outcomes.castFailure(void, W.failureWith(env, .encode, problem, writer));
@@ -124,7 +126,7 @@ pub fn Variant(
                 writer.write(",") catch |problem| return outcomes.castFailure(void, W.failureWith(env, .encode, problem, writer));
                 writer.quoted(payload_name) catch |problem| return outcomes.castFailure(void, W.failureWith(env, .encode, problem, writer));
                 writer.write(":") catch |problem| return outcomes.castFailure(void, W.failureWith(env, .encode, problem, writer));
-                const input = &@field(value.*, item.field_name);
+                const input = &@field(record_value.get(value).*, item.field_name);
                 const checked = if (comptime item.nested) item.codec.writeJson(env, input, writer) else item.codec.writeJson(input, writer);
                 if (checked == .fail) {
                     var issue = checked.fail;
@@ -186,11 +188,11 @@ pub fn Variant(
         /// Parameters:
         /// - `name: comptime []const u8`: Compile-time stable, nonempty identity component validated at definition
         ///   time.
-        /// - `payload: @FieldType(T, name)`: payload for the selected Zig union case.
+        /// - `payload: @FieldType(Fields, name)`: payload for the selected Zig union case.
         /// Returns (`T`): The typed stored or computed value; ownership follows the enclosing type contract.
-        pub fn make(comptime name: []const u8, payload: @FieldType(T, name)) T {
+        pub fn make(comptime name: []const u8, payload: @FieldType(Fields, name)) T {
             inline for (cases) |item| {
-                if (comptime std.mem.eql(u8, item.field_name, name)) return @unionInit(T, name, payload);
+                if (comptime std.mem.eql(u8, item.field_name, name)) return record_value.init(T, @unionInit(Fields, name, payload));
             }
             @compileError("Zig case is not part of this variant schema");
         }
@@ -201,12 +203,12 @@ pub fn Variant(
         ///   time.
         /// - `value: *const T`: Borrowed input; keep its owner alive until the operation has copied or
         ///   joined it.
-        /// Returns (`?*const @FieldType(T, name)`): selected variant payload, or `null` when the tag does not match.
-        pub fn project(comptime name: []const u8, value: *const T) ?*const @FieldType(T, name) {
+        /// Returns (`?*const @FieldType(Fields, name)`): selected variant payload, or `null` when the tag does not match.
+        pub fn project(comptime name: []const u8, value: *const T) ?*const @FieldType(Fields, name) {
             inline for (cases) |item| {
                 if (comptime std.mem.eql(u8, item.field_name, name)) {
-                    if (!std.mem.eql(u8, @tagName(std.meta.activeTag(value.*)), name)) return null;
-                    return &@field(value.*, name);
+                    if (!std.mem.eql(u8, @tagName(std.meta.activeTag(record_value.get(value).*)), name)) return null;
+                    return &@field(record_value.get(value).*, name);
                 }
             }
             @compileError("Zig case is not part of this variant schema");
@@ -269,7 +271,7 @@ pub fn Variant(
                     const payload = json.object.get(payload_name) orelse return at(env, payload_name, .missing_field);
                     const decoded = decodeCase(item, env, &payload, state);
                     return switch (decoded) {
-                        .success => |value| .{ .success = @unionInit(T, item.field_name, value) },
+                        .success => |value| .{ .success = record_value.init(T, @unionInit(Fields, item.field_name, value)) },
                         .fail => |original| blk: {
                             var issue = original;
                             issue.bindAllocator(env);
@@ -323,12 +325,12 @@ pub fn Variant(
         /// Returns (`outcomes.Exit(std.json.Value, Issue)`): Carries `std.json.Value` on `.success` or `Issue` on `.fail`; `.die`, `.interrupted`, and `.finalization_failed` preserve other terminal causes.
         pub fn encodeWithin(env: *const R, value: *const T, state: *structural.EncodeState) outcomes.Exit(std.json.Value, Issue) {
             var object: std.json.ObjectMap = .{};
-            const active = @tagName(std.meta.activeTag(value.*));
+            const active = @tagName(std.meta.activeTag(record_value.get(value).*));
             inline for (cases) |item| {
                 if (std.mem.eql(u8, active, item.field_name)) {
                     object.put(state.scratch, discriminator, .{ .string = item.wire_tag }) catch
                         return .{ .die = outcomes.Defect.out_of_memory };
-                    const payload = @field(value.*, item.field_name);
+                    const payload = @field(record_value.get(value).*, item.field_name);
                     const encoded = encodeCase(item, env, &payload, state);
                     switch (encoded) {
                         .success => |json_payload| object.put(state.scratch, payload_name, json_payload) catch

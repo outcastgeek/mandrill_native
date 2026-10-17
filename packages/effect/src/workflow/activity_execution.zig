@@ -126,6 +126,40 @@ pub fn runRecorded(
     comptime encode_exit: fn (*const outcomes.Exit(@TypeOf(handler).ActivityDefinition.Success, @TypeOf(handler).ActivityDefinition.DomainError), *const R) outcomes.Exit(outcomes.OwnedSlice(u8), CodecError),
     comptime decode_exit: fn ([]const u8, *const R) outcomes.Exit(outcomes.Exit(@TypeOf(handler).ActivityDefinition.Success, @TypeOf(handler).ActivityDefinition.DomainError), CodecError),
 ) effects.Effect(Recorded(@TypeOf(handler).ActivityDefinition.Success, @TypeOf(handler).ActivityDefinition.DomainError), RunError(engine_module.WorkflowEngine(R, ProviderError, guarantee).Failure, CodecError), R) {
+    const C = struct {
+        fn engine(_: *const void, env: *const R) *const engine_module.WorkflowEngine(R, ProviderError, guarantee) {
+            return select_engine(env);
+        }
+        fn activation(_: *const void, env: *const R) types.Activation {
+            return select_activation(env);
+        }
+        fn activity(_: *const void, env: *const R) types.ActivityId {
+            return select_activity(env);
+        }
+        fn payload(_: *const void, env: *const R) *const @TypeOf(handler).ActivityDefinition.Payload {
+            return select_payload(env);
+        }
+    };
+    return runRecordedCaptured(handler, R, ProviderError, CodecError, guarantee, void, &{}, C.engine, C.activation, C.activity, C.payload, encode_exit, decode_exit);
+}
+
+/// Borrow typed per-call inputs through recording/replay. The enclosing owner
+/// keeps them live through the complete returned Effect and provider work.
+pub fn runRecordedCaptured(
+    comptime handler: anytype,
+    comptime R: type,
+    comptime ProviderError: type,
+    comptime CodecError: type,
+    comptime guarantee: engine_module.Guarantee,
+    comptime C: type,
+    inputs: *const C,
+    comptime select_engine: fn (*const C, *const R) *const engine_module.WorkflowEngine(R, ProviderError, guarantee),
+    comptime select_activation: fn (*const C, *const R) types.Activation,
+    comptime select_activity: fn (*const C, *const R) types.ActivityId,
+    comptime select_payload: fn (*const C, *const R) *const @TypeOf(handler).ActivityDefinition.Payload,
+    comptime encode_exit: fn (*const outcomes.Exit(@TypeOf(handler).ActivityDefinition.Success, @TypeOf(handler).ActivityDefinition.DomainError), *const R) outcomes.Exit(outcomes.OwnedSlice(u8), CodecError),
+    comptime decode_exit: fn ([]const u8, *const R) outcomes.Exit(outcomes.Exit(@TypeOf(handler).ActivityDefinition.Success, @TypeOf(handler).ActivityDefinition.DomainError), CodecError),
+) effects.Effect(Recorded(@TypeOf(handler).ActivityDefinition.Success, @TypeOf(handler).ActivityDefinition.DomainError), RunError(engine_module.WorkflowEngine(R, ProviderError, guarantee).Failure, CodecError), R) {
     const Definition = @TypeOf(handler).ActivityDefinition;
     const A = Definition.Success;
     const E = Definition.DomainError;
@@ -138,6 +172,7 @@ pub fn runRecorded(
         /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
         /// and must be released after use.
         pub const effect_owned_payload = true;
+        inputs: *const C,
         outcome: outcomes.Exit(A, E),
         encoded: Encoded,
 
@@ -163,7 +198,7 @@ pub fn runRecorded(
                 return error.OutOfMemory;
             var owned = copy;
             errdefer owned.deinit();
-            return .{ .outcome = owned, .encoded = try self.encoded.clone() };
+            return .{ .inputs = self.inputs, .outcome = owned, .encoded = try self.encoded.clone() };
         }
     };
     const Adapter = struct {
@@ -209,7 +244,7 @@ pub fn runRecorded(
             };
         }
 
-        fn executed(value: outcomes.Exit(A, E), env: *const R) Out {
+        fn executed(input: *const *const C, value: outcomes.Exit(A, E), env: *const R) Out {
             // A locally interrupted attempt has not completed. Replay must
             // run it again rather than memoizing a suspension/cancellation.
             if (value == .interrupted) return Out.fromOwnedOutcome(env, .interrupted);
@@ -223,13 +258,13 @@ pub fn runRecorded(
                     return Out.fromOwnedOutcome(env, outcomes.castFailure(Output, mapped));
                 },
             };
-            const capture: Capture = .{ .outcome = owned, .encoded = encoded };
-            const engine = select_engine(env);
+            const capture: Capture = .{ .inputs = input.*, .outcome = owned, .encoded = encoded };
+            const engine = select_engine(input.*, env);
             var recording = engine.vtable.record_activity(
                 engine.userdata,
                 env,
-                select_activation(env),
-                select_activity(env),
+                select_activation(input.*, env),
+                select_activity(input.*, env),
                 handler.definition.version,
                 capture.encoded.items,
             );
@@ -237,24 +272,24 @@ pub fn runRecorded(
             return mapped.flatMapCapturedOwned(env, Output, capture, committed);
         }
 
-        fn loaded(record: ?types.RecordedActivity, env: *const R) Out {
+        fn loaded(input: *const *const C, record: ?types.RecordedActivity, env: *const R) Out {
             if (record) |existing| return replay(existing, env);
-            var body = handler.body(select_payload(env), env);
+            var body = handler.body(select_payload(input.*, env), env);
             var settled = body.materializeOwned(env);
             var aligned = settled.mapErrorOwned(env, impossible);
-            return aligned.flatMapOwned(env, executed);
+            return aligned.flatMapCapturedOwned(env, Output, input.*, executed);
         }
     };
-    return Out.deferEffect(struct {
-        fn start(env: *const R) Out {
-            const activation = select_activation(env);
-            const activity = select_activity(env);
+    return Out.deferBorrowed(C, inputs, struct {
+        fn start(input: *const C, env: *const R) Out {
+            const activation = select_activation(input, env);
+            const activity = select_activity(input, env);
             if (!activation.valid() or activity.validate() == .err)
                 return Out.fromOwnedOutcome(env, .{ .fail = .invalid_identity });
-            const engine = select_engine(env);
+            const engine = select_engine(input, env);
             var reading = engine.vtable.lookup_activity(engine.userdata, env, activation.execution, activity);
             var mapped = reading.mapErrorOwned(env, Adapter.engineError);
-            return mapped.flatMapOwned(env, Adapter.loaded);
+            return mapped.flatMapCapturedOwned(env, Output, input, Adapter.loaded);
         }
     }.start);
 }

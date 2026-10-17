@@ -153,6 +153,7 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
         loader: Loader,
         executor: execution.Executor,
         mutex: std.Io.Mutex = .init,
+        users_idle: std.Io.Condition = .init,
         closing_mutex: std.Io.Mutex = .init,
         wake: std.Io.Event = .unset,
         entries: ?*Entry = null,
@@ -214,6 +215,18 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
             self.wake.set(self.io);
         }
 
+        fn beginUse(self: *Self) void {
+            self.mutex.lockUncancelable(self.io);
+            self.users += 1;
+            self.mutex.unlock(self.io);
+        }
+        fn endUse(self: *Self) void {
+            self.mutex.lockUncancelable(self.io);
+            self.users -= 1;
+            if (self.users == 0) self.users_idle.broadcast(self.io);
+            self.mutex.unlock(self.io);
+        }
+
         const Snapshot = struct { entry: *Entry, retained: bool, invalidated: bool, expires: ?std.Io.Timestamp, settled: bool };
         fn snapshot(self: *Self) ?[]Snapshot {
             var count: usize = 0;
@@ -254,14 +267,8 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
         /// Select a retained/shared/new generation before waiting and return an independent value observation.
         /// Cancellation removes this observer; the scoped shared load and other observers keep their own lifetimes.
         pub fn getObservedToken(self: *Self, key: Key, token: ?*const Cancellation) outcomes.Exit(CacheLookup(A), E) {
-            self.mutex.lockUncancelable(self.io);
-            self.users += 1;
-            self.mutex.unlock(self.io);
-            defer {
-                self.mutex.lockUncancelable(self.io);
-                self.users -= 1;
-                self.mutex.unlock(self.io);
-            }
+            self.beginUse();
+            defer self.endUse();
             while (true) {
                 if (if (token) |cancellation| cancellation.isRequested() else false) return .interrupted;
                 self.mutex.lockUncancelable(self.io);
@@ -379,6 +386,8 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
 
         /// Inspect settled successful entries only; never starts or waits for a load.
         pub fn tryGet(self: *Self, key: Key) outcomes.Exit(?A, E) {
+            self.beginUse();
+            defer self.endUse();
             while (true) {
                 self.mutex.lockUncancelable(self.io);
                 if (self.closed) {
@@ -592,14 +601,8 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
             }.matches, null);
         }
         fn invalidateMatching(self: *Self, comptime Input: type, input: Input, comptime matchesEntry: fn (*Self, Key, ?*const DependencySnapshot, Input) bool, replacement: ?*Entry) outcomes.Exit(void, E) {
-            self.mutex.lockUncancelable(self.io);
-            self.users += 1;
-            self.mutex.unlock(self.io);
-            defer {
-                self.mutex.lockUncancelable(self.io);
-                self.users -= 1;
-                self.mutex.unlock(self.io);
-            }
+            self.beginUse();
+            defer self.endUse();
             while (true) {
                 self.mutex.lockUncancelable(self.io);
                 const revision = self.revision;
@@ -696,6 +699,8 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
 
         /// Copy replacement data before atomically excluding earlier equal-key generations.
         pub fn set(self: *Self, key: Key, value: *const A) outcomes.Exit(void, E) {
+            self.beginUse();
+            defer self.endUse();
             const owned_key = self.config.keys.retain(self.config.keys.userdata, key) catch return .{ .die = outcomes.Defect.out_of_memory };
             const entry = self.allocator.create(Entry) catch {
                 var discarded = owned_key;
@@ -762,7 +767,14 @@ pub fn Cache(comptime Key: type, comptime A: type, comptime E: type) type {
         /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
         /// Returns (`void`): no value.
         pub fn deinit(self: *Self) void {
-            std.debug.assert(self.manager_joined and self.users == 0);
+            std.debug.assert(self.manager_joined);
+            // Shutdown joins provider generations. Borrowers can still be
+            // returning from Deferred observations or user policy callbacks;
+            // keep entries, the loader context and scope inputs alive until
+            // those already active calls have released their cache access.
+            self.mutex.lockUncancelable(self.io);
+            while (self.users != 0) self.users_idle.waitUncancelable(self.io, &self.mutex);
+            self.mutex.unlock(self.io);
             var current = self.entries;
             self.entries = null;
             while (current) |entry| {

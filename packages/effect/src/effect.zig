@@ -9,6 +9,7 @@ const providers = @import("services.zig");
 const execution = @import("executor.zig");
 const asynchronous = @import("async.zig");
 const primitives = @import("primitives.zig");
+const inference = @import("dsl/inference.zig");
 
 const EffectTypeMember = enum { Success, Error, Environment };
 
@@ -22,6 +23,8 @@ fn functionInfo(comptime callback: anytype, comptime operation: diagnostics.Oper
 }
 
 fn unaryResult(comptime callback: anytype, comptime Input: type, comptime operation: diagnostics.Operation) type {
+    if (@typeInfo(@TypeOf(callback)) == .@"fn" and @typeInfo(@TypeOf(callback)).@"fn".is_generic)
+        return inference.unary(callback, Input, operation.label());
     const info = functionInfo(callback, operation);
     const expected = @typeInfo(fn (Input) void).@"fn";
     if (info.param_types.len != expected.param_types.len)
@@ -34,6 +37,8 @@ fn unaryResult(comptime callback: anytype, comptime Input: type, comptime operat
 }
 
 fn continuationResult(comptime callback: anytype, comptime Input: type, comptime R: type, comptime operation: diagnostics.Operation) type {
+    if (@typeInfo(@TypeOf(callback)) == .@"fn" and @typeInfo(@TypeOf(callback)).@"fn".is_generic)
+        return inference.continuation(callback, Input, R, operation.label());
     const info = functionInfo(callback, operation);
     const expected = @typeInfo(fn (Input, *const R) void).@"fn";
     if (info.param_types.len != expected.param_types.len) return unaryResult(callback, Input, operation);
@@ -44,7 +49,7 @@ fn continuationResult(comptime callback: anytype, comptime Input: type, comptime
     return info.return_type.?;
 }
 
-inline fn callContinuation(comptime callback: anytype, value: anytype, env: anytype) @typeInfo(@TypeOf(callback)).@"fn".return_type.? {
+inline fn callContinuation(comptime callback: anytype, value: anytype, env: anytype) inference.continuation(callback, @TypeOf(value), @typeInfo(@TypeOf(env)).pointer.child, "continuation") {
     const expected = @typeInfo(fn (@TypeOf(value), @TypeOf(env)) void).@"fn";
     if (comptime @typeInfo(@TypeOf(callback)).@"fn".param_types.len == expected.param_types.len)
         return @call(.always_inline, callback, .{ value, env });
@@ -107,11 +112,30 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         delivery: rt.Delivery = .ordinary,
         ownership: ?*rt.DescriptionNode = null,
 
+        /// Whether known retained captures permit worker admission. Ordinary
+        /// borrowed pointers retain their native caller lifetime obligations.
+        pub fn concurrentSafe(self: *const Self) bool {
+            var current = self.ownership;
+            while (current) |node| : (current = node.previous) if (!node.concurrent_safe) return false;
+            return true;
+        }
+
         const AdapterJob = Job;
         /// Internal typed trampoline bridge for codecs that execute on this Effect kernel.
         pub const RuntimeAdapter = struct {
             /// Borrowed running job; factories transfer owned descriptions to the job.
             pub const Job = AdapterJob;
+            /// Borrow the native immediate constructor's success for a fresh
+            /// description transfer. Custom adapters retain their own value
+            /// interpretation; their storage is not an immediate outcome.
+            pub fn terminalSuccess(program: *const Self) ?*const A {
+                if (program.ready != terminalReady or program.value != .terminal or program.value.terminal != .success) return null;
+                return &program.value.terminal.success;
+            }
+            /// Preserve a fully known generated adapter at the existing root boundary.
+            pub fn specialize(comptime program: Self) Self {
+                return withEntry(program);
+            }
         };
         const Job = struct {
             program: Self,
@@ -120,6 +144,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             // descriptions returned by a running factory/continuation transfer
             // ownership to this job, and must be reclaimed before the next one.
             owned: ?*rt.DescriptionNode = null,
+            retained: ?*rt.RetainedDescription = null,
             env: *const R,
             sink: rt.Sink(A, E),
 
@@ -140,6 +165,8 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             fn finish(self: *Job, evaluated: outcomes.Exit(A, E)) rt.Step {
                 rt.DescriptionNode.deinit(self.owned);
                 self.owned = null;
+                rt.RetainedDescription.deinit(self.retained);
+                self.retained = null;
                 return self.sink.deliver(evaluated);
             }
 
@@ -156,6 +183,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                 const self: *Job = @ptrCast(@alignCast(data.?));
                 state.services = self.program.services(self.env).inherit(self.inherited);
                 state.protected_failure = false;
+                if (self.program.delivery == .ordinary) state.committed_delivery = false;
                 if (self.program.delivery == .ordinary and state.cancelled()) return self.finish(.interrupted);
                 const io = state.services.ioValue();
                 const old = if (state.protection != 0 and io != null) io.?.swapCancelProtection(.blocked) else null;
@@ -389,7 +417,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                 outcomes.discardPayload(&abandoned);
                 return die(outcomes.Defect.out_of_memory);
             };
-            node.* = .{ .header = .{ .previous = null, .allocator = allocator, .destroy = Node.destroy, .origin = .{ .data = node, .resolve = Node.origin } }, .capture = capture };
+            node.* = .{ .header = .{ .previous = null, .concurrent_safe = @import("dsl/ownership.zig").concurrentValue(&capture), .allocator = allocator, .destroy = Node.destroy, .origin = .{ .data = node, .resolve = Node.origin } }, .capture = capture };
             return .{ .value = .{ .borrowed = node }, .ready = if (suspended) null else Node.ready, .start = if (suspended) Node.start else null, .ownership = &node.header };
         }
 
@@ -405,6 +433,17 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         /// Returns (`Self`): owning lazy effect. Call `deinit` exactly once;
         /// allocation failure instead produces a defect description.
         pub fn fromOwned(env: *const R, capture: anytype, comptime callback: fn (*const @TypeOf(capture), *const R) outcomes.Exit(A, E)) Self {
+            const allocator = rt.services(R, env).allocatorValue() orelse {
+                var abandoned = capture;
+                outcomes.discardPayload(&abandoned);
+                return die(.{ .kind = .invalid_configuration, .message = diagnostics.owned_binding_allocator });
+            };
+            return fromOwnedAllocated(allocator, capture, callback);
+        }
+
+        /// Own description storage in an explicit allocation domain while
+        /// execution and its providers continue to use the exact environment R.
+        pub fn fromOwnedAllocated(allocator: std.mem.Allocator, capture: anytype, comptime callback: fn (*const @TypeOf(capture), *const R) outcomes.Exit(A, E)) Self {
             const Capture = @TypeOf(capture);
             const Node = struct {
                 header: rt.DescriptionNode,
@@ -425,18 +464,13 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                     return callback(&node.capture, supplied);
                 }
             };
-            const allocator = rt.services(R, env).allocatorValue() orelse {
-                var abandoned = capture;
-                outcomes.discardPayload(&abandoned);
-                return die(.{ .kind = .invalid_configuration, .message = diagnostics.owned_binding_allocator });
-            };
             const node = allocator.create(Node) catch {
                 var abandoned = capture;
                 outcomes.discardPayload(&abandoned);
                 return die(outcomes.Defect.out_of_memory);
             };
             node.* = .{
-                .header = .{ .previous = null, .allocator = allocator, .destroy = Node.destroy, .origin = .{ .data = node, .resolve = Node.origin } },
+                .header = .{ .previous = null, .concurrent_safe = @import("dsl/ownership.zig").concurrentValue(&capture), .allocator = allocator, .destroy = Node.destroy, .origin = .{ .data = node, .resolve = Node.origin } },
                 .capture = capture,
             };
             return .{ .value = .{ .borrowed = node }, .ready = Node.ready, .ownership = &node.header };
@@ -1014,18 +1048,27 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         // Runtime-selected descriptions retain typed frames and stepping; known
         // synchronous composition does not need a frame simply to hold its evaluated.
         inline fn startBinding(source: Self, comptime Out: type, comptime next: fn (outcomes.Exit(A, E), *const R, *rt.State) Out, state: *rt.State, parent: *Out.Job) rt.Step {
+            return startBindingContext(source, Out, @as(void, {}), struct {
+                fn invoke(_: void, value: outcomes.Exit(A, E), env: *const R, active: *rt.State) Out {
+                    return next(value, env, active);
+                }
+            }.invoke, state, parent);
+        }
+        inline fn startBindingContext(source: Self, comptime Out: type, context: anytype, comptime next: fn (@TypeOf(context), outcomes.Exit(A, E), *const R, *rt.State) Out, state: *rt.State, parent: *Out.Job) rt.Step {
             const Frame = struct {
                 child: Job,
                 evaluated: outcomes.Exit(A, E) = undefined,
                 parent: *Out.Job,
                 allocator: std.mem.Allocator,
+                context: @TypeOf(context),
 
                 fn complete(active: *rt.State, data: ?*anyopaque) rt.Step {
                     const frame: *@This() = @ptrCast(@alignCast(data.?));
                     const evaluated = frame.evaluated;
                     const target = frame.parent;
+                    const current_context = frame.context;
                     frame.allocator.destroy(frame);
-                    target.replace(next(evaluated, target.env, active));
+                    target.replace(next(current_context, evaluated, target.env, active));
                     return target.tail(active);
                 }
             };
@@ -1036,7 +1079,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                 state.services = current.services(parent.env).inherit(enclosing);
                 if (current.delivery == .ordinary and state.cancelled()) {
                     rt.DescriptionNode.deinit(produced_owner);
-                    parent.replace(next(.interrupted, parent.env, state));
+                    parent.replace(next(context, .interrupted, parent.env, state));
                     return parent.tail(state);
                 }
                 if (current.reduce) |reduce| {
@@ -1049,7 +1092,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                 if (current.ready) |ready| {
                     const evaluated = ready(parent.env, current.value, state);
                     rt.DescriptionNode.deinit(produced_owner);
-                    parent.replace(next(evaluated, parent.env, state));
+                    parent.replace(next(context, evaluated, parent.env, state));
                     return parent.tail(state);
                 }
                 break;
@@ -1065,7 +1108,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                 rt.DescriptionNode.deinit(produced_owner);
                 return parent.finish(.{ .die = outcomes.Defect.out_of_memory });
             };
-            frame.* = .{ .parent = parent, .allocator = allocator, .child = .{
+            frame.* = .{ .parent = parent, .allocator = allocator, .context = context, .child = .{
                 .program = current,
                 .inherited = state.services,
                 .owned = produced_owner,
@@ -1095,7 +1138,10 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                             var discarded = evaluated;
                             outcomes.discardPayload(&discarded);
                             break :blk Out.interrupted();
-                        } else callContinuation(next, evaluated, env),
+                        } else blk: {
+                            state.committed_delivery = false;
+                            break :blk callContinuation(next, evaluated, env);
+                        },
                         else => Out.terminalFailure(value),
                     };
                 }
@@ -1117,15 +1163,67 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         pub fn flatMapOwned(self: *Self, env: *const R, comptime next: anytype) continuationResult(next, A, R, .flatMapOwned) {
             const Out = continuationResult(next, A, R, .flatMapOwned);
             comptime requireEffect(Out, E, R, .flatMapOwned);
-            return self.bindExitOwned(env, Out, struct {
-                fn handle(evaluated: outcomes.Exit(A, E), supplied: *const R, state: *rt.State) Out {
-                    return switch (evaluated) {
-                        .success => |value| if (state.cancelled()) blk: {
-                            var discarded = value;
-                            outcomes.discardPayload(&discarded);
+            const allocator = self.services(env).allocatorValue() orelse {
+                self.deinit();
+                return Out.die(.{ .kind = .invalid_configuration, .message = diagnostics.owned_binding_allocator });
+            };
+            return self.flatMapAllocated(allocator, next);
+        }
+
+        /// Consume a description using an explicit construction allocator.
+        /// Execution still selects providers exclusively from its exact R.
+        pub fn flatMapAllocated(self: *Self, allocator: std.mem.Allocator, comptime next: anytype) continuationResult(next, A, R, .flatMapOwned) {
+            const Out = continuationResult(next, A, R, .flatMapOwned);
+            comptime requireEffect(Out, E, R, .flatMapOwned);
+            return self.bindExitAllocated(allocator, Out, struct {
+                fn handle(value: outcomes.Exit(A, E), env: *const R, state: *rt.State) Out {
+                    return switch (value) {
+                        .success => |a| if (state.cancelled()) blk: {
+                            var abandoned = a;
+                            outcomes.discardPayload(&abandoned);
                             break :blk Out.interrupted();
-                        } else callContinuation(next, value, supplied),
-                        else => Out.terminalFailure(evaluated),
+                        } else blk: {
+                            state.committed_delivery = false;
+                            break :blk callContinuation(next, a, env);
+                        },
+                        else => Out.terminalFailure(value),
+                    };
+                }
+            }.handle, null);
+        }
+        pub fn mapAllocated(self: *Self, allocator: std.mem.Allocator, comptime transform: anytype) Effect(unaryResult(transform, A, .map), E, R) {
+            const Out = Effect(unaryResult(transform, A, .map), E, R);
+            return self.flatMapAllocated(allocator, struct {
+                fn next(value: A) Out {
+                    return Out.succeedMoved(transform(value));
+                }
+            }.next);
+        }
+        pub fn mapErrorAllocated(self: *Self, allocator: std.mem.Allocator, comptime transform: anytype) Effect(A, unaryResult(transform, E, .mapError), R) {
+            const F = unaryResult(transform, E, .mapError);
+            const Out = Effect(A, F, R);
+            return self.bindExitAllocated(allocator, Out, struct {
+                fn handle(value: outcomes.Exit(A, E), _: *const R, state: *rt.State) Out {
+                    return Out.terminalExit(outcomes.mapError(F, value, state.services.allocatorValue(), struct {
+                        fn apply(problem: E) F {
+                            return transform(problem);
+                        }
+                    }.apply));
+                }
+            }.handle, null);
+        }
+        pub fn catchAllAllocated(self: *Self, allocator: std.mem.Allocator, comptime recover: anytype) Self {
+            if (continuationResult(recover, E, R, .catchAll) != Self) @compileError(diagnostics.recovery_result);
+            return self.bindExitAllocated(allocator, Self, struct {
+                fn handle(value: outcomes.Exit(A, E), env: *const R, state: *rt.State) Self {
+                    return switch (value) {
+                        .success => |a| succeedMoved(a),
+                        .fail => |err| if (state.cancelled()) blk: {
+                            var abandoned = err;
+                            outcomes.discardPayload(&abandoned);
+                            break :blk interrupted();
+                        } else callContinuation(recover, err, env),
+                        else => terminalFailure(value),
                     };
                 }
             }.handle, null);
@@ -1133,8 +1231,8 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
 
         /// Carries an owned runtime value through a suspended continuation.
         /// `next` may inspect the capture while constructing its returned
-        /// Effect; any data needed after that return must be copied into the
-        /// new description. The capture is released exactly once.
+        /// Effect. Its owner is retained through returned suspended work, so
+        /// borrowed fields remain valid until that work and its cleanup finish.
         ///
         /// Parameters:
         /// - `self: *Self`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
@@ -1150,8 +1248,20 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             env: *const R,
             comptime B: type,
             capture: anytype,
-            comptime next: fn (*const @TypeOf(capture), A, *const R) Effect(B, E, R),
+            comptime next: anytype,
         ) Effect(B, E, R) {
+            const Out = Effect(B, E, R);
+            const allocator = self.services(env).allocatorValue() orelse {
+                self.deinit();
+                var abandoned = capture;
+                outcomes.discardPayload(&abandoned);
+                return Out.die(.{ .kind = .invalid_configuration, .message = diagnostics.owned_binding_allocator });
+            };
+            return self.flatMapCapturedAllocated(allocator, B, capture, next);
+        }
+
+        /// Typed capture construction with a stable allocation source across R projections.
+        pub fn flatMapCapturedAllocated(self: *Self, construction_allocator: std.mem.Allocator, comptime B: type, capture: anytype, comptime next: anytype) Effect(B, E, R) {
             const Capture = @TypeOf(capture);
             const Out = Effect(B, E, R);
             const Node = struct {
@@ -1178,14 +1288,23 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                 }
 
                 fn continueWith(node: *const @This(), result_value: outcomes.Exit(A, E), state: *rt.State, parent: *Out.Job) rt.Step {
-                    const produced: Out = switch (result_value) {
-                        .success => |value| if (state.cancelled()) blk: {
+                    const invoke_next = result_value == .success and !state.cancelled();
+                    if (invoke_next) state.committed_delivery = false;
+                    var produced: Out = switch (result_value) {
+                        .success => |value| if (!invoke_next) blk: {
                             var discarded = value;
                             outcomes.discardPayload(&discarded);
                             break :blk Out.interrupted();
                         } else next(&node.capture, value, parent.env),
                         else => Out.terminalFailure(result_value),
                     };
+                    if (invoke_next) {
+                        const retained = rt.RetainedDescription.create(@constCast(&node.header), parent.retained) catch {
+                            produced.discardProduced();
+                            return parent.finish(.{ .die = outcomes.Defect.out_of_memory });
+                        };
+                        parent.retained = retained;
+                    }
                     parent.replace(produced);
                     return parent.tail(state);
                 }
@@ -1252,20 +1371,14 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                     return frame.child.step();
                 }
             };
-            const allocator = self.services(env).allocatorValue() orelse {
-                self.deinit();
-                var abandoned = capture;
-                outcomes.discardPayload(&abandoned);
-                return Out.die(.{ .kind = .invalid_configuration, .message = diagnostics.owned_binding_allocator });
-            };
-            const node = allocator.create(Node) catch {
+            const node = construction_allocator.create(Node) catch {
                 self.deinit();
                 var abandoned = capture;
                 outcomes.discardPayload(&abandoned);
                 return Out.die(outcomes.Defect.out_of_memory);
             };
             node.* = .{
-                .header = .{ .previous = self.ownership, .allocator = allocator, .destroy = Node.destroy, .origin = .{ .data = node, .resolve = Node.origin } },
+                .header = .{ .previous = self.ownership, .concurrent_safe = @import("dsl/ownership.zig").concurrentValue(&capture), .allocator = construction_allocator, .destroy = Node.destroy, .origin = .{ .data = node, .resolve = Node.origin } },
                 .source = self.*,
                 .capture = capture,
             };
@@ -1274,9 +1387,26 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         }
 
         fn bindExitOwned(self: *Self, env: *const R, comptime Out: type, comptime next: fn (outcomes.Exit(A, E), *const R, *rt.State) Out, scoped_services: ?rt.Services) Out {
+            const capabilities = if (self.resolve == null) scoped_services orelse self.services(env) else self.services(env);
+            const allocator = capabilities.allocatorValue() orelse {
+                self.deinit();
+                return Out.die(.{ .kind = .invalid_configuration, .message = diagnostics.owned_binding_allocator });
+            };
+            return self.bindExitAllocated(allocator, Out, next, scoped_services);
+        }
+
+        fn bindExitAllocated(self: *Self, allocator: std.mem.Allocator, comptime Out: type, comptime next: fn (outcomes.Exit(A, E), *const R, *rt.State) Out, scoped_services: ?rt.Services) Out {
+            return self.bindExitContextAllocated(allocator, Out, @as(void, {}), struct {
+                fn invoke(_: void, value: outcomes.Exit(A, E), env: *const R, active: *rt.State) Out {
+                    return next(value, env, active);
+                }
+            }.invoke, scoped_services);
+        }
+        fn bindExitContextAllocated(self: *Self, allocator: std.mem.Allocator, comptime Out: type, context: anytype, comptime next: fn (@TypeOf(context), outcomes.Exit(A, E), *const R, *rt.State) Out, scoped_services: ?rt.Services) Out {
             const Node = struct {
                 header: rt.DescriptionNode,
                 source: Self,
+                context: @TypeOf(context),
                 scoped_services: ?rt.Services,
 
                 fn destroy(header: *rt.DescriptionNode) void {
@@ -1300,19 +1430,15 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
 
                 fn start(state: *rt.State, parent: *Out.Job) rt.Step {
                     const node: *const @This() = @ptrCast(@alignCast(@constCast(parent.program.value.borrowed)));
-                    return startBinding(node.source, Out, next, state, parent);
+                    return startBindingContext(node.source, Out, node.context, next, state, parent);
                 }
-            };
-            const capabilities = if (self.resolve == null) scoped_services orelse self.services(env) else self.services(env);
-            const allocator = capabilities.allocatorValue() orelse {
-                self.deinit();
-                return Out.die(.{ .kind = .invalid_configuration, .message = diagnostics.owned_binding_allocator });
             };
             const node = allocator.create(Node) catch {
                 self.deinit();
                 return Out.die(outcomes.Defect.out_of_memory);
             };
             node.source = self.*;
+            node.context = context;
             node.scoped_services = scoped_services;
             node.header = .{
                 .previous = self.ownership,
@@ -1347,6 +1473,13 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return borrowed;
         }
 
+        // Discard a freshly produced, unexecuted description at an internal
+        // transfer boundary. Terminal outcomes already own their active payload.
+        fn discardProduced(self: *Self) void {
+            if (self.ready == terminalReady and self.delivery == .terminal) self.value.terminal.deinit();
+            self.deinit();
+        }
+
         // An owning Exit can only enter the private continuation path, where
         // its ownership moves exactly once. It is not a reusable constructor.
         fn terminalFailure(value: anytype) Self {
@@ -1363,23 +1496,28 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         pub fn map(comptime self: Self, comptime transform: anytype) Effect(unaryResult(transform, A, .map), E, R) {
             const B = unaryResult(transform, A, .map);
             const Out = Effect(B, E, R);
-            if (comptime self.ready != null) return .{ .resolve = struct {
-                fn resolve(env: *const R, _: Out.Value) rt.Services {
-                    return self.services(env);
-                }
-            }.resolve, .ready = struct {
-                fn ready(env: *const R, _: Out.Value, state: *rt.State) outcomes.Exit(B, E) {
-                    const value = self.ready.?(env, self.value, state);
-                    return switch (value) {
-                        .success => |evaluated| if (state.cancelled()) blk: {
-                            var discarded = evaluated;
-                            outcomes.discardPayload(&discarded);
-                            break :blk .interrupted;
-                        } else .{ .success = transform(evaluated) },
-                        else => outcomes.castFailure(B, value),
-                    };
-                }
-            }.ready };
+            if (comptime self.ready != null) {
+                const described: Out = .{ .resolve = struct {
+                    fn resolve(env: *const R, _: Out.Value) rt.Services {
+                        return self.services(env);
+                    }
+                }.resolve, .ready = struct {
+                    fn ready(env: *const R, _: Out.Value, state: *rt.State) outcomes.Exit(B, E) {
+                        const value = @call(.always_inline, self.ready.?, .{ env, self.value, state });
+                        return switch (value) {
+                            .success => |evaluated| if (state.cancelled()) blk: {
+                                var discarded = evaluated;
+                                outcomes.discardPayload(&discarded);
+                                break :blk .interrupted;
+                            } else .{ .success = transform(evaluated) },
+                            else => outcomes.castFailure(B, value),
+                        };
+                    }
+                }.ready };
+                // A direct leaf already specializes at its caller. Preserve
+                // the known entry across nested resolver adapters as well.
+                return if (comptime self.resolve == null) described else comptime Out.withEntry(described);
+            }
             return self.flatMap(struct {
                 fn next(value: A) Out {
                     return Out.succeedMoved(transform(value));
@@ -1420,7 +1558,11 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             const Out = Effect(A, F, R);
             return self.bindExit(Out, struct {
                 fn handle(value: outcomes.Exit(A, E), _: *const R, state: *rt.State) Out {
-                    return Out.terminalExit(outcomes.mapError(F, value, state.services.allocatorValue(), transform));
+                    return Out.terminalExit(outcomes.mapError(F, value, state.services.allocatorValue(), struct {
+                        fn apply(problem: E) F {
+                            return transform(problem);
+                        }
+                    }.apply));
                 }
             }.handle);
         }
@@ -1440,7 +1582,25 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             const Out = Effect(A, F, R);
             return self.bindExitOwned(env, Out, struct {
                 fn handle(value: outcomes.Exit(A, E), _: *const R, state: *rt.State) Out {
-                    return Out.terminalExit(outcomes.mapError(F, value, state.services.allocatorValue(), transform));
+                    return Out.terminalExit(outcomes.mapError(F, value, state.services.allocatorValue(), struct {
+                        fn apply(problem: E) F {
+                            return transform(problem);
+                        }
+                    }.apply));
+                }
+            }.handle, null);
+        }
+
+        /// Consume a description while borrowing typed error-mapper inputs.
+        /// Their owner must cover execution and any borrowed mapped payloads.
+        pub fn mapErrorBorrowedAllocated(self: *Self, allocator: std.mem.Allocator, capture: anytype, comptime transform: anytype) Effect(A, @import("dsl/inference.zig").result(transform, &.{ @TypeOf(capture), E }, "mapErrorBorrowed"), R) {
+            const P = @TypeOf(capture);
+            if (@typeInfo(P) != .pointer or @typeInfo(P).pointer.size != .one) @compileError("mapErrorBorrowed requires a single-item capture pointer");
+            const F = @import("dsl/inference.zig").result(transform, &.{ P, E }, "mapErrorBorrowed");
+            const Out = Effect(A, F, R);
+            return self.bindExitContextAllocated(allocator, Out, capture, struct {
+                fn handle(pointer: P, value: outcomes.Exit(A, E), _: *const R, active: *rt.State) Out {
+                    return Out.terminalExit(outcomes.mapErrorCaptured(F, value, active.services.allocatorValue(), pointer, transform));
                 }
             }.handle, null);
         }
@@ -1854,6 +2014,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         ///   static.
         /// Returns (`Self`): CPU-dispatched work borrowing `capture` until its provider job joins.
         pub fn onCpuBorrowed(comptime Capture: type, capture: *const Capture, comptime callback: fn (*const Capture, *const R, *const rt.Cancellation) outcomes.Exit(A, E)) Self {
+            comptime @import("dsl/ownership.zig").requireConcurrent(Capture, "onCpuBorrowed");
             return onEngineBorrowed(Capture, capture, callback, .cpu);
         }
 
@@ -1865,6 +2026,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         ///   static.
         /// Returns (`Self`): blocking-dispatched work borrowing `capture` until its provider job joins.
         pub fn onBlockingBorrowed(comptime Capture: type, capture: *const Capture, comptime callback: fn (*const Capture, *const R, *const rt.Cancellation) outcomes.Exit(A, E)) Self {
+            comptime @import("dsl/ownership.zig").requireConcurrent(Capture, "onBlockingBorrowed");
             return onEngineBorrowed(Capture, capture, callback, .blocking);
         }
 
@@ -1979,6 +2141,52 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         /// - `right: comptime Self`: Right-hand typed description in this composition.
         /// Returns (`Self`): A composed description of the same specialized API; evaluation remains deferred.
         pub fn race(comptime self: Self, comptime right: Self) Self {
+            return raceKernel(struct {
+                fn left(_: Value) Self {
+                    return self;
+                }
+            }.left, struct {
+                fn selected(_: Value) Self {
+                    return right;
+                }
+            }.selected, .none, null);
+        }
+
+        // Timeout's validated duration is runtime data. Retain its timer
+        // description through the same race authority and both joined workers.
+        fn raceRuntimeTimer(comptime self: Self, env: *const R, timer: *Self) Self {
+            const Holder = struct {
+                header: rt.DescriptionNode,
+                timer: Self,
+                fn destroy(header: *rt.DescriptionNode) void {
+                    const holder: *@This() = @alignCast(@fieldParentPtr("header", header));
+                    header.allocator.destroy(holder);
+                }
+                fn origin(current: *const anyopaque, _: *const anyopaque) rt.Services {
+                    return self.services(@ptrCast(@alignCast(current)));
+                }
+                fn left(_: Value) Self {
+                    return self;
+                }
+                fn right(value: Value) Self {
+                    const holder: *const @This() = @ptrCast(@alignCast(value.borrowed));
+                    return holder.timer;
+                }
+            };
+            const allocator = self.services(env).allocatorValue() orelse {
+                timer.deinit();
+                return die(.{ .kind = .invalid_configuration, .message = diagnostics.suspended_binding_allocator });
+            };
+            const holder = allocator.create(Holder) catch {
+                timer.deinit();
+                return die(outcomes.Defect.out_of_memory);
+            };
+            holder.* = .{ .header = .{ .previous = timer.ownership, .allocator = allocator, .destroy = Holder.destroy, .origin = .{ .data = holder, .resolve = Holder.origin } }, .timer = timer.* };
+            timer.* = undefined;
+            return raceKernel(Holder.left, Holder.right, .{ .borrowed = holder }, &holder.header);
+        }
+
+        fn raceKernel(comptime selected_left: fn (Value) Self, comptime selected_right: fn (Value) Self, stored: Value, description_owner: ?*rt.DescriptionNode) Self {
             const Adapter = struct {
                 const Side = enum { left, right };
                 const Competitors = @Tuple(&.{ Self, Self });
@@ -2007,8 +2215,8 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                         var child_state = worker.frame.initial;
                         child_state.branch_cancellation = &worker.cancellation;
                         const program = switch (worker.side) {
-                            .left => self,
-                            .right => right,
+                            .left => worker.frame.left,
+                            .right => worker.frame.right,
                         };
                         worker.evaluated = evaluateBorrowed(worker.frame.parent.env, program, &child_state);
                         worker.protected_failure = child_state.protected_failure;
@@ -2023,6 +2231,8 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                     allocator: std.mem.Allocator,
                     io: std.Io,
                     initial: rt.State,
+                    left: Self,
+                    right: Self,
                     mutex: std.Io.Mutex = .init,
                     selected: std.Io.Event = .unset,
                     workers: [count]Worker = undefined,
@@ -2080,15 +2290,15 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                     }
                 };
 
-                fn resolve(env: *const R, _: Value) rt.Services {
-                    return self.services(env);
+                fn resolve(env: *const R, value: Value) rt.Services {
+                    return selected_left(value).services(env);
                 }
 
                 fn start(state: *rt.State, parent: *Job) rt.Step {
                     const allocator = state.services.allocatorValue() orelse return parent.finish(.{ .die = .{ .kind = .invalid_configuration, .message = diagnostics.suspended_binding_allocator } });
                     const io = state.services.ioValue() orelse return parent.finish(.{ .die = .{ .kind = .provider_unavailable, .message = diagnostics.race_requires_environment_i_o_for_synchronization } });
                     const frame = allocator.create(Frame) catch return parent.finish(.{ .die = outcomes.Defect.out_of_memory });
-                    frame.* = .{ .parent = parent, .allocator = allocator, .io = io, .initial = state.* };
+                    frame.* = .{ .parent = parent, .allocator = allocator, .io = io, .initial = state.*, .left = selected_left(parent.program.value), .right = selected_right(parent.program.value) };
                     const provider = executor(parent.env, .independent);
                     for (&frame.workers, std.meta.tags(Side)) |*worker, side| {
                         worker.* = .{ .frame = frame, .side = side, .cleanup_storage = .{ .owner = frame, .release = Frame.releaseStorage, .allocator = allocator }, .handle_storage = .{ .owner = frame, .release = Frame.releaseStorage, .allocator = allocator } };
@@ -2116,7 +2326,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                     return .{ .data = frame, .advance = if (complete) Frame.continueAsync else null, .suspended = Frame.continueAsync };
                 }
             };
-            return .{ .resolve = Adapter.resolve, .start = Adapter.start };
+            return .{ .value = stored, .ownership = description_owner, .resolve = Adapter.resolve, .start = Adapter.start };
         }
 
         /// Bound this Effect by a caller-selected duration.
@@ -2154,22 +2364,29 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         /// Returns (`Self`): an effect using the environment-selected duration; overdue work is cancelled and joined before publication.
         pub fn timeoutFrom(comptime self: Self, comptime select_delay: fn (*const R) std.Io.Duration, comptime on_timeout: fn () E) Self {
             const Adapter = struct {
-                fn expired(_: *const void, env: *const R) outcomes.Exit(A, E) {
-                    const duration = select_delay(env);
-                    if (duration.nanoseconds < 0) return .{ .die = .{ .kind = .invalid_configuration, .message = diagnostics.timeout_duration_must_be_non_negative } };
-                    if (comptime @hasField(R, "clock")) switch (env.clock.sleep(duration)) {
+                fn expired(duration: *const std.Io.Duration, env: *const R, token: ?*const rt.Cancellation) outcomes.Exit(A, E) {
+                    if (token) |cancellation| if (cancellation.isRequested()) return .interrupted;
+                    if (comptime R != void and @hasField(R, "clock")) switch (env.clock.sleep(duration.*)) {
                         .done => {},
                         .interrupted => return .interrupted,
                         .defect => |defect| return .{ .die = defect },
-                    } else env.io.sleep(duration, .awake) catch return .interrupted;
+                    } else env.io.sleep(duration.*, .awake) catch return .interrupted;
                     return .{ .fail = on_timeout() };
                 }
                 fn factory(env: *const R) Self {
                     const duration = select_delay(env);
                     if (duration.nanoseconds < 0) return die(.{ .kind = .invalid_configuration, .message = diagnostics.timeout_duration_must_be_non_negative });
-                    if (duration.nanoseconds == 0) return fail(on_timeout());
-                    const timer = comptime fromNativeBorrowed(void, &{}, expired);
-                    return self.race(timer);
+                    if (duration.nanoseconds == 0) return fromOutcome(struct {
+                        fn timedOut(_: *const R) outcomes.Exit(A, E) {
+                            return .{ .fail = on_timeout() };
+                        }
+                    }.timedOut);
+                    const allocator = self.services(env).allocatorValue() orelse return die(.{ .kind = .invalid_configuration, .message = diagnostics.suspended_binding_allocator });
+                    var timer = captureOwned(allocator, duration, true, expired);
+                    // Capture construction is setup, so its allocation failure
+                    // cannot compete with successful application work.
+                    if (timer.ownership == null) return timer;
+                    return self.raceRuntimeTimer(env, &timer);
                 }
             };
             return deferEffect(Adapter.factory);
@@ -2474,6 +2691,16 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             }.handle);
         }
 
+        /// Consuming runtime recovery preserving capture and allocator owners.
+        pub fn catchAllOwned(self: *Self, env: *const R, comptime recover: anytype) Self {
+            if (continuationResult(recover, E, R, .catchAll) != Self) @compileError(diagnostics.recovery_result);
+            const allocator = self.services(env).allocatorValue() orelse {
+                self.deinit();
+                return die(.{ .kind = .invalid_configuration, .message = diagnostics.owned_binding_allocator });
+            };
+            return self.catchAllAllocated(allocator, recover);
+        }
+
         /// Acquire and register a resource in the current scope.
         /// Parameters:
         /// - `acquisition_description: comptime Self`: Compile-time the acquisition description input required by
@@ -2482,7 +2709,8 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         /// - `release: comptime fn (A) Effect(void, E, R)`: Compile-time typed callback; its signature is checked at comptime where
         ///   static.
         /// Returns (`Self`): an effect that registers a successful acquisition with `scope` and releases it at scope close.
-        pub fn scopeAcquire(comptime acquisition_description: Self, scope: *scopes.Scope(E), comptime release: fn (A) Effect(void, E, R)) Self {
+        pub fn scopeAcquire(comptime acquisition_description: Self, scope: *scopes.Scope(E), comptime release: anytype) Self {
+            if (continuationResult(release, A, R, .acquireRelease_finalizer) != Effect(void, E, R)) @compileError("scopeAcquire.release requires exact Effect(void,E,R)");
             return scopeAcquisition(struct {
                 const description: Self = acquisition_description;
                 fn select(_: Value) Self {
@@ -2492,16 +2720,58 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                 fn select(value: Value) *scopes.Scope(E) {
                     return @ptrCast(@alignCast(@constCast(value.borrowed)));
                 }
-            }.select, .{ .borrowed = scope }, release);
+            }.select, .{ .borrowed = scope }, void, struct {
+                fn capture(_: Value) *const void {
+                    return &{};
+                }
+            }.capture, struct {
+                fn owner(_: Value) ?*rt.DescriptionNode {
+                    return null;
+                }
+            }.owner, struct {
+                fn cleanup(_: *const void, resource_value: A, env: *const R) Effect(void, E, R) {
+                    return callContinuation(release, resource_value, env);
+                }
+            }.cleanup);
+        }
+
+        /// Consume a runtime acquisition into an existing lexical scope using
+        /// its explicit construction allocator. Execution still uses exact R.
+        pub fn scopeAcquireAllocated(self: *Self, allocator: std.mem.Allocator, scope: *scopes.Scope(E), comptime release: fn (A) Effect(void, E, R)) Self {
+            return self.scopeAcquireDynamic(allocator, scope, release);
         }
 
         fn scopeAcquireDynamic(self: *Self, allocator: std.mem.Allocator, scope: *scopes.Scope(E), comptime release: fn (A) Effect(void, E, R)) Self {
+            return self.scopeAcquireCapturedAllocated(allocator, scope, @as(void, {}), struct {
+                fn cleanup(_: *const void, resource_value: A, _: *const R) Effect(void, E, R) {
+                    return release(resource_value);
+                }
+            }.cleanup);
+        }
+
+        /// Consume the description and its declared capture into the existing
+        /// scope authority. Each registration retains this description until
+        /// its release and release-description teardown have both completed.
+        pub fn scopeAcquireCapturedAllocated(self: *Self, allocator: std.mem.Allocator, scope: *scopes.Scope(E), capture: anytype, comptime release: fn (*const @TypeOf(capture), A, *const R) Effect(void, E, R)) Self {
+            return self.scopeCapturedAllocated(allocator, scope, capture, null, release);
+        }
+
+        /// Build each acquisition lazily from the scope-retained capture.
+        pub fn scopeAcquireFactoryCapturedAllocated(allocator: std.mem.Allocator, scope: *scopes.Scope(E), capture: anytype, comptime acquire: fn (*const @TypeOf(capture), *const R) Self, comptime release: fn (*const @TypeOf(capture), A, *const R) Effect(void, E, R)) Self {
+            var source = Self.interrupted();
+            return source.scopeCapturedAllocated(allocator, scope, capture, acquire, release);
+        }
+
+        fn scopeCapturedAllocated(self: *Self, allocator: std.mem.Allocator, scope: *scopes.Scope(E), capture: anytype, comptime acquire: ?fn (*const @TypeOf(capture), *const R) Self, comptime release: fn (*const @TypeOf(capture), A, *const R) Effect(void, E, R)) Self {
+            const Capture = @TypeOf(capture);
             const Holder = struct {
                 header: rt.DescriptionNode,
                 source: Self,
                 scope: *scopes.Scope(E),
+                capture: Capture,
                 fn destroy(header: *rt.DescriptionNode) void {
                     const holder: *@This() = @alignCast(@fieldParentPtr("header", header));
+                    outcomes.discardPayload(&holder.capture);
                     header.allocator.destroy(holder);
                 }
                 fn origin(env: *const anyopaque, data: *const anyopaque) rt.Services {
@@ -2510,25 +2780,36 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                 }
                 fn select(value: Value) Self {
                     const holder: *const @This() = @ptrCast(@alignCast(value.borrowed));
+                    if (comptime acquire != null) return Self.deferBorrowed(Capture, &holder.capture, acquire.?);
                     return holder.source;
                 }
                 fn selectedScope(value: Value) *scopes.Scope(E) {
                     const holder: *const @This() = @ptrCast(@alignCast(value.borrowed));
                     return holder.scope;
                 }
+                fn selectedCapture(value: Value) *const Capture {
+                    const holder: *const @This() = @ptrCast(@alignCast(value.borrowed));
+                    return &holder.capture;
+                }
+                fn selectedOwner(value: Value) ?*rt.DescriptionNode {
+                    const holder: *const @This() = @ptrCast(@alignCast(value.borrowed));
+                    return @constCast(&holder.header);
+                }
             };
             const holder = allocator.create(Holder) catch {
                 self.deinit();
+                var abandoned = capture;
+                outcomes.discardPayload(&abandoned);
                 return die(outcomes.Defect.out_of_memory);
             };
-            holder.* = .{ .header = .{ .previous = self.ownership, .allocator = allocator, .destroy = Holder.destroy, .origin = .{ .data = holder, .resolve = Holder.origin } }, .source = self.*, .scope = scope };
+            holder.* = .{ .header = .{ .previous = self.ownership, .allocator = allocator, .destroy = Holder.destroy, .origin = .{ .data = holder, .resolve = Holder.origin } }, .source = self.*, .scope = scope, .capture = capture };
             self.* = undefined;
-            var program = scopeAcquisition(Holder.select, Holder.selectedScope, .{ .borrowed = holder }, release);
+            var program = scopeAcquisition(Holder.select, Holder.selectedScope, .{ .borrowed = holder }, Capture, Holder.selectedCapture, Holder.selectedOwner, release);
             program.ownership = &holder.header;
             return program;
         }
 
-        fn scopeAcquisition(comptime source: fn (Value) Self, comptime selected_scope: fn (Value) *scopes.Scope(E), stored: Value, comptime release: fn (A) Effect(void, E, R)) Self {
+        fn scopeAcquisition(comptime source: fn (Value) Self, comptime selected_scope: fn (Value) *scopes.Scope(E), stored: Value, comptime Capture: type, comptime selected_capture: fn (Value) *const Capture, comptime selected_owner: fn (Value) ?*rt.DescriptionNode, comptime release: fn (*const Capture, A, *const R) Effect(void, E, R)) Self {
             if (comptime outcomes.ownsPayload(A)) @compileError(diagnostics.scoped_acquisitions_must_expose_borrowed_resource_handles_acquire_an_owning_evaluated_by);
             const Unit = Effect(void, E, R);
             const Scope = scopes.Scope(E);
@@ -2548,13 +2829,17 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                     acquisition: Job = undefined,
                     acquired: outcomes.Exit(A, E) = undefined,
                     resource: A = undefined,
+                    capture: *const Capture,
+                    description_owner: ?*rt.DescriptionNode,
                     finalizer: Unit.Job = undefined,
                     cleanup: outcomes.Exit(void, E) = undefined,
 
                     fn destroy(header: *Scope.Finalizer) void {
                         const node: *@This() = @alignCast(@fieldParentPtr("header", header));
                         providers.freeAnnotations(node.allocator, node.annotations);
+                        const description_owner = node.description_owner;
                         node.allocator.destroy(node);
+                        rt.DescriptionNode.deinit(description_owner);
                     }
 
                     fn releaseStorage(data: *anyopaque) void {
@@ -2564,7 +2849,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
 
                     fn startFinalizer(header: *Scope.Finalizer, state: *rt.State, sink: rt.Sink(void, E)) rt.Step {
                         const node: *@This() = @alignCast(@fieldParentPtr("header", header));
-                        const program = release(node.resource);
+                        const program = release(node.capture, node.resource, &node.env);
                         node.previous_annotations = state.annotations;
                         node.previous_span = state.span;
                         node.finalizer_sink = sink;
@@ -2627,8 +2912,11 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                         .inherited = state.services,
                         .annotations = annotations_copy,
                         .span = state.span,
+                        .capture = selected_capture(parent.program.value),
+                        .description_owner = selected_owner(parent.program.value),
                         .header = .{ .start = Node.startFinalizer, .destroy = Node.destroy, .storage = .{ .owner = node, .release = Node.releaseStorage, .allocator = allocator } },
                     };
+                    if (node.description_owner) |owner| owner.retain();
                     const acquisition = source(parent.program.value);
                     node.acquisition = .{ .program = acquisition.borrow(), .inherited = state.services, .env = parent.env, .sink = .{ .output = &node.acquired, .next_step = .{ .data = node, .advance = Node.acquiredStep } } };
                     return node.acquisition.step();
@@ -2646,21 +2934,26 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         }
 
         fn scopeCloser(scope: *scopes.Scope(E), comptime destroy: bool) Effect(void, E, R) {
+            return scopeCloserMapped(E, scope, destroy, null);
+        }
+
+        fn scopeCloserMapped(comptime F: type, scope: *scopes.Scope(F), comptime destroy: bool, comptime transform: anytype) Effect(void, E, R) {
             const Unit = Effect(void, E, R);
             const Adapter = struct {
-                fn complete(_: *rt.State, data: ?*anyopaque, value: outcomes.Exit(void, E)) rt.Step {
+                fn complete(_: *rt.State, data: ?*anyopaque, value: outcomes.Exit(void, F)) rt.Step {
                     const parent: *Unit.Job = @ptrCast(@alignCast(data.?));
+                    const mapped = if (comptime @TypeOf(transform) == @TypeOf(null)) value else outcomes.mapError(E, value, parent.env.allocator, transform);
                     if (destroy) {
-                        const owned: *scopes.Scope(E) = @ptrCast(@alignCast(@constCast(parent.program.value.borrowed)));
+                        const owned: *scopes.Scope(F) = @ptrCast(@alignCast(@constCast(parent.program.value.borrowed)));
                         const allocator = owned.allocator;
                         owned.deinit();
                         allocator.destroy(owned);
                     }
-                    return parent.finish(value);
+                    return parent.finish(mapped);
                 }
 
                 fn start(state: *rt.State, parent: *Unit.Job) rt.Step {
-                    const target: *scopes.Scope(E) = @ptrCast(@alignCast(@constCast(parent.program.value.borrowed)));
+                    const target: *scopes.Scope(F) = @ptrCast(@alignCast(@constCast(parent.program.value.borrowed)));
                     return switch (target.admitClose()) {
                         .completed => |value| complete(state, parent, value),
                         .owner => target.drain(state, parent, complete),
@@ -2669,7 +2962,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                 }
                 fn waitClosed(state: *rt.State, data: ?*anyopaque) rt.Step {
                     const parent: *Unit.Job = @ptrCast(@alignCast(data.?));
-                    const target: *scopes.Scope(E) = @ptrCast(@alignCast(@constCast(parent.program.value.borrowed)));
+                    const target: *scopes.Scope(F) = @ptrCast(@alignCast(@constCast(parent.program.value.borrowed)));
                     return complete(state, parent, target.beginClose().?);
                 }
             };
@@ -2681,7 +2974,9 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         /// - `use_scope: comptime fn (*scopes.Scope(E)) Self`: Compile-time typed function selected at comptime; no runtime callback
         ///   lookup is required.
         /// Returns (`Self`): a scoped effect that closes the supplied scope after execution.
-        pub fn scoped(comptime use_scope: fn (*scopes.Scope(E)) Self) Self {
+        pub fn scoped(comptime use_scope: anytype) Self {
+            if (continuationResult(use_scope, *scopes.Scope(E), R, .acquireRelease_body) != Self)
+                @compileError("scoped.body requires exact Effect(A,E,R) for the selected scope");
             const Acquire = Effect(*scopes.Scope(E), E, R);
             const Factory = struct {
                 fn create(env: *const R) outcomes.Exit(*scopes.Scope(E), E) {
@@ -2696,6 +2991,51 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                 }
             };
             return (comptime Acquire.fromOutcome(Factory.create)).acquireRelease(use_scope, Factory.release);
+        }
+
+        /// A scoped body with one generated owning capture, using the same
+        /// scope acquisition and protected close as the static form.
+        pub fn scopedCaptured(env: *const R, capture: anytype, comptime use_scope: fn (*const @TypeOf(capture), *scopes.Scope(E), *const R) Self) Self {
+            const Capture = @TypeOf(capture);
+            const Acquire = Effect(*scopes.Scope(E), E, R);
+            const Factory = struct {
+                fn create(current: *const R) outcomes.Exit(*scopes.Scope(E), E) {
+                    const scope = current.allocator.create(scopes.Scope(E)) catch return .{ .die = outcomes.Defect.out_of_memory };
+                    scope.* = scopes.Scope(E).init(current);
+                    return .{ .success = scope };
+                }
+                fn release(_: *const Capture, scope: *scopes.Scope(E), _: outcomes.PrimaryOutcome(E), _: *const R) Effect(void, E, R) {
+                    return scopeCloser(scope, true);
+                }
+            };
+            var acquire = Acquire.fromOutcome(Factory.create);
+            return acquire.acquireReleaseCapturedOwned(env, capture, use_scope, Factory.release);
+        }
+
+        /// Own a scope with a distinct error channel, mapping its close outcome
+        /// only after the existing Scope authority has drained every finalizer.
+        /// The close adapter allocates no execution frame before drain.
+        pub fn scopedErrorCaptured(
+            comptime ScopeError: type,
+            env: *const R,
+            capture: anytype,
+            comptime map_scope_error: fn (ScopeError) E,
+            comptime use_scope: fn (*const @TypeOf(capture), *scopes.Scope(ScopeError), *const R) Self,
+        ) Self {
+            const Capture = @TypeOf(capture);
+            const Acquire = Effect(*scopes.Scope(ScopeError), E, R);
+            const Factory = struct {
+                fn create(current: *const R) outcomes.Exit(*scopes.Scope(ScopeError), E) {
+                    const scope = current.allocator.create(scopes.Scope(ScopeError)) catch return .{ .die = outcomes.Defect.out_of_memory };
+                    scope.* = scopes.Scope(ScopeError).init(current);
+                    return .{ .success = scope };
+                }
+                fn release(_: *const Capture, scope: *scopes.Scope(ScopeError), _: outcomes.PrimaryOutcome(E), _: *const R) Effect(void, E, R) {
+                    return scopeCloserMapped(ScopeError, scope, true, map_scope_error);
+                }
+            };
+            var acquire = Acquire.fromOutcome(Factory.create);
+            return acquire.acquireReleaseCapturedOwned(env, capture, use_scope, Factory.release);
         }
 
         /// Describe a cancellable delay through the environment’s I/O capability.
@@ -2722,7 +3062,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                         frame.wake.set(frame.io);
                     }
                     fn work(frame: *@This()) void {
-                        if (comptime @hasField(R, "clock")) frame.result_value = switch (frame.parent.env.clock.sleep(frame.duration)) {
+                        if (comptime R != void and @hasField(R, "clock")) frame.result_value = switch (frame.parent.env.clock.sleep(frame.duration)) {
                             .done => .{ .success = {} },
                             .interrupted => .interrupted,
                             .defect => |defect| .{ .die = defect },
@@ -2985,6 +3325,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         ///   hidden default is installed.
         /// Returns (`Self`): this effect repeated after typed failures according to `policy`.
         pub fn retry(comptime self: Self, comptime policy: anytype) Self {
+            if (comptime outcomes.ownsPayload(@TypeOf(policy))) @compileError("owning schedule state requires a fresh retryFrom policy factory");
             return self.iterate(false, struct {
                 fn select(_: *const R) @TypeOf(policy) {
                     return policy;
@@ -3000,6 +3341,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         ///   hidden default is installed.
         /// Returns (`Self`): A composed description of the same specialized API; evaluation remains deferred.
         pub fn repeat(comptime self: Self, comptime policy: anytype) Self {
+            if (comptime outcomes.ownsPayload(@TypeOf(policy))) @compileError("owning schedule state requires a fresh repeatFrom policy factory");
             return self.iterate(true, struct {
                 fn select(_: *const R) @TypeOf(policy) {
                     return policy;
@@ -3028,8 +3370,57 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
             return self.iterate(true, policy);
         }
 
+        pub fn retryFromOwned(self: *Self, env: *const R, comptime policy: anytype) Self {
+            return self.iterateOwned(env, false, policy);
+        }
+        pub fn repeatFromOwned(self: *Self, env: *const R, comptime policy: anytype) Self {
+            return self.iterateOwned(env, true, policy);
+        }
+
+        fn iterateOwned(self: *Self, env: *const R, comptime repeating: bool, comptime policy: anytype) Self {
+            const Holder = struct {
+                header: rt.DescriptionNode,
+                source: Self,
+                fn destroy(header: *rt.DescriptionNode) void {
+                    const holder: *@This() = @alignCast(@fieldParentPtr("header", header));
+                    header.allocator.destroy(holder);
+                }
+                fn origin(current: *const anyopaque, data: *const anyopaque) rt.Services {
+                    const holder: *const @This() = @ptrCast(@alignCast(data));
+                    return holder.source.services(@ptrCast(@alignCast(current)));
+                }
+                fn select(value: Value) Self {
+                    const holder: *const @This() = @ptrCast(@alignCast(value.borrowed));
+                    return holder.source;
+                }
+            };
+            const allocator = self.services(env).allocatorValue() orelse {
+                self.deinit();
+                return die(.{ .kind = .invalid_configuration, .message = diagnostics.suspended_binding_allocator });
+            };
+            const holder = allocator.create(Holder) catch {
+                self.deinit();
+                return die(outcomes.Defect.out_of_memory);
+            };
+            holder.* = .{ .header = .{ .previous = self.ownership, .allocator = allocator, .destroy = Holder.destroy, .origin = .{ .data = holder, .resolve = Holder.origin } }, .source = self.* };
+            self.* = undefined;
+            return iterateKernel(repeating, policy, Holder.select, .{ .borrowed = holder }, &holder.header);
+        }
+
         fn iterate(comptime self: Self, comptime repeating: bool, comptime select_policy: anytype) Self {
-            const Policy = unaryResult(select_policy, *const R, .service);
+            return iterateKernel(repeating, select_policy, struct {
+                fn select(_: Value) Self {
+                    return self;
+                }
+            }.select, .none, null);
+        }
+
+        fn iterateKernel(comptime repeating: bool, comptime select_policy: anytype, comptime source: fn (Value) Self, stored: Value, description_owner: ?*rt.DescriptionNode) Self {
+            const Selected = unaryResult(select_policy, *const R, .service);
+            const effectful_initialization = comptime @import("dsl/inference.zig").isEffect(Selected);
+            if (comptime effectful_initialization) comptime requireEffect(Selected, E, R, .service);
+            const Policy = if (effectful_initialization) Selected.Success else Selected;
+            const Initialize = Effect(Policy, E, R);
             const Input = if (repeating) A else E;
             if (Policy.Input != Input) @compileError(diagnostics.schedule_input_must_match_the_selected_effect_success_error_channel);
             if (Policy.uses_random and (R == void or !@hasField(R, "random") or @FieldType(R, "random") != providers.Random))
@@ -3039,7 +3430,11 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                     parent: *Job,
                     allocator: std.mem.Allocator,
                     inherited: rt.Services,
-                    policy: Policy,
+                    source: Self,
+                    policy: Policy = undefined,
+                    has_policy: bool = false,
+                    initializing: Initialize.Job = undefined,
+                    initialized_value: outcomes.Exit(Policy, E) = undefined,
                     io: std.Io = undefined,
                     clock: providers.Clock,
                     started: std.Io.Timestamp,
@@ -3050,7 +3445,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
 
                     fn attempt(_: *rt.State, data: ?*anyopaque) rt.Step {
                         const frame: *@This() = @ptrCast(@alignCast(data.?));
-                        frame.child = .{ .program = self, .inherited = frame.inherited, .env = frame.parent.env, .sink = .{
+                        frame.child = .{ .program = frame.source, .inherited = frame.inherited, .env = frame.parent.env, .sink = .{
                             .output = &frame.outcome,
                             .next_step = .{ .data = frame, .advance = complete },
                         } };
@@ -3066,12 +3461,18 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                         const sample = if (Policy.uses_random) frame.parent.env.random.sample() else 0;
                         const decision = frame.policy.step(input, frame.started.durationTo(frame.clock.now()), sample);
                         switch (decision) {
-                            .stop => return frame.finish(frame.outcome),
+                            .stop => |output| {
+                                var discarded = output;
+                                @import("dsl/ownership.zig").discard(&discarded);
+                                return frame.finish(frame.outcome);
+                            },
                             .invalid => |defect| {
                                 frame.outcome.deinit();
                                 return frame.finish(.{ .die = defect });
                             },
                             .continue_with => |next| {
+                                var discarded = next.output;
+                                @import("dsl/ownership.zig").discard(&discarded);
                                 frame.outcome.deinit();
                                 if (state.cancelled()) return frame.finish(.interrupted);
                                 const program = sleep(next.delay);
@@ -3090,19 +3491,30 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
 
                     fn finish(frame: *@This(), value: outcomes.Exit(A, E)) rt.Step {
                         const parent = frame.parent;
+                        if (frame.has_policy) outcomes.discardPayload(&frame.policy);
                         frame.allocator.destroy(frame);
                         return parent.finish(value);
                     }
+
+                    fn initialized(state: *rt.State, data: ?*anyopaque) rt.Step {
+                        const frame: *@This() = @ptrCast(@alignCast(data.?));
+                        if (frame.initialized_value != .success) return frame.finish(outcomes.castFailure(A, frame.initialized_value));
+                        frame.policy = frame.initialized_value.success;
+                        frame.has_policy = true;
+                        if (state.cancelled()) return frame.finish(.interrupted);
+                        frame.started = frame.clock.now();
+                        return .{ .data = frame, .advance = attempt };
+                    }
                 };
 
-                fn resolve(env: *const R, _: Value) rt.Services {
-                    return self.services(env);
+                fn resolve(env: *const R, value: Value) rt.Services {
+                    return source(value).services(env);
                 }
 
                 fn start(state: *rt.State, parent: *Job) rt.Step {
                     const allocator = state.services.allocatorValue() orelse return parent.finish(.{ .die = .{ .kind = .invalid_configuration, .message = diagnostics.suspended_binding_allocator } });
                     const frame = allocator.create(Frame) catch return parent.finish(.{ .die = outcomes.Defect.out_of_memory });
-                    frame.* = .{ .parent = parent, .allocator = allocator, .inherited = state.services, .policy = select_policy(parent.env), .clock = undefined, .started = undefined };
+                    frame.* = .{ .parent = parent, .allocator = allocator, .inherited = state.services, .source = source(parent.program.value), .clock = undefined, .started = undefined };
                     if (comptime R != void and @hasField(R, "clock")) {
                         frame.clock = parent.env.clock;
                     } else {
@@ -3112,11 +3524,19 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                         };
                         frame.clock = providers.Clock.fromIo(&frame.io);
                     }
-                    frame.started = frame.clock.now();
-                    return .{ .data = frame, .advance = Frame.attempt };
+                    if (comptime effectful_initialization) {
+                        const program = select_policy(parent.env);
+                        frame.initializing = .{ .program = program, .owned = program.ownership, .inherited = state.services, .env = parent.env, .sink = .{ .output = &frame.initialized_value, .next_step = .{ .data = frame, .advance = Frame.initialized } } };
+                        return frame.initializing.step();
+                    } else {
+                        frame.policy = select_policy(parent.env);
+                        frame.has_policy = true;
+                        frame.started = frame.clock.now();
+                        return .{ .data = frame, .advance = Frame.attempt };
+                    }
                 }
             };
-            return .{ .resolve = Adapter.resolve, .start = Adapter.start };
+            return .{ .value = stored, .ownership = description_owner, .resolve = Adapter.resolve, .start = Adapter.start };
         }
 
         /// Compose acquisition, use, and release under a scope.
@@ -3130,9 +3550,10 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         /// Returns (`continuationResult(use, A, R, .acquireRelease_body)`): The typed Effect returned by the compile-time continuation or binding.
         pub fn acquireRelease(comptime self: Self, comptime use: anytype, comptime release: anytype) continuationResult(use, A, R, .acquireRelease_body) {
             const Out = continuationResult(use, A, R, .acquireRelease_body);
+            const Callbacks = bracketCallbacks(use, release);
             if (self.resolve == null and (R == void or !@hasField(R, @tagName(rt.EnvironmentField.allocator))))
                 @compileError(diagnostics.resource_allocator_capability);
-            return acquireReleaseKernel(use, release, struct {
+            return acquireReleaseKernel(Out, Callbacks.body, Callbacks.cleanup, struct {
                 fn select(_: *const R, _: Out.Value) Self {
                     return self;
                 }
@@ -3153,6 +3574,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
         /// Returns (`continuationResult(use, A, R, .acquireRelease_body)`): The typed Effect returned by the compile-time continuation or binding.
         pub fn acquireReleaseOwned(self: *Self, env: *const R, comptime use: anytype, comptime release: anytype) continuationResult(use, A, R, .acquireRelease_body) {
             const Out = continuationResult(use, A, R, .acquireRelease_body);
+            const Callbacks = bracketCallbacks(use, release);
             if (R == void or !@hasField(R, @tagName(rt.EnvironmentField.allocator)))
                 @compileError(diagnostics.resource_allocator_capability);
             const Node = struct {
@@ -3187,24 +3609,103 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                 .source = self.*,
             };
             self.* = undefined;
-            return acquireReleaseKernel(use, release, Node.select, .{ .borrowed = node }, &node.header);
+            return acquireReleaseKernel(Out, Callbacks.body, Callbacks.cleanup, Node.select, .{ .borrowed = node }, &node.header);
         }
 
-        fn acquireReleaseKernel(
-            comptime use: anytype,
-            comptime release: anytype,
-            comptime select: anytype,
-            stored: continuationResult(use, A, R, .acquireRelease_body).Value,
-            description_owner: ?*rt.DescriptionNode,
-        ) continuationResult(use, A, R, .acquireRelease_body) {
+        fn bracketCallbacks(comptime use: anytype, comptime release: anytype) type {
             const Out = continuationResult(use, A, R, .acquireRelease_body);
             const Release = Effect(void, E, R);
             comptime requireEffect(Out, E, R, .acquireRelease_body);
             _ = functionInfo(release, .acquireRelease_finalizer);
             const Finalizer = fn (A, outcomes.PrimaryOutcome(E)) Release;
             const EnvironmentFinalizer = fn (A, outcomes.PrimaryOutcome(E), *const R) Release;
-            if (@TypeOf(release) != Finalizer and @TypeOf(release) != EnvironmentFinalizer)
+            const ObservingFinalizer = fn (A, *const outcomes.PrimaryOutcome(E)) Release;
+            const EnvironmentObservingFinalizer = fn (A, *const outcomes.PrimaryOutcome(E), *const R) Release;
+            if (@TypeOf(release) != Finalizer and @TypeOf(release) != EnvironmentFinalizer and @TypeOf(release) != ObservingFinalizer and @TypeOf(release) != EnvironmentObservingFinalizer)
                 @compileError(diagnostics.finalizer_contract);
+            return struct {
+                fn body(value: A, env: *const R, _: Out.Value) Out {
+                    return callContinuation(use, value, env);
+                }
+                fn cleanup(value: A, primary: *const outcomes.PrimaryOutcome(E), env: *const R, _: Out.Value) Release {
+                    if (comptime @TypeOf(release) == EnvironmentObservingFinalizer) return release(value, primary, env);
+                    if (comptime @TypeOf(release) == ObservingFinalizer) return release(value, primary);
+                    return if (comptime @TypeOf(release) == EnvironmentFinalizer) release(value, primary.*, env) else release(value, primary.*);
+                }
+            };
+        }
+
+        /// Consume a runtime capture into the same bracket authority. The
+        /// generated description owns it through body and release teardown.
+        pub fn acquireReleaseCapturedOwned(self: *Self, env: *const R, capture: anytype, comptime use: anytype, comptime release: anytype) @import("dsl/inference.zig").result(use, &.{ *const @TypeOf(capture), A, *const R }, "resourceCaptured.body") {
+            return self.bracketCapturedOwned(env, capture, null, use, release);
+        }
+
+        pub fn acquireReleaseFactoryCapturedOwned(env: *const R, capture: anytype, comptime acquire: fn (*const @TypeOf(capture), *const R) Self, comptime use: anytype, comptime release: anytype) @import("dsl/inference.zig").result(use, &.{ *const @TypeOf(capture), A, *const R }, "resourceCaptured.body") {
+            var source = Self.interrupted();
+            return source.bracketCapturedOwned(env, capture, acquire, use, release);
+        }
+
+        fn bracketCapturedOwned(self: *Self, env: *const R, capture: anytype, comptime acquire: ?fn (*const @TypeOf(capture), *const R) Self, comptime use: anytype, comptime release: anytype) @import("dsl/inference.zig").result(use, &.{ *const @TypeOf(capture), A, *const R }, "resourceCaptured.body") {
+            const Capture = @TypeOf(capture);
+            const infer = @import("dsl/inference.zig");
+            const Out = infer.result(use, &.{ *const Capture, A, *const R }, "resourceCaptured.body");
+            comptime requireEffect(Out, E, R, .acquireRelease_body);
+            const PrimaryInput = infer.primaryInput(release, 2, E);
+            if (infer.result(release, &.{ *const Capture, A, PrimaryInput, *const R }, "resourceCaptured.release") != Effect(void, E, R)) @compileError("resourceCaptured.release requires exact Effect(void,E,R)");
+            const Holder = struct {
+                header: rt.DescriptionNode,
+                source: Self,
+                capture: Capture,
+                fn destroy(header: *rt.DescriptionNode) void {
+                    const holder: *@This() = @alignCast(@fieldParentPtr("header", header));
+                    outcomes.discardPayload(&holder.capture);
+                    header.allocator.destroy(holder);
+                }
+                fn origin(supplied: *const anyopaque, data: *const anyopaque) rt.Services {
+                    const holder: *const @This() = @ptrCast(@alignCast(data));
+                    return holder.source.services(@ptrCast(@alignCast(supplied)));
+                }
+                fn select(_: *const R, value: Out.Value) Self {
+                    const holder: *const @This() = @ptrCast(@alignCast(value.borrowed));
+                    if (comptime acquire != null) return Self.deferBorrowed(Capture, &holder.capture, acquire.?);
+                    return holder.source;
+                }
+                fn body(value: A, current: *const R, stored: Out.Value) Out {
+                    const holder: *const @This() = @ptrCast(@alignCast(stored.borrowed));
+                    return use(&holder.capture, value, current);
+                }
+                fn cleanup(value: A, primary: *const outcomes.PrimaryOutcome(E), current: *const R, stored: Out.Value) Effect(void, E, R) {
+                    const holder: *const @This() = @ptrCast(@alignCast(stored.borrowed));
+                    return release(&holder.capture, value, if (comptime PrimaryInput == outcomes.PrimaryOutcome(E)) primary.* else primary, current);
+                }
+            };
+            const allocator = self.services(env).allocatorValue() orelse {
+                self.deinit();
+                var abandoned = capture;
+                outcomes.discardPayload(&abandoned);
+                return Out.die(.{ .kind = .invalid_configuration, .message = diagnostics.resource_allocator });
+            };
+            const holder = allocator.create(Holder) catch {
+                self.deinit();
+                var abandoned = capture;
+                outcomes.discardPayload(&abandoned);
+                return Out.die(outcomes.Defect.out_of_memory);
+            };
+            holder.* = .{ .header = .{ .previous = self.ownership, .allocator = allocator, .destroy = Holder.destroy, .origin = .{ .data = holder, .resolve = Holder.origin } }, .source = self.*, .capture = capture };
+            self.* = undefined;
+            return acquireReleaseKernel(Out, Holder.body, Holder.cleanup, Holder.select, .{ .borrowed = holder }, &holder.header);
+        }
+
+        fn acquireReleaseKernel(
+            comptime Out: type,
+            comptime use: fn (A, *const R, Out.Value) Out,
+            comptime release: fn (A, *const outcomes.PrimaryOutcome(E), *const R, Out.Value) Effect(void, E, R),
+            comptime select: anytype,
+            stored: Out.Value,
+            description_owner: ?*rt.DescriptionNode,
+        ) Out {
+            const Release = Effect(void, E, R);
             return .{
                 .value = stored,
                 .ownership = description_owner,
@@ -3228,7 +3729,9 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                         acquired: outcomes.Exit(A, E) = undefined,
                         body: Out.Job,
                         body_result: outcomes.Exit(Out.Success, E) = undefined,
+                        primary: outcomes.PrimaryOutcome(E) = undefined,
                         body_protected_failure: bool = false,
+                        body_committed_delivery: bool = false,
                         finalizer: Release.Job,
                         cleanup: outcomes.Exit(void, E) = undefined,
                         resource: A = undefined,
@@ -3252,7 +3755,8 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                                 frame.body_result = .interrupted;
                                 return .{ .data = frame, .advance = bodyStep };
                             }
-                            const body = callContinuation(use, frame.resource, frame.parent.env);
+                            state.committed_delivery = false;
+                            const body = use(frame.resource, frame.parent.env, frame.parent.program.value);
                             frame.body = .{ .program = body, .inherited = state.services, .owned = body.ownership, .env = frame.parent.env, .sink = .{
                                 .output = &frame.body_result,
                                 .next_step = .{ .data = frame, .advance = bodyStep },
@@ -3263,13 +3767,13 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                         fn bodyStep(state: *rt.State, data: ?*anyopaque) rt.Step {
                             const frame: *@This() = @ptrCast(@alignCast(data.?));
                             frame.body_protected_failure = state.protected_failure;
+                            frame.body_committed_delivery = state.committed_delivery;
                             frame.body_result = state.publish(frame.body_result);
+                            frame.primary = frame.body_result.primary();
+                            state.committed_delivery = false;
                             state.services = frame.source.services(frame.parent.env).inherit(frame.parent.inherited);
                             state.protection += 1;
-                            const finalizer = if (comptime @TypeOf(release) == EnvironmentFinalizer)
-                                release(frame.resource, frame.body_result.primary(), frame.parent.env)
-                            else
-                                release(frame.resource, frame.body_result.primary());
+                            const finalizer = release(frame.resource, &frame.primary, frame.parent.env, frame.parent.program.value);
                             frame.finalizer = .{ .program = finalizer, .inherited = state.services, .owned = finalizer.ownership, .env = frame.parent.env, .sink = .{
                                 .output = &frame.cleanup,
                                 .next_step = .{ .data = frame, .advance = cleanupStep },
@@ -3310,6 +3814,7 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                             state.protection -= 1;
                             state.protected_failure = frame.body_protected_failure;
                             state.services = frame.source.services(frame.parent.env).inherit(frame.parent.inherited);
+                            state.committed_delivery = frame.body_committed_delivery;
                             var evaluated = state.publish(frame.body_result);
                             switch (frame.cleanup) {
                                 .success => {},
@@ -3465,6 +3970,93 @@ pub fn Effect(comptime A: type, comptime E: type, comptime R: type) type {
                 return Out.die(outcomes.Defect.out_of_memory);
             };
             node.* = .{ .header = .{ .previous = self.ownership, .allocator = allocator, .destroy = Node.destroy, .origin = .{ .data = node, .resolve = Node.origin } }, .source = self.*, .source_env = source_env };
+            self.* = undefined;
+            return .{ .value = .{ .borrowed = node }, .ownership = &node.header, .resolve = Node.resolve, .start = Node.start };
+        }
+
+        /// Project each execution environment while retaining construction storage.
+        pub fn provideSomeOwned(self: *Self, construction_env: *const R, comptime Large: type, comptime project: anytype) Effect(A, E, Large) {
+            const Out = Effect(A, E, Large);
+            const allocator = self.services(construction_env).allocatorValue() orelse {
+                self.deinit();
+                return Out.die(.{ .kind = .invalid_configuration, .message = diagnostics.provision_allocator });
+            };
+            return self.provideSomeAllocated(allocator, Large, project);
+        }
+
+        pub fn provideSomeAllocated(self: *Self, construction_allocator: std.mem.Allocator, comptime Large: type, comptime project: anytype) Effect(A, E, Large) {
+            if (unaryResult(project, *const Large, .provideSome) != *const R) @compileError(diagnostics.projection_contract);
+            return self.provideSomeContextAllocated(construction_allocator, Large, @as(void, {}), struct {
+                fn invoke(_: void, env: *const Large) *const R {
+                    return project(env);
+                }
+            }.invoke);
+        }
+        /// Project dependencies using borrowed typed application inputs. The
+        /// capture owner must cover projected work and its protected cleanup.
+        pub fn provideSomeBorrowedAllocated(self: *Self, construction_allocator: std.mem.Allocator, comptime Large: type, capture: anytype, comptime project: anytype) Effect(A, E, Large) {
+            if (@typeInfo(@TypeOf(capture)) != .pointer) @compileError("provideSomeBorrowed requires a typed capture pointer");
+            return self.provideSomeContextAllocated(construction_allocator, Large, capture, project);
+        }
+        fn provideSomeContextAllocated(self: *Self, construction_allocator: std.mem.Allocator, comptime Large: type, capture: anytype, comptime project: anytype) Effect(A, E, Large) {
+            if (@import("dsl/inference.zig").result(project, &.{ @TypeOf(capture), *const Large }, "provideSome") != *const R) @compileError(diagnostics.projection_contract);
+            const Out = Effect(A, E, Large);
+            const Node = struct {
+                header: rt.DescriptionNode,
+                source: Self,
+                capture: @TypeOf(capture),
+
+                fn destroy(header: *rt.DescriptionNode) void {
+                    const node: *@This() = @alignCast(@fieldParentPtr("header", header));
+                    header.allocator.destroy(node);
+                }
+
+                fn origin(env_data: *const anyopaque, data: *const anyopaque) rt.Services {
+                    const node: *const @This() = @ptrCast(@alignCast(data));
+                    return node.source.services(project(node.capture, @as(*const Large, @ptrCast(@alignCast(env_data)))));
+                }
+
+                fn resolve(env: *const Large, value: Out.Value) rt.Services {
+                    const node: *const @This() = @ptrCast(@alignCast(value.borrowed));
+                    return node.source.services(project(node.capture, env));
+                }
+
+                const Frame = struct {
+                    child: Job,
+                    evaluated: outcomes.Exit(A, E) = undefined,
+                    parent: *Out.Job,
+                    allocator: std.mem.Allocator,
+
+                    fn complete(_: *rt.State, data: ?*anyopaque) rt.Step {
+                        const frame: *@This() = @ptrCast(@alignCast(data.?));
+                        const evaluated = frame.evaluated;
+                        const parent = frame.parent;
+                        frame.allocator.destroy(frame);
+                        return parent.finish(evaluated);
+                    }
+                };
+
+                fn start(state: *rt.State, parent: *Out.Job) rt.Step {
+                    const node: *const @This() = @ptrCast(@alignCast(parent.program.value.borrowed));
+                    const allocator = state.services.allocatorValue() orelse return parent.finish(.{ .die = .{
+                        .kind = .invalid_configuration,
+                        .message = diagnostics.provision_allocator,
+                    } });
+                    const frame = allocator.create(Frame) catch return parent.finish(.{ .die = outcomes.Defect.out_of_memory });
+                    frame.* = .{ .parent = parent, .allocator = allocator, .child = .{
+                        .program = node.source,
+                        .inherited = state.services,
+                        .env = project(node.capture, parent.env),
+                        .sink = .{ .output = &frame.evaluated, .next_step = .{ .data = frame, .advance = Frame.complete } },
+                    } };
+                    return frame.child.step();
+                }
+            };
+            const node = construction_allocator.create(Node) catch {
+                self.deinit();
+                return Out.die(outcomes.Defect.out_of_memory);
+            };
+            node.* = .{ .header = .{ .previous = self.ownership, .allocator = construction_allocator, .destroy = Node.destroy, .origin = .{ .data = node, .resolve = Node.origin } }, .source = self.*, .capture = capture };
             self.* = undefined;
             return .{ .value = .{ .borrowed = node }, .ownership = &node.header, .resolve = Node.resolve, .start = Node.start };
         }
@@ -3796,7 +4388,7 @@ pub fn Layer(comptime Input: type, comptime E: type, comptime Output: type) type
         /// - `release: comptime fn (Output) Effect(void, E, Input)`: Compile-time typed callback; its signature is checked at comptime where
         ///   static.
         /// Returns (`Self`): a layer that acquires the service and releases it with its scope.
-        pub fn scoped(comptime acquire: Build, comptime release: fn (Output) Effect(void, E, Input)) Self {
+        pub fn scoped(comptime acquire: Build, comptime release: anytype) Self {
             return .{ .build_fn = struct {
                 fn build(scope: *Scope) Build {
                     return acquire.scopeAcquire(scope, release);
@@ -3813,10 +4405,10 @@ pub fn Layer(comptime Input: type, comptime E: type, comptime Output: type) type
         /// - `combine: comptime anytype`: Compile-time statically inferred input checked when this operation is
         ///   instantiated.
         /// Returns (`Layer(Input, E, @typeInfo(@TypeOf(combine)).@"fn".return_type.?)`): A lazy scoped service or resource description; acquisition and release occur during execution.
-        pub fn merge(comptime self: Self, comptime right: anytype, comptime combine: anytype) Layer(Input, E, @typeInfo(@TypeOf(combine)).@"fn".return_type.?) {
+        pub fn merge(comptime self: Self, comptime right: anytype, comptime combine: anytype) Layer(Input, E, @import("dsl/inference.zig").result(combine, &.{ Output, @TypeOf(right).Service }, "layer.merge")) {
             const Right = @TypeOf(right);
             if (Right.Environment != Input or Right.Error != E) @compileError(diagnostics.merged_layers_must_share_environment_and_error_types);
-            const Merged = @typeInfo(@TypeOf(combine)).@"fn".return_type.?;
+            const Merged = @import("dsl/inference.zig").result(combine, &.{ Output, Right.Service }, "layer.merge");
             const RightBuild = Effect(Right.Service, E, Input);
             const Out = Effect(Merged, E, Input);
             return .{ .build_fn = struct {
@@ -3992,6 +4584,7 @@ pub fn Layer(comptime Input: type, comptime E: type, comptime Output: type) type
 pub fn Chunk(comptime A: type) type {
     return union(enum) {
         const Self = @This();
+        pub const Item = A;
         /// Ownership marker read by `Exit`/`Result` cleanup helpers; this payload implements `deinit`
         /// and must be released after use.
         pub const effect_owned_payload = true;
@@ -4057,6 +4650,59 @@ pub fn StreamReader(comptime A: type, comptime E: type, comptime R: type) type {
         };
         pull: Effect(Chunk(A), E, R),
         description: *Description,
+        /// Attach an owning capture to the existing reader description. Pulls
+        /// retain this root through pending work; clones retain storage rather
+        /// than cloning application configuration. Native scope rules still
+        /// govern the reader's acquired resources and borrowed chunk contents.
+        pub fn retainCaptureAllocated(memory: std.mem.Allocator, reader: @This(), capture: anytype) error{OutOfMemory}!@This() {
+            const NativeCapture = @TypeOf(capture);
+            if (comptime @import("dsl/ownership.zig").containsOwned(NativeCapture) and !outcomes.ownsPayload(NativeCapture)) @compileError("reader retention requires declared native capture ownership");
+            const Reader = @This();
+            const Stored = struct {
+                pub const effect_owned_payload = true;
+                inner: Reader,
+                extra: @TypeOf(capture),
+                pub fn deinit(self: *@This()) void {
+                    self.inner.deinit();
+                    outcomes.discardPayload(&self.extra);
+                }
+            };
+            const descriptor = memory.create(Description) catch {
+                var abandoned: Stored = .{ .inner = reader, .extra = capture };
+                abandoned.deinit();
+                return error.OutOfMemory;
+            };
+            const Pull = Effect(Chunk(A), E, R);
+            const Seed = Effect(void, E, R);
+            var seed: Seed = .{
+                .value = .{ .borrowed = reader.description },
+                .resolve = struct {
+                    fn resolve(env: *const R, value: Seed.Value) rt.Services {
+                        const original: *const Description = @ptrCast(@alignCast(value.borrowed));
+                        return original.program.services(env);
+                    }
+                }.resolve,
+                .ready = struct {
+                    fn ready(_: *const R, _: Seed.Value, _: *rt.State) outcomes.Exit(void, E) {
+                        return .{ .success = {} };
+                    }
+                }.ready,
+            };
+            const program = seed.flatMapCapturedAllocated(memory, Chunk(A), Stored{ .inner = reader, .extra = capture }, struct {
+                fn next(stored: *const Stored, _: void, _: *const R) Pull {
+                    return stored.inner.pull.borrow();
+                }
+            }.next);
+            // The static seed has no owner, so an absent allocated root here
+            // denotes capture-node OOM, which already disposed both inputs.
+            if (program.ownership == null) {
+                memory.destroy(descriptor);
+                return error.OutOfMemory;
+            }
+            descriptor.* = .{ .allocator = memory, .program = program };
+            return .{ .description = descriptor, .pull = program.borrow() };
+        }
+
         /// Release resources owned by this value.
         /// Parameters:
         /// - `self: *@This()`: Mutable borrowed receiver; this method may change or invalidate its state, as specified in the operation contract.
@@ -4091,6 +4737,9 @@ pub fn StreamReader(comptime A: type, comptime E: type, comptime R: type) type {
 pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
     return struct {
         const Self = @This();
+        pub const Item = A;
+        pub const Error = E;
+        pub const Environment = R;
         const Scope = scopes.Scope(E);
         const Reader = StreamReader(A, E, R);
         const Open = Effect(Reader, E, R);
@@ -4131,6 +4780,51 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
             }.invoke };
         }
 
+        /// Consume an acquisition already registered with its scope into a
+        /// reader. The scope remains the resource authority; reader ownership
+        /// covers only the pull description. Used by inferred runtime adapters.
+        pub fn openAcquired(acquisition: anytype, allocator: std.mem.Allocator, comptime pull: anytype) Open {
+            return openAcquiredCaptured(acquisition, allocator, @as(void, {}), struct {
+                fn invoke(_: *const void, resource_value: @typeInfo(@TypeOf(acquisition)).pointer.child.Success, env: *const R) Pull {
+                    return callContinuation(pull, resource_value, env);
+                }
+            }.invoke);
+        }
+
+        /// Move typed pull configuration into shared storage retained by the
+        /// reader. Pointer fields keep their ordinary borrowed lifetime.
+        pub fn openAcquiredCaptured(acquisition: anytype, allocator: std.mem.Allocator, capture: anytype, comptime pull: anytype) Open {
+            const Acquire = @typeInfo(@TypeOf(acquisition)).pointer.child;
+            comptime requireEffect(Acquire, E, R, .acquireRelease_body);
+            const Capture = @TypeOf(capture);
+            const Owner = @import("internal/capture_owner.zig").Owner(Capture);
+            const Stored = struct {
+                pub const effect_owned_payload = true;
+                memory: std.mem.Allocator,
+                owner: if (Capture == void) void else Owner,
+                pub fn deinit(self: *@This()) void {
+                    if (comptime Capture != void) self.owner.deinit();
+                }
+            };
+            const owner = if (comptime Capture == void) {} else Owner.create(allocator, capture) catch {
+                acquisition.deinit();
+                return Open.die(outcomes.Defect.out_of_memory);
+            };
+            return acquisition.flatMapCapturedAllocated(allocator, Reader, Stored{ .memory = allocator, .owner = owner }, struct {
+                fn opened(stored: *const Stored, resource_value: Acquire.Success, env: *const R) Open {
+                    const description = stored.memory.create(Reader.Description) catch return Open.die(outcomes.Defect.out_of_memory);
+                    const inputs = if (comptime Capture == void) &{} else stored.owner.borrow();
+                    const program = pull(inputs, resource_value, env);
+                    comptime requireEffect(@TypeOf(program), E, R, .flatMap);
+                    if (@TypeOf(program) != Pull) @compileError("stream.pull requires exact Effect(Chunk(Item),E,R)");
+                    description.* = .{ .allocator = stored.memory, .program = program };
+                    const native: Reader = .{ .pull = program.borrow(), .description = description };
+                    const retained = if (comptime Capture == void) native else Reader.retainCaptureAllocated(stored.memory, native, stored.owner.retain()) catch return Open.die(outcomes.Defect.out_of_memory);
+                    return Open.fromOwnedSuccess(env, retained);
+                }
+            }.opened);
+        }
+
         /// Reinterprets expected stream failures while preserving the source
         /// scope, pull state, cancellation and finalizer outcomes.
         ///
@@ -4142,18 +4836,70 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
         /// Returns (`Stream(A, unaryResult(transform, E, .mapError), R)`): A lazy typed Stream; the caller consumes it under its scope and handles terminal Exit.
         pub fn mapError(comptime self: Self, comptime transform: anytype) Stream(A, unaryResult(transform, E, .mapError), R) {
             const F = unaryResult(transform, E, .mapError);
+            const Adapter = ErrorMapping(void, struct {
+                fn invoke(_: *const void, err: E) F {
+                    return transform(err);
+                }
+            }.invoke);
+            return .{ .open_fn = struct {
+                fn open(scope: *scopes.Scope(F)) Effect(StreamReader(A, F, R), F, R) {
+                    return Adapter.open(self, scope, {});
+                }
+            }.open };
+        }
+        /// Open a runtime stream with borrowed error-mapping inputs, including
+        /// its reader scope's cleanup failures in the mapped channel.
+        pub fn openErrorMappedCaptured(self: Self, scope: anytype, capture: anytype, comptime transform: anytype) Effect(StreamReader(A, @import("dsl/inference.zig").result(transform, &.{ *const @TypeOf(capture), E }, "stream.mapError"), R), @import("dsl/inference.zig").result(transform, &.{ *const @TypeOf(capture), E }, "stream.mapError"), R) {
+            if (@typeInfo(@TypeOf(capture)) != .pointer or @typeInfo(@TypeOf(capture)).pointer.size != .one) @compileError("openErrorMappedCaptured requires a borrowed capture pointer");
+            return ErrorMapping(@TypeOf(capture), transform).open(self, scope, capture);
+        }
+
+        /// Project opening and every pull while retaining the original reader.
+        /// Source scope registrations keep their original environment/provider.
+        pub fn openProjectedCaptured(self: Self, scope: *Scope, capture: anytype, comptime project: anytype) Effect(StreamReader(A, E, @import("dsl/inference.zig").environment(project, "stream.project")), E, @import("dsl/inference.zig").environment(project, "stream.project")) {
+            const Large = @import("dsl/inference.zig").environment(project, "stream.project");
+            const MappedReader = StreamReader(A, E, Large);
+            const MappedOpen = Effect(MappedReader, E, Large);
+            const Stored = struct { memory: std.mem.Allocator, inputs: @TypeOf(capture) };
+            var opening = self.open(scope);
+            var projected = opening.provideSomeBorrowedAllocated(scope.allocator, Large, capture, project);
+            return projected.flatMapCapturedAllocated(scope.allocator, MappedReader, Stored{ .memory = scope.allocator, .inputs = capture }, struct {
+                fn opened(stored: *const Stored, original: Reader, env: *const Large) MappedOpen {
+                    const description = stored.memory.create(MappedReader.Description) catch {
+                        var abandoned = original;
+                        abandoned.deinit();
+                        return MappedOpen.die(outcomes.Defect.out_of_memory);
+                    };
+                    var source = original.pull.borrow();
+                    const program = source.provideSomeBorrowedAllocated(stored.memory, Large, stored.inputs, project);
+                    description.* = .{ .allocator = stored.memory, .program = program };
+                    const reader: MappedReader = .{ .pull = program.borrow(), .description = description };
+                    const retained = MappedReader.retainCaptureAllocated(stored.memory, reader, original) catch return MappedOpen.die(outcomes.Defect.out_of_memory);
+                    return MappedOpen.fromOwnedSuccess(env, retained);
+                }
+            }.opened);
+        }
+        fn ErrorMapping(comptime C: type, comptime transform: anytype) type {
+            const F = @import("dsl/inference.zig").result(transform, &.{ *const C, E }, "stream.mapError");
             const Mapped = Stream(A, F, R);
+            const MappedUnit = Effect(void, F, R);
+            const SourceUnit = Effect(void, E, R);
             const Bridge = struct {
                 allocator: std.mem.Allocator,
                 scope: Scope,
                 reader: ?Reader = null,
+                source: Self,
+                inputs: C,
+                closing_parent: *MappedUnit.RuntimeAdapter.Job = undefined,
+                closing: SourceUnit.RuntimeAdapter.Job = undefined,
+                closed: outcomes.Exit(void, E) = undefined,
             };
             const Acquire = Effect(*Bridge, F, R);
-            const MappedUnit = Effect(void, F, R);
-            const Adapter = struct {
-                fn allocate(env: *const R) outcomes.Exit(*Bridge, F) {
+            return struct {
+                const Inputs = struct { source: Self, scope: *scopes.Scope(F), capture: C };
+                fn allocate(inputs: *const Inputs, env: *const R) outcomes.Exit(*Bridge, F) {
                     const bridge = env.allocator.create(Bridge) catch return .{ .die = outcomes.Defect.out_of_memory };
-                    bridge.* = .{ .allocator = env.allocator, .scope = Scope.init(env) };
+                    bridge.* = .{ .allocator = env.allocator, .scope = Scope.init(env), .source = inputs.source, .inputs = inputs.capture };
                     return .{ .success = bridge };
                 }
 
@@ -4163,33 +4909,29 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
                 }
 
                 fn use(bridge: *Bridge, env: *const R) Acquire {
-                    var opening = self.open(&bridge.scope);
-                    var mapped = opening.mapErrorOwned(env, transform);
+                    var opening = bridge.source.open(&bridge.scope);
+                    var mapped = opening.mapErrorBorrowedAllocated(env.allocator, @as(*const C, &bridge.inputs), transform);
                     return mapped.flatMapCapturedOwned(env, *Bridge, bridge, opened);
                 }
 
-                fn afterClose(bridge: *const *Bridge, result: outcomes.Exit(void, F), env: *const R) MappedUnit {
-                    if (bridge.*.reader) |*reader| reader.deinit();
-                    bridge.*.scope.deinit();
-                    bridge.*.allocator.destroy(bridge.*);
-                    return MappedUnit.fromOwnedOutcome(env, result);
-                }
-
                 fn close(bridge: *Bridge) MappedUnit {
-                    return MappedUnit.deferBorrowed(Bridge, bridge, struct {
-                        fn run(current: *const Bridge, env: *const R) MappedUnit {
-                            const mutable = @constCast(current);
-                            var closing = Effect(void, E, R).closeScope(&mutable.scope);
-                            var mapped = closing.mapErrorOwned(env, transform);
-                            var settled = mapped.materializeOwned(env);
-                            var aligned = settled.mapErrorOwned(env, struct {
-                                fn impossible(_: void) F {
-                                    unreachable;
-                                }
-                            }.impossible);
-                            return aligned.flatMapCapturedOwned(env, void, mutable, afterClose);
-                        }
-                    }.run);
+                    return .{ .value = .{ .borrowed = bridge }, .start = closeStart };
+                }
+                fn closeStart(active: *rt.State, parent: *MappedUnit.RuntimeAdapter.Job) rt.Step {
+                    const bridge: *Bridge = @ptrCast(@alignCast(@constCast(parent.program.value.borrowed)));
+                    bridge.closing_parent = parent;
+                    const described = SourceUnit.closeScope(&bridge.scope);
+                    bridge.closing = .{ .program = described, .env = parent.env, .inherited = active.services, .sink = .{ .output = &bridge.closed, .next_step = .{ .data = bridge, .advance = closedStep } } };
+                    return bridge.closing.adapterStep();
+                }
+                fn closedStep(_: *rt.State, data: ?*anyopaque) rt.Step {
+                    const bridge: *Bridge = @ptrCast(@alignCast(data.?));
+                    const parent = bridge.closing_parent;
+                    const result = outcomes.mapErrorCaptured(F, bridge.closed, bridge.allocator, @as(*const C, &bridge.inputs), transform);
+                    if (bridge.reader) |*reader| reader.deinit();
+                    bridge.scope.deinit();
+                    bridge.allocator.destroy(bridge);
+                    return parent.adapterFinish(result);
                 }
 
                 fn cleanupFailed(bridge: *Bridge, primary: outcomes.PrimaryOutcome(F)) MappedUnit {
@@ -4201,13 +4943,22 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
                     return Out.deferBorrowed(Bridge, bridge, struct {
                         fn run(current: *const Bridge, env: *const R) Out {
                             var source = current.reader.?.pull.borrow();
-                            return source.mapErrorOwned(env, transform);
+                            return source.mapErrorBorrowedAllocated(env.allocator, @as(*const C, &current.inputs), transform);
                         }
                     }.run);
                 }
+                fn open(source: Self, scope: *scopes.Scope(F), capture: C) Effect(StreamReader(A, F, R), F, R) {
+                    var seed = MappedUnit.succeed({});
+                    return seed.flatMapCapturedAllocated(scope.allocator, StreamReader(A, F, R), Inputs{ .source = source, .scope = scope, .capture = capture }, struct {
+                        fn begin(inputs: *const Inputs, _: void, env: *const R) Effect(StreamReader(A, F, R), F, R) {
+                            var acquire = Acquire.fromBorrowed(Inputs, inputs, allocate);
+                            var safe = acquire.acquireReleaseOwned(env, use, cleanupFailed);
+                            var registered = safe.scopeAcquireAllocated(inputs.scope.allocator, inputs.scope, close);
+                            return Mapped.openAcquired(&registered, inputs.scope.allocator, pull);
+                        }
+                    }.begin);
+                }
             };
-            const acquired = Acquire.fromOutcome(Adapter.allocate).acquireRelease(Adapter.use, Adapter.cleanupFailed);
-            return Mapped.fromPull(acquired, Adapter.pull, Adapter.close);
         }
 
         /// Build a Stream from acquisition, pull, and release operations.
@@ -4376,16 +5127,38 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
         ///   static.
         /// Returns (`Stream(unaryResult(transform, A, .flatMap).Success, E, R)`): A lazy typed Stream; the caller consumes it under its scope and handles terminal Exit.
         pub fn mapEffect(comptime self: Self, comptime transform: anytype) Stream(unaryResult(transform, A, .flatMap).Success, E, R) {
-            const Transform = unaryResult(transform, A, .flatMap);
+            const Out = unaryResult(transform, A, .flatMap);
+            const Adapter = Mapping(void, struct {
+                fn invoke(_: *const void, item: A, _: *const R) Out {
+                    return transform(item);
+                }
+            }.invoke);
+            return .{ .open_fn = struct {
+                fn open(scope: *Scope) Effect(StreamReader(Out.Success, E, R), E, R) {
+                    return Adapter.open(self, scope, {});
+                }
+            }.open };
+        }
+
+        /// Open a mapped runtime stream with typed borrowed callback inputs.
+        /// The enclosing scope keeps those inputs alive through reader use.
+        pub fn openMappedCaptured(self: Self, scope: *Scope, capture: anytype, comptime transform: anytype) Effect(StreamReader(@import("dsl/inference.zig").result(transform, &.{ *const @TypeOf(capture), A, *const R }, "stream.map").Success, E, R), E, R) {
+            if (@typeInfo(@TypeOf(capture)) != .pointer or @typeInfo(@TypeOf(capture)).pointer.size != .one) @compileError("openMappedCaptured requires a borrowed capture pointer");
+            return Mapping(@TypeOf(capture), transform).open(self, scope, capture);
+        }
+
+        fn Mapping(comptime C: type, comptime transform: anytype) type {
+            const Transform = @import("dsl/inference.zig").result(transform, &.{ *const C, A, *const R }, "stream.map");
             comptime requireEffect(Transform, E, R, .flatMap);
             const B = Transform.Success;
             const MappedReader = StreamReader(B, E, R);
             const MappedOpen = Effect(MappedReader, E, R);
             const MappedPull = Effect(Chunk(B), E, R);
-            const Adapter = struct {
+            return struct {
                 const Capture = struct {
                     header: rt.DescriptionNode,
                     reader: Reader = undefined,
+                    inputs: C,
                     fn destroy(header: *rt.DescriptionNode) void {
                         const capture: *@This() = @alignCast(@fieldParentPtr("header", header));
                         capture.reader.deinit();
@@ -4404,6 +5177,7 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
                     transformed: outcomes.Exit(B, E) = undefined,
                     values: ?[]B = null,
                     count: usize = 0,
+                    inputs: C,
                     fn finish(frame: *@This(), value: outcomes.Exit(Chunk(B), E)) rt.Step {
                         if (frame.chunk == .success) frame.chunk.success.deinit();
                         if (frame.values) |values| {
@@ -4430,7 +5204,7 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
                             return frame.finish(.{ .success = Chunk(B).owned(.{ .items = values, .allocator = frame.allocator }) });
                         }
                         const value = outcomes.clonePayload(frame.chunk.success.items.values[frame.count]) catch return frame.finish(.{ .die = outcomes.Defect.out_of_memory });
-                        const program = transform(value);
+                        const program = transform(&frame.inputs, value, frame.parent.env);
                         frame.child = .{ .program = program, .owned = program.ownership, .env = frame.parent.env, .inherited = state.services, .sink = .{ .output = &frame.transformed, .next_step = .{ .data = frame, .advance = transformedStep } } };
                         return frame.child.step();
                     }
@@ -4447,7 +5221,7 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
                     const allocator = state.services.allocatorValue() orelse return parent.finish(.{ .die = outcomes.Defect.out_of_memory });
                     const frame = allocator.create(PullFrame) catch return parent.finish(.{ .die = outcomes.Defect.out_of_memory });
                     const capture: *const Capture = @ptrCast(@alignCast(@constCast(parent.program.value.borrowed)));
-                    frame.* = .{ .parent = parent, .allocator = allocator };
+                    frame.* = .{ .parent = parent, .allocator = allocator, .inputs = capture.inputs };
                     frame.pulling = .{ .program = capture.reader.pull.borrow(), .env = parent.env, .inherited = state.services, .sink = .{ .output = &frame.chunk, .next_step = .{ .data = frame, .advance = PullFrame.pulled } } };
                     return frame.pulling.step();
                 }
@@ -4456,6 +5230,7 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
                     allocator: std.mem.Allocator,
                     capture: *Capture,
                     description: *MappedReader.Description,
+                    inputs: C,
                     child: Open.Job = undefined,
                     opened: outcomes.Exit(Reader, E) = undefined,
                     fn complete(state: *rt.State, data: ?*anyopaque) rt.Step {
@@ -4463,7 +5238,7 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
                         frame.opened = state.publish(frame.opened);
                         var value: outcomes.Exit(MappedReader, E) = undefined;
                         if (frame.opened == .success) {
-                            frame.capture.* = .{ .reader = frame.opened.success, .header = .{ .previous = null, .allocator = frame.allocator, .destroy = Capture.destroy, .origin = .{ .data = frame.capture, .resolve = Capture.origin } } };
+                            frame.capture.* = .{ .reader = frame.opened.success, .inputs = frame.inputs, .header = .{ .previous = null, .allocator = frame.allocator, .destroy = Capture.destroy, .origin = .{ .data = frame.capture, .resolve = Capture.origin } } };
                             const pull: MappedPull = .{ .value = .{ .borrowed = frame.capture }, .start = pullStart, .ownership = &frame.capture.header };
                             frame.description.* = .{ .allocator = frame.allocator, .program = pull };
                             value = .{ .success = .{ .pull = pull.borrow(), .description = frame.description } };
@@ -4489,17 +5264,22 @@ pub fn Stream(comptime A: type, comptime E: type, comptime R: type) type {
                         allocator.destroy(frame);
                         return parent.finish(.{ .die = outcomes.Defect.out_of_memory });
                     };
-                    frame.* = .{ .parent = parent, .allocator = allocator, .capture = capture, .description = description };
-                    const scope: *Scope = @ptrCast(@alignCast(@constCast(parent.program.value.borrowed)));
-                    const program = self.open(scope);
+                    const input: *const Inputs = @ptrCast(@alignCast(parent.program.value.borrowed));
+                    frame.* = .{ .parent = parent, .allocator = allocator, .capture = capture, .description = description, .inputs = input.capture };
+                    const program = input.source.open(input.scope);
                     frame.child = .{ .program = program, .owned = program.ownership, .env = parent.env, .inherited = state.services, .sink = .{ .output = &frame.opened, .next_step = .{ .data = frame, .advance = OpenFrame.complete } } };
                     return frame.child.step();
                 }
-                fn open(scope: *Scope) MappedOpen {
-                    return .{ .value = .{ .borrowed = scope }, .start = openStart };
+                const Inputs = struct { source: Self, scope: *Scope, capture: C };
+                fn open(source: Self, scope: *Scope, capture: C) MappedOpen {
+                    var seed = Unit.succeed({});
+                    return seed.flatMapCapturedAllocated(scope.allocator, MappedReader, Inputs{ .source = source, .scope = scope, .capture = capture }, struct {
+                        fn build(input: *const Inputs, _: void, _: *const R) MappedOpen {
+                            return .{ .value = .{ .borrowed = input }, .start = openStart };
+                        }
+                    }.build);
                 }
             };
-            return .{ .open_fn = Adapter.open };
         }
 
         /// Consume the Stream and collect values within a caller-selected bound.
@@ -5058,6 +5838,12 @@ fn drive(initial: rt.Step, state: *rt.State) void {
     }
 }
 
+// Runtime publication gets one ordinary specialization per outcome type.
+// Static entries retain forced inline publication for optimized body identity.
+fn publishRuntime(state: *rt.State, value: anytype) @TypeOf(value) {
+    return state.publish(value);
+}
+
 inline fn runDriver(comptime known_entry: bool, env: anytype, program: anytype) outcomes.Exit(@TypeOf(program).Success, @TypeOf(program).Error) {
     const Program = @TypeOf(program);
     const R = Program.Environment;
@@ -5067,6 +5853,7 @@ inline fn runDriver(comptime known_entry: bool, env: anytype, program: anytype) 
     var state: rt.State = .{ .services = enclosing };
     state.origin_cancellation = state.services.cancellation;
     if (state.cancelled()) return .interrupted;
+    if (comptime known_entry) if (program.ready) |ready| return state.publish(@call(.always_inline, ready, .{ env_ptr, program.value, &state }));
     // Keep the known initial reduction outside the driver's loop. Folding it
     // into a mutable loop-carried descriptor needlessly erases its call target.
     var produced_owner: ?*rt.DescriptionNode = null;
@@ -5085,17 +5872,20 @@ inline fn runDriver(comptime known_entry: bool, env: anytype, program: anytype) 
     }
     if (comptime Program.Error != void) if (current.value == .terminal) {
         state.services = rt.services(R, env_ptr).inherit(enclosing);
-        return state.publish(current.value.terminal);
+        return if (comptime known_entry) state.publish(current.value.terminal) else publishRuntime(&state, current.value.terminal);
     };
     state.services = current.services(env_ptr).inherit(enclosing);
     if (current.delivery == .ordinary and state.cancelled()) return .interrupted;
-    if (current.ready) |ready| return state.publish(ready(env_ptr, current.value, &state));
+    if (current.ready) |ready| {
+        const evaluated = ready(env_ptr, current.value, &state);
+        return if (comptime known_entry) state.publish(evaluated) else publishRuntime(&state, evaluated);
+    }
     var result: outcomes.Exit(Program.Success, Program.Error) = undefined;
     var job: Program.Job = .{ .program = current, .inherited = enclosing, .owned = produced_owner, .env = env_ptr, .sink = .{ .output = &result, .next_step = .done } };
     produced_owner = null;
     defer rt.DescriptionNode.deinit(job.owned);
     drive(current.start.?(&state, &job), &state);
-    return state.publish(result);
+    return if (comptime known_entry) state.publish(result) else publishRuntime(&state, result);
 }
 
 test "lazy typed binding and repeated independent environments" {
@@ -5216,6 +6006,31 @@ fn ManagedEnvironment(comptime R: type) type {
     };
 }
 
+// Scope acquisition retains the typed input owner until the facility has
+// stopped and joined its callbacks. Provider contexts borrow that stable input
+// and store the selected policy once, alongside the existing execution owner.
+fn ManagedInputs(comptime R: type, comptime Inputs: type, comptime Policy: type) type {
+    return struct {
+        runtime: *ManagedEnvironment(R),
+        inputs: *const Inputs,
+        policy: Policy,
+        fn create(env: *const R, state: *const rt.State, inputs: *const Inputs, policy: Policy) ?*@This() {
+            const runtime = ManagedEnvironment(R).create(env, state) orelse return null;
+            const context = env.allocator.create(@This()) catch {
+                runtime.destroy();
+                return null;
+            };
+            context.* = .{ .runtime = runtime, .inputs = inputs, .policy = policy };
+            return context;
+        }
+        fn destroy(self: *@This()) void {
+            const runtime = self.runtime;
+            runtime.env.allocator.destroy(self);
+            runtime.destroy();
+        }
+    };
+}
+
 /// Specialize an Effect-backed cache with typed keys and values.
 /// Parameters:
 /// - `Key: comptime type`: Key type used to identify or look up entries in this component.
@@ -5269,6 +6084,53 @@ pub fn EffectCache(comptime Key: type, comptime A: type, comptime E: type, compt
             };
             const acquire: Out = .{ .ready = Adapter.ready };
             return acquire.scopeAcquire(scope, Adapter.release);
+        }
+        /// Named-role adapters retain their typed inputs in this same scope;
+        /// configuration is selected once and provider work uses its existing
+        /// ManagedEnvironment and cache generation authority.
+        pub fn makeCaptured(env: *const R, scope: *scopes.Scope(E), inputs: anytype, comptime configure: fn (*const @TypeOf(inputs), *const R) Config, comptime load: fn (*const @TypeOf(inputs), Key, *const R) Effect(A, E, R)) Out {
+            const Inputs = @TypeOf(inputs);
+            const OwnedInputs = @import("dsl/ownership.zig").Capture(Inputs);
+            comptime @import("dsl/ownership.zig").requireConcurrent(Inputs, "managed facility");
+            const Context = ManagedInputs(R, Inputs, Config);
+            const Adapter = struct {
+                fn ready(current: *const R, value: Out.Value, state: *rt.State) outcomes.Exit(*Core, E) {
+                    const borrowed: *const Inputs = @ptrCast(@alignCast(value.borrowed));
+                    const policy = configure(borrowed, current);
+                    const context = Context.create(current, state, borrowed, policy) orelse return .{ .die = outcomes.Defect.out_of_memory };
+                    const result = Core.create(&context.runtime.env, policy, .{
+                        .userdata = context,
+                        .run = struct {
+                            fn run(data: *anyopaque, key: Key, token: *const rt.Cancellation) outcomes.Exit(A, E) {
+                                const selected: *Context = @ptrCast(@alignCast(data));
+                                return selected.runtime.execute(load(selected.inputs, key, &selected.runtime.env), token, false, true);
+                            }
+                        }.run,
+                        .deinit = struct {
+                            fn destroy(data: *anyopaque) void {
+                                const selected: *Context = @ptrCast(@alignCast(data));
+                                selected.destroy();
+                            }
+                        }.destroy,
+                    });
+                    if (result != .success) context.destroy();
+                    return result;
+                }
+                fn acquire(borrowed: *const OwnedInputs, _: *const R) Out {
+                    return .{ .value = .{ .borrowed = &borrowed.value }, .ready = ready };
+                }
+                fn release(_: *const OwnedInputs, cache: *Core, _: *const R) Unit {
+                    return Unit.cleanupBorrowed(Core, cache, struct {
+                        fn close(value: *const Core, _: *const R) outcomes.Exit(void, E) {
+                            const owned = @constCast(value);
+                            const result = owned.shutdown();
+                            owned.deinit();
+                            return result;
+                        }
+                    }.close);
+                }
+            };
+            return Out.scopeAcquireFactoryCapturedAllocated(env.allocator, scope, OwnedInputs{ .value = inputs }, Adapter.acquire, Adapter.release);
         }
         /// Look up the selected value.
         /// Parameters:
@@ -5378,6 +6240,65 @@ pub fn DependencyCache(comptime Key: type, comptime Dependency: type, comptime A
             };
             const acquire: Out = .{ .ready = Adapter.ready };
             return acquire.scopeAcquire(scope, Adapter.release);
+        }
+        /// Captured loader inputs are scope-owned. Bounds and dependency
+        /// retention policy are selected once at authoritative construction.
+        pub fn makeDependentCaptured(env: *const R, scope: *scopes.Scope(E), inputs: anytype, comptime configure: fn (*const @TypeOf(inputs), *const R) Config, comptime load: fn (*const @TypeOf(inputs), Key, *const R) Effect(Loaded, E, R)) Out {
+            const Inputs = @TypeOf(inputs);
+            const OwnedInputs = @import("dsl/ownership.zig").Capture(Inputs);
+            comptime @import("dsl/ownership.zig").requireConcurrent(Inputs, "managed facility");
+            const Context = ManagedInputs(R, Inputs, Config);
+            const Adapter = struct {
+                fn ready(current: *const R, value: Out.Value, state: *rt.State) outcomes.Exit(*Core, E) {
+                    const borrowed: *const Inputs = @ptrCast(@alignCast(value.borrowed));
+                    const policy = configure(borrowed, current);
+                    if (!policy.valid()) return .{ .fail = policy.capacity_error() };
+                    const context = Context.create(current, state, borrowed, policy) orelse return .{ .die = outcomes.Defect.out_of_memory };
+                    const result = Core.create(&context.runtime.env, policy.core(), .{
+                        .userdata = context,
+                        .run = struct {
+                            fn run(data: *anyopaque, key: Key, token: *const rt.Cancellation) outcomes.Exit(Loaded, E) {
+                                const selected: *Context = @ptrCast(@alignCast(data));
+                                var loaded = selected.runtime.execute(load(selected.inputs, key, &selected.runtime.env), token, false, true);
+                                if (loaded == .success and loaded.success.dependencies.len > selected.policy.maximum_dependencies_per_entry) {
+                                    loaded.deinit();
+                                    return .{ .fail = selected.policy.capacity_error() };
+                                }
+                                if (loaded == .success) {
+                                    const retained = loaded.success.reown(&selected.runtime.env, selected.policy.dependency_policy) catch {
+                                        loaded.deinit();
+                                        return .{ .die = outcomes.Defect.out_of_memory };
+                                    };
+                                    return .{ .success = retained };
+                                }
+                                return loaded;
+                            }
+                        }.run,
+                        .deinit = struct {
+                            fn destroy(data: *anyopaque) void {
+                                const selected: *Context = @ptrCast(@alignCast(data));
+                                selected.destroy();
+                            }
+                        }.destroy,
+                    });
+                    if (result != .success) context.destroy();
+                    return result;
+                }
+                fn acquire(borrowed: *const OwnedInputs, _: *const R) Out {
+                    return .{ .value = .{ .borrowed = &borrowed.value }, .ready = ready };
+                }
+                fn release(_: *const OwnedInputs, cache: *Core, _: *const R) Unit {
+                    return Unit.cleanupBorrowed(Core, cache, struct {
+                        fn close(value: *const Core, _: *const R) outcomes.Exit(void, E) {
+                            const owned = @constCast(value);
+                            const result = owned.shutdown();
+                            owned.deinit();
+                            return result;
+                        }
+                    }.close);
+                }
+            };
+            return Out.scopeAcquireFactoryCapturedAllocated(env.allocator, scope, OwnedInputs{ .value = inputs }, Adapter.acquire, Adapter.release);
         }
         /// Lazily observe A, releasing copied dependency metadata while transferring any marked owning value.
         pub fn get(value: *Core, key: Key) Effect(A, E, R) {
@@ -5535,6 +6456,65 @@ pub fn EffectPool(comptime A: type, comptime E: type, comptime R: type) type {
             };
             const program: Out = .{ .ready = Adapter.ready };
             return program.scopeAcquire(scope, Adapter.release);
+        }
+        /// Captured role factories use the existing pool lifecycle. Its scope
+        /// holds the shared input owner through creation, validation, disposal,
+        /// outstanding leases and shutdown joining.
+        pub fn makeCaptured(env: *const R, scope: *scopes.Scope(E), inputs: anytype, comptime configure: fn (*const @TypeOf(inputs), *const R) Config, comptime create: fn (*const @TypeOf(inputs), *const R) Effect(A, E, R), comptime validate: fn (*const @TypeOf(inputs), A, *const R) Effect(bool, E, R), comptime dispose: fn (*const @TypeOf(inputs), A, *const R) Unit) Out {
+            const Inputs = @TypeOf(inputs);
+            const OwnedInputs = @import("dsl/ownership.zig").Capture(Inputs);
+            comptime @import("dsl/ownership.zig").requireConcurrent(Inputs, "managed facility");
+            const Context = ManagedInputs(R, Inputs, Config);
+            const Adapter = struct {
+                fn ready(current: *const R, stored: Out.Value, state: *rt.State) outcomes.Exit(*Core, E) {
+                    const borrowed: *const Inputs = @ptrCast(@alignCast(stored.borrowed));
+                    const policy = configure(borrowed, current);
+                    const context = Context.create(current, state, borrowed, policy) orelse return .{ .die = outcomes.Defect.out_of_memory };
+                    const result = Core.create(&context.runtime.env, policy, .{
+                        .userdata = context,
+                        .create = struct {
+                            fn run(data: *anyopaque, token: *const rt.Cancellation) outcomes.Exit(A, E) {
+                                const selected: *Context = @ptrCast(@alignCast(data));
+                                return selected.runtime.execute(create(selected.inputs, &selected.runtime.env), token, false, false);
+                            }
+                        }.run,
+                        .validate = struct {
+                            fn run(data: *anyopaque, resource_value: A, token: *const rt.Cancellation) outcomes.Exit(bool, E) {
+                                const selected: *Context = @ptrCast(@alignCast(data));
+                                return selected.runtime.execute(validate(selected.inputs, resource_value, &selected.runtime.env), token, false, true);
+                            }
+                        }.run,
+                        .dispose = struct {
+                            fn run(data: *anyopaque, resource_value: A) outcomes.Exit(void, E) {
+                                const selected: *Context = @ptrCast(@alignCast(data));
+                                return selected.runtime.execute(dispose(selected.inputs, resource_value, &selected.runtime.env), null, true, false);
+                            }
+                        }.run,
+                        .deinit = struct {
+                            fn destroy(data: *anyopaque) void {
+                                const selected: *Context = @ptrCast(@alignCast(data));
+                                selected.destroy();
+                            }
+                        }.destroy,
+                    });
+                    if (result != .success) context.destroy();
+                    return result;
+                }
+                fn acquire(borrowed: *const OwnedInputs, _: *const R) Out {
+                    return .{ .value = .{ .borrowed = &borrowed.value }, .ready = ready };
+                }
+                fn release(_: *const OwnedInputs, pool: *Core, _: *const R) Unit {
+                    return Unit.cleanupBorrowed(Core, pool, struct {
+                        fn close(borrowed: *const Core, _: *const R) outcomes.Exit(void, E) {
+                            const owned = @constCast(borrowed);
+                            const result = owned.shutdown();
+                            owned.deinit();
+                            return result;
+                        }
+                    }.close);
+                }
+            };
+            return Out.scopeAcquireFactoryCapturedAllocated(env.allocator, scope, OwnedInputs{ .value = inputs }, Adapter.acquire, Adapter.release);
         }
         /// Acquire a resource from the selected capability.
         /// Parameters:
@@ -5863,8 +6843,8 @@ pub fn EffectWebSocket(comptime R: type) type {
         /// - `acquisition: comptime NativeEffect`: Typed Effect that acquires the resource before the body runs.
         /// - `use_connection: comptime anytype`: Compile-time statically inferred input checked when this operation
         ///   is instantiated.
-        /// Returns (`@typeInfo(@TypeOf(use_connection)).@"fn".return_type.?`): The exact result type inferred from the supplied typed callback.
-        pub fn withSocket(comptime select_limits: fn (*const R) sockets.Limits, comptime acquisition: NativeEffect, comptime use_connection: anytype) @typeInfo(@TypeOf(use_connection)).@"fn".return_type.? {
+        /// Returns (`@import("dsl/inference.zig").continuation(use_connection, *sockets.Connection, R, "websocket.body")`): The exact result type inferred from the supplied typed callback.
+        pub fn withSocket(comptime select_limits: fn (*const R) sockets.Limits, comptime acquisition: NativeEffect, comptime use_connection: anytype) @import("dsl/inference.zig").continuation(use_connection, *sockets.Connection, R, "websocket.body") {
             return withSocketMapError(identity, select_limits, acquisition, use_connection);
         }
         /// Run a scoped native socket body with mapped typed errors.
@@ -5876,25 +6856,30 @@ pub fn EffectWebSocket(comptime R: type) type {
         /// - `acquisition: comptime NativeEffect`: Typed Effect that acquires the resource before the body runs.
         /// - `use_connection: comptime anytype`: Compile-time statically inferred input checked when this operation
         ///   is instantiated.
-        /// Returns (`@typeInfo(@TypeOf(use_connection)).@"fn".return_type.?`): The exact result type inferred from the supplied typed callback.
-        pub fn withSocketMapError(comptime map_error: anytype, comptime select_limits: fn (*const R) sockets.Limits, comptime acquisition: NativeEffect, comptime use_connection: anytype) @typeInfo(@TypeOf(use_connection)).@"fn".return_type.? {
+        /// Returns (`@import("dsl/inference.zig").continuation(use_connection, *sockets.Connection, R, "websocket.body")`): The exact result type inferred from the supplied typed callback.
+        pub fn withSocketMapError(comptime map_error: anytype, comptime select_limits: fn (*const R) sockets.Limits, comptime acquisition: NativeEffect, comptime use_connection: anytype) @import("dsl/inference.zig").continuation(use_connection, *sockets.Connection, R, "websocket.body") {
             return withNative(map_error, struct {
-                fn limits(env: *const R) sockets.Limits {
+                pub const Selection = sockets.Limits;
+                fn select(_: *const void, env: *const R) Selection {
                     return select_limits(env);
                 }
-                fn acquire(_: *const R) NativeEffect {
+                fn limits(selected: *const Selection) sockets.Limits {
+                    return selected.*;
+                }
+                fn acquire(_: *const void, _: *const Selection, _: *const R) NativeEffect {
                     return acquisition.borrow();
                 }
             }, use_connection);
         }
+
         /// Run a body with a scoped managed WebSocket connection.
         /// Parameters:
         /// - `select_options: comptime fn (*const R) sockets.ConnectOptions`: Compile-time typed selector from the current environment; its
         ///   result must remain valid through use.
         /// - `use_connection: comptime anytype`: Compile-time statically inferred input checked when this operation
         ///   is instantiated.
-        /// Returns (`@typeInfo(@TypeOf(use_connection)).@"fn".return_type.?`): The exact result type inferred from the supplied typed callback.
-        pub fn withConnection(comptime select_options: fn (*const R) sockets.ConnectOptions, comptime use_connection: anytype) @typeInfo(@TypeOf(use_connection)).@"fn".return_type.? {
+        /// Returns (`@import("dsl/inference.zig").continuation(use_connection, *sockets.Connection, R, "websocket.body")`): The exact result type inferred from the supplied typed callback.
+        pub fn withConnection(comptime select_options: fn (*const R) sockets.ConnectOptions, comptime use_connection: anytype) @import("dsl/inference.zig").continuation(use_connection, *sockets.Connection, R, "websocket.body") {
             return withConnectionMapError(identity, select_options, use_connection);
         }
         /// Run a scoped connection body with mapped typed errors.
@@ -5905,34 +6890,112 @@ pub fn EffectWebSocket(comptime R: type) type {
         ///   result must remain valid through use.
         /// - `use_connection: comptime anytype`: Compile-time statically inferred input checked when this operation
         ///   is instantiated.
-        /// Returns (`@typeInfo(@TypeOf(use_connection)).@"fn".return_type.?`): The exact result type inferred from the supplied typed callback.
-        pub fn withConnectionMapError(comptime map_error: anytype, comptime select_options: fn (*const R) sockets.ConnectOptions, comptime use_connection: anytype) @typeInfo(@TypeOf(use_connection)).@"fn".return_type.? {
+        /// Returns (`@import("dsl/inference.zig").continuation(use_connection, *sockets.Connection, R, "websocket.body")`): The exact result type inferred from the supplied typed callback.
+        pub fn withConnectionMapError(comptime map_error: anytype, comptime select_options: fn (*const R) sockets.ConnectOptions, comptime use_connection: anytype) @import("dsl/inference.zig").continuation(use_connection, *sockets.Connection, R, "websocket.body") {
             return withNative(map_error, struct {
-                fn limits(env: *const R) sockets.Limits {
-                    return select_options(env).limits;
+                pub const Selection = sockets.ConnectOptions;
+                fn select(_: *const void, env: *const R) Selection {
+                    return select_options(env);
                 }
-                fn acquire(env: *const R) NativeEffect {
-                    return NativeEffect.captureOwned(env.allocator, select_options(env), true, struct {
-                        fn connect(options: *const sockets.ConnectOptions, environment: *const R, token: ?*const rt.Cancellation) outcomes.Exit(sockets.NativeSocket, sockets.Error) {
-                            const uri = std.Uri.parse(options.uri) catch return .{ .fail = .{ .invalid_options = diagnostics.an_absolute_ws_wss_uri_is_required } };
-                            if (uri.host == null or (!std.ascii.eqlIgnoreCase(uri.scheme, "ws") and !std.ascii.eqlIgnoreCase(uri.scheme, "wss"))) return .{ .fail = .{ .invalid_options = diagnostics.an_absolute_ws_wss_uri_is_required } };
-                            if (@FieldType(R, "websocket_transport") != sockets.Transport) @compileError(diagnostics.r_websocket_transport_must_be_a_typed_websocket_transport);
-                            return environment.websocket_transport.connect(environment.websocket_transport.userdata, options.*, token);
-                        }
-                    }.connect);
+                fn limits(selected: *const Selection) sockets.Limits {
+                    return selected.limits;
+                }
+                fn acquire(_: *const void, selected: *const Selection, env: *const R) NativeEffect {
+                    return connectOptions(selected.*, env);
                 }
             }, use_connection);
         }
-        fn withNative(comptime map_error: anytype, comptime Factory: type, comptime use_connection: anytype) @typeInfo(@TypeOf(use_connection)).@"fn".return_type.? {
-            const Out = @typeInfo(@TypeOf(use_connection)).@"fn".return_type.?;
+
+        fn connectOptions(options: sockets.ConnectOptions, env: *const R) NativeEffect {
+            return NativeEffect.captureOwned(env.allocator, options, true, struct {
+                fn connect(selected: *const sockets.ConnectOptions, environment: *const R, token: ?*const rt.Cancellation) outcomes.Exit(sockets.NativeSocket, sockets.Error) {
+                    const uri = std.Uri.parse(selected.uri) catch return .{ .fail = .{ .invalid_options = diagnostics.an_absolute_ws_wss_uri_is_required } };
+                    if (uri.host == null or (!std.ascii.eqlIgnoreCase(uri.scheme, "ws") and !std.ascii.eqlIgnoreCase(uri.scheme, "wss"))) return .{ .fail = .{ .invalid_options = diagnostics.an_absolute_ws_wss_uri_is_required } };
+                    if (@FieldType(R, "websocket_transport") != sockets.Transport) @compileError(diagnostics.r_websocket_transport_must_be_a_typed_websocket_transport);
+                    return environment.websocket_transport.connect(environment.websocket_transport.userdata, selected.*, token);
+                }
+            }.connect);
+        }
+
+        /// Own typed body/acquisition inputs through native socket cleanup.
+        pub fn withSocketCaptured(env: *const R, inputs: anytype, comptime select_limits: fn (*const @TypeOf(inputs), *const R) sockets.Limits, comptime acquisition_factory: fn (*const @TypeOf(inputs), *const R) NativeEffect, comptime use_connection: anytype, comptime map_error: anytype) @import("dsl/inference.zig").result(use_connection, &.{ *const @TypeOf(inputs), *sockets.Connection, *const R }, "websocket.body") {
+            const Inputs = @TypeOf(inputs);
+            const Out = @import("dsl/inference.zig").result(use_connection, &.{ *const Inputs, *sockets.Connection, *const R }, "websocket.body");
+            const Factory = struct {
+                pub const Selection = sockets.Limits;
+                fn select(stored: *const Inputs, current: *const R) Selection {
+                    return select_limits(stored, current);
+                }
+                fn limits(selected: *const Selection) sockets.Limits {
+                    return selected.*;
+                }
+                fn acquire(stored: *const Inputs, _: *const Selection, current: *const R) NativeEffect {
+                    return acquisition_factory(stored, current);
+                }
+            };
+            return @import("dsl.zig").owned(env, inputs, struct {
+                fn body(stored: *const Inputs, _: *const R) Out {
+                    return nativeInput(Inputs, stored, map_error, Factory, use_connection);
+                }
+            }.body);
+        }
+
+        /// Select connection options once, retaining input ownership through
+        /// transport completion, body work and close/abort/disposal.
+        pub fn withConnectionCaptured(env: *const R, inputs: anytype, comptime select_options: fn (*const @TypeOf(inputs), *const R) sockets.ConnectOptions, comptime use_connection: anytype, comptime map_error: anytype) @import("dsl/inference.zig").result(use_connection, &.{ *const @TypeOf(inputs), *sockets.Connection, *const R }, "websocket.body") {
+            const Inputs = @TypeOf(inputs);
+            const Out = @import("dsl/inference.zig").result(use_connection, &.{ *const Inputs, *sockets.Connection, *const R }, "websocket.body");
+            const Factory = struct {
+                pub const Selection = sockets.ConnectOptions;
+                fn select(stored: *const Inputs, current: *const R) Selection {
+                    return select_options(stored, current);
+                }
+                fn limits(selected: *const Selection) sockets.Limits {
+                    return selected.limits;
+                }
+                fn acquire(_: *const Inputs, selected: *const Selection, current: *const R) NativeEffect {
+                    return connectOptions(selected.*, current);
+                }
+            };
+            return @import("dsl.zig").owned(env, inputs, struct {
+                fn body(stored: *const Inputs, _: *const R) Out {
+                    return nativeInput(Inputs, stored, map_error, Factory, use_connection);
+                }
+            }.body);
+        }
+        fn withNative(comptime map_error: anytype, comptime Factory: type, comptime use_connection: anytype) @import("dsl/inference.zig").continuation(use_connection, *sockets.Connection, R, "websocket.body") {
+            const Out = @import("dsl/inference.zig").continuation(use_connection, *sockets.Connection, R, "websocket.body");
+            const Adapter = struct {
+                fn body(_: *const void, connection: *sockets.Connection, env: *const R) Out {
+                    return @import("dsl/inference.zig").call(use_connection, connection, env);
+                }
+            };
+            return nativeInput(void, &{}, map_error, Factory, Adapter.body);
+        }
+        fn nativeInput(comptime Inputs: type, inputs: *const Inputs, comptime map_error: anytype, comptime Factory: type, comptime use_connection: anytype) @import("dsl/inference.zig").result(use_connection, &.{ *const Inputs, *sockets.Connection, *const R }, "websocket.body") {
+            const Out = @import("dsl/inference.zig").result(use_connection, &.{ *const Inputs, *sockets.Connection, *const R }, "websocket.body");
+            comptime @import("dsl/inference.zig").requireEffect(Out, "websocket.body");
             const E = Out.Error;
             comptime requireEffect(Out, E, R, .acquireRelease_body);
-            if (@TypeOf(use_connection) != fn (*sockets.Connection) Out) @compileError(diagnostics.websocket_callback_must_accept_a_borrowed_connection_pointer_and_return_an_effect);
-            if (@TypeOf(map_error) != fn (sockets.Error) E) @compileError(diagnostics.websocket_error_mapper_must_return_the_callback_effect_s_error_type);
+            const mapper_arity = @import("dsl/inference.zig").info(map_error, "websocket.map_error").param_types.len;
+            const Mapped = if (mapper_arity == 3)
+                @import("dsl/inference.zig").result(map_error, &.{ *const Inputs, sockets.Error, *const R }, "websocket.map_error")
+            else
+                @import("dsl/inference.zig").continuation(map_error, sockets.Error, R, "websocket.map_error");
+            if (Mapped != E) @compileError(diagnostics.websocket_error_mapper_must_return_the_callback_effect_s_error_type);
+            const MapContext = struct { inputs: *const Inputs, env: *const R };
+            const Mapper = struct {
+                fn map(context: MapContext, err: sockets.Error) E {
+                    if (comptime mapper_arity == 3) return map_error(context.inputs, err, context.env);
+                    return @import("dsl/inference.zig").call(map_error, err, context.env);
+                }
+            };
             const Adapter = struct {
                 const Frame = struct {
                     const Cleanup = enum { close, abort, dispose };
                     parent: *Out.Job,
+                    inputs: *const Inputs,
+                    selection: Factory.Selection,
                     allocator: std.mem.Allocator,
                     limits: sockets.Limits,
                     acquisition: NativeEffect.Job = undefined,
@@ -5951,14 +7014,14 @@ pub fn EffectWebSocket(comptime R: type) type {
                         const frame: *@This() = @ptrCast(@alignCast(data.?));
                         if (frame.acquired != .success) {
                             const parent = frame.parent;
-                            const value = outcomes.mapError(E, outcomes.castFailure(Out.Success, frame.acquired), frame.allocator, map_error);
+                            const value = outcomes.mapErrorCaptured(E, outcomes.castFailure(Out.Success, frame.acquired), frame.allocator, MapContext{ .inputs = frame.inputs, .env = frame.parent.env }, Mapper.map);
                             release(frame);
                             return parent.finish(value);
                         }
                         frame.native = frame.acquired.success;
                         const created = sockets.Connection.acquire(frame.parent.env, frame.native.?, frame.limits);
                         if (created != .success) {
-                            frame.body_result = outcomes.mapError(E, outcomes.castFailure(Out.Success, created), frame.allocator, map_error);
+                            frame.body_result = outcomes.mapErrorCaptured(E, outcomes.castFailure(Out.Success, created), frame.allocator, MapContext{ .inputs = frame.inputs, .env = frame.parent.env }, Mapper.map);
                             return .{ .data = frame, .advance = bodyStep };
                         }
                         frame.connection = created.success;
@@ -5966,12 +7029,12 @@ pub fn EffectWebSocket(comptime R: type) type {
                             frame.body_result = .interrupted;
                             return .{ .data = frame, .advance = bodyStep };
                         }
-                        const program = use_connection(frame.connection.?);
+                        const program = use_connection(frame.inputs, frame.connection.?, frame.parent.env);
                         frame.body = .{ .program = program, .owned = program.ownership, .env = frame.parent.env, .inherited = state.services, .sink = .{ .output = &frame.body_result, .next_step = .{ .data = frame, .advance = bodyStep } } };
                         return frame.body.step();
                     }
                     fn append(frame: *@This(), comptime operation: Cleanup, cleanup: outcomes.Exit(void, sockets.Error)) void {
-                        const mapped = outcomes.mapError(E, cleanup, frame.allocator, map_error);
+                        const mapped = outcomes.mapErrorCaptured(E, cleanup, frame.allocator, MapContext{ .inputs = frame.inputs, .env = frame.parent.env }, Mapper.map);
                         frame.storage[@backingInt(operation)].appendExit(&frame.body_result, mapped);
                         if (frame.storage[@backingInt(operation)].retained()) _ = frame.references.fetchAdd(1, .monotonic);
                     }
@@ -6001,19 +7064,21 @@ pub fn EffectWebSocket(comptime R: type) type {
                     }
                 };
                 fn start(state: *rt.State, parent: *Out.Job) rt.Step {
-                    const limits = Factory.limits(parent.env);
+                    const captured: *const Inputs = @ptrCast(@alignCast(parent.program.value.borrowed));
+                    const selection = Factory.select(captured, parent.env);
+                    const limits = Factory.limits(&selection);
                     const valid = sockets.validate(limits);
-                    if (valid != .success) return parent.finish(outcomes.mapError(E, outcomes.castFailure(Out.Success, valid), state.services.allocatorValue(), map_error));
+                    if (valid != .success) return parent.finish(outcomes.mapErrorCaptured(E, outcomes.castFailure(Out.Success, valid), state.services.allocatorValue(), MapContext{ .inputs = captured, .env = parent.env }, Mapper.map));
                     const allocator = state.services.allocatorValue() orelse return parent.finish(.{ .die = outcomes.Defect.out_of_memory });
                     const frame = allocator.create(Frame) catch return parent.finish(.{ .die = outcomes.Defect.out_of_memory });
-                    frame.* = .{ .parent = parent, .allocator = allocator, .limits = limits };
+                    frame.* = .{ .parent = parent, .inputs = captured, .selection = selection, .allocator = allocator, .limits = limits };
                     for (&frame.storage) |*storage| storage.* = .{ .allocator = allocator, .owner = frame, .release = Frame.release };
-                    const program = Factory.acquire(parent.env);
+                    const program = Factory.acquire(captured, &frame.selection, parent.env);
                     frame.acquisition = .{ .program = program, .owned = program.ownership, .env = parent.env, .inherited = state.services, .sink = .{ .output = &frame.acquired, .next_step = .{ .data = frame, .advance = Frame.acquiredStep } } };
                     return frame.acquisition.step();
                 }
             };
-            return .{ .start = Adapter.start };
+            return .{ .value = .{ .borrowed = inputs }, .start = Adapter.start };
         }
     };
 }

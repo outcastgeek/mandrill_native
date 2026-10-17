@@ -1,0 +1,19 @@
+const std = @import("std");
+const fx = @import("effect");
+const Env = struct { allocator: std.mem.Allocator };
+const operation = fx.dsl.rpcUnaryDefinition(.{ .name = "runtime.contract", .version = 1, .request = fx.JsonCodec.signed_integer, .success = fx.JsonCodec.borrowed_string, .failure = fx.JsonCodec.borrowed_string });
+const foreign = fx.dsl.rpcUnaryDefinition(.{ .name = "unpaired", .version = 1, .request = fx.JsonCodec.signed_integer, .success = fx.JsonCodec.borrowed_string, .failure = fx.JsonCodec.borrowed_string });
+fn handle(_: anytype, _: *const i64, _: *const Env) fx.Effect(bool, []const u8, Env) {
+    return fx.Effect(bool, []const u8, Env).succeed(false);
+}
+const Use = struct {
+    fn run(registry: anytype, inputs: anytype, _: *const Env) @TypeOf(registry.invoke(operation, inputs.request)) {
+        return registry.invoke(operation, inputs.request);
+    }
+};
+pub fn main() void {
+    const env: Env = .{ .allocator = std.heap.page_allocator };
+    const entry = .{ .definition = fx.dsl.declareMetadata(.{ .operation = operation, .handler = handle }), .inputs = .{} };
+    var described = fx.dsl.makeRpcHandler(&env, entry);
+    described.deinit();
+}

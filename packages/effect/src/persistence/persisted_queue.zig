@@ -384,7 +384,7 @@ pub fn Store(comptime R: type, comptime ProviderError: type, comptime guarantee:
             return OfferEffect.deferEffect(struct {
                 fn start(env: *const R) OfferEffect {
                     const submission = select_submission(env);
-                    if (keys.inspectEncoded(submission.queue_key) == .err or keys.inspectEncoded(submission.offer_key) == .err)
+                    if (!validSubmission(submission))
                         return OfferEffect.fail(.malformed);
                     const store = select_store(env);
                     return store.vtable.offer(store.userdata, env, submission);
@@ -417,7 +417,7 @@ pub fn Store(comptime R: type, comptime ProviderError: type, comptime guarantee:
                     const queue = select_queue(env);
                     const owner = select_owner(env);
                     const policy = select_policy(env);
-                    if (keys.inspectEncoded(queue) == .err or owner.len == 0 or !policy.valid())
+                    if (!validClaim(queue, owner, policy))
                         return ClaimEffect.fail(.invalid_policy);
                     const store = select_store(env);
                     return store.vtable.claim(store.userdata, env, queue, owner, select_generation(env), policy);
@@ -578,6 +578,58 @@ pub fn Store(comptime R: type, comptime ProviderError: type, comptime guarantee:
             }.start);
         }
 
+        fn validSubmission(submission: Submission) bool {
+            return keys.inspectEncoded(submission.queue_key) == .ok and keys.inspectEncoded(submission.offer_key) == .ok;
+        }
+        fn validClaim(key: []const u8, owner: []const u8, policy: ClaimPolicy) bool {
+            return keys.inspectEncoded(key) == .ok and owner.len != 0 and policy.valid();
+        }
+        fn captured(self: Self, env: *const R, value: anytype, comptime invoke: anytype) @TypeOf(invoke(self, @as(*const @TypeOf(value), undefined), env)) {
+            const Out = @TypeOf(invoke(self, @as(*const @TypeOf(value), undefined), env));
+            const Input = struct { provider: Self, value: @TypeOf(value) };
+            var seed = effects.Effect(void, Failure, R).succeed({});
+            return seed.flatMapCapturedOwned(env, Out.Success, Input{ .provider = self, .value = value }, struct {
+                fn start(input: *const Input, _: void, current: *const R) Out {
+                    return invoke(input.provider, &input.value, current);
+                }
+            }.start);
+        }
+        /// Capture runtime submission fields with the same validation as offer.
+        /// Referenced keys and bytes remain borrowed through completion.
+        pub fn offerValue(self: Self, env: *const R, submission: Submission) OfferEffect {
+            return self.captured(env, submission, struct {
+                fn invoke(provider: Self, value: *const Submission, current: *const R) OfferEffect {
+                    if (!validSubmission(value.*)) return OfferEffect.fromOwnedOutcome(current, .{ .fail = .malformed });
+                    return provider.vtable.offer(provider.userdata, current, value.*);
+                }
+            }.invoke);
+        }
+        pub fn claimValue(self: Self, env: *const R, key: []const u8, owner: []const u8, generation: u64, policy: ClaimPolicy) ClaimEffect {
+            const Input = struct { key: []const u8, owner: []const u8, generation: u64, policy: ClaimPolicy };
+            return self.captured(env, Input{ .key = key, .owner = owner, .generation = generation, .policy = policy }, struct {
+                fn invoke(provider: Self, value: *const Input, current: *const R) ClaimEffect {
+                    if (!validClaim(value.key, value.owner, value.policy)) return ClaimEffect.fromOwnedOutcome(current, .{ .fail = .invalid_policy });
+                    return provider.vtable.claim(provider.userdata, current, value.key, value.owner, value.generation, value.policy);
+                }
+            }.invoke);
+        }
+        pub fn acknowledgeValue(self: Self, env: *const R, token: ClaimToken) AckEffect {
+            return self.captured(env, token, struct {
+                fn invoke(provider: Self, value: *const ClaimToken, current: *const R) AckEffect {
+                    if (!validToken(value.*)) return AckEffect.fromOwnedOutcome(current, .{ .fail = .malformed });
+                    return provider.vtable.acknowledge(provider.userdata, current, value.*);
+                }
+            }.invoke);
+        }
+        pub fn retryValue(self: Self, env: *const R, token: ClaimToken, visible_at: deadlines.WallInstant) RetryEffect {
+            const Input = struct { token: ClaimToken, visible_at: deadlines.WallInstant };
+            return self.captured(env, Input{ .token = token, .visible_at = visible_at }, struct {
+                fn invoke(provider: Self, value: *const Input, current: *const R) RetryEffect {
+                    if (!validToken(value.token)) return RetryEffect.fromOwnedOutcome(current, .{ .fail = .malformed });
+                    return provider.vtable.retry(provider.userdata, current, value.token, value.visible_at);
+                }
+            }.invoke);
+        }
         fn validToken(token: ClaimToken) bool {
             return keys.inspectEncoded(token.queue_key) == .ok and
                 keys.inspectEncoded(token.offer_key) == .ok and token.owner_id.len > 0 and token.attempt > 0;

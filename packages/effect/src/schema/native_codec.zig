@@ -6,6 +6,7 @@ const effects = @import("../effect.zig");
 const rt = @import("../internal/runtime.zig");
 const Issue = @import("schema_issue.zig").Issue;
 const codecs = @import("codec.zig");
+const record_value = @import("record_value.zig");
 
 /// Declare a required native record field; a missing representation member becomes a typed Issue.
 pub fn required(comptime name: []const u8, comptime child: anytype) Field(name, child, .required, {}) {
@@ -76,17 +77,18 @@ fn borrows(comptime T: type) bool {
 /// allocating operations return a typed Exit, never a hidden allocator.
 pub fn Record(comptime T: type, comptime O: type, comptime DecodeEnv: type, comptime EncodeEnv: type, comptime fields: anytype, comptime reject_unknown: bool) type {
     const Rep = O.Representation;
+    const Fields = record_value.Fields(T);
     comptime {
-        const shape = @typeInfo(T);
+        const shape = @typeInfo(Fields);
         if (shape != .@"struct" or shape.@"struct".is_tuple or shape.@"struct".field_names.len != fields.len) @compileError("native record requires every named field exactly once");
         for (fields, 0..) |field, index| {
-            if (!@hasField(T, field.name)) @compileError("native record field does not exist");
+            if (!@hasField(Fields, field.name)) @compileError("native record field does not exist");
             for (fields, 0..) |prior, prior_index| if (prior_index < index and std.mem.eql(u8, prior.name, field.name)) @compileError("duplicate native record field");
             const C = @TypeOf(childCodec(field.codec));
             if (C.Representation != Rep or (C.DecodingEnvironment != void and C.DecodingEnvironment != DecodeEnv) or (C.EncodingEnvironment != void and C.EncodingEnvironment != EncodeEnv)) @compileError("native field codec representation/environment mismatch");
             if (field.presence == .defaulted and borrows(C.Decoded)) @compileError("native default output must own borrowed data before default storage is released");
             const Expected = if (field.presence == .optional) ?C.Decoded else C.Decoded;
-            if (@FieldType(T, field.name) != Expected) @compileError("native record field decoded type mismatch");
+            if (@FieldType(Fields, field.name) != Expected) @compileError("native record field decoded type mismatch");
             if (outcomes.ownsPayload(Expected) and !outcomes.ownsPayload(T)) @compileError("native record with owned fields requires public clone/deinit ownership evidence");
             for (shape.@"struct".field_names, shape.@"struct".field_types, shape.@"struct".field_attrs) |name, Type, attrs| {
                 if (std.mem.eql(u8, name, field.name)) {
@@ -116,7 +118,7 @@ pub fn Record(comptime T: type, comptime O: type, comptime DecodeEnv: type, comp
             index: usize = 0,
             fn fail(self: *@This(), result: outcomes.Exit(T, Issue)) rt.Step {
                 inline for (fields, 0..) |field, index| if (self.initialized[index]) {
-                    outcomes.discardPayload(&@field(self.value, field.name));
+                    outcomes.discardPayload(&@field(record_value.get(&self.value).*, field.name));
                 };
                 const parent = self.parent;
                 self.allocator.destroy(self);
@@ -144,7 +146,7 @@ pub fn Record(comptime T: type, comptime O: type, comptime DecodeEnv: type, comp
                                 current.allocator.destroy(slot);
                                 switch (result) {
                                     .success => |value| {
-                                        @field(current.value, field.name) = value;
+                                        @field(record_value.get(&current.value).*, field.name) = value;
                                         current.initialized[index] = true;
                                         current.index += 1;
                                         return .{ .data = current, .advance = DecodeFrame.advance };
@@ -164,7 +166,7 @@ pub fn Record(comptime T: type, comptime O: type, comptime DecodeEnv: type, comp
                         };
                         const found = O.find(frame.input, field.name);
                         if (found == null and field.presence == .optional) {
-                            @field(frame.value, field.name) = null;
+                            @field(record_value.get(&frame.value).*, field.name) = null;
                             frame.initialized[index] = true;
                             frame.index += 1;
                             return .{ .data = frame, .advance = DecodeFrame.advance };
@@ -268,11 +270,11 @@ pub fn Record(comptime T: type, comptime O: type, comptime DecodeEnv: type, comp
                                 return .{ .data = current, .advance = EncodeFrame.advance };
                             }
                         };
-                        if (comptime field.presence == .optional) if (@field(frame.input.*, field.name) == null) {
+                        if (comptime field.presence == .optional) if (@field(record_value.get(frame.input).*, field.name) == null) {
                             frame.index += 1;
                             return .{ .data = frame, .advance = EncodeFrame.advance };
                         };
-                        const value = if (field.presence == .optional) &@field(frame.input.*, field.name).? else &@field(frame.input.*, field.name);
+                        const value = if (field.presence == .optional) &@field(record_value.get(frame.input).*, field.name).? else &@field(record_value.get(frame.input).*, field.name);
                         const slot = frame.allocator.create(Slot) catch return frame.fail(.{ .die = outcomes.Defect.out_of_memory });
                         slot.* = .{ .frame = frame };
                         const program = child.encode(value);

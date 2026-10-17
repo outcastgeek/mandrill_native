@@ -69,6 +69,13 @@ pub fn Parsed(comptime A: type) type {
         pub fn json(self: *const @This()) std.json.Value {
             return self.document.source.value;
         }
+
+        /// Move another decoded value under this same parsed-document owner.
+        /// Retaining the document never clones the application value.
+        pub fn retainValue(self: *const @This(), value: anytype) Parsed(@TypeOf(value)) {
+            _ = self.document.references.fetchAdd(1, .monotonic);
+            return .{ .value = value, .document = self.document };
+        }
     };
 }
 

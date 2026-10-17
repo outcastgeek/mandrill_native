@@ -27,6 +27,9 @@ pub fn Resolver(comptime Definition: type, comptime R: type, comptime ProviderEr
     }
     return struct {
         const Self = @This();
+        pub const RequestDefinition = Definition;
+        pub const Environment = R;
+        pub const ProviderFailure = ProviderError;
         /// Typed request or input value decoded by this definition.
         pub const Input = Definition.Input;
         /// Value type carried by the successful channel.
@@ -124,13 +127,25 @@ pub fn Resolver(comptime Definition: type, comptime R: type, comptime ProviderEr
         ///   must remain valid through use.
         /// Returns (`BatchEffect`): typed results for one bounded batch of jobs.
         pub fn resolveBatch(comptime select_resolver: fn (*const R) *const Self, comptime select_jobs: fn (*const R) []const Job) BatchEffect {
-            return BatchEffect.deferEffect(struct {
-                fn start(env: *const R) BatchEffect {
-                    const jobs = select_jobs(env);
+            return batch(void, &{}, struct {
+                fn select(_: *const void, env: *const R) Self {
+                    return select_resolver(env).*;
+                }
+            }.select, struct {
+                fn select(_: *const void, env: *const R) []const Job {
+                    return select_jobs(env);
+                }
+            }.select);
+        }
+
+        fn batch(comptime Inputs: type, inputs: *const Inputs, comptime select_resolver: fn (*const Inputs, *const R) Self, comptime select_jobs: fn (*const Inputs, *const R) []const Job) BatchEffect {
+            return BatchEffect.deferBorrowed(Inputs, inputs, struct {
+                fn start(capture: *const Inputs, env: *const R) BatchEffect {
+                    const jobs = select_jobs(capture, env);
                     if (jobs.len == 0) return BatchEffect.fail(.{ .operation = .empty_batch });
                     for (jobs) |job| if (keys.inspectEncoded(job.key) == .err)
                         return BatchEffect.fail(.{ .operation = .invalid_key });
-                    const resolver = select_resolver(env);
+                    const resolver = select_resolver(capture, env);
                     var resolved = resolver.vtable.resolve_batch(resolver.userdata, env, jobs);
                     return resolved.flatMapCapturedOwned(env, Results, jobs.len, struct {
                         fn checked(expected_count: *const usize, results: Results, supplied: *const R) BatchEffect {
@@ -144,6 +159,29 @@ pub fn Resolver(comptime Definition: type, comptime R: type, comptime ProviderEr
                     }.checked);
                 }
             }.start);
+        }
+
+        fn CapturedProvider(comptime Inputs: type, comptime resolve_batch: fn (*const Inputs, []const Job, *const R) BatchEffect) type {
+            return struct {
+                fn select(inputs: *const Inputs, _: *const R) Self {
+                    return fromProvider(@constCast(inputs), &.{ .resolve_batch = invoke });
+                }
+                fn invoke(data: ?*anyopaque, env: *const R, jobs: []const Job) BatchEffect {
+                    const inputs: *const Inputs = @ptrCast(@alignCast(data.?));
+                    return resolve_batch(inputs, jobs, env);
+                }
+            };
+        }
+
+        /// Retain generated input ownership through provider completion and
+        /// result validation on the same batch authority.
+        pub fn resolveBatchCaptured(env: *const R, inputs: anytype, comptime select_jobs: fn (*const @TypeOf(inputs), *const R) []const Job, comptime resolve_batch: fn (*const @TypeOf(inputs), []const Job, *const R) BatchEffect) BatchEffect {
+            const Inputs = @TypeOf(inputs);
+            return @import("dsl.zig").owned(env, inputs, struct {
+                fn body(stored: *const Inputs, _: *const R) BatchEffect {
+                    return batch(Inputs, stored, CapturedProvider(Inputs, resolve_batch).select, select_jobs);
+                }
+            }.body);
         }
 
         /// Partition one bounded input batch by a caller-selected stable
@@ -164,6 +202,36 @@ pub fn Resolver(comptime Definition: type, comptime R: type, comptime ProviderEr
             comptime select_jobs: fn (*const R) []const Job,
             comptime select_group: fn (*const Job) []const u8,
         ) BatchEffect {
+            const Adapter = Grouped(void, struct {
+                fn select(_: *const void, env: *const R) Self {
+                    return select_resolver(env).*;
+                }
+            }.select, struct {
+                fn select(_: *const void, env: *const R) []const Job {
+                    return select_jobs(env);
+                }
+            }.select, struct {
+                fn select(_: *const void, job: *const Job, _: *const R) []const u8 {
+                    return select_group(job);
+                }
+            }.select);
+            const acquire = comptime effects.Effect(*Adapter.FrameState, Failure, R).fromOutcome(Adapter.prepareDefault);
+            return acquire.acquireRelease(Adapter.use, Adapter.release);
+        }
+
+        pub fn resolveGroupedCaptured(env: *const R, inputs: anytype, comptime select_jobs: fn (*const @TypeOf(inputs), *const R) []const Job, comptime select_group: fn (*const @TypeOf(inputs), *const Job, *const R) []const u8, comptime resolve_batch: fn (*const @TypeOf(inputs), []const Job, *const R) BatchEffect) BatchEffect {
+            const Inputs = @TypeOf(inputs);
+            const Adapter = Grouped(Inputs, CapturedProvider(Inputs, resolve_batch).select, select_jobs, select_group);
+            const Acquire = effects.Effect(*Adapter.FrameState, Failure, R);
+            return @import("dsl.zig").owned(env, inputs, struct {
+                fn body(stored: *const Inputs, current: *const R) BatchEffect {
+                    var acquire = Acquire.fromBorrowed(Inputs, stored, Adapter.prepare);
+                    return acquire.acquireReleaseOwned(current, Adapter.use, Adapter.release);
+                }
+            }.body);
+        }
+
+        fn Grouped(comptime Inputs: type, comptime select_resolver: fn (*const Inputs, *const R) Self, comptime select_jobs: fn (*const Inputs, *const R) []const Job, comptime select_group: fn (*const Inputs, *const Job, *const R) []const u8) type {
             const Group = struct {
                 key: []const u8,
                 jobs: std.array_list.Managed(Job),
@@ -175,6 +243,7 @@ pub fn Resolver(comptime Definition: type, comptime R: type, comptime ProviderEr
                 }
             };
             const State = struct {
+                inputs: *const Inputs,
                 allocator: std.mem.Allocator,
                 groups: std.array_list.Managed(Group),
                 results: []?ItemExit,
@@ -190,11 +259,16 @@ pub fn Resolver(comptime Definition: type, comptime R: type, comptime ProviderEr
             const Position = struct { state: *State, group_index: usize };
             const Unit = effects.Effect(void, Failure, R);
             const Adapter = struct {
-                fn prepare(env: *const R) outcomes.Exit(*State, Failure) {
-                    const jobs = select_jobs(env);
+                pub const FrameState = State;
+                fn prepareDefault(env: *const R) outcomes.Exit(*State, Failure) {
+                    return prepare(&{}, env);
+                }
+                fn prepare(inputs: *const Inputs, env: *const R) outcomes.Exit(*State, Failure) {
+                    const jobs = select_jobs(inputs, env);
                     if (jobs.len == 0) return .{ .fail = .{ .operation = .empty_batch } };
                     const state = env.allocator.create(State) catch return .{ .die = outcomes.Defect.out_of_memory };
                     state.* = .{
+                        .inputs = inputs,
                         .allocator = env.allocator,
                         .groups = std.array_list.Managed(Group).init(env.allocator),
                         .results = env.allocator.alloc(?ItemExit, jobs.len) catch {
@@ -206,7 +280,7 @@ pub fn Resolver(comptime Definition: type, comptime R: type, comptime ProviderEr
                     var keep = false;
                     defer if (!keep) state.deinit();
                     for (jobs, 0..) |job, index| {
-                        const group_key = select_group(&job);
+                        const group_key = select_group(inputs, &job, env);
                         if (keys.inspectEncoded(job.key) == .err or keys.inspectEncoded(group_key) == .err)
                             return .{ .fail = .{ .operation = .invalid_key } };
                         var selected: ?usize = null;
@@ -256,7 +330,7 @@ pub fn Resolver(comptime Definition: type, comptime R: type, comptime ProviderEr
                         }
                         return BatchEffect.fromOwnedSuccess(env, .{ .items = ordered, .allocator = env.allocator });
                     }
-                    const resolver = select_resolver(env);
+                    const resolver = select_resolver(state.inputs, env);
                     var running = resolver.vtable.resolve_batch(resolver.userdata, env, state.groups.items[group_index].jobs.items);
                     return running.flatMapCapturedOwned(env, Results, Position{ .state = state, .group_index = group_index }, next);
                 }
@@ -270,8 +344,7 @@ pub fn Resolver(comptime Definition: type, comptime R: type, comptime ProviderEr
                     return Unit.succeed({});
                 }
             };
-            const acquire = comptime effects.Effect(*State, Failure, R).fromOutcome(Adapter.prepare);
-            return acquire.acquireRelease(Adapter.use, Adapter.release);
+            return Adapter;
         }
     };
 }

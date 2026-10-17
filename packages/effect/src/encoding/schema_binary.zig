@@ -141,10 +141,17 @@ pub fn decode(env: anytype, comptime schema_name: []const u8, frame: []const u8,
 /// Direct adapter retains pure callback execution while framing allocation
 /// remains explicit through R. No Effect frames are created by these methods.
 pub fn Pure(comptime child: anytype, comptime schema_name: []const u8) type {
+    const Identity = schema_name;
+    const Child = child;
     const checked = @import("../schema/codec.zig").requirePure(child);
     const C = @TypeOf(checked);
     if (C.Representation != []const u8) @compileError("pure binary adapter requires a borrowed byte representation");
     return struct {
+        pub const binary_schema = struct {
+            pub const codec = Child;
+            pub const name = Identity;
+        };
+        pub const LimitsType = Limits;
         pub const Decoded = C.Decoded;
         pub const pure_decoding = true;
         pub const pure_encoding = true;

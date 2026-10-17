@@ -71,6 +71,8 @@ pub fn Observed(comptime T: type) type {
 pub fn Decision(comptime A: type, comptime E: type) type {
     return union(enum) {
         const Self = @This();
+        pub const Success = A;
+        pub const Error = E;
         commit: A,
         fail: E,
         retry,
