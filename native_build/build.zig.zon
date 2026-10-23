@@ -1,0 +1,7 @@
+.{
+    .name = .native_build,
+    .version = "0.1.0",
+    .fingerprint = 0x1165662ddf6c8473,
+    .minimum_zig_version = "0.17.0",
+    .paths = .{ "build.zig", "build.zig.zon", "rust.zig", "cmake.zig", "zcc", "zcxx", "zar", "zranlib", "cargo-build", "cmake-build", "interop" },
+}

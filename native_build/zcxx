@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+export ZIG_RUST_CXX=1
+exec "$(dirname "$0")/zcc" "$@"

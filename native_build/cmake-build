@@ -1,0 +1,67 @@
+#!/bin/sh
+set -eu
+cmake_exe=$1
+source_dir=$2
+install_dir=$3
+support_dir=$4
+zig_exe=$5
+rust_target=$6
+zig_target=$7
+build_type=$8
+system_name=$9
+shift 9
+system_processor=$1
+target_mode=$2
+prefix_count=$3
+shift 3
+prefix_path=
+while [ "$prefix_count" -gt 0 ]; do
+    if [ -n "$prefix_path" ]; then prefix_path="$prefix_path;$1"; else prefix_path=$1; fi
+    prefix_count=$((prefix_count - 1))
+    shift
+done
+export ZIG_RUST_TARGET="$rust_target" ZIG_RUST_ZIG="$zig_exe" ZIG_RUST_ZIG_TARGET="$zig_target"
+build_dir="$install_dir/build"
+if [ "$target_mode" = cross ]; then
+    set -- "-DCMAKE_SYSTEM_NAME=$system_name" "-DCMAKE_SYSTEM_PROCESSOR=$system_processor" "-DCMAKE_FIND_ROOT_PATH=$prefix_path" "$@"
+fi
+case "$rust_target" in
+    x86_64-linux-android|aarch64-linux-android)
+        ndk=${ZIG_RUST_ANDROID_NDK:?Android CMake targets require -Dandroid-ndk}
+        api=${ZIG_RUST_ANDROID_API:-24}
+        case "$rust_target" in
+            x86_64-linux-android) android_abi=x86_64 ;;
+            aarch64-linux-android) android_abi=arm64-v8a ;;
+        esac
+        set -- "-DCMAKE_ANDROID_NDK=$ndk" "-DCMAKE_ANDROID_ARCH_ABI=$android_abi" "-DCMAKE_SYSTEM_VERSION=$api" "$@"
+        ;;
+    x86_64-apple-ios|aarch64-apple-ios|aarch64-apple-ios-sim)
+        case "$rust_target" in
+            aarch64-apple-ios) apple_sdk=iphoneos; apple_arch=arm64 ;;
+            aarch64-apple-ios-sim) apple_sdk=iphonesimulator; apple_arch=arm64 ;;
+            x86_64-apple-ios) apple_sdk=iphonesimulator; apple_arch=x86_64 ;;
+        esac
+        apple_sysroot=$(xcrun --sdk "$apple_sdk" --show-sdk-path)
+        set -- "-DCMAKE_OSX_SYSROOT=$apple_sysroot" "-DCMAKE_OSX_ARCHITECTURES=$apple_arch" "$@"
+        ;;
+    x86_64-apple-darwin|aarch64-apple-darwin)
+        case "$rust_target" in
+            x86_64-apple-darwin) apple_arch=x86_64 ;;
+            aarch64-apple-darwin) apple_arch=arm64 ;;
+        esac
+        set -- "-DCMAKE_OSX_ARCHITECTURES=$apple_arch" "$@"
+        ;;
+esac
+if [ -n "${ZIG_RUST_APPLE_DEPLOYMENT_TARGET:-}" ]; then
+    set -- "-DCMAKE_OSX_DEPLOYMENT_TARGET=$ZIG_RUST_APPLE_DEPLOYMENT_TARGET" "$@"
+fi
+"$cmake_exe" -S "$source_dir" -B "$build_dir" \
+    "-DCMAKE_INSTALL_PREFIX=$install_dir" "-DCMAKE_INSTALL_LIBDIR=lib" \
+    "-DCMAKE_BUILD_TYPE=$build_type" "-DCMAKE_PREFIX_PATH=$prefix_path" \
+    "-DCMAKE_C_COMPILER=$support_dir/zcc" "-DCMAKE_AR=$support_dir/zar" \
+    "-DCMAKE_CXX_COMPILER=$support_dir/zcxx" "-DCMAKE_ASM_COMPILER=$support_dir/zcc" \
+    "-DCMAKE_RANLIB=$support_dir/zranlib" \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF \
+    -DBUILD_TESTING=OFF -DPERFORM_HEADER_CHECK=OFF "$@"
+"$cmake_exe" --build "$build_dir" --config "$build_type"
+"$cmake_exe" --install "$build_dir" --config "$build_type"

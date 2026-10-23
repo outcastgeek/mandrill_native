@@ -73,6 +73,8 @@ turso = { version = "0.8.0-pre.13", default-features = false }
 turso_parser = { version = "=0.8.0-pre.13" }
 url = "2.5.8"
 uuid = "1.26.1"
+gix = { version = "0.81.0", default-features = false, features = ["sha1"] }
+gix-url = "0.35.2"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

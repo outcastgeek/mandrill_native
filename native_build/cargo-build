@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+# All paths are supplied as build graph arguments, including generated sources.
+cargo_exe=$1
+project_dir=$2
+target_dir=$3
+support_dir=$4
+zig_exe=$5
+rust_target=$6
+zig_target=$7
+rustup_exe=$8
+toolchain=$9
+shift 9
+export ZIG_RUST_TARGET="$rust_target" ZIG_RUST_ZIG="$zig_exe"
+if [ -n "$zig_target" ]; then
+    export ZIG_RUST_ZIG_TARGET="$zig_target"
+    target_var=$(printf '%s' "$rust_target" | tr '[:lower:]-' '[:upper:]_')
+    cc_target_var=$(printf '%s' "$rust_target" | tr '.-' '__')
+    export "CARGO_TARGET_${target_var}_LINKER=$support_dir/zcc"
+    export "CC_${cc_target_var}=$support_dir/zcc"
+    export "CXX_${cc_target_var}=$support_dir/zcxx"
+    export "AR_${cc_target_var}=$support_dir/zar"
+fi
+cd "$project_dir"
+if [ "$toolchain" != - ]; then
+    exec "$rustup_exe" run "$toolchain" "$cargo_exe" build --target "$rust_target" --target-dir "$target_dir" "$@"
+fi
+exec "$cargo_exe" build --target "$rust_target" --target-dir "$target_dir" "$@"

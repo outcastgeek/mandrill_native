@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+zig_exe=${ZIG_RUST_ZIG:-zig}
+exec "$zig_exe" ar "$@"

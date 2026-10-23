@@ -1,0 +1,8 @@
+.{
+    .name = .ai_example_consumer,
+    .version = "0.0.0",
+    .fingerprint = 0xd62372f9855ca535,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{ .ai = .{ .path = "../.." } },
+    .paths = .{ "build.zig", "build.zig.zon", "main.zig" },
+}

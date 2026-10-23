@@ -1,0 +1,15 @@
+.{
+    .name = .ai,
+    .version = "0.0.1",
+    .fingerprint = 0x095191e5e99277cc,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .native_build = .{ .path = "../../native_build" },
+        .quickjs = .{
+            .url = "https://bellard.org/quickjs/quickjs-2026-06-04.tar.xz",
+            .hash = "N-V-__8AAL7kNAAbKbYKolIhC3DZZuIDd2WYJUWqjviJbGL4",
+            .lazy = true,
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "root.zig", "README.md", "src", "build", "native", "data", "tools", "examples", "tests" },
+}

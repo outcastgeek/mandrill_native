@@ -9,7 +9,7 @@ const std = @import("std");
 pub const Context = struct {
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     support_dir: std.Build.LazyPath,
     cargo_exe: []const u8,
     rustup_exe: []const u8,
@@ -22,12 +22,17 @@ pub const LibraryOptions = struct {
     name: []const u8,
     /// Directory containing Cargo.toml, relative to the build root.
     project_dir: []const u8,
+    /// Generated/staged projects retain build-graph dependencies.
+    project_path: ?std.Build.LazyPath = null,
     /// Rust crate name as emitted on disk (`-` normalized to `_`).
     crate_name: []const u8,
     manifest_name: []const u8 = "Cargo.toml",
     features: []const []const u8 = &.{},
     no_default_features: bool = false,
     cargo_args: []const []const u8 = &.{},
+    /// Select an already-installed toolchain without rustup's implicit install
+    /// behavior when a rust-toolchain file is encountered by the cargo shim.
+    toolchain: ?[]const u8 = null,
 };
 
 pub const Library = struct {
@@ -42,20 +47,26 @@ pub const Library = struct {
     /// the final link.
     pub fn link(self: Library, artifact: *std.Build.Step.Compile) void {
         artifact.step.dependOn(&self.build.step);
-        artifact.root_module.addObjectFile(self.archive);
-        linkRuntime(self.context, artifact);
+        if(self.linkModule(artifact.root_module)) |libc| artifact.setLibCFile(libc);
+    }
+    /// Imported modules propagate their archive, generated-path dependencies,
+    /// and system libraries to each consumer. Android's artifact-level libc
+    /// file is returned for the final compile step to attach.
+    pub fn linkModule(self: Library,module: *std.Build.Module) ?std.Build.LazyPath {
+        module.addObjectFile(self.archive);
+        return linkRuntimeModule(self.context,module);
     }
 };
 
 pub fn create(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) Context {
     return createWithSupport(b, target, optimize, b.path("native_build"));
 }
 
-pub fn createWithSupport(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, support_dir: std.Build.LazyPath) Context {
+pub fn createWithSupport(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, support_dir: std.Build.LazyPath) Context {
     return .{
         .b = b,
         .support_dir = support_dir,
@@ -71,14 +82,20 @@ pub fn createWithSupport(b: *std.Build, target: std.Build.ResolvedTarget, optimi
 pub fn addLibrary(context: Context, options: LibraryOptions) Library {
     const b = context.b;
     const rust_target = targetTriple(context.target.result);
-    const profile = if (context.optimize == .Debug) "debug" else "release";
-    const target_dir = b.fmt(".zig-cache/rust/{s}", .{options.name});
-    const target_dir_absolute = b.path(target_dir).getPath(b);
-    const manifest = b.fmt("{s}/{s}", .{ options.project_dir, options.manifest_name });
-
-    const cargo = b.addSystemCommand(&.{ context.cargo_exe, "build", "--manifest-path", manifest, "--target", rust_target, "--target-dir", target_dir_absolute });
-    cargo.setCwd(b.path("."));
-    if (context.optimize != .Debug) cargo.addArg("--release");
+    const profile = if (context.optimize == .debug) "debug" else "release";
+    const cargo = b.addSystemCommand(&.{"sh"});
+    cargo.addFileArg2(context.support_dir.path(b, "cargo-build"), .{});
+    cargo.addArg(context.cargo_exe);
+    cargo.addDirectoryArg2(options.project_path orelse b.path(options.project_dir), .{});
+    const target_dir = cargo.addOutputDirectoryArg2(options.name, .{});
+    cargo.addDirectoryArg2(context.support_dir, .{});
+    cargo.addFileArg2(.zig_exe, .{});
+    cargo.addArg(rust_target);
+    cargo.addArg(if (context.target.query.isNative()) "" else context.target.query.zigTriple(b.allocator) catch @panic("out of memory"));
+    cargo.addArg(context.rustup_exe);
+    cargo.addArg(options.toolchain orelse "-");
+    cargo.addArgs(&.{ "--manifest-path", options.manifest_name });
+    if (context.optimize != .debug) cargo.addArg("--release");
     if (options.no_default_features) cargo.addArg("--no-default-features");
     if (options.features.len != 0) {
         cargo.addArg("--features");
@@ -86,29 +103,35 @@ pub fn addLibrary(context: Context, options: LibraryOptions) Library {
     }
     cargo.addArgs(options.cargo_args);
 
-    const linker = context.support_dir.path(b, "zcc").getPath(b);
     cargo.setEnvironmentVariable("ZIG_RUST_TARGET", rust_target);
     cargo.setEnvironmentVariable("ZIG_RUST_ZIG", b.graph.zig_exe);
-    cargo.setEnvironmentVariable("ZIG_RUST_ANDROID_API", b.fmt("{d}", .{context.android_api}));
-    if (context.android_ndk) |ndk| cargo.setEnvironmentVariable("ZIG_RUST_ANDROID_NDK", ndk);
+    setTargetEnvironment(context,cargo);
     // Native Cargo build scripts and proc macros must use the host linker.
     // The target-specific Zig linker is only required for cross compilation.
-    if (!context.target.query.isNative()) {
-        const requested_triple = context.target.query.zigTriple(b.allocator) catch @panic("out of memory");
-        cargo.setEnvironmentVariable("ZIG_RUST_ZIG_TARGET", requested_triple);
-        cargo.setEnvironmentVariable(cargoTargetVariable(b, rust_target, "LINKER"), linker);
-        cargo.setEnvironmentVariable(ccTargetVariable(b, rust_target), linker);
-    }
-
     const archive_name = b.fmt("lib{s}.a", .{normalizeCrateName(b, options.crate_name)});
-    const archive_path = b.fmt("{s}/{s}/{s}/{s}", .{ target_dir, rust_target, profile, archive_name });
     return .{
         .name = options.name,
         .rust_target = rust_target,
-        .archive = b.path(archive_path),
+        .archive = target_dir.path(b, b.fmt("{s}/{s}/{s}", .{ rust_target, profile, archive_name })),
         .build = cargo,
         .context = context,
     };
+}
+/// Keep CMake and Cargo compiler wrappers on the final Zig target's SDK and
+/// deployment settings, including C build scripts invoked by Rust crates.
+pub fn setTargetEnvironment(context: Context,command: *std.Build.Step.Run) void {
+    const b=context.b;
+    command.setEnvironmentVariable("ZIG_RUST_ANDROID_API",b.fmt("{d}",.{context.android_api}));
+    if(context.android_ndk) |ndk| command.setEnvironmentVariable("ZIG_RUST_ANDROID_NDK",ndk);
+    switch(context.target.result.os.tag) {
+        .macos,.ios=>|tag| {
+            const version=context.target.result.os.version_range.semver.min;
+            const deployment=b.fmt("{d}.{d}.{d}",.{version.major,version.minor,version.patch});
+            command.setEnvironmentVariable("ZIG_RUST_APPLE_DEPLOYMENT_TARGET",deployment);
+            command.setEnvironmentVariable(if(tag == .macos) "MACOSX_DEPLOYMENT_TARGET" else "IPHONEOS_DEPLOYMENT_TARGET",deployment);
+        },
+        else=>{},
+    }
 }
 
 pub fn addTargetInstallStep(context: Context, name: []const u8) *std.Build.Step {
@@ -158,38 +181,40 @@ pub fn addRuntimeLinkArgs(context: Context, command: *std.Build.Step.Run) void {
     }
 }
 
-fn linkRuntime(context: Context, artifact: *std.Build.Step.Compile) void {
+fn linkRuntimeModule(context: Context, module: *std.Build.Module) ?std.Build.LazyPath {
+    var libc_file: ?std.Build.LazyPath=null;
     switch (context.target.result.os.tag) {
         .linux => if (context.target.result.abi == .android) {
-            configureAndroid(context, artifact);
-            artifact.root_module.linkSystemLibrary("c", .{});
-            artifact.root_module.linkSystemLibrary("m", .{});
-            artifact.root_module.linkSystemLibrary("dl", .{});
-            artifact.root_module.linkSystemLibrary("log", .{});
+            libc_file=configureAndroidModule(context, module);
+            module.linkSystemLibrary("c", .{});
+            module.linkSystemLibrary("m", .{});
+            module.linkSystemLibrary("dl", .{});
+            module.linkSystemLibrary("log", .{});
         } else {
-            artifact.root_module.linkSystemLibrary("c", .{});
-            artifact.root_module.linkSystemLibrary("m", .{});
-            artifact.root_module.linkSystemLibrary("pthread", .{});
-            artifact.root_module.linkSystemLibrary("dl", .{});
-            artifact.root_module.linkSystemLibrary("unwind", .{});
+            module.linkSystemLibrary("c", .{});
+            module.linkSystemLibrary("m", .{});
+            module.linkSystemLibrary("pthread", .{});
+            module.linkSystemLibrary("dl", .{});
+            module.linkSystemLibrary("unwind", .{});
         },
         .windows => {
-            artifact.root_module.linkSystemLibrary("kernel32", .{});
-            artifact.root_module.linkSystemLibrary("ws2_32", .{});
-            artifact.root_module.linkSystemLibrary("userenv", .{});
-            artifact.root_module.linkSystemLibrary("unwind", .{});
-            artifact.root_module.linkSystemLibrary("c", .{});
+            module.linkSystemLibrary("kernel32", .{});
+            module.linkSystemLibrary("ws2_32", .{});
+            module.linkSystemLibrary("userenv", .{});
+            module.linkSystemLibrary("unwind", .{});
+            module.linkSystemLibrary("c", .{});
         },
-        .macos => artifact.root_module.linkSystemLibrary("c", .{}),
+        .macos => module.linkSystemLibrary("c", .{}),
         .ios => {
-            configureIos(context, artifact);
-            artifact.root_module.linkSystemLibrary("System", .{});
+            configureIosModule(context, module);
+            module.linkSystemLibrary("System", .{});
         },
-        else => artifact.root_module.linkSystemLibrary("c", .{}),
+        else => module.linkSystemLibrary("c", .{}),
     }
+    return libc_file;
 }
 
-fn configureAndroid(context: Context, artifact: *std.Build.Step.Compile) void {
+fn configureAndroidModule(context: Context, module: *std.Build.Module) std.Build.LazyPath {
     const b = context.b;
     const ndk = context.android_ndk orelse @panic("Android Rust targets require -Dandroid-ndk=/absolute/path/to/ndk");
     if (context.android_api < 24) @panic("Android Rust targets require -Dandroid-api=24 or newer");
@@ -212,27 +237,27 @@ fn configureAndroid(context: Context, artifact: *std.Build.Step.Compile) void {
         "include_dir={s}\nsys_include_dir={s}\ncrt_dir={s}\nmsvc_lib_dir=\nkernel32_lib_dir=\ngcc_dir=\n",
         .{ include, sys_include, crt },
     ));
-    artifact.setLibCFile(libc_file);
-    artifact.root_module.addSystemIncludePath(.{ .cwd_relative = include });
-    artifact.root_module.addSystemIncludePath(.{ .cwd_relative = sys_include });
-    artifact.root_module.addLibraryPath(.{ .cwd_relative = crt });
+    module.addSystemIncludePath(b.graph.cwdRelativePath(include));
+    module.addSystemIncludePath(b.graph.cwdRelativePath(sys_include));
+    module.addLibraryPath(b.graph.cwdRelativePath(crt));
 
     const clang_root = b.fmt("{s}/toolchains/llvm/prebuilt/{s}/lib64/clang", .{ ndk, host });
     if (firstDirectory(b, clang_root)) |version| {
         const unwind_arch = if (context.target.result.cpu.arch == .aarch64) "aarch64" else "x86_64";
-        artifact.root_module.addObjectFile(.{ .cwd_relative = b.fmt("{s}/{s}/lib/linux/{s}/libunwind.a", .{ clang_root, version, unwind_arch }) });
+        module.addObjectFile(b.graph.cwdRelativePath(b.fmt("{s}/{s}/lib/linux/{s}/libunwind.a", .{ clang_root, version, unwind_arch })));
     }
+    return libc_file;
 }
 
-fn configureIos(context: Context, artifact: *std.Build.Step.Compile) void {
+fn configureIosModule(context: Context, module: *std.Build.Module) void {
     const b = context.b;
     const sdk_name = if (context.target.result.abi == .simulator) "iphonesimulator" else "iphoneos";
     const output = b.run(&.{ "xcrun", "--sdk", sdk_name, "--show-sdk-path" });
     const sdk = std.mem.trim(u8, output, &std.ascii.whitespace);
     if (sdk.len == 0) @panic("xcrun returned an empty iOS SDK path");
-    artifact.root_module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk}) });
-    artifact.root_module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk}) });
-    artifact.root_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk}) });
+    module.addFrameworkPath(b.graph.cwdRelativePath(b.fmt("{s}/System/Library/Frameworks", .{sdk})));
+    module.addSystemIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/usr/include", .{sdk})));
+    module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/usr/lib", .{sdk})));
 }
 
 fn firstDirectory(b: *std.Build, path: []const u8) ?[]const u8 {
@@ -262,7 +287,9 @@ fn cargoTargetVariable(b: *std.Build, triple: []const u8, suffix: []const u8) []
 }
 
 fn ccTargetVariable(b: *std.Build, triple: []const u8) []const u8 {
-    return b.fmt("CC_{s}", .{upperTarget(b, triple)});
+    const value=b.allocator.dupe(u8,triple) catch @panic("out of memory");
+    for(value) |*byte| if(byte.* == '-' or byte.* == '.') { byte.*='_'; };
+    return b.fmt("CC_{s}", .{value});
 }
 
 fn upperTarget(b: *std.Build, triple: []const u8) []const u8 {
