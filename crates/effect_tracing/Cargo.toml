@@ -2,12 +2,14 @@
 name = "effect-tracing"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version.workspace = true
+
 [dependencies]
 effect = { path = "../effect" }
 tracing = { workspace = true }
+
 [lints]
 workspace = true
 
 [dev-dependencies]
-futures-executor = "0.3.34"
+futures-executor = { workspace = true }

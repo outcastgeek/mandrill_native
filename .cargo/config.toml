@@ -1,3 +1,97 @@
+# Cargo configuration for cross-compilation
+# The zcc wrapper intelligently routes to the appropriate toolchain:
+# - Zig CC for: Linux (GNU/musl), Windows, macOS
+# - Android NDK for: Android targets
+# - xcrun/Apple clang for: iOS targets
+
+# =============================================================================
+# Linux targets (GNU libc) - uses Zig CC
+# =============================================================================
+[target.x86_64-unknown-linux-gnu]
+linker = "native_build/zcc"
+
+[target.aarch64-unknown-linux-gnu]
+linker = "native_build/zcc"
+
+# =============================================================================
+# Linux targets (musl libc - static) - uses Zig CC
+# =============================================================================
+[target.x86_64-unknown-linux-musl]
+linker = "native_build/zcc"
+
+[target.aarch64-unknown-linux-musl]
+linker = "native_build/zcc"
+
+# =============================================================================
+# Windows targets - uses Zig CC
+# =============================================================================
+[target.x86_64-pc-windows-gnu]
+linker = "native_build/zcc"
+rustflags = ["-C", "link-arg=-Wl,--export-all-symbols"]
+
+# Note: aarch64-pc-windows-gnullvm has ABI incompatibilities with Zig
+# It's included for completeness but may not work reliably
+[target.aarch64-pc-windows-gnullvm]
+linker = "native_build/zcc"
+rustflags = ["-C", "link-arg=-Wl,--export-all-symbols"]
+
+# =============================================================================
+# macOS targets - uses Zig CC
+# =============================================================================
+[target.x86_64-apple-darwin]
+linker = "native_build/zcc"
+
+[target.aarch64-apple-darwin]
+linker = "native_build/zcc"
+
+# =============================================================================
+# Android targets - uses NDK clang (Zig can't provide Bionic libc)
+# =============================================================================
+[target.x86_64-linux-android]
+linker = "native_build/zcc"
+
+[target.aarch64-linux-android]
+linker = "native_build/zcc"
+
+# =============================================================================
+# iOS targets - uses xcrun/Apple clang (Xcode SDK required)
+# =============================================================================
+[target.x86_64-apple-ios]
+linker = "native_build/zcc"
+
+[target.aarch64-apple-ios]
+linker = "native_build/zcc"
+
+[target.aarch64-apple-ios-sim]
+linker = "native_build/zcc"
+
+# =============================================================================
+# Environment variables for CC
+# =============================================================================
+[env]
+# To allow plain `cargo build` and drop the prefix `ZIG_RUST_TARGET=aarch64-apple-darwin cargo build`
+ZIG_RUST_TARGET = "aarch64-apple-darwin"
+# Linux GNU
+CC_x86_64-unknown-linux-gnu = { value = "native_build/zcc", relative = true }
+CC_aarch64-unknown-linux-gnu = { value = "native_build/zcc", relative = true }
+# Linux musl
+CC_x86_64-unknown-linux-musl = { value = "native_build/zcc", relative = true }
+CC_aarch64-unknown-linux-musl = { value = "native_build/zcc", relative = true }
+# Windows
+CC_x86_64-pc-windows-gnu = { value = "native_build/zcc", relative = true }
+CC_aarch64-pc-windows-gnullvm = { value = "native_build/zcc", relative = true }
+# macOS
+CC_x86_64-apple-darwin = { value = "native_build/zcc", relative = true }
+CC_aarch64-apple-darwin = { value = "native_build/zcc", relative = true }
+# Android
+CC_x86_64-linux-android = { value = "native_build/zcc", relative = true }
+CC_aarch64-linux-android = { value = "native_build/zcc", relative = true }
+# iOS
+CC_x86_64-apple-ios = { value = "native_build/zcc", relative = true }
+CC_aarch64-apple-ios = { value = "native_build/zcc", relative = true }
+CC_aarch64-apple-ios-sim = { value = "native_build/zcc", relative = true }
+
+
 [build]
 # Bootstrap once with the Rust-only command in tools/effect-dsl-lints/README.md.
 rustc-wrapper = "tools/effect-dsl-lints/target/debug/effect-dsl-lint"

@@ -107,10 +107,11 @@ fn output(compiler: &OsStr, arguments: &[&str]) -> io::Result<String> {
 }
 
 /// Compile only the custom driver with rustc-dev's private compiler API.
-fn driver(root: &Path, compiler: &OsStr, version: &str) -> io::Result<PathBuf> {
+fn driver(root: &Path, compiler: &OsStr, version: &str, sysroot: &Path) -> io::Result<PathBuf> {
     let tool = root.join("tools/effect-dsl-lints");
     let mut hash = DefaultHasher::new();
     version.hash(&mut hash);
+    sysroot.hash(&mut hash);
     for name in ["main.rs", "registry.rs", "kernel.rs"] {
         fs::read(tool.join(name))?.hash(&mut hash);
     }
@@ -131,11 +132,13 @@ fn driver(root: &Path, compiler: &OsStr, version: &str) -> io::Result<PathBuf> {
             .arg(tool.join("main.rs"))
             .arg("-o")
             .arg(&executable)
+            .arg("-L")
+            .arg(sysroot.join("lib"))
             .env("RUSTC_BOOTSTRAP", "1")
             .status()?;
         if !status.success() {
             return Err(io::Error::other(
-                "custom lint driver failed to compile; install rustc-dev for Rust 1.99.0",
+                "custom lint driver failed to compile; install rustc-dev for Rust 1.99.1",
             ));
         }
     }
@@ -178,9 +181,9 @@ fn run() -> io::Result<i32> {
     if workspace && !query {
         coverage::verify(root)?;
         let version = output(compiler, &["-vV"])?;
-        if !version.lines().any(|line| line == "release: 1.99.0") {
+        if !version.lines().any(|line| line == "release: 1.99.1") {
             return Err(io::Error::other(
-                "DSL lint driver requires the workspace Rust 1.99.0 compiler",
+                "DSL lint driver requires the workspace Rust 1.99.1 compiler",
             ));
         }
         let sysroot = PathBuf::from(output(compiler, &["--print", "sysroot"])?.trim());
@@ -195,7 +198,7 @@ fn run() -> io::Result<i32> {
         }
         let library_path = env::join_paths(libraries).map_err(io::Error::other)?;
         // Rust's process API preserves Cargo's inherited jobserver descriptors.
-        let status = Command::new(driver(root, compiler, &version)?)
+        let status = Command::new(driver(root, compiler, &version, &sysroot)?)
             .args(arguments)
             .env(library_env, library_path)
             .status()?;

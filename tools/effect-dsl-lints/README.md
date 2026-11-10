@@ -3,8 +3,8 @@ The workspace Cargo wrapper runs the `manual_dsl_construction` compiler lint bef
 Bootstrap the native launcher once:
 
 ```sh
-rustup component add rustc-dev --toolchain 1.99.0
-cargo +1.99.0 --config 'build.rustc-wrapper=""' build --manifest-path tools/effect-dsl-lints/Cargo.toml --bin effect-dsl-lint -j2
+rustup component add rustc-dev --toolchain 1.99.1
+cargo +1.99.1 --config 'build.rustc-wrapper=""' build --manifest-path tools/effect-dsl-lints/Cargo.toml --bin effect-dsl-lint -j2
 ```
 
 The configuration override applies only to building this launcher. Normal workspace and nested fixture Cargo commands use `.cargo/config.toml` and require the launcher; missing tooling fails the command. No Python or other scripting runtime is required. The launcher compiles the private compiler driver with `RUSTC_BOOTSTRAP` scoped to that driver compilation; production compilation retains its ordinary compiler and lint settings. Rust process spawning preserves Cargo's inherited jobserver descriptors.

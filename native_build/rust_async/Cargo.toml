@@ -2,7 +2,7 @@
 name = "native-async-runtime"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version.workspace = true
 
 [dependencies]
 tokio = { workspace = true, features = ["sync", "time"] }

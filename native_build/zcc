@@ -43,5 +43,12 @@ case "$target" in
   *) echo "unsupported Rust target: $target" >&2; exit 1 ;;
 esac
 
+case "$target" in
+    x86_64-apple-darwin|aarch64-apple-darwin)
+        sdk=$(xcrun --show-sdk-path)
+        set -- "-F$sdk/System/Library/Frameworks" "-L$sdk/usr/lib" "$@"
+        ;;
+esac
+
 zig_target=${ZIG_RUST_ZIG_TARGET:-$zig_target}
-exec "$zig_exe" "$zig_driver" -target "$zig_target" "$@"
+exec "$zig_exe" "$zig_driver" "$@" --target="$zig_target"

@@ -2,9 +2,11 @@
 name = "effect-rayon"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version.workspace = true
+
 [dependencies]
 effect = { path = "../effect" }
-rayon = "1.12.0"
+rayon = { workspace = true }
+
 [lints]
 workspace = true

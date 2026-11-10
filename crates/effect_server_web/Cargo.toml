@@ -2,7 +2,7 @@
 name = "effect-server-web"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version.workspace = true
 
 [features]
 default = []
@@ -35,7 +35,7 @@ tokio = { workspace = true, features = ["sync", "time", "fs"] }
 
 [target.'cfg(unix)'.dependencies]
 # POSIX getrusage backs the native process diagnostic capability.
-libc = "0.2.189"
+libc = "0.2.191"
 
 [dev-dependencies]
 effect-tokio = { path = "../effect_tokio" }
