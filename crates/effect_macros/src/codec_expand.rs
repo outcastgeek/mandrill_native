@@ -12,6 +12,7 @@ pub(crate) fn codec(input: Input) -> syn::Result<TokenStream> {
     let mode = input.mode(
         &[
             "pure",
+            "contextual_pure",
             "effectful",
             "contextual",
             "transform",
@@ -24,7 +25,10 @@ pub(crate) fn codec(input: Input) -> syn::Result<TokenStream> {
     )?;
     let mut fields = input.fields;
     let path = crate::expand::effect_crate_path()?;
-    let pure = mode == "pure" || mode == "recursive_pure" || mode == "transform_pure";
+    let pure = matches!(
+        mode.as_str(),
+        "pure" | "contextual_pure" | "recursive_pure" | "transform_pure"
+    );
     let owner = if pure {
         quote!(#path::PureCodec)
     } else {
@@ -58,7 +62,11 @@ pub(crate) fn codec(input: Input) -> syn::Result<TokenStream> {
             quote!((#source).#method(#decode, #encode))
         }
         _ => {
-            let arity = if mode == "contextual" { 2 } else { 1 };
+            let arity = if matches!(mode.as_str(), "contextual" | "contextual_pure") {
+                2
+            } else {
+                1
+            };
             let category = if pure {
                 BodyCategory::Native
             } else {
@@ -68,7 +76,7 @@ pub(crate) fn codec(input: Input) -> syn::Result<TokenStream> {
             let encode = shared_direction(&mut fields, "encode", arity, category)?;
             let ast = if fields.contains("ast") {
                 fields.take("ast")?
-            } else if mode == "contextual" {
+            } else if matches!(mode.as_str(), "contextual" | "contextual_pure") {
                 return Err(syn::Error::new(
                     Span::call_site(),
                     "contextual codec requires ast",
@@ -175,7 +183,7 @@ fn finish_codec(
             quote!(#ordinary, #environments, B: Send + 'static, F: Fn(A) -> #path::Effect<B, #path::SchemaIssue, D> + Send + Sync + 'static, G: Fn(B) -> #path::Effect<A, #path::SchemaIssue, E> + Send + Sync + 'static),
             output,
         ),
-        "pure" => fields.finish_inferred(
+        "pure" | "contextual_pure" => fields.finish_inferred(
             quote!(A, Encoded),
             &types(
                 quote!(::std::sync::Arc<dyn Fn(&Encoded, ::core::option::Option<&#path::ParseContext>) -> ::core::result::Result<A, #path::SchemaIssue> + Send + Sync>),

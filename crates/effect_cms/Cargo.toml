@@ -1,0 +1,64 @@
+[package]
+name = "effect_cms"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+
+[dependencies]
+# The localization owner reads request-scoped input and description JSON, so it
+# depends on the workspace effect kernel, the native request boundary and the
+# shared JSON reader. The description decoder streams members through serde
+# visitors and skips ignored data with serde_json's iterative scanner, so it needs
+# no stack-growing deserializer and no unbounded-recursion mode.
+# No database, SQL or storage dependency is added.
+effect = { path = "../effect" }
+effect-server = { path = "../effect_server" }
+# The queries and access owners build HTTP status/header contracts (access responses,
+# redirect targets) and decode relation selection tokens, so they need the workspace
+# native HTTP types and serde's derive for the token records. No database, SQL or
+# storage dependency is added.
+http = { workspace = true }
+# The media owner parses relative/absolute URLs and decodes path escapes without
+# form-space conversion.
+url = { workspace = true }
+percent-encoding = { workspace = true }
+uuid = { workspace = true, features = ["v4", "v5"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+# The content owner builds authored HTML with the mandated Maud templates, applies
+# the sanitizer's value patterns with the workspace's resolved `regex` release, and
+# tokenizes author-supplied HTML with a WHATWG tokenizer, writing the surviving
+# filtered token stream with html5ever's HTML serializer. `html5ever` supplies that
+# tokenizer and processed-content serializer for the one boundary; no CSS or DOM
+# feature of it is used. No database, SQL or storage dependency is added.
+maud = { workspace = true }
+regex = "1.13.1"
+html5ever = "0.40.1"
+# The forms owner renders its governed form controls, localized tabs and relation
+# editor with the workspace component library's published class/property contracts
+# and its icon markup, so the form surfaces share the existing design contract.
+# No component source is modified.
+web_components = { path = "../web_components" }
+# Relation row element identities derive stable row keys with SHA-256; sha2 0.11.1 is
+# already resolved in the workspace lock.
+sha2 = "0.11.1"
+# Date/time civil arithmetic and the real IANA time-zone database. chrono is the
+# workspace version; chrono-tz supplies the database (DST rules and abbreviations),
+# not a fixed-offset approximation.
+chrono = { workspace = true }
+chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
+
+# Source media demo identities use SHA-1 namespace UUIDs.
+sha1 = "0.10.7"
+
+[lints]
+workspace = true
+
+
+[dev-dependencies]
+futures-executor = { workspace = true }
+effect-tokio = { path = "../effect_tokio" }
+tokio = { workspace = true, features = ["net", "time"] }
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+http-body-util = { workspace = true }

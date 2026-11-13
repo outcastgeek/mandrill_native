@@ -2,7 +2,7 @@
 pub const SOURCES: &[(&str, u64)] = &[
     ("async_expand.rs", 0x8d2028b3c4659166),
     ("callback_expand.rs", 0x24f499a730f79574),
-    ("codec_expand.rs", 0x95940728b800bfbe),
+    ("codec_expand.rs", 0x0e213fa6eba02cd0),
     ("context_expand.rs", 0xcce4d5a13e3f26f7),
     ("descriptor_expand.rs", 0x816133b58e3ae2d3),
     ("domain_expand.rs", 0xf7b70860fdb2a746),

@@ -1,0 +1,22 @@
+//! Resource pages: canonical values, Maud composition, publication and SSE.
+mod render_contracts;
+mod render_helpers;
+mod render_form;
+mod render_list;
+mod render_dashboard;
+mod render_pages;
+mod renderer;
+mod request;
+mod search_sse;
+pub use render_contracts::*;
+pub use render_helpers::*;
+pub use render_form::*;
+pub use render_list::*;
+pub use render_dashboard::*;
+pub use render_pages::*;
+pub use renderer::*;
+pub use request::*;
+pub use search_sse::*;
+pub use crate::forms::{ResourceFieldVM,ResourceFieldOptionVM,ResourceFormPageVM,ResourceFormSectionVM};
+pub use crate::rendering::{ResourceDetailPageVM,ResourceListPageVM,ResourceListSectionVM,ResourceListItemVM,ResourceDetailSectionVM};
+pub use crate::dashboards::{ResourceDashboardPageVM,ContentDashboardPageVM};

@@ -675,16 +675,34 @@ pub fn json_all_of<A: Send + 'static>(
         move |value, context| {
             let active = super::parse_context::policy(context, policy);
             super::internal::parser::check_limits(value, &active.limits)?;
+            let budget = super::parse_context::budget(context, active);
+            let initial = budget.used();
+            let mut issues = Vec::new();
             let mut selected = None;
+
             for (index, codec) in decode.iter().enumerate() {
-                let child = super::parse_context::child(context, IssueSegment::Alternative(index))?;
-                let decoded = codec
-                    .decode_in_ref(value, child.as_ref())
-                    .map_err(|issue| issue.at(IssueSegment::Alternative(index)))?;
-                if index == select_decode {
-                    selected = Some(decoded);
+                if active.errors != super::SchemaErrorMode::First {
+                    budget.available()?;
+                }
+                let before = budget.used();
+                let child =
+                    super::parse_context::child(context, IssueSegment::Alternative(index))?;
+                match codec.decode_in_ref(value, child.as_ref()) {
+                    Ok(decoded) => {
+                        if index == select_decode {
+                            selected = Some(decoded);
+                        }
+                    }
+                    Err(issue) => retain_decode_issue(
+                        &mut issues,
+                        issue.at(IssueSegment::Alternative(index)),
+                        active,
+                        &budget,
+                        before,
+                    )?,
                 }
             }
+            finish_decode_issues(issues, &budget, initial)?;
             selected.ok_or_else(invalid)
         },
         move |value, context| {
@@ -737,6 +755,38 @@ pub fn json_all_of<A: Send + 'static>(
     } else {
         result
     })
+}
+
+fn retain_decode_issue(
+    issues: &mut Vec<SchemaIssue>,
+    issue: SchemaIssue,
+    policy: ParsePolicy,
+    budget: &super::parse_context::IssueBudget,
+    before: usize,
+) -> Result<(), SchemaIssue> {
+    if policy.errors == super::SchemaErrorMode::First || resource_failure(&issue) {
+        return Err(issue);
+    }
+    budget.record(before, &issue)?;
+    issues.push(issue);
+    Ok(())
+}
+
+fn finish_decode_issues(
+    mut issues: Vec<SchemaIssue>,
+    budget: &super::parse_context::IssueBudget,
+    initial: usize,
+) -> Result<(), SchemaIssue> {
+    if issues.is_empty() {
+        return Ok(());
+    }
+    let issue = if issues.len() == 1 {
+        issues.remove(0)
+    } else {
+        SchemaIssue::new(SchemaIssueKind::Multiple).with_children(issues)
+    };
+    budget.record(initial, &issue)?;
+    Err(issue)
 }
 /// Inclusive array-length bounds and optional JSON/type-side uniqueness checks.
 #[derive(Clone, Copy, Debug)]
@@ -1266,26 +1316,57 @@ pub fn json_object_constraints<A: Send + 'static>(
                     format!("{}..={}", decode.minimum, decode.maximum),
                 ));
             }
+            let budget = super::parse_context::budget(context, policy);
+            let initial = budget.used();
+            let mut issues = Vec::new();
             let mut values = BTreeMap::new();
+
             for (name, value) in fields {
+                if policy.errors != super::SchemaErrorMode::First {
+                    budget.available()?;
+                }
+                let before = budget.used();
+                let routes = match decode.select(name, context) {
+                    Ok(routes) => routes,
+                    Err(issue) => {
+                        retain_decode_issue(&mut issues, issue, policy, &budget, before)?;
+                        continue;
+                    }
+                };
                 let mut selected = None;
-                for codec in decode.select(name, context)? {
-                    let decoded = codec
-                        .decode_in_ref(
-                            value,
-                            super::parse_context::child(
-                                context,
-                                IssueSegment::Field(name.as_str().into()),
-                            )?
-                            .as_ref(),
-                        )
-                        .map_err(|issue| issue.at(IssueSegment::Field(name.as_str().into())))?;
-                    if selected.is_none() {
-                        selected = Some(decoded);
+                let mut failed = false;
+                for codec in routes {
+                    if policy.errors != super::SchemaErrorMode::First {
+                        budget.available()?;
+                    }
+                    let before = budget.used();
+                    let child = super::parse_context::child(
+                        context,
+                        IssueSegment::Field(name.as_str().into()),
+                    )?;
+                    match codec.decode_in_ref(value, child.as_ref()) {
+                        Ok(decoded) => {
+                            if selected.is_none() {
+                                selected = Some(decoded);
+                            }
+                        }
+                        Err(issue) => {
+                            failed = true;
+                            retain_decode_issue(
+                                &mut issues,
+                                issue.at(IssueSegment::Field(name.as_str().into())),
+                                policy,
+                                &budget,
+                                before,
+                            )?;
+                        }
                     }
                 }
-                values.insert(name.clone(), selected.ok_or_else(invalid)?);
+                if !failed {
+                    values.insert(name.clone(), selected.ok_or_else(invalid)?);
+                }
             }
+            finish_decode_issues(issues, &budget, initial)?;
             Ok(values)
         },
         move |values: &BTreeMap<String, A>, context| {

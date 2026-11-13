@@ -19,6 +19,8 @@ members = [
     "crates/effect_server_identity",
     "crates/effect_server_web",
     "crates/effect_otel",
+    "crates/effect_cms",
+    "crates/web_components",
 ]
 resolver = "3"
 
@@ -122,3 +124,7 @@ incremental = false
 lto = true
 opt-level = "s"
 strip = true
+
+# Narrow attribute-spread extension; the Maud runtime remains unchanged.
+[patch.crates-io]
+maud_macros = { path = "vendor/maud_macros" }

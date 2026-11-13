@@ -45,13 +45,16 @@ impl IssueBudget {
             spent: Arc::new(Mutex::new(0)),
         }
     }
-    pub(crate) fn used(&self) -> usize {
+    /// Return the number of issue-tree nodes already charged to this invocation.
+    #[must_use]
+    pub fn used(&self) -> usize {
         *self
             .spent
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
-    pub(crate) fn available(&self) -> Result<(), SchemaIssue> {
+    /// Reject further issue accumulation when this invocation has no capacity left.
+    pub fn available(&self) -> Result<(), SchemaIssue> {
         if self.used() >= self.maximum {
             Err(Self::exhausted())
         } else {
@@ -60,7 +63,7 @@ impl IssueBudget {
     }
     /// Charge newly produced issue-tree nodes since `before`, excluding child work
     /// already charged to this shared budget. Reject overflow and budget exhaustion.
-    pub(crate) fn record(&self, before: usize, issue: &SchemaIssue) -> Result<(), SchemaIssue> {
+    pub fn record(&self, before: usize, issue: &SchemaIssue) -> Result<(), SchemaIssue> {
         let count = issue_count(issue);
         let mut spent = self
             .spent
@@ -184,7 +187,12 @@ impl ParseContext {
             observed,
         })
     }
-    pub(crate) fn issue_budget(&self) -> IssueBudget {
+    /// Borrow an invocation-owned handle to the shared issue-tree budget.
+    ///
+    /// Clones share the same accounting state; creating a new root context starts
+    /// fresh counters.
+    #[must_use]
+    pub fn issue_budget(&self) -> IssueBudget {
         self.issues.clone()
     }
     pub(crate) fn descend(&self) -> Result<Self, SchemaIssue> {

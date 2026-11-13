@@ -248,6 +248,18 @@ impl<A: Send + 'static, Encoded: Send + 'static> PureCodec<A, Encoded> {
         (self.decode)(encoded, None)
     }
 
+    /// Decode a borrowed value with the caller's active traversal state.
+    /// Nested codecs share its paths and budgets; the encoded representation is
+    /// checked by the boundary that created the context.
+    pub fn decode_ref_in(&self, encoded: &Encoded, context: &ParseContext) -> Result<A, SchemaIssue> {
+        self.decode_in_ref(encoded, Some(context))
+    }
+
+    /// Encode a borrowed value with the caller's active traversal state.
+    pub fn encode_ref_in(&self, value: &A, context: &ParseContext) -> Result<Encoded, SchemaIssue> {
+        self.encode_in_ref(value, Some(context))
+    }
+
     /// Inspect a borrowed application value and return an independently owned representation, applying the encoder's checks.
     pub fn encode_ref(&self, value: &A) -> Result<Encoded, SchemaIssue> {
         (self.encode)(value, None)
@@ -372,6 +384,15 @@ impl<A: Send + 'static> PureCodec<A, JsonValue> {
         self.ast.prepare(policy.limits)?;
         let encoded = super::internal::parser::parse_json(text, policy)?;
         self.decode_ref(&encoded)
+    }
+
+    /// Parse serialized JSON and decode it with one caller-supplied context.
+    pub fn parse_str_in(&self, text: &str, context: &ParseContext) -> Result<A, SchemaIssue> {
+        let policy = context.policy().parse;
+        self.ast.prepare(policy.limits)?;
+        let encoded = super::internal::parser::parse_json(text, policy)?;
+        context.check_json(&encoded)?;
+        self.decode_ref_in(&encoded, context)
     }
 
     /// Tie a recursive codec using weak self-references without an ownership cycle.
