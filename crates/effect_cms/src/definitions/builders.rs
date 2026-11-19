@@ -139,6 +139,11 @@ pub fn new_resource_dashboard_definition(
 pub fn normalize_resource_definition(mut definition: ResourceDefinition) -> ResourceDefinition {
     let relations = clone_relations(&definition.relations);
     definition.relations = relations;
+    normalize_owned_resource_definition(definition)
+}
+
+/// Take ownership of detached relation data during prepared registration.
+pub(super) fn normalize_owned_resource_definition(mut definition: ResourceDefinition) -> ResourceDefinition {
     if definition.management_route_mode.as_str() == RESOURCE_MANAGEMENT_ROUTE_MODE_UNIFIED {
         let routes = unified_management_route_set(definition.management_routes);
         definition.management_routes = routes;

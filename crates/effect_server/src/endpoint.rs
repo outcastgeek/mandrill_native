@@ -1,8 +1,10 @@
 //! Endpoint descriptions, registration metadata and owned middleware continuations.
 
 use crate::effect_future;
+use crate::prepared_request_storage::{Loan, Vacancy};
 use crate::{BodyOutcome, HasRequest, Reply, Request, ResourceValidators, ServerError};
 use effect::{Effect, Exit, PrimaryOutcomeRef, Release, Scope, effect, service};
+use effect::memory::MemoryError;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
@@ -38,6 +40,65 @@ pub type Continuation<E, R> = Arc<dyn Fn() -> Effect<(), E, R> + Send + Sync>;
 /// Request execution middleware over one owned continuation, not a detached native callback.
 pub type Middleware<E, R> =
     Arc<dyn Fn(Request, Continuation<E, R>) -> Effect<(), E, R> + Send + Sync>;
+
+type PreparedMiddleware<E, R> =
+    Arc<dyn Fn(Request, PreparedNext<E, R>) -> Effect<(), E, R> + Send + Sync>;
+
+enum PipelineStage<E: Send + 'static, R: Send + Sync + 'static> {
+    Ordinary(Middleware<E, R>),
+    Prepared(PreparedMiddleware<E, R>),
+}
+impl<E: Send + 'static, R: Send + Sync + 'static> Clone for PipelineStage<E, R> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Ordinary(stage) => Self::Ordinary(stage.clone()),
+            Self::Prepared(stage) => Self::Prepared(stage.clone()),
+        }
+    }
+}
+
+pub(crate) struct PipelineRun<E: Send + 'static, R: Send + Sync + 'static> {
+    request: Request,
+    reply: Effect<(), E, R>,
+    outer: Pipeline<E, R>,
+    inner: Pipeline<E, R>,
+}
+
+/// Awaited continuation over one admitted middleware run.
+/// A cloned cursor keeps the request and terminal Effect alive until its last owner drops.
+#[must_use]
+pub struct PreparedNext<E: Send + 'static, R: Send + Sync + 'static> {
+    run: Loan<PipelineRun<E, R>>,
+    index: usize,
+}
+impl<E: Send + 'static, R: Send + Sync + 'static> Clone for PreparedNext<E, R> {
+    fn clone(&self) -> Self {
+        Self { run: self.run.clone(), index: self.index }
+    }
+}
+impl<E: Send + 'static, R: Send + Sync + 'static> PreparedNext<E, R> {
+    /// Invoke the next stage or clone the terminal Effect at the end.
+    /// Repeating this call starts at the same stage.
+    pub fn invoke(&self) -> Effect<(), E, R> {
+        let outer = self.run.outer.stages();
+        let stage = if self.index < outer.len() {
+            outer.get(self.index)
+        } else {
+            self.run.inner.stages().get(self.index - outer.len())
+        };
+        let Some(stage) = stage else { return self.run.reply.clone(); };
+        let next = Self {
+            run: self.run.clone(),
+            index: self.index + 1,
+        };
+        let request = self.run.request.clone();
+        match stage {
+            PipelineStage::Prepared(stage) => stage(request, next),
+            PipelineStage::Ordinary(stage) => stage(request, Arc::new(move || next.invoke())),
+        }
+    }
+}
+
 /// Typed endpoint ending in one completed reply. Construction is inert and reusable.
 pub struct Endpoint<E: Send + 'static, R: Send + Sync + 'static> {
     /// Callback binds endpoint resources directly into the enclosing request scope.
@@ -148,7 +209,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Endpoint<E, R> {
 /// Ordered full-request middleware descriptions. Fn callbacks preserve reusable construction.
 pub struct Pipeline<E: Send + 'static, R: Send + Sync + 'static> {
     /// Declaration order is preserved and later stages are awaited continuations.
-    stages: Vec<Middleware<E, R>>,
+    stages: Option<Arc<Vec<PipelineStage<E, R>>>>,
 }
 impl<E: Send + 'static, R: Send + Sync + 'static> Clone for Pipeline<E, R> {
     /// Share stage descriptions, never active request scopes.
@@ -168,14 +229,25 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Pipeline<E, R> {
     /// Create an inert ordered pipeline.
     #[must_use]
     pub fn new() -> Self {
-        Self { stages: Vec::new() }
+        Self { stages: None }
     }
     /// Append extracted middleware whose continuation must remain owned and awaited.
     pub fn stage(
         mut self,
         stage: impl Fn(Request, Continuation<E, R>) -> Effect<(), E, R> + Send + Sync + 'static,
     ) -> Self {
-        self.stages.push(Arc::new(stage));
+        let stages = self.stages.get_or_insert_with(|| Arc::new(Vec::new()));
+        Arc::make_mut(stages).push(PipelineStage::Ordinary(Arc::new(stage)));
+        self
+    }
+    /// Add middleware that uses the request's prepared continuation storage.
+    /// Run it on a prepared host with inner request controls.
+    pub fn prepared_stage(
+        mut self,
+        stage: impl Fn(Request, PreparedNext<E, R>) -> Effect<(), E, R> + Send + Sync + 'static,
+    ) -> Self {
+        let stages = self.stages.get_or_insert_with(|| Arc::new(Vec::new()));
+        Arc::make_mut(stages).push(PipelineStage::Prepared(Arc::new(stage)));
         self
     }
     /// Run an Effect before the entire downstream body program.
@@ -261,13 +333,12 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Pipeline<E, R> {
             let request_for_reply = request.clone();
             Effect::service(move |_: &R| {
                 request.with_extensions(|extensions| {
-                    extensions.get::<ReplyContinuation<E, R>>().cloned()
+                    extensions.get::<WeakReplyContinuation<E, R>>().and_then(WeakReplyContinuation::upgrade)
                 })
             })
             .flat_map(move |continuation| match continuation {
                 Some(continuation) => {
-                    let continuation = continuation.0.clone();
-                    reply(request_for_reply.clone()).flat_map(move |reply| continuation(reply))
+                    reply(request_for_reply.clone()).flat_map(move |reply| continuation.invoke(reply))
                 }
                 None => Effect::die(effect::Defect::new(
                     "response continuation unavailable outside request boundary",
@@ -296,32 +367,99 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Pipeline<E, R> {
     /// Compose child stages inside these stages, preserving declaration/nesting order.
     #[must_use]
     pub fn append(mut self, child: Self) -> Self {
-        self.stages.extend(child.stages);
+        if let Some(child) = child.stages {
+            if let Some(stages) = &mut self.stages {
+                Arc::make_mut(stages).extend(child.iter().cloned());
+            } else {
+                self.stages = Some(child);
+            }
+        }
         self
     }
+    fn stages(&self) -> &[PipelineStage<E, R>] {
+        self.stages.as_deref().map(Vec::as_slice).unwrap_or_default()
+    }
     /// Apply the middleware nesting exactly once around an owned awaited continuation.
-    pub(crate) fn apply(&self, request: Request, terminal: Continuation<E, R>) -> Effect<(), E, R> {
-        let mut next = terminal;
-        for stage in self.stages.iter().rev() {
+    pub(crate) fn apply(
+        &self,
+        inner: &Self,
+        request: Request,
+        reply: Effect<(), E, R>,
+        prepared: Option<Vacancy<PipelineRun<E, R>>>,
+    ) -> Result<Effect<(), E, R>, MemoryError> {
+        let outer = self.stages();
+        let inner_stages = inner.stages();
+        if outer.is_empty() && inner_stages.is_empty() {
+            return Ok(reply);
+        }
+        let stages = outer.iter().chain(inner_stages.iter());
+        if stages.clone().any(|stage| matches!(stage, PipelineStage::Prepared(_))) {
+            let prepared = prepared.ok_or(MemoryError::UnsupportedRunContract)?;
+            let run = prepared.publish(PipelineRun {
+                request,
+                reply,
+                outer: self.clone(),
+                inner: inner.clone(),
+            })
+            .map_err(|_| MemoryError::ConstructionUnbound)?;
+            return Ok(PreparedNext { run, index: 0 }.invoke());
+        }
+        drop(prepared);
+        let mut next: Continuation<E, R> = Arc::new(move || reply.clone());
+        for stage in stages.rev() {
+            let PipelineStage::Ordinary(stage) = stage else {
+                return Err(MemoryError::UnsupportedRunContract);
+            };
             let stage = stage.clone();
             let request = request.clone();
             let inner = next;
             next = Arc::new(move || stage(request.clone(), inner.clone()));
         }
-        next()
+        Ok(next())
     }
 }
 /// Native response-field owner shared by outer wrappers and short circuits.
 #[derive(Clone, Default)]
 pub struct ResponseHeaders(pub Arc<Mutex<http::HeaderMap>>);
 /// A request-local continuation consuming one reply. It grants no authority beyond response ownership.
-pub(crate) struct ReplyContinuation<E: Send + 'static, R: Send + Sync + 'static>(
-    pub(crate) Arc<ReplyConsumer<E, R>>,
-);
+pub(crate) enum ReplyContinuation<E: Send + 'static, R: Send + Sync + 'static> {
+    Ordinary(Arc<ReplyConsumer<E, R>>),
+    Prepared(crate::prepared_request_control::PreparedReplyContinuation<E, R>),
+}
+/// The request may outlive its boundary; this handle must not retain the
+/// callback that itself owns a clone of that request.
+pub(crate) enum WeakReplyContinuation<E: Send + 'static, R: Send + Sync + 'static> {
+    Ordinary(std::sync::Weak<ReplyConsumer<E, R>>),
+    Prepared(crate::prepared_request_control::WeakPreparedReplyContinuation<E, R>),
+}
+impl<E: Send + 'static, R: Send + Sync + 'static> Clone for WeakReplyContinuation<E, R> {
+    fn clone(&self) -> Self { match self { Self::Ordinary(value) => Self::Ordinary(value.clone()), Self::Prepared(value) => Self::Prepared(value.clone()) } }
+}
 impl<E: Send + 'static, R: Send + Sync + 'static> Clone for ReplyContinuation<E, R> {
     /// Share native continuation without copying its reply payload.
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        match self { Self::Ordinary(value) => Self::Ordinary(value.clone()), Self::Prepared(value) => Self::Prepared(value.clone()) }
+    }
+}
+impl<E: Send + 'static, R: Send + Sync + 'static> ReplyContinuation<E, R> {
+    pub(crate) fn downgrade(&self) -> WeakReplyContinuation<E, R> {
+        match self { Self::Ordinary(value) => WeakReplyContinuation::Ordinary(Arc::downgrade(value)), Self::Prepared(value) => WeakReplyContinuation::Prepared(value.downgrade()) }
+    }
+    pub(crate) fn invoke(&self, reply: Reply<E, R>) -> Effect<(), E, R> {
+        match self {
+            Self::Ordinary(value) => value(reply),
+            Self::Prepared(value) => match value.delivery() {
+                Some(delivery) => delivery.invoke(reply),
+                None => native_once(move |_, _| async move {
+                    effect::Exit::Die(effect::Defect::new("response continuation unavailable outside request boundary"))
+                }),
+            },
+        }
+    }
+}
+impl<E: Send + 'static, R: Send + Sync + 'static> WeakReplyContinuation<E, R> {
+    fn upgrade(&self) -> Option<ReplyContinuation<E, R>> {
+        match self { Self::Ordinary(value) => value.upgrade().map(ReplyContinuation::Ordinary), Self::Prepared(value) => value.upgrade().map(ReplyContinuation::Prepared) }
     }
 }
 /// Registration-time metadata remains distinct from an endpoint's per-request execution.
@@ -384,7 +522,7 @@ pub struct RequestCompletion<E> {
 }
 
 /// Deferred endpoint body under the existing request scope.
-type EndpointBody<E, R> = dyn Fn(Scope<E>) -> Effect<Reply<E, R>, E, R> + Send + Sync;
+pub(crate) type EndpointBody<E, R> = dyn Fn(Scope<E>) -> Effect<Reply<E, R>, E, R> + Send + Sync;
 
 /// Typed endpoint failure renderer.
 type ErrorRenderer<E, R> = dyn Fn(E) -> Effect<Reply<E, R>, E, R> + Send + Sync;

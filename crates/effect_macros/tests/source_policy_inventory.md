@@ -97,3 +97,40 @@ makes its member indices visible to the token inventory.
 The service environment adapter preserves the native caller’s explicit environment
 type at the macro boundary. Its `environment` syntax and hygienic selector name
 choose no runtime policy; the callback factory still evaluates once.
+
+## Prepared storage and compiler expansion review
+
+- Core memory, runtime, scope and synchronization literals describe physical
+  record counts, layout and range arithmetic, free-list sentinels, generation
+  checks, and diagnostic text at already-checked ownership boundaries. For
+  example, the cache's five frames per admitted loader cover the driver,
+  completion notice, parallel context and two interpreter frames. The active
+  loader count comes from the caller. Decimal and binary byte-unit factors in
+  memory configuration are exact conversions. The region-name hash uses
+  the FNV-1a offset basis and prime.
+- Cache, resolver, pool, workflow, journal, cluster, persistence and reactivity
+  counts track retained records, retries already represented by an existing
+  attempt, and changes to an existing sequence or revision. Counted diagnostic
+  and snapshot cells are distinct from configured active-work and retention
+  capacities. Format labels name data already selected by a typed outcome.
+- Prepared encoding and schema literals implement existing binary tags, JSON
+  tokens and escaping, bounded traversal positions, decimal arithmetic and
+  checked conversions. The UUID length, separators, and version/variant
+  labels remain the existing protocol. UUID rejection constructs one typed
+  constraint after validation, replacing repeated descriptions. Prepared
+  syntax diagnostics reserve the larger of the input field-name width and the
+  formatted byte offset with its JSON or UTF-8 diagnostic prefix. The
+  application uses this demand instead of a fixed byte floor. Decimal
+  integer telemetry formatting reserves the width of a `u64`, and finite
+  float encoding follows the documented provider format width.
+- Compiler literals name grammar fields, descriptor modes, known Cargo facade
+  identities, erased-representation checks, hygienic generated identifiers and
+  emitted diagnostics. The existing facade owner list moved from `expand.rs`
+  to `extension_support.rs`. Arity, tuple and fixed-size generated layout
+  values select positions or count known storage, while emitted capacities
+  still come from the declared configuration. Application strings name
+  existing sample fields, selected CLI settings and diagnostic output.
+
+The ordinary workflow policy's custom defect for an impossible prepared-memory
+refusal has no matching typed invariant in the current public defect enum.
+That call and its message remain outside this reviewed inventory.

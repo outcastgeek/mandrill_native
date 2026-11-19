@@ -84,8 +84,13 @@ use effect::{
     Semaphore, SemaphoreError, effect, effect_all_concurrent, effect_map, effect_map_error,
     effect_permit, effect_recover, effect_retry, effect_sync, effect_try_sync,
 };
+use effect::memory::MemoryError;
 use effect_server::{Reply, Request, Router, ServerError};
 use http::Method;
+
+mod prepared;
+pub use prepared::{PreparedManagedRouteCapacity, PreparedManagedRouteStorage};
+use prepared::RouteTable;
 
 /// Produces the response for one registered route.
 ///
@@ -589,15 +594,19 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Clone for Options<E, R> {
 /// performed by the same service shares it, so concurrent registration calls cannot
 /// exceed it.
 pub struct Service<E: Send + 'static, R: Send + Sync + 'static> {
-    options: Options<E, R>,
+    options: Arc<Options<E, R>>,
     slots: Arc<Semaphore>,
+    prepared: Option<PreparedRoutes<E, R>>,
 }
+
+type PreparedRoutes<E, R> = (Arc<PreparedManagedRouteStorage<E, R>>, Arc<RouteTable<E, R>>);
 
 impl<E: Send + 'static, R: Send + Sync + 'static> Clone for Service<E, R> {
     fn clone(&self) -> Self {
         Self {
             options: self.options.clone(),
             slots: Arc::clone(&self.slots),
+            prepared: self.prepared.clone(),
         }
     }
 }
@@ -608,14 +617,44 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Service<E, R> {
     pub fn new(options: Options<E, R>) -> Self {
         let capacity = NonZeroUsize::new(DEFAULT_ASYNC_SYNC_SLOTS).unwrap_or(NonZeroUsize::MIN);
         Self {
-            options,
+            options: Arc::new(options),
             slots: Arc::new(Semaphore::full(capacity)),
+            prepared: None,
+        }
+    }
+
+    /// Move configured route descriptions into one admitted startup table.
+    pub fn new_prepared(
+        options: Options<E, R>,
+        storage: Arc<PreparedManagedRouteStorage<E, R>>,
+    ) -> Result<Self, MemoryError> {
+        let Options { access, routes } = options;
+        let table = storage.store(routes)?;
+        let mut service = Self::new(Options { access, routes: Vec::new() });
+        service.prepared = Some((storage, Arc::new(table)));
+        Ok(service)
+    }
+
+    fn routes(&self) -> &[ManagedRoute<E, R>] {
+        match &self.prepared {
+            Some((_, table)) => table.as_slice(),
+            None => &self.options.routes,
         }
     }
 
     /// Reuse this service's synchronization capacity for a newly resolved route set.
-    pub(crate) fn with_routes(&self, routes: Vec<ManagedRoute<E, R>>) -> Self {
-        Self { options: Options { access: self.options.access.clone(), routes }, slots: Arc::clone(&self.slots) }
+    pub(crate) fn with_routes(&self, routes: Vec<ManagedRoute<E, R>>) -> Result<Self, ManagedRouteError> {
+        let (routes, prepared) = if let Some((storage, _)) = &self.prepared {
+            let table = storage.store(routes).map_err(registration_memory)?;
+            (Vec::new(), Some((storage.clone(), Arc::new(table))))
+        } else {
+            (routes, None)
+        };
+        Ok(Self {
+            options: Arc::new(Options { access: self.options.access.clone(), routes }),
+            slots: Arc::clone(&self.slots),
+            prepared,
+        })
     }
 
     /// Admit, protect and mount every configured route in configuration order.
@@ -632,9 +671,16 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Service<E, R> {
         router: Option<Router<E, R>>,
         mounter: Option<&ManagedRouteMounter<E, R>>,
     ) -> Result<RegisteredRoutes<E, R>, ManagedRouteError> {
-        let mut routes = Vec::with_capacity(self.options.routes.len());
+        let mut routes = Vec::new();
         let mut current = router;
-        for route in &self.options.routes {
+        if current.is_some() {
+            if self.prepared.is_some() {
+                routes.try_reserve_exact(self.routes().len()).map_err(|_| registration_memory(MemoryError::CollectionReservationFailed))?;
+            } else {
+                routes.reserve(self.routes().len());
+            }
+        }
+        for route in self.routes() {
             let (next, registration) =
                 register(current.take(), &self.options.access, mounter, route)?;
             if next.is_none() {
@@ -681,22 +727,33 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Service<E, R> {
         X: From<ManagedStartError<E>> + Send + Sync + 'static,
         R: HasClock + HasConsole + HasTaskSpawner + Send + Sync + 'static,
     {
-        let options = self.options.clone();
-        let slots = Arc::clone(&self.slots);
+        let service = self.clone();
         let owner = owner.clone();
         let router = router.clone();
         let mounter = mounter.cloned();
         effect! {
-            let options = options.clone();
-            let slots = Arc::clone(&slots);
+            let service = service.clone();
+            let slots = Arc::clone(&service.slots);
             let owner = owner.clone();
             let router = router.clone();
             let mounter = mounter.clone();
             let mut current = router;
             let mut registrations = Vec::new();
             let mut children: Vec<Effect<(), X, R>> = Vec::new();
-            for route in options.routes {
-                let access = options.access.clone();
+            if current.is_some() && service.prepared.is_some() {
+                let count = service.routes().len();
+                let reserved = registrations.try_reserve_exact(count)
+                    .and_then(|()| children.try_reserve_exact(count))
+                    .map_err(|_| registration_memory(MemoryError::CollectionReservationFailed));
+                effect_try_sync! {
+                    once;
+                    body: move || reserved,
+                    on_error: |error| X::from(ManagedStartError::Registration(error)),
+                }?;
+            }
+            for route in service.routes() {
+                let route = route.clone();
+                let access = service.options.access.clone();
                 let preflight_route = route.clone();
                 let has_router = current.is_some();
                 let sync = effect_try_sync! {
@@ -717,7 +774,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Service<E, R> {
                     let child = owner.fork(sync_child::<E, X, R>(Arc::clone(&slots), sync))?;
                     children.push(child.join::<R>());
                 }
-                let access = options.access.clone();
+                let access = service.options.access.clone();
                 let mounter = mounter.clone();
                 let mount_router = current.take();
                 let (next, registration) = effect_try_sync! {
@@ -1025,17 +1082,12 @@ impl<E: Send + 'static, R: Send + Sync + 'static> AccessControl<E, R> {
                     }
                 },
             }?;
-            let mut required: BTreeSet<String> = BTreeSet::new();
-            if let Some(requirement) = requirement {
-                for permission in requirement.required_permissions {
-                    if permission.id.trim().is_empty() {
-                        continue;
-                    }
-                    required.insert(permission.id);
-                }
-            }
             for permission in resolved {
-                if required.contains(permission.id.as_str()) {
+                if requirement.as_ref().is_some_and(|requirement| {
+                    requirement.required_permissions.iter().any(|existing| {
+                        !existing.id.trim().is_empty() && existing.id == permission.id
+                    })
+                }) {
                     continue;
                 }
                 let add_permission_name = permission.name.clone();
@@ -1130,6 +1182,10 @@ pub enum ManagedRouteError {
     MissingMounter,
     /// The consumer's server refused the mounted route.
     Server(ServerError),
+}
+
+fn registration_memory(error: MemoryError) -> ManagedRouteError {
+    ManagedRouteError::Server(ServerError::Memory(error))
 }
 
 impl fmt::Display for ManagedRouteError {

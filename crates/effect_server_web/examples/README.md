@@ -19,10 +19,10 @@ For a second ownership fixture, username **lee** uses the same demo password and
 
 ## Build and start
 
-Run from the workspace root (the directory containing the root `Cargo.toml`) with Rust 1.99.0 installed. `cargo run` also builds. Package: `effect-server-web`; required features: `identity,otel,sqlx-turso`; no positional arguments. Python 3 creates fresh native XML keys and a JSON translation catalog. Use a free port and keep `CAFE_ORIGIN` consistent with `CAFE_LISTEN`.
+Run from the workspace root (the directory containing the root `Cargo.toml`) with Rust 1.100.0 installed. `cargo run` also builds. Package: `effect-server-web`; required features: `identity,otel,sqlx-turso`; no positional arguments. Python 3 creates fresh native XML keys and a JSON translation catalog. Use a free port and keep `CAFE_ORIGIN` consistent with `CAFE_LISTEN`.
 
 ```sh
-cargo +1.99.0 build --locked -p effect-server-web --features identity,otel,sqlx-turso --example cafe_application
+cargo +1.100.0 build --locked -p effect-server-web --features identity,otel,sqlx-turso --example cafe_application
 web_dir=$(mktemp -d "${TMPDIR:-/tmp}/effect-web.XXXXXX")
 python3 - "$web_dir" <<'PYSETUP'
 import base64
@@ -66,6 +66,7 @@ CAFE_COOKIE_SECURE=false \
 CAFE_CULTURE=en-US \
 CAFE_CATALOG="$web_dir/en-US.json" \
 CAFE_WORKERS=2 \
+CAFE_MEMORY_BYTES=536870912 \
 CAFE_CAPACITY=32 \
 CAFE_BYTES=8192 \
 CAFE_DEPTH=8 \
@@ -74,10 +75,88 @@ CAFE_WINDOW_SECONDS=5 \
 CAFE_SESSION_SECONDS=1800 \
 CAFE_RECENT_SECONDS=300 \
 CAFE_RETRY_SECONDS=1 \
-cargo +1.99.0 run --locked -p effect-server-web --features identity,otel,sqlx-turso --example cafe_application
+cargo +1.100.0 run --locked -p effect-server-web --features identity,otel,sqlx-turso --example cafe_application
 ```
 
 The setup creates a fresh directory, random 64-byte native master key with a UUID and valid dates, English pickup catalog, and database filename. Startup seeds the native accounts and owner-bound ready orders only if absent. The HTML pages use English labels; the pickup announcement uses the selected catalog’s `orders.ready` template with its typed `customer` argument. Editing that template is observable on a ready customer’s next pickup-page load after the five-second catalog reload interval. It does not change the public menu or reset a collected order.
+
+The command provisions a single 512 MiB managed region and selects immediate overload refusal. Add `CAFE_QUEUE_CAPACITY=32` to the same command to also allow up to 32 parsed heads to wait for one of the 32 active request places. The queue reserves its FIFO and wake records at startup from the same arena, and the host allows 32 additional connections in that mode. A waiting head holds no Effectful request-body, decode or response buffer. A full queue or wait expiry uses the existing static HTTP 503 response while the connection remains open. The optional queue wait uses half the configured window, leaving time for the reply before the HTTP idle deadline. Earlier connection exhaustion can leave the socket unaccepted. Hyper and the network can retain native input independently.
+
+## Linux configuration for a 2 GB host
+
+This worked starting profile uses a **2,000,000,000-byte host budget** and keeps the same **536,870,912-byte (512 MiB) Effectful arena** as the launch above. The systemd unit uses Linux cgroup v2. Its high threshold starts reclaim and throttling. The maximum is the final containment boundary and can cause a cgroup OOM kill. The café's request limits, deadlines and static 503 response are the application-level overload controls. The numbers below are provisional configuration values. Measure the envelope on the target host before relying on them. [systemd memory controls](https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html#Memory%20Accounting%20and%20Control) · [Linux memory controller](https://docs.kernel.org/admin-guide/cgroup-v2.html#memory-interface-files)
+
+| Budget component | Bytes | Accounting boundary |
+| --- | ---: | --- |
+| Effectful arena | 536,870,912 | One managed reservation, including region overhead and unused space. |
+| Native service allowance | 805,306,368 | Non-region memory and service margin below the high threshold. |
+| Service surge allowance | 268,435,456 | Difference between the high threshold and the maximum. |
+| Outside-service host reserve | 389,387,264 | Kernel and system services outside the unit, including any separate proxy. |
+| **Host budget** | **2,000,000,000** | Recalculate the split if the machine’s usable `MemTotal` is smaller. |
+
+Use the existing café executable as `/opt/effectful/bin/cafe_application` under the dedicated `effectful-cafe` service account. Give that account access to the catalogue and key files created in the local setup, and let it own the database directory. This fixture listens on loopback with the same local HTTP settings as the command above. If you add a TLS proxy, include its memory in the host worksheet.
+
+`/etc/systemd/system/effectful-cafe.service`:
+
+```ini
+[Unit]
+Description=Effectful café example
+
+[Service]
+Type=exec
+User=effectful-cafe
+StateDirectory=effectful-cafe
+EnvironmentFile=/etc/effectful/cafe.env
+ExecStart=/opt/effectful/bin/cafe_application
+MemoryAccounting=yes
+MemoryHigh=1342177280
+MemoryMax=1610612736
+MemorySwapMax=0
+KillSignal=SIGINT
+TimeoutStopSec=30s
+```
+
+`SIGINT` reaches the café's existing Ctrl-C handler so it can drain request and provider work. The service stop deadline is the outer process limit. The unit starts the executable directly, keeping Cargo and compilation outside service accounting. [systemd execution settings](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html) · [systemd stop signals](https://www.freedesktop.org/software/systemd/man/latest/systemd.kill.html)
+
+`/etc/effectful/cafe.env`:
+
+```ini
+CAFE_LISTEN=127.0.0.1:8082
+CAFE_DATABASE=/var/lib/effectful-cafe/cafe.db
+CAFE_KEY_RING=/var/lib/effectful-cafe/keys.xml
+CAFE_ORIGIN=http://127.0.0.1:8082
+CAFE_COOKIE=Cafe.Customer
+CAFE_COOKIE_SECURE=false
+CAFE_CULTURE=en-US
+CAFE_CATALOG=/var/lib/effectful-cafe/en-US.json
+CAFE_WORKERS=2
+CAFE_MEMORY_BYTES=536870912
+CAFE_CAPACITY=32
+CAFE_BYTES=8192
+CAFE_DEPTH=8
+CAFE_HASH_ITERATIONS=100000
+CAFE_WINDOW_SECONDS=5
+CAFE_SESSION_SECONDS=1800
+CAFE_RECENT_SECONDS=300
+CAFE_RETRY_SECONDS=1
+```
+
+The environment file selects immediate refusal. Set `CAFE_QUEUE_CAPACITY=32` to use the bounded queue variant. That variant keeps the arena total and increases the admitted connection count, so include its native costs in the worksheet when qualifying it.
+
+### Non-region memory worksheet
+
+Record startup, steady load, overload and drained peaks for the chosen profile. Use aggregate cgroup charge to check the service envelope. Use the component figures to explain that total, since RSS/PSS, mapped files and cgroup counters overlap.
+
+| Domain | Evidence to record |
+| --- | --- |
+| Managed arena | Plan total, committed/resident arena memory where observable, and region used/backing high-water marks. |
+| Native heap and allocator | Reservations and committed/resident usage, including allocator retention, Tokio, Hyper, Identity, OTel/export and any in-unit TLS. |
+| Threads | Reactor, worker and blocking thread counts, stack reservations and resident stack pages. |
+| Database and executable | SQL pager, connection and mapped database memory where present, charged file cache, and executable/shared-library mappings. |
+| Kernel and network | In-unit socket buffers, page tables, kernel stacks and slab. Record outside-unit network costs and other services against the host reserve. |
+| Process, service and host totals | Process RSS/PSS from `/proc/<pid>/smaps_rollup`; unit `memory.current`, `memory.peak` where available, `memory.stat`, `memory.events` and `memory.swap.current`; host `MemTotal` and `MemAvailable`. |
+
+For a total-service target, pick an arena size that satisfies **arena reservation + measured peak non-region charge + service margin ≤ effective high threshold** and still fits the application's checked region plan. Use measurements from the same workload and profile, and account for any lower parent-cgroup limit. Keep the hard maximum plus the independently measured outside-service reserve within usable host memory. Validate graceful refusal and recovery by observing the application's overload replies, cleanup progress and memory plateau alongside cgroup events. Treat OOM events as a failed overload qualification. Measurements and load qualification are separate from this configuration. [Linux accounting fields](https://docs.kernel.org/admin-guide/cgroup-v2.html#memory-interface-files) · [Process memory accounting](https://docs.kernel.org/filesystems/proc.html)
 
 ## Native request flow and curl verification
 
@@ -112,7 +191,7 @@ Successful login returns HTTP 200 with `Signed in. Your pickup order is ready to
 
 ## Configuration reference
 
-Every environment input is required by [the host wiring](cafe_host/mod.rs):
+[The host wiring](cafe_host/mod.rs) reads these environment inputs.
 
 | Variable | Meaning |
 | --- | --- |
@@ -127,12 +206,32 @@ Every environment input is required by [the host wiring](cafe_host/mod.rs):
 | `CAFE_WORKERS` | Positive native Tokio worker-thread count. |
 | `CAFE_CAPACITY` | Positive count bound for admission, cache entries/loaders, catalog keys, probes and telemetry capacities. |
 | `CAFE_BYTES` | Positive byte bound for finite resources, key file, body chunks, catalog keys/values/messages and cached responses. |
+| `CAFE_MEMORY_BYTES` | Optional total for the shared Effectful arena, in bytes. Use `536870912` for 512 MiB. When omitted, the host uses the checked sum of the configured regions. Startup refuses a total smaller than the region requests. |
+| `CAFE_QUEUE_CAPACITY` | Optional positive number of waiting request heads. Omit it for immediate refusal. |
 | `CAFE_DEPTH` | Positive catalog nesting-depth bound. |
 | `CAFE_HASH_ITERATIONS` | Native password-hash iteration count. |
-| `CAFE_WINDOW_SECONDS` | Positive seconds for cache retention, catalog reload, probe deadlines and request/provider drain. |
+| `CAFE_WINDOW_SECONDS` | Positive seconds for cache retention, catalog reload, probe deadlines, first HTTP head, HTTP/1 header read, HTTP network idle and request/provider drain. The optional queue wait uses half the window. |
 | `CAFE_SESSION_SECONDS` | Positive cookie/ticket and verified-self grant lifetime in seconds; `1800` gives 30 minutes for the browser workflow. |
 | `CAFE_RECENT_SECONDS` | Recent-authentication grant lifetime in seconds. |
 | `CAFE_RETRY_SECONDS` | Positive Retry-After guidance in whole seconds. |
+
+The arena covers the café's prepared origin and dependency caches, finite output cache and retained response backing, availability report workspace, catalogue generation slots, host request and connection controls, Identity and telemetry admission controls, Identity diagnostic carriers, and the SQL session, cleanup and row backing used by the readiness and pickup reads. The optional FIFO is charged only when selected. Native runtime, HTTP parser storage, database connections, Identity providers, telemetry SDK and application callback allocations retain their own ownership domains.
+
+## Local load and refusal reproduction
+
+Build the café, then run the Rust loopback driver from the CMS fixture crate. It uses the existing Hyper HTTP/1 client, starts a fresh café with a 512 MiB arena, and records native login and collection, retained-request refusal, steady and overload traffic, recovery, and SIGINT drain.
+
+```sh
+cargo build --locked -p effect-server-web --features identity,otel,sqlx-turso --example cafe_application
+cargo run --locked -p effect_cms --example cafe_load -- target/debug/examples/cafe_application /tmp/cafe-immediate-evidence
+cargo run --locked -p effect_cms --example cafe_load -- target/debug/examples/cafe_application /tmp/cafe-queued-evidence --queued
+```
+
+Each run needs a fresh evidence directory and a free loopback port. Use `--port N` to select another port and `--seconds N` to set the duration of each load phase. The driver writes the service log and raw process samples to that directory. On Linux, `--linux-service-limits` runs the café in a transient user scope with the same high, max and swap values as the deployment unit. The load driver stays outside that scope. The Linux report includes the process's actual cgroup readings. Record the host's own memory envelope separately when qualifying the complete 2 GB deployment.
+
+The driver counts a stalled request only after Hyper reports HTTP 100 Continue, which confirms the handler started reading its body. The normal saturated shutdown exercise releases these clients 100 ms after SIGINT. Use `--drain-probe saturated-release` to run that shutdown alone. Use `--drain-probe keep-open` to hold one admitted body until the five-second deadline and record the typed cleanup failure, or `--drain-probe release` to release one client before the deadline.
+
+The public menu caches anonymous finite replies. Requests with authentication or cookies bypass that cache and use the same renderer limit. The host budgets separate output slots for retained menu replies and live requests. The welcome and pickup pages render into an admitted output slot, and stock overload and error replies have reusable static backing.
 
 The [application](cafe_application.rs) composes existing Web caches, localization, security and observability. [Native host wiring](cafe_host/mod.rs) supplies the owned services; [customer routes](cafe_host/customer_routes.rs) bind existing Identity workflows; [pickup data/workflow](pickup/mod.rs) uses typed owner-bound SQL and a single atomic state change. The support directories are not separate runnable targets. No external telemetry collector is required. See [all example guides](../../effect/examples/README.md#support-modules-and-extension-examples).
 

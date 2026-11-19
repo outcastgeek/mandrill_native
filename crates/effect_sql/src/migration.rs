@@ -7,7 +7,7 @@
 use crate::effect_future;
 use crate::{Identifier, MigrationPhase, SqlError, SqlKernel};
 use effect::{Defect, Effect, Exit};
-use futures_util::FutureExt;
+use futures_util::{FutureExt, TryStreamExt};
 use sqlx::{AssertSqlSafe, Row, SqlSafeStr, TursoConnection};
 use std::{borrow::Cow, sync::Arc, time::Instant};
 
@@ -61,19 +61,62 @@ impl MigrationStep {
 #[derive(Clone)]
 #[must_use]
 pub struct MigrationCatalog {
-    /// Stable journal name from the SQLx schema owner, never source-position generated.
-    journal: String,
-    /// Quoted provider journal syntax.
-    quoted: String,
+    /// Immutable journal identity and SQL shared across operations.
+    journal: Arc<MigrationJournal>,
     /// Static metadata shared without copying execution payloads.
     steps: Arc<[MigrationStep]>,
 }
+
+struct MigrationJournal {
+    name: String,
+    bootstrap: String,
+    history: Arc<str>,
+    clean_history: Arc<str>,
+    native_dirty: Arc<str>,
+    dirty_marker: Arc<str>,
+    mark_dirty: Arc<str>,
+    clear_dirty: Arc<str>,
+    insert_history: Arc<str>,
+    delete_history: Arc<str>,
+}
+
+impl MigrationJournal {
+    fn new(name: String, quoted: &str) -> Self {
+        Self {
+            name,
+            bootstrap: format!(
+                "CREATE TABLE IF NOT EXISTS {quoted} (version BIGINT PRIMARY KEY, \
+                 description TEXT NOT NULL, installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+                 success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL); \
+                 CREATE TABLE IF NOT EXISTS {DIRTY_METADATA} (journal TEXT PRIMARY KEY, version BIGINT NOT NULL, \
+                 direction TEXT NOT NULL CHECK(direction IN ('up','down')), checksum BLOB NOT NULL);"
+            ),
+            history: format!("SELECT version,checksum,success FROM {quoted} ORDER BY version").into(),
+            clean_history: format!("SELECT version,checksum,success FROM {quoted} WHERE success=TRUE ORDER BY version").into(),
+            native_dirty: format!("SELECT version,checksum FROM {quoted} WHERE success=FALSE ORDER BY version").into(),
+            dirty_marker: format!("SELECT version,direction,checksum FROM {DIRTY_METADATA} WHERE journal=?").into(),
+            mark_dirty: format!("INSERT INTO {DIRTY_METADATA}(journal,version,direction,checksum) VALUES (?,?,?,?)").into(),
+            clear_dirty: format!("DELETE FROM {DIRTY_METADATA} WHERE journal=?").into(),
+            insert_history: format!(
+                "INSERT INTO {quoted}(version,description,success,checksum,execution_time) VALUES (?,?,TRUE,?,?) \
+                 ON CONFLICT(version) DO UPDATE SET success=TRUE,execution_time=excluded.execution_time \
+                 WHERE checksum=excluded.checksum AND success=FALSE"
+            ).into(),
+            delete_history: format!("DELETE FROM {quoted} WHERE version=?").into(),
+        }
+    }
+}
+
 impl MigrationCatalog {
     /// Validate strict ordering, unique IDs, checksums and explicit reversible version agreement.
     /// Use the existing journal for a schema; a custom journal must be an explicit schema contract.
+    #[expect(
+        clippy::result_large_err,
+        reason = "retains the owned SQL error representation without an extra heap allocation"
+    )]
     pub fn new(journal: impl Into<String>, steps: Vec<MigrationStep>) -> Result<Self, SqlError> {
         let journal = journal.into();
-        let quoted = Identifier::new(&journal)?.quoted().to_owned();
+        let quoted = Identifier::new(&journal)?;
         let mut previous = None;
         for step in &steps {
             if previous.is_some_and(|version| version >= step.up.version)
@@ -121,15 +164,14 @@ impl MigrationCatalog {
             previous = Some(step.up.version);
         }
         Ok(Self {
-            journal,
-            quoted,
+            journal: Arc::new(MigrationJournal::new(journal, quoted.quoted())),
             steps: steps.into(),
         })
     }
     /// Borrow the exact SQLx journal selected for this schema.
     #[must_use]
     pub fn journal(&self) -> &str {
-        &self.journal
+        &self.journal.name
     }
     /// Borrow immutable native metadata for static checked/provider interoperation.
     #[must_use]
@@ -138,21 +180,13 @@ impl MigrationCatalog {
     }
 }
 
-/// Captured acknowledged SQLx history; only the migrator constructs its down plan.
-#[derive(Clone, PartialEq, Eq)]
-struct HistoryEntry {
-    /// Stable native SQLx version.
-    version: i64,
-    /// SQLx-native immutable checksum.
-    checksum: Vec<u8>,
-}
 /// Opaque preflighted down plan, fenced to both its catalog and exact captured history.
 #[must_use]
 pub struct DownPlan {
     /// Catalog used to establish reversibility.
     catalog: MigrationCatalog,
-    /// Full history snapshot rechecked under database write authority.
-    history: Vec<HistoryEntry>,
+    /// Length of the exact validated catalog prefix, rechecked under write authority.
+    applied: usize,
     /// Number of reversible tail entries selected by the caller.
     count: usize,
     /// Private selected database configuration; an identical history in another database grants no authority.
@@ -167,11 +201,13 @@ impl DownPlan {
     /// Stable versions in actual rollback order, without exposing construction authority.
     #[must_use = "the returned iterator describes rollback order and performs no schema work"]
     pub fn versions(&self) -> impl Iterator<Item = i64> + '_ {
-        self.history
+        self.catalog
+            .steps
             .iter()
+            .take(self.applied)
             .rev()
             .take(self.count)
-            .map(|entry| entry.version)
+            .map(|step| step.up.version)
     }
 }
 /// Direction of an unresolved step; protocol metadata is stable across process restarts.
@@ -253,6 +289,10 @@ pub struct SqlMigrator {
 }
 impl SqlMigrator {
     /// Select authoritative migration configuration without opening a connection.
+    #[expect(
+        clippy::result_large_err,
+        reason = "retains the owned SQL error representation without an extra heap allocation"
+    )]
     pub fn new(kernel: SqlKernel, catalog: MigrationCatalog) -> Result<Self, SqlError> {
         kernel.require_authoritative()?;
         Ok(Self {
@@ -268,6 +308,10 @@ impl SqlMigrator {
     }
     /// Ensure compatible SQLx journal/metadata under database write authority.
     /// Native Identity startup calls this directly without invoking Effect.
+    #[expect(
+        clippy::result_large_err,
+        reason = "retains the owned SQL error representation without an extra heap allocation"
+    )]
     pub async fn initialize(&self) -> Result<(), SqlError> {
         let catalog = self.catalog.clone();
         self.kernel
@@ -278,27 +322,48 @@ impl SqlMigrator {
             .map_err(annotate_terminal)
     }
     /// Preflight unapplied versions under a consistent authoritative history snapshot.
+    #[expect(
+        clippy::result_large_err,
+        reason = "retains the owned SQL error representation without an extra heap allocation"
+    )]
     pub async fn plan_up(&self) -> Result<Vec<i64>, SqlError> {
+        self.with_applied_prefix(|catalog, applied| {
+            let mut pending = Vec::new();
+            pending.try_reserve_exact(catalog.steps.len() - applied).map_err(|_| {
+                SqlError::Memory(effect::memory::MemoryError::CollectionReservationFailed)
+            })?;
+            pending.extend(catalog.steps.iter().skip(applied).map(|step| step.up.version));
+            Ok(pending)
+        })
+        .await
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "retains the owned SQL error representation without an extra heap allocation"
+    )]
+    async fn with_applied_prefix<A: Send + 'static>(
+        &self,
+        project: impl FnOnce(&MigrationCatalog, usize) -> Result<A, SqlError> + Send + 'static,
+    ) -> Result<A, SqlError> {
         let catalog = self.catalog.clone();
         self.kernel
             .transaction(move |connection| {
                 Box::pin(async move {
                     ensure(connection, &catalog).await?;
                     reject_dirty(connection, &catalog).await?;
-                    let history = history(connection, &catalog).await?;
-                    validate_history(&catalog, &history)?;
-                    Ok(catalog
-                        .steps
-                        .iter()
-                        .skip(history.len())
-                        .map(|step| step.up.version)
-                        .collect())
+                    let applied = history(connection, &catalog).await?;
+                    project(&catalog, applied)
                 })
             })
             .await
             .map_err(annotate_terminal)
     }
     /// Capture exactly count reversible applied tail steps without changing user schema.
+    #[expect(
+        clippy::result_large_err,
+        reason = "retains the owned SQL error representation without an extra heap allocation"
+    )]
     pub async fn plan_down(&self, count: usize) -> Result<DownPlan, SqlError> {
         let catalog = self.catalog.clone();
         let kernel = self.kernel.clone();
@@ -307,16 +372,15 @@ impl SqlMigrator {
                 Box::pin(async move {
                     ensure(connection, &catalog).await?;
                     reject_dirty(connection, &catalog).await?;
-                    let history = history(connection, &catalog).await?;
-                    validate_history(&catalog, &history)?;
-                    if count > history.len() {
+                    let applied = history(connection, &catalog).await?;
+                    if count > applied {
                         return Err(migration_failure(
                             MigrationPhase::History,
                             None,
                             SqlError::Configuration("down count exceeds applied history".into()),
                         ));
                     }
-                    for step in catalog.steps.iter().take(history.len()).rev().take(count) {
+                    for step in catalog.steps.iter().take(applied).rev().take(count) {
                         if matches!(step.rollback, Rollback::Irreversible) {
                             return Err(migration_failure(
                                 MigrationPhase::Validate,
@@ -329,7 +393,7 @@ impl SqlMigrator {
                     }
                     Ok(DownPlan {
                         catalog,
-                        history,
+                        applied,
                         count,
                         kernel,
                     })
@@ -340,6 +404,10 @@ impl SqlMigrator {
     }
     /// Apply all pending transactional steps atomically, revalidating history under BEGIN IMMEDIATE.
     /// Nontransactional steps use a durable dirty marker and the selected maintenance owner.
+    #[expect(
+        clippy::result_large_err,
+        reason = "retains the owned SQL error representation without an extra heap allocation"
+    )]
     pub async fn up(&self) -> Result<usize, SqlError> {
         if self.catalog.steps.iter().any(|step| step.up.no_tx) {
             return self.up_with_maintenance().await;
@@ -351,18 +419,21 @@ impl SqlMigrator {
                     ensure(connection, &catalog).await?;
                     reject_dirty(connection, &catalog).await?;
                     let applied = history(connection, &catalog).await?;
-                    validate_history(&catalog, &applied)?;
-                    for step in catalog.steps.iter().skip(applied.len()) {
+                    for step in catalog.steps.iter().skip(applied) {
                         apply_transactional(connection, &catalog, step, MigrationDirection::Up)
                             .await?;
                     }
-                    Ok(catalog.steps.len() - applied.len())
+                    Ok(catalog.steps.len() - applied)
                 })
             })
             .await
             .map_err(annotate_terminal)
     }
     /// Apply only an opaque preflighted plan after exact locked history/catalog revalidation.
+    #[expect(
+        clippy::result_large_err,
+        reason = "retains the owned SQL error representation without an extra heap allocation"
+    )]
     pub async fn down(&self, plan: DownPlan) -> Result<usize, SqlError> {
         if !self.kernel.same_configuration(&plan.kernel)
             || !same_catalog(&self.catalog, &plan.catalog)
@@ -377,7 +448,7 @@ impl SqlMigrator {
             .catalog
             .steps
             .iter()
-            .take(plan.history.len())
+            .take(plan.applied)
             .rev()
             .take(plan.count)
             .any(|step| matches!(&step.rollback, Rollback::Reversible(down) if down.no_tx))
@@ -390,15 +461,14 @@ impl SqlMigrator {
                     ensure(connection, &plan.catalog).await?;
                     reject_dirty(connection, &plan.catalog).await?;
                     let current = history(connection, &plan.catalog).await?;
-                    validate_history(&plan.catalog, &current)?;
-                    if current != plan.history {
+                    if current != plan.applied {
                         return Err(stale_plan());
                     }
                     for step in plan
                         .catalog
                         .steps
                         .iter()
-                        .take(current.len())
+                        .take(current)
                         .rev()
                         .take(plan.count)
                     {
@@ -417,6 +487,10 @@ impl SqlMigrator {
             .map_err(annotate_terminal)
     }
     /// Inspect dirty schema state without guessing whether a migration program took effect.
+    #[expect(
+        clippy::result_large_err,
+        reason = "retains the owned SQL error representation without an extra heap allocation"
+    )]
     pub async fn inspect_dirty(&self) -> Result<Option<DirtyMigration>, SqlError> {
         let catalog = self.catalog.clone();
         self.kernel
@@ -431,6 +505,10 @@ impl SqlMigrator {
     }
     /// Assess actual schema under database write authority, then reconcile the same SQLx history.
     /// The callback has a lifetime-bound native connection, not another ambient SQL environment.
+    #[expect(
+        clippy::result_large_err,
+        reason = "retains the owned SQL error representation without an extra heap allocation"
+    )]
     pub async fn recover<F>(&self, assess: F) -> Result<(), SqlError>
     where
         F: for<'a> FnOnce(
@@ -454,13 +532,12 @@ impl SqlMigrator {
                     })?;
                     adopt_native_dirty(connection, &catalog, &dirty).await?;
                     let current = recovery_history(connection, &catalog).await?;
-                    validate_history(&catalog, &current)?;
                     let index = catalog
                         .steps
                         .iter()
                         .position(|step| step.up.version == dirty.version)
                         .ok_or_else(stale_plan)?;
-                    if current.len() != index && current.len() != index + 1 {
+                    if current != index && current != index + 1 {
                         return Err(migration_failure(
                             MigrationPhase::Recovery,
                             Some(dirty.version),
@@ -474,7 +551,7 @@ impl SqlMigrator {
                         (MigrationDirection::Up, RecoveryDecision::StepApplied)
                             | (MigrationDirection::Down, RecoveryDecision::StepNotApplied)
                     );
-                    if journaled && current.len() == index {
+                    if journaled && current == index {
                         insert_history(
                             connection,
                             &catalog,
@@ -635,13 +712,12 @@ impl SqlMigrator {
                                     dirty(connection, &catalog).await?.ok_or_else(stale_plan)?;
                                 adopt_native_dirty(connection, &catalog, &dirty).await?;
                                 let current = recovery_history(connection, &catalog).await?;
-                                validate_history(&catalog, &current)?;
                                 let index = catalog
                                     .steps
                                     .iter()
                                     .position(|step| step.up.version == dirty.version)
                                     .ok_or_else(stale_plan)?;
-                                if current.len() != index && current.len() != index + 1 {
+                                if current != index && current != index + 1 {
                                     return Err(stale_plan());
                                 }
                                 Ok(dirty)
@@ -690,6 +766,10 @@ impl SqlMigrator {
         }, }
     }
     /// Acquire external maintenance once and retain it across nontransactional schema execution.
+    #[expect(
+        clippy::result_large_err,
+        reason = "retains the owned SQL error representation without an extra heap allocation"
+    )]
     async fn up_with_maintenance(&self) -> Result<usize, SqlError> {
         let provider = self
             .maintenance
@@ -697,25 +777,23 @@ impl SqlMigrator {
             .ok_or(SqlError::MaintenanceRequired)?;
         let guard = provider.acquire(self.kernel.clone()).await?;
         let result = std::panic::AssertUnwindSafe(async {
-            let pending = self.plan_up().await?;
-            let count = pending.len();
-            for version in pending {
-                let step = self
-                    .catalog
-                    .steps
-                    .iter()
-                    .find(|step| step.up.version == version)
-                    .ok_or_else(stale_plan)?;
+            let applied = self.with_applied_prefix(|_, applied| Ok(applied)).await?;
+            let pending = self.catalog.steps.get(applied..).ok_or_else(stale_plan)?;
+            for step in pending {
                 self.apply_maintained(step, MigrationDirection::Up, None)
                     .await?;
             }
-            Ok(count)
+            Ok(pending.len())
         })
         .catch_unwind()
         .await;
         join_native_cleanup(caught_native(result), release_maintenance(guard).await)
     }
     /// Keep the same explicit maintenance guard through exact down-plan revalidation and all steps.
+    #[expect(
+        clippy::result_large_err,
+        reason = "retains the owned SQL error representation without an extra heap allocation"
+    )]
     async fn down_with_maintenance(&self, plan: DownPlan) -> Result<usize, SqlError> {
         let provider = self
             .maintenance
@@ -723,18 +801,18 @@ impl SqlMigrator {
             .ok_or(SqlError::MaintenanceRequired)?;
         let guard = provider.acquire(self.kernel.clone()).await?;
         let result = std::panic::AssertUnwindSafe(async {
-            let mut expected = plan.history;
+            let mut expected = plan.applied;
             for step in plan
                 .catalog
                 .steps
                 .iter()
-                .take(expected.len())
+                .take(expected)
                 .rev()
                 .take(plan.count)
             {
-                self.apply_maintained(step, MigrationDirection::Down, Some(expected.clone()))
+                self.apply_maintained(step, MigrationDirection::Down, Some(expected))
                     .await?;
-                let _closed_version = expected.pop();
+                expected -= 1;
             }
             Ok(plan.count)
         })
@@ -743,11 +821,15 @@ impl SqlMigrator {
         join_native_cleanup(caught_native(result), release_maintenance(guard).await)
     }
     /// Persist dirty state before nontransactional I/O, or keep transactional steps inside one lock.
+    #[expect(
+        clippy::result_large_err,
+        reason = "retains the owned SQL error representation without an extra heap allocation"
+    )]
     async fn apply_maintained(
         &self,
         step: &MigrationStep,
         direction: MigrationDirection,
-        expected: Option<Vec<HistoryEntry>>,
+        expected: Option<usize>,
     ) -> Result<(), SqlError> {
         let native = match direction {
             MigrationDirection::Up => &step.up,
@@ -768,11 +850,10 @@ impl SqlMigrator {
                         ensure(connection, &catalog).await?;
                         reject_dirty(connection, &catalog).await?;
                         let current = history(connection, &catalog).await?;
-                        validate_history(&catalog, &current)?;
                         if expected.is_some_and(|expected| expected != current) {
                             return Err(stale_plan());
                         }
-                        validate_boundary(&catalog, &current, step.up.version, direction)?;
+                        validate_boundary(&catalog, current, step.up.version, direction)?;
                         apply_transactional(connection, &catalog, &step, direction).await
                     })
                 })
@@ -787,13 +868,12 @@ impl SqlMigrator {
                     ensure(connection, &prepare_catalog).await?;
                     reject_dirty(connection, &prepare_catalog).await?;
                     let current = history(connection, &prepare_catalog).await?;
-                    validate_history(&prepare_catalog, &current)?;
                     if expected.is_some_and(|expected| expected != current) {
                         return Err(stale_plan());
                     }
                     validate_boundary(
                         &prepare_catalog,
-                        &current,
+                        current,
                         prepare_step.up.version,
                         direction,
                     )?;
@@ -834,68 +914,119 @@ impl SqlMigrator {
 }
 
 /// Bootstrap SQLx-compatible history and only the versioned dirty extension metadata.
+#[expect(
+    clippy::result_large_err,
+    reason = "retains the owned SQL error representation without an extra heap allocation"
+)]
 async fn ensure(
     connection: &mut TursoConnection,
     catalog: &MigrationCatalog,
 ) -> Result<(), SqlError> {
-    connection.native_execute_batch(format!("CREATE TABLE IF NOT EXISTS {} (version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL); CREATE TABLE IF NOT EXISTS {DIRTY_METADATA} (journal TEXT PRIMARY KEY, version BIGINT NOT NULL, direction TEXT NOT NULL CHECK(direction IN ('up','down')), checksum BLOB NOT NULL);", catalog.quoted)).await.map_err(|error| migration_failure(MigrationPhase::History, None, error.into()))?;
+    connection
+        .native_execute_batch(&catalog.journal.bootstrap)
+        .await
+        .map_err(|error| migration_failure(MigrationPhase::History, None, error.into()))?;
     Ok(())
 }
-/// Read acknowledged SQLx history, rejecting native SQLx dirty rows rather than treating them applied.
+/// Validate the exact applied catalog prefix while retaining one fetched row.
+#[expect(
+    clippy::result_large_err,
+    reason = "retains the owned SQL error representation without an extra heap allocation"
+)]
 async fn history(
     connection: &mut TursoConnection,
     catalog: &MigrationCatalog,
-) -> Result<Vec<HistoryEntry>, SqlError> {
-    let rows = sqlx::query(AssertSqlSafe(format!(
-        "SELECT version,checksum,success FROM {} ORDER BY version",
-        catalog.quoted
-    )))
-    .fetch_all(connection)
-    .await
-    .map_err(|error| migration_failure(MigrationPhase::History, None, error.into()))?;
-    rows.into_iter()
-        .map(|row| {
-            let version: i64 = row.try_get("version")?;
-            if !row.try_get::<bool, _>("success")? {
-                return Err(migration_failure(
-                    MigrationPhase::Recovery,
-                    Some(version),
-                    SqlError::Configuration("SQLx dirty migration requires assessment".into()),
-                ));
-            }
-            Ok(HistoryEntry {
-                version,
-                checksum: row.try_get("checksum")?,
-            })
-        })
-        .collect()
+) -> Result<usize, SqlError> {
+    read_history(connection, catalog, true).await
 }
-/// Enforce exact catalog-prefix history rather than ignoring missing or modified migrations.
-fn validate_history(catalog: &MigrationCatalog, current: &[HistoryEntry]) -> Result<(), SqlError> {
-    if current.len() > catalog.steps.len() {
-        return Err(stale_plan());
-    }
-    for (step, current) in catalog.steps.iter().zip(current) {
-        if step.up.version != current.version || step.up.checksum.as_ref() != current.checksum {
-            return Err(migration_failure(
-                MigrationPhase::History,
-                Some(current.version),
-                SqlError::Configuration("migration history/checksum mismatch".into()),
-            ));
+
+#[expect(
+    clippy::result_large_err,
+    reason = "retains the owned SQL error representation without an extra heap allocation"
+)]
+async fn read_history(
+    connection: &mut TursoConnection,
+    catalog: &MigrationCatalog,
+    include_dirty: bool,
+) -> Result<usize, SqlError> {
+    let sql = if include_dirty {
+        &catalog.journal.history
+    } else {
+        &catalog.journal.clean_history
+    };
+    let mut rows = sqlx::query(AssertSqlSafe(sql.clone())).fetch(connection);
+    let mut applied = 0usize;
+    let mut invalid = None;
+    let mut mismatch = None;
+    // Continue fetching after a row error so provider failures remain primary.
+    // Overlength history still takes precedence over a checksum mismatch.
+    while let Some(row) = rows.try_next().await.map_err(|error| {
+        migration_failure(MigrationPhase::History, None, error.into())
+    })? {
+        if invalid.is_some() {
+            continue;
+        }
+        match history_row(&row, include_dirty) {
+            Ok((version, checksum)) => {
+                if let Some(step) = catalog.steps.get(applied)
+                    && (step.up.version != version || step.up.checksum.as_ref() != checksum)
+                {
+                    mismatch.get_or_insert(version);
+                }
+                applied = applied.saturating_add(1);
+            }
+            Err(error) => invalid = Some(error),
         }
     }
-    Ok(())
+    if let Some(error) = invalid {
+        return Err(error);
+    }
+    if applied > catalog.steps.len() {
+        return Err(stale_plan());
+    }
+    if let Some(version) = mismatch {
+        return Err(migration_failure(
+            MigrationPhase::History,
+            Some(version),
+            SqlError::Configuration("migration history/checksum mismatch".into()),
+        ));
+    }
+    Ok(applied)
 }
+
+#[expect(
+    clippy::result_large_err,
+    reason = "retains the owned SQL error representation without an extra heap allocation"
+)]
+fn history_row(row: &sqlx::TursoRow, include_dirty: bool) -> Result<(i64, &[u8]), SqlError> {
+    let version = row.try_get("version")?;
+    if include_dirty && !row.try_get::<bool, _>("success")? {
+        return Err(migration_failure(
+            MigrationPhase::Recovery,
+            Some(version),
+            SqlError::Configuration("SQLx dirty migration requires assessment".into()),
+        ));
+    }
+    Ok((version, row.try_get("checksum")?))
+}
+
 /// Require that a maintained step is still the exact next up or last applied down boundary.
+#[expect(
+    clippy::result_large_err,
+    reason = "retains the owned SQL error representation without an extra heap allocation"
+)]
 fn validate_boundary(
     catalog: &MigrationCatalog,
-    current: &[HistoryEntry],
+    current: usize,
     version: i64,
     direction: MigrationDirection,
 ) -> Result<(), SqlError> {
     let actual = match direction {
-        MigrationDirection::Up => catalog.steps.get(current.len()).map(|step| step.up.version),
-        MigrationDirection::Down => current.last().map(|step| step.version),
+        MigrationDirection::Up => catalog.steps.get(current).map(|step| step.up.version),
+        MigrationDirection::Down => current
+            .checked_sub(1)
+            .and_then(|index| catalog.steps.get(index))
+            .map(|step| step.up.version),
     };
     if actual != Some(version) {
         return Err(stale_plan());
@@ -903,61 +1034,63 @@ fn validate_boundary(
     Ok(())
 }
 /// Resolve a versioned dirty marker against the current immutable catalog/checksum.
+#[expect(
+    clippy::result_large_err,
+    reason = "retains the owned SQL error representation without an extra heap allocation"
+)]
 async fn dirty(
     connection: &mut TursoConnection,
     catalog: &MigrationCatalog,
 ) -> Result<Option<DirtyMigration>, SqlError> {
-    let marker = sqlx::query(AssertSqlSafe(format!(
-        "SELECT version,direction,checksum FROM {DIRTY_METADATA} WHERE journal=?"
-    )))
-    .bind(&catalog.journal)
+    let marker = sqlx::query(AssertSqlSafe(catalog.journal.dirty_marker.clone()))
+    .bind(catalog.journal())
     .fetch_optional(&mut *connection)
     .await?;
-    let (version, checksum, direction, native_dirty) = if let Some(row) = marker {
-        let direction = match row.try_get::<String, _>("direction")?.as_str() {
+    let (row, direction, native_dirty) = if let Some(row) = marker {
+        let direction = match row.try_get::<&str, _>("direction")? {
             "up" => MigrationDirection::Up,
             "down" => MigrationDirection::Down,
             _ => return Err(stale_plan()),
         };
-        (
-            row.try_get::<i64, _>("version")?,
-            row.try_get::<Vec<u8>, _>("checksum")?,
-            direction,
-            false,
-        )
+        (row, direction, false)
     } else {
-        let rows = sqlx::query(AssertSqlSafe(format!(
-            "SELECT version,checksum FROM {} WHERE success=FALSE ORDER BY version",
-            catalog.quoted
-        )))
-        .fetch_all(connection)
-        .await
-        .map_err(|error| migration_failure(MigrationPhase::History, None, error.into()))?;
-        if rows.len() > 1 {
+        let mut rows = sqlx::query(AssertSqlSafe(catalog.journal.native_dirty.clone()))
+        .fetch(connection);
+        let Some(row) = rows.try_next().await.map_err(|error| {
+            migration_failure(MigrationPhase::History, None, error.into())
+        })? else {
+            return Ok(None);
+        };
+        let mut duplicate = false;
+        while rows.try_next().await.map_err(|error| {
+            migration_failure(MigrationPhase::History, None, error.into())
+        })?.is_some() {
+            duplicate = true;
+        }
+        if duplicate {
             return Err(migration_failure(
                 MigrationPhase::Recovery,
                 None,
                 SqlError::Configuration("multiple native dirty migrations".into()),
             ));
         }
-        let Some(row) = rows.into_iter().next() else {
-            return Ok(None);
-        };
-        (
-            row.try_get::<i64, _>("version")?,
-            row.try_get::<Vec<u8>, _>("checksum")?,
-            MigrationDirection::Up,
-            true,
-        )
+        (row, MigrationDirection::Up, true)
     };
+    let version = row.try_get::<i64, _>("version")?;
+    let persisted = row.try_get::<&[u8], _>("checksum")?;
     let step = catalog
         .steps
         .iter()
         .find(|step| step.up.version == version)
         .ok_or_else(stale_plan)?;
-    if checksum != step.up.checksum.as_ref() {
+    if persisted != step.up.checksum.as_ref() {
         return Err(stale_plan());
     }
+    let mut checksum = Vec::new();
+    checksum.try_reserve_exact(persisted.len()).map_err(|_| {
+        SqlError::Memory(effect::memory::MemoryError::CollectionReservationFailed)
+    })?;
+    checksum.extend_from_slice(persisted);
     Ok(Some(DirtyMigration {
         version,
         name: step.up.description.to_string(),
@@ -966,28 +1099,23 @@ async fn dirty(
         native_dirty,
     }))
 }
-/// Retain clean native history during deliberate recovery; false rows are assessed separately.
+/// Validate clean native history during deliberate recovery; false rows are assessed separately.
+#[expect(
+    clippy::result_large_err,
+    reason = "retains the owned SQL error representation without an extra heap allocation"
+)]
 async fn recovery_history(
     connection: &mut TursoConnection,
     catalog: &MigrationCatalog,
-) -> Result<Vec<HistoryEntry>, SqlError> {
-    let rows = sqlx::query(AssertSqlSafe(format!(
-        "SELECT version,checksum FROM {} WHERE success=TRUE ORDER BY version",
-        catalog.quoted
-    )))
-    .fetch_all(connection)
-    .await
-    .map_err(|error| migration_failure(MigrationPhase::History, None, error.into()))?;
-    rows.into_iter()
-        .map(|row| {
-            Ok(HistoryEntry {
-                version: row.try_get("version")?,
-                checksum: row.try_get("checksum")?,
-            })
-        })
-        .collect()
+) -> Result<usize, SqlError> {
+    read_history(connection, catalog, false).await
 }
+
 /// Extend native dirty metadata with a direction marker inside the same write transaction.
+#[expect(
+    clippy::result_large_err,
+    reason = "retains the owned SQL error representation without an extra heap allocation"
+)]
 async fn adopt_native_dirty(
     connection: &mut TursoConnection,
     catalog: &MigrationCatalog,
@@ -1004,6 +1132,10 @@ async fn adopt_native_dirty(
     Ok(())
 }
 /// Reject unresolved schema state before any new history plan or mutation.
+#[expect(
+    clippy::result_large_err,
+    reason = "retains the owned SQL error representation without an extra heap allocation"
+)]
 async fn reject_dirty(
     connection: &mut TursoConnection,
     catalog: &MigrationCatalog,
@@ -1018,16 +1150,18 @@ async fn reject_dirty(
     Ok(())
 }
 /// Mark a schema boundary in compatible extension metadata; nontransactional callers commit this first.
+#[expect(
+    clippy::result_large_err,
+    reason = "retains the owned SQL error representation without an extra heap allocation"
+)]
 async fn mark_dirty(
     connection: &mut TursoConnection,
     catalog: &MigrationCatalog,
     step: &MigrationStep,
     direction: MigrationDirection,
 ) -> Result<(), SqlError> {
-    sqlx::query(AssertSqlSafe(format!(
-        "INSERT INTO {DIRTY_METADATA}(journal,version,direction,checksum) VALUES (?,?,?,?)"
-    )))
-    .bind(&catalog.journal)
+    sqlx::query(AssertSqlSafe(catalog.journal.mark_dirty.clone()))
+    .bind(catalog.journal())
     .bind(step.up.version)
     .bind(match direction {
         MigrationDirection::Up => "up",
@@ -1039,14 +1173,16 @@ async fn mark_dirty(
     Ok(())
 }
 /// Clear only one acknowledged marker; absence is a recovery failure rather than guessed success.
+#[expect(
+    clippy::result_large_err,
+    reason = "retains the owned SQL error representation without an extra heap allocation"
+)]
 async fn clear_dirty(
     connection: &mut TursoConnection,
     catalog: &MigrationCatalog,
 ) -> Result<(), SqlError> {
-    let result = sqlx::query(AssertSqlSafe(format!(
-        "DELETE FROM {DIRTY_METADATA} WHERE journal=?"
-    )))
-    .bind(&catalog.journal)
+    let result = sqlx::query(AssertSqlSafe(catalog.journal.clear_dirty.clone()))
+    .bind(catalog.journal())
     .execute(connection)
     .await?;
     if result.rows_affected() != 1 {
@@ -1055,6 +1191,10 @@ async fn clear_dirty(
     Ok(())
 }
 /// Apply a declared step, journal it and clear its marker under the same database write owner.
+#[expect(
+    clippy::result_large_err,
+    reason = "retains the owned SQL error representation without an extra heap allocation"
+)]
 async fn apply_transactional(
     connection: &mut TursoConnection,
     catalog: &MigrationCatalog,
@@ -1080,6 +1220,10 @@ async fn apply_transactional(
     clear_dirty(connection, catalog).await
 }
 /// Reconcile the existing SQLx journal according to the declared migration direction.
+#[expect(
+    clippy::result_large_err,
+    reason = "retains the owned SQL error representation without an extra heap allocation"
+)]
 async fn publish_step(
     connection: &mut TursoConnection,
     catalog: &MigrationCatalog,
@@ -1093,28 +1237,40 @@ async fn publish_step(
     }
 }
 /// Insert SQLx-native checksum/history fields; execution_time uses native nanosecond units; recovery entries record assessment/publication duration, never an invented original step duration.
+#[expect(
+    clippy::result_large_err,
+    reason = "retains the owned SQL error representation without an extra heap allocation"
+)]
 async fn insert_history(
     connection: &mut TursoConnection,
     catalog: &MigrationCatalog,
     step: &MigrationStep,
     execution_ns: i64,
 ) -> Result<(), SqlError> {
-    let result = sqlx::query(AssertSqlSafe(format!("INSERT INTO {}(version,description,success,checksum,execution_time) VALUES (?,?,TRUE,?,?) ON CONFLICT(version) DO UPDATE SET success=TRUE,execution_time=excluded.execution_time WHERE checksum=excluded.checksum AND success=FALSE", catalog.quoted))).bind(step.up.version).bind(step.up.description.as_ref()).bind(step.up.checksum.as_ref()).bind(execution_ns).execute(connection).await.map_err(|error| migration_failure(MigrationPhase::Journal, Some(step.up.version), error.into()))?;
+    let result = sqlx::query(AssertSqlSafe(catalog.journal.insert_history.clone()))
+        .bind(step.up.version)
+        .bind(step.up.description.as_ref())
+        .bind(step.up.checksum.as_ref())
+        .bind(execution_ns)
+        .execute(connection)
+        .await
+        .map_err(|error| migration_failure(MigrationPhase::Journal, Some(step.up.version), error.into()))?;
     if result.rows_affected() != 1 {
         return Err(stale_plan());
     }
     Ok(())
 }
 /// Delete exactly the selected down boundary from the same SQLx journal.
+#[expect(
+    clippy::result_large_err,
+    reason = "retains the owned SQL error representation without an extra heap allocation"
+)]
 async fn delete_history(
     connection: &mut TursoConnection,
     catalog: &MigrationCatalog,
     version: i64,
 ) -> Result<(), SqlError> {
-    let result = sqlx::query(AssertSqlSafe(format!(
-        "DELETE FROM {} WHERE version=?",
-        catalog.quoted
-    )))
+    let result = sqlx::query(AssertSqlSafe(catalog.journal.delete_history.clone()))
     .bind(version)
     .execute(connection)
     .await
@@ -1125,6 +1281,10 @@ async fn delete_history(
     Ok(())
 }
 /// Repair only the assessed dirty boundary while the caller retains the database write transaction.
+#[expect(
+    clippy::result_large_err,
+    reason = "retains the owned SQL error representation without an extra heap allocation"
+)]
 async fn repair_recovery(
     connection: &mut TursoConnection,
     catalog: &MigrationCatalog,
@@ -1138,13 +1298,12 @@ async fn repair_recovery(
         return Err(stale_plan());
     }
     let current = recovery_history(connection, catalog).await?;
-    validate_history(catalog, &current)?;
     let index = catalog
         .steps
         .iter()
         .position(|step| step.up.version == version)
         .ok_or_else(stale_plan)?;
-    if current.len() != index && current.len() != index + 1 {
+    if current != index && current != index + 1 {
         return Err(stale_plan());
     }
     let journaled = matches!(
@@ -1152,7 +1311,7 @@ async fn repair_recovery(
         (MigrationDirection::Up, RecoveryDecision::StepApplied)
             | (MigrationDirection::Down, RecoveryDecision::StepNotApplied)
     );
-    if journaled && current.len() == index {
+    if journaled && current == index {
         insert_history(
             connection,
             catalog,
@@ -1167,6 +1326,10 @@ async fn repair_recovery(
     clear_dirty(connection, catalog).await
 }
 /// Convert provider-owned elapsed time to SQLx's signed nanosecond journal units without truncation.
+#[expect(
+    clippy::result_large_err,
+    reason = "retains the owned SQL error representation without an extra heap allocation"
+)]
 fn elapsed_ns(started: Instant) -> Result<i64, SqlError> {
     i64::try_from(started.elapsed().as_nanos()).map_err(|_| {
         SqlError::Configuration(
@@ -1175,15 +1338,16 @@ fn elapsed_ns(started: Instant) -> Result<i64, SqlError> {
     })
 }
 /// Delete assessed nonapplied history, accepting absence deliberately only in the recovery path.
+#[expect(
+    clippy::result_large_err,
+    reason = "retains the owned SQL error representation without an extra heap allocation"
+)]
 async fn delete_recovery_history(
     connection: &mut TursoConnection,
     catalog: &MigrationCatalog,
     version: i64,
 ) -> Result<(), SqlError> {
-    sqlx::query(AssertSqlSafe(format!(
-        "DELETE FROM {} WHERE version=?",
-        catalog.quoted
-    )))
+    sqlx::query(AssertSqlSafe(catalog.journal.delete_history.clone()))
     .bind(version)
     .execute(connection)
     .await?;
@@ -1191,7 +1355,7 @@ async fn delete_recovery_history(
 }
 /// Compare exact immutable schema contracts before allowing a down-plan to cross configurations.
 fn same_catalog(left: &MigrationCatalog, right: &MigrationCatalog) -> bool {
-    left.journal == right.journal
+    left.journal() == right.journal()
         && left.steps.len() == right.steps.len()
         && left
             .steps
@@ -1248,6 +1412,10 @@ fn annotate_terminal(error: SqlError) -> SqlError {
         | SqlError::Provider(_)
         | SqlError::RowAbsent
         | SqlError::Decode(_)
+        | SqlError::Memory(_)
+        | SqlError::PreparedRow(_)
+        | SqlError::RowLimit { .. }
+        | SqlError::PreparedStatement(_)
         | SqlError::InactiveSession
         | SqlError::MaintenanceRequired
         | SqlError::ReplicaNotAuthoritative
@@ -1263,6 +1431,10 @@ fn annotate_terminal(error: SqlError) -> SqlError {
     }
 }
 /// Preserve primary and maintenance release failures in observation order.
+#[expect(
+    clippy::result_large_err,
+    reason = "retains the owned SQL error representation without an extra heap allocation"
+)]
 fn join_native_cleanup<A>(
     result: Result<A, SqlError>,
     cleanup: Result<(), SqlError>,
@@ -1289,6 +1461,10 @@ fn native_exit<A>(result: Result<A, SqlError>) -> Exit<A, SqlError> {
     }
 }
 /// Retain invocation-local defects while still reaching maintenance release.
+#[expect(
+    clippy::result_large_err,
+    reason = "retains the owned SQL error representation without an extra heap allocation"
+)]
 fn caught_native<A>(
     result: Result<Result<A, SqlError>, Box<dyn std::any::Any + Send>>,
 ) -> Result<A, SqlError> {
@@ -1300,6 +1476,10 @@ fn caught_native<A>(
     }
 }
 /// Catch both release-factory and release-future panics as ordered cleanup defects.
+#[expect(
+    clippy::result_large_err,
+    reason = "retains the owned SQL error representation without an extra heap allocation"
+)]
 async fn release_maintenance(guard: Box<dyn MaintenanceGuard>) -> Result<(), SqlError> {
     caught_native(
         std::panic::AssertUnwindSafe(async move { guard.release().await })

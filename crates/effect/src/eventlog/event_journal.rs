@@ -125,21 +125,38 @@ pub(crate) fn validate_journal_read(
     after: JournalCursor,
     limit: NonZeroUsize,
 ) -> Result<(), JournalReadViolation> {
-    if read.entries.len() > limit.get() {
+    validate_journal_positions(
+        read.entries
+            .iter()
+            .map(|entry| (entry.sequence, entry.event.stream() == *stream)),
+        read.next,
+        read.has_more,
+        after,
+        limit,
+    )
+}
+
+pub(super) fn validate_journal_positions(
+    entries: impl ExactSizeIterator<Item = (NonZeroU64, bool)>,
+    next: JournalCursor,
+    has_more: bool,
+    after: JournalCursor,
+    limit: NonZeroUsize,
+) -> Result<(), JournalReadViolation> {
+    let count = entries.len();
+    if count > limit.get() {
         return Err(JournalReadViolation::PageLimitExceeded {
             limit,
-            actual: read.entries.len(),
+            actual: count,
         });
     }
-    if read.entries.is_empty() && read.has_more {
+    if count == 0 && has_more {
         return Err(JournalReadViolation::EmptyPageWithMore);
     }
     let mut expected = after;
-    for entry in &read.entries {
-        if entry.event.stream() != *stream {
-            return Err(JournalReadViolation::WrongStream {
-                sequence: entry.sequence,
-            });
+    for (sequence, same_stream) in entries {
+        if !same_stream {
+            return Err(JournalReadViolation::WrongStream { sequence });
         }
         expected = JournalCursor::new(
             expected
@@ -147,15 +164,15 @@ pub(crate) fn validate_journal_read(
                 .checked_add(1)
                 .ok_or(JournalReadViolation::SequenceExhausted)?,
         );
-        let actual = JournalCursor::new(entry.sequence.get());
+        let actual = JournalCursor::new(sequence.get());
         if actual != expected {
             return Err(JournalReadViolation::NonContiguous { expected, actual });
         }
     }
-    if read.next != expected {
+    if next != expected {
         return Err(JournalReadViolation::CursorMismatch {
             expected,
-            actual: read.next,
+            actual: next,
         });
     }
     Ok(())

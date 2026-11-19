@@ -5,24 +5,170 @@ use super::{
     EncodedWorkflowOutcome, RecordedActivity, RecordedChild, RecordedCompensation,
     RecordedDeadline, RecordedRace, RecordedSignal, SignalWait, WorkflowActivityId,
     WorkflowCompensationId, WorkflowDefinitionId, WorkflowEngine, WorkflowEngineError,
-    WorkflowHandle, WorkflowRaceId, WorkflowRegistration, WorkflowRunId, WorkflowSignalId,
-    WorkflowSnapshot, WorkflowStatus, WorkflowVersion, WorkflowWait, WorkflowWakeReason,
+    WorkflowHandle, WorkflowHead, WorkflowRaceId, WorkflowRegistration, WorkflowRunId,
+    WorkflowSignalId, WorkflowSnapshot, WorkflowStatus, WorkflowVersion, WorkflowWait,
+    WorkflowWakeReason,
 };
-use crate::{Effect, UtcMillis};
-use crate::{effect_sync, effect_try_sync};
+use crate::memory::{Bytes, MemoryError, PreparedMemory, RegionId};
+use crate::{Defect, Effect, Exit, UtcMillis, effect_sync};
 use std::collections::{BTreeMap, BTreeSet};
+use std::marker::PhantomData;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-#[derive(Default)]
+mod prepared;
+use prepared::{History, PreparedWorkflowHistories, PreparedWorkflowStorage, Table};
+pub use prepared::{
+    PreparedWorkflowCapacity, PreparedWorkflowHistoryCursor, PreparedWorkflowHistoryError,
+    PreparedWorkflowHistoryPage, WorkflowHistoryRecord,
+};
+
+type DefinitionKey = (WorkflowDefinitionId, WorkflowVersion);
+type Definitions = Table<DefinitionKey, Arc<[u8]>>;
+type Runs = Table<WorkflowRunId, Run>;
+
+struct Run {
+    execution: u64,
+    handle: WorkflowHandle,
+    compatibility: Arc<[u8]>,
+    encoded_input: Arc<[u8]>,
+    status: WorkflowStatus,
+    activities: History<RecordedActivity>,
+    children: History<RecordedChild>,
+    signals: History<RecordedSignal>,
+    compensations: History<RecordedCompensation>,
+    races: History<RecordedRace>,
+    deadline: Option<RecordedDeadline>,
+    waiting_on: Option<WorkflowWait>,
+    wake_reason: Option<WorkflowWakeReason>,
+    history_revision: u64,
+    retained_bytes: Bytes,
+}
+
+impl Run {
+    fn from_snapshot(snapshot: WorkflowSnapshot) -> Self {
+        Self {
+            execution: snapshot.execution,
+            handle: snapshot.handle,
+            compatibility: snapshot.compatibility,
+            encoded_input: snapshot.encoded_input,
+            status: snapshot.status,
+            activities: History::Ordinary(snapshot.activities),
+            children: History::Ordinary(snapshot.children),
+            signals: History::Ordinary(snapshot.signals),
+            compensations: History::Ordinary(snapshot.compensations),
+            races: History::Ordinary(snapshot.races),
+            deadline: snapshot.deadline,
+            waiting_on: snapshot.waiting_on,
+            wake_reason: snapshot.wake_reason,
+            history_revision: 0,
+            retained_bytes: Bytes::new(0),
+        }
+    }
+
+    fn head(&self) -> WorkflowHead {
+        WorkflowHead {
+            execution: self.execution,
+            handle: self.handle.clone(),
+            compatibility: Arc::clone(&self.compatibility),
+            encoded_input: Arc::clone(&self.encoded_input),
+            status: self.status.clone(),
+            deadline: self.deadline.clone(),
+            waiting_on: self.waiting_on.clone(),
+            wake_reason: self.wake_reason.clone(),
+        }
+    }
+
+    fn checkpoint(&self) -> super::WorkflowCheckpoint {
+        super::WorkflowCheckpoint {
+            status: self.status.clone(),
+            execution: self.execution,
+        }
+    }
+
+    fn snapshot(&self) -> WorkflowSnapshot {
+        let head = self.head();
+        WorkflowSnapshot {
+            execution: head.execution,
+            handle: head.handle,
+            compatibility: head.compatibility,
+            encoded_input: head.encoded_input,
+            status: head.status,
+            activities: self.activities.to_vec(),
+            children: self.children.to_vec(),
+            signals: self.signals.to_vec(),
+            compensations: self.compensations.to_vec(),
+            races: self.races.to_vec(),
+            deadline: head.deadline,
+            waiting_on: head.waiting_on,
+            wake_reason: head.wake_reason,
+        }
+    }
+
+    fn prepare_history(
+        &self,
+        capacity: Option<PreparedWorkflowCapacity>,
+        identities: &[usize],
+        payloads: &[usize],
+    ) -> Result<(Bytes, u64), MemoryError> {
+        let Some(capacity) = capacity else {
+            return Ok((self.retained_bytes, self.history_revision));
+        };
+        for &length in identities {
+            check_bytes(Bytes::new(length), capacity.bytes_per_identity)?;
+        }
+        let bytes = payload_bytes(capacity, self.retained_bytes, payloads)?;
+        let revision = self
+            .history_revision
+            .checked_add(1)
+            .ok_or(MemoryError::ArithmeticOverflow)?;
+        Ok((bytes, revision))
+    }
+
+    fn publish_history(&mut self, (bytes, revision): (Bytes, u64)) {
+        self.retained_bytes = bytes;
+        self.history_revision = revision;
+    }
+}
+
+fn check_bytes(requested: Bytes, capacity: Bytes) -> Result<(), MemoryError> {
+    if requested > capacity {
+        return Err(MemoryError::ValueTooLarge {
+            requested,
+            capacity,
+        });
+    }
+    Ok(())
+}
+
+fn payload_bytes(
+    capacity: PreparedWorkflowCapacity,
+    retained: Bytes,
+    payloads: &[usize],
+) -> Result<Bytes, MemoryError> {
+    let mut total = retained;
+    for &length in payloads {
+        let bytes = Bytes::new(length);
+        check_bytes(bytes, capacity.bytes_per_payload)?;
+        total = total.checked_add(bytes)?;
+    }
+    check_bytes(total, capacity.bytes_per_run)?;
+    Ok(total)
+}
+
 /// Typed state used by workflow memory workflow engine.
+#[derive(Default)]
 struct State {
-    definitions: BTreeMap<(WorkflowDefinitionId, WorkflowVersion), Arc<[u8]>>,
-    runs: BTreeMap<WorkflowRunId, WorkflowSnapshot>,
+    definitions: Definitions,
+    runs: Runs,
     shutdown: bool,
+    prepared: Option<PreparedWorkflowStorage>,
 }
 
 impl State {
+    fn capacity(&self) -> Option<PreparedWorkflowCapacity> {
+        self.prepared.as_ref().map(|storage| storage.capacity)
+    }
     ///
     /// # Returns
     /// Type: `Result<(), WorkflowEngineError>`.
@@ -196,9 +342,78 @@ pub enum WorkflowReplayPolicy {
 /// Reconstructible in-process implementation of the WorkflowEngine contract.
 /// Its records can be copied to a different provider, but this type itself
 /// makes no claim of surviving process loss.
-#[derive(Default)]
-pub struct MemoryWorkflowEngine {
+pub struct MemoryWorkflowEngine<P = OrdinaryWorkflowStorage> {
     state: Arc<Mutex<State>>,
+    policy: PhantomData<P>,
+}
+
+/// The selected backend retains the ordinary lifecycle and prepared memory errors.
+pub type PreparedMemoryWorkflowEngine = MemoryWorkflowEngine<PreparedWorkflowPolicy>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreparedWorkflowError {
+    Engine(WorkflowEngineError),
+    Memory(MemoryError),
+}
+
+impl From<WorkflowEngineError> for PreparedWorkflowError {
+    fn from(error: WorkflowEngineError) -> Self {
+        Self::Engine(error)
+    }
+}
+
+impl From<MemoryError> for PreparedWorkflowError {
+    fn from(error: MemoryError) -> Self {
+        Self::Memory(error)
+    }
+}
+
+#[doc(hidden)]
+pub struct OrdinaryWorkflowStorage;
+
+#[doc(hidden)]
+pub struct PreparedWorkflowPolicy;
+
+#[doc(hidden)]
+pub trait WorkflowStoragePolicy: Send + Sync + 'static {
+    type Error: Send + 'static;
+
+    fn publish<A>(outcome: Result<A, PreparedWorkflowError>) -> Exit<A, Self::Error>;
+}
+
+impl WorkflowStoragePolicy for OrdinaryWorkflowStorage {
+    type Error = WorkflowEngineError;
+
+    fn publish<A>(outcome: Result<A, PreparedWorkflowError>) -> Exit<A, Self::Error> {
+        match outcome {
+            Ok(value) => Exit::Success(value),
+            Err(PreparedWorkflowError::Engine(error)) => Exit::Fail(error),
+            // Only the prepared state can produce this failure.
+            Err(PreparedWorkflowError::Memory(_)) => Exit::Die(Defect::new(
+                "ordinary workflow state returned a prepared storage refusal",
+            )),
+        }
+    }
+}
+
+impl WorkflowStoragePolicy for PreparedWorkflowPolicy {
+    type Error = PreparedWorkflowError;
+
+    fn publish<A>(outcome: Result<A, PreparedWorkflowError>) -> Exit<A, Self::Error> {
+        match outcome {
+            Ok(value) => Exit::Success(value),
+            Err(error) => Exit::Fail(error),
+        }
+    }
+}
+
+impl Default for MemoryWorkflowEngine {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(State::default())),
+            policy: PhantomData,
+        }
+    }
 }
 
 impl MemoryWorkflowEngine {
@@ -209,6 +424,24 @@ impl MemoryWorkflowEngine {
     /// Type: `Self`.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Prepare the shared engine's physical run, history, and replay storage.
+    pub fn prepare(
+        memory: &PreparedMemory<'static>,
+        region: RegionId,
+        capacity: PreparedWorkflowCapacity,
+    ) -> Result<PreparedMemoryWorkflowEngine, MemoryError> {
+        capacity.storage_bytes()?;
+        Ok(MemoryWorkflowEngine {
+            state: Arc::new(Mutex::new(State {
+                definitions: Table::prepare(memory, region, capacity.definitions)?,
+                runs: Table::prepare(memory, region, capacity.runs)?,
+                shutdown: false,
+                prepared: Some(PreparedWorkflowStorage::prepare(memory, region, capacity)?),
+            })),
+            policy: PhantomData,
+        })
     }
 
     /// Reconstruct state from the supplied recorded snapshot.
@@ -352,7 +585,10 @@ impl MemoryWorkflowEngine {
             ) {
                 snapshot.status = WorkflowStatus::Ready;
             }
-            if runs.insert(snapshot.handle.run.clone(), snapshot).is_some() {
+            if runs
+                .insert(snapshot.handle.run.clone(), Run::from_snapshot(snapshot))
+                .is_some()
+            {
                 return Err(WorkflowEngineError::RunConflict);
             }
         }
@@ -429,13 +665,17 @@ impl MemoryWorkflowEngine {
         }
         Ok(Self {
             state: Arc::new(Mutex::new(State {
-                definitions: registered,
-                runs,
+                definitions: Table::Ordinary(registered),
+                runs: Table::Ordinary(runs),
                 shutdown: false,
+                prepared: None,
             })),
+            policy: PhantomData,
         })
     }
+}
 
+impl<P> MemoryWorkflowEngine<P> {
     #[must_use]
     /// Capture every registered run’s current replayable state.
     ///
@@ -447,7 +687,7 @@ impl MemoryWorkflowEngine {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .runs
             .values()
-            .cloned()
+            .map(Run::snapshot)
             .collect()
     }
 
@@ -531,9 +771,15 @@ impl MemoryWorkflowEngine {
 /// # Returns
 /// Type: `Result<Vec<WorkflowRunId>, WorkflowEngineError>`.
 fn descendants(
-    runs: &BTreeMap<WorkflowRunId, WorkflowSnapshot>,
+    state: &State,
     root: &WorkflowRunId,
-) -> Result<Vec<WorkflowRunId>, WorkflowEngineError> {
+) -> Result<History<WorkflowRunId>, PreparedWorkflowError> {
+    if let Some(storage) = &state.prepared {
+        return storage
+            .collect_descendants(&state.runs, root)
+            .map(History::Prepared);
+    }
+    let runs = &state.runs;
     let mut pending = runs
         .get(root)
         .ok_or(WorkflowEngineError::MissingRun)?
@@ -545,7 +791,7 @@ fn descendants(
     let mut result = Vec::new();
     while let Some(run) = pending.pop() {
         if run == *root || !seen.insert(run.clone()) {
-            return Err(WorkflowEngineError::ChildConflict);
+            return Err(WorkflowEngineError::ChildConflict.into());
         }
         if let Some(snapshot) = runs.get(&run) {
             pending.extend(
@@ -557,7 +803,7 @@ fn descendants(
         }
         result.push(run);
     }
-    Ok(result)
+    Ok(History::Ordinary(result))
 }
 
 ///
@@ -567,7 +813,7 @@ fn descendants(
 ///
 /// # Returns
 /// Type: `()`.
-fn wake_parent(runs: &mut BTreeMap<WorkflowRunId, WorkflowSnapshot>, child: &WorkflowRunId) {
+fn wake_parent(runs: &mut Runs, child: &WorkflowRunId) {
     for snapshot in runs.values_mut() {
         if snapshot.status == WorkflowStatus::Suspended
             && matches!(&snapshot.waiting_on,
@@ -580,9 +826,192 @@ fn wake_parent(runs: &mut BTreeMap<WorkflowRunId, WorkflowSnapshot>, child: &Wor
     }
 }
 
-impl WorkflowEngine for MemoryWorkflowEngine {
+impl<P: WorkflowStoragePolicy> MemoryWorkflowEngine<P> {
+    fn storage_effect<A: Send + 'static>(
+        work: impl Fn() -> Result<A, PreparedWorkflowError> + Send + Sync + 'static,
+    ) -> Effect<A, P::Error> {
+        Effect::ready(move |_, _| P::publish(work()))
+    }
+
+    fn start_projected<O: Send + 'static>(
+        &self,
+        handle: WorkflowHandle,
+        encoded_input: Arc<[u8]>,
+        project: fn(&Run) -> O,
+    ) -> Effect<O, P::Error> {
+        let state = Arc::clone(&self.state);
+        Self::storage_effect(move || {
+            let mut state = lock_live(&state)?;
+            let compatibility = state
+                .definitions
+                .get(&(handle.definition.clone(), handle.version))
+                .ok_or(WorkflowEngineError::DefinitionMismatch)?;
+            if let Some(existing) = state.runs.get(&handle.run) {
+                if existing.handle != handle
+                    || existing.compatibility != *compatibility
+                    || existing.encoded_input != encoded_input
+                {
+                    return Err(WorkflowEngineError::RunConflict.into());
+                }
+                return Ok(project(existing));
+            }
+            let compatibility = Arc::clone(compatibility);
+            let (histories, retained_bytes) = if let Some(storage) = &state.prepared {
+                let capacity = storage.capacity;
+                check_bytes(
+                    Bytes::new(handle.run.as_bytes().len()),
+                    capacity.bytes_per_identity,
+                )?;
+                check_bytes(
+                    Bytes::new(handle.definition.as_str().len()),
+                    capacity.bytes_per_identity,
+                )?;
+                let retained = payload_bytes(capacity, Bytes::new(0), &[encoded_input.len()])?;
+                (storage.histories()?, retained)
+            } else {
+                (
+                    PreparedWorkflowHistories {
+                        activities: History::ordinary(),
+                        children: History::ordinary(),
+                        signals: History::ordinary(),
+                        compensations: History::ordinary(),
+                        races: History::ordinary(),
+                    },
+                    Bytes::new(0),
+                )
+            };
+            let snapshot = Run {
+                execution: 0,
+                handle: handle.clone(),
+                compatibility,
+                encoded_input: Arc::clone(&encoded_input),
+                status: WorkflowStatus::Ready,
+                activities: histories.activities,
+                children: histories.children,
+                signals: histories.signals,
+                compensations: histories.compensations,
+                races: histories.races,
+                deadline: None,
+                waiting_on: None,
+                wake_reason: None,
+                history_revision: 0,
+                retained_bytes,
+            };
+            let output = project(&snapshot);
+            state.runs.try_insert(handle.run.clone(), snapshot)?;
+            Ok(output)
+        })
+    }
+
+    fn transition_projected<O: Send + 'static>(
+        &self,
+        run: WorkflowRunId,
+        expected: super::WorkflowCheckpoint,
+        next: WorkflowStatus,
+        project: fn(&Run) -> O,
+    ) -> Effect<O, P::Error> {
+        let state = Arc::clone(&self.state);
+        Self::storage_effect(move || {
+            let mut state = lock_live(&state)?;
+            let snapshot = state
+                .runs
+                .get_mut(&run)
+                .ok_or(WorkflowEngineError::MissingRun)?;
+            if snapshot.checkpoint() != expected {
+                return Err(WorkflowEngineError::StateConflict.into());
+            }
+            if matches!(
+                snapshot.status,
+                WorkflowStatus::Completed(_)
+                    | WorkflowStatus::Cancelled
+                    | WorkflowStatus::Abandoned
+            ) {
+                return Err(WorkflowEngineError::TerminalRun.into());
+            }
+            if !matches!(
+                (&snapshot.status, &next),
+                (WorkflowStatus::Ready, WorkflowStatus::Running)
+                    | (WorkflowStatus::Running, WorkflowStatus::Ready)
+                    | (WorkflowStatus::Running, WorkflowStatus::Suspended)
+                    | (WorkflowStatus::Suspended, WorkflowStatus::Ready)
+            ) {
+                return Err(WorkflowEngineError::InvalidTransition.into());
+            }
+            if next == WorkflowStatus::Running {
+                snapshot.execution = snapshot
+                    .execution
+                    .checked_add(1)
+                    .ok_or(WorkflowEngineError::ExecutionExhausted)?;
+            }
+            snapshot.status = next.clone();
+            if next == WorkflowStatus::Running {
+                snapshot.wake_reason = None;
+            } else if next == WorkflowStatus::Ready {
+                snapshot.waiting_on = None;
+                if expected.status == WorkflowStatus::Suspended {
+                    snapshot.wake_reason = Some(WorkflowWakeReason::Manual);
+                }
+            }
+            Ok(project(snapshot))
+        })
+    }
+
+    fn complete_projected<O: Send + 'static>(
+        &self,
+        run: WorkflowRunId,
+        outcome: EncodedWorkflowOutcome,
+        project: fn(&Run) -> O,
+    ) -> Effect<O, P::Error> {
+        let state = Arc::clone(&self.state);
+        Self::storage_effect(move || {
+            let mut state = lock_live(&state)?;
+            let prior = state
+                .runs
+                .get(&run)
+                .ok_or(WorkflowEngineError::MissingRun)?;
+            match &prior.status {
+                WorkflowStatus::Completed(existing) if existing == &outcome => {
+                    return Ok(project(prior));
+                }
+                WorkflowStatus::Completed(_)
+                | WorkflowStatus::Cancelled
+                | WorkflowStatus::Abandoned => {
+                    return Err(WorkflowEngineError::TerminalRun.into());
+                }
+                WorkflowStatus::Ready | WorkflowStatus::Running | WorkflowStatus::Suspended => {}
+            }
+            let child_runs = descendants(&state, &run)?;
+            if child_runs.iter().any(|child| {
+                !matches!(
+                    state.runs.get(child).map(|snapshot| &snapshot.status),
+                    Some(WorkflowStatus::Completed(_)) | Some(WorkflowStatus::Cancelled)
+                )
+            }) {
+                return Err(WorkflowEngineError::StateConflict.into());
+            }
+            let capacity = state.capacity();
+            let snapshot = state
+                .runs
+                .get_mut(&run)
+                .ok_or(WorkflowEngineError::MissingRun)?;
+            if let Some(capacity) = capacity {
+                snapshot.retained_bytes =
+                    payload_bytes(capacity, snapshot.retained_bytes, &[outcome.payload.len()])?;
+            }
+            snapshot.status = WorkflowStatus::Completed(outcome.clone());
+            snapshot.deadline = None;
+            snapshot.waiting_on = None;
+            snapshot.wake_reason = None;
+            let completed = project(snapshot);
+            wake_parent(&mut state.runs, &run);
+            Ok(completed)
+        })
+    }
+}
+
+impl<P: WorkflowStoragePolicy> WorkflowEngine for MemoryWorkflowEngine<P> {
     /// Type alias for error in workflow memory workflow engine.
-    type Error = WorkflowEngineError;
+    type Error = P::Error;
 
     ///
     /// # Parameters
@@ -593,21 +1022,31 @@ impl WorkflowEngine for MemoryWorkflowEngine {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn register(&self, definition: WorkflowRegistration) -> Effect<(), Self::Error> {
         let state = Arc::clone(&self.state);
-        effect_try_sync! { body: move || {
+        Self::storage_effect(move || {
             let mut state = lock_live(&state)?;
             let key = (definition.id.clone(), definition.version);
             match state.definitions.get(&key) {
                 Some(existing) if existing.as_ref() == definition.compatibility.as_ref() => {
                     return Ok(());
                 }
-                Some(_) => return Err(WorkflowEngineError::DefinitionConflict),
+                Some(_) => return Err(WorkflowEngineError::DefinitionConflict.into()),
                 None => {}
+            }
+            if let Some(capacity) = state.capacity() {
+                check_bytes(
+                    Bytes::new(definition.id.as_str().len()),
+                    capacity.bytes_per_identity,
+                )?;
+                check_bytes(
+                    Bytes::new(definition.compatibility.len()),
+                    capacity.bytes_per_payload,
+                )?;
             }
             state
                 .definitions
-                .insert(key, Arc::clone(&definition.compatibility));
+                .try_insert(key, Arc::clone(&definition.compatibility))?;
             Ok(())
-        }, on_error: std::convert::identity, }
+        })
     }
 
     ///
@@ -623,41 +1062,15 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         handle: WorkflowHandle,
         encoded_input: Arc<[u8]>,
     ) -> Effect<WorkflowSnapshot, Self::Error> {
-        let state = Arc::clone(&self.state);
-        effect_try_sync! { body: move || {
-            let mut state = lock_live(&state)?;
-            let compatibility = state
-                .definitions
-                .get(&(handle.definition.clone(), handle.version))
-                .ok_or(WorkflowEngineError::DefinitionMismatch)?;
-            let compatibility = Arc::clone(compatibility);
-            if let Some(existing) = state.runs.get(&handle.run) {
-                if existing.handle != handle
-                    || existing.compatibility != compatibility
-                    || existing.encoded_input != encoded_input
-                {
-                    return Err(WorkflowEngineError::RunConflict);
-                }
-                return Ok(existing.clone());
-            }
-            let snapshot = WorkflowSnapshot {
-                execution: 0,
-                handle: handle.clone(),
-                compatibility,
-                encoded_input: Arc::clone(&encoded_input),
-                status: WorkflowStatus::Ready,
-                activities: Vec::new(),
-                children: Vec::new(),
-                signals: Vec::new(),
-                compensations: Vec::new(),
-                races: Vec::new(),
-                deadline: None,
-                waiting_on: None,
-                wake_reason: None,
-            };
-            state.runs.insert(handle.run.clone(), snapshot.clone());
-            Ok(snapshot)
-        }, on_error: std::convert::identity, }
+        self.start_projected(handle, encoded_input, Run::snapshot)
+    }
+
+    fn start_head(
+        &self,
+        handle: WorkflowHandle,
+        encoded_input: Arc<[u8]>,
+    ) -> Effect<WorkflowHead, Self::Error> {
+        self.start_projected(handle, encoded_input, Run::head)
     }
 
     ///
@@ -675,7 +1088,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .runs
                 .get(&run)
-                .cloned()
+                .map(Run::snapshot)
         }, }
     }
 
@@ -688,56 +1101,30 @@ impl WorkflowEngine for MemoryWorkflowEngine {
     /// # Returns
     /// Type: `Effect<WorkflowSnapshot, Self::Error>`.
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
+    fn inspect_head(&self, run: WorkflowRunId) -> Effect<Option<WorkflowHead>, Self::Error> {
+        let state = Arc::clone(&self.state);
+        effect_sync! { body: move || {
+            state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .runs.get(&run).map(Run::head)
+        }, }
+    }
+
     fn transition(
         &self,
         run: WorkflowRunId,
         expected: super::WorkflowCheckpoint,
         next: WorkflowStatus,
     ) -> Effect<WorkflowSnapshot, Self::Error> {
-        let state = Arc::clone(&self.state);
-        effect_try_sync! { body: move || {
-            let mut state = lock_live(&state)?;
-            let snapshot = state
-                .runs
-                .get_mut(&run)
-                .ok_or(WorkflowEngineError::MissingRun)?;
-            if snapshot.checkpoint() != expected {
-                return Err(WorkflowEngineError::StateConflict);
-            }
-            if matches!(
-                snapshot.status,
-                WorkflowStatus::Completed(_)
-                    | WorkflowStatus::Cancelled
-                    | WorkflowStatus::Abandoned
-            ) {
-                return Err(WorkflowEngineError::TerminalRun);
-            }
-            if !matches!(
-                (&snapshot.status, &next),
-                (WorkflowStatus::Ready, WorkflowStatus::Running)
-                    | (WorkflowStatus::Running, WorkflowStatus::Ready)
-                    | (WorkflowStatus::Running, WorkflowStatus::Suspended)
-                    | (WorkflowStatus::Suspended, WorkflowStatus::Ready)
-            ) {
-                return Err(WorkflowEngineError::InvalidTransition);
-            }
-            if next == WorkflowStatus::Running {
-                snapshot.execution = snapshot
-                    .execution
-                    .checked_add(1)
-                    .ok_or(WorkflowEngineError::ExecutionExhausted)?;
-            }
-            snapshot.status = next.clone();
-            if next == WorkflowStatus::Running {
-                snapshot.wake_reason = None;
-            } else if next == WorkflowStatus::Ready {
-                snapshot.waiting_on = None;
-                if expected.status == WorkflowStatus::Suspended {
-                    snapshot.wake_reason = Some(WorkflowWakeReason::Manual);
-                }
-            }
-            Ok(snapshot.clone())
-        }, on_error: std::convert::identity, }
+        self.transition_projected(run, expected, next, Run::snapshot)
+    }
+
+    fn transition_head(
+        &self,
+        run: WorkflowRunId,
+        expected: super::WorkflowCheckpoint,
+        next: WorkflowStatus,
+    ) -> Effect<WorkflowHead, Self::Error> {
+        self.transition_projected(run, expected, next, Run::head)
     }
 
     ///
@@ -760,8 +1147,9 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         outcome: EncodedWorkflowOutcome,
     ) -> Effect<RecordedActivity, Self::Error> {
         let state = Arc::clone(&self.state);
-        effect_try_sync! { body: move || {
+        Self::storage_effect(move || {
             let mut state = lock_live(&state)?;
+            let capacity = state.capacity();
             let snapshot = state
                 .runs
                 .get_mut(&run)
@@ -776,13 +1164,13 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                 latest_attempt.get_or_insert(existing.attempt);
                 if existing.attempt == attempt {
                     if existing.encoded_input != encoded_input || existing.outcome != outcome {
-                        return Err(WorkflowEngineError::ActivityConflict);
+                        return Err(WorkflowEngineError::ActivityConflict.into());
                     }
                     return Ok(existing.clone());
                 }
             }
             if latest_attempt.is_some_and(|latest| latest > attempt) {
-                return Err(WorkflowEngineError::ActivityAttemptConflict);
+                return Err(WorkflowEngineError::ActivityAttemptConflict.into());
             }
             if matches!(
                 snapshot.status,
@@ -790,7 +1178,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                     | WorkflowStatus::Cancelled
                     | WorkflowStatus::Abandoned
             ) {
-                return Err(WorkflowEngineError::TerminalRun);
+                return Err(WorkflowEngineError::TerminalRun.into());
             }
             let record = RecordedActivity {
                 identity: activity.clone(),
@@ -798,9 +1186,15 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                 encoded_input: Arc::clone(&encoded_input),
                 outcome: outcome.clone(),
             };
-            snapshot.activities.push(record.clone());
+            let charge = snapshot.prepare_history(
+                capacity,
+                &[activity.as_bytes().len()],
+                &[encoded_input.len(), outcome.payload.len()],
+            )?;
+            snapshot.activities.try_push(record.clone())?;
+            snapshot.publish_history(charge);
             Ok(record)
-        }, on_error: std::convert::identity, }
+        })
     }
 
     ///
@@ -819,7 +1213,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         attempt: NonZeroU32,
     ) -> Effect<Option<RecordedActivity>, Self::Error> {
         let state = Arc::clone(&self.state);
-        effect_try_sync! { body: move || {
+        Self::storage_effect(move || {
             let state = state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -832,7 +1226,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                 .iter()
                 .find(|record| record.identity == activity && record.attempt == attempt)
                 .cloned())
-        }, on_error: std::convert::identity, }
+        })
     }
 
     ///
@@ -849,16 +1243,15 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         child: RecordedChild,
     ) -> Effect<RecordedChild, Self::Error> {
         let state = Arc::clone(&self.state);
-        effect_try_sync! { body: move || {
+        Self::storage_effect(move || {
             let mut state = lock_live(&state)?;
             if child.handle.run == parent {
-                return Err(WorkflowEngineError::ChildConflict);
+                return Err(WorkflowEngineError::ChildConflict.into());
             }
             if let Some(started) = state.runs.get(&child.handle.run)
-                && (started.handle != child.handle
-                    || started.encoded_input != child.encoded_input)
+                && (started.handle != child.handle || started.encoded_input != child.encoded_input)
             {
-                return Err(WorkflowEngineError::ChildConflict);
+                return Err(WorkflowEngineError::ChildConflict.into());
             }
             let snapshot = state
                 .runs
@@ -872,7 +1265,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                 return if existing == &child {
                     Ok(existing.clone())
                 } else {
-                    Err(WorkflowEngineError::ChildConflict)
+                    Err(WorkflowEngineError::ChildConflict.into())
                 };
             }
             if matches!(
@@ -881,7 +1274,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                     | WorkflowStatus::Cancelled
                     | WorkflowStatus::Abandoned
             ) {
-                return Err(WorkflowEngineError::TerminalRun);
+                return Err(WorkflowEngineError::TerminalRun.into());
             }
             if state.runs.iter().any(|(run, snapshot)| {
                 run != &parent
@@ -890,14 +1283,16 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                         .iter()
                         .any(|existing| existing.handle.run == child.handle.run)
             }) {
-                return Err(WorkflowEngineError::ChildConflict);
+                return Err(WorkflowEngineError::ChildConflict.into());
             }
             let mut ancestor = parent.clone();
-            let mut visited = BTreeSet::new();
+            // Every parent visited along a valid chain belongs to the run index.
+            let mut remaining = state.runs.len();
             loop {
-                if ancestor == child.handle.run || !visited.insert(ancestor.clone()) {
-                    return Err(WorkflowEngineError::ChildConflict);
+                if ancestor == child.handle.run || remaining == 0 {
+                    return Err(WorkflowEngineError::ChildConflict.into());
                 }
+                remaining -= 1;
                 let next = state.runs.iter().find_map(|(run, snapshot)| {
                     snapshot
                         .children
@@ -910,14 +1305,23 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                     None => break,
                 }
             }
-            state
+            let capacity = state.capacity();
+            let snapshot = state
                 .runs
                 .get_mut(&parent)
-                .ok_or(WorkflowEngineError::MissingRun)?
-                .children
-                .push(child.clone());
+                .ok_or(WorkflowEngineError::MissingRun)?;
+            let charge = snapshot.prepare_history(
+                capacity,
+                &[
+                    child.handle.run.as_bytes().len(),
+                    child.handle.definition.as_str().len(),
+                ],
+                &[child.encoded_input.len()],
+            )?;
+            snapshot.children.try_push(child.clone())?;
+            snapshot.publish_history(charge);
             Ok(child.clone())
-        }, on_error: std::convert::identity, }
+        })
     }
 
     ///
@@ -934,7 +1338,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         child: WorkflowRunId,
     ) -> Effect<ChildWait, Self::Error> {
         let state = Arc::clone(&self.state);
-        effect_try_sync! { body: move || {
+        Self::storage_effect(move || {
             let mut state = lock_live(&state)?;
             let parent_snapshot = state
                 .runs
@@ -945,7 +1349,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                 .iter()
                 .any(|record| record.handle.run == child)
             {
-                return Err(WorkflowEngineError::ChildConflict);
+                return Err(WorkflowEngineError::ChildConflict.into());
             }
             if matches!(
                 parent_snapshot.status,
@@ -953,7 +1357,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                     | WorkflowStatus::Cancelled
                     | WorkflowStatus::Abandoned
             ) {
-                return Err(WorkflowEngineError::TerminalRun);
+                return Err(WorkflowEngineError::TerminalRun.into());
             }
             let child_status = state
                 .runs
@@ -982,7 +1386,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
             parent_snapshot.waiting_on = Some(WorkflowWait::Child(child.clone()));
             parent_snapshot.wake_reason = None;
             Ok(ChildWait::Waiting)
-        }, on_error: std::convert::identity, }
+        })
     }
 
     ///
@@ -999,8 +1403,9 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         deadline: RecordedDeadline,
     ) -> Effect<WorkflowSnapshot, Self::Error> {
         let state = Arc::clone(&self.state);
-        effect_try_sync! { body: move || {
+        Self::storage_effect(move || {
             let mut state = lock_live(&state)?;
+            let capacity = state.capacity();
             let snapshot = state
                 .runs
                 .get_mut(&run)
@@ -1011,7 +1416,13 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                     | WorkflowStatus::Cancelled
                     | WorkflowStatus::Abandoned
             ) {
-                return Err(WorkflowEngineError::TerminalRun);
+                return Err(WorkflowEngineError::TerminalRun.into());
+            }
+            if let Some(capacity) = capacity {
+                check_bytes(
+                    Bytes::new(deadline.identity.as_bytes().len()),
+                    capacity.bytes_per_identity,
+                )?;
             }
             if snapshot.status == WorkflowStatus::Suspended
                 && matches!(&snapshot.waiting_on, Some(WorkflowWait::Deadline(_)))
@@ -1019,8 +1430,8 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                 snapshot.waiting_on = Some(WorkflowWait::Deadline(deadline.clone()));
             }
             snapshot.deadline = Some(deadline.clone());
-            Ok(snapshot.clone())
-        }, on_error: std::convert::identity, }
+            Ok(snapshot.snapshot())
+        })
     }
 
     ///
@@ -1037,7 +1448,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         expected: RecordedDeadline,
     ) -> Effect<DeadlineClear, Self::Error> {
         let state = Arc::clone(&self.state);
-        effect_try_sync! { body: move || {
+        Self::storage_effect(move || {
             let mut state = lock_live(&state)?;
             let snapshot = state
                 .runs
@@ -1049,10 +1460,10 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                     | WorkflowStatus::Cancelled
                     | WorkflowStatus::Abandoned
             ) {
-                return Err(WorkflowEngineError::TerminalRun);
+                return Err(WorkflowEngineError::TerminalRun.into());
             }
             if snapshot.deadline.as_ref() != Some(&expected) {
-                return Ok(DeadlineClear::Unchanged(snapshot.clone()));
+                return Ok(DeadlineClear::Unchanged(snapshot.snapshot()));
             }
             snapshot.deadline = None;
             if matches!(&snapshot.waiting_on,
@@ -1062,8 +1473,8 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                 snapshot.status = WorkflowStatus::Ready;
                 snapshot.wake_reason = Some(WorkflowWakeReason::Manual);
             }
-            Ok(DeadlineClear::Cleared(snapshot.clone()))
-        }, on_error: std::convert::identity, }
+            Ok(DeadlineClear::Cleared(snapshot.snapshot()))
+        })
     }
 
     ///
@@ -1075,10 +1486,10 @@ impl WorkflowEngine for MemoryWorkflowEngine {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn wake_due(&self, now: UtcMillis) -> Effect<Vec<WorkflowRunId>, Self::Error> {
         let state = Arc::clone(&self.state);
-        effect_try_sync! { body: move || {
+        Self::storage_effect(move || {
             let mut state = lock_live(&state)?;
             let mut woken = Vec::new();
-            for (run, snapshot) in &mut state.runs {
+            for (run, snapshot) in state.runs.iter_mut() {
                 if snapshot.status == WorkflowStatus::Suspended
                     && let Some(WorkflowWait::Deadline(due)) = &snapshot.waiting_on
                     && snapshot.deadline.as_ref() == Some(due)
@@ -1092,7 +1503,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                 }
             }
             Ok(woken)
-        }, on_error: std::convert::identity, }
+        })
     }
 
     ///
@@ -1111,7 +1522,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         now: UtcMillis,
     ) -> Effect<DeadlineWake, Self::Error> {
         let state = Arc::clone(&self.state);
-        effect_try_sync! { body: move || {
+        Self::storage_effect(move || {
             let mut state = lock_live(&state)?;
             let snapshot = state
                 .runs
@@ -1126,11 +1537,11 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                 snapshot.status = WorkflowStatus::Ready;
                 snapshot.waiting_on = None;
                 snapshot.wake_reason = Some(WorkflowWakeReason::Deadline(expected.clone()));
-                Ok(DeadlineWake::Woken(snapshot.clone()))
+                Ok(DeadlineWake::Woken(snapshot.snapshot()))
             } else {
-                Ok(DeadlineWake::Unchanged(snapshot.clone()))
+                Ok(DeadlineWake::Unchanged(snapshot.snapshot()))
             }
-        }, on_error: std::convert::identity, }
+        })
     }
 
     ///
@@ -1149,8 +1560,9 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         now: UtcMillis,
     ) -> Effect<DeadlineWait, Self::Error> {
         let state = Arc::clone(&self.state);
-        effect_try_sync! { body: move || {
+        Self::storage_effect(move || {
             let mut state = lock_live(&state)?;
+            let capacity = state.capacity();
             let snapshot = state
                 .runs
                 .get_mut(&run)
@@ -1161,7 +1573,13 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                     | WorkflowStatus::Cancelled
                     | WorkflowStatus::Abandoned
             ) {
-                return Err(WorkflowEngineError::TerminalRun);
+                return Err(WorkflowEngineError::TerminalRun.into());
+            }
+            if let Some(capacity) = capacity {
+                check_bytes(
+                    Bytes::new(deadline.identity.as_bytes().len()),
+                    capacity.bytes_per_identity,
+                )?;
             }
             snapshot.deadline = Some(deadline.clone());
             if deadline.at <= now {
@@ -1177,7 +1595,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                 snapshot.wake_reason = None;
                 Ok(DeadlineWait::Waiting)
             }
-        }, on_error: std::convert::identity, }
+        })
     }
 
     ///
@@ -1194,14 +1612,15 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         signal: RecordedSignal,
     ) -> Effect<RecordedSignal, Self::Error> {
         let state = Arc::clone(&self.state);
-        effect_try_sync! { body: move || {
+        Self::storage_effect(move || {
             let mut state = lock_live(&state)?;
+            let capacity = state.capacity();
             let snapshot = state
                 .runs
                 .get_mut(&run)
                 .ok_or(WorkflowEngineError::MissingRun)?;
             if snapshot.handle.version != signal.version {
-                return Err(WorkflowEngineError::DefinitionMismatch);
+                return Err(WorkflowEngineError::DefinitionMismatch.into());
             }
             if let Some(existing) = snapshot
                 .signals
@@ -1209,7 +1628,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                 .find(|entry| entry.identity == signal.identity)
             {
                 if existing.payload != signal.payload {
-                    return Err(WorkflowEngineError::SignalConflict);
+                    return Err(WorkflowEngineError::SignalConflict.into());
                 }
                 return Ok(existing.clone());
             }
@@ -1219,9 +1638,15 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                     | WorkflowStatus::Cancelled
                     | WorkflowStatus::Abandoned
             ) {
-                return Err(WorkflowEngineError::TerminalRun);
+                return Err(WorkflowEngineError::TerminalRun.into());
             }
-            snapshot.signals.push(signal.clone());
+            let charge = snapshot.prepare_history(
+                capacity,
+                &[signal.identity.as_bytes().len()],
+                &[signal.payload.len()],
+            )?;
+            snapshot.signals.try_push(signal.clone())?;
+            snapshot.publish_history(charge);
             if snapshot.status == WorkflowStatus::Suspended
                 && matches!(&snapshot.waiting_on,
                 Some(WorkflowWait::Signal { identity, version })
@@ -1229,11 +1654,10 @@ impl WorkflowEngine for MemoryWorkflowEngine {
             {
                 snapshot.status = WorkflowStatus::Ready;
                 snapshot.waiting_on = None;
-                snapshot.wake_reason =
-                    Some(WorkflowWakeReason::Signal(signal.identity.clone()));
+                snapshot.wake_reason = Some(WorkflowWakeReason::Signal(signal.identity.clone()));
             }
             Ok(signal.clone())
-        }, on_error: std::convert::identity, }
+        })
     }
 
     ///
@@ -1252,7 +1676,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         version: WorkflowVersion,
     ) -> Effect<Option<RecordedSignal>, Self::Error> {
         let state = Arc::clone(&self.state);
-        effect_try_sync! { body: move || {
+        Self::storage_effect(move || {
             let state = state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1261,14 +1685,14 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                 .get(&run)
                 .ok_or(WorkflowEngineError::MissingRun)?;
             if snapshot.handle.version != version {
-                return Err(WorkflowEngineError::DefinitionMismatch);
+                return Err(WorkflowEngineError::DefinitionMismatch.into());
             }
             Ok(snapshot
                 .signals
                 .iter()
                 .find(|entry| entry.identity == signal)
                 .cloned())
-        }, on_error: std::convert::identity, }
+        })
     }
 
     ///
@@ -1287,14 +1711,15 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         version: WorkflowVersion,
     ) -> Effect<SignalWait, Self::Error> {
         let state = Arc::clone(&self.state);
-        effect_try_sync! { body: move || {
+        Self::storage_effect(move || {
             let mut state = lock_live(&state)?;
+            let capacity = state.capacity();
             let snapshot = state
                 .runs
                 .get_mut(&run)
                 .ok_or(WorkflowEngineError::MissingRun)?;
             if snapshot.handle.version != version {
-                return Err(WorkflowEngineError::DefinitionMismatch);
+                return Err(WorkflowEngineError::DefinitionMismatch.into());
             }
             if let Some(recorded) = snapshot
                 .signals
@@ -1319,7 +1744,13 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                     | WorkflowStatus::Cancelled
                     | WorkflowStatus::Abandoned
             ) {
-                return Err(WorkflowEngineError::TerminalRun);
+                return Err(WorkflowEngineError::TerminalRun.into());
+            }
+            if let Some(capacity) = capacity {
+                check_bytes(
+                    Bytes::new(signal.as_bytes().len()),
+                    capacity.bytes_per_identity,
+                )?;
             }
             snapshot.status = WorkflowStatus::Suspended;
             snapshot.waiting_on = Some(WorkflowWait::Signal {
@@ -1328,7 +1759,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
             });
             snapshot.wake_reason = None;
             Ok(SignalWait::Waiting)
-        }, on_error: std::convert::identity, }
+        })
     }
 
     ///
@@ -1347,8 +1778,9 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         order: NonZeroU32,
     ) -> Effect<RecordedCompensation, Self::Error> {
         let state = Arc::clone(&self.state);
-        effect_try_sync! { body: move || {
+        Self::storage_effect(move || {
             let mut state = lock_live(&state)?;
+            let capacity = state.capacity();
             let snapshot = state
                 .runs
                 .get_mut(&run)
@@ -1359,7 +1791,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                 .find(|entry| entry.identity == identity)
             {
                 if existing.order != order {
-                    return Err(WorkflowEngineError::CompensationConflict);
+                    return Err(WorkflowEngineError::CompensationConflict.into());
                 }
                 return Ok(existing.clone());
             }
@@ -1369,23 +1801,25 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                     | WorkflowStatus::Cancelled
                     | WorkflowStatus::Abandoned
             ) {
-                return Err(WorkflowEngineError::TerminalRun);
+                return Err(WorkflowEngineError::TerminalRun.into());
             }
             if snapshot
                 .compensations
                 .iter()
                 .any(|entry| entry.order == order)
             {
-                return Err(WorkflowEngineError::CompensationConflict);
+                return Err(WorkflowEngineError::CompensationConflict.into());
             }
             let entry = RecordedCompensation {
                 identity: identity.clone(),
                 order,
                 state: CompensationState::Pending,
             };
-            snapshot.compensations.push(entry.clone());
+            let charge = snapshot.prepare_history(capacity, &[identity.as_bytes().len()], &[])?;
+            snapshot.compensations.try_push(entry.clone())?;
+            snapshot.publish_history(charge);
             Ok(entry)
-        }, on_error: std::convert::identity, }
+        })
     }
 
     ///
@@ -1404,29 +1838,41 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         outcome: EncodedWorkflowOutcome,
     ) -> Effect<RecordedCompensation, Self::Error> {
         let state = Arc::clone(&self.state);
-        effect_try_sync! { body: move || {
+        Self::storage_effect(move || {
             let mut state = lock_live(&state)?;
+            let capacity = state.capacity();
             let snapshot = state
                 .runs
                 .get_mut(&run)
                 .ok_or(WorkflowEngineError::MissingRun)?;
+            let index = snapshot
+                .compensations
+                .iter()
+                .position(|entry| entry.identity == identity)
+                .ok_or(WorkflowEngineError::CompensationConflict)?;
             let entry = snapshot
                 .compensations
-                .iter_mut()
-                .find(|entry| entry.identity == identity)
+                .get(index)
                 .ok_or(WorkflowEngineError::CompensationConflict)?;
             match &entry.state {
                 CompensationState::Completed(existing) if existing == &outcome => {
                     return Ok(entry.clone());
                 }
                 CompensationState::Completed(_) => {
-                    return Err(WorkflowEngineError::CompensationConflict);
+                    return Err(WorkflowEngineError::CompensationConflict.into());
                 }
                 CompensationState::Pending => {}
             }
+            let charge = snapshot.prepare_history(capacity, &[], &[outcome.payload.len()])?;
+            let entry = snapshot
+                .compensations
+                .get_mut(index)
+                .ok_or(WorkflowEngineError::CompensationConflict)?;
             entry.state = CompensationState::Completed(outcome.clone());
-            Ok(entry.clone())
-        }, on_error: std::convert::identity, }
+            let output = entry.clone();
+            snapshot.publish_history(charge);
+            Ok(output)
+        })
     }
 
     ///
@@ -1441,7 +1887,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         run: WorkflowRunId,
     ) -> Effect<Vec<RecordedCompensation>, Self::Error> {
         let state = Arc::clone(&self.state);
-        effect_try_sync! { body: move || {
+        Self::storage_effect(move || {
             let state = state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1457,7 +1903,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                 .collect();
             entries.sort_by_key(|entry| std::cmp::Reverse(entry.order));
             Ok(entries)
-        }, on_error: std::convert::identity, }
+        })
     }
 
     ///
@@ -1474,7 +1920,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         race: WorkflowRaceId,
     ) -> Effect<Option<RecordedRace>, Self::Error> {
         let state = Arc::clone(&self.state);
-        effect_try_sync! { body: move || {
+        Self::storage_effect(move || {
             let state = state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1487,7 +1933,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                 .iter()
                 .find(|entry| entry.identity == race)
                 .cloned())
-        }, on_error: std::convert::identity, }
+        })
     }
 
     ///
@@ -1504,8 +1950,9 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         race: RecordedRace,
     ) -> Effect<RecordedRace, Self::Error> {
         let state = Arc::clone(&self.state);
-        effect_try_sync! { body: move || {
+        Self::storage_effect(move || {
             let mut state = lock_live(&state)?;
+            let capacity = state.capacity();
             let snapshot = state
                 .runs
                 .get_mut(&run)
@@ -1518,7 +1965,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                 return if existing == &race {
                     Ok(existing.clone())
                 } else {
-                    Err(WorkflowEngineError::RaceConflict)
+                    Err(WorkflowEngineError::RaceConflict.into())
                 };
             }
             if matches!(
@@ -1527,18 +1974,24 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                     | WorkflowStatus::Cancelled
                     | WorkflowStatus::Abandoned
             ) {
-                return Err(WorkflowEngineError::TerminalRun);
+                return Err(WorkflowEngineError::TerminalRun.into());
             }
             if !snapshot
                 .activities
                 .iter()
                 .any(|entry| entry.identity == race.winner && entry.attempt == race.attempt)
             {
-                return Err(WorkflowEngineError::RaceWinnerMissing);
+                return Err(WorkflowEngineError::RaceWinnerMissing.into());
             }
-            snapshot.races.push(race.clone());
+            let charge = snapshot.prepare_history(
+                capacity,
+                &[race.identity.as_bytes().len(), race.winner.as_bytes().len()],
+                &[],
+            )?;
+            snapshot.races.try_push(race.clone())?;
+            snapshot.publish_history(charge);
             Ok(race.clone())
-        }, on_error: std::convert::identity, }
+        })
     }
 
     ///
@@ -1554,46 +2007,15 @@ impl WorkflowEngine for MemoryWorkflowEngine {
         run: WorkflowRunId,
         outcome: EncodedWorkflowOutcome,
     ) -> Effect<WorkflowSnapshot, Self::Error> {
-        let state = Arc::clone(&self.state);
-        effect_try_sync! { body: move || {
-            let mut state = lock_live(&state)?;
-            let prior = state
-                .runs
-                .get(&run)
-                .ok_or(WorkflowEngineError::MissingRun)?;
-            match &prior.status {
-                WorkflowStatus::Completed(existing) if existing == &outcome => {
-                    return Ok(prior.clone());
-                }
-                WorkflowStatus::Completed(_)
-                | WorkflowStatus::Cancelled
-                | WorkflowStatus::Abandoned => {
-                    return Err(WorkflowEngineError::TerminalRun);
-                }
-                WorkflowStatus::Ready | WorkflowStatus::Running | WorkflowStatus::Suspended => {
-                }
-            }
-            let child_runs = descendants(&state.runs, &run)?;
-            if child_runs.iter().any(|child| {
-                !matches!(
-                    state.runs.get(child).map(|snapshot| &snapshot.status),
-                    Some(WorkflowStatus::Completed(_)) | Some(WorkflowStatus::Cancelled)
-                )
-            }) {
-                return Err(WorkflowEngineError::StateConflict);
-            }
-            let snapshot = state
-                .runs
-                .get_mut(&run)
-                .ok_or(WorkflowEngineError::MissingRun)?;
-            snapshot.status = WorkflowStatus::Completed(outcome.clone());
-            snapshot.deadline = None;
-            snapshot.waiting_on = None;
-            snapshot.wake_reason = None;
-            let completed = snapshot.clone();
-            wake_parent(&mut state.runs, &run);
-            Ok(completed)
-        }, on_error: std::convert::identity, }
+        self.complete_projected(run, outcome, Run::snapshot)
+    }
+
+    fn complete_head(
+        &self,
+        run: WorkflowRunId,
+        outcome: EncodedWorkflowOutcome,
+    ) -> Effect<WorkflowHead, Self::Error> {
+        self.complete_projected(run, outcome, Run::head)
     }
 
     ///
@@ -1605,9 +2027,9 @@ impl WorkflowEngine for MemoryWorkflowEngine {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn cancel(&self, run: WorkflowRunId) -> Effect<CancellationOutcome, Self::Error> {
         let state = Arc::clone(&self.state);
-        effect_try_sync! { body: move || {
+        Self::storage_effect(move || {
             let mut state = lock_live(&state)?;
-            let child_runs = descendants(&state.runs, &run)?;
+            let child_runs = descendants(&state, &run)?;
             if child_runs.iter().any(|child| {
                 matches!(
                     state.runs.get(child).map(|snapshot| &snapshot.status),
@@ -1624,9 +2046,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                 WorkflowStatus::Completed(_) => CancellationOutcome::AlreadyCompleted,
                 WorkflowStatus::Cancelled => CancellationOutcome::AlreadyCancelled,
                 WorkflowStatus::Running => CancellationOutcome::Active,
-                WorkflowStatus::Ready
-                | WorkflowStatus::Suspended
-                | WorkflowStatus::Abandoned => {
+                WorkflowStatus::Ready | WorkflowStatus::Suspended | WorkflowStatus::Abandoned => {
                     snapshot.status = WorkflowStatus::Cancelled;
                     snapshot.deadline = None;
                     snapshot.waiting_on = None;
@@ -1635,8 +2055,8 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                 }
             };
             if matches!(outcome, CancellationOutcome::Cancelled) {
-                for child in child_runs {
-                    if let Some(snapshot) = state.runs.get_mut(&child)
+                for child in child_runs.iter() {
+                    if let Some(snapshot) = state.runs.get_mut(child)
                         && !matches!(snapshot.status, WorkflowStatus::Completed(_))
                     {
                         snapshot.status = WorkflowStatus::Cancelled;
@@ -1650,7 +2070,7 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                 wake_parent(&mut state.runs, &run);
             }
             Ok(outcome)
-        }, on_error: std::convert::identity, }
+        })
     }
 
     ///
@@ -1662,9 +2082,9 @@ impl WorkflowEngine for MemoryWorkflowEngine {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn force_interrupt(&self, run: WorkflowRunId) -> Effect<CancellationOutcome, Self::Error> {
         let state = Arc::clone(&self.state);
-        effect_try_sync! { body: move || {
+        Self::storage_effect(move || {
             let mut state = lock_live(&state)?;
-            let child_runs = descendants(&state.runs, &run)?;
+            let child_runs = descendants(&state, &run)?;
             let snapshot = state
                 .runs
                 .get_mut(&run)
@@ -1684,8 +2104,8 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                 }
             };
             if matches!(outcome, CancellationOutcome::Cancelled) {
-                for child in child_runs {
-                    if let Some(snapshot) = state.runs.get_mut(&child)
+                for child in child_runs.iter() {
+                    if let Some(snapshot) = state.runs.get_mut(child)
                         && !matches!(snapshot.status, WorkflowStatus::Completed(_))
                     {
                         snapshot.status = WorkflowStatus::Cancelled;
@@ -1699,6 +2119,6 @@ impl WorkflowEngine for MemoryWorkflowEngine {
                 wake_parent(&mut state.runs, &run);
             }
             Ok(outcome)
-        }, on_error: std::convert::identity, }
+        })
     }
 }

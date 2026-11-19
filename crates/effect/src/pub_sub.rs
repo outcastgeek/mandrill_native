@@ -551,7 +551,7 @@ impl<A: Send + Sync + 'static> PubSub<A> {
             };
             let hub = hub.clone();
             let commit = commit.clone();
-            Step::Suspended(Box::pin(async move {
+            Step::suspended(Box::pin(async move {
                 let outcome =
                     AssertUnwindSafe(hub.inner.publish(value, context.cancellation, commit))
                         .catch_unwind()
@@ -819,7 +819,7 @@ impl<A: Send + Sync + 'static> Subscription<A> {
         let subscription = Arc::clone(&self.inner);
         Effect::new(move |_, context, finish| {
             let subscription = Arc::clone(&subscription);
-            Step::Suspended(Box::pin(async move {
+            Step::suspended(Box::pin(async move {
                 let outcome = AssertUnwindSafe(subscription.take(context.cancellation))
                     .catch_unwind()
                     .await

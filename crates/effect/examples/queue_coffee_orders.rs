@@ -1,6 +1,6 @@
 //! Deliver Nora's pickup ticket from a persisted queue to one barista worker.
 //!
-//! Run: `cargo +1.99.0 run -p effect --example queue_coffee_orders`.
+//! Run: `cargo +1.100.0 run -p effect --example queue_coffee_orders`.
 //! Input: ticket 106 for one cup. Output: one set of pickup instructions, its recorded
 //! result, and an empty claim after acknowledgement. Stores are process-local.
 

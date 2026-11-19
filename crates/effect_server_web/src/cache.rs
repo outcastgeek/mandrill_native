@@ -8,11 +8,14 @@ use crate::{WebError, admission::independent};
 use crate::{
     effect_die, effect_future, effect_map, effect_map_error, effect_sync, effect_try_sync,
 };
+use effect::memory::{Bytes, MemoryError, PreparedMemory, RegionId};
 use effect::{
-    AdmissionCapacity, AdmissionError, Cache, CacheAdmission, CacheCapacity, CacheConfig,
+    AdmissionCapacity, AdmissionError, Cache, CacheAdmission, CacheCapacity, CacheConfig, CacheKey,
     CacheLookup, CacheObservation, CacheOptions, CacheTtl, DependencyCache, DependencyCacheError,
-    DependencyCachePolicy, Effect, Exit, HasClock, HasTaskSpawner, ProviderAdmission, Scope,
-    SharedValue, effect,
+    DependencyCachePolicy, Effect, Exit, HasClock, HasTaskSpawner, PreparedCacheCapacity,
+    PreparedCacheRefusals, PreparedCacheStorage, PreparedDependencyCache, PreparedDependencyPolicy,
+    PreparedDependencyPool, PreparedDependencyStorage, PreparedDependencyValue,
+    PreparedDependencyWriter, ProviderAdmission, Scope, SharedValue, effect,
 };
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -46,6 +49,15 @@ impl Retain {
         }
         Ok(Self { mode, ttl })
     }
+
+    /// Settled entry capacity used when budgeting the selected core index.
+    #[must_use]
+    pub const fn cache_capacity(self) -> CacheCapacity {
+        match self.mode {
+            Retention::Bounded(maximum) => CacheCapacity::Bounded(maximum),
+            Retention::Coalescing | Retention::Disabled => CacheCapacity::NoRetention,
+        }
+    }
 }
 /// Explicit active-loader admission using typed capacity failures.
 #[must_use]
@@ -73,6 +85,7 @@ enum Origin<
 > {
     /// Reuse the existing shared-load/retained engine.
     Cached(Cache<K, A, E>),
+    PreparedIndependent(Cache<K, A, E>),
     /// No cache state is kept; each call owns its loader and core permit.
     Disabled {
         /// Core producer admission and drain owner.
@@ -179,10 +192,45 @@ impl<
             }
         }
     }
+
+    /// Acquire the selected retained, coalescing or independent cache using startup backing.
+    pub fn scoped_prepared(
+        scope: Scope<SharedValue<E>>,
+        keys: impl Fn(&K, &K) -> bool + Send + Sync + 'static,
+        retain: Retain,
+        admission: LoadAdmission<E>,
+        (memory, refusals): (PreparedCacheStorage<K, A, E>, PreparedCacheRefusals<E>),
+        cache_failures: impl Fn(&E) -> bool + Send + Sync + 'static,
+        loader: impl Fn(CacheKey<K>) -> Effect<A, E, R> + Send + Sync + 'static,
+    ) -> Effect<Self, SharedValue<E>, R> {
+        let independent = matches!(retain.mode, Retention::Disabled);
+        let cache = effect::cache! {
+            scope: scope,
+            config: CacheConfig {
+                equal: Arc::new(keys), ttl: retain.ttl,
+                capacity: retain.cache_capacity(), cache_failure: Arc::new(cache_failures),
+            },
+            options: CacheOptions {
+                ttl: CacheTtl::Fixed(retain.ttl),
+                admission: CacheAdmission::Bounded {
+                    maximum: admission.maximum,
+                    capacity_error: Arc::new(move || (admission.on_full)(AdmissionError::Full)),
+                },
+            },
+            memory: memory, refusals: refusals, independent: independent, load_shared: loader,
+        };
+        effect_map! {
+            program: cache,
+            map: move |cache| {
+                let owner = if independent { Origin::PreparedIndependent(cache) } else { Origin::Cached(cache) };
+                Self { origin: Arc::new(owner) }
+            },
+        }
+    }
     /// Get/load one key and atomically classify its selected acquisition path.
     pub fn get_observed(&self, key: K) -> Effect<CacheLookup<A>, SharedValue<E>, R> {
         match self.origin.as_ref() {
-            Origin::Cached(cache) => cache.get_observed(key),
+            Origin::Cached(cache) | Origin::PreparedIndependent(cache) => cache.get_observed(key),
             Origin::Disabled {
                 owner,
                 load,
@@ -228,7 +276,7 @@ impl<
     pub fn try_get(&self, key: K) -> Effect<Option<SharedValue<A>>, SharedValue<E>, R> {
         match self.origin.as_ref() {
             Origin::Cached(cache) => cache.try_get(key),
-            Origin::Disabled { .. } => {
+            Origin::Disabled { .. } | Origin::PreparedIndependent(_) => {
                 effect_sync! { body: { let __dsl_value = None; move || __dsl_value.clone() }, }
             }
         }
@@ -238,14 +286,14 @@ impl<
     pub fn invalidate(&self, key: K) -> Effect<(), SharedValue<E>, R> {
         match self.origin.as_ref() {
             Origin::Cached(cache) => cache.invalidate(key),
-            Origin::Disabled { .. } => effect_sync! { body { () }, },
+            Origin::Disabled { .. } | Origin::PreparedIndependent(_) => effect_sync! { body { () }, },
         }
     }
     /// Replace through the same core owner; disabled mode deliberately retains nothing.
     pub fn set(&self, key: K, value: A) -> Effect<(), SharedValue<E>, R> {
         match self.origin.as_ref() {
             Origin::Cached(cache) => cache.set(key, value),
-            Origin::Disabled { .. } => {
+            Origin::Disabled { .. } | Origin::PreparedIndependent(_) => {
                 effect_map! { program: effect_try_sync! { once; body: { let __dsl_result = Ok(value); move || __dsl_result }, on_error: ::core::convert::identity, }, map: |_| (), }
             }
         }
@@ -254,13 +302,13 @@ impl<
     pub fn clear(&self) -> Effect<(), SharedValue<E>, R> {
         match self.origin.as_ref() {
             Origin::Cached(cache) => cache.clear(),
-            Origin::Disabled { .. } => effect_sync! { body { () }, },
+            Origin::Disabled { .. } | Origin::PreparedIndependent(_) => effect_sync! { body { () }, },
         }
     }
     /// Close and join the selected core owner. No native task is detached on drop.
     pub fn shutdown(&self) -> Effect<(), SharedValue<E>, R> {
         match self.origin.as_ref() {
-            Origin::Cached(cache) => effect_map! { program: cache.shutdown(), map: |_| (), },
+            Origin::Cached(cache) | Origin::PreparedIndependent(cache) => effect_map! { program: cache.shutdown(), map: |_| (), },
             Origin::Disabled { owner, .. } => {
                 let owner = owner.clone();
                 effect_future! {
@@ -280,6 +328,59 @@ impl<
 type DependencyLoader<K, D, A, E, R> =
     Arc<dyn Fn(Arc<K>) -> Effect<(A, Vec<D>), E, R> + Send + Sync>;
 
+/// Selected region backing for a dependency read-through and its finite writers.
+pub struct PreparedDependentReadThroughStorage<
+    K: Send + Sync + 'static,
+    D: Send + Sync + 'static,
+    A: Send + 'static,
+    E: Send + 'static,
+> {
+    cache: PreparedDependencyStorage<K, D, A, E>,
+    writers: Arc<PreparedDependencyPool<D>>,
+    maximum_dependencies: NonZeroUsize,
+}
+
+impl<K: Send + Sync + 'static, D: Send + Sync + 'static, A: Send + 'static, E: Send + 'static>
+    PreparedDependentReadThroughStorage<K, D, A, E>
+{
+    /// Region bytes for cache records, values, and retained dependency identities.
+    pub fn storage_bytes(
+        cache: PreparedCacheCapacity,
+        values: NonZeroUsize,
+        writers: NonZeroUsize,
+        maximum_dependencies: NonZeroUsize,
+    ) -> Result<Bytes, MemoryError> {
+        PreparedDependencyStorage::<K, D, A, E>::storage_bytes(cache, values)?.checked_add(
+            PreparedDependencyPool::<D>::storage_bytes(writers.get(), maximum_dependencies.get())?,
+        )
+    }
+
+    /// Reserve storage before Web startup begins accepting requests.
+    pub fn prepare(
+        memory: &PreparedMemory<'static>,
+        region: RegionId,
+        cache: PreparedCacheCapacity,
+        values: NonZeroUsize,
+        writers: NonZeroUsize,
+        maximum_dependencies: NonZeroUsize,
+    ) -> Result<Self, MemoryError> {
+        let _ = Self::storage_bytes(cache, values, writers, maximum_dependencies)?;
+        Ok(Self {
+            cache: PreparedDependencyStorage::prepare(memory, region, cache, values)?,
+            writers: Arc::new(
+                PreparedDependencyPool::prepare(
+                    memory,
+                    region,
+                    writers.get(),
+                    maximum_dependencies.get(),
+                )?
+                .with_logical_width_errors(),
+            ),
+            maximum_dependencies,
+        })
+    }
+}
+
 /// Core dependency owner or deliberately independent disabled origin loads.
 enum DependentOrigin<
     K: Send + Sync + 'static,
@@ -290,6 +391,12 @@ enum DependentOrigin<
 > {
     /// Existing cache/dependency index owns all coalescing/retained associations.
     Core(DependencyCache<K, D, A, E>),
+    Prepared {
+        cache: PreparedDependencyCache<K, D, A, E>,
+        independent: bool,
+        maximum_dependencies: NonZeroUsize,
+        refusals: PreparedCacheRefusals<DependencyCacheError<E>>,
+    },
     /// Independent producers retain no dependency metadata or settled values.
     Disabled {
         /// Core active-loader reservation/drain capability.
@@ -458,6 +565,144 @@ impl<
             },
         )
     }
+
+    /// Acquire the selected cache and pass its reserved dependency writer to each loader.
+    /// The writer must be returned with the value so the exact written identities can be retained.
+    pub fn scoped_prepared(
+        scope: Scope<SharedValue<DependencyCacheError<E>>>,
+        retain: Retain,
+        admission: LoadAdmission<E>,
+        maximum_dependencies: NonZeroUsize,
+        callbacks: (
+            impl Fn(&K, &K) -> bool + Send + Sync + 'static,
+            impl Fn(&D, &D) -> bool + Send + Sync + 'static,
+            impl Fn(&E) -> bool + Send + Sync + 'static,
+        ),
+        (memory, refusals): (
+            PreparedDependentReadThroughStorage<K, D, A, E>,
+            PreparedCacheRefusals<DependencyCacheError<E>>,
+        ),
+        loader: impl Fn(
+            CacheKey<K>,
+            PreparedDependencyWriter<D>,
+        ) -> Effect<(A, PreparedDependencyWriter<D>), E, R>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Effect<Self, SharedValue<DependencyCacheError<E>>, R> {
+        let independent = matches!(retain.mode, Retention::Disabled);
+        if memory.maximum_dependencies != maximum_dependencies {
+            return effect_try_sync! { body: move || Err(refusals.memory(MemoryError::UnsupportedRunContract)), };
+        }
+        let (keys, dependencies, cache_failures) = callbacks;
+        let admission_error = admission.on_full.clone();
+        let policy = PreparedDependencyPolicy {
+            config: CacheConfig {
+                equal: Arc::new(keys),
+                ttl: retain.ttl,
+                capacity: retain.cache_capacity(),
+                cache_failure: Arc::new(move |error| match error {
+                    DependencyCacheError::Load(error) => cache_failures(error),
+                    DependencyCacheError::DependencyCapacity { .. }
+                    | DependencyCacheError::ActiveCapacity { .. }
+                    | DependencyCacheError::Memory(_) => false,
+                }),
+            },
+            options: CacheOptions {
+                ttl: CacheTtl::Fixed(retain.ttl),
+                admission: CacheAdmission::Bounded {
+                    maximum: admission.maximum,
+                    capacity_error: Arc::new(move || {
+                        DependencyCacheError::Load((admission.on_full)(AdmissionError::Full))
+                    }),
+                },
+            },
+            dependency_equal: Arc::new(dependencies),
+        };
+        let cache = if independent {
+            PreparedDependencyCache::make_prepared_independent(
+                scope,
+                policy,
+                memory.cache,
+                memory.writers,
+                refusals.clone(),
+                loader,
+            )
+        } else {
+            PreparedDependencyCache::make_prepared_with_refusals(
+                scope,
+                policy,
+                memory.cache,
+                memory.writers,
+                refusals.clone(),
+                loader,
+            )
+        };
+        effect_map! {
+            program: cache,
+            map: move |cache| Self {
+                origin: Arc::new(DependentOrigin::Prepared {
+                    cache, independent, maximum_dependencies, refusals: refusals.clone(),
+                }),
+                admission_error: admission_error.clone(),
+            },
+        }
+    }
+
+    /// Select dependencies from a borrowed successful value while retaining the
+    /// resulting identities in the reserved writer. Selector-owned Vec backing
+    /// remains with the callback until the identities move into the writer.
+    pub fn scoped_prepared_by(
+        scope: Scope<SharedValue<DependencyCacheError<E>>>,
+        retain: Retain,
+        admission: LoadAdmission<E>,
+        maximum_dependencies: NonZeroUsize,
+        callbacks: (
+            impl Fn(&K, &K) -> bool + Send + Sync + 'static,
+            impl Fn(&D, &D) -> bool + Send + Sync + 'static,
+            impl Fn(&E) -> bool + Send + Sync + 'static,
+        ),
+        prepared: (
+            PreparedDependentReadThroughStorage<K, D, A, E>,
+            PreparedCacheRefusals<DependencyCacheError<E>>,
+        ),
+        (loader, select): (
+            impl Fn(CacheKey<K>) -> Effect<A, E, R> + Send + Sync + 'static,
+            impl Fn(&K, &A) -> Vec<D> + Send + Sync + 'static,
+        ),
+    ) -> Effect<Self, SharedValue<DependencyCacheError<E>>, R> {
+        let select = Arc::new(select);
+        Self::scoped_prepared(
+            scope,
+            retain,
+            admission,
+            maximum_dependencies,
+            callbacks,
+            prepared,
+            move |key, writer| {
+                let select = select.clone();
+                let loaded = loader(key.clone());
+                let writer = effect_sync! { once; body: move || writer, };
+                effect! {
+                    let select = select.clone();
+                    let key = key.clone();
+                    let loaded = loaded.clone();
+                    let writer = writer.clone();
+                    let mut writer = writer?;
+                    let value = loaded?;
+                    effect_sync! {
+                        once;
+                        body: move || {
+                            for dependency in select(&key, &value) {
+                                let _ = writer.push(dependency);
+                            }
+                            (value, writer)
+                        },
+                    }?
+                }
+            },
+        )
+    }
     /// Acquire a value and its atomic core Loaded/Shared/Retained classification.
     pub fn get_observed(
         &self,
@@ -479,6 +724,18 @@ impl<
                         error
                     }
                 }, }
+            }
+            DependentOrigin::Prepared { cache, .. } => {
+                effect! {
+                    bind;
+                    program: cache.get_observed(key),
+                    body: move |lookup: CacheLookup<PreparedDependencyValue<A, D>>| {
+                        match lookup.value.with(|value| value.value.clone()) {
+                            Ok(value) => effect_sync! { once; body: move || CacheLookup { value, observation: lookup.observation }, },
+                            Err(defect) => effect_die! { defect: defect, },
+                        }
+                    },
+                }
             }
             DependentOrigin::Disabled {
                 owner,
@@ -547,7 +804,19 @@ impl<
     ) -> Effect<Option<SharedValue<A>>, SharedValue<DependencyCacheError<E>>, R> {
         match self.origin.as_ref() {
             DependentOrigin::Core(cache) => cache.try_get(key),
-            DependentOrigin::Disabled { .. } => {
+            DependentOrigin::Prepared { cache, independent: false, .. } => {
+                effect! {
+                    bind;
+                    program: cache.try_get(key),
+                    body: move |result: Option<SharedValue<PreparedDependencyValue<A, D>>>| {
+                        match result.map(|value| value.with(|value| value.value.clone())).transpose() {
+                            Ok(value) => effect_sync! { once; body: move || value, },
+                            Err(defect) => effect_die! { defect: defect, },
+                        }
+                    },
+                }
+            }
+            DependentOrigin::Disabled { .. } | DependentOrigin::Prepared { independent: true, .. } => {
                 effect_sync! { body: { let __dsl_value = None; move || __dsl_value.clone() }, }
             }
         }
@@ -561,6 +830,34 @@ impl<
     ) -> Effect<(), SharedValue<DependencyCacheError<E>>, R> {
         match self.origin.as_ref() {
             DependentOrigin::Core(cache) => cache.set(key, value, dependencies),
+            DependentOrigin::Prepared { cache, independent, maximum_dependencies, refusals } => {
+                let independent = *independent;
+                let maximum = maximum_dependencies.get();
+                let cache = cache.clone();
+                let refusals = refusals.clone();
+                effect! {
+                    bind;
+                    program: effect_sync! { once; body: move || (key, value, dependencies), },
+                    body: move |(key, value, dependencies): (K, A, Vec<D>)| {
+                        let writer = if dependencies.len() > maximum {
+                            Err(cache.dependency_capacity_error(maximum, dependencies.len()))
+                        } else if independent {
+                            return effect_sync! { body { () }, };
+                        } else {
+                            cache.try_writer().and_then(|mut writer| {
+                                for dependency in dependencies {
+                                    writer.push(dependency)?;
+                                }
+                                Ok(writer)
+                            }).map_err(|error| refusals.memory(error))
+                        };
+                        match writer {
+                            Ok(writer) => cache.set(key, value, writer),
+                            Err(error) => effect_try_sync! { once; body: move || Err(error), },
+                        }
+                    },
+                }
+            }
             DependentOrigin::Disabled {
                 maximum_dependencies,
                 ..
@@ -591,7 +888,8 @@ impl<
     pub fn invalidate(&self, key: K) -> Effect<(), SharedValue<DependencyCacheError<E>>, R> {
         match self.origin.as_ref() {
             DependentOrigin::Core(cache) => cache.invalidate(key),
-            DependentOrigin::Disabled { .. } => effect_sync! { body { () }, },
+            DependentOrigin::Prepared { cache, independent: false, .. } => cache.invalidate(key),
+            DependentOrigin::Disabled { .. } | DependentOrigin::Prepared { independent: true, .. } => effect_sync! { body { () }, },
         }
     }
     /// Core dependency invalidation conservatively fences/cancels/joins earlier
@@ -602,20 +900,23 @@ impl<
     ) -> Effect<(), SharedValue<DependencyCacheError<E>>, R> {
         match self.origin.as_ref() {
             DependentOrigin::Core(cache) => cache.invalidate_dependency(dependency),
-            DependentOrigin::Disabled { .. } => effect_sync! { body { () }, },
+            DependentOrigin::Prepared { cache, independent: false, .. } => cache.invalidate_dependency(dependency),
+            DependentOrigin::Disabled { .. } | DependentOrigin::Prepared { independent: true, .. } => effect_sync! { body { () }, },
         }
     }
     /// Remove retained associations and fence/join earlier active core producers.
     pub fn clear(&self) -> Effect<(), SharedValue<DependencyCacheError<E>>, R> {
         match self.origin.as_ref() {
             DependentOrigin::Core(cache) => cache.clear(),
-            DependentOrigin::Disabled { .. } => effect_sync! { body { () }, },
+            DependentOrigin::Prepared { cache, independent: false, .. } => cache.clear(),
+            DependentOrigin::Disabled { .. } | DependentOrigin::Prepared { independent: true, .. } => effect_sync! { body { () }, },
         }
     }
     /// Close selected admission and join producer cleanup through the original owner.
     pub fn shutdown(&self) -> Effect<(), SharedValue<DependencyCacheError<E>>, R> {
         match self.origin.as_ref() {
             DependentOrigin::Core(cache) => effect_map! { program: cache.shutdown(), map: |_| (), },
+            DependentOrigin::Prepared { cache, .. } => effect_map! { program: cache.shutdown(), map: |_| (), },
             DependentOrigin::Disabled { owner, .. } => {
                 let owner = owner.clone();
                 effect_future! {

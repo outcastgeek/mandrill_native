@@ -32,10 +32,14 @@ pub struct JsonWriterPolicy {
     pub depth: NonZeroUsize,
 }
 /// Identity and compact container counters captured before a codec appends one value; avoids copying object-name sets.
-pub(crate) struct WriterBoundary {
+pub(crate) struct OrdinaryBoundary {
     owner: std::sync::Arc<()>,
     root: bool,
     containers: Vec<ContainerBoundary>,
+}
+pub(crate) enum WriterBoundary {
+    Ordinary(OrdinaryBoundary),
+    Prepared(super::prepared_json_writer::Boundary),
 }
 enum ContainerBoundary {
     Array {
@@ -83,12 +87,15 @@ enum Container {
 /// # Ok::<(), effect::SchemaIssue>(())
 /// ```
 pub struct JsonWriter {
+    prepared: Option<super::prepared_json_writer::Owner>,
+    serde_counting: bool,
     /// Buffered destination retained for the original owned-byte API.
     output: Vec<u8>,
     /// Optional native destination; when present, output bytes are never collected.
     sink: Option<Box<dyn JsonWriterSink>>,
     /// Total successfully emitted bytes, independent of destination buffering.
     emitted: usize,
+    byte_limit_attempt: Option<Option<usize>>,
     identity: Option<std::sync::Arc<()>>,
     policy: JsonWriterPolicy,
     containers: Vec<Container>,
@@ -96,13 +103,28 @@ pub struct JsonWriter {
     failed: bool,
 }
 impl JsonWriter {
+    pub(crate) fn issue_memory(&self) -> Option<&super::PreparedIssueMemory> {
+        self.prepared.as_ref().and_then(|owner| owner.issues.as_deref())
+    }
+    /// Prefix a child issue using this writer's selected diagnostic backing.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn issue_at(&self, issue: SchemaIssue, segment: super::IssueSegment) -> SchemaIssue {
+        match &self.prepared {
+            Some(owner) => super::parse_context::selected_issue_at(owner.issues.as_deref(), issue, segment),
+            None => issue.at(segment),
+        }
+    }
     /// Create an empty writer with the supplied limits; no default resource policy is assumed.
     #[must_use]
     pub const fn new(policy: JsonWriterPolicy) -> Self {
         Self {
+            prepared: None,
+            serde_counting: false,
             output: Vec::new(),
             sink: None,
             emitted: 0,
+            byte_limit_attempt: None,
             identity: None,
             policy,
             containers: Vec::new(),
@@ -121,9 +143,40 @@ impl JsonWriter {
             ..Self::new(policy)
         }
     }
+    pub(super) fn from_prepared(policy: JsonWriterPolicy, owner: super::prepared_json_writer::Owner) -> Self {
+        Self { prepared: Some(owner), ..Self::new(policy) }
+    }
+    pub(super) fn from_serde_counting(policy: JsonWriterPolicy, owner: super::prepared_json_writer::Owner) -> Self {
+        Self { prepared: Some(owner), serde_counting: true, ..Self::new(policy) }
+    }
+    /// Return a complete prepared buffered document with its real backing retained.
+    pub fn finish_prepared(mut self) -> Result<super::PreparedJsonOutput, SchemaIssue> {
+        if self.failed || !self.root || self.prepared.as_ref().is_none_or(|owner| !owner.storage.containers.is_empty() || owner.has_sink()) {
+            return Err(SchemaIssue::new(SchemaIssueKind::InvalidDefinition));
+        }
+        let owner = self.prepared.take().ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?;
+        Ok(super::PreparedJsonOutput { owner })
+    }
     pub(crate) fn boundary(&mut self) -> Result<WriterBoundary, SchemaIssue> {
         if self.failed {
             return Err(SchemaIssue::new(SchemaIssueKind::InvalidDefinition));
+        }
+        if self.prepared.is_some() {
+            use super::prepared_json_writer::{Boundary, BoundaryFrame, Container as C};
+            let result = (|| {
+            let owner = self.prepared.as_mut().ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?;
+            let token = owner.token.try_clone().map_err(|_| SchemaIssue::new(SchemaIssueKind::LimitExceeded { resource: SchemaResource::WriterBoundaries }))?;
+            let mut snapshot = owner.snapshots.checkout().map_err(|_| SchemaIssue::new(SchemaIssueKind::LimitExceeded { resource: SchemaResource::WriterBoundaries }))?;
+            for entry in owner.storage.containers.as_slice() {
+                let frame = match entry {
+                    C::Array { serial, count } => BoundaryFrame::Array { serial: *serial, count: *count },
+                    C::Object { serial, count, pending, .. } => BoundaryFrame::Object { serial: *serial, count: *count, pending: *pending },
+                };
+                if snapshot.frames.push(frame).is_err() { snapshot.frames.clear(); return Err(SchemaIssue::new(SchemaIssueKind::Memory(crate::memory::MemoryError::NoSlot))); }
+            }
+            Ok(WriterBoundary::Prepared(Boundary { snapshot, token, root: self.root }))
+            })();
+            return result.map_err(|issue| self.fail(issue));
         }
         let owner = self.identity.get_or_insert_with(|| std::sync::Arc::new(()));
         let containers = self
@@ -145,15 +198,36 @@ impl JsonWriter {
                 },
             })
             .collect();
-        Ok(WriterBoundary {
+        Ok(WriterBoundary::Ordinary(OrdinaryBoundary {
             owner: std::sync::Arc::clone(owner),
             root: self.root,
             containers,
-        })
+        }))
     }
     /// Verify one appended value belongs to the original writer and leaves every caller-owned container intact.
     pub(crate) fn complete_value(&mut self, boundary: &WriterBoundary) -> Result<(), SchemaIssue> {
         let invalid = || SchemaIssue::new(SchemaIssueKind::InvalidDefinition);
+        if let WriterBoundary::Prepared(boundary) = boundary {
+            use super::prepared_json_writer::{BoundaryFrame as B, Container as C};
+            let Some(owner) = &self.prepared else { return Err(self.fail(invalid())); };
+            let before = boundary.snapshot.frames.as_slice();
+            let after = owner.storage.containers.as_slice();
+            if self.failed || !owner.token.same_slot(&boundary.token) || before.len() != after.len() { return Err(self.fail(invalid())); }
+            if before.is_empty() { if boundary.root || !self.root { return Err(self.fail(invalid())); } return Ok(()); }
+            if self.root != boundary.root { return Err(self.fail(invalid())); }
+            for (index, (left, right)) in before.iter().zip(after).enumerate() {
+                let last = index.saturating_add(1) == before.len();
+                let valid = match (left, right) {
+                    (B::Array { serial: a, count: x }, C::Array { serial: b, count: y }) => a == b && if last { x.checked_add(1) == Some(*y) } else { x == y },
+                    (B::Object { serial: a, count: x, pending: p }, C::Object { serial: b, count: y, pending: q, .. }) => a == b && x == y && if last { *p && !*q } else { p == q },
+                    _ => false,
+                };
+                if !valid { return Err(self.fail(invalid())); }
+            }
+            return Ok(());
+        }
+        let WriterBoundary::Ordinary(boundary) = boundary else { return Err(self.fail(invalid())); };
+        if self.prepared.is_some() { return Err(self.fail(invalid())); }
         if self.failed
             || self
                 .identity
@@ -233,16 +307,20 @@ impl JsonWriter {
         if self.failed {
             return Err(SchemaIssue::new(SchemaIssueKind::InvalidDefinition));
         }
-        if self
-            .emitted
-            .checked_add(bytes.len())
-            .is_none_or(|len| len > self.policy.bytes.get())
-        {
+        let attempted = self.emitted.checked_add(bytes.len());
+        if attempted.is_none_or(|len| len > self.policy.bytes.get()) {
+            self.byte_limit_attempt = Some(attempted);
             return Err(self.fail(SchemaIssue::new(SchemaIssueKind::LimitExceeded {
                 resource: SchemaResource::Bytes,
             })));
         }
-        if let Some(sink) = &mut self.sink {
+        if let Some(owner) = &mut self.prepared {
+            let result = match owner.write_sink(bytes) {
+                Some(result) => result,
+                None => owner.storage.output.extend_from_slice(bytes).map_err(|error| SchemaIssue::new(SchemaIssueKind::Memory(error))),
+            };
+            if let Err(issue) = result { return Err(self.fail(issue)); }
+        } else if let Some(sink) = &mut self.sink {
             if let Err(issue) = sink.write(bytes) {
                 return Err(self.fail(issue));
             }
@@ -252,6 +330,7 @@ impl JsonWriter {
         self.emitted += bytes.len();
         Ok(())
     }
+    pub(crate) fn byte_limit_attempt(&self) -> Option<Option<usize>> { self.byte_limit_attempt }
     fn value(&mut self) -> Result<(), SchemaIssue> {
         if self
             .containers
@@ -262,6 +341,27 @@ impl JsonWriter {
             return Err(self.fail(SchemaIssue::new(SchemaIssueKind::LimitExceeded {
                 resource: SchemaResource::JsonDepth,
             })));
+        }
+        if let Some(owner) = &mut self.prepared {
+            use super::prepared_json_writer::Container as PreparedContainer;
+            let depth = owner.storage.containers.len();
+            if depth.checked_add(1).is_none_or(|n| n > self.policy.depth.get()) {
+                return Err(self.fail(SchemaIssue::new(SchemaIssueKind::LimitExceeded { resource: SchemaResource::JsonDepth })));
+            }
+            let mut comma = false;
+            match owner.storage.containers.as_mut_slice().last_mut() {
+                Some(PreparedContainer::Array { count, .. }) => {
+                    comma = *count > 0;
+                    let Some(next) = count.checked_add(1) else { return Err(self.fail(SchemaIssue::new(SchemaIssueKind::Memory(crate::memory::MemoryError::ArithmeticOverflow)))); };
+                    *count = next;
+                }
+                Some(PreparedContainer::Object { pending, .. }) if *pending => *pending = false,
+                Some(PreparedContainer::Object { .. }) => return Err(self.fail(SchemaIssue::new(SchemaIssueKind::InvalidDefinition))),
+                None if self.root => return Err(self.fail(SchemaIssue::new(SchemaIssueKind::InvalidDefinition))),
+                None => self.root = true,
+            }
+            if comma { self.emit(b",")?; }
+            return Ok(());
         }
         match self.containers.last_mut() {
             Some(Container::Array { count, .. }) => {
@@ -282,8 +382,56 @@ impl JsonWriter {
         }
         Ok(())
     }
+    fn prepared_begin(&mut self, object: bool) -> Result<(), SchemaIssue> {
+        use super::prepared_json_writer::Container as C;
+        let owner = self.prepared.as_ref().ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?;
+        if owner.storage.containers.len() == owner.storage.containers.capacity() { return Err(self.fail(SchemaIssue::new(SchemaIssueKind::Memory(crate::memory::MemoryError::NoSlot)))); }
+        let Some(serial) = owner.storage.serial.checked_add(1) else { return Err(self.fail(SchemaIssue::new(SchemaIssueKind::Memory(crate::memory::MemoryError::ArithmeticOverflow)))); };
+        self.value()?;
+        self.emit(if object { b"{" } else { b"[" })?;
+        let owner = self.prepared.as_mut().ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?;
+        owner.storage.serial = serial;
+        let entry = if object { C::Object { serial, names_base: owner.storage.index.len(), bytes_base: owner.storage.names.len(), count: 0, pending: false } } else { C::Array { serial, count: 0 } };
+        if owner.storage.containers.push(entry).is_err() { return Err(self.fail(SchemaIssue::new(SchemaIssueKind::Memory(crate::memory::MemoryError::NoSlot)))); }
+        Ok(())
+    }
+    fn prepared_end(&mut self, object: bool) -> Result<(), SchemaIssue> {
+        use super::prepared_json_writer::Container as C;
+        let owner = self.prepared.as_mut().ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?;
+        let entry = owner.storage.containers.as_slice().last().copied();
+        match (object, entry) {
+            (false, Some(C::Array { .. })) => { owner.storage.containers.pop(); },
+            (true, Some(C::Object { names_base, bytes_base, pending: false, .. })) => {
+                owner.storage.containers.pop();
+                while owner.storage.index.len() > names_base { owner.storage.index.pop(); }
+                owner.storage.names.truncate(bytes_base);
+            },
+            _ => return Err(self.fail(SchemaIssue::new(SchemaIssueKind::InvalidDefinition))),
+        }
+        self.emit(if object { b"}" } else { b"]" })
+    }
+    fn prepared_property(&mut self, name: &str) -> Result<(), SchemaIssue> {
+        use super::prepared_json_writer::{Container as C, NameSpan};
+        let owner = self.prepared.as_mut().ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?;
+        let Some(C::Object { names_base, count, pending: false, .. }) = owner.storage.containers.as_slice().last().copied() else { return Err(self.fail(SchemaIssue::new(SchemaIssueKind::InvalidDefinition))); };
+        let Some(next_count) = count.checked_add(1) else { return Err(self.fail(SchemaIssue::new(SchemaIssueKind::Memory(crate::memory::MemoryError::ArithmeticOverflow)))); };
+        let duplicate = owner.storage.index.as_slice().iter().skip(names_base).any(|span| owner.storage.names.as_slice().get(span.start..span.end) == Some(name.as_bytes()));
+        if duplicate { let issue = super::schema_issue::prepared_duplicate_field(owner.issues.as_deref(), name); return Err(self.fail(issue)); }
+        if owner.storage.index.len() == owner.storage.index.capacity() { return Err(self.fail(SchemaIssue::new(SchemaIssueKind::Memory(crate::memory::MemoryError::NoSlot)))); }
+        let start = owner.storage.names.len();
+        if let Err(error) = owner.storage.names.extend_from_slice(name.as_bytes()) { return Err(self.fail(SchemaIssue::new(SchemaIssueKind::Memory(error)))); }
+        let end = owner.storage.names.len();
+        if owner.storage.index.push(NameSpan { start, end }).is_err() { owner.storage.names.truncate(start); return Err(self.fail(SchemaIssue::new(SchemaIssueKind::Memory(crate::memory::MemoryError::NoSlot)))); }
+        if let Some(C::Object { count, .. }) = owner.storage.containers.as_mut_slice().last_mut() { *count = next_count; }
+        if count > 0 { self.emit(b",")?; }
+        self.quoted(name)?;
+        self.emit(b":")?;
+        if let Some(owner) = &mut self.prepared && let Some(C::Object { pending, .. }) = owner.storage.containers.as_mut_slice().last_mut() { *pending = true; }
+        Ok(())
+    }
     /// Start one array value at the current position, checking depth and byte limits.
     pub fn begin_array(&mut self) -> Result<(), SchemaIssue> {
+        if self.prepared.is_some() { return self.prepared_begin(false); }
         self.value()?;
         self.emit(b"[")?;
         self.containers.push(Container::Array {
@@ -294,6 +442,7 @@ impl JsonWriter {
     }
     /// Close the current array. A different current container is an invalid-definition error.
     pub fn end_array(&mut self) -> Result<(), SchemaIssue> {
+        if self.prepared.is_some() { return self.prepared_end(false); }
         if !matches!(self.containers.last(), Some(Container::Array { .. })) {
             return Err(self.fail(SchemaIssue::new(SchemaIssueKind::InvalidDefinition)));
         }
@@ -302,6 +451,7 @@ impl JsonWriter {
     }
     /// Start one object value; names must be written with [`Self::property`] before their values.
     pub fn begin_object(&mut self) -> Result<(), SchemaIssue> {
+        if self.prepared.is_some() { return self.prepared_begin(true); }
         self.value()?;
         self.emit(b"{")?;
         self.containers.push(Container::Object {
@@ -313,6 +463,7 @@ impl JsonWriter {
     }
     /// Close the current object; an unfilled property or non-object current container poisons the writer.
     pub fn end_object(&mut self) -> Result<(), SchemaIssue> {
+        if self.prepared.is_some() { return self.prepared_end(true); }
         if !matches!(
             self.containers.last(),
             Some(Container::Object { pending: false, .. })
@@ -327,6 +478,7 @@ impl JsonWriter {
     /// Rejects duplicates, use outside an object, or another name while a value is
     /// pending. Names are escaped as JSON strings and count toward the byte limit.
     pub fn property(&mut self, name: &str) -> Result<(), SchemaIssue> {
+        if self.prepared.is_some() { return self.prepared_property(name); }
         let comma = match self.containers.last_mut() {
             Some(Container::Object {
                 names,
@@ -362,10 +514,18 @@ impl JsonWriter {
                 '\n' => self.emit(b"\\n")?,
                 '\r' => self.emit(b"\\r")?,
                 '\t' => self.emit(b"\\t")?,
+                '\u{0008}' if self.serde_counting => self.emit(b"\\b")?,
+                '\u{000c}' if self.serde_counting => self.emit(b"\\f")?,
                 // JSON requires escaping U+0000 through U+001F as hex digits.
                 character if character <= '\u{001f}' => {
-                    let escaped = format!("\\u{:04x}", u32::from(character));
-                    self.emit(escaped.as_bytes())?;
+                    let mut escaped = *b"\\u0000";
+                    let code = u32::from(character);
+                    let hex = b"0123456789abcdef";
+                    if let (Some([target_high, target_low]), Some(high), Some(low)) = (escaped.get_mut(4..), hex.get(usize::try_from(code >> 4).unwrap_or_default()), hex.get(usize::try_from(code & 15).unwrap_or_default())) {
+                        *target_high = *high;
+                        *target_low = *low;
+                    }
+                    self.emit(&escaped)?;
                 }
                 character => {
                     let mut utf8 = [0; std::mem::size_of::<char>()];
@@ -407,10 +567,27 @@ impl JsonWriter {
     /// The token must parse as a JSON number and round-trip to the exact same spelling;
     /// otherwise returns [`SchemaIssueKind::OutOfRange`] and poisons the writer.
     pub fn number(&mut self, token: &str) -> Result<(), SchemaIssue> {
+        if self.prepared.is_some() {
+            if !super::managed_number::ManagedNumber::parse(token).is_some_and(|number| number.is_normalized()) {
+                return Err(self.fail(SchemaIssue::new(SchemaIssueKind::OutOfRange)));
+            }
+            self.value()?;
+            return self.emit(token.as_bytes());
+        }
         let number = token
             .parse::<serde_json::Number>()
             .map_err(|_| self.fail(SchemaIssue::new(SchemaIssueKind::OutOfRange)))?;
-        if number.to_string() != token {
+        struct Compare<'a> { target: &'a [u8], offset: usize }
+        impl std::fmt::Write for Compare<'_> {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                let end = self.offset.checked_add(text.len()).ok_or(std::fmt::Error)?;
+                if self.target.get(self.offset..end) != Some(text.as_bytes()) { return Err(std::fmt::Error); }
+                self.offset = end;
+                Ok(())
+            }
+        }
+        let mut comparison = Compare { target: token.as_bytes(), offset: 0 };
+        if std::fmt::write(&mut comparison, format_args!("{number}")).is_err() || comparison.offset != token.len() {
             return Err(self.fail(SchemaIssue::new(SchemaIssueKind::OutOfRange)));
         }
         self.value()?;
@@ -421,6 +598,11 @@ impl JsonWriter {
     /// This explicit tree route needs no direct-writer witness. It borrows the tree
     /// and enforces this writer's byte, depth and container-state bounds.
     pub fn tree(&mut self, value: &JsonValue) -> Result<(), SchemaIssue> {
+        if self.prepared.is_some() {
+            let result = self.prepared_tree(value);
+            if let Some(owner) = &mut self.prepared { owner.storage.tree.clear(); }
+            return result;
+        }
         enum Frame<'a> {
             Value(&'a JsonValue),
             Property(&'a str),
@@ -464,12 +646,108 @@ impl JsonWriter {
         }
         Ok(())
     }
+    fn prepared_tree(&mut self, root: &JsonValue) -> Result<(), SchemaIssue> {
+        use super::prepared_json_writer::TreeFrame;
+        fn locate<'a>(root: &'a JsonValue, path: &[TreeFrame]) -> Option<&'a JsonValue> {
+            let mut value = root;
+            for frame in path {
+                let index = frame.next.checked_sub(1)?;
+                value = match value {
+                    JsonValue::Array(items) => items.get(index)?,
+                    JsonValue::Object(fields) => fields.iter().nth(index)?.1,
+                    JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) | JsonValue::String(_) => return None,
+                };
+            }
+            Some(value)
+        }
+        if let Some(owner) = &mut self.prepared { owner.storage.tree.clear(); }
+        let mut current = Some(root);
+        loop {
+            if let Some(value) = current.take() {
+                match value {
+                    JsonValue::Null => self.null()?,
+                    JsonValue::Bool(value) => self.boolean(*value)?,
+                    JsonValue::String(value) => self.string(value)?,
+                    JsonValue::Number(number) => {
+                        if let Some(value) = number.as_i64() { self.i64(value)?; }
+                        else if let Some(value) = number.as_u64() { self.u64(value)?; }
+                        else { self.value()?; self.emit_number_display(number)?; }
+                    }
+                    JsonValue::Array(_) | JsonValue::Object(_) => {
+                        let owner = self.prepared.as_ref().ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?;
+                        if owner.storage.tree.len() == owner.storage.tree.capacity() { return Err(self.fail(SchemaIssue::new(SchemaIssueKind::Memory(crate::memory::MemoryError::NoSlot)))); }
+                        if matches!(value, JsonValue::Array(_)) { self.begin_array()?; } else { self.begin_object()?; }
+                        let owner = self.prepared.as_mut().ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?;
+                        if owner.storage.tree.push(TreeFrame { next: 0 }).is_err() { return Err(self.fail(SchemaIssue::new(SchemaIssueKind::Memory(crate::memory::MemoryError::NoSlot)))); }
+                    }
+                }
+            }
+            let (next, name, closing) = {
+                let owner = self.prepared.as_ref().ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?;
+                let Some((frame, path)) = owner.storage.tree.as_slice().split_last() else { return Ok(()); };
+                let parent = locate(root, path).ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?;
+                match parent {
+                    JsonValue::Array(items) => match items.get(frame.next) { Some(value) => (Some(value), None, None), None => (None, None, Some(false)) },
+                    JsonValue::Object(fields) => match fields.iter().nth(frame.next) { Some((name, value)) => (Some(value), Some(name.as_str()), None), None => (None, None, Some(true)) },
+                    JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) | JsonValue::String(_) => return Err(self.fail(SchemaIssue::new(SchemaIssueKind::InvalidDefinition))),
+                }
+            };
+            if let Some(object) = closing {
+                if let Some(owner) = &mut self.prepared { owner.storage.tree.pop(); }
+                if object { self.end_object()?; } else { self.end_array()?; }
+            } else {
+                if let Some(owner) = &mut self.prepared && let Some(frame) = owner.storage.tree.as_mut_slice().last_mut() {
+                    let Some(next_index) = frame.next.checked_add(1) else { return Err(self.fail(SchemaIssue::new(SchemaIssueKind::Memory(crate::memory::MemoryError::ArithmeticOverflow)))); };
+                    frame.next = next_index;
+                }
+                if let Some(name) = name { self.property(name)?; }
+                current = next;
+            }
+        }
+    }
+    pub(crate) fn managed_number(&mut self, token: &str) -> Result<(), SchemaIssue> {
+        let number = super::managed_number::ManagedNumber::parse(token)
+            .ok_or_else(|| self.fail(SchemaIssue::new(SchemaIssueKind::InvalidDefinition)))?;
+        let (prefix, exponent, sign, suffix) = number.pieces();
+        self.value()?;
+        for part in [prefix, exponent, sign, suffix] {
+            if !part.is_empty() { self.emit(part.as_bytes())?; }
+        }
+        Ok(())
+    }
+    pub(crate) fn finite_f64(&mut self, value: f64) -> Result<(), SchemaIssue> {
+        if !value.is_finite() { return Err(self.fail(SchemaIssue::new(SchemaIssueKind::NonFinite))); }
+        // Pinned zmij 1.0.23 uses a 24-byte buffer for every finite f64.
+        let mut storage = [0u8; 24];
+        let used = {
+            let mut remaining = storage.as_mut_slice();
+            serde_json::to_writer(&mut remaining, &value)
+                .map_err(|_| self.fail(SchemaIssue::new(SchemaIssueKind::InvalidDefinition)))?;
+            24 - remaining.len()
+        };
+        let bytes = storage.get(..used).ok_or_else(|| self.fail(SchemaIssue::new(SchemaIssueKind::InvalidDefinition)))?;
+        self.value()?;
+        self.emit(bytes)
+    }
+    fn emit_number_display(&mut self, number: &serde_json::Number) -> Result<(), SchemaIssue> {
+        struct Emit<'a> { writer: &'a mut JsonWriter, issue: Option<SchemaIssue> }
+        impl std::fmt::Write for Emit<'_> {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                match self.writer.emit(text.as_bytes()) { Ok(()) => Ok(()), Err(issue) => { self.issue = Some(issue); Err(std::fmt::Error) } }
+            }
+        }
+        let mut output = Emit { writer: self, issue: None };
+        if std::fmt::write(&mut output, format_args!("{number}")).is_err() {
+            return Err(output.issue.unwrap_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition)));
+        }
+        Ok(())
+    }
     /// Consume the writer and return its UTF-8 bytes only for one complete successful root.
     ///
     /// An empty document, open container or prior failure returns `InvalidDefinition`;
     /// no partial output is returned.
     pub fn finish(self) -> Result<Vec<u8>, SchemaIssue> {
-        if self.failed || !self.root || !self.containers.is_empty() || self.sink.is_some() {
+        if self.prepared.is_some() || self.failed || !self.root || !self.containers.is_empty() || self.sink.is_some() {
             Err(SchemaIssue::new(SchemaIssueKind::InvalidDefinition))
         } else {
             Ok(self.output)
@@ -482,6 +760,10 @@ impl JsonWriter {
     pub fn finish_sink(mut self) -> Result<(), SchemaIssue> {
         if self.failed || !self.root || !self.containers.is_empty() {
             return Err(SchemaIssue::new(SchemaIssueKind::InvalidDefinition));
+        }
+        if let Some(owner) = &mut self.prepared {
+            if !owner.storage.containers.is_empty() { return Err(SchemaIssue::new(SchemaIssueKind::InvalidDefinition)); }
+            return owner.finish_sink().unwrap_or_else(|| Err(SchemaIssue::new(SchemaIssueKind::InvalidDefinition)));
         }
         match self.sink.as_mut() {
             Some(sink) => sink.finish(),

@@ -18,10 +18,11 @@ pub use message::{
 };
 pub use preferences::{
     LocalePreferences, PreferenceError, PreferenceJob, PreferencePolicy, PreferenceShutdown,
-    PreferenceStatus, PreferenceSubmission,
+    PreferenceStatus, PreferenceSubmission, PreparedLocalePreferences,
 };
 pub use reload::{
     CatalogRuntime, CatalogSelection, CatalogStatus, IntoLocalization, Localization, PinnedCatalog,
+    PreparedCatalogGenerations,
 };
 
 /// Protected localization error categories, excluding resource contents and user values.
@@ -42,6 +43,8 @@ pub enum LocalizationError {
     Missing(String),
     /// Owned reload/preference worker could not obtain its core resource.
     Admission,
+    /// The selected catalogue, resource or message workspace refused admission or output.
+    Memory(effect::memory::MemoryError),
     /// A resource loader failed; identity is safe but provider details are not public.
     Load(String),
     /// Catalogue generation counter exhausted; old generation remains retained.
@@ -58,6 +61,7 @@ impl std::fmt::Display for LocalizationError {
             Self::Template(name) => write!(f, "invalid message template: {name}"),
             Self::Missing(name) => write!(f, "missing message: {name}"),
             Self::Admission => f.write_str("localization admission failed"),
+            Self::Memory(error) => error.fmt(f),
             Self::Load(name) => write!(f, "catalogue load failed: {name}"),
             Self::GenerationOverflow => f.write_str("catalogue generation exhausted"),
         }

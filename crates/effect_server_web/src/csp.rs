@@ -5,6 +5,8 @@
 //! for its renderer. `none` is exclusive; append cannot silently replace it.
 
 use crate::WebError;
+use effect::memory::{BufferLease, BufferView};
+use effect_server::native::bytes::Bytes;
 use http::HeaderValue;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -174,7 +176,13 @@ impl CspSources {
 /// this type validates CSP base64-value syntax without claiming entropy strength.
 #[derive(Clone)]
 #[must_use]
-pub struct ResponseNonce(Arc<str>);
+pub struct ResponseNonce(NonceStorage);
+
+#[derive(Clone)]
+enum NonceStorage {
+    Shared(Arc<str>),
+    Hex([u8; 32]),
+}
 impl std::fmt::Debug for ResponseNonce {
     /// Never expose the current nonce through generic diagnostics.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -194,12 +202,26 @@ impl ResponseNonce {
         {
             return Err(WebError::Configuration("response nonce".into()));
         }
-        Ok(Self(value))
+        Ok(Self(NonceStorage::Shared(value)))
+    }
+
+    /// Store an ASCII hexadecimal nonce in fixed inline storage. Callers
+    /// supply the same entropy they would for a shared nonce string.
+    pub fn from_hex_bytes(value: [u8; 32]) -> Result<Self, WebError> {
+        if value.iter().all(u8::is_ascii_hexdigit) {
+            Ok(Self(NonceStorage::Hex(value)))
+        } else {
+            Err(WebError::Configuration("response nonce".into()))
+        }
     }
     /// Borrow the nonce for an explicitly selected renderer, preserving header identity.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.0
+        match &self.0 {
+            NonceStorage::Shared(value) => value,
+            // The only constructor for this variant checks every octet for ASCII.
+            NonceStorage::Hex(value) => std::str::from_utf8(value).unwrap_or_default(),
+        }
     }
 }
 /// Reusable CSP metadata. No random values or headers are produced during construction.
@@ -279,31 +301,58 @@ impl Csp {
     /// Bind a validated nonce at response time; missing required nonce is typed failure.
     pub fn header(&self, nonce: Option<&ResponseNonce>) -> Result<HeaderValue, WebError> {
         let mut output = String::new();
-        for (directive, sources) in &self.directives {
-            if !output.is_empty() {
-                output.push_str("; ");
+        self.write_header(nonce, |text| {
+            output.push_str(text);
+            Ok(())
+        })?;
+        HeaderValue::from_str(&output).map_err(|_| WebError::Configuration("CSP header".into()))
+    }
+
+    pub(crate) fn header_prepared(
+        &self,
+        nonce: Option<&ResponseNonce>,
+        mut output: BufferLease<'static>,
+    ) -> Result<HeaderValue, WebError> {
+        self.write_header(nonce, |text| {
+            output
+                .extend_from_slice(text.as_bytes())
+                .map_err(WebError::Memory)
+        })?;
+        let bytes = Bytes::from_owner(BufferView::new(output.share()));
+        HeaderValue::from_maybe_shared(bytes)
+            .map_err(|_| WebError::Configuration("CSP header".into()))
+    }
+
+    fn write_header(
+        &self,
+        nonce: Option<&ResponseNonce>,
+        mut append: impl FnMut(&str) -> Result<(), WebError>,
+    ) -> Result<(), WebError> {
+        for (index, (directive, sources)) in self.directives.iter().enumerate() {
+            if index != 0 {
+                append("; ")?;
             }
-            output.push_str(directive.name());
+            append(directive.name())?;
             for source in sources.values.iter() {
-                output.push(' ');
+                append(" ")?;
                 match source {
-                    CspSource::None => output.push_str("'none'"),
-                    CspSource::SelfOrigin => output.push_str("'self'"),
+                    CspSource::None => append("'none'")?,
+                    CspSource::SelfOrigin => append("'self'")?,
                     CspSource::Nonce => {
                         let nonce = nonce
                             .ok_or_else(|| WebError::Configuration("missing CSP nonce".into()))?;
-                        output.push_str("'nonce-");
-                        output.push_str(nonce.as_str());
-                        output.push('\'');
+                        append("'nonce-")?;
+                        append(nonce.as_str())?;
+                        append("'")?;
                     }
-                    CspSource::UnsafeInline => output.push_str("'unsafe-inline'"),
-                    CspSource::UnsafeEval => output.push_str("'unsafe-eval'"),
-                    CspSource::StrictDynamic => output.push_str("'strict-dynamic'"),
-                    CspSource::Native(value) => output.push_str(&value.0),
+                    CspSource::UnsafeInline => append("'unsafe-inline'")?,
+                    CspSource::UnsafeEval => append("'unsafe-eval'")?,
+                    CspSource::StrictDynamic => append("'strict-dynamic'")?,
+                    CspSource::Native(value) => append(&value.0)?,
                 }
             }
         }
-        HeaderValue::from_str(&output).map_err(|_| WebError::Configuration("CSP header".into()))
+        Ok(())
     }
 }
 impl Default for Csp {

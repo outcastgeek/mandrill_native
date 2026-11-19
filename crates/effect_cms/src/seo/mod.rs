@@ -92,9 +92,9 @@ mod service;
 mod structured;
 
 pub use self::documents::{
-    SitemapDocumentVM, SitemapEntryVM, SitemapIndexVM, definition_sitemap_document,
+    SitemapDocumentVM, SitemapEntryVM, SitemapIndexVM, SitemapWriteError, definition_sitemap_document,
     definition_sitemap_index, format_sitemap_lastmod_date, format_sitemap_lastmod_date_time,
-    normalize_sitemap_lastmod,
+    normalize_sitemap_lastmod, write_sitemap_index,
 };
 pub use self::head::seo_head;
 pub use self::props::{
@@ -114,7 +114,8 @@ pub use self::structured::{
     ItemListEntry, MetaTag, SchemaObjectJSONLDInput, StructuredVideo, build_item_list_entries,
     collection_list_json_ld_blocks, collection_page_json_ld, item_list_json_ld, json_ld,
     schema_object_json_ld, schema_object_json_ld_from_map, schema_typed_node, video_object_json_ld,
-    video_open_graph_meta, video_twitter_card, video_twitter_meta,
+    video_open_graph_meta, video_twitter_card, video_twitter_meta, JsonLdLimits, JsonLdWriteError,
+    write_item_list_json_ld, write_json_ld,
 };
 
 /// Compile-time witness that the SEO service keeps the owner's effect shape.

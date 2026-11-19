@@ -1,19 +1,33 @@
 //! Volatile in-memory Cluster message storage.
 
+use super::activation_table::ActivationTable;
 use super::{
     AcceptedRequest, ActivationId, ActivationLease, ActivationOutcome, ActivationPhase,
     ActivationStatus, ClaimOptions, ClaimToken, ClusterActivationStore, ClusterAddress,
     ClusterMessageStore, ClusterObserverId, ClusterOwner, ClusterRequestId, ClusterStoreError,
     CompletedReply, HasClusterActivationStore, HasClusterMessageStore, MessageAcceptance,
     MessageClaim, MessageDisposition, MessageInspection, MessageScan, MessageStoreCapacity,
-    ObserverCursor, OwnershipGeneration, PassivationOutcome, PayloadConflictPolicy, SavedChunk,
-    SavedMessage, SavedMessageState, SavedReply, StoreCompletion, StoreMutation, StoreObservation,
+    ObserverCursor, OwnershipGeneration, PassivationOutcome, SavedChunk, SavedMessage,
+    SavedMessageState, StoreCompletion, StoreMutation, StoreObservation,
 };
 use crate::effect_try_sync;
+use crate::memory::Bytes;
 use crate::{Effect, Layer, UtcMillis};
 use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Mutex};
+
+mod prepared;
+use prepared::{
+    History, Observers, PreparedStorage, RecordIndex, RetainedBytes, StoredChunk, StoredReply,
+    StoredRequest,
+};
+pub use prepared::{
+    PreparedAcceptedRequest, PreparedClusterChunk, PreparedClusterClaim, PreparedClusterClaims,
+    PreparedClusterMessageState, PreparedClusterObservation, PreparedClusterPayloadReservation,
+    PreparedClusterReply, PreparedClusterSnapshot, PreparedClusterSnapshots,
+    PreparedClusterStoreCapacity, PreparedClusterStoreError,
+};
 
 /// Type alias for message key in cluster memory store.
 type MessageKey = (ClusterAddress, ClusterRequestId);
@@ -24,7 +38,7 @@ enum InternalState {
     Claimed(ClaimToken),
     Completed {
         token: ClaimToken,
-        reply: SavedReply,
+        reply: StoredReply,
         completed_at: UtcMillis,
         retained_until: UtcMillis,
     },
@@ -41,18 +55,19 @@ struct ObserverState {
 
 /// Typed record used by cluster memory store.
 struct Record {
-    request: AcceptedRequest,
+    request: StoredRequest,
     order: NonZeroU64,
     attempts: Option<NonZeroU32>,
     state: InternalState,
-    chunks: Vec<SavedChunk>,
-    observers: BTreeMap<ClusterObserverId, ObserverState>,
+    chunks: History,
+    observers: Observers,
 }
 
 /// Typed memory state used by cluster memory store.
 struct MemoryState {
-    records: BTreeMap<MessageKey, Record>,
-    current_owner: BTreeMap<ClusterAddress, ActivationStatus>,
+    records: RecordIndex,
+    prepared: Option<PreparedStorage>,
+    current_owner: ActivationTable,
     next_order: Option<NonZeroU64>,
     next_claim_generation: Option<NonZeroU64>,
 }
@@ -89,8 +104,9 @@ impl MemoryClusterMessageStore {
     pub fn new(capacity: MessageStoreCapacity) -> Self {
         Self {
             state: Arc::new(Mutex::new(MemoryState {
-                records: BTreeMap::new(),
-                current_owner: BTreeMap::new(),
+                records: RecordIndex::Ordinary(BTreeMap::new()),
+                prepared: None,
+                current_owner: ActivationTable::ordinary(),
                 next_order: Some(NonZeroU64::MIN),
                 next_claim_generation: Some(NonZeroU64::MIN),
             })),
@@ -122,11 +138,15 @@ impl MemoryClusterMessageStore {
     /// # Returns
     /// Type: `Effect<O, ClusterStoreError>`.
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
-    fn transact<I: Send + 'static, O: Send + 'static>(
+    fn transact<
+        I: Send + 'static,
+        O: Send + 'static,
+        E: From<ClusterStoreError> + Send + 'static,
+    >(
         &self,
         input: I,
-        mutate: impl FnOnce(&mut MemoryState, I) -> Result<O, ClusterStoreError> + Send + 'static,
-    ) -> Effect<O, ClusterStoreError> {
+        mutate: impl FnOnce(&mut MemoryState, I) -> Result<O, E> + Send + 'static,
+    ) -> Effect<O, E> {
         let state = Arc::clone(&self.state);
         let pending = Mutex::new(Some((input, mutate)));
         effect_try_sync! { body: move || {
@@ -169,8 +189,8 @@ fn disposition(state: &InternalState) -> MessageDisposition {
 fn acknowledged(record: &Record) -> bool {
     record
         .observers
-        .values()
-        .all(|observer| observer.reply_acknowledged)
+        .iter()
+        .all(|(_, observer)| observer.reply_acknowledged)
 }
 
 ///
@@ -204,7 +224,7 @@ fn recorded(record: &Record) -> SavedMessage {
             retained_until,
             ..
         } => SavedMessageState::Completed {
-            reply: reply.clone(),
+            reply: reply.legacy(),
             completed_at: *completed_at,
             retained_until: *retained_until,
         },
@@ -213,13 +233,13 @@ fn recorded(record: &Record) -> SavedMessage {
         },
     };
     SavedMessage {
-        address: record.request.address.clone(),
-        request: record.request.id.clone(),
-        payload: Arc::clone(&record.request.payload),
-        accepted_at: record.request.accepted_at,
-        policy: record.request.policy,
+        address: record.request.info.address.clone(),
+        request: record.request.info.id.clone(),
+        payload: record.request.payload.legacy(),
+        accepted_at: record.request.info.accepted_at,
+        policy: record.request.info.policy,
         state,
-        chunks: record.chunks.clone(),
+        chunks: record.chunks.iter().map(StoredChunk::legacy).collect(),
         observers: record
             .observers
             .iter()
@@ -244,24 +264,20 @@ fn recorded(record: &Record) -> SavedMessage {
 /// # Returns
 /// Type: `Result<&'a mut Record, ClusterStoreError>`.
 fn verify_claim<'a>(
-    state: &'a mut MemoryState,
+    records: &'a mut RecordIndex,
+    current_owner: &ActivationTable,
     token: &ClaimToken,
     now: UtcMillis,
 ) -> Result<&'a mut Record, ClusterStoreError> {
     let key = (token.address.clone(), token.request.clone());
-    if !state
-        .current_owner
-        .get(&token.address)
-        .is_some_and(|status| {
-            status.phase == ActivationPhase::Active
-                && status.lease.owner == token.owner
-                && now < status.lease.lease_until
-        })
-    {
+    if !current_owner.get(&token.address).is_some_and(|status| {
+        status.phase == ActivationPhase::Active
+            && status.lease.owner == token.owner
+            && now < status.lease.lease_until
+    }) {
         return Err(ClusterStoreError::WrongOwner);
     }
-    let record = state
-        .records
+    let record = records
         .get_mut(&key)
         .ok_or(ClusterStoreError::MissingRequest)?;
     match &record.state {
@@ -273,6 +289,29 @@ fn verify_claim<'a>(
             Err(ClusterStoreError::StaleClaim)
         }
     }
+}
+
+fn validate_claim_options(
+    current_owner: &ActivationTable,
+    options: &ClaimOptions,
+) -> Result<(), ClusterStoreError> {
+    if options.lease_until <= options.now {
+        return Err(ClusterStoreError::LeaseNotAfterClaim);
+    }
+    let owner = &options.owner;
+    let status = current_owner
+        .get(&owner.address)
+        .ok_or(ClusterStoreError::WrongOwner)?;
+    if status.phase != ActivationPhase::Active
+        || status.lease.owner != *owner
+        || options.now >= status.lease.lease_until
+    {
+        return Err(ClusterStoreError::WrongOwner);
+    }
+    if options.lease_until > status.lease.lease_until {
+        return Err(ClusterStoreError::ActivationLeaseExpired);
+    }
+    Ok(())
 }
 
 impl ClusterMessageStore for MemoryClusterMessageStore {
@@ -289,50 +328,27 @@ impl ClusterMessageStore for MemoryClusterMessageStore {
     fn accept(&self, request: AcceptedRequest) -> Effect<MessageAcceptance, Self::Error> {
         let capacity = self.capacity;
         self.transact(request, move |state, request| {
-            let key = (request.address.clone(), request.id.clone());
-            if let Some(existing) = state.records.get(&key)
-                && !expiry(existing, request.accepted_at)
-            {
-                if existing.request.payload.as_ref() == request.payload.as_ref()
-                    && existing.request.idempotency_key == request.idempotency_key
-                    && existing.request.policy == request.policy
-                {
-                    return Ok(MessageAcceptance::Duplicate {
-                        disposition: disposition(&existing.state),
-                    });
-                }
-                return match request.policy.payload_conflict {
-                    PayloadConflictPolicy::Reject => Err(ClusterStoreError::PayloadConflict),
-                    PayloadConflictPolicy::ReportExisting => {
-                        Ok(MessageAcceptance::PayloadConflict {
-                            disposition: disposition(&existing.state),
-                        })
-                    }
-                };
-            }
-            let replacing = state.records.contains_key(&key);
-            if !replacing
-                && matches!(capacity, MessageStoreCapacity::Bounded(limit)
-                if state.records.len() >= limit.get())
-            {
-                return Err(ClusterStoreError::CapacityExceeded);
-            }
-            let order = state
-                .next_order
-                .ok_or(ClusterStoreError::SequenceExhausted)?;
-            state.next_order = order.get().checked_add(1).and_then(NonZeroU64::new);
-            state.records.insert(
-                key,
-                Record {
-                    request,
-                    order,
-                    attempts: None,
-                    state: InternalState::Pending,
-                    chunks: Vec::new(),
-                    observers: BTreeMap::new(),
+            let AcceptedRequest {
+                address,
+                id,
+                payload,
+                idempotency_key,
+                accepted_at,
+                policy,
+            } = request;
+            prepared::accept_bytes(
+                state,
+                capacity,
+                PreparedAcceptedRequest {
+                    address,
+                    id,
+                    idempotency_key,
+                    accepted_at,
+                    policy,
                 },
-            );
-            Ok(MessageAcceptance::Accepted { order })
+                RetainedBytes::Ordinary(payload),
+            )
+            .map_err(PreparedClusterStoreError::into_legacy)
         })
     }
 
@@ -345,23 +361,13 @@ impl ClusterMessageStore for MemoryClusterMessageStore {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn claim(&self, options: ClaimOptions) -> Effect<Vec<MessageClaim>, Self::Error> {
         self.transact(options, |state, options| {
-            if options.lease_until <= options.now {
-                return Err(ClusterStoreError::LeaseNotAfterClaim);
+            if state.prepared.is_some() {
+                return prepared::claim(state, options)
+                    .map(PreparedClusterClaims::into_legacy)
+                    .map_err(PreparedClusterStoreError::into_legacy);
             }
+            validate_claim_options(&state.current_owner, &options)?;
             let owner = &options.owner;
-            let status = state
-                .current_owner
-                .get(&owner.address)
-                .ok_or(ClusterStoreError::WrongOwner)?;
-            if status.phase != ActivationPhase::Active
-                || status.lease.owner != *owner
-                || options.now >= status.lease.lease_until
-            {
-                return Err(ClusterStoreError::WrongOwner);
-            }
-            if options.lease_until > status.lease.lease_until {
-                return Err(ClusterStoreError::ActivationLeaseExpired);
-            }
             let mut candidates = state
                 .records
                 .iter()
@@ -400,7 +406,7 @@ impl ClusterMessageStore for MemoryClusterMessageStore {
                 };
                 if record
                     .attempts
-                    .is_some_and(|attempt| attempt >= record.request.policy.maximum_attempts)
+                    .is_some_and(|attempt| attempt >= record.request.info.policy.maximum_attempts)
                 {
                     dead_letters.push((
                         key,
@@ -449,9 +455,9 @@ impl ClusterMessageStore for MemoryClusterMessageStore {
                 record.state = InternalState::Claimed(token.clone());
                 claims.push(MessageClaim {
                     token,
-                    payload: Arc::clone(&record.request.payload),
-                    accepted_at: record.request.accepted_at,
-                    chunks: record.chunks.clone(),
+                    payload: record.request.payload.legacy(),
+                    accepted_at: record.request.info.accepted_at,
+                    chunks: record.chunks.iter().map(StoredChunk::legacy).collect(),
                 });
             }
             Ok(claims)
@@ -474,30 +480,14 @@ impl ClusterMessageStore for MemoryClusterMessageStore {
         now: UtcMillis,
     ) -> Effect<StoreMutation, Self::Error> {
         self.transact((token, chunk, now), |state, (token, chunk, now)| {
-            let record = verify_claim(state, &token, now)?;
-            let current =
-                usize::try_from(chunk.sequence.get()).map_err(|_| ClusterStoreError::ChunkGap)?;
-            if current <= record.chunks.len() {
-                let recorded = record
-                    .chunks
-                    .get(current - 1)
-                    .ok_or(ClusterStoreError::ChunkGap)?;
-                return if recorded.payload == chunk.payload {
-                    Ok(StoreMutation::AlreadyStored)
-                } else {
-                    Err(ClusterStoreError::ChunkConflict)
-                };
-            }
-            let next = record
-                .chunks
-                .len()
-                .checked_add(1)
-                .ok_or(ClusterStoreError::SequenceExhausted)?;
-            if current != next {
-                return Err(ClusterStoreError::ChunkGap);
-            }
-            record.chunks.push(chunk);
-            Ok(StoreMutation::Stored)
+            prepared::save_chunk_bytes(
+                state,
+                token,
+                chunk.sequence,
+                RetainedBytes::Ordinary(chunk.payload),
+                now,
+            )
+            .map_err(PreparedClusterStoreError::into_legacy)
         })
     }
 
@@ -510,57 +500,14 @@ impl ClusterMessageStore for MemoryClusterMessageStore {
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn complete(&self, completion: CompletedReply) -> Effect<StoreCompletion, Self::Error> {
         self.transact(completion, |state, completion| {
-            let token = completion.token;
-            let key = (token.address.clone(), token.request.clone());
-            if let Some(record) = state.records.get(&key)
-                && let InternalState::Completed {
-                    token: saved_token,
-                    reply,
-                    ..
-                } = &record.state
-            {
-                return if saved_token == &token && reply == &completion.reply {
-                    Ok(StoreCompletion::AlreadyCompleted)
-                } else {
-                    Err(ClusterStoreError::ReplyConflict)
-                };
-            }
-            if !state
-                .current_owner
-                .get(&token.address)
-                .is_some_and(|status| {
-                    status.phase == ActivationPhase::Active
-                        && status.lease.owner == token.owner
-                        && completion.completed_at < status.lease.lease_until
-                })
-            {
-                return Err(ClusterStoreError::WrongOwner);
-            }
-            let record = state
-                .records
-                .get_mut(&key)
-                .ok_or(ClusterStoreError::MissingRequest)?;
-            if !matches!(&record.state, InternalState::Claimed(current)
-                if current == &token && completion.completed_at < token.lease_until)
-            {
-                return Err(ClusterStoreError::StaleClaim);
-            }
-            let retention = record
-                .request
-                .policy
-                .dedup_retention
-                .max(record.request.policy.reply_retention);
-            let retained_until = completion
-                .completed_at
-                .checked_add(retention)
-                .map_err(|_| ClusterStoreError::RetentionOverflow)?;
-            record.state = InternalState::Completed {
-                token,
-                reply: completion.reply,
-                completed_at: completion.completed_at,
-                retained_until,
-            };
-            Ok(StoreCompletion::Completed)
+            prepared::complete_bytes(
+                state,
+                completion.token,
+                completion.reply.kind,
+                RetainedBytes::Ordinary(completion.reply.payload),
+                completion.completed_at,
+            )
+            .map_err(PreparedClusterStoreError::into_legacy)
         })
     }
 
@@ -593,8 +540,9 @@ impl ClusterMessageStore for MemoryClusterMessageStore {
         self.transact(scan, |state, scan| {
             let mut messages = state
                 .records
-                .values()
-                .filter(|record| record.request.address == scan.address)
+                .iter()
+                .map(|(_, record)| record)
+                .filter(|record| record.request.info.address == scan.address)
                 .collect::<Vec<_>>();
             messages.sort_by_key(|record| record.order);
             Ok(MessageInspection {
@@ -627,22 +575,22 @@ impl ClusterMessageStore for MemoryClusterMessageStore {
         self.transact(
             (address, request, observer, after),
             |state, (address, request, observer, after)| {
+                let max_bytes = state.prepared.as_ref().map_or(Bytes::new(0), |store| {
+                    store.capacity.identity_bytes_per_observer
+                });
                 let record = state
                     .records
                     .get_mut(&(address, request))
                     .ok_or(ClusterStoreError::MissingRequest)?;
-                record.observers.entry(observer).or_insert(ObserverState {
-                    last_acknowledged: None,
-                    reply_acknowledged: false,
-                });
+                record.observers.insert(observer, max_bytes)?;
                 let chunks = record
                     .chunks
                     .iter()
                     .filter(|chunk| after.is_none_or(|last| chunk.sequence > last))
-                    .cloned()
+                    .map(StoredChunk::legacy)
                     .collect();
                 let reply = match &record.state {
-                    InternalState::Completed { reply, .. } => Some(reply.clone()),
+                    InternalState::Completed { reply, .. } => Some(reply.legacy()),
                     InternalState::Pending
                     | InternalState::Claimed(_)
                     | InternalState::DeadLetter { .. } => None,
@@ -769,7 +717,7 @@ impl ClusterMessageStore for MemoryClusterMessageStore {
                     .records
                     .get_mut(&(address, request))
                     .ok_or(ClusterStoreError::MissingRequest)?;
-                Ok(record.observers.remove(&observer).is_some())
+                Ok(record.observers.remove(&observer))
             },
         )
     }
@@ -784,7 +732,7 @@ impl ClusterMessageStore for MemoryClusterMessageStore {
     fn cleanup(&self, now: UtcMillis) -> Effect<usize, Self::Error> {
         self.transact(now, |state, now| {
             let before = state.records.len();
-            state.records.retain(|_, record| !expiry(record, now));
+            state.records.retain(|record| !expiry(record, now));
             Ok(before - state.records.len())
         })
     }
@@ -866,13 +814,10 @@ impl ClusterActivationStore for MemoryClusterMessageStore {
                     },
                     lease_until,
                 };
-                state.current_owner.insert(
-                    address,
-                    ActivationStatus {
-                        lease: lease.clone(),
-                        phase: ActivationPhase::Active,
-                    },
-                );
+                state.current_owner.try_insert(ActivationStatus {
+                    lease: lease.clone(),
+                    phase: ActivationPhase::Active,
+                })?;
                 Ok(ActivationOutcome::Activated {
                     lease,
                     recoverable_claims,

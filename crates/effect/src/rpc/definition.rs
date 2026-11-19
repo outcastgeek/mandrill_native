@@ -35,13 +35,18 @@ impl OperationId {
     /// Type: `Result<Self, OperationIdError>`.
     pub fn new(value: impl Into<Arc<str>>) -> Result<Self, OperationIdError> {
         let value = value.into();
+        Self::validate(&value)?;
+        Ok(Self(value))
+    }
+
+    pub(super) fn validate(value: &str) -> Result<(), OperationIdError> {
         if value.trim().is_empty() {
             return Err(OperationIdError::Empty);
         }
         if value.chars().any(|character| character.is_control()) {
             return Err(OperationIdError::InvalidCharacter);
         }
-        Ok(Self(value))
+        Ok(())
     }
 
     #[must_use]

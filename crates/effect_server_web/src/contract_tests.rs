@@ -118,7 +118,14 @@ fn csp_nonce_and_outer_headers() -> Result<(), Box<dyn std::error::Error>> {
     assert!(csp.header(Some(&nonce))?.to_str()?.contains(nonce.as_str()));
     assert!(csp.header(None).is_err());
     assert!(CspSources::new(vec![CspSource::None, CspSource::SelfOrigin]).is_err());
-    let mut selected: Security<WebError, ()> = security! { csp: csp, }?;
+    let fixed_nonce = nonce.clone();
+    let mut selected: Security<WebError, ()> = security! {
+        csp: csp,
+        nonce: move || {
+            let nonce = fixed_nonce.clone();
+            effect_sync! { once; body: move || nonce, }
+        },
+    }?;
     selected
         .headers
         .append("x-cafe", http::HeaderValue::from_static("first"));

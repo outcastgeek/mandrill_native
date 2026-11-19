@@ -191,10 +191,7 @@ pub fn source_content_from_stored_fields(markdown: Option<&str>, org: Option<&st
         return org.to_owned();
     }
     if let Some(markdown) = markdown {
-        return markdown
-            .strip_prefix(CONTENT_EDN_STORAGE_PREFIX)
-            .unwrap_or(markdown)
-            .to_owned();
+        return markdown.trim_prefix(CONTENT_EDN_STORAGE_PREFIX).to_owned();
     }
     String::new()
 }

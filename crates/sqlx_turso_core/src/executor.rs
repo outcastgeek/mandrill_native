@@ -6,19 +6,74 @@ use futures_util::{FutureExt, StreamExt, TryStreamExt, stream};
 use sqlx_core::{
     HashMap,
     column::Column,
+    connection::LogSettings,
     error::Error,
     executor::{Execute, Executor},
     ext::ustr::UStr,
     logger::QueryLogger,
-    sql_str::SqlStr,
+    sql_str::{AssertSqlSafe, SqlSafeStr, SqlStr},
     statement::Statement,
 };
 use turso_parser::{lexer::Lexer, parser::Parser, token::TokenType};
 
 use crate::{
-    Turso, TursoArguments, TursoColumn, TursoConnection, TursoQueryResult, TursoRow,
-    TursoStatement, TursoValue, column::collect_column_names, error::unsupported_sqlx,
+    PreparedTursoCursorReservation, PreparedTursoRowError, PreparedTursoRowMemoryError,
+    PreparedTursoRowsPool, Turso, TursoArguments, TursoColumn, TursoConnection, TursoQueryResult,
+    TursoRow, TursoStatement, TursoValue, column::collect_column_names, error::unsupported_sqlx,
 };
+
+/// Native cursor error preserving actual prepared row backing refusal.
+#[derive(Debug)]
+pub enum PreparedTursoCursorError {
+    Native(Error),
+    Memory(PreparedTursoRowMemoryError),
+}
+impl std::fmt::Display for PreparedTursoCursorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Native(e) => e.fmt(f),
+            Self::Memory(e) => e.fmt(f),
+        }
+    }
+}
+impl std::error::Error for PreparedTursoCursorError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Native(e) => Some(e),
+            Self::Memory(e) => Some(e),
+        }
+    }
+}
+impl From<Error> for PreparedTursoCursorError {
+    fn from(e: Error) -> Self {
+        Self::Native(e)
+    }
+}
+#[expect(
+    clippy::unreachable,
+    reason = "ordinary cursors never supply a prepared row pool"
+)]
+fn ordinary_error(e: PreparedTursoCursorError) -> Error {
+    match e {
+        PreparedTursoCursorError::Native(e) => e,
+        PreparedTursoCursorError::Memory(_) => unreachable!("ordinary cursor has no row pool"),
+    }
+}
+
+type PreparedCursorItems =
+    BoxStream<'static, Result<Either<TursoQueryResult, TursoRow>, PreparedTursoCursorError>>;
+
+fn prepared_open(
+    state: Result<IncrementalState, PreparedTursoCursorError>,
+) -> Result<PreparedCursorItems, Error> {
+    match state {
+        Ok(state) => Ok(stream::try_unfold(state, IncrementalState::next).boxed()),
+        Err(PreparedTursoCursorError::Native(error)) => Err(error),
+        Err(error @ PreparedTursoCursorError::Memory(_)) => {
+            Ok(stream::once(async move { Err(error) }).boxed())
+        }
+    }
+}
 
 impl TursoConnection {
     pub(crate) async fn fetch_many_sql(
@@ -30,7 +85,7 @@ impl TursoConnection {
         self.clear_pending_rollback().await?;
 
         let logger = QueryLogger::new(sql.clone(), self.options().log_settings().clone());
-        let commands = parse_sql_commands(sql.as_str())?;
+        let commands = parse_batch_commands(sql.as_str())?;
         if commands.len() > 1 {
             if arguments.is_some() {
                 return Err(unsupported_sqlx("Turso SQLx batch query arguments"));
@@ -45,7 +100,9 @@ impl TursoConnection {
         let column_names = collect_column_names(&columns);
         let rows = match arguments {
             Some(arguments) => statement
-                .query(arguments.into_turso_values())
+                .query(turso::params::Params::Positional(
+                    arguments.into_turso_values(),
+                ))
                 .await
                 .map_err(map_turso_error)?,
             None => statement.query(()).await.map_err(map_turso_error)?,
@@ -62,9 +119,110 @@ impl TursoConnection {
                 pending_row: None,
                 logger,
             },
-            FetchState::next,
+            |state| async move { state.next(true, None, None).await.map_err(ordinary_error) },
         )
         .boxed())
+    }
+
+    /// Open the same owned cursor machinery without row lookahead or batch buffering.
+    pub(crate) async fn fetch_many_incremental(
+        &mut self,
+        sql: SqlStr,
+        arguments: Option<TursoArguments>,
+    ) -> Result<BoxStream<'static, Result<Either<TursoQueryResult, TursoRow>, Error>>, Error> {
+        let state = self
+            .incremental_state(sql, arguments, None, None)
+            .await
+            .map_err(ordinary_error)?;
+        Ok(stream::try_unfold(state, |state| async move {
+            state.next().await.map_err(ordinary_error)
+        })
+        .boxed())
+    }
+
+    pub(crate) async fn fetch_many_incremental_prepared(
+        &mut self,
+        sql: SqlStr,
+        arguments: Option<TursoArguments>,
+        pool: Arc<PreparedTursoRowsPool>,
+    ) -> Result<
+        BoxStream<'static, Result<Either<TursoQueryResult, TursoRow>, PreparedTursoCursorError>>,
+        Error,
+    > {
+        prepared_open(
+            self.incremental_state(sql, arguments, Some(pool), None)
+                .await,
+        )
+    }
+
+    pub(crate) async fn fetch_many_incremental_reserved(
+        &mut self,
+        sql: SqlStr,
+        arguments: Option<TursoArguments>,
+        reservation: PreparedTursoCursorReservation,
+    ) -> Result<
+        BoxStream<'static, Result<Either<TursoQueryResult, TursoRow>, PreparedTursoCursorError>>,
+        Error,
+    > {
+        let PreparedTursoCursorReservation { permit, pool } = reservation;
+        prepared_open(
+            self.incremental_state(sql, arguments, Some(pool), Some(permit))
+                .await,
+        )
+    }
+
+    async fn incremental_state(
+        &mut self,
+        sql: SqlStr,
+        arguments: Option<TursoArguments>,
+        pool: Option<Arc<PreparedTursoRowsPool>>,
+        first: Option<crate::PreparedTursoRowReservation>,
+    ) -> Result<IncrementalState, PreparedTursoCursorError> {
+        self.clear_pending_rollback().await?;
+        let commands = parse_batch_commands(sql.as_str())?;
+        if commands.len() > 1 && arguments.is_some() {
+            return Err(unsupported_sqlx("Turso SQLx batch query arguments").into());
+        }
+        let connection = self.raw().clone();
+        let settings = self.options().log_settings().clone();
+        let (current, commands) = if commands.len() <= 1 {
+            let params = match arguments {
+                Some(arguments) => {
+                    turso::params::Params::Positional(arguments.try_into_turso_values().map_err(
+                        |_| Error::Io(std::io::Error::from(std::io::ErrorKind::OutOfMemory)),
+                    )?)
+                }
+                None => turso::params::Params::None,
+            };
+            let mut statement = self
+                .prepare_query_statement_checked(sql.clone(), true, pool.as_deref())
+                .await?;
+            let columns: Arc<[TursoColumn]> = turso_columns(&statement.columns()).into();
+            let column_names = collect_column_names(&columns);
+            let rows = statement.query(params).await.map_err(map_turso_error)?;
+            (
+                Some(FetchState::Rows {
+                    rows,
+                    statement,
+                    connection: connection.clone(),
+                    columns,
+                    column_names,
+                    pending_row: None,
+                    logger: QueryLogger::new(sql, settings.clone()),
+                }),
+                Vec::new().into_iter(),
+            )
+        } else {
+            (None, commands.into_iter())
+        };
+        Ok(IncrementalState {
+            current,
+            commands,
+            connection,
+            settings,
+            pool,
+            first,
+        })
     }
 
     async fn execute_batch_sql(
@@ -106,7 +264,24 @@ impl TursoConnection {
     }
 
     async fn prepare_sql(&mut self, sql: SqlStr) -> Result<TursoStatement, Error> {
+        self.prepare_sql_checked(sql, None)
+            .await
+            .map_err(ordinary_error)
+    }
+
+    async fn prepare_sql_checked(
+        &mut self,
+        sql: SqlStr,
+        pool: Option<&PreparedTursoRowsPool>,
+    ) -> Result<TursoStatement, PreparedTursoCursorError> {
         if let Some(statement) = self.cached_statement(sql.as_str()) {
+            if let Some(pool) = pool {
+                let columns = statement
+                    .raw()
+                    .map_or_else(|| statement.columns().len(), |raw| raw.column_count());
+                pool.check_columns(columns)
+                    .map_err(PreparedTursoCursorError::Memory)?;
+            }
             return Ok(statement);
         }
 
@@ -115,6 +290,10 @@ impl TursoConnection {
             .prepare(sql.as_str())
             .await
             .map_err(map_turso_error)?;
+        if let Some(pool) = pool {
+            pool.check_columns(statement.column_count())
+                .map_err(PreparedTursoCursorError::Memory)?;
+        }
         let parameters = Some(parameter_count(sql.as_str())?);
         let statement = TursoStatement::with_raw(
             sql.as_str().to_owned(),
@@ -131,14 +310,32 @@ impl TursoConnection {
         sql: SqlStr,
         persistent: bool,
     ) -> Result<turso::Statement, Error> {
-        if persistent && let Some(statement) = self.prepare_sql(sql.clone()).await?.raw() {
+        self.prepare_query_statement_checked(sql, persistent, None)
+            .await
+            .map_err(ordinary_error)
+    }
+
+    async fn prepare_query_statement_checked(
+        &mut self,
+        sql: SqlStr,
+        persistent: bool,
+        pool: Option<&PreparedTursoRowsPool>,
+    ) -> Result<turso::Statement, PreparedTursoCursorError> {
+        if persistent
+            && let Some(statement) = self.prepare_sql_checked(sql.clone(), pool).await?.raw()
+        {
             return Ok(statement);
         }
-
-        self.raw()
+        let statement = self
+            .raw()
             .prepare(sql.as_str())
             .await
-            .map_err(map_turso_error)
+            .map_err(map_turso_error)?;
+        if let Some(pool) = pool {
+            pool.check_columns(statement.column_count())
+                .map_err(PreparedTursoCursorError::Memory)?;
+        }
+        Ok(statement)
     }
 }
 
@@ -160,7 +357,12 @@ enum FetchState {
 }
 
 impl FetchState {
-    async fn next(self) -> Result<Option<(Either<TursoQueryResult, TursoRow>, Self)>, Error> {
+    async fn next(
+        self,
+        lookahead: bool,
+        pool: Option<&PreparedTursoRowsPool>,
+        first: Option<crate::PreparedTursoRowReservation>,
+    ) -> Result<Option<(Either<TursoQueryResult, TursoRow>, Self)>, PreparedTursoCursorError> {
         if let Self::QueryResult { result, logger } = self {
             drop(logger);
             return Ok(Some((Either::Left(result), Self::Done)));
@@ -179,6 +381,16 @@ impl FetchState {
             return Ok(None);
         };
 
+        let permit = if let Some(permit) = first {
+            permit
+                .check_columns(columns.len())
+                .map_err(PreparedTursoCursorError::Memory)?;
+            Some(permit)
+        } else {
+            pool.map(|pool| pool.reserve_columns(columns.len()))
+                .transpose()
+                .map_err(PreparedTursoCursorError::Memory)?
+        };
         let row = match pending_row {
             Some(row) => Some(row),
             None => rows.next().await.map_err(map_turso_error)?,
@@ -197,12 +409,39 @@ impl FetchState {
         };
         logger.increment_rows_returned();
 
-        let mut values = Vec::with_capacity(columns.len());
-        for (index, column) in columns.iter().enumerate() {
-            values.push(
-                TursoValue::from_turso(row.get_value(index).map_err(map_turso_error)?)
-                    .with_type_info(column.type_info().clone()),
-            );
+        let result_row = if let Some(permit) = permit {
+            permit
+                .copy_native(&row, columns.clone(), column_names.clone())
+                .map_err(|e| match e {
+                    PreparedTursoRowError::Memory(e) => PreparedTursoCursorError::Memory(e),
+                    PreparedTursoRowError::Native(e) => {
+                        PreparedTursoCursorError::Native(map_turso_error(e))
+                    }
+                })?
+        } else {
+            let mut values = Vec::with_capacity(columns.len());
+            for (index, column) in columns.iter().enumerate() {
+                values.push(
+                    TursoValue::from_turso(row.get_value(index).map_err(map_turso_error)?)
+                        .with_type_info(column.type_info().clone()),
+                );
+            }
+            TursoRow::with_shared_columns(columns.clone(), column_names.clone(), values)
+        };
+
+        if !lookahead {
+            return Ok(Some((
+                Either::Right(result_row),
+                Self::Rows {
+                    rows,
+                    statement,
+                    connection,
+                    columns,
+                    column_names,
+                    pending_row: None,
+                    logger,
+                },
+            )));
         }
 
         let pending_row = rows.next().await.map_err(map_turso_error)?;
@@ -225,14 +464,63 @@ impl FetchState {
             }
         };
 
-        Ok(Some((
-            Either::Right(TursoRow::with_shared_columns(
-                columns.clone(),
-                column_names.clone(),
-                values,
-            )),
-            next_state,
-        )))
+        Ok(Some((Either::Right(result_row), next_state)))
+    }
+}
+
+struct IncrementalState {
+    current: Option<FetchState>,
+    commands: std::vec::IntoIter<String>,
+    connection: turso::Connection,
+    settings: LogSettings,
+    pool: Option<Arc<PreparedTursoRowsPool>>,
+    first: Option<crate::PreparedTursoRowReservation>,
+}
+impl IncrementalState {
+    async fn next(
+        mut self,
+    ) -> Result<Option<(Either<TursoQueryResult, TursoRow>, Self)>, PreparedTursoCursorError> {
+        loop {
+            if let Some(current) = self.current.take() {
+                let first = if matches!(&current, FetchState::Rows { .. }) {
+                    self.first.take()
+                } else {
+                    None
+                };
+                if let Some((item, next)) = current.next(false, self.pool.as_deref(), first).await?
+                {
+                    if !matches!(next, FetchState::Done) {
+                        self.current = Some(next);
+                    }
+                    return Ok(Some((item, self)));
+                }
+            }
+            let Some(command) = self.commands.next() else {
+                return Ok(None);
+            };
+            let sql = AssertSqlSafe(command).into_sql_str();
+            let mut statement = self
+                .connection
+                .prepare(sql.as_str())
+                .await
+                .map_err(map_turso_error)?;
+            if let Some(pool) = &self.pool {
+                pool.check_columns(statement.column_count())
+                    .map_err(PreparedTursoCursorError::Memory)?;
+            }
+            let columns: Arc<[TursoColumn]> = turso_columns(&statement.columns()).into();
+            let column_names = collect_column_names(&columns);
+            let rows = statement.query(()).await.map_err(map_turso_error)?;
+            self.current = Some(FetchState::Rows {
+                rows,
+                statement,
+                connection: self.connection.clone(),
+                columns,
+                column_names,
+                pending_row: None,
+                logger: QueryLogger::new(sql, self.settings.clone()),
+            });
+        }
     }
 }
 
@@ -314,14 +602,32 @@ impl<'c> Executor<'c> for &'c mut TursoConnection {
     }
 }
 
-fn parse_sql_commands(sql: &str) -> Result<Vec<String>, Error> {
-    Parser::new(sql.as_bytes())
-        .map(|command| {
+/// Validates every command; zero or one command returns an empty batch marker.
+fn parse_batch_commands(sql: &str) -> Result<Vec<String>, Error> {
+    let mut commands = Parser::new(sql.as_bytes());
+    let Some(first) = commands
+        .next()
+        .transpose()
+        .map_err(|error| Error::Protocol(error.to_string()))?
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(second) = commands
+        .next()
+        .transpose()
+        .map_err(|error| Error::Protocol(error.to_string()))?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut result = vec![first.to_string(), second.to_string()];
+    for command in commands {
+        result.push(
             command
-                .map(|command| command.to_string())
-                .map_err(|error| Error::Protocol(error.to_string()))
-        })
-        .collect()
+                .map_err(|error| Error::Protocol(error.to_string()))?
+                .to_string(),
+        );
+    }
+    Ok(result)
 }
 
 fn parameter_count(sql: &str) -> Result<usize, Error> {

@@ -4,6 +4,14 @@ use proc_macro_crate::{FoundCrate, crate_name};
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::quote;
 
+pub(crate) const EFFECT_FACADE_PACKAGES: [&str; 5] = [
+    "effect-sql",
+    "effect-server",
+    "effect-server-identity",
+    "effect-server-web",
+    "effect-otel",
+];
+
 /// Resolve an extension's Cargo package through the consumer's dependency alias.
 /// Each extension declares `extern crate self as its_underscore_name`, allowing
 /// the same expansion in its own documentation and in renamed downstream crates.

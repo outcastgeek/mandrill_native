@@ -581,12 +581,15 @@ where
     E: Error + Send + 'static,
     R: Send + Sync + 'static,
 {
+    let admission_identity = (kind, action);
     let request = request.clone();
     let kind = kind.clone();
     let action = action.clone();
     let validation = validation.clone();
     let commands = commands.cloned();
-    effect! {
+    let admission = commands.clone();
+    let admission_request = request.clone();
+    let program = effect! {
         let request = request.clone();
         let kind = kind.clone();
         let action = action.clone();
@@ -612,6 +615,15 @@ where
             once;
             body: move || stage_validation(validation_attempt, request.clone()),
         }?;
+        if before.is_some()
+            && let Some(preflight) = commands.as_ref().and_then(|commands| commands.preflight_input(&staged.input))
+        {
+            let validation = staged.validation.clone();
+            effect_map_error! {
+                program: preflight,
+                map: move |cause| classify_failure(None, validation.clone(), MutationCause::Command(cause)),
+            }?;
+        }
         let ready = run_before(staged, before.clone())?;
         let validation = ready.validated.validation.clone();
         let commands = match commands {
@@ -621,7 +633,7 @@ where
             }?,
         };
         let executed = effect_map_error! {
-            program: commands.execute(
+            program: commands.execute_admitted(
                 &ready.validated.request,
                 Some(ready.validated.input.clone()),
             ),
@@ -634,7 +646,13 @@ where
             },
         }?;
         AppliedMutation::new(Some(executed), ready.validated.validation)
+    };
+    if let Some(commands) = admission {
+        return commands.with_work(&admission_request, Some(admission_identity), program, |cause| {
+            classify_failure(None, ValidationResult::default(), MutationCause::Command(cause))
+        });
     }
+    program
 }
 
 /// Run one deferred attempt and recover its classified outcome.

@@ -74,7 +74,7 @@ fn return_keeps_expected_primary_and_all_release_failures() {
         Exit::FinalizationFailed(Finalization {
             primary: PrimaryOutcome::Failed(99),
             first: CleanupFailure::ReleaseFailure(0),
-            rest: Vec::new()
+            rest: effect::CleanupFailures::default()
         })
     );
 }
@@ -137,7 +137,7 @@ fn named_resource_factory_retains_primary_and_cleanup() {
         Exit::FinalizationFailed(Finalization {
             primary: PrimaryOutcome::Failed(7),
             first: CleanupFailure::ReleaseFailure(9),
-            rest: Vec::new(),
+            rest: effect::CleanupFailures::default(),
         })
     );
     assert_eq!(inspected.load(Ordering::SeqCst), 1);
@@ -164,7 +164,7 @@ fn named_stream_mapping_retains_cleanup_owner() {
         Exit::FinalizationFailed(Finalization {
             primary: PrimaryOutcome::Failed(String::from("ticket-7")),
             first: CleanupFailure::ReleaseFailure(String::from("ticket-9")),
-            rest: Vec::new(),
+            rest: effect::CleanupFailures::default(),
         })
     );
     assert_eq!(released.load(Ordering::SeqCst), 1);

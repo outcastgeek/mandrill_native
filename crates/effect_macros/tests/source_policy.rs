@@ -90,14 +90,18 @@ impl Audit {
     }
 }
 
+fn is_test_only(attributes: &[syn::Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        attribute.path().is_ident("cfg")
+            && attribute
+                .parse_args::<syn::Ident>()
+                .is_ok_and(|condition| condition == "test")
+    })
+}
+
 impl<'ast> Visit<'ast> for Audit {
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
-        if item.attrs.iter().any(|attribute| {
-            attribute.path().is_ident("cfg")
-                && attribute
-                    .parse_args::<syn::Ident>()
-                    .is_ok_and(|condition| condition == "test")
-        }) {
+        if is_test_only(&item.attrs) {
             return;
         }
         syn::visit::visit_item_mod(self, item);
@@ -175,6 +179,9 @@ fn source_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
 
 fn audit(file: PathBuf, source: &str) -> syn::Result<Vec<String>> {
     let syntax = syn::parse_file(source)?;
+    if is_test_only(&syntax.attrs) {
+        return Ok(Vec::new());
+    }
     let mut audit = Audit {
         file,
         item: Vec::new(),

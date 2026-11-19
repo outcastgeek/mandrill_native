@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use effect::{
     Clock, Effect, HasClock, HasLogger, HasTaskSpawner, LogLevel, effect,
-    effect_map_error, effect_sync, effect_recover, service, span,
+    effect_map, effect_map_error, effect_sync, effect_recover, service, span,
 };
 use effect_server::{BodyStatus, ByteFormData, Reply, Request, ServerError, reply};
 use crate::commands::InputBytes;
@@ -49,7 +49,7 @@ use super::translation::{
     normalize_target_languages,
 };
 use crate::forms::{
-    LOCALIZED_TRANSLATION_WIDGET_KEY_FIELD_NAME, LocalizedAuthoringSignals,
+    LOCALIZED_TRANSLATION_WIDGET_KEY_FIELD_NAME, LocalizedAuthoringSignals, PreparedMergedForms,
     localized_authoring_signals_for_widget, localized_field_signal_name,
     localized_format_signal_name, localized_has_content_signal_name,
 };
@@ -155,6 +155,18 @@ where
     R: Send + Sync + 'static,
 {
     options: LocalizedAuthoringTranslationHandlerOptions<A, T, R>,
+    form_input: Option<PreparedAuthoringInput<A, T>>,
+}
+
+type AuthoringFormFailure<A, T> = Arc<dyn Fn(ServerError) -> AuthoringHandlerError<A, T> + Send + Sync>;
+struct PreparedAuthoringInput<A, T> {
+    forms: Arc<PreparedMergedForms>,
+    on_error: AuthoringFormFailure<A, T>,
+}
+impl<A, T> Clone for PreparedAuthoringInput<A, T> {
+    fn clone(&self) -> Self {
+        Self { forms: self.forms.clone(), on_error: self.on_error.clone() }
+    }
 }
 
 impl<A, T, R> Clone for LocalizedAuthoringService<A, T, R>
@@ -166,6 +178,7 @@ where
     fn clone(&self) -> Self {
         Self {
             options: clone_localized_options(&self.options),
+            form_input: self.form_input.clone(),
         }
     }
 }
@@ -179,13 +192,24 @@ where
     /// Construct the service from its complete configuration.
     #[must_use]
     pub fn new(options: LocalizedAuthoringTranslationHandlerOptions<A, T, R>) -> Self {
-        Self { options }
+        Self { options, form_input: None }
+    }
+
+    /// Select shared CMS form backing for the ordinary authoring route handler.
+    #[must_use]
+    pub fn with_prepared_memory(
+        mut self,
+        memory: &crate::PreparedCmsMemory,
+        on_error: impl Fn(ServerError) -> AuthoringHandlerError<A, T> + Send + Sync + 'static,
+    ) -> Self {
+        self.form_input = Some(PreparedAuthoringInput { forms: memory.forms().clone(), on_error: Arc::new(on_error) });
+        self
     }
 
     /// Produce the localized authoring translation handler.
     #[must_use]
     pub fn translate_localized_content(&self) -> RouteHandler<AuthoringHandlerError<A, T>, R> {
-        new_localized_authoring_translation_handler(clone_localized_options(&self.options))
+        localized_handler(clone_localized_options(&self.options), self.form_input.clone())
     }
 }
 
@@ -277,6 +301,18 @@ where
     T: std::fmt::Display + Send + 'static,
     R: HasClock + HasLogger + HasTaskSpawner + Send + Sync + 'static,
 {
+    localized_handler(options, None)
+}
+
+fn localized_handler<A, T, R>(
+    options: LocalizedAuthoringTranslationHandlerOptions<A, T, R>,
+    form_input: Option<PreparedAuthoringInput<A, T>>,
+) -> RouteHandler<AuthoringHandlerError<A, T>, R>
+where
+    A: Send + 'static,
+    T: std::fmt::Display + Send + 'static,
+    R: HasClock + HasLogger + HasTaskSpawner + Send + Sync + 'static,
+{
     let timeout = if options.timeout.is_zero() {
         DEFAULT_AUTHORING_TRANSLATION_TIMEOUT
     } else {
@@ -288,7 +324,7 @@ where
     let patch_normalize = normalize_language.clone();
     let unavailable_key = translate_key_port.clone();
     let failed_key = translate_key_port;
-    new_authoring_translation_handler(AuthoringTranslationHandlerOptions {
+    make_handler(AuthoringTranslationHandlerOptions {
         translator: options.translator,
         timeout,
         require_access: options.require_access,
@@ -324,7 +360,7 @@ where
         deliver_patch: options.deliver_patch.clone(),
         form_policy: options.form_policy,
         form: options.form.clone(),
-    })
+    }, form_input)
 }
 
 /// Build the authoring translation handler.
@@ -337,14 +373,44 @@ where
     T: std::fmt::Display + Send + 'static,
     R: HasClock + HasLogger + HasTaskSpawner + Send + Sync + 'static,
 {
+    make_handler(options, None)
+}
+
+/// Select shared prepared form backing for the existing authoring handler.
+#[must_use]
+pub fn new_prepared_authoring_translation_handler<A, T, R>(
+    options: AuthoringTranslationHandlerOptions<A, T, R>,
+    memory: &crate::PreparedCmsMemory,
+    on_error: impl Fn(ServerError) -> AuthoringHandlerError<A, T> + Send + Sync + 'static,
+) -> RouteHandler<AuthoringHandlerError<A, T>, R>
+where
+    A: Send + 'static,
+    T: std::fmt::Display + Send + 'static,
+    R: HasClock + HasLogger + HasTaskSpawner + Send + Sync + 'static,
+{
+    make_handler(options, Some(PreparedAuthoringInput {
+        forms: memory.forms().clone(), on_error: Arc::new(on_error),
+    }))
+}
+
+fn make_handler<A, T, R>(
+    options: AuthoringTranslationHandlerOptions<A, T, R>,
+    form_input: Option<PreparedAuthoringInput<A, T>>,
+) -> RouteHandler<AuthoringHandlerError<A, T>, R>
+where
+    A: Send + 'static,
+    T: std::fmt::Display + Send + 'static,
+    R: HasClock + HasLogger + HasTaskSpawner + Send + Sync + 'static,
+{
     let options = Arc::new(options);
-    Arc::new(move |request: &Request| handler_effect(Arc::clone(&options), request.clone()))
+    Arc::new(move |request: &Request| handler_effect(options.clone(), request.clone(), form_input.clone()))
 }
 
 /// The complete handler effect.
 fn handler_effect<A, T, R>(
     options: Arc<AuthoringTranslationHandlerOptions<A, T, R>>,
     request: Request,
+    form_input: Option<PreparedAuthoringInput<A, T>>,
 ) -> Effect<Reply<AuthoringHandlerError<A, T>, R>, AuthoringHandlerError<A, T>, R>
 where
     A: Send + 'static,
@@ -352,13 +418,13 @@ where
     R: HasClock + HasLogger + HasTaskSpawner + Send + Sync + 'static,
 {
     effect! {
-        let options=options.clone();let request=request.clone();
+        let options=options.clone();let request=request.clone();let form_input=form_input.clone();
         let denied=match options.require_access.as_ref() {
             Some(check)=>check(&request)?, None=>None,
         };
         match denied {
             Some(reply)=>reply,
-            None=>after_access(options.clone(),request.clone())?,
+            None=>after_access(options.clone(),request.clone(),form_input)?,
         }
     }
 }
@@ -367,18 +433,23 @@ where
 fn after_access<A, T, R>(
     options: Arc<AuthoringTranslationHandlerOptions<A, T, R>>,
     request: Request,
+    form_input: Option<PreparedAuthoringInput<A, T>>,
 ) -> Effect<Reply<AuthoringHandlerError<A, T>, R>, AuthoringHandlerError<A, T>, R>
 where
     A: Send + 'static,
     T: std::fmt::Display + Send + 'static,
     R: HasClock + HasLogger + HasTaskSpawner + Send + Sync + 'static,
 {
-    let form = read_authoring_form::<AuthoringHandlerError<A, T>, R>(
-        request.clone(),
-        options.form_policy,
-        options.form.clone(),
-        if options.translator.is_none() { InitializeForm::FormValue } else { InitializeForm::ParseForm },
-    );
+    let mode = if options.translator.is_none() { InitializeForm::FormValue } else { InitializeForm::ParseForm };
+    let form = match (form_input, &options.form) {
+        (Some(input), None) => effect_map! {
+            program: input.forms.read(&request, options.form_policy, mode, move |error| (input.on_error)(error)),
+            map: AuthoringForm::Prepared,
+        },
+        (Some(_), Some(_)) | (None, _) => read_authoring_form::<AuthoringHandlerError<A, T>, R>(
+            request.clone(), options.form_policy, options.form.clone(), mode,
+        ),
+    };
     let options_for_body = Arc::clone(&options);
     let request_for_body = request;
     effect! {

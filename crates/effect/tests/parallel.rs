@@ -266,7 +266,7 @@ fn concurrent_failure_cancels_and_joins_started_sibling_release() {
         Exit::FinalizationFailed(Finalization {
             primary: PrimaryOutcome::Failed(Error::Body(Cell::new(3))),
             first: CleanupFailure::ReleaseFailure(Error::Release(Cell::new(2))),
-            rest: Vec::new(),
+            rest: effect::CleanupFailures::default(),
         })
     );
     env.tasks.finish();
@@ -402,7 +402,7 @@ fn race_selects_terminal_failure_then_joins_loser_before_returning() {
         Exit::FinalizationFailed(Finalization {
             primary: PrimaryOutcome::Failed(Error::Body(Cell::new(3))),
             first: CleanupFailure::ReleaseFailure(Error::Release(Cell::new(2))),
-            rest: Vec::new(),
+            rest: effect::CleanupFailures::default(),
         })
     );
     env.tasks.finish();
@@ -462,7 +462,7 @@ fn race_discards_loser_ordinary_error_but_retains_its_cleanup_error() {
         Exit::FinalizationFailed(Finalization {
             primary: PrimaryOutcome::Succeeded,
             first: CleanupFailure::ReleaseFailure(Error::Release(Cell::new(2))),
-            rest: Vec::new(),
+            rest: effect::CleanupFailures::default(),
         })
     );
     env.tasks.finish();
@@ -512,7 +512,7 @@ fn accepted_worker_loss_settles_traversal_and_preserves_every_ownership_defect()
             first: CleanupFailure::ReleaseDefect(Defect::library(
                 LibraryDefect::ScheduledTaskDropped
             )),
-            rest: Vec::new(),
+            rest: effect::CleanupFailures::default(),
         })
     );
     Ok(())
@@ -536,7 +536,7 @@ fn race_driver_loss_wakes_selection_and_retains_loser_ownership_failure() -> Res
             first: CleanupFailure::ReleaseDefect(Defect::library(
                 LibraryDefect::ScheduledTaskDropped
             )),
-            rest: Vec::new(),
+            rest: effect::CleanupFailures::default(),
         })
     );
     Ok(())
@@ -678,7 +678,7 @@ fn nested_race_retains_protected_winner_failure_for_its_cancelled_fiber_owner() 
         Exit::FinalizationFailed(Finalization {
             primary: PrimaryOutcome::WasInterrupted,
             first: CleanupFailure::ReleaseFailure(Error::Body(Cell::new(2))),
-            rest: Vec::new(),
+            rest: effect::CleanupFailures::default(),
         })
     );
 }
@@ -916,7 +916,7 @@ fn cleanup_groups_commit_in_order_before_discarded_primary_destructors() {
             rest: vec![CleanupFailure::ReleaseFailure(Failure {
                 label: Label::ThirdCleanup,
                 gate: None
-            })],
+            })].into(),
         })
     );
     env.tasks.finish();

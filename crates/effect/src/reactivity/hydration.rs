@@ -14,6 +14,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 
+mod prepared;
+pub use prepared::{
+    PreparedHydrationBytes, PreparedHydrationCodec, PreparedHydrationError,
+    PreparedHydrationImportPage, PreparedHydrationInputPage, PreparedHydrationPage,
+    PreparedHydrationRecord, PreparedHydrationRecordResult, PreparedHydrationSchema,
+    PreparedHydrationSet, PreparedHydrationSetCapacity,
+};
+
 /// Type alias for hydration export in reactivity hydration.
 ///
 /// # Type parameters
@@ -494,6 +502,12 @@ fn routing_key(record: &[u8], limits: ParseLimits) -> Result<Arc<[u8]>, Hydratio
 }
 
 impl<A: Send + Sync + 'static> AtomRef<A> {
+    fn hydrate_permit<R: Send + Sync + 'static>(
+        &self,
+    ) -> Effect<crate::SemaphorePermit, crate::SemaphoreError, R> {
+        self.mutation.acquire(NonZeroUsize::MIN)
+    }
+
     /// The mutation gate keeps the value and revision from different commits
     /// from being combined into one exported record.
     ///
@@ -517,8 +531,7 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
         let source = self.clone();
         {
             let __dsl_program = effect_map_error! {
-            program: self.mutation
-            .acquire(NonZeroUsize::MIN), map: |error| HydrationError::Source(AtomRefError::Admission(error)), };
+            program: self.hydrate_permit(), map: |error| HydrationError::Source(AtomRefError::Admission(error)), };
             effect! {
                 let __dsl_program = __dsl_program.clone(); let schema = schema.clone(); let source = source.clone(); let permit = __dsl_program?; {
                 let source = source.clone();
@@ -563,18 +576,30 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
         if schema.atom != self.id {
             return effect_try_sync! { once; body: { let __dsl_result = Err(HydrationError::WrongAtom); move || __dsl_result }, on_error: ::core::convert::identity, };
         }
-        let source = self.clone();
         let bytes = Mutex::new(Some(bytes));
+        let decoded = effect_try_sync! {
+        body: move || {
+            let bytes = bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .ok_or(HydrationError::InputConsumed)?;
+            schema.decode(&bytes)
+        }, on_error: std::convert::identity, };
+        self.apply_decoded_hydration(decoded, policy)
+    }
+
+    fn apply_decoded_hydration<E, R>(
+        &self,
+        __dsl_program: Effect<(A, NonZeroU64), E, R>,
+        policy: HydrationConflictPolicy,
+    ) -> Effect<HydrationImportOutcome, E, R>
+    where
+        E: From<HydrationError> + Send + 'static,
+        R: Send + Sync + 'static,
+    {
+        let source = self.clone();
         {
-            let __dsl_program = effect_try_sync! {
-            body: move || {
-                let bytes = bytes
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-                    .ok_or(HydrationError::InputConsumed)?;
-                schema.decode(&bytes)
-            }, on_error: std::convert::identity, };
             effect! {
                            let __dsl_program = __dsl_program.clone(); let source = source.clone(); let (value , incoming) = __dsl_program.clone()?; {
                        let source = source.clone();
@@ -582,16 +607,14 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
                        effect! {
             bind;
             program: effect_map_error! {
-                program: source
-                           .mutation
-                           .acquire(NonZeroUsize::MIN), map: |error| HydrationError::Source(AtomRefError::Admission(error)), },
+                program: source.hydrate_permit(), map: |error| E::from(HydrationError::Source(AtomRefError::Admission(error))), },
             body: move |permit| {
                                let value = value
                                    .lock()
                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                                    .take();
                                let Some(value) = value else {
-                                   return effect_try_sync! { once; body: { let __dsl_result = Err(HydrationError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                   return effect_try_sync! { once; body: { let __dsl_result = Err(E::from(HydrationError::InputConsumed)); move || __dsl_result }, on_error: ::core::convert::identity, };
                                };
                                let current = *source
                                    .revision
@@ -601,10 +624,10 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
                                    HydrationConflictPolicy::OnlyIfNewer if incoming <= current => {
                                        return effect_try_sync! {
                                            once; body: {
-                                           let __dsl_result = Err(HydrationError::Stale {
+                                           let __dsl_result = Err(E::from(HydrationError::Stale {
                                            current,
                                            incoming,
-                                       }); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                       })); move || __dsl_result }, on_error: ::core::convert::identity, };
                                    }
                                    HydrationConflictPolicy::OnlyIfNewer => (incoming, false),
                                    HydrationConflictPolicy::ForceMonotonic if incoming > current => {
@@ -617,7 +640,7 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
                                            return effect_try_sync! {
                                                once; body: {
                                                let __dsl_result = Err(
-                                               HydrationError::RevisionExhausted,
+                                               E::from(HydrationError::RevisionExhausted),
                                            ); move || __dsl_result }, on_error: ::core::convert::identity, };
                                        };
                                        (revision, true)
@@ -635,16 +658,16 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
                                            .lock()
                                            .unwrap_or_else(std::sync::PoisonError::into_inner) = revision;
                                    }), map: |error: PubSubError| {
-                                       HydrationError::Source(AtomRefError::Publication(error))
+                                       E::from(HydrationError::Source(AtomRefError::Publication(error)))
                                    }, }; effect! {
                                        let __dsl_program = __dsl_program.clone(); let id = id.clone(); let registry = registry.clone(); let publication = __dsl_program?; {
                                        effect_map! {
                                            program: effect_map_error! {
                                            program: registry
                                            .changed(id.clone()), map: |error| {
-                                               HydrationError::Source(
+                                               E::from(HydrationError::Source(
                                                    AtomRefError::CommittedWithoutInvalidation(error),
-                                               )
+                                               ))
                                            }, }, map: move |_| HydrationImportOutcome {
                                                revision,
                                                forced,

@@ -9,6 +9,14 @@
 //! may coexist in the same environment. No runtime is constructed by this crate.
 extern crate self as effect_server;
 
+fn try_admission_lock<T>(mutex: &std::sync::Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, effect::memory::MemoryError> {
+    match mutex.try_lock() {
+        Ok(guard) => Ok(guard),
+        Err(std::sync::TryLockError::Poisoned(error)) => Ok(error.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => Err(effect::memory::MemoryError::Busy),
+    }
+}
+
 /// Typed callback blocks using this facade's existing Effect dependency.
 pub use effect::{
     codec, effect_all, effect_all_concurrent, effect_blocking, effect_cpu, effect_die,
@@ -26,9 +34,35 @@ mod body;
 mod endpoint;
 mod host;
 mod input;
+mod prepared_body_completion;
+#[allow(dead_code)] // Connection settlement wiring is not yet connected to the host.
+mod prepared_connection_retention;
+mod prepared_endpoint;
+mod prepared_native_slot;
+mod prepared_native_bytes;
+pub use prepared_native_bytes::{PreparedNativeBytesCapacity, PreparedNativeBytesDemand, PreparedNativeBytesPool, PreparedNativeFrame};
+#[allow(dead_code)] // prepared provider wiring is in progress
+mod prepared_native_task;
+mod prepared_observers;
+mod prepared_request_control;
+mod prepared_streaming_channel;
+#[allow(dead_code)] // Prepared host terminal wiring is in progress.
+mod prepared_terminal;
+#[allow(dead_code)] // Prepared transport wiring is not yet connected to the host.
+mod prepared_transport_body;
 mod reply;
+mod prepared_request_storage;
+pub use prepared_request_storage::{PreparedRequestStorageCapacity, PreparedRequestStorageDemand, PreparedRequestStoragePool};
+mod prepared_response_headers;
+pub use prepared_response_headers::{PreparedResponseHeadersDemand, PreparedResponseHeadersPool};
 mod route;
 mod validators;
+pub use prepared_native_task::{PreparedNativeTaskFuture, PreparedNativeTaskPool};
+pub use prepared_endpoint::{PreparedInputEndpoint, PreparedInputEndpointPlan};
+pub use prepared_streaming_channel::{PreparedBodyChannelCapacity, PreparedBodyChannelDemand};
+pub use prepared_terminal::{
+    PreparedConnectionTaskDemand, PreparedHostCapacity, PreparedHostResult, PreparedRequestControlCapacity, PreparedServer,
+};
 #[cfg(feature = "websocket")]
 mod websocket;
 
@@ -40,6 +74,14 @@ pub use body::*;
 /// `on_error |error| { ... }`/`on_error(callback)`, and `preconditions(callback, mapper)`.
 /// Extracted Effects keep their own explicit resource ownership; no payload is cloned.
 /// `body: callback` retains a native scoped future factory and its complete Exit errors.
+/// A `prepared` endpoint with a `contract` can prepare its actual storage at
+/// startup with `capacity(memory, region, runs, frames)`. Its optional
+/// `on_capacity: reply` accepts a `StaticOverloadReply` for early route refusal.
+/// `byte_pools: pools` selects an `Arc<PreparedEndpointBytePools>`. Its encoded
+/// body, decoded byte destination and output destination are checked out together
+/// before endpoint selection and are available through the selected `Request`.
+/// Decoded storage bounds explicit writes into that destination. A caller codec
+/// that returns an independently allocated value has its own allocation policy.
 ///
 /// ```
 /// use effect::effect_sync;
@@ -73,6 +115,24 @@ pub use effect_macros::endpoint;
 /// let _ = pipeline;
 /// ```
 /// `source(existing_pipeline)` must precede stages and reuses that owned description.
+///
+/// `prepared_stage` receives a [`PreparedNext`] cursor. Select prepared inner
+/// request controls on the host to provision one run cell per inner dispatch.
+/// A cursor clone retains that cell and its request through its last owner.
+/// Calling `invoke()` repeatedly selects the same next stage.
+///
+/// ```rust,ignore
+/// use effect_server::{Pipeline, PreparedNext, Request, ServerError, pipeline};
+///
+/// let middleware: Pipeline<ServerError, ()> = pipeline! {
+///     prepared_stage(|_request: Request, next: PreparedNext<ServerError, ()>| next.invoke());
+/// };
+/// ```
+///
+/// The prepared cursor shares the configured stage descriptions. In a mixed
+/// pipeline, each reached legacy stage still receives its ordinary Arc
+/// continuation. Effects constructed by stage callbacks retain their own
+/// allocation policy.
 pub use effect_macros::pipeline;
 /// Attach registration metadata to a completed endpoint without running its body.
 /// Required `endpoint` is separate from `name`, `tags`, `summary`, `description`,
@@ -102,6 +162,9 @@ pub use effect_macros::registered;
 /// stream/SSE, negotiate, native, redirect, file path, no-content, and empty.
 /// `source(reply)` applies metadata to an existing Reply; `finite(reply)` transfers
 /// an owned FiniteReply through the native constructor without collecting a body.
+/// `lease(view, media)` retains a region buffer view without copying its bytes,
+/// using one native Bytes owner control. `frame(frame, media)` moves a prepared
+/// native frame without adding an owner control or copying the frame again.
 /// HTML strings require `HtmlContent::text` or the explicit trusted-markup constructor.
 /// Codec JSON requires `JsonWriterCodec::require` and an explicit writer policy.
 ///
@@ -179,6 +242,12 @@ pub use effect_macros::routes;
 /// `middleware`, `around_request`, `around_selection`, and feature-gated `websockets`.
 /// `around_selection` begins under root R after classification and before authentication;
 /// `around_request` begins under selected R after environment resolution.
+/// Supply `memory`, `region`, `capacity`, `result_frames`, `cleanup` and
+/// `request_controls` together to prepare the host and return
+/// `Result<PreparedServer<E, R>, ServerError>`. This also works with
+/// `source(existing_server)`. Optional `admission` couples each admitted request
+/// control to its caller-provided numeric quota. An optional `overload` takes a
+/// `StaticOverloadReply` for early prepared-request capacity refusal.
 ///
 /// ```
 /// use effect_server::{Server, ServerError, ServerPolicy, RequestBinding, Router, HttpProtocols, server};
@@ -187,16 +256,21 @@ pub use effect_macros::routes;
 ///     listen: std::net::SocketAddr, routes: Router<E,R>,
 /// ) -> Result<Server<E,R>,ServerError> {
 ///     server! { policy: policy, environment: environment,
-///         listen: listen, protocols: HttpProtocols::Http1, routes: routes }
+///         listen: listen, protocols: HttpProtocols::Http1, routes: routes,
+///         http1_header_timeout: std::time::Duration::from_secs(5) }
 /// }
 /// ```
 pub use effect_macros::server;
 /// Build a response-body program with `source(core_stream)` plus
 /// `write |value, writer| { ... }`, or one `body |writer| { ... }`/`body(callback)`.
+/// `leases(core_stream)` pulls owned region buffer views. `frames(core_stream)`
+/// pulls prepared native frames. Both move the byte owner through the normal
+/// awaited write path. Region views require one native Bytes owner control per
+/// frame, and prepared native frames reuse their existing backing.
 /// Inline binds use the existing Effect interpreter and request scope; native writes
 /// await bounded transport acceptance before the next producer step. This export does
 /// not alter the core `effect::stream!` grammar or `yield_from` delegation semantics.
-/// Source and body forms are mutually exclusive. SSE uses the same program and a
+/// Source, body, lease and frame forms are mutually exclusive. SSE uses the same program and a
 /// separately selected framing/cursor policy; no detached writer is started.
 ///
 /// ```
@@ -210,6 +284,7 @@ pub use effect_macros::server_stream as stream;
 pub use endpoint::*;
 pub use host::*;
 pub use input::*;
+pub use prepared_endpoint::*;
 pub use reply::*;
 pub use route::*;
 pub use validators::*;

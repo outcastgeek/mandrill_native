@@ -989,6 +989,7 @@ fn resource_issue(issue: &SchemaIssue) -> bool {
     matches!(
         issue.kind(),
         SchemaIssueKind::LimitExceeded { .. }
+            | SchemaIssueKind::Memory(_)
             | SchemaIssueKind::ResourceDemand { .. }
             | SchemaIssueKind::PatternBudget
     ) || issue.children().iter().any(resource_issue)

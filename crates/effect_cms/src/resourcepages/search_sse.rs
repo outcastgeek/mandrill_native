@@ -50,3 +50,38 @@ pub fn write_resource_paginated_component_stream<E:Send+'static,R:Send+Sync+'sta
     write_paginated_component_stream(&options.selector,&options.components,&next,&options.url_signal,&options.loading_signal,&options.has_more_signal,has_more)
 }
 pub fn write_resource_list_component_stream<E:Send+'static,R:Send+Sync+'static>(options:ResourcePaginatedComponentStreamOptions)->Reply<E,R>{write_resource_paginated_component_stream(options)}
+
+/// Stream a bounded sequence of existing Maud components and signal data through
+/// prepared native DATA backing. Each frame retains its lease through delivery.
+pub fn prepared_resource_search_stream<E: Send + 'static, R: Send + Sync + 'static>(
+    (selector, mode, components, signals): (Arc<str>, Arc<str>, Arc<[Markup]>, Arc<str>),
+    frames: Arc<effect::memory::SlotPool<'static, effect::memory::Buffer<'static>>>,
+    maximum_components: std::num::NonZeroUsize,
+    on_error: impl Fn(effect::memory::MemoryError) -> E + Send + Sync + 'static,
+) -> effect::Effect<Reply<E, R>, E, R> {
+    crate::rendering::datastar::prepared_event_stream(
+        (selector, mode, components, signals),
+        frames,
+        maximum_components,
+        on_error,
+    )
+}
+
+/// Render an ordered search event stream using the current prepared CMS environment.
+pub fn prepared_cms_search_stream<E, R>(
+    patches: (Arc<str>, Arc<str>, Arc<[Markup]>, Arc<str>),
+    maximum_components: std::num::NonZeroUsize,
+    on_error: impl Fn(effect::memory::MemoryError) -> E + Send + Sync + 'static,
+) -> effect::Effect<Reply<E, R>, E, R>
+where
+    E: Send + 'static,
+    R: crate::HasCmsMemory + Send + Sync + 'static,
+{
+    let on_error = Arc::new(on_error);
+    effect::effect! {
+        let on_error = on_error.clone();
+        let patches = patches.clone();
+        let frames = effect::service! { env: |env: &R| env.cms_memory().event_frames().clone(), }?;
+        prepared_resource_search_stream(patches, frames, maximum_components, move |error| on_error(error))?
+    }
+}

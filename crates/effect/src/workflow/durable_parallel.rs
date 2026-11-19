@@ -179,7 +179,7 @@ where
                         let next = attempt.get().checked_add(1).and_then(NonZeroU32::new);
                         match next {
                             Some(next) => retry_step(run.clone(), next_branch.clone(), policy, next),
-                            None => effect_try_sync! { once; body: { let __dsl_result = Err(DurableRetryError::AttemptExhausted); move || __dsl_result }, on_error: ::core::convert::identity, },
+                            None => effect_try_sync! { once; body: { let __dsl_result = Err(DurableRetryError::AttemptExhausted); /* SchemaIssue retains prepared children; boxing would allocate. */ #[allow(clippy::result_large_err)] move || __dsl_result }, on_error: ::core::convert::identity, },
                         }
                     }
                     other => effect_sync! { once; body: move || other, },
@@ -481,7 +481,7 @@ impl DurableRace {
                     .inspect_race(run.clone(), race.clone()), map: DurableRaceError::Engine, }, project: |_: &R| (), }; effect! {
                         let __dsl_program = __dsl_program.clone(); let engine = engine.clone(); let left = left.clone(); let left_id = left_id.clone(); let race = race.clone(); let right = right.clone(); let right_id = right_id.clone(); let run = run.clone(); let recorded = __dsl_program.clone()?; match recorded {
                         Some(recorded) if recorded.attempt != attempt => {
-                            effect_try_sync! { once; body: { let __dsl_result = Err(DurableRaceError::RecordedAttemptMismatch); move || __dsl_result }, on_error: ::core::convert::identity, }
+                            effect_try_sync! { once; body: { let __dsl_result = Err(DurableRaceError::RecordedAttemptMismatch); /* SchemaIssue retains prepared children; boxing would allocate. */ #[allow(clippy::result_large_err)] move || __dsl_result }, on_error: ::core::convert::identity, }
                         }
                         Some(recorded) if recorded.winner == left_id => {
                             effect_map! { program: left.clone(), map: |(_, result)| result, }
@@ -490,7 +490,7 @@ impl DurableRace {
                             effect_map! { program: right.clone(), map: |(_, result)| result, }
                         }
                         Some(_) => {
-                            effect_try_sync! { once; body: { let __dsl_result = Err(DurableRaceError::RecordedWinnerUnknown); move || __dsl_result }, on_error: ::core::convert::identity, }
+                            effect_try_sync! { once; body: { let __dsl_result = Err(DurableRaceError::RecordedWinnerUnknown); /* SchemaIssue retains prepared children; boxing would allocate. */ #[allow(clippy::result_large_err)] move || __dsl_result }, on_error: ::core::convert::identity, }
                         }
                         None => {
                             let engine = Arc::clone(&engine);
@@ -521,14 +521,14 @@ impl DurableRace {
                                                     once; body: {
                                                     let __dsl_result = Err(
                                                     DurableRaceError::RecordedWinnerMismatch,
-                                                ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                                ); /* SchemaIssue retains prepared children; boxing would allocate. */ #[allow(clippy::result_large_err)] move || __dsl_result }, on_error: ::core::convert::identity, };
                                             }
                                             let result = result
                                                 .lock()
                                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                                 .take()
                                                 .ok_or(DurableRaceError::InputConsumed);
-                                            effect_try_sync! { once; body: { let __dsl_result = result; move || __dsl_result }, on_error: ::core::convert::identity, }
+                                            effect_try_sync! { once; body: { let __dsl_result = result; /* SchemaIssue retains prepared children; boxing would allocate. */ #[allow(clippy::result_large_err)] move || __dsl_result }, on_error: ::core::convert::identity, }
                                         })()? } }
                                 }? } }
                         }

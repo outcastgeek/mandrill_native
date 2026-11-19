@@ -143,7 +143,7 @@ fn scopes_are_lazy_fresh_and_drain_reverse_order_after_primary_failure() {
                 first: CleanupFailure::ReleaseFailure(Error::Release(std::cell::Cell::new(2))),
                 rest: vec![CleanupFailure::ReleaseFailure(Error::Release(
                     std::cell::Cell::new(1)
-                ))],
+                ))].into(),
             })
         );
     }
@@ -237,7 +237,7 @@ fn concurrent_closers_join_one_drain_and_owner_retains_non_clone_errors() {
             Exit::FinalizationFailed(Finalization {
                 primary: PrimaryOutcome::Failed(Error::Body(std::cell::Cell::new(42))),
                 first: CleanupFailure::ReleaseFailure(Error::Release(std::cell::Cell::new(7))),
-                rest: Vec::new(),
+                rest: effect::CleanupFailures::default(),
             })
         );
         // The acknowledgement remains available after the owner takes E.
@@ -332,7 +332,7 @@ fn acquisition_into_closed_scope_awaits_masked_release_before_rejection() {
         Exit::FinalizationFailed(Finalization {
             primary: PrimaryOutcome::Defected(Defect::from(LibraryDefect::ScopeRegistrationClosed)),
             first: CleanupFailure::ReleaseFailure(Error::Release(std::cell::Cell::new(1))),
-            rest: Vec::new(),
+            rest: effect::CleanupFailures::default(),
         })
     );
     assert_eq!(count.load(Ordering::SeqCst), 1);
@@ -389,7 +389,7 @@ fn release_factory_defect_does_not_skip_remaining_finalizers() {
             first: CleanupFailure::ReleaseDefect(Defect::from_panic(Box::new(
                 "scope release factory"
             ))),
-            rest: Vec::new(),
+            rest: effect::CleanupFailures::default(),
         })
     );
     assert_eq!(count.load(Ordering::SeqCst), 1);
@@ -445,7 +445,7 @@ fn abandoned_close_driver_wakes_joiners_and_owner_publishes_cleanup_defect() {
                     first: CleanupFailure::ReleaseDefect(Defect::from(
                         LibraryDefect::ScopeCloseDriverDropped
                     )),
-                    rest: Vec::new(),
+                    rest: effect::CleanupFailures::default(),
                 })
             )
         );
@@ -481,7 +481,7 @@ fn late_registration_releases_immediately_and_retains_its_failure() {
         Exit::FinalizationFailed(Finalization {
             primary: PrimaryOutcome::Defected(Defect::from(LibraryDefect::ScopeRegistrationClosed)),
             first: CleanupFailure::ReleaseFailure(Error::Release(std::cell::Cell::new(9))),
-            rest: Vec::new(),
+            rest: effect::CleanupFailures::default(),
         })
     );
     assert_eq!(count.load(Ordering::SeqCst), 1);

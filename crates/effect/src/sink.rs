@@ -1,5 +1,8 @@
 //! Typed consumers for effectful stream elements.
 
+mod prepared;
+pub use prepared::{PreparedFoldPool, PreparedFoldValue};
+
 use crate::internal::runtime;
 use crate::internal::workflow::{self, bind, success};
 use crate::{Chunk, Defect, Effect, Exit, LibraryDefect, Stream, StreamReader};

@@ -42,7 +42,15 @@ impl Parse for Entries {
                 if input.peek(Token![|]) {
                     input.parse::<Token![|]>()?;
                     while !input.peek(Token![|]) {
-                        patterns.push(input.call(syn::Pat::parse_single)?);
+                        let pattern = input.call(syn::Pat::parse_single)?;
+                        let pattern = if name == "prepared" && input.peek(Token![:]) {
+                            input.parse::<Token![:]>()?;
+                            let ty: syn::Type = input.parse()?;
+                            parse_quote!(#pattern: #ty)
+                        } else {
+                            pattern
+                        };
+                        patterns.push(pattern);
                         if input.peek(Token![,]) {
                             input.parse::<Token![,]>()?;
                         } else {
@@ -154,6 +162,156 @@ fn endpoint(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> 
     let endpoint_body_ident = Ident::new("__endpoint_body", Span::mixed_site());
 
     let descriptor = syn::parse2::<Entries>(input.clone());
+    if let Ok(Entries(entries)) = &descriptor
+        && entries.iter().any(|entry| entry.name == "prepared")
+    {
+        let effect = crate::expand::effect_crate_path()?;
+        let mut program = None;
+        let mut contract = None;
+        let mut cleanup = None;
+        let mut panic_diagnostics = None;
+        let mut on_capacity = None;
+        let mut capacity = None;
+        let mut byte_pools = None;
+        let mut input_pattern = None;
+        let mut bindings = Vec::new();
+        let mut bind = |value: &Expr, ty: TokenStream| {
+            let local = Ident::new(
+                &format!("__prepared_endpoint_field_{}", bindings.len()),
+                Span::mixed_site(),
+            );
+            bindings.push(quote!(let #local: #ty = #value;));
+            local
+        };
+        for entry in entries {
+            match entry.name.to_string().as_str() {
+                "prepared" => {
+                    if program.is_some() {
+                        return Err(syn::Error::new(
+                            entry.name.span(),
+                            "duplicate prepared endpoint body",
+                        ));
+                    }
+                    let expression = if let Some((patterns, block)) = &entry.inline {
+                        if patterns.len() > 1 {
+                            return Err(syn::Error::new(
+                                entry.name.span(),
+                                "prepared endpoint body accepts at most one input pattern",
+                            ));
+                        }
+                        input_pattern = patterns.first().cloned();
+                        syn::parse2(quote!(#effect::effect! #block))?
+                    } else {
+                        entry.value()?.clone()
+                    };
+                    program = Some(crate::prepared_program_expand::root(expression, &effect)?);
+                }
+                "contract" => {
+                    if contract.is_some() {
+                        return Err(syn::Error::new(
+                            entry.name.span(),
+                            "duplicate prepared endpoint contract",
+                        ));
+                    }
+                    contract = Some(bind(entry.value()?, quote!(#effect::DynamicRunContract)));
+                }
+                "panic_diagnostics" => {
+                    if panic_diagnostics.is_some() {
+                        return Err(syn::Error::new(
+                            entry.name.span(),
+                            "duplicate prepared endpoint panic diagnostics",
+                        ));
+                    }
+                    panic_diagnostics = Some(bind(entry.value()?, quote!(#effect::PreparedPanicPool)));
+                }
+                "cleanup" => {
+                    if cleanup.is_some() {
+                        return Err(syn::Error::new(
+                            entry.name.span(),
+                            "duplicate prepared endpoint cleanup",
+                        ));
+                    }
+                    cleanup = Some(bind(entry.value()?, quote!(#effect::PreparedCleanupConfig<_>)));
+                }
+                "on_capacity" => {
+                    if on_capacity.is_some() {
+                        return Err(syn::Error::new(
+                            entry.name.span(),
+                            "duplicate prepared endpoint capacity reply",
+                        ));
+                    }
+                    on_capacity = Some(bind(entry.value()?, quote!(#path::StaticOverloadReply)));
+                }
+                "capacity" => {
+                    if capacity.is_some() {
+                        return Err(syn::Error::new(
+                            entry.name.span(),
+                            "duplicate prepared endpoint capacity",
+                        ));
+                    }
+                    let types = [
+                        quote!(&#effect::memory::PreparedMemory<'static>),
+                        quote!(#effect::memory::RegionId),
+                        quote!(usize),
+                        quote!(#effect::memory::FramePool<'static>),
+                    ];
+                    capacity = Some(entry.arguments(4)?.iter().zip(types)
+                        .map(|(argument, ty)| bind(argument, ty))
+                        .collect::<Vec<_>>());
+                }
+                "byte_pools" => {
+                    if byte_pools.is_some() {
+                        return Err(syn::Error::new(
+                            entry.name.span(),
+                            "duplicate prepared endpoint byte pools",
+                        ));
+                    }
+                    byte_pools = Some(bind(
+                        entry.value()?,
+                        quote!(::std::sync::Arc<#path::PreparedEndpointBytePools>),
+                    ));
+                }
+                _ => return Err(unknown(entry)),
+            }
+        }
+        let program = program
+            .ok_or_else(|| syn::Error::new(Span::call_site(), "missing prepared endpoint body"))?;
+        let contract = contract.ok_or_else(|| {
+            syn::Error::new(
+                Span::call_site(),
+                "missing prepared endpoint execution contract",
+            )
+        })?;
+        let plan = match input_pattern {
+            Some(input) => {
+                quote!(#path::PreparedInputEndpointPlan::from_graph(#effect::__private::prepared_graph::PreparedGraphPlan::new_with_input(move |#input| {#program}, #contract)))
+            }
+            None => {
+                quote!(#path::PreparedEndpointPlan::from_graph(#effect::__private::prepared_graph::PreparedGraphPlan::new(move || {#program}, #contract)))
+            }
+        };
+        let plan = match cleanup {
+            Some(cleanup) => quote!((#plan).with_cleanup(#cleanup)),
+            None => plan,
+        };
+        let plan = match panic_diagnostics {
+            Some(diagnostics) => quote!((#plan).with_panic_diagnostics(#diagnostics)),
+            None => plan,
+        };
+        let plan = match on_capacity {
+            Some(reply) => quote!((#plan).on_capacity(#reply)),
+            None => plan,
+        };
+        let plan = match byte_pools {
+            Some(pools) => quote!((#plan).with_byte_pools(#pools)),
+            None => plan,
+        };
+        let endpoint = match capacity {
+            Some(args) => quote!((#plan).prepare(#(#args),*)),
+            None => plan,
+        };
+        return Ok(quote!({ #(#bindings)* #endpoint }));
+    }
     if let Ok(Entries(entries)) = descriptor
         && entries.iter().any(|entry| {
             matches!(
@@ -299,7 +457,7 @@ fn reply(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStre
             }
             "text" | "html" | "render" | "json" | "json_codec" | "problem" | "validation"
             | "bytes" | "stream" | "sse" | "negotiate" | "native" | "redirect" | "file_path"
-            | "no_content" | "empty" | "source" | "finite" => {
+            | "no_content" | "empty" | "source" | "finite" | "lease" | "frame" => {
                 if terminal.is_some() {
                     return Err(syn::Error::new(
                         entry.name.span(),
@@ -308,7 +466,8 @@ fn reply(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStre
                 }
                 let count = match name.as_str() {
                     "empty" | "no_content" => 0,
-                    "bytes" | "stream" | "negotiate" | "redirect" | "file_path" => 2,
+                    "bytes" | "stream" | "negotiate" | "redirect" | "file_path" | "lease"
+                    | "frame" => 2,
                     "json_codec" => 3,
                     _ => 1,
                 };
@@ -621,6 +780,10 @@ fn pipeline(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenS
                 let callback = entry.callback(path, 2)?;
                 operations.push(quote!(let #pipeline_ident=#pipeline_ident.stage(#callback);));
             }
+            "prepared_stage" => {
+                let callback = entry.callback(path, 2)?;
+                operations.push(quote!(let #pipeline_ident=#pipeline_ident.prepared_stage(#callback);));
+            }
             "include" => {
                 let value = entry.value()?;
                 operations.push(quote!(let #pipeline_ident=#pipeline_ident.append(#value);));
@@ -773,9 +936,11 @@ fn server(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStr
     let server_ident = Ident::new("__server", Span::mixed_site());
 
     let mut fields = std::collections::BTreeMap::new();
+    let mut prepared = std::collections::BTreeMap::new();
     let mut bindings = Vec::new();
     let mut operations = Vec::new();
     let mut source = None;
+    let mut overload = false;
     for entry in entries {
         let name = entry.name.to_string();
         let local = Ident::new(
@@ -800,11 +965,46 @@ fn server(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStr
                 }
                 bindings.push(quote!(let #local=#value;));
             }
-            "configure_app" | "configure_builder" | "middleware" | "before_environment"
-            | "before_routing" | "after_response" | "around_request" | "around_selection"
-            | "websockets" => {
+            "memory" | "region" | "capacity" | "result_frames" | "cleanup" | "request_controls"
+            | "admission" => {
+                let local = Ident::new(
+                    &format!("__server_prepared_{}", prepared.len()),
+                    Span::mixed_site(),
+                );
+                if prepared.insert(name, local.clone()).is_some() {
+                    return Err(syn::Error::new(
+                        entry.name.span(),
+                        "duplicate prepared server field",
+                    ));
+                }
+                let binding = quote!(let #local=#value;);
+                if source.is_some() {
+                    operations.push(binding);
+                } else {
+                    bindings.push(binding);
+                }
+            }
+            "configure_app"
+            | "configure_builder"
+            | "middleware"
+            | "before_environment"
+            | "before_routing"
+            | "after_response"
+            | "around_request"
+            | "around_selection"
+            | "websockets"
+            | "http1_header_timeout"
+            | "overload" => {
+                if name == "overload" && std::mem::replace(&mut overload, true) {
+                    return Err(syn::Error::new(entry.name.span(), "duplicate server overload"));
+                }
+                let method_name = match name.as_str() {
+                    "http1_header_timeout" => "with_http1_header_timeout",
+                    "overload" => "with_overload_reply",
+                    _ => &name,
+                };
                 let method = Ident::new(
-                    &entry.name.to_string(),
+                    method_name,
                     entry.name.span().resolved_at(Span::mixed_site()),
                 );
                 if source.is_some() {
@@ -819,6 +1019,25 @@ fn server(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStr
             _ => return Err(unknown(&entry)),
         }
     }
+    let finish = if prepared.is_empty() {
+        quote!(::core::result::Result::<_,#path::ServerError>::Ok(#server_ident))
+    } else {
+        let args = ["memory", "region", "capacity", "result_frames", "cleanup", "request_controls"]
+            .into_iter()
+            .map(|name| {
+                prepared.get(name).ok_or_else(|| {
+                    syn::Error::new(Span::call_site(), format!("prepared server requires {name}"))
+                })
+            })
+            .collect::<syn::Result<Vec<_>>>()?;
+        let prepare = quote!(#path::PreparedServer::prepare_with_request_controls(#server_ident,#(#args),*)
+            .map_err(#path::ServerError::Memory));
+        match prepared.get("admission") {
+            Some(admission) => quote!((#prepare?).with_request_control_admission(#admission)
+                .map_err(#path::ServerError::Memory)),
+            None => prepare,
+        }
+    };
     if let Some(source) = source {
         if !fields.is_empty() {
             return Err(syn::Error::new(
@@ -826,7 +1045,12 @@ fn server(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStr
                 "server source conflicts with construction fields",
             ));
         }
-        return Ok(quote!({#(#bindings)* let #server_ident=#source;#(#operations)* #server_ident}));
+        let body = quote!(#(#bindings)* let #server_ident=#source;#(#operations)*);
+        return if prepared.is_empty() {
+            Ok(quote!({#body #server_ident}))
+        } else {
+            Ok(quote!((|| {#body #finish})()))
+        };
     }
     let mut required = Vec::new();
     for name in ["policy", "environment", "listen", "protocols", "routes"] {
@@ -850,7 +1074,7 @@ fn server(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStr
         .get(4)
         .ok_or_else(|| syn::Error::new(Span::call_site(), "missing routes"))?;
     Ok(
-        quote!((|| {#(#bindings)* let #server_ident=#path::Server::new(#policy,#path::IntoRequestBinding::into_binding(#environment),#listen,#protocols,#path::IntoRouter::into_router(#routes)?);#(#operations)* ::core::result::Result::<_,#path::ServerError>::Ok(#server_ident)})()),
+        quote!((|| {#(#bindings)* let #server_ident=#path::Server::new(#policy,#path::IntoRequestBinding::into_binding(#environment),#listen,#protocols,#path::IntoRouter::into_router(#routes)?);#(#operations)* #finish})()),
     )
 }
 /// Connect inline/extracted writer callbacks to common Effect and scoped stream production semantics.
@@ -864,6 +1088,23 @@ fn stream(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> {
     let context_ident = Ident::new("__context", Span::mixed_site());
 
     let Entries(entries) = syn::parse2(input)?;
+    if let Some(owned) = entries
+        .iter()
+        .find(|entry| matches!(entry.name.to_string().as_str(), "leases" | "frames"))
+    {
+        if entries.len() != 1 {
+            return Err(syn::Error::new(
+                owned.name.span(),
+                "stream leases or frames must be the only operation",
+            ));
+        }
+        let source = owned.value()?;
+        let method = Ident::new(
+            &owned.name.to_string(),
+            owned.name.span().resolved_at(Span::mixed_site()),
+        );
+        return Ok(quote!(#path::BodyProgram::#method(#source)));
+    }
     let mut source = None;
     let mut writer = None;
     let mut body = None;

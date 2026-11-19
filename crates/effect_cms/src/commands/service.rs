@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use effect::{AtomicRef, Effect, effect, effect_map_error, effect_ref, effect_try_sync};
+use effect::memory::MemoryError;
+use effect::{AtomicRef, Effect, effect, effect_map_error, effect_ref, effect_try_sync, effect_using};
 use effect_server::Request;
 
 use crate::definitions::{
@@ -20,6 +21,9 @@ use crate::queries::{ResourceDetailQuery, ResourceListQuery};
 
 use super::actions::{ActionLabelResolver, SubmitActionVM};
 use super::bindings::ResourceCommandBindings;
+use super::work::PreparedCommandWork;
+
+type SelectedWork<E> = (Arc<PreparedCommandWork>, Arc<dyn Fn(MemoryError) -> E + Send + Sync>);
 
 /// The invalid-request message.
 pub const ERR_INVALID_REQUEST: &str = "contentmgmt: invalid request";
@@ -52,7 +56,10 @@ impl<'de> serde::Deserialize<'de> for InputBytes {
 
 impl serde::Serialize for InputBytes {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&crate::byte_text::encoding_text(self.as_bytes()))
+        match self.to_str() {
+            Ok(text) => serializer.serialize_str(text),
+            Err(_) => serializer.serialize_str(&crate::byte_text::encoding_text(self.as_bytes())),
+        }
     }
 }
 
@@ -341,6 +348,7 @@ where
 {
     resources: Arc<dyn Registry + Send + Sync>,
     options: Options<E, R>,
+    work: Option<SelectedWork<E>>,
 }
 
 impl<E, R> Clone for CommandService<E, R>
@@ -352,6 +360,7 @@ where
         Self {
             resources: Arc::clone(&self.resources),
             options: self.options.clone(),
+            work: self.work.clone(),
         }
     }
 }
@@ -364,7 +373,62 @@ where
     /// Construct the command service.
     #[must_use]
     pub fn new(resources: Arc<dyn Registry + Send + Sync>, options: Options<E, R>) -> Self {
-        Self { resources, options }
+        Self { resources, options, work: None }
+    }
+
+    /// Use the caller's preprovisioned command workspace and typed refusal mapping.
+    #[must_use]
+    pub fn with_prepared_work(
+        mut self,
+        work: Arc<PreparedCommandWork>,
+        on_capacity: impl Fn(MemoryError) -> E + Send + Sync + 'static,
+    ) -> Self {
+        self.work = Some((work, Arc::new(on_capacity)));
+        self
+    }
+
+    pub(crate) fn with_work<A: Send + 'static, O: Send + 'static>(
+        &self,
+        request: &Request,
+        identity: Option<(&ResourceKind, &ResourceAction)>,
+        program: Effect<A, O, R>,
+        map: impl Fn(CommandError<E>) -> O + Send + Sync + 'static,
+    ) -> Effect<A, O, R> {
+        let Some((work, on_capacity)) = self.work.clone() else { return program };
+        let request = request.clone();
+        let identity = identity.map(|(kind, action)| (kind.clone(), action.clone()));
+        effect_using! {
+            acquire: effect_try_sync! {
+                body: move || {
+                    if let Some((kind, action)) = &identity {
+                        work.check_identity(kind, action)?;
+                    }
+                    work.reserve(&request)
+                },
+                on_error: move |error| map(CommandError::Consumer(on_capacity(error))),
+            },
+            body: move |_| program.clone(),
+        }
+    }
+
+    fn check_work_input(&self, input: &CommandInput) -> Result<(), CommandError<E>> {
+        if let Some((work, on_capacity)) = &self.work {
+            work.check_input(input).map_err(|error| CommandError::Consumer(on_capacity(error)))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn preflight_input(&self, input: &CommandInputHandle) -> Option<Effect<(), CommandError<E>, R>> {
+        self.work.as_ref()?;
+        let service = self.clone();
+        let input = input.clone();
+        Some(effect! {
+            bind;
+            program: input.with::<Result<(), CommandError<E>>, CommandError<E>, R>(move |input| {
+                service.check_work_input(input)
+            }),
+            body: move |selected| effect_try_sync! { once; body: move || selected, },
+        })
     }
 
     /// Return the actions offered for a kind, in declaration order.
@@ -383,13 +447,11 @@ where
         let kind = kind.clone();
         effect_try_sync! {
             body {
-                let definition = resources.definition(&kind)?;
-                Ok(resolve_available_actions(
-                    &definition,
-                    &request,
-                    &kind,
-                    label.as_ref(),
-                ))
+                let mut actions = Vec::new();
+                resources.visit_definition(&kind, &mut |definition| {
+                    actions = resolve_available_actions(definition, &request, &kind, label.as_ref());
+                })?;
+                Ok(actions)
             },
         }
     }
@@ -401,10 +463,10 @@ where
     /// when the definition lists it.
     #[must_use]
     pub fn supports(&self, kind: &ResourceKind, action: &ResourceAction) -> bool {
-        let Ok(definition) = self.resources.definition(kind) else {
-            return false;
-        };
-        decide_action_support(&definition, action)
+        let mut supported = false;
+        self.resources.visit_definition(kind, &mut |definition| {
+            supported = decide_action_support(definition, action);
+        }).is_ok() && supported
     }
 
     /// Execute the bound executor for a validated input.
@@ -417,6 +479,14 @@ where
     /// validator receives a value copy whose redirect-parameter handle aliases the
     /// published result's map contents; its scalar changes remain local.
     pub fn execute(
+        &self,
+        request: &Request,
+        input: Option<CommandInputHandle>,
+    ) -> Effect<MutationResult, CommandError<E>, R> {
+        self.with_work(request, None, self.execute_admitted(request, input), std::convert::identity)
+    }
+
+    pub(crate) fn execute_admitted(
         &self,
         request: &Request,
         input: Option<CommandInputHandle>,
@@ -439,24 +509,26 @@ where
                 in_place;
                 reference: validation_input,
                 modify: move |value| {
+                    service_for_validation.check_work_input(value)?;
                     match service_for_validation
                         .options
                         .validate_command_input
                         .as_ref()
                     {
-                        Some(validate) => validate(value),
+                        Some(validate) => validate(value).map_err(CommandError::Consumer),
                         None => Ok(()),
                     }
                 },
             }?;
             effect_try_sync! {
                 once;
-                body: move || validation.map_err(CommandError::Consumer),
+                body: move || validation,
             }?;
             let service_for_prepare = service.clone();
             let prepare_input = input.clone();
             let selection = prepare_input
                 .with::<Result<Executor<E, R>, CommandError<E>>, CommandError<E>, R>(move |value| {
+                    service_for_prepare.check_work_input(value)?;
                     if !service_for_prepare.supports(&value.kind, &value.action) {
                         return Err(CommandError::unsupported_action(value.action.clone()));
                     }
@@ -491,28 +563,25 @@ where
                 program: executor(&request, executor_input),
                 map |cause| { CommandError::Consumer(cause) },
             }?;
+            let needs_kind = result.kind.as_str().is_empty();
+            let needs_action = result.action.as_str().is_empty();
             let defaults_input = input.clone();
             let (kind, action) = defaults_input
-                .with::<(ResourceKind, ResourceAction), CommandError<E>, R>(|value| {
-                    (value.kind.clone(), value.action.clone())
+                .with::<(Option<ResourceKind>, Option<ResourceAction>), CommandError<E>, R>(move |value| {
+                    (needs_kind.then(|| value.kind.clone()), needs_action.then(|| value.action.clone()))
                 })?;
-            if result.kind.as_str().is_empty() {
-                result.kind = kind;
-            }
-            if result.action.as_str().is_empty() {
-                result.action = action;
-            }
+            if let Some(kind) = kind { result.kind = kind; }
+            if let Some(action) = action { result.action = action; }
             let service_for_result = service.clone();
-            let result_for_validation = result.clone();
+            let result_for_validation = service.options.validate_mutation_result.is_some().then(|| result.clone());
             effect_try_sync! {
                 once;
                 body: move || {
-                    if let Some(validate) = service_for_result
-                        .options
-                        .validate_mutation_result
-                        .as_ref()
-                    {
-                        validate(result_for_validation).map_err(CommandError::Consumer)?;
+                    if let (Some(validate), Some(result)) = (
+                        service_for_result.options.validate_mutation_result.as_ref(),
+                        result_for_validation,
+                    ) {
+                        validate(result).map_err(CommandError::Consumer)?;
                     }
                     Ok(())
                 },

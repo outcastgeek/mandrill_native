@@ -19,7 +19,28 @@ fn take_media_token(raw: &[u8]) -> (&[u8], &[u8]) {
     raw.split_at(end)
 }
 
-fn take_media_parameter(raw: &[u8]) -> Option<(Vec<u8>, Vec<u8>, &[u8])> {
+struct MediaParameter<'a> {
+    name: &'a [u8],
+    value: &'a [u8],
+    quoted: bool,
+    tail: &'a [u8],
+}
+
+impl MediaParameter<'_> {
+    fn value_bytes(&self) -> impl Iterator<Item = u8> + '_ {
+        let mut raw = self.value.iter().copied().peekable();
+        std::iter::from_fn(move || {
+            let byte = raw.next()?;
+            if self.quoted && byte == b'\\' && raw.peek().is_some_and(|next| media_special(*next)) {
+                raw.next()
+            } else {
+                Some(byte)
+            }
+        })
+    }
+}
+
+fn borrow_media_parameter(raw: &[u8]) -> Option<MediaParameter<'_>> {
     let rest = trim_unicode_whitespace(raw).strip_prefix(b";")?;
     let rest = trim_unicode_whitespace(rest);
     let (name, rest) = take_media_token(rest);
@@ -28,35 +49,45 @@ fn take_media_parameter(raw: &[u8]) -> Option<(Vec<u8>, Vec<u8>, &[u8])> {
     }
     let rest = trim_unicode_whitespace(rest).strip_prefix(b"=")?;
     let rest = trim_unicode_whitespace(rest);
-    let name = name.to_ascii_lowercase();
     if rest.first() != Some(&b'"') {
         let (value, tail) = take_media_token(rest);
         if value.is_empty() {
             return None;
         }
-        return Some((name, value.to_vec(), tail));
+        return Some(MediaParameter { name, value, quoted: false, tail });
     }
-    let mut value = Vec::new();
     let mut index = 1;
     while let Some(&byte) = rest.get(index) {
         match byte {
-            b'"' => return Some((name, value, &rest[index + 1..])),
+            b'"' => return Some(MediaParameter {
+                name,
+                value: rest.get(1..index)?,
+                quoted: true,
+                tail: rest.get(index + 1..)?,
+            }),
             b'\r' | b'\n' => return None,
             b'\\' => {
                 if let Some(&next) = rest.get(index + 1)
                     && media_special(next)
                 {
-                    value.push(next);
                     index += 2;
                     continue;
                 }
-                value.push(byte);
             }
-            _ => value.push(byte),
+            _ => {}
         }
         index += 1;
     }
     None
+}
+
+fn take_media_parameter(raw: &[u8]) -> Option<(Vec<u8>, Vec<u8>, &[u8])> {
+    let parameter = borrow_media_parameter(raw)?;
+    Some((
+        parameter.name.to_ascii_lowercase(),
+        parameter.value_bytes().collect(),
+        parameter.tail,
+    ))
 }
 
 /// Parse the media type needed by ParseForm, retaining ordinary parameter errors.
@@ -124,6 +155,74 @@ pub(crate) fn recognizes_urlencoded(raw: &[u8]) -> bool {
         }
         parameters.insert(name, value);
         rest = tail;
+    }
+}
+
+/// Check the meaning of URL-encoded Content-Type on the prepared path using the
+/// admitted header bytes. Compare previous parameters in place to preserve
+/// duplicate-name behavior without a detached parameter map.
+pub(crate) fn recognizes_prepared_urlencoded(raw: &[u8]) -> bool {
+    let (base, parameters) = raw.split_at(
+        raw.iter().position(|byte| *byte == b';').unwrap_or(raw.len()),
+    );
+    if !trim_unicode_whitespace(base).eq_ignore_ascii_case(b"application/x-www-form-urlencoded") {
+        return false;
+    }
+    !matches!(prepared_media_parameters(parameters), Err(MediaParameterIssue::Duplicate))
+}
+
+/// Inspect prepared header bytes with the same syntax and duplicate rules as
+/// `form_media_type`, using borrowed parameter names and decoded value iterators.
+pub(crate) fn prepared_form_media_type(raw: &[u8]) -> (bool, Option<&'static str>) {
+    if raw.is_empty() {
+        return (false, None);
+    }
+    let (base, parameters) = raw.split_at(
+        raw.iter().position(|byte| *byte == b';').unwrap_or(raw.len()),
+    );
+    let base = trim_unicode_whitespace(base);
+    let mut parts = base.split(|byte| *byte == b'/');
+    let first = parts.next().unwrap_or_default();
+    let second = parts.next();
+    if first.is_empty()
+        || !first.iter().all(|byte| media_token(*byte))
+        || second.is_some_and(|part| part.is_empty() || !part.iter().all(|byte| media_token(*byte)))
+        || parts.next().is_some()
+    {
+        return (false, Some("mime: invalid media type"));
+    }
+    let urlencoded = base.eq_ignore_ascii_case(b"application/x-www-form-urlencoded");
+    match prepared_media_parameters(parameters) {
+        Ok(()) => (urlencoded, None),
+        Err(MediaParameterIssue::Malformed) => (urlencoded, Some("mime: invalid media parameter")),
+        Err(MediaParameterIssue::Duplicate) => (false, Some("mime: duplicate parameter name")),
+    }
+}
+
+enum MediaParameterIssue {
+    Malformed,
+    Duplicate,
+}
+
+fn prepared_media_parameters(parameters: &[u8]) -> Result<(), MediaParameterIssue> {
+    let mut rest = parameters;
+    loop {
+        let trimmed = trim_unicode_whitespace(rest);
+        if trimmed.is_empty() || trimmed == b";" {
+            return Ok(());
+        }
+        let current = borrow_media_parameter(rest).ok_or(MediaParameterIssue::Malformed)?;
+        let mut previous = parameters;
+        while previous.len() > rest.len() {
+            let Some(parameter) = borrow_media_parameter(previous) else { break };
+            if current.name.eq_ignore_ascii_case(parameter.name)
+                && !current.value_bytes().eq(parameter.value_bytes())
+            {
+                return Err(MediaParameterIssue::Duplicate);
+            }
+            previous = parameter.tail;
+        }
+        rest = current.tail;
     }
 }
 

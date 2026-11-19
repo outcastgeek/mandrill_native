@@ -30,6 +30,8 @@ use crate::attachments::{
     MediaSurfaceMounts, RoleNormalizer, normalize_media_attachment_role,
 };
 use crate::commands::{CommandInput, ResourceCommandBindings};
+use crate::content::PreparedCmsContent;
+use effect::memory::MemoryError;
 use crate::validation::Bindings;
 
 use crate::definitions::{
@@ -42,15 +44,19 @@ use crate::media::assets::{
     MediaAssetFormInput, MediaAssetIdGenerator, MediaAssetListResult, MediaAssetNowUnix,
     MediaAssetRecord, MediaAssetStore, MediaAssetURLResolver, MediaStoreAttachmentOptions,
     apply_media_asset_form_record, list_media_attachment_form_items_from_store,
+    list_prepared_media_attachment_form_items_from_store,
     media_shortcode_items_from_result, prepare_record_for_create, prepare_record_for_update,
     record_from_form, replace_media_attachments_from_store_request,
+    replace_prepared_media_attachments_from_store_request,
 };
 use crate::attachments::MediaAttachmentInput;
 use crate::media::attachmentflow::{
     CurrentMediaAttachmentInputOptions, MediaAttachmentAssetLoader, MediaAttachmentItemBuilder,
     MediaAttachmentItemLoader, MediaAttachmentPreviewOptions,
+    PreparedAttachmentRows,
     current_media_attachment_inputs, preview_media_attachment_form_items_from_inputs,
     preview_media_attachment_form_items_from_request,
+    preview_prepared_media_attachment_form_items_from_request,
 };
 use crate::media::assets::media_attachment_form_item_from_records;
 use crate::media::surface::{
@@ -953,6 +959,19 @@ where
         list_media_attachment_form_items_from_store(&options)
     }
 
+    /// List through the same consumer stores with the selected CMS content memory.
+    pub fn list_attachment_items_prepared(
+        &self,
+        request: &Request,
+        owner_type: InputBytes,
+        owner_content_id: InputBytes,
+        memory: &PreparedCmsContent,
+        on_memory: impl Fn(MemoryError) -> E + Send + Sync + 'static,
+    ) -> Effect<PreparedAttachmentRows<MediaAttachmentFormItem>, E, R> {
+        let options = self.store_attachment_options(request, &owner_type, &owner_content_id);
+        list_prepared_media_attachment_form_items_from_store(&options, memory, on_memory)
+    }
+
     /// List the current attachment items for one owner.
     #[must_use]
     pub fn current_attachment_items(
@@ -1068,6 +1087,30 @@ where
         )
     }
 
+    /// Use the existing asset loader and URL/projector callbacks with prepared previews.
+    pub fn preview_attachment_items_from_request_prepared(
+        &self,
+        request: &Request,
+        form: Option<Arc<ByteFormData>>,
+        memory: &PreparedCmsContent,
+        on_memory: impl Fn(MemoryError) -> E + Send + Sync + 'static,
+    ) -> Effect<PreparedAttachmentRows<MediaAttachmentFormItem>, E, R> {
+        preview_prepared_media_attachment_form_items_from_request(
+            MediaAttachmentPreviewOptions {
+                request: Some(request.clone()),
+                form,
+                inputs: Vec::new(),
+                normalize_role: Some(Arc::new(|raw: &[u8]| normalize_media_attachment_role(raw).into()) as RoleNormalizer),
+                load_assets_by_id: self.attachment_asset_loader(),
+                build_item: Some(self.attachment_item_builder(request)),
+            },
+            memory.attachments.clone(),
+            memory.attachment_items.clone(),
+            memory.attachment_metadata,
+            on_memory,
+        )
+    }
+
     /// Replace one owner's attachments from the request.
     #[must_use]
     pub fn replace_attachments_from_request(
@@ -1080,6 +1123,21 @@ where
         let mut options = self.store_attachment_options(request, &owner_type, &owner_content_id);
         options.form = form;
         replace_media_attachments_from_store_request(&options)
+    }
+
+    /// Replace once through the existing consumer store after admitting local input and output work.
+    pub fn replace_attachments_from_request_prepared(
+        &self,
+        request: &Request,
+        owner_type: InputBytes,
+        owner_content_id: InputBytes,
+        form: Option<Arc<ByteFormData>>,
+        memory: &PreparedCmsContent,
+        on_memory: impl Fn(MemoryError) -> E + Send + Sync + 'static,
+    ) -> Effect<PreparedAttachmentRows<MediaAttachmentFormItem>, E, R> {
+        let mut options = self.store_attachment_options(request, &owner_type, &owner_content_id);
+        options.form = form;
+        replace_prepared_media_attachments_from_store_request(&options, memory, on_memory)
     }
 
     /// Build the attachment manager props for one owner surface.

@@ -77,11 +77,15 @@
 mod assets;
 mod format;
 mod links;
+mod memory;
 mod payload;
 mod presentation;
 mod sanitize;
 mod shortcode;
 mod text;
+
+pub use self::sanitize::{HtmlSanitizeLimits, PreparedHtmlSanitizer};
+pub use self::memory::{PreparedCmsContent, PreparedCmsContentCapacity};
 
 pub use self::assets::{
     CONTENT_ASSET_BASE_URL_ENV_KEY, ContentAssetConfig, absolute_content_asset_url,
@@ -115,7 +119,8 @@ pub use self::presentation::{
 };
 pub use self::shortcode::{
     CONTENT_SURFACE_CHAT_HTML, CONTENT_SURFACE_SLIDE_HTML, CONTENT_SURFACE_TRANSCRIPT_HTML,
-    ContentRenderOptions, RenderedContentFragment, ShortcodeCatalog, ShortcodeResolver,
+    ContentRenderOptions, PreparedContentFragment, PreparedShortcodeRenderer,
+    RenderedContentFragment, ShortcodeCatalog, ShortcodeRenderLimits, ShortcodeResolver,
     ShortcodeToken, shortcode_arg,
 };
 pub use self::text::{

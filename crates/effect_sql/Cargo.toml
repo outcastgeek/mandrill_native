@@ -11,6 +11,8 @@ turso = ["dep:sqlx"]
 macros = ["turso", "sqlx/macros"]
 # Native sync statistics remain an explicitly selected local-driver capability.
 sync = ["turso", "sqlx/sync"]
+# Forward Turso's existing full-text search capability without changing defaults.
+fts = ["turso", "sqlx/fts"]
 
 [dependencies]
 effect = { path = "../effect" }

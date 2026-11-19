@@ -1,15 +1,15 @@
 # Build and run the Identity example
 
-Run these commands from the workspace root (the directory containing the root `Cargo.toml`) with Rust 1.99.0 installed. `cargo run` also builds the selected example.
+Run these commands from the workspace root (the directory containing the root `Cargo.toml`) with Rust 1.100.0 installed. `cargo run` also builds the selected example.
 
 ## `customer_account`
 
 [Source](customer_account.rs). Package `effect-server-identity`; required feature: `sqlx-turso`. No positional arguments are accepted by the recipe. `CAFE_DATABASE` selects a local database filename; the parent directory must exist. The native driver creates the database if needed.
 
 ```sh
-cargo +1.99.0 build --locked -p effect-server-identity --features sqlx-turso --example customer_account
+cargo +1.100.0 build --locked -p effect-server-identity --features sqlx-turso --example customer_account
 mkdir -p target/example-data
-CAFE_DATABASE=target/example-data/receipt-accounts.db cargo +1.99.0 run --locked -p effect-server-identity --features sqlx-turso --example customer_account
+CAFE_DATABASE=target/example-data/receipt-accounts.db cargo +1.100.0 run --locked -p effect-server-identity --features sqlx-turso --example customer_account
 ```
 
 The example registers a uniquely named Maya account, verifies its supplied demo password, and saves the private email-receipt preference. Expected output:

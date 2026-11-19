@@ -14,6 +14,12 @@ use std::sync::{
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+mod prepared;
+pub use prepared::{
+    PreparedClockAdvance, PreparedClockCapacity, PreparedClockError, PreparedClockTick,
+    PreparedClockWait, PreparedTestClock,
+};
+
 #[derive(Debug)]
 /// A failure to schedule or observe time through a clock provider.
 pub enum ClockError {
@@ -202,7 +208,7 @@ impl<E: Send + 'static, R: HasClock + Send + Sync + 'static> Effect<(), E, R> {
                 Ok(future) => future,
                 Err(panic) => return runtime::finish(finish, Exit::Die(Defect::from_panic(panic))),
             };
-            Step::Suspended(Box::pin(async move {
+            Step::suspended(Box::pin(async move {
                 let result = futures_util::FutureExt::catch_unwind(AssertUnwindSafe(future)).await;
                 let outcome = match result {
                     Ok(Ok(tick)) => {

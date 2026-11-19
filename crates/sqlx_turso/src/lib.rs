@@ -37,12 +37,14 @@
 extern crate self as sqlx_turso;
 
 pub use sqlx_turso_core::{
-    Turso, TursoAdapterError, TursoArguments, TursoColumn, TursoConnectOptions, TursoConnection,
-    TursoDatabaseError, TursoDatabaseTarget, TursoDescribeExt, TursoEncryptionOptions,
-    TursoExecutor, TursoExperimentalFeature, TursoExperimentalFeatures, TursoIo,
-    TursoNativeTransaction, TursoPool, TursoPoolOptions, TursoQueryResult, TursoRow,
-    TursoStatement, TursoSyncOptions, TursoTransaction, TursoTransactionManager, TursoTypeChecking,
-    TursoTypeInfo, TursoValue, TursoValueRef,
+    PreparedTursoCursorError, PreparedTursoCursorReservation, PreparedTursoRowError,
+    PreparedTursoRowMemoryError, PreparedTursoRowReservation, PreparedTursoRowsCapacity,
+    PreparedTursoRowsDemand, PreparedTursoRowsPool, Turso, TursoAdapterError, TursoArguments,
+    TursoColumn, TursoConnectOptions, TursoConnection, TursoDatabaseError, TursoDatabaseTarget,
+    TursoDescribeExt, TursoEncryptionOptions, TursoExecutor, TursoExperimentalFeature,
+    TursoExperimentalFeatures, TursoIo, TursoNativeTransaction, TursoPool, TursoPoolOptions,
+    TursoQueryResult, TursoRow, TursoStatement, TursoSyncOptions, TursoTransaction,
+    TursoTransactionManager, TursoTypeChecking, TursoTypeInfo, TursoValue, TursoValueRef,
 };
 
 /// The exact native Turso crate used by this adapter.

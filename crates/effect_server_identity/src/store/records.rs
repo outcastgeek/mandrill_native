@@ -5,10 +5,16 @@
 //! acceptance is not delivery completion or a job execution engine. Every adapter
 //! is fenced to the selected account-store configuration.
 
+mod prepared;
+
+pub use prepared::{PreparedRecordCodec, PreparedRecordMemory, RecordWriter};
+
 use super::SqlxIdentityStore;
 use crate::{effect_future, effect_uninterruptible};
-use effect::Effect;
-use effect_sql::{NativeOperation, SqlError};
+use effect::{Effect, memory::MemoryError};
+use effect_sql::{NativeOperation, SqlError, kernel::NativeTransactionReservation};
+pub(super) use prepared::RecordBuffer;
+use prepared::{PayloadBinding, PreparedCodec};
 use sqlx::{AssertSqlSafe, Row};
 use std::{
     marker::PhantomData,
@@ -68,12 +74,14 @@ pub struct RecordPolicy {
 }
 /// Bind the selected byte ceiling before returning stored payload cells. Oversize
 /// corrupt payloads become NULL/decode failure instead of allocating their bytes.
+#[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
 fn max_bytes_sql(policy: RecordPolicy) -> Result<i64, SqlError> {
     i64::try_from(policy.max_bytes.get())
         .map_err(|_| SqlError::Binding(Box::new(RecordError::Bound)))
 }
 /// Preserve native expiry precision and reject instants outside SQLite's integer
 /// nanosecond representation instead of silently truncating or changing expiry.
+#[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
 fn utc_nanos(value: OffsetDateTime) -> Result<i64, RecordError> {
     i64::try_from(value.unix_timestamp_nanos()).map_err(|_| RecordError::Bound)
 }
@@ -84,8 +92,10 @@ pub trait RecordCodec<A>: Send + Sync + 'static {
     /// Stable version identifying this private record representation.
     fn version(&self) -> NonZeroU16;
     /// Encode by borrow into the provider's necessary owned byte representation.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     fn encode(&self, value: &A) -> Result<Vec<u8>, RecordError>;
     /// Validate and decode exactly the selected acknowledged version.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     fn decode(&self, version: NonZeroU16, bytes: &[u8]) -> Result<A, RecordError>;
 }
 
@@ -171,6 +181,31 @@ pub struct RecordPage<A> {
     pub next: Option<Uuid>,
 }
 
+pub(super) struct RecordWriteAdmission<'a> {
+    buffer: Option<RecordBuffer>,
+    transaction: Option<NativeTransactionReservation<'a>>,
+}
+
+impl<'a> RecordWriteAdmission<'a> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "preserves the established typed record ABI"
+    )]
+    fn reserve(
+        backend: &'a SqlxIdentityStore,
+        buffer: Option<RecordBuffer>,
+    ) -> Result<Self, RecordError> {
+        let transaction = buffer
+            .as_ref()
+            .map(|_| backend.kernel.reserve_transaction_operation())
+            .transpose()?;
+        Ok(Self {
+            buffer,
+            transaction,
+        })
+    }
+}
+
 /// Selected SQL adapter for exactly one storage category and typed private codec.
 pub struct SqlRecordAdapter<A, C> {
     /// Actual account backend, shared as immutable service configuration.
@@ -181,6 +216,7 @@ pub struct SqlRecordAdapter<A, C> {
     policy: RecordPolicy,
     /// Typed codec generation shared without copying record payloads.
     codec: Arc<C>,
+    prepared: Option<Arc<PreparedCodec<A, C>>>,
     /// Application payload remains statically typed; it is not retained in the handle.
     value: PhantomData<fn() -> A>,
 }
@@ -192,6 +228,7 @@ impl<A, C> Clone for SqlRecordAdapter<A, C> {
             category: self.category,
             policy: self.policy,
             codec: self.codec.clone(),
+            prepared: self.prepared.clone(),
             value: PhantomData,
         }
     }
@@ -209,8 +246,58 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
             category,
             policy,
             codec: Arc::new(codec),
+            prepared: None,
             value: PhantomData,
         }
+    }
+    /// Select preadmitted record bytes for every read and write on this adapter.
+    /// Exhaustion uses the existing record bound failure before codec invocation.
+    pub fn with_prepared_memory(
+        mut self,
+        memory: Arc<PreparedRecordMemory>,
+    ) -> Result<Self, MemoryError>
+    where
+        C: PreparedRecordCodec<A>,
+    {
+        self.prepared = Some(Arc::new(PreparedCodec::new(memory, self.policy)?));
+        Ok(self)
+    }
+    fn prepared_codec(&self) -> Option<&PreparedCodec<A, C>> {
+        self.prepared.as_deref()
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "preserves the established typed record ABI"
+    )]
+    pub(super) fn reserve_buffer(&self) -> Result<Option<RecordBuffer>, RecordError> {
+        prepared::reserve(self.prepared_codec()).map_err(|_| RecordError::Bound)
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "preserves the established typed record ABI"
+    )]
+    pub(super) fn reserve_write(&self) -> Result<RecordWriteAdmission<'_>, RecordError> {
+        self.reserve_write_with(self.reserve_buffer()?)
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "preserves the established typed record ABI"
+    )]
+    pub(super) fn reserve_write_with(
+        &self,
+        buffer: Option<RecordBuffer>,
+    ) -> Result<RecordWriteAdmission<'_>, RecordError> {
+        RecordWriteAdmission::reserve(&self.backend, buffer)
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "preserves the established typed record ABI"
+    )]
+    pub(super) fn check_selected_size(&self, bytes: usize) -> Result<(), RecordError> {
+        if self.prepared.is_some() && bytes > self.policy.max_bytes.get() {
+            return Err(RecordError::Bound);
+        }
+        Ok(())
     }
     /// Check the handle's private configuration identity before a selected workflow.
     #[must_use]
@@ -223,11 +310,26 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
         self.category
     }
     /// Read current unexpired state; storage/codec errors are never absent state.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     pub async fn find(
         &self,
         owner: &str,
         id: Uuid,
         now: OffsetDateTime,
+    ) -> Result<Option<Record<A>>, RecordError> {
+        let mut buffer = self.reserve_buffer()?;
+        self.find_reserved(owner, id, now, buffer.as_mut()).await
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "preserves the established typed record ABI"
+    )]
+    pub(super) async fn find_reserved(
+        &self,
+        owner: &str,
+        id: Uuid,
+        now: OffsetDateTime,
+        buffer: Option<&mut RecordBuffer>,
     ) -> Result<Option<Record<A>>, RecordError> {
         /// Finite borrowed native read executed under the shared connection owner.
         struct Find<'a, A, C> {
@@ -239,9 +341,11 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
             id: Uuid,
             /// Caller-selected UTC value for expiry.
             now: OffsetDateTime,
+            buffer: Option<&'a mut RecordBuffer>,
         }
         impl<A: Send + 'static, C: RecordCodec<A>> NativeOperation<Option<Record<A>>> for Find<'_, A, C> {
             /// Decode owned native cells under the kernel lease, retaining typed failures.
+            #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
             async fn run<'a>(
                 self,
                 connection: &'a mut sqlx::TursoConnection,
@@ -251,7 +355,7 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
             {
                 let row=sqlx::query(AssertSqlSafe("SELECT record_id,revision,codec_version,expires_at,CASE WHEN length(payload)<=? THEN payload ELSE NULL END AS payload FROM effect_identity_records WHERE category=? AND owner=? AND record_id=? AND (expires_at IS NULL OR expires_at>?)"))
                     .bind(max_bytes_sql(self.adapter.policy)?).bind(self.adapter.category.key()).bind(self.owner).bind(self.id.to_string()).bind(utc_nanos(self.now).map_err(|error|SqlError::Binding(Box::new(error)))?).fetch_optional(connection).await?;
-                row.map(|row| self.adapter.decode(row))
+                row.map(|row| self.adapter.decode(row, self.buffer))
                     .transpose()
                     .map_err(|error| SqlError::Binding(Box::new(error)))
             }
@@ -263,12 +367,14 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
                 owner,
                 id,
                 now,
+                buffer,
             })
             .await
             .map_err(record_sql_error)
     }
     /// Create a fresh record atomically; uniqueness/commit uncertainty propagate.
     /// This returns the committed revision only after native settlement.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     pub async fn create(
         &self,
         owner: &str,
@@ -276,12 +382,20 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
         expires_at: Option<OffsetDateTime>,
         value: A,
     ) -> Result<Uuid, RecordError> {
-        let (version, payload) = self.encode_payload(&value)?;
-        self.mutate_bytes(owner, id, None, expires_at, (version, payload), None)
-            .await
+        self.write_reserved(
+            owner,
+            id,
+            (None, expires_at),
+            value,
+            self.reserve_write()?,
+            None,
+        )
+        .await
+        .map(|(revision, _)| revision)
     }
     /// Replace exactly the expected revision. This does not imply a caller's
     /// surrounding account/session workflow is a single SQL transaction.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     pub async fn replace(
         &self,
         owner: &str,
@@ -290,19 +404,20 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
         expires_at: Option<OffsetDateTime>,
         value: A,
     ) -> Result<Uuid, RecordError> {
-        let (version, payload) = self.encode_payload(&value)?;
-        self.mutate_bytes(
+        self.write_reserved(
             owner,
             id,
-            Some(expected),
-            expires_at,
-            (version, payload),
+            (Some(expected), expires_at),
+            value,
+            self.reserve_write()?,
             None,
         )
         .await
+        .map(|(revision, _)| revision)
     }
     /// Acknowledge acceptance while returning the original moved payload for an
     /// explicitly selected application transport/job callback; no Clone is needed.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     pub async fn create_returned(
         &self,
         owner: &str,
@@ -310,14 +425,19 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
         expires_at: Option<OffsetDateTime>,
         value: A,
     ) -> Result<(Uuid, A), RecordError> {
-        let (version, payload) = self.encode_payload(&value)?;
-        let revision = self
-            .mutate_bytes(owner, id, None, expires_at, (version, payload), None)
-            .await?;
-        Ok((revision, value))
+        self.write_reserved(
+            owner,
+            id,
+            (None, expires_at),
+            value,
+            self.reserve_write()?,
+            None,
+        )
+        .await
     }
     /// Create one expiring record under a caller-selected live owner quota. Cleanup,
     /// quota check and insertion share one acknowledged transaction across clients.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     pub async fn create_bounded(
         &self,
         owner: &str,
@@ -332,36 +452,39 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
         }
         let capacity = i64::try_from(capacity.get()).map_err(|_| RecordError::Bound)?;
         let now = utc_nanos(now)?;
-        let (version, payload) = self.encode_payload(&value)?;
-        self.mutate_bytes(
+        self.write_reserved(
             owner,
             id,
-            None,
-            Some(expires_at),
-            (version, payload),
+            (None, Some(expires_at)),
+            value,
+            self.reserve_write()?,
             Some((capacity, now)),
         )
         .await
+        .map(|(revision, _)| revision)
     }
-    /// Perform the provider-required encoded ownership conversion before native I/O.
-    fn encode_payload(&self, value: &A) -> Result<(u16, Vec<u8>), RecordError> {
-        let payload = self.codec.encode(value)?;
-        if payload.len() > self.policy.max_bytes.get() {
-            return Err(RecordError::Bound);
-        }
-        Ok((self.codec.version().get(), payload))
-    }
-    /// Move the codec version and its encoded bytes together into one acknowledged revision mutation.
-    async fn mutate_bytes(
+    /// Encode and move one admitted operation directly into the established SQL settlement path.
+    #[expect(
+        clippy::result_large_err,
+        reason = "preserves the established typed record ABI"
+    )]
+    pub(super) async fn write_reserved(
         &self,
         owner: &str,
         id: Uuid,
-        expected: Option<Uuid>,
-        expires_at: Option<OffsetDateTime>,
-        encoded: (u16, Vec<u8>),
+        (expected, expires_at): (Option<Uuid>, Option<OffsetDateTime>),
+        value: A,
+        admission: RecordWriteAdmission<'_>,
         capacity: Option<(i64, i64)>,
-    ) -> Result<Uuid, RecordError> {
-        let (version, payload) = encoded;
+    ) -> Result<(Uuid, A), RecordError> {
+        let mut payload = prepared::encode(
+            &*self.codec,
+            self.prepared_codec(),
+            self.policy,
+            &value,
+            admission.buffer,
+        )?;
+        let version = self.codec.version().get();
         let expires_at = expires_at.map(utc_nanos).transpose()?;
         /// One borrowed-owner/moved-payload invocation; SQL's cleanup implementation owns settlement.
         struct Mutation<'a> {
@@ -378,7 +501,7 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
             /// Codec generation version, independent of public-view schemas.
             version: u16,
             /// Encoded native/provider ownership conversion, moved once.
-            payload: Vec<u8>,
+            payload: PayloadBinding<'a>,
             /// Optional live-record quota and explicit UTC nanosecond instant.
             capacity: Option<(i64, i64)>,
         }
@@ -393,16 +516,16 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
             {
                 let revision = Uuid::new_v4();
                 let result = if let Some(expected) = self.expected {
-                    sqlx::query(AssertSqlSafe("UPDATE effect_identity_records SET revision=?,codec_version=?,expires_at=?,payload=? WHERE category=? AND owner=? AND record_id=? AND revision=?"))
-                            .bind(revision.to_string()).bind(i64::from(self.version)).bind(self.expires_at).bind(self.payload).bind(self.category).bind(self.owner).bind(self.id.to_string()).bind(expected.to_string()).execute(connection).await?
+                    self.payload.bind(sqlx::query(AssertSqlSafe("UPDATE effect_identity_records SET revision=?,codec_version=?,expires_at=?,payload=? WHERE category=? AND owner=? AND record_id=? AND revision=?"))
+                            .bind(revision.to_string()).bind(i64::from(self.version)).bind(self.expires_at)).bind(self.category).bind(self.owner).bind(self.id.to_string()).bind(expected.to_string()).execute(connection).await?
                 } else if let Some((capacity, now)) = self.capacity {
                     sqlx::query(AssertSqlSafe("DELETE FROM effect_identity_records WHERE category=? AND owner=? AND expires_at<=?"))
                             .bind(self.category).bind(self.owner).bind(now).execute(&mut *connection).await?;
-                    sqlx::query(AssertSqlSafe("INSERT INTO effect_identity_records(category,owner,record_id,revision,codec_version,expires_at,payload) SELECT ?,?,?,?,?,?,? WHERE (SELECT COUNT(*) FROM effect_identity_records WHERE category=? AND owner=?)<?"))
-                            .bind(self.category).bind(self.owner).bind(self.id.to_string()).bind(revision.to_string()).bind(i64::from(self.version)).bind(self.expires_at).bind(self.payload).bind(self.category).bind(self.owner).bind(capacity).execute(connection).await?
+                    self.payload.bind(sqlx::query(AssertSqlSafe("INSERT INTO effect_identity_records(category,owner,record_id,revision,codec_version,expires_at,payload) SELECT ?,?,?,?,?,?,? WHERE (SELECT COUNT(*) FROM effect_identity_records WHERE category=? AND owner=?)<?"))
+                            .bind(self.category).bind(self.owner).bind(self.id.to_string()).bind(revision.to_string()).bind(i64::from(self.version)).bind(self.expires_at)).bind(self.category).bind(self.owner).bind(capacity).execute(connection).await?
                 } else {
-                    sqlx::query(AssertSqlSafe("INSERT INTO effect_identity_records(category,owner,record_id,revision,codec_version,expires_at,payload) VALUES(?,?,?,?,?,?,?)"))
-                            .bind(self.category).bind(self.owner).bind(self.id.to_string()).bind(revision.to_string()).bind(i64::from(self.version)).bind(self.expires_at).bind(self.payload).execute(connection).await?
+                    self.payload.bind(sqlx::query(AssertSqlSafe("INSERT INTO effect_identity_records(category,owner,record_id,revision,codec_version,expires_at,payload) VALUES(?,?,?,?,?,?,?)"))
+                            .bind(self.category).bind(self.owner).bind(self.id.to_string()).bind(revision.to_string()).bind(i64::from(self.version)).bind(self.expires_at)).execute(connection).await?
                 };
                 if result.rows_affected() != 1 {
                     return Err(SqlError::Binding(Box::new(RecordError::Conflict)));
@@ -410,24 +533,26 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
                 Ok(revision)
             }
         }
-        let result = self
-            .backend
-            .kernel
-            .transaction_operation(Mutation {
-                category: self.category.key(),
-                owner,
-                id,
-                expected,
-                expires_at,
-                version,
-                payload,
-                capacity,
-            })
-            .await;
-        result.map_err(record_sql_error)
+        let operation = Mutation {
+            category: self.category.key(),
+            owner,
+            id,
+            expected,
+            expires_at,
+            version,
+            payload: payload.binding(),
+            capacity,
+        };
+        let result = match admission.transaction {
+            Some(transaction) => transaction.run(operation).await,
+            None => self.backend.kernel.transaction_operation(operation).await,
+        };
+        let revision = result.map_err(record_sql_error)?;
+        Ok((revision, value))
     }
     /// Consume one matching purpose/owner-bound unexpired record at one durable
     /// linearization point. The record ID supplied by the selected protocol binds purpose.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     pub async fn take(
         &self,
         owner: &str,
@@ -439,6 +564,7 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
     }
     /// Consume an explicitly expiring protocol record. A null persisted expiry is
     /// corruption, never a permanent challenge; validation occurs before delete.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     pub async fn take_expiring(
         &self,
         owner: &str,
@@ -449,6 +575,7 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
         self.take_inner(owner, id, expected, now, true).await
     }
     /// Share the same durable consume path while retaining the protocol expiry rule.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     async fn take_inner(
         &self,
         owner: &str,
@@ -471,6 +598,7 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
             now: OffsetDateTime,
             /// Protocol consumption requires a persisted finite expiry.
             require_expiry: bool,
+            buffer: Option<&'a mut RecordBuffer>,
         }
         impl<A: Send + 'static, C: RecordCodec<A>> NativeOperation<Option<Record<A>>> for Take<'_, A, C> {
             /// Decode before deleting so corrupt state fails closed and rolls back.
@@ -486,7 +614,7 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
                 let Some(row) = row else { return Ok(None) };
                 let record = self
                     .adapter
-                    .decode(row)
+                    .decode(row, self.buffer)
                     .map_err(|error| SqlError::Binding(Box::new(error)))?;
                 if self.require_expiry && record.expires_at.is_none() {
                     return Err(SqlError::Binding(Box::new(RecordError::Corrupt)));
@@ -499,6 +627,7 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
                 Ok(Some(record))
             }
         }
+        let mut buffer = self.reserve_buffer()?;
         self.backend
             .kernel
             .transaction_operation(Take {
@@ -508,12 +637,14 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
                 expected,
                 now,
                 require_expiry,
+                buffer: buffer.as_mut(),
             })
             .await
             .map_err(record_sql_error)
     }
     /// Revoke/remove exactly the expected record revision; failed acknowledgment
     /// cannot establish logout, delivery cancellation or completed deletion.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     pub async fn remove(&self, owner: &str, id: Uuid, expected: Uuid) -> Result<bool, RecordError> {
         /// Borrowed conditional deletion shares the same native transaction semantics.
         struct Remove<'a> {
@@ -549,6 +680,7 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
             .map_err(Into::into)
     }
     /// Read one finite page; no transaction or request is retained by its consumer.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     pub async fn page(
         &self,
         owner: &str,
@@ -571,9 +703,11 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
             limit: NonZeroU16,
             /// Explicit native UTC instant for expiry filtering.
             now: OffsetDateTime,
+            buffer: Option<&'a mut RecordBuffer>,
         }
         impl<A: Send + 'static, C: RecordCodec<A>> NativeOperation<RecordPage<A>> for Page<'_, A, C> {
             /// Decode only one finite native page and release the lease before returning it.
+            #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
             async fn run<'a>(
                 self,
                 c: &'a mut sqlx::TursoConnection,
@@ -583,9 +717,10 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
             {
                 let rows=sqlx::query(AssertSqlSafe("SELECT record_id,revision,codec_version,expires_at,CASE WHEN length(payload)<=? THEN payload ELSE NULL END AS payload FROM effect_identity_records WHERE category=? AND owner=? AND record_id>? AND (expires_at IS NULL OR expires_at>?) ORDER BY record_id LIMIT ?"))
                     .bind(max_bytes_sql(self.adapter.policy)?).bind(self.adapter.category.key()).bind(self.owner).bind(self.after.map_or_else(String::new,|v|v.to_string())).bind(utc_nanos(self.now).map_err(|error|SqlError::Binding(Box::new(error)))?).bind(i64::from(self.limit.get())+1).fetch_all(c).await?;
+                let mut buffer = self.buffer;
                 let mut records = rows
                     .into_iter()
-                    .map(|row| self.adapter.decode(row))
+                    .map(|row| self.adapter.decode(row, buffer.as_deref_mut()))
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|error| SqlError::Binding(Box::new(error)))?;
                 let next = if records.len() > usize::from(self.limit.get()) {
@@ -597,6 +732,7 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
                 Ok(RecordPage { records, next })
             }
         }
+        let mut buffer = self.reserve_buffer()?;
         self.backend
             .kernel
             .connection_operation(Page {
@@ -605,12 +741,18 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
                 after,
                 limit,
                 now,
+                buffer: buffer.as_mut(),
             })
             .await
             .map_err(record_sql_error)
     }
     /// Decode native SQL cells and validate both codec version and policy bound.
-    fn decode(&self, row: sqlx::TursoRow) -> Result<Record<A>, RecordError> {
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
+    fn decode(
+        &self,
+        row: sqlx::TursoRow,
+        buffer: Option<&mut RecordBuffer>,
+    ) -> Result<Record<A>, RecordError> {
         let id: String = row.try_get("record_id").map_err(|_| RecordError::Corrupt)?;
         let revision: String = row.try_get("revision").map_err(|_| RecordError::Corrupt)?;
         let version: i64 = row
@@ -619,10 +761,7 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
         let expires_at: Option<i64> = row
             .try_get("expires_at")
             .map_err(|_| RecordError::Corrupt)?;
-        let payload: Vec<u8> = row.try_get("payload").map_err(|_| RecordError::Corrupt)?;
-        if payload.len() > self.policy.max_bytes.get() {
-            return Err(RecordError::Corrupt);
-        }
+        let payload: &[u8] = row.try_get("payload").map_err(|_| RecordError::Corrupt)?;
         let version = u16::try_from(version)
             .ok()
             .and_then(NonZeroU16::new)
@@ -634,7 +773,14 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
                 .map(|value| OffsetDateTime::from_unix_timestamp_nanos(i128::from(value)))
                 .transpose()
                 .map_err(|_| RecordError::Corrupt)?,
-            value: self.codec.decode(version, &payload)?,
+            value: prepared::decode(
+                &*self.codec,
+                self.prepared_codec(),
+                self.policy,
+                version,
+                payload,
+                buffer,
+            )?,
         })
     }
     /// Lazy reusable read selects owner/clock from R on each run; no runtime is created.
@@ -710,6 +856,10 @@ fn record_sql_error(error: SqlError) -> RecordError {
         | SqlError::Provider(_)
         | SqlError::RowAbsent
         | SqlError::Decode(_)
+        | SqlError::Memory(_)
+        | SqlError::RowLimit { .. }
+        | SqlError::PreparedStatement(_)
+        | SqlError::PreparedRow(_)
         | SqlError::InactiveSession
         | SqlError::CommitOutcomeUnknown(_)
         | SqlError::Cleanup { .. }
@@ -743,6 +893,7 @@ pub struct SqlAuditAdapter<A, C> {
     backend: SqlxIdentityStore,
     /// Application-owned codec retained once; no untyped event interpretation.
     codec: Arc<C>,
+    prepared: Option<Arc<PreparedCodec<A, C>>>,
     /// Explicit encoded byte/page bounds.
     policy: RecordPolicy,
     /// Payload type remains static without retained active values.
@@ -754,6 +905,7 @@ impl<A, C> Clone for SqlAuditAdapter<A, C> {
         Self {
             backend: self.backend.clone(),
             codec: self.codec.clone(),
+            prepared: self.prepared.clone(),
             policy: self.policy,
             value: PhantomData,
         }
@@ -765,9 +917,32 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlAuditAdapter<A, C> {
         Self {
             backend,
             codec: Arc::new(codec),
+            prepared: None,
             policy,
             value: PhantomData,
         }
+    }
+    /// Select preadmitted record bytes for every read and write on this adapter.
+    /// Exhaustion uses the existing record bound failure before codec invocation.
+    pub fn with_prepared_memory(
+        mut self,
+        memory: Arc<PreparedRecordMemory>,
+    ) -> Result<Self, MemoryError>
+    where
+        C: PreparedRecordCodec<A>,
+    {
+        self.prepared = Some(Arc::new(PreparedCodec::new(memory, self.policy)?));
+        Ok(self)
+    }
+    fn prepared_codec(&self) -> Option<&PreparedCodec<A, C>> {
+        self.prepared.as_deref()
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "preserves the established typed record ABI"
+    )]
+    fn reserve_buffer(&self) -> Result<Option<RecordBuffer>, RecordError> {
+        prepared::reserve(self.prepared_codec()).map_err(|_| RecordError::Bound)
     }
     /// Reject a selected handle from another storage definition.
     #[must_use]
@@ -776,11 +951,16 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlAuditAdapter<A, C> {
     }
     /// Append exactly one moved event and return its acknowledged sequence. Lost
     /// acknowledgment is inspected by event ID instead of blindly retried.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     pub async fn append(&self, owner: &str, event_id: Uuid, value: A) -> Result<i64, RecordError> {
-        let payload = self.codec.encode(&value)?;
-        if payload.len() > self.policy.max_bytes.get() {
-            return Err(RecordError::Bound);
-        }
+        let admission = RecordWriteAdmission::reserve(&self.backend, self.reserve_buffer()?)?;
+        let mut payload = prepared::encode(
+            &*self.codec,
+            self.prepared_codec(),
+            self.policy,
+            &value,
+            admission.buffer,
+        )?;
         /// Borrow owner while moving one encoded event under kernel settlement.
         struct Append<'a> {
             /// Selected administrative owner namespace, not authority by itself.
@@ -790,7 +970,7 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlAuditAdapter<A, C> {
             /// Stable private codec version.
             version: u16,
             /// Encoded moved event bytes, bounded before native execution.
-            payload: Vec<u8>,
+            payload: PayloadBinding<'a>,
         }
         impl NativeOperation<i64> for Append<'_> {
             /// Native INSERT RETURNING acknowledges this event's actual sequence.
@@ -798,24 +978,26 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlAuditAdapter<A, C> {
             where
                 Self: 'a,
             {
-                let row=sqlx::query(AssertSqlSafe("INSERT INTO effect_identity_audit(owner,event_id,codec_version,payload) VALUES(?,?,?,?) RETURNING sequence"))
-                    .bind(self.owner).bind(self.event_id.to_string()).bind(i64::from(self.version)).bind(self.payload).fetch_one(c).await?;
+                let row=self.payload.bind(sqlx::query(AssertSqlSafe("INSERT INTO effect_identity_audit(owner,event_id,codec_version,payload) VALUES(?,?,?,?) RETURNING sequence"))
+                    .bind(self.owner).bind(self.event_id.to_string()).bind(i64::from(self.version))).fetch_one(c).await?;
                 row.try_get("sequence").map_err(Into::into)
             }
         }
-        self.backend
-            .kernel
-            .transaction_operation(Append {
-                owner,
-                event_id,
-                version: self.codec.version().get(),
-                payload,
-            })
-            .await
-            .map_err(Into::into)
+        let operation = Append {
+            owner,
+            event_id,
+            version: self.codec.version().get(),
+            payload: payload.binding(),
+        };
+        let result = match admission.transaction {
+            Some(transaction) => transaction.run(operation).await,
+            None => self.backend.kernel.transaction_operation(operation).await,
+        };
+        result.map_err(Into::into)
     }
     /// Incrementally read a finite page for application authority checks before each
     /// emitted record. This store method alone does not establish operator permission.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     pub async fn page(
         &self,
         owner: &str,
@@ -835,9 +1017,11 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlAuditAdapter<A, C> {
             after: i64,
             /// Explicit finite query limit with one continuation lookahead.
             limit: u16,
+            buffer: Option<&'a mut RecordBuffer>,
         }
         impl<A: Send + 'static, C: RecordCodec<A>> NativeOperation<AuditPage<A>> for Read<'_, A, C> {
             /// Consume native cells under the lease; no native row escapes into Effect.
+            #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
             async fn run<'a>(
                 self,
                 c: &'a mut sqlx::TursoConnection,
@@ -847,16 +1031,14 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlAuditAdapter<A, C> {
             {
                 let rows=sqlx::query(AssertSqlSafe("SELECT sequence,event_id,codec_version,CASE WHEN length(payload)<=? THEN payload ELSE NULL END AS payload FROM effect_identity_audit WHERE owner=? AND sequence>? ORDER BY sequence LIMIT ?"))
                     .bind(max_bytes_sql(self.adapter.policy)?).bind(self.owner).bind(self.after).bind(i64::from(self.limit)+1).fetch_all(c).await?;
+                let mut buffer = self.buffer;
                 let mut entries = Vec::with_capacity(rows.len());
                 for row in rows {
                     let sequence: i64 = row.try_get("sequence")?;
                     let event_id: String = row.try_get("event_id")?;
                     let version: i64 = row.try_get("codec_version")?;
-                    let payload: Vec<u8> = row.try_get("payload")?;
-                    let decode = || -> Result<AuditEntry<A>, RecordError> {
-                        if payload.len() > self.adapter.policy.max_bytes.get() {
-                            return Err(RecordError::Corrupt);
-                        }
+                    let payload: &[u8] = row.try_get("payload")?;
+                    let mut decode = || -> Result<AuditEntry<A>, RecordError> {
                         let version = u16::try_from(version)
                             .ok()
                             .and_then(NonZeroU16::new)
@@ -865,7 +1047,14 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlAuditAdapter<A, C> {
                             sequence,
                             event_id: Uuid::parse_str(&event_id)
                                 .map_err(|_| RecordError::Corrupt)?,
-                            value: self.adapter.codec.decode(version, &payload)?,
+                            value: prepared::decode(
+                                &*self.adapter.codec,
+                                self.adapter.prepared_codec(),
+                                self.adapter.policy,
+                                version,
+                                payload,
+                                buffer.as_deref_mut(),
+                            )?,
                         })
                     };
                     entries.push(decode().map_err(|error| SqlError::Binding(Box::new(error)))?);
@@ -879,6 +1068,7 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlAuditAdapter<A, C> {
                 Ok(AuditPage { entries, next })
             }
         }
+        let mut buffer = self.reserve_buffer()?;
         self.backend
             .kernel
             .connection_operation(Read {
@@ -886,6 +1076,7 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlAuditAdapter<A, C> {
                 owner,
                 after: after.unwrap_or(0),
                 limit: limit.get(),
+                buffer: buffer.as_mut(),
             })
             .await
             .map_err(record_sql_error)

@@ -47,6 +47,8 @@
 
 extern crate self as effect;
 
+pub use effect_macros::{effect_drop_guard, memory, memory_lease, memory_vec, memory_write};
+
 pub use effect_macros::{
     activity, activity_definition, atom, cache, cluster, cluster_schedule, dependency_cache,
     durable_queue, entity, entity_resource, event, event_group, handled_event, hydration,
@@ -60,10 +62,10 @@ pub use effect_macros::{
     codec, effect_all, effect_all_concurrent, effect_blocking, effect_cpu, effect_die,
     effect_finalizer, effect_for_each, effect_for_each_concurrent, effect_from_option,
     effect_future, effect_map, effect_map_error, effect_on_interrupt, effect_permit,
-    effect_provide_some, effect_provided, effect_race, effect_recover, effect_ref, effect_repeat,
-    effect_resource, effect_retry, effect_sandbox, effect_schema_parse, effect_scope,
-    effect_scope_acquire, effect_socket, effect_stream_for_each, effect_sync, effect_timeout,
-    effect_try_blocking, effect_try_cpu, effect_try_future, effect_try_sync,
+    effect_prepare, effect_provide_some, effect_provided, effect_race, effect_recover, effect_ref,
+    effect_repeat, effect_resource, effect_retry, effect_sandbox, effect_schema_parse,
+    effect_scope, effect_scope_acquire, effect_socket, effect_stream_for_each, effect_sync,
+    effect_timeout, effect_try_blocking, effect_try_cpu, effect_try_future, effect_try_sync,
     effect_uninterruptible, effect_using, effect_with_layer, layer, pool, request_resolver,
     schedule, sink, weak_cache,
 };
@@ -71,6 +73,7 @@ pub use effect_macros::{
 mod admission;
 mod cache;
 mod cancellation;
+mod cleanup_failures;
 mod clock;
 pub mod cluster;
 mod config;
@@ -90,13 +93,30 @@ mod internal;
 mod job;
 mod latch;
 mod layer;
+pub mod memory;
 mod metric;
 mod native_context;
 mod owned_run;
 mod parallel;
+pub use parallel::PreparedUnitCohorts;
 mod partitioned_semaphore;
 pub mod persistence;
 mod pool;
+mod prepared_admission;
+mod prepared_atomic_ref;
+mod prepared_deferred;
+mod prepared_exit_mapper;
+mod prepared_gate;
+mod prepared_oneshot;
+mod prepared_partitioned_semaphore;
+mod prepared_payload;
+pub mod prepared_provider;
+mod prepared_pub_sub;
+mod prepared_queue;
+mod prepared_semaphore;
+mod prepared_subscription_ref;
+mod prepared_synchronized_ref;
+mod prepared_watch;
 mod primary_key;
 #[path = "effect.rs"]
 mod program;
@@ -124,75 +144,162 @@ pub mod websocket;
 pub mod workflow;
 
 pub use cancellation::Cancellation;
-pub use clock::{Clock, ClockError, ClockFuture, ClockTick, HasClock, TestClock, TestClockAdvance};
+pub use cleanup_failures::{
+    CleanupFailures, CleanupFailuresIntoIter, CleanupReturnWaiter, PreparedCleanupAccumulator,
+    PreparedCleanupConfig, PreparedCleanupPool,
+};
+pub use clock::{
+    Clock, ClockError, ClockFuture, ClockTick, HasClock, PreparedClockAdvance, PreparedClockCapacity,
+    PreparedClockError, PreparedClockTick, PreparedClockWait, PreparedTestClock, TestClock,
+    TestClockAdvance,
+};
+mod prepared_config;
+mod prepared_effect_config;
+pub use prepared_effect_config::{HasPreparedConfigSource, PreparedConfigFailure, PreparedConfigLoadError, PreparedConfigSource, PreparedConfigStoreSource, PreparedEffectConfig, PreparedEffectConfigWithDefault};
+pub use prepared_config::{HasPreparedConfigStore, PreparedConfig, PreparedConfigStore, PreparedMemoryConfigCapacity, PreparedMemoryConfigDemand, PreparedMemoryConfigSource};
 pub use config::{
     Config, ConfigError, ConfigErrorKind, ConfigPath, ConfigPathError, ConfigSource, EffectConfig,
     HasConfigSource, MemoryConfigSource,
 };
-pub use console::{Console, ConsoleChannel, HasConsole, StandardConsole};
+pub use console::{
+    Console, ConsoleChannel, HasConsole, PreparedConsole, PreparedConsoleError, StandardConsole,
+};
 pub use cron::{
     CalendarOccurrence, CalendarTimeError, CalendarTransitionPolicy, CalendarZone, CivilDateTime,
     Cron, CronBudgetKind, CronEvalError, CronEvalErrorKind, CronFieldKind, CronParseError,
     CronParseErrorKind, CronSearchBudget, DayMatch, FixedOffsetZone, GapPolicy, LocalResolution,
-    MissedOccurrencePolicy, OccurrencePhase, OverlapPolicy,
+    MissedOccurrencePolicy, OccurrencePhase, OverlapPolicy, PreparedCronError,
 };
-pub use defect::{Defect, DefectKind, LibraryDefect};
+pub use defect::{
+    Defect, DefectKind, LibraryDefect, PanicMessageOverflow, PreparedPanicConfig,
+    PreparedPanicDemand, PreparedPanicPool, PreparedPanicReservation,
+};
 pub use deferred::Deferred;
 pub use duration::{Deadline, HasWallClock, TestWallClock, TimeError, UtcMillis, WallClock};
 pub use effect_macros::{effect, persistable, schema, schema_enum};
 pub use execution::{HasCancellation, HasTaskSpawner, ScheduledTask, TaskSpawner};
 pub use exit::{CleanupFailure, Exit, Finalization, PrimaryOutcome, PrimaryOutcomeRef};
 pub use fiber::{Fiber, FiberStatus, OutcomeStatus, SharedExit};
+pub use internal::runtime::prepared_graph::ResourceValue as PreparedGraphResourceValue;
+pub use internal::runtime::prepared_graph::scope_binding::{
+    ScopePermit as PreparedScopePermit, TargetMismatch as PreparedScopeTargetMismatch,
+};
+pub use internal::runtime::{
+    ConstructionShape, ConstructionSite, ConstructionVacancy, DynamicRunContract, LeasedRunFuture,
+    LeasedRunResult, PreparedCancellation, PreparedCancellationObservation,
+    PreparedCancellationSignalWait, PreparedCancellationWait, PreparedConstructionPool,
+    PreparedDriver, PreparedInvocation, PreparedNativeAdmission, PreparedNativeFuture,
+    PreparedNativeReservation, PreparedOutput, PreparedOutputOwnerReservation,
+    PreparedOutputOwnerView, PreparedOwnedDriver, PreparedPollHook, PreparedPollInstrumentation,
+    PreparedRun, PreparedRunContext,
+    PreparedRunDemand, PreparedRunPlan, ReservedOutputOrigins, construction_site,
+    join_prepared_native,
+};
 pub use job::{BlockingExecutor, CpuExecutor, HasBlockingExecutor, HasCpuExecutor, ScheduledJob};
-pub use latch::Latch;
+pub use latch::{Latch, PreparedLatch, PreparedLatchWait};
 pub use layer::Layer;
 pub use metric::{
     GaugeValue, HasMetricRecorder, MemoryMetricRecorder, MetricAggregate, MetricCapacity,
     MetricDescriptor, MetricDomain, MetricError, MetricKind, MetricLabels, MetricName,
-    MetricRecorder, MetricSample, MetricSeries, MetricValue,
+    MetricRecorder, MetricSample, MetricSeries, MetricValue, PreparedMetricCapacity,
+    PreparedMetricDraft, PreparedMetricError, PreparedMetricRecorder, PreparedMetricSeries,
+    PreparedMetricSnapshot,
 };
-pub use native_context::{NativeContext, PollInstrumentation, PollScope};
+pub use native_context::{
+    NativeContext, PollInstrumentation, PollScope, PreparedContextualFutureLayouts,
+    PreparedContextualFutureReservation,
+};
 pub use owned_run::{RunDriver, RunObserver};
+pub use prepared_admission::{
+    PreparedAdmissionError, PreparedAdmissionPermit, PreparedCapacityPermit, PreparedDriverPermit,
+    PreparedProviderAdmission, PreparedProviderDrain,
+};
+pub use prepared_atomic_ref::PreparedAtomicRef;
+pub use prepared_deferred::{
+    PreparedDeferred, PreparedDeferredError, PreparedDeferredWait, PreparedExitBorrow,
+    PreparedSharedExit,
+};
+pub use prepared_exit_mapper::PreparedExitMapper;
+pub use prepared_gate::PreparedGate;
+pub use prepared_oneshot::{
+    PreparedOneshotClosed, PreparedOneshotPool, PreparedReceiver, PreparedSender, prepared_oneshot,
+    prepared_oneshot_storage_bytes,
+};
+pub use prepared_partitioned_semaphore::PreparedPartitionedSemaphore;
+pub use prepared_payload::{
+    PreparedPayloadLink, PreparedPayloadPool, PreparedPayloadReservation, PreparedPayloadView,
+};
+pub use prepared_pub_sub::{
+    PreparedCallbackPubSub, PreparedCandidateFailure, PreparedPubSub, PreparedPubSubCapacity,
+    PreparedPubSubDemand, PreparedPubSubError, PreparedPublication, PreparedPublish,
+    PreparedSubscription, PreparedSubscriptionEvent, PreparedSubscriptionTake,
+};
+pub use prepared_queue::{
+    PreparedQueue, PreparedQueueCapacity, PreparedQueueDemand, PreparedQueueItem,
+    PreparedQueueOffer, PreparedQueueOfferReservation, PreparedQueueReceiver, PreparedQueueTake,
+};
+pub use prepared_semaphore::{
+    PreparedSemaphore, PreparedSemaphoreAcquire, PreparedSemaphoreError, PreparedSemaphorePermit,
+};
+pub use prepared_subscription_ref::{
+    PreparedSubscriptionRef, PreparedSubscriptionSet, PreparedSubscriptionSnapshot,
+};
+pub use prepared_synchronized_ref::{PreparedSynchronizedRef, PreparedSynchronizedRefDemand};
+pub use prepared_watch::{
+    PreparedWatchBorrow, PreparedWatchClosed, PreparedWatchPool, PreparedWatchPublication,
+    PreparedWatchReceiver, PreparedWatchSender, PreparedWatchView, prepared_watch,
+    prepared_watch_storage_bytes,
+};
 pub use program::Effect;
 pub use queue::{AsyncQueue, QueueCapacity, QueueError, QueueShutdown};
 pub use random::{HasRandom, Random, RandomFn, UnitInterval};
 pub use reference::AtomicRef;
 pub use resource::{Release, ResourceBinding, ResourceValue};
 pub use schedule::{
-    CombineSampling, Deterministic, GrowthFactor, NonnegativeFactor, Randomized, Schedule,
-    ScheduleDecision, ScheduleSampling,
+    CombineSampling, Deterministic, GrowthFactor, NonnegativeFactor, PreparedSchedule,
+    PreparedScheduleAttempt, PreparedScheduleTransition, Randomized, Schedule, ScheduleDecision,
+    ScheduleSampling,
 };
 pub use schema::{
-    AnyOfValue, ArrayConstraints, CheckedPattern, Codec, ConfiguredCodec, Decimal, DecimalError,
-    DomainCodec, DuplicateFields, EffectSchema, IssueBudget, IssueSegment, JsonExactNumber,
-    JsonRepresentation, JsonSchemaDocument, JsonValue, JsonWriter, JsonWriterPolicy,
-    JsonWriterSink, LiteralEnumValue, MultiplePatternPolicy, NativeField, NativeFields, NativeNil,
+    AnyOfValue, PreparedObjectConstraints, PreparedObjectEntry, PreparedObjectValue, PreparedPatternProperty, json_prepared_object_constraints, PreparedAnyOfValue, json_prepared_any_of, json_prepared_one_of, json_prepared_all_of, ArrayConstraints, CheckedPattern, Codec, ConfiguredCodec, Decimal, DecimalError,
+    DomainCodec, DuplicateFields, EffectSchema, IssueBudget, IssueSegment, PreparedDiagnosticText, PreparedDiagnosticTextBuilder, PreparedDiagnosticTextError, PreparedIssueMemory, PreparedIssueMemoryCapacity, PreparedIssueMemoryDemand, JsonExactNumber, prepared_issue_at, prepared_unknown_field,
+    JsonRepresentation, JsonSchemaDocument, JsonValue, JsonWriter, JsonWriterPolicy, json_prepared_prefix_rest, PreparedPrefixElement, PreparedPrefixValue, json_prepared_exact_number, PreparedJsonExactNumber, PreparedNumericScratchCapacity, PreparedNumericScratchDemand, PreparedNumericScratchPool, prepared_view_kind, PreparedTaggedEnumBuilder, PreparedObjectAssembly, PreparedRecordBuilder, PreparedRecordField, PreparedRecordFields, PreparedRecordNil, PreparedRecordIssues, PreparedIssueAccumulator, PreparedJsonArray, PreparedJsonArrayBuilder, PreparedJsonArrayCapacity, PreparedJsonArrayDemand, PreparedJsonArrayPool, PreparedArrayOperationCapacity, PreparedArrayOperationPool, PreparedJsonArrayCodec, PreparedJsonArrayCodecResources, PreparedSequenceCursor, PreparedSequenceRepresentation, PreparedJsonSequenceRepresentation, PreparedJsonSequenceCursor, PreparedJsonSequenceWriteAdmission, PreparedSequenceCodec, PreparedSequenceCodecResources, PreparedSequenceOperationCapacity, PreparedSequenceOperationPool, PreparedMapOperationCapacity, PreparedMapOperationPool, PreparedJsonMapCodec, PreparedJsonMapCodecResources, PreparedRecordRequired, PreparedRecordOptional, PreparedRecordDefaulted, PreparedRecordChildDefaultValidator, PreparedRecordContextDefaultValidator, PreparedOptionalRecord, PreparedDefaultRecord, PreparedContextDefaultRecord, JsonRecordBacking, RecordBacking, PreparedGenericRecordBacking, PreparedGenericRecordResources, PreparedEffectRecordWithPolicy, PreparedEffectRecordAdded, PreparedEffectRecordBuilt, PreparedEffectRecordBuilder, PreparedEffectRecordField, PreparedEffectRecordFields, PreparedEffectRecordNil, PreparedEffectRecordCodec, PreparedEffectRecordResources, PreparedRecordOperationCapacity, PreparedRecordOperationPool, PreparedObjectCodec, PreparedObjectCodecResources, PreparedObjectOperationCapacity, PreparedObjectOperationPool, PreparedObjectCursor, PreparedObjectRepresentation, PreparedRecordRepresentation, PreparedJsonObjectCursor, PreparedJsonObjectRepresentation, PreparedJsonObjectWriteAdmission, SharedPreparedJsonArray, PreparedJsonOutput, PreparedJsonWriterCapacity, PreparedJsonWriterPool, PreparedJsonWriterSinkReservation, PreparedParseContextCapacity, PreparedParseContextDemand, PreparedParseContextPool, PreparedSchemaMemory, PreparedSchemaMemoryCapacity, PreparedSchemaMemoryDemand, PreparedJsonValidationCapacity, PreparedJsonValidationDemand, PreparedJsonValidationPool, PreparedJsonDocument, PreparedJsonKind, PreparedJsonParserCapacity, PreparedJsonParserDemand, PreparedJsonParserPool, PreparedJsonValue, SharedPreparedJsonValue,
+    JsonWriterSink, LiteralEnumValue, PreparedLiteralEnumValue, MultiplePatternPolicy, NativeField, NativeFields, NativeNil,
     NativeRecordBuilder, NumericConstraint, ObjectConstraints, ObjectRepresentation, ParseContext,
-    ParseLimits, ParsePolicy, PatternPolicy, PatternProperty, PrefixElement, PrefixValue,
-    PrimitiveShape, PureCodec, RecordBuilder, RecordField, RecordFields, RecordNil,
+    ParseLimits, ParsePolicy, PatternPolicy, PreparedPatternCacheDemand, PatternProperty, PrefixElement, PrefixValue,
+    PrimitiveShape, PureCodec, PreparedCodec, PreparedPureCodec, RecordBuilder, RecordField, RecordFields, RecordNil,
     RepresentationError, RepresentationLimits, RepresentationPrecision, Schema, SchemaAst,
     SchemaErrorMode, SchemaIssue, SchemaIssueKind, SchemaPolicy, SchemaProperty, SchemaReference,
     SchemaResource, SchemaShape, SequenceRepresentation, StoredCleanup, StoredDefect,
     StoredFinalization, StoredOutcome, StoredPrimary, StringConstraints, StringLengthUnit,
     StringPattern, TaggedEnumBuilder, UnknownFields, UnknownLiteralPolicy, ValueKind,
-    export_json_schema, json_all_of, json_any_of, json_array, json_array_constraints, json_bool,
+    export_json_schema, json_all_of, json_any_of, json_array, json_array_constraints, json_prepared_array_constraints, json_bool,
     json_bytes, json_decimal, json_exact_number, json_f64, json_i64, json_literal,
-    json_literal_enum, json_null, json_nullable, json_object_constraints, json_one_of, json_option,
-    json_prefix_rest, json_result, json_stable_key, json_string, json_string_constraints,
+    json_literal_enum, json_prepared_literal_enum, json_null, json_nullable, json_object_constraints, json_one_of, json_option,
+    json_prefix_rest, json_result, json_stable_key, json_string, json_prepared_string, json_prepared_literal, json_prepared_bytes, json_prepared_nullable, json_prepared_array, json_prepared_tuple2, json_prepared_null, json_prepared_bool, json_prepared_i64, json_prepared_u64, json_prepared_f64, PreparedJsonString, json_string_constraints, json_prepared_string_constraints,
     json_string_pattern, json_tuple2, json_u64, json_utc_millis, native_array, native_map,
     stored_outcome_codec, value_kind,
 };
-pub use scope::{Scope, ScopeCloseStatus};
+pub use scope::{
+    PreparedCheckpoint, PreparedCleanupDemand, PreparedCloseWait, PreparedFutureResourceBinding,
+    PreparedFutureResourcePlan, PreparedRelease, PreparedReleasePlan, PreparedResourceBinding,
+    PreparedResourceDemand, PreparedResourcePlan, PreparedResourceValue, PreparedScope,
+    PreparedScopeAdmissionError, PreparedScopeClose, PreparedScopeCloseDemand, PreparedScopeDemand,
+    PreparedScopeLimits, PreparedScopeOwner, PreparedScopePool, Scope, ScopeCloseStatus,
+};
 pub use semaphore::{Semaphore, SemaphoreError, SemaphorePermit};
-pub use sink::Sink;
+pub use sink::{PreparedFoldPool, PreparedFoldValue, Sink};
 
 /// Safe construction bridge for procedural macro expansion.
 #[doc(hidden)]
 pub mod __private {
     use crate::effect_sync;
+    pub use crate::prepared_synchronized_ref::PreparedSynchronizedWrite;
 
     pub use crate::Exit;
     pub use crate::internal::macro_future::{AsyncBindable, MacroContext, async_workflow};
+    pub use crate::internal::runtime::prepared_graph;
+    pub use crate::internal::runtime_storage::{ReservedOnce, ReservedOnceReservation};
     pub use crate::internal::scoped_body::ScopedBody;
     pub use crate::internal::workflow::{
         Bindable, Workflow, bind, defer, defer_callback0, defer_callback1, defer_callback2, once,
@@ -255,11 +362,16 @@ pub mod __private {
     }
 }
 
-pub use stream::{Chunk, Stream, StreamBufferOptions, StreamContext, StreamReader};
+pub use stream::{
+    Chunk, PreparedChunk, PreparedChunkPool, PreparedChunkValues, PreparedStream,
+    PreparedStreamPull, Stream, StreamBufferOptions, StreamContext, StreamReader,
+};
 pub use telemetry::{
     Annotations, DiagnosticCapacity, DiagnosticOverflow, Diagnostics, HasLogger, HasTracer,
-    LogEvent, LogLevel, Logger, SharedAnnotations, SpanFinish, SpanId, SpanOutcome, SpanStart,
-    TraceContext, Tracer,
+    LogEvent, LogLevel, Logger, PreparedDiagnostic, PreparedDiagnosticCapacity,
+    PreparedDiagnosticError, PreparedDiagnosticSnapshot, PreparedDiagnostics, PreparedTraceCapacity,
+    PreparedTraceContext, PreparedTracePool, SharedAnnotations, SpanFinish, SpanId, SpanOutcome,
+    SpanStart, TraceContext, Tracer,
 };
 
 pub use admission::{
@@ -280,7 +392,7 @@ pub use websocket::{
 };
 
 pub use partitioned_semaphore::PartitionedSemaphore;
-pub use pool::{Pool, PoolCapacity, PoolEndStatus, PoolLease};
+pub use pool::{Pool, PoolCapacity, PoolEndStatus, PoolLease, PreparedPoolSnapshots, PreparedPoolStorage};
 
 pub use pub_sub::{
     CallbackContention, CallbackDrop, CallbackOverflow, CallbackPubSub, CallbackPubSubOptions,
@@ -290,20 +402,30 @@ pub use pub_sub::{
 pub use subscription_ref::{SubscriptionRef, SubscriptionSnapshot};
 pub use synchronized_ref::SynchronizedRef;
 
-pub use primary_key::{KeyDomain, KeyError, KeyNamespace, KeyParts, KeySegment, StableKey};
+pub use primary_key::{
+    KeyDomain, KeyError, KeyNamespace, KeyParts, KeySegment, KeySegmentRef, PreparedKeyError,
+    PreparedKeyPool, PreparedStableKey, StableKey,
+};
 pub use request::{Request, RequestGroup, RequestKey};
-pub use request_resolver::{HasRequestScope, RequestResolver, RequestResolverError, RequestScope};
+pub use request_resolver::{
+    HasRequestScope, PreparedRequestBatch, PreparedResolvedBatch, PreparedResolverCapacity,
+    PreparedResolverIndex, RequestBatchInput, RequestResolver, RequestResolverError, RequestScope,
+};
 
 pub use cache::{
-    Cache, CacheAdmission, CacheCapacity, CacheConfig, CacheLookup, CacheObservation, CacheOptions,
-    CacheTtl, SharedValue,
+    Cache, CacheAdmission, CacheCapacity, CacheConfig, CacheKey, CacheLookup, CacheObservation,
+    CacheOptions, CacheTtl, PreparedCacheCapacity, PreparedCacheIndex, PreparedCacheRefusals,
+    PreparedCacheStorage, SharedValue,
 };
+pub use cache::{PreparedSharedValuePool, PreparedSharedValueReservation};
 pub use dependency_cache::{
     DependencyCache, DependencyCacheCoalescingPolicy, DependencyCacheError, DependencyCachePolicy,
-    DependencyValue,
+    DependencyValue, PreparedDependencies, PreparedDependencyCache, PreparedDependencyCacheIndex,
+    PreparedDependencyPayloadIndex, PreparedDependencyPolicy, PreparedDependencyPool,
+    PreparedDependencyStorage, PreparedDependencyValue, PreparedDependencyWriter,
 };
 
-pub use weak_cache::{CachePartition, WeakCache, WeakCacheValue};
+pub use weak_cache::{CachePartition, PreparedWeakCacheCapacity, PreparedWeakCacheStorage, WeakCache, WeakCacheValue};
 
 /// Typed native-service operation and resource mapping over the application environment.
 mod service;

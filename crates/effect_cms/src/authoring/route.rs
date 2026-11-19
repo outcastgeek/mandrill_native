@@ -109,7 +109,7 @@ where
         let service=self.clone();let owner=owner.clone();let mounter=mounter.cloned();let has_router=router.is_some();
         effect::effect! {
             bind;
-            program:effect::effect_sync! { once; body:move || {
+            program:effect::effect_try_sync! { once; body:move || {
                 let mut routes=Vec::new();
                 if has_router && !service.options.route_name.is_empty() && !service.options.path.is_empty() {
                     if let Some(authoring)=&service.options.authoring {
@@ -118,7 +118,7 @@ where
                     }
                 }
                 service.routes.with_routes(routes)
-            } },
+            }, on_error: |error| X::from(crate::routing::ManagedStartError::Registration(error)), },
             body:move |routes|routes.register_and_start_routes(&owner,router.clone(),mounter.as_ref()),
         }
     }

@@ -1,4 +1,5 @@
 //! Regressions run the mandatory native Cargo wrapper against actual Effect metadata.
+use std::borrow::Cow;
 use std::env;
 use std::fs;
 use std::io;
@@ -9,10 +10,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 /// A successful mandatory check validates metadata once before downstream probes.
-static METADATA: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+static METADATA: OnceLock<Result<(PathBuf, Vec<PathBuf>), String>> = OnceLock::new();
 
 /// Select the metadata built by the required native workspace check.
-fn metadata(root: &Path) -> io::Result<PathBuf> {
+fn build_artifacts(root: &Path) -> io::Result<(PathBuf, Vec<PathBuf>)> {
     METADATA
         .get_or_init(|| validated_metadata(root).map_err(|error| error.to_string()))
         .clone()
@@ -20,10 +21,10 @@ fn metadata(root: &Path) -> io::Result<PathBuf> {
 }
 
 /// Require current source to pass the configured compiler lint before selecting its library artifact.
-fn validated_metadata(root: &Path) -> io::Result<PathBuf> {
+fn validated_metadata(root: &Path) -> io::Result<(PathBuf, Vec<PathBuf>)> {
     let check = Command::new("cargo")
         .args([
-            "+1.99.0",
+            "+1.100.0",
             "check",
             "--locked",
             "-p",
@@ -35,40 +36,355 @@ fn validated_metadata(root: &Path) -> io::Result<PathBuf> {
         .current_dir(root)
         .output()?;
     if !check.status.success() {
-        let diagnostics = String::from_utf8_lossy(&check.stdout)
-            .lines()
-            .filter(|line| line.contains("\"reason\":\"compiler-message\""))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let stdout = String::from_utf8_lossy(&check.stdout);
+        let diagnostics = compiler_diagnostics(&stdout);
         return Err(io::Error::other(format!(
             "mandatory Effect metadata check failed: {}\n{diagnostics}",
             String::from_utf8_lossy(&check.stderr)
         )));
     }
-    // Cargo reports the exact artifact even when fresh. Never choose another
-    // invocation's metadata by directory age or guessed feature configuration.
     let output = String::from_utf8(check.stdout).map_err(io::Error::other)?;
-    let mut artifacts = output
-        .lines()
-        .filter(|line| {
-            line.contains("\"reason\":\"compiler-artifact\"")
-                && line.contains("\"name\":\"effect\"")
-                && line.contains("\"kind\":[\"lib\"]")
-        })
-        .filter_map(|line| line.split_once("\"filenames\":[").map(|(_, names)| names))
-        .filter_map(|names| names.split_once(']').map(|(names, _)| names))
-        .flat_map(|names| names.split('"'))
-        .filter(|name| name.ends_with(".rmeta"))
-        .map(PathBuf::from);
-    let artifact = artifacts
-        .next()
-        .ok_or_else(|| io::Error::other("Cargo did not report Effect library metadata"))?;
-    if artifacts.next().is_some() || !artifact.metadata()?.is_file() {
+    let manifest = root.join("crates/effect/Cargo.toml").canonicalize()?;
+    let (artifact, directories) = cargo_artifacts(&output, &manifest)?;
+    if !artifact.metadata()?.is_file() {
         return Err(io::Error::other(
-            "Cargo reported ambiguous or missing Effect library metadata",
+            "Cargo reported missing Effect library metadata",
         ));
     }
-    Ok(artifact)
+    Ok((artifact, directories))
+}
+
+#[derive(Default)]
+struct CargoMessage<'a> {
+    reason: Option<Cow<'a, str>>,
+    manifest: Option<&'a str>,
+    target: Option<&'a str>,
+    filenames: Option<&'a str>,
+}
+
+impl<'a> CargoMessage<'a> {
+    fn parse(line: &'a str) -> io::Result<Self> {
+        let mut message = Self::default();
+        if !line.trim_start().starts_with('{') {
+            return Ok(message);
+        }
+        json_fields(line, |name, value| {
+            match name {
+                "reason" => message.reason = Some(json_text(value)?),
+                "manifest_path" => message.manifest = Some(value),
+                "target" => message.target = Some(value),
+                "filenames" => message.filenames = Some(value),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(message)
+    }
+
+    fn effect_library(&self, manifest: &Path) -> io::Result<bool> {
+        let Some(target) = self.target else {
+            return Ok(false);
+        };
+        let mut name = None;
+        let mut kind = None;
+        json_fields(target, |key, value| {
+            match key {
+                "name" => name = Some(json_text(value)?),
+                "kind" => kind = Some(json_text_array(value)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        if name.as_deref() != Some("effect") || !kind.is_some_and(|kind| kind.as_slice() == ["lib"])
+        {
+            return Ok(false);
+        }
+
+        let path = json_text(self.manifest.ok_or_else(bad_json)?)?;
+        let path = Path::new(path.as_ref());
+        Ok(path == manifest || path.canonicalize().is_ok_and(|path| path == manifest))
+    }
+}
+
+fn compiler_diagnostics(output: &str) -> Cow<'_, str> {
+    let messages = output
+        .lines()
+        .filter(|line| {
+            CargoMessage::parse(line)
+                .is_ok_and(|message| message.reason.as_deref() == Some("compiler-message"))
+        })
+        .collect::<Vec<_>>();
+    if messages.is_empty() {
+        // Retain stdout if Cargo failed before emitting a compiler message.
+        Cow::Borrowed(output)
+    } else {
+        Cow::Owned(messages.join("\n"))
+    }
+}
+
+/// Cargo reports exact artifacts even when fresh. The check's target/profile/
+/// feature selection is authoritative, including its dependency locations.
+fn cargo_artifacts(output: &str, manifest: &Path) -> io::Result<(PathBuf, Vec<PathBuf>)> {
+    let mut artifact = None;
+    let mut directories = Vec::new();
+    for line in output.lines() {
+        let message = CargoMessage::parse(line)?;
+        if message.reason.as_deref() != Some("compiler-artifact") {
+            continue;
+        }
+        let selected = message.effect_library(manifest)?;
+        let filenames = json_text_array(message.filenames.ok_or_else(bad_json)?)?;
+        for filename in filenames {
+            let path = Path::new(filename.as_ref());
+            if !path.is_absolute() {
+                continue;
+            }
+            if let Some(parent) = path.parent() {
+                directories.push(parent.to_path_buf());
+            }
+            if selected
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "rmeta")
+            {
+                if artifact.replace(path.to_path_buf()).is_some() {
+                    return Err(io::Error::other(
+                        "Cargo reported ambiguous Effect library metadata",
+                    ));
+                }
+            }
+        }
+    }
+    directories.sort_unstable();
+    directories.dedup();
+    let artifact =
+        artifact.ok_or_else(|| io::Error::other("Cargo did not report Effect library metadata"))?;
+    Ok((artifact, directories))
+}
+
+fn bad_json() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "invalid Cargo JSON metadata")
+}
+
+fn json_fields<'a>(
+    input: &'a str,
+    mut visit: impl FnMut(&str, &'a str) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut input = input.trim();
+    json_punctuation(&mut input, '{')?;
+    if input == "}" {
+        return Ok(());
+    }
+    loop {
+        let key = json_text(take_json_string(&mut input)?)?;
+        json_punctuation(&mut input, ':')?;
+        visit(&key, take_json_value(&mut input)?)?;
+        if input == "}" {
+            return Ok(());
+        }
+        json_punctuation(&mut input, ',')?;
+    }
+}
+
+fn json_text_array(input: &str) -> io::Result<Vec<Cow<'_, str>>> {
+    let mut input = input.trim();
+    json_punctuation(&mut input, '[')?;
+    let mut values = Vec::new();
+    if input == "]" {
+        return Ok(values);
+    }
+    loop {
+        values.push(json_text(take_json_string(&mut input)?)?);
+        if input == "]" {
+            return Ok(values);
+        }
+        json_punctuation(&mut input, ',')?;
+    }
+}
+
+fn json_punctuation(input: &mut &str, expected: char) -> io::Result<()> {
+    *input = input
+        .strip_prefix(expected)
+        .ok_or_else(bad_json)?
+        .trim_start();
+    Ok(())
+}
+
+fn take_json_string<'a>(input: &mut &'a str) -> io::Result<&'a str> {
+    let body = input.strip_prefix('"').ok_or_else(bad_json)?;
+    let mut escaped = false;
+    for (offset, byte) in body.bytes().enumerate() {
+        if byte < b' ' {
+            return Err(bad_json());
+        }
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            let (quoted, tail) = input.split_at(offset + 2);
+            *input = tail.trim_start();
+            return Ok(quoted);
+        }
+    }
+    Err(bad_json())
+}
+
+/// Skip irrelevant Cargo fields while keeping nested objects/arrays and
+/// quoted delimiters intact. Only fields the harness consumes are decoded.
+fn take_json_value<'a>(input: &mut &'a str) -> io::Result<&'a str> {
+    let first = input.as_bytes().first().copied().ok_or_else(bad_json)?;
+    let end = match first {
+        b'"' => return take_json_string(input),
+        b'{' | b'[' => {
+            let mut groups = Vec::new();
+            let mut rest = *input;
+            loop {
+                let next = rest.chars().next().ok_or_else(bad_json)?;
+                match next {
+                    '"' => {
+                        take_json_string(&mut rest)?;
+                        continue;
+                    }
+                    '{' => groups.push('}'),
+                    '[' => groups.push(']'),
+                    '}' | ']' => {
+                        if groups.pop() != Some(next) {
+                            return Err(bad_json());
+                        }
+                        if groups.is_empty() {
+                            break input.len() - rest.len() + 1;
+                        }
+                    }
+                    _ => {}
+                }
+                rest = &rest[next.len_utf8()..];
+            }
+        }
+        b'-' | b'0'..=b'9' | b'f' | b'n' | b't' => input
+            .find(|character: char| {
+                character == ',' || character == '}' || character.is_whitespace()
+            })
+            .unwrap_or(input.len()),
+        _ => return Err(bad_json()),
+    };
+    let (value, rest) = input.split_at(end);
+    *input = rest.trim_start();
+    Ok(value)
+}
+
+fn json_text(quoted: &str) -> io::Result<Cow<'_, str>> {
+    let text = quoted
+        .strip_prefix('"')
+        .and_then(|text| text.strip_suffix('"'))
+        .ok_or_else(bad_json)?;
+    let mut rest = text;
+    let Some(mut escape) = rest.find('\\') else {
+        return Ok(Cow::Borrowed(text));
+    };
+    let mut decoded = String::with_capacity(text.len());
+    loop {
+        let (plain, sequence) = rest.split_at(escape);
+        decoded.push_str(plain);
+        let mut characters = sequence.chars();
+        characters.next();
+        let code = characters.next().ok_or_else(bad_json)?;
+        rest = characters.as_str();
+        decoded.push(match code {
+            '"' | '\\' | '/' => code,
+            'b' => '\u{8}',
+            'f' => '\u{c}',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'u' => {
+                let high = unicode_unit(&mut rest)?;
+                let scalar = if (0xd800..=0xdbff).contains(&high) {
+                    rest = rest.strip_prefix("\\u").ok_or_else(bad_json)?;
+                    let low = unicode_unit(&mut rest)?;
+                    if !(0xdc00..=0xdfff).contains(&low) {
+                        return Err(bad_json());
+                    }
+                    0x1_0000 + ((u32::from(high) - 0xd800) << 10) + (u32::from(low) - 0xdc00)
+                } else {
+                    u32::from(high)
+                };
+                char::from_u32(scalar).ok_or_else(bad_json)?
+            }
+            _ => return Err(bad_json()),
+        });
+        let Some(next) = rest.find('\\') else {
+            decoded.push_str(rest);
+            return Ok(Cow::Owned(decoded));
+        };
+        escape = next;
+    }
+}
+
+fn unicode_unit(input: &mut &str) -> io::Result<u16> {
+    let (unit, rest) = input.split_at_checked(4).ok_or_else(bad_json)?;
+    if !unit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(bad_json());
+    }
+    *input = rest;
+    u16::from_str_radix(unit, 16).map_err(|_| bad_json())
+}
+
+#[test]
+#[cfg(unix)]
+fn cargo_artifact_decodes_exact_paths() -> io::Result<()> {
+    let output = r#"
+        { "reason": "compiler-artifact", "filenames": ["/vendor/effect/libeffect.rmeta"], "manifest_path": "/vendor/effect/Cargo.toml", "target": {"kind": ["lib"],"name":"effect"} }
+        { "reason": "compiler-artifact", "filenames": ["/wrong-kind/libeffect.rmeta"], "manifest_path": "/workspace/crates/effect/Cargo.toml", "target": {"kind": ["bin"],"name":"effect","other":{"kind":["lib"],"name":"effect"}} }
+        { "filenames": ["\/target/custom [\"] \\ \u03c0 \ud83d\ude80/deps/libeffect.rmeta", "/target/custom [\"] \\ π 🚀/deps/libeffect.rlib"], "target": {"kind": ["lib"],"name":"effect"}, "manifest_path": "/workspace/crates/\u0065ffect/Cargo.toml", "reason": "compiler-artifact", "fresh": true, "ignored": [{"filenames":["/ignored/libwrong.rmeta"],"closing":"] } \""}] }
+        { "reason": "compiler-artifact", "filenames": ["/build root/proc/dependency.so"], "target": {"name":"derived","kind":["proc-macro"]} }
+        { "reason": "build-finished", "filenames": ["/unrelated/bogus.rmeta"], "success": true }
+    "#;
+    let manifest = Path::new("/workspace/crates/effect/Cargo.toml");
+    let (artifact, directories) = cargo_artifacts(output, manifest)?;
+    let selected = Path::new("/target/custom [\"] \\ π 🚀/deps");
+    assert_eq!(artifact, selected.join("libeffect.rmeta"));
+    assert_eq!(
+        directories,
+        [
+            PathBuf::from("/build root/proc"),
+            selected.to_path_buf(),
+            PathBuf::from("/vendor/effect"),
+            PathBuf::from("/wrong-kind"),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn cargo_artifact_rejects_ambiguous_metadata() {
+    let output = r#"{"reason":"compiler-artifact","manifest_path":"/workspace/crates/effect/Cargo.toml","target":{"name":"effect","kind":["lib"]},"filenames":["/check/first.rmeta","/check/second.rmeta"]}"#;
+    let manifest = Path::new("/workspace/crates/effect/Cargo.toml");
+    let Err(error) = cargo_artifacts(output, manifest) else {
+        panic!("ambiguous metadata was accepted");
+    };
+    assert!(error.to_string().contains("ambiguous"));
+}
+
+#[test]
+fn cargo_artifact_preserves_compiler_diagnostics() {
+    let diagnostic = r#"{ "message": { "rendered": "diagnostic with ] and \"" }, "\u0072eason": "compiler-message" }"#;
+    let output = format!("{{\"reason\":\"build-finished\"}}\n{diagnostic}\n");
+    assert_eq!(compiler_diagnostics(&output), diagnostic);
+    assert_eq!(
+        compiler_diagnostics("unstructured Cargo output"),
+        "unstructured Cargo output"
+    );
+}
+
+/// Exact metadata and dependency directories from the same Cargo invocation.
+fn metadata(root: &Path) -> io::Result<PathBuf> {
+    build_artifacts(root).map(|(metadata, _)| metadata)
+}
+
+fn dependency_directories(root: &Path) -> io::Result<Vec<PathBuf>> {
+    build_artifacts(root).map(|(_, directories)| directories)
 }
 
 /// Analyze one real downstream source through the configured native wrapper.
@@ -104,16 +420,16 @@ fn compile_crate_flags(body: &str, crate_name: &str, flags: &[&str]) -> io::Resu
         .arg("--emit=metadata")
         .arg("-o")
         .arg(directory.join("probe.rmeta"))
-        .arg("-L")
-        .arg(format!(
-            "dependency={}",
-            root.join("target/debug/deps").display()
-        ))
         .env(
             "CARGO_MANIFEST_DIR",
             root.join("crates/effect/tests/fixtures/runtime_neutral"),
         )
         .env("CARGO_PKG_NAME", "effect-neutral-consumer");
+    for directory in dependency_directories(root)? {
+        command
+            .arg("-L")
+            .arg(format!("dependency={}", directory.display()));
+    }
     if crate_name == "effect" {
         command.arg("--cfg=test");
     } else {
@@ -122,12 +438,8 @@ fn compile_crate_flags(body: &str, crate_name: &str, flags: &[&str]) -> io::Resu
             .arg(format!("fx={}", metadata(root)?.display()));
     }
     let result = command.args(flags).output();
-    fs::remove_file(source)?;
-    let metadata = directory.join("probe.rmeta");
-    if metadata.exists() {
-        fs::remove_file(metadata)?;
-    }
-    fs::remove_dir(directory)?;
+    // A failed probe can also leave rustc's expanded-type diagnostic in this directory.
+    fs::remove_dir_all(directory)?;
     result
 }
 
@@ -954,21 +1266,26 @@ fn changed_policy_rechecks_a_cached_consumer() -> io::Result<()> {
     )?;
     let body = "#![allow(dead_code)]\nfn observe(program: fx::Effect<u8, ()>) { let _ = program.either(); }\n";
     fs::write(consumer.join("src/lib.rs"), body)?;
+    let mut rustflags = vec![
+        "--extern".to_owned(),
+        format!("fx={}", metadata(original)?.display()),
+    ];
+    for directory in dependency_directories(original)? {
+        rustflags.extend([
+            "-L".to_owned(),
+            format!("dependency={}", directory.display()),
+        ]);
+    }
     fs::write(
         root.join(".cargo/config.toml"),
         format!(
-            "[build]\nrustc-wrapper={:?}\nrustflags=[\"--extern\", {:?}, \"-L\", {:?}]\n",
+            "[build]\nrustc-wrapper={:?}\nrustflags={rustflags:?}\n",
             wrapper.to_string_lossy(),
-            format!("fx={}", metadata(original)?.display()),
-            format!(
-                "dependency={}",
-                original.join("target/debug/deps").display()
-            )
         ),
     )?;
     let check = || {
         Command::new("cargo")
-            .arg("+1.99.0")
+            .arg("+1.100.0")
             .arg("check")
             .arg("--offline")
             .arg("--manifest-path")
@@ -1002,5 +1319,125 @@ fn changed_policy_rechecks_a_cached_consumer() -> io::Result<()> {
         "wrong failure: {diagnostics}"
     );
     fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn prepared_consumer_forms_keep_renamed_and_native_boundaries() -> io::Result<()> {
+    let result = compile(
+        r#"
+        use fx::memory::{HasMemoryPool, Memory, MemoryError, RegionId, SlotPool};
+        use fx::{DynamicRunContract, Effect};
+        use std::sync::Arc;
+
+        #[macro_export]
+        macro_rules! foreign_future { () => { 7u8 } }
+        mod native { pub(crate) use crate::foreign_future as effect_future; }
+
+        struct Owned(u8);
+        struct App { memory: Memory<'static>, outputs: SlotPool<'static, Owned> }
+        fx::memory! { capability App => self.memory; }
+        impl HasMemoryPool<()> for App {
+            type Value = Owned;
+            fn memory_pool(&self, _: &()) -> &SlotPool<'static, Owned> { &self.outputs }
+        }
+
+        fn main() -> Result<(), MemoryError> {
+            let memory = fx::memory! {
+                total: 32 KiB, mode: prepared, metadata: work, partition work: 32 KiB,
+            }?.prepare()?;
+            let region = RegionId::named("work");
+            let _: Effect<fx::memory::SlotLease<'static, Owned>, MemoryError, App> =
+                fx::memory_lease! { pool: (), on_error: std::convert::identity, };
+            let values = fx::memory_vec! { allocator: memory.allocator(region)?, capacity: 1, init |index| {
+                Ok::<_, std::convert::Infallible>(Owned(u8::try_from(index).unwrap_or(0)))
+            }, };
+            let owned = fx::effect_drop_guard! {
+                value: Owned(11),
+                cleanup: |item: Owned| { let _ = item.0; },
+            };
+            let recovered = std::mem::DropGuard::dismiss(owned);
+            let plan = fx::effect_prepare! {
+                graph;
+                program: fx::effect! {
+                    let qualified = native::effect_future!();
+                    let nested = || native::effect_future!();
+                    let value = fx::effect_try_sync! { body: move || Ok::<_, !>(qualified + nested() + recovered.0), }?;
+                    value
+                },
+                contract: DynamicRunContract::GeneratedGraph { clock_ticks: 0, contexts: 1, listeners: 0, bridges: 0 },
+            };
+            let demand = plan.demand(1)?;
+            let frames = memory.frames(region, demand.frames_per_run, demand.frame_layout)?;
+            let run = fx::effect_prepare! {
+                prepare; plan: plan, memory: memory, region: region, capacity: 1, frames: frames,
+            }?;
+            let _ = fx::effect_prepare! { admit; run: &run, environment: Arc::new(()), }?;
+            let _ = values;
+            Ok(())
+        }
+    "#,
+    )?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    Ok(())
+}
+
+#[test]
+fn prepared_consumer_forms_reject_invalid_units_ownership_and_callbacks() -> io::Result<()> {
+    for (body, diagnostic) in [
+        (
+            "fn main() { let _: fx::Effect<u8, fx::memory::MemoryError> = fx::Effect::from_prepared_exit_future_with_context(|_: std::sync::Arc<()>, _| async { fx::Exit::Success(1) }, std::convert::identity); }",
+            "manual DSL construction through",
+        ),
+        (
+            "fn main() { let _ = fx::memory! { total: 16 bogus, mode: prepared, partition work: 16 B, }; }",
+            "expected B, kB, MB, KiB, MiB or GiB",
+        ),
+        (
+            "fn main() { let _ = fx::memory! { total: 1 KiB, total: 2 KiB, mode: prepared, partition work: 1 KiB, }; }",
+            "duplicate memory field",
+        ),
+        (
+            "fn main() { let _ = fx::effect_drop_guard! { value: 1u8, cleanup: async |_: u8| {}, }; }",
+            "DropGuard cleanup must be synchronous",
+        ),
+        (
+            "fn main() { let _ = fx::effect_drop_guard! { value: 1u8, cleanup: |_: u8| {}, surplus: (), }; }",
+            "unknown or conflicting descriptor field",
+        ),
+        (
+            "fn main() { let _ = fx::memory_lease! { environment: (), pool: (), on_error: std::convert::identity, }; }",
+            "HasMemoryPool",
+        ),
+        (
+            r#"use fx::memory::*;
+                fn leak(backing: &mut [std::mem::MaybeUninit<u8>]) -> Result<SlotLease<'static, u8>, MemoryError> {
+                    let config = fx::memory! { total: 4 KiB, mode: prepared, metadata: work, partition work: 4 KiB, }?;
+                    let memory = config.plan()?.prepare_borrowed(backing)?;
+                    memory.slots(RegionId::named("work"), 1, |_| Ok(1u8))?.try_checkout()
+                }
+                fn main() {}"#,
+            "lifetime may not live long enough",
+        ),
+        (
+            "fn main() { let guard = fx::effect_drop_guard! { value: String::new(), cleanup: drop, }; drop(guard); let _ = std::mem::DropGuard::dismiss(guard); }",
+            "use of moved value",
+        ),
+    ] {
+        let result = compile(body)?;
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            !result.status.success(),
+            "invalid prepared consumer compiled: {body}"
+        );
+        assert!(
+            stderr.contains(diagnostic),
+            "expected {diagnostic:?}: {stderr}"
+        );
+    }
     Ok(())
 }

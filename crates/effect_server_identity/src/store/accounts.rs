@@ -133,6 +133,7 @@ impl AtomicAccounts {
     pub async fn find(&self, id: &UserId) -> Result<Option<VersionedAccount>, StoreError> {
         /// Borrow the caller identity until one complete read settles.
         struct Read<'a> {
+            security: super::schema::SecurityScope,
             /// Exact native user identity.
             id: &'a UserId,
             /// Explicit token allocation bound for this snapshot interface.
@@ -147,7 +148,7 @@ impl AtomicAccounts {
             where
                 Self: 'a,
             {
-                let connection = StoreConnection::new(c);
+                let connection = StoreConnection::new(c, self.security);
                 let result = load(&connection, self.id, self.capacity).await;
                 result.map_err(|error| connection.diagnostics().command_error(error))
             }
@@ -155,6 +156,7 @@ impl AtomicAccounts {
         self.backend
             .kernel
             .transaction_operation(Read {
+                security: self.backend.security_scope()?,
                 id,
                 capacity: self.token_capacity.get(),
             })
@@ -171,6 +173,7 @@ impl AtomicAccounts {
         snapshot.validate(self.token_capacity.get())?;
         /// Move a complete aggregate into one native acknowledged create operation.
         struct Create {
+            security: super::schema::SecurityScope,
             /// Owned native state and security children, with no payload Clone bound.
             snapshot: AccountSnapshot,
             /// Native selected uniqueness policy, atomically persisted with aliases.
@@ -185,7 +188,7 @@ impl AtomicAccounts {
             where
                 Self: 'a,
             {
-                let connection = StoreConnection::new(c);
+                let connection = StoreConnection::new(c, self.security);
                 let result=async{
                     let user=self.snapshot.user.metadata();let id=user.id();
                     match &self.snapshot.user {
@@ -194,7 +197,7 @@ impl AtomicAccounts {
                             let mut protected=connection.query("SELECT user_id FROM effect_identity_protected_users LIMIT 1",()).await.map_err(provider_category)?;
                             if protected.next().await.map_err(provider_category)?.is_some(){return Err(StoreError::ConstraintViolation)}
                             validate_email_claim(&connection,user,self.unique).await?;
-                            connection.execute("INSERT INTO effect_identity_users(id,normalized_user_name,normalized_email,concurrency_stamp,payload) VALUES(?1,?2,?3,?4,?5)",(id.to_string(),name.as_str(),user.normalized_email().map(ToString::to_string),user.concurrency_stamp().to_string(),serialize_user(user)?)).await.map_err(provider_category)?;
+                            connection.execute("INSERT INTO effect_identity_users(id,normalized_user_name,normalized_email,concurrency_stamp,payload) VALUES(?1,?2,?3,?4,?5)",(id.to_string(),name.as_str(),user.normalized_email().map(ToString::to_string),user.concurrency_stamp().to_string(),connection.encode_security(user)?)).await.map_err(provider_category)?;
                             connection.execute("INSERT INTO effect_identity_user_email_policy(user_id,require_unique) VALUES(?1,?2)",(id.to_string(),i64::from(self.unique))).await.map_err(provider_category)?;
                         },
                         AccountState::Protected(record)=>{
@@ -202,8 +205,8 @@ impl AtomicAccounts {
                             let mut plain=connection.query("SELECT 1 FROM effect_identity_users u LEFT JOIN effect_identity_protected_users p ON p.user_id=u.id WHERE p.user_id IS NULL LIMIT 1",()).await.map_err(provider_category)?;
                             if plain.next().await.map_err(provider_category)?.is_some(){return Err(StoreError::ConstraintViolation)}
                             validate_protected_claims(&connection,record).await?;
-                            connection.execute("INSERT INTO effect_identity_users(id,normalized_user_name,normalized_email,concurrency_stamp,payload) VALUES(?1,?2,NULL,?3,?4)",(id.to_string(),format!("protected:{id}"),user.concurrency_stamp().to_string(),serialize_user(user)?)).await.map_err(provider_category)?;
-                            connection.execute("INSERT INTO effect_identity_protected_users(user_id,require_unique,payload) VALUES(?1,?2,?3)",(id.to_string(),i64::from(self.unique),super::schema::encode_security(record)?)).await.map_err(provider_category)?;
+                            connection.execute("INSERT INTO effect_identity_users(id,normalized_user_name,normalized_email,concurrency_stamp,payload) VALUES(?1,?2,NULL,?3,?4)",(id.to_string(),format!("protected:{id}"),user.concurrency_stamp().to_string(),connection.encode_security(user)?)).await.map_err(provider_category)?;
+                            connection.execute("INSERT INTO effect_identity_protected_users(user_id,require_unique,payload) VALUES(?1,?2,?3)",(id.to_string(),i64::from(self.unique),connection.encode_security(record)?)).await.map_err(provider_category)?;
                             insert_protected_indexes(&connection,record).await?;
                         },
                     }
@@ -216,6 +219,7 @@ impl AtomicAccounts {
         self.backend
             .kernel
             .transaction_operation(Create {
+                security: self.backend.security_scope()?,
                 snapshot,
                 unique: require_unique_email,
             })
@@ -232,6 +236,7 @@ impl AtomicAccounts {
         snapshot.validate(self.token_capacity.get())?;
         /// One moved replacement and its immutable expected aggregate fence.
         struct Replace {
+            security: super::schema::SecurityScope,
             /// Expected full aggregate revision, not merely metadata's native stamp.
             expected: AccountRevision,
             /// Complete owned snapshot whose relations replace the prior set.
@@ -246,7 +251,7 @@ impl AtomicAccounts {
             where
                 Self: 'a,
             {
-                let connection = StoreConnection::new(c);
+                let connection = StoreConnection::new(c, self.security);
                 let result=async{
                     let id=self.snapshot.user.metadata().id();
                     if revision(&connection,&id).await?!=self.expected{return Err(StoreError::TransactionConflict)}
@@ -259,16 +264,16 @@ impl AtomicAccounts {
                             if protected.is_some(){return Err(StoreError::ConstraintViolation)}
                             let name=user.normalized_user_name().ok_or(StoreError::CorruptStoredData)?;
                             validate_email_claim(&connection,user,false).await?;
-                            let changed=connection.execute("UPDATE effect_identity_users SET normalized_user_name=?1,normalized_email=?2,concurrency_stamp=?3,payload=?4 WHERE id=?5 AND aggregate_revision=?6",(name.as_str(),user.normalized_email().map(ToString::to_string),stamp.to_string(),serialize_refreshed_user(user,&stamp)?,id.to_string(),self.expected.0)).await.map_err(provider_category)?;
+                            let changed=connection.execute("UPDATE effect_identity_users SET normalized_user_name=?1,normalized_email=?2,concurrency_stamp=?3,payload=?4 WHERE id=?5 AND aggregate_revision=?6",(name.as_str(),user.normalized_email().map(ToString::to_string),stamp.to_string(),serialize_refreshed_user(&connection,user,&stamp)?,id.to_string(),self.expected.0)).await.map_err(provider_category)?;
                             ensure_rows_changed(changed,StoreError::TransactionConflict)?;
                         },
                         AccountState::Protected(record)=>{
                             let row=protected.ok_or(StoreError::ConstraintViolation)?;
                             if row_integer_at(&row,0)?!=i64::from(record.require_unique_email()){return Err(StoreError::ConstraintViolation)}
                             validate_protected_claims(&connection,record).await?;
-                            let changed=connection.execute("UPDATE effect_identity_users SET concurrency_stamp=?1,payload=?2 WHERE id=?3 AND aggregate_revision=?4",(stamp.to_string(),serialize_refreshed_user(user,&stamp)?,id.to_string(),self.expected.0)).await.map_err(provider_category)?;
+                            let changed=connection.execute("UPDATE effect_identity_users SET concurrency_stamp=?1,payload=?2 WHERE id=?3 AND aggregate_revision=?4",(stamp.to_string(),serialize_refreshed_user(&connection,user,&stamp)?,id.to_string(),self.expected.0)).await.map_err(provider_category)?;
                             ensure_rows_changed(changed,StoreError::TransactionConflict)?;
-                            connection.execute("UPDATE effect_identity_protected_users SET payload=?1 WHERE user_id=?2",(super::schema::encode_security(record)?,id.to_string())).await.map_err(provider_category)?;
+                            connection.execute("UPDATE effect_identity_protected_users SET payload=?1 WHERE user_id=?2",(connection.encode_security(record)?,id.to_string())).await.map_err(provider_category)?;
                             connection.execute("DELETE FROM effect_identity_protected_indexes WHERE user_id=?1",(id.to_string(),)).await.map_err(provider_category)?;
                             insert_protected_indexes(&connection,record).await?;
                         },
@@ -282,7 +287,7 @@ impl AtomicAccounts {
         }
         self.backend
             .kernel
-            .transaction_operation(Replace { expected, snapshot })
+            .transaction_operation(Replace { security: self.backend.security_scope()?, expected, snapshot })
             .await
             .map_err(|error| self.backend.narrow(error))
     }
@@ -291,6 +296,7 @@ impl AtomicAccounts {
     pub async fn delete(&self, id: &UserId, expected: AccountRevision) -> Result<(), StoreError> {
         /// Borrow identity while conditionally deleting one full aggregate.
         struct Delete<'a> {
+            security: super::schema::SecurityScope,
             /// Exact native account identity.
             id: &'a UserId,
             /// Expected revision binding this destructive account command.
@@ -302,7 +308,7 @@ impl AtomicAccounts {
             where
                 Self: 'a,
             {
-                let connection = StoreConnection::new(c);
+                let connection = StoreConnection::new(c, self.security);
                 let changed = connection
                     .execute(
                         "DELETE FROM effect_identity_users WHERE id=?1 AND aggregate_revision=?2",
@@ -315,7 +321,7 @@ impl AtomicAccounts {
         }
         self.backend
             .kernel
-            .transaction_operation(Delete { id, expected })
+            .transaction_operation(Delete { security: self.backend.security_scope()?, id, expected })
             .await
             .map_err(|error| self.backend.narrow(error))
     }
@@ -468,7 +474,7 @@ async fn load(
         if recovery_hashes.len() >= super::schema::NATIVE_RECOVERY_LIMIT {
             return Err(StoreError::CorruptStoredData);
         }
-        recovery_hashes.push(deserialize_recovery_code_hash(&row_text(&row)?)?);
+        recovery_hashes.push(rows.decode_security(&row, 0)?);
     }
     let mut rows=c.query(collection_lookahead_sql!("SELECT payload FROM effect_identity_user_passkeys WHERE user_id=?1 ORDER BY credential_id LIMIT ",""),(id.to_string(),)).await.map_err(provider_category)?;
     let passkeys = read_user_passkeys(&mut rows, id).await?;
@@ -527,10 +533,10 @@ async fn write_children(
         c.execute("INSERT INTO effect_identity_user_tokens(user_id,login_provider,name,value) VALUES(?1,?2,?3,?4)",(id.to_string(),token.provider.as_str(),token.name.as_str(),token.value.as_str())).await.map_err(provider_category)?;
     }
     for hash in &snapshot.recovery_hashes {
-        c.execute("INSERT INTO effect_identity_user_recovery_code_hashes(user_id,code_hash) VALUES(?1,?2)",(id.to_string(),serialize_recovery_code_hash(hash)?)).await.map_err(provider_category)?;
+        c.execute("INSERT INTO effect_identity_user_recovery_code_hashes(user_id,code_hash) VALUES(?1,?2)",(id.to_string(),c.encode_security(hash)?)).await.map_err(provider_category)?;
     }
     for passkey in &snapshot.passkeys {
-        c.execute("INSERT INTO effect_identity_user_passkeys(user_id,credential_id,payload) VALUES(?1,?2,?3)",(id.to_string(),passkey.credential_id().as_bytes(),super::native::serialize_expected_passkey(id,passkey)?)).await.map_err(provider_category)?;
+        c.execute("INSERT INTO effect_identity_user_passkeys(user_id,credential_id,payload) VALUES(?1,?2,?3)",(id.to_string(),passkey.credential_id().as_bytes(),super::native::serialize_expected_passkey(c,id,passkey)?)).await.map_err(provider_category)?;
     }
     Ok(())
 }

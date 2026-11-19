@@ -5,10 +5,10 @@
 //! caller's explicit policy. No store,
 //! database, SQL or backend exists here.
 
-use std::sync::Arc;
 use crate::commands::InputBytes;
+use std::sync::Arc;
 
-use effect::{Effect, effect, effect_sync};
+use effect::{Effect, effect, effect_map, effect_sync};
 use effect_server::{ByteFormData, Request, ServerError};
 
 use crate::attachments::{InitializeForm, MediaFormPolicy, initialize_media_form};
@@ -53,24 +53,55 @@ pub fn media_asset_form_input_from_record(record: &MediaAssetRecord) -> MediaAss
 /// Parse media asset form input from decoded merged form values.
 #[must_use]
 pub fn media_asset_form_input_from_form(form: Option<&ByteFormData>) -> MediaAssetFormInput {
-    let value = |key: &str| -> InputBytes {
+    from_values(|key| {
         form.and_then(|form| form.values.get(key.as_bytes()))
             .and_then(|values| values.first())
-            .map(|value| InputBytes::from(value.as_slice()))
+            .map(Vec::as_slice)
             .unwrap_or_default()
-    };
+    })
+}
+
+fn from_values<'a>(value: impl Fn(&'static str) -> &'a [u8]) -> MediaAssetFormInput {
+    let trimmed = |key| InputBytes::from(crate::validation::trim_unicode_whitespace(value(key)));
     MediaAssetFormInput {
-        kind: normalize_media_kind(&value("kind")),
-        source_kind: normalize_media_source_kind(&value("source_kind")),
-        url: value("url").trim().to_owned(),
-        provider: value("provider").trim().to_owned(),
-        title: value("title").trim().to_owned(),
-        description: value("description").trim().to_owned(),
-        thumbnail_url: value("thumbnail_url").trim().to_owned(),
-        alt: value("alt").trim().to_owned(),
-        duration: parse_optional_positive_int(&value("duration")).map(|value|std::sync::Arc::new(std::sync::atomic::AtomicI64::new(value))),
-        status: normalize_media_status(&value("status")),
+        kind: normalize_media_kind(value("kind")),
+        source_kind: normalize_media_source_kind(value("source_kind")),
+        url: trimmed("url"),
+        provider: trimmed("provider"),
+        title: trimmed("title"),
+        description: trimmed("description"),
+        thumbnail_url: trimmed("thumbnail_url"),
+        alt: trimmed("alt"),
+        duration: parse_optional_positive_int(value("duration"))
+            .map(|value| std::sync::Arc::new(std::sync::atomic::AtomicI64::new(value))),
+        status: normalize_media_status(value("status")),
     }
+}
+
+/// Admit the shared merged form and copy only selected media metadata into the
+/// existing consumer DTO. The field-selection and diagnostic policy is unchanged.
+pub fn media_asset_form_input_from_prepared_request<E, R>(
+    request: &Request,
+    policy: MediaFormPolicy,
+    storage: &Arc<crate::forms::PreparedMergedForms>,
+    on_error: impl Fn(ServerError) -> E + Send + Sync + 'static,
+) -> Effect<MediaAssetFormInput, E, R>
+where
+    E: Send + 'static,
+    R: Send + Sync + 'static,
+{
+    effect_map! {
+        program: storage.read_reusing_validation(request, policy, InitializeForm::FormValue, on_error),
+        map: |form| media_asset_form_input_from_prepared_form(&form),
+    }
+}
+
+/// Read an already admitted form with the existing media field precedence.
+#[must_use]
+pub fn media_asset_form_input_from_prepared_form(
+    form: &crate::forms::PreparedMergedForm,
+) -> MediaAssetFormInput {
+    from_values(|key| form.values(key.as_bytes()).next().unwrap_or_default())
 }
 
 /// Decode one request's merged form values.
@@ -91,7 +122,10 @@ where
     if let Some(form) = preinitialized {
         return effect_sync! { body: move || ByteFormData { values: form.values.clone() } };
     }
-    let read = initialize_media_form::<E, R>(request, policy, InitializeForm::FormValue, move |error| on_error(error));
+    let read =
+        initialize_media_form::<E, R>(request, policy, InitializeForm::FormValue, move |error| {
+            on_error(error)
+        });
     effect! {
         let read = read.clone();
         let (form, _diagnostic) = read?;
@@ -118,4 +152,3 @@ where
         media_asset_form_input_from_form(Some(&form))
     }
 }
-

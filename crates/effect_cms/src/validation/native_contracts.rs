@@ -1,13 +1,16 @@
 //! Native caller contracts and typed DTO preparation. Consumers supply codecs;
 //! this owner routes selectors and reports issues without a foreign schema runtime.
 use super::{
-    BUILTIN_CONTRACT_SELECTORS, BuiltinContractError, ValidationArgument, ValidationResult,
+    BUILTIN_CONTRACT_SELECTORS, BuiltinContractError, CODE_INVALID_REQUEST,
+    PreparedValidationResult, PreparedValidationResults, ValidationArgument, ValidationResult,
     builtin_contract, is_builtin_contract_selector,
 };
+use effect::memory::MemoryError;
 use effect::{
     Effect, JsonValue, ParseContext, PureCodec, SchemaIssue, SchemaPolicy, effect_try_sync,
 };
 use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
+use std::num::NonZeroU8;
 
 /// One immutable native selector set, prepared by its owning application.
 #[derive(Clone, Default)]
@@ -46,6 +49,35 @@ impl NativeContractValidator {
             .map_err(|issue| {
                 NativeContractError::Contract(BuiltinContractError::invalid(selector, issue))
             })
+    }
+
+    /// Validate a borrowed document with prepared issue backing and publication.
+    /// A rejected document retains both the original schema issue and the prepared
+    /// normalized projection. The caller owns the supplied document representation.
+    pub fn validate_prepared(
+        &self,
+        selector: &str,
+        document: &JsonValue,
+        context: &ParseContext,
+        outputs: &PreparedValidationResults,
+        group_depth: NonZeroU8,
+    ) -> Result<Option<PreparedNativeContractRejection>, PreparedNativeContractError> {
+        let codec = self.contracts.get(selector)
+            .ok_or(PreparedNativeContractError::MissingSelector)?;
+        if context.issue_memory().is_none() {
+            return Err(PreparedNativeContractError::Memory(MemoryError::UnsupportedRunContract));
+        }
+        let output = outputs.reserve().map_err(PreparedNativeContractError::Memory)?;
+        let validated = context.check_json(document)
+            .and_then(|()| codec.decode_ref_in(document, context).map(|_| ()));
+        match validated {
+            Ok(()) => Ok(None),
+            Err(cause) => {
+                let report = output.publish_schema_rejection("", CODE_INVALID_REQUEST, &cause, group_depth)
+                    .map_err(PreparedNativeContractError::Memory)?;
+                Ok(Some(PreparedNativeContractRejection { cause, report }))
+            }
+        }
     }
     /// Parse serialized input and validate using one supplied context.
     pub fn validate_serialized(
@@ -92,6 +124,30 @@ impl NativeContractValidator {
         effect_try_sync! { body: move || validator.validate(&selector, &document, &ParseContext::new(policy)), }
     }
 }
+
+/// A rejected native contract with its original schema cause and bounded CMS report.
+pub struct PreparedNativeContractRejection {
+    pub cause: SchemaIssue,
+    pub report: PreparedValidationResult,
+}
+
+/// Failure to resolve or run the prepared native contract.
+#[derive(Debug)]
+pub enum PreparedNativeContractError {
+    MissingSelector,
+    Memory(MemoryError),
+}
+
+impl fmt::Display for PreparedNativeContractError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingSelector => formatter.write_str("validate schema: missing selector"),
+            Self::Memory(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for PreparedNativeContractError {}
 /// Typed preparation uses the application's real codec, not reflection or guessed fields.
 pub struct NativeContractDocument<A: Send + 'static> {
     codec: PureCodec<A, JsonValue>,

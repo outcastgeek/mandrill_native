@@ -8,7 +8,6 @@ use effect::{
 };
 use futures_executor::block_on;
 use std::cell::Cell;
-use std::collections::VecDeque;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -22,8 +21,6 @@ mod portable;
 mod suspension;
 #[path = "support/task_cases.rs"]
 pub mod tasks;
-#[path = "../src/internal/waiting.rs"]
-mod waiting;
 
 #[test]
 fn external_queue_workflows_move_payloads_and_compose_with_scoped_children() {
@@ -765,51 +762,6 @@ fn matching_racing_cancellation_either_commits_once_or_leaves_the_offer_for_a_ne
         }
         assert_eq!(block_on(original), Exit::Interrupted);
     }
-}
-
-#[test]
-fn indexed_waiting_links_preserve_order_through_middle_removal_and_slot_reuse() {
-    const ENTRIES: usize = 10_000; // A finite high-water/reuse workload, not a queue capacity default.
-    let mut list = waiting::Waiting::default();
-    assert!(list.is_empty());
-    assert_eq!(list.len(), 0);
-    let values: Vec<_> = (0..ENTRIES).map(Arc::new).collect();
-    let positions: Vec<_> = values
-        .iter()
-        .map(|value| list.push_back(Arc::clone(value)))
-        .collect();
-    assert_eq!(list.len(), values.len());
-    let mut expected = VecDeque::from(values.clone()); // Only fixture Arc handles are copied.
-    // Remove alternate interior entries, then append the same number of fresh
-    // entries. This exercises both neighbor directions and every reused hole.
-    for (index, (position, value)) in positions.iter().zip(&values).enumerate() {
-        if index % 2 != 0 {
-            assert!(
-                list.remove_where(*position, |stored| Arc::ptr_eq(stored, value))
-                    .is_some()
-            );
-            expected.retain(|stored| !Arc::ptr_eq(stored, value));
-        }
-    }
-    let replacements: Vec<_> = (ENTRIES..ENTRIES + ENTRIES / 2).map(Arc::new).collect();
-    for value in &replacements {
-        let _ = list.push_back(Arc::clone(value));
-        expected.push_back(Arc::clone(value));
-    }
-    for (position, old) in positions.iter().zip(&values) {
-        // Matching by actual retained allocation distinguishes live originals
-        // from later entries in reused slots, without a guessed generation ID.
-        let removed = list.remove_where(*position, |stored| Arc::ptr_eq(stored, old));
-        if removed.is_some() {
-            expected.retain(|stored| !Arc::ptr_eq(stored, old));
-        }
-    }
-    while let Some(value) = expected.pop_front() {
-        assert_eq!(list.pop_front(), Some(value));
-        assert_eq!(list.len(), expected.len());
-    }
-    assert!(list.pop_front().is_none());
-    assert!(list.is_empty());
 }
 
 struct SuspendedTasks {

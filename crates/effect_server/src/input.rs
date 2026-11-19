@@ -5,6 +5,7 @@ use axum::body::Body;
 use axum::extract::{FromRequest, Multipart};
 use bytes::Bytes;
 use effect::{Cancellation, Effect, HasCancellation, HasTaskSpawner};
+use effect::memory::{BufferLease, BufferView, MemoryError};
 use effect::{effect, service};
 use headers::{Header, HeaderMapExt};
 use http::{Extensions, HeaderMap, HeaderValue, Method, Uri, Version};
@@ -14,6 +15,9 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+
+mod prepared_form;
+use prepared_form::PreparedForm;
 
 /// HTTP input/configuration failures; applications explicitly map these into E.
 #[derive(Debug)]
@@ -26,12 +30,18 @@ pub enum ServerError {
     Invalid(String),
     /// A caller-selected byte/count/text bound was exceeded.
     Limit(String),
+    /// A selected native response ingestion limit was exceeded.
+    OutputLimit(crate::OutputLimit),
     /// Another incompatible decoder already owns the native body.
     BodyClaimed,
     /// A compatible form cannot be reused under a different parse policy.
     FormPolicyConflict,
     /// The peer disconnected before the operation settled.
     Disconnected,
+    /// Prepared endpoint/lifecycle admission was refused.
+    Memory(effect::memory::MemoryError),
+    /// The selected prepared native provider refused admission.
+    Provider(effect::prepared_provider::ProviderRefusal),
     /// Native connection transport failed with its retained defect diagnostics.
     Transport(effect::Defect),
     /// Native transport or file I/O failed, retaining its source.
@@ -55,9 +65,12 @@ impl std::fmt::Display for ServerError {
             Self::Duplicate(name) => write!(f, "duplicate {name}"),
             Self::Invalid(name) => write!(f, "invalid {name}"),
             Self::Limit(name) => write!(f, "limit exceeded: {name}"),
+            Self::OutputLimit(limit) => write!(f, "output limit exceeded: {limit:?}"),
             Self::BodyClaimed => f.write_str("request body already claimed"),
             Self::FormPolicyConflict => f.write_str("incompatible form policy"),
             Self::Disconnected => f.write_str("peer disconnected"),
+            Self::Memory(error) => write!(f, "prepared hosting: {error}"),
+            Self::Provider(error) => write!(f, "prepared provider refused: {error:?}"),
             Self::Transport(defect) => write!(f, "native transport: {}", defect.message()),
             Self::Io(error) => write!(f, "native I/O: {error}"),
             Self::Multipart(_) | Self::MultipartRejection(_) => {
@@ -288,12 +301,11 @@ impl<A: 'static> Field<A> {
         form: Option<&FormData>,
     ) -> Result<Vec<String>, ServerError> {
         let values = match self.source {
-            FieldSource::Query => decode_text_pairs(
-                request.uri().query().unwrap_or("").as_bytes(),
-                false,
-            )?
-                .remove(self.name.as_ref())
-                .unwrap_or_default(),
+            FieldSource::Query => {
+                decode_text_pairs(request.uri().query().unwrap_or("").as_bytes(), false)?
+                    .remove(self.name.as_ref())
+                    .unwrap_or_default()
+            }
             FieldSource::Header => request
                 .headers()
                 .get_all(self.name.as_ref())
@@ -346,6 +358,12 @@ pub struct FormPolicy {
     pub fields: NonZeroUsize,
     /// Bounds for each repeated field value.
     pub values: FieldBounds,
+}
+impl FormPolicy {
+    /// Worst-case physical backing for prepared decoded bytes and their sorted field records.
+    pub fn prepared_storage_bytes(self) -> Result<effect::memory::Bytes, MemoryError> {
+        prepared_form::storage_bytes(self)
+    }
 }
 /// Explicit byte/count bounds for one byte-preserving form field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -407,7 +425,10 @@ enum FormReadPolicy {
         reject_raw_semicolons: bool,
     },
     /// Byte-preserving fields with retained syntax diagnostics.
-    PartialBytes { policy: ByteFormPolicy, segment_limit: Option<NonZeroUsize> },
+    PartialBytes {
+        policy: ByteFormPolicy,
+        segment_limit: Option<NonZeroUsize>,
+    },
     /// Multipart fields with shared memory accounting.
     AccountedMultipartFields {
         policy: MultipartPolicy,
@@ -423,16 +444,24 @@ enum FormReadPolicy {
     },
 }
 /// One parsed form representation kept in the shared claim cell.
-#[derive(Clone)]
 enum ParsedFormData {
     /// UTF-8 text fields.
     Text(Arc<FormData>),
+    /// UTF-8 fields in admitted byte backing, with optional public FormData projection.
+    PreparedText {
+        form: PreparedForm,
+        materialized: Option<Arc<FormData>>,
+    },
     /// Byte-preserving fields.
     Bytes(Arc<ByteFormData>),
     /// Byte fields and a retained syntax diagnostic.
     PartialBytes(Arc<BytePairsOutcome>),
     /// Successfully collected multipart fields.
     MultipartFields(Arc<ByteFormData>),
+}
+enum TextFormRead {
+    Ordinary(Arc<FormData>),
+    Prepared(PreparedForm),
 }
 /// Body claim state moves the native Body exactly once; compatible parses share a cell.
 enum BodyState {
@@ -445,7 +474,7 @@ enum BodyState {
     /// Same-representation form reads share one acknowledged parse.
     Form {
         policy: FormReadPolicy,
-        result: Arc<tokio::sync::Mutex<ParsedForm>>,
+        result: Option<Arc<tokio::sync::Mutex<ParsedForm>>>,
     },
 }
 /// Compatible form owner serializes the one parse and retains its typed acknowledged result.
@@ -455,24 +484,156 @@ struct ParsedForm {
     /// Completed parse result shared without copying form/error payloads.
     result: Option<Result<ParsedFormData, Arc<ServerError>>>,
 }
+/// Shared body and extension storage for a prepared base request.
+pub(crate) struct RequestBase {
+    extensions: Mutex<Extensions>,
+    body: Mutex<BodyState>,
+    form: tokio::sync::Mutex<ParsedForm>,
+    endpoint_bytes: Mutex<Option<crate::prepared_endpoint::EndpointByteLeases>>,
+}
+#[derive(Clone)]
+enum RequestExtensions {
+    Ordinary(Arc<Mutex<Extensions>>),
+    Prepared(crate::prepared_request_storage::BaseLoan),
+}
+impl RequestExtensions {
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, Extensions>> {
+        match self { Self::Ordinary(value) => value.lock(), Self::Prepared(value) => value.extensions.lock() }
+    }
+}
+#[derive(Clone)]
+enum RequestBody {
+    Ordinary(Arc<Mutex<BodyState>>),
+    Prepared(crate::prepared_request_storage::BaseLoan),
+}
+impl RequestBody {
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, BodyState>> {
+        match self { Self::Ordinary(value) => value.lock(), Self::Prepared(value) => value.body.lock() }
+    }
+
+    fn try_lock(&self) -> std::sync::TryLockResult<std::sync::MutexGuard<'_, BodyState>> {
+        match self {
+            Self::Ordinary(value) => value.try_lock(),
+            Self::Prepared(value) => value.body.try_lock(),
+        }
+    }
+}
+enum FormCell<'a> {
+    Ordinary(Arc<tokio::sync::Mutex<ParsedForm>>),
+    Prepared(&'a tokio::sync::Mutex<ParsedForm>),
+}
+impl std::ops::Deref for FormCell<'_> {
+    type Target = tokio::sync::Mutex<ParsedForm>;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Ordinary(cell) => cell,
+            Self::Prepared(cell) => cell,
+        }
+    }
+}
+impl RequestBody {
+    fn form_cell<'a>(
+        &'a self,
+        result: &Option<Arc<tokio::sync::Mutex<ParsedForm>>>,
+    ) -> Option<FormCell<'a>> {
+        match (self, result) {
+            (_, Some(cell)) => Some(FormCell::Ordinary(cell.clone())),
+            (Self::Prepared(base), None) => Some(FormCell::Prepared(&base.form)),
+            (Self::Ordinary(_), None) => None,
+        }
+    }
+}
+
 /// Native request metadata and checked body owner shared by one request only.
-struct RequestState {
-    /// Original parts remain intact; only service metadata is shared.
+pub(crate) struct RequestState {
     parts: http::request::Parts,
-    /// Explicit extension insertions support native auth/culture/telemetry stages.
-    extensions: Arc<Mutex<Extensions>>,
-    /// Short ownership transition lock; never held while awaiting native I/O.
-    body: Arc<Mutex<BodyState>>,
-    /// Body/disconnect cancellation source.
+    extensions: RequestExtensions,
+    body: RequestBody,
     cancellation: Cancellation,
+    endpoint_bytes: Mutex<Option<crate::prepared_endpoint::EndpointByteLeases>>,
+}
+#[derive(Clone)]
+enum RequestOwner {
+    Ordinary(Arc<RequestState>),
+    Prepared { snapshot: crate::prepared_request_storage::SnapshotLoan, pool: Arc<crate::PreparedRequestStoragePool> },
+}
+impl std::ops::Deref for RequestOwner {
+    type Target = RequestState;
+    fn deref(&self) -> &RequestState { match self { Self::Ordinary(value) => value, Self::Prepared { snapshot, .. } => snapshot } }
 }
 /// Fresh request state; cloning shares metadata and its single body claim.
 #[derive(Clone)]
 pub struct Request {
-    /// One request owner shared with selected application environment.
-    state: Arc<RequestState>,
+    state: RequestOwner,
 }
 impl Request {
+    fn from_reserved_native(
+        request: http::Request<Body>,
+        cancellation: Cancellation,
+        reservation: crate::prepared_request_storage::PreparedRequestStorageReservation,
+    ) -> Result<Self, effect::memory::MemoryError> {
+        if request.extensions().get::<RoutingSnapshot>().is_some() {
+            return Err(effect::memory::MemoryError::UnsupportedRunContract);
+        }
+        let (mut parts, body) = request.into_parts();
+        let extensions = std::mem::take(&mut parts.extensions);
+        let base = reservation.base.publish(RequestBase {
+            extensions: Mutex::new(extensions),
+            body: Mutex::new(BodyState::Unread(Some(body))),
+            form: tokio::sync::Mutex::new(ParsedForm { body: None, result: None }),
+            endpoint_bytes: Mutex::new(None),
+        }).map_err(|_| effect::memory::MemoryError::ConstructionUnbound)?;
+        let state = RequestState {
+            parts,
+            extensions: RequestExtensions::Prepared(base.clone()),
+            body: RequestBody::Prepared(base),
+            cancellation,
+            endpoint_bytes: Mutex::new(None),
+        };
+        let snapshot = reservation.snapshot.publish(state).map_err(|_| effect::memory::MemoryError::ConstructionUnbound)?;
+        Ok(Self { state: RequestOwner::Prepared { snapshot, pool: reservation.pool } })
+    }
+    /// Construct from native input using finite pre-reserved request and snapshot storage.
+    /// Native HTTP containers and the supplied cancellation retain their own backing.
+    /// An existing prepared routing snapshot retains its original pool and
+    /// shares its original body and extensions; a new request uses `pool`.
+    /// On refusal, this consumes and drops the unadmitted native request and
+    /// cancellation after rolling back physical reservations, before body reads.
+    pub fn try_from_native_in(
+        request: http::Request<Body>,
+        cancellation: Cancellation,
+        pool: &Arc<crate::PreparedRequestStoragePool>,
+    ) -> Result<Self, effect::memory::MemoryError> {
+        if let Some(shared) = request.extensions().get::<RoutingSnapshot>() {
+            let original = match &shared.0.state {
+                RequestOwner::Prepared { pool, .. } => Arc::clone(pool),
+                RequestOwner::Ordinary(_) => return Err(effect::memory::MemoryError::UnsupportedRunContract),
+            };
+            let vacancy = original.reserve_snapshot()?;
+            let (mut parts, body) = request.into_parts();
+            let shared = parts.extensions.remove::<RoutingSnapshot>().ok_or(effect::memory::MemoryError::ConstructionUnbound)?;
+            let extensions = std::mem::take(&mut parts.extensions);
+            let request = shared.0.publish_parts(parts, vacancy, original)?;
+            request.state.extensions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(extensions);
+            let mut state = request.state.body.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if matches!(*state, BodyState::Routing) { *state = BodyState::Unread(Some(body)); }
+            drop(state);
+            return Ok(request);
+        }
+        let reservation = pool.reserve_request()?;
+        Self::from_reserved_native(request, cancellation, reservation)
+    }
+    fn publish_parts(&self, mut parts: http::request::Parts, vacancy: crate::prepared_request_storage::SnapshotVacancy, pool: Arc<crate::PreparedRequestStoragePool>) -> Result<Self, effect::memory::MemoryError> {
+        parts.extensions = Extensions::new();
+        let state = RequestState { parts, extensions: self.state.extensions.clone(), body: self.state.body.clone(), cancellation: self.state.cancellation.clone(), endpoint_bytes: Mutex::new(None) };
+        let snapshot = vacancy.publish(state).map_err(|_| effect::memory::MemoryError::ConstructionUnbound)?;
+        Ok(Self { state: RequestOwner::Prepared { snapshot, pool } })
+    }
+    fn try_with_parts(&self, parts: &http::request::Parts) -> Result<Self, effect::memory::MemoryError> {
+        let RequestOwner::Prepared { pool, .. } = &self.state else { return Err(effect::memory::MemoryError::UnsupportedRunContract); };
+        let vacancy = pool.reserve_snapshot()?;
+        self.publish_parts(parts.clone(), vacancy, Arc::clone(pool))
+    }
     /// Transfer an axum request into a fresh owner; no body or extension payload is cloned.
     pub fn from_native(request: http::Request<Body>, cancellation: Cancellation) -> Self {
         let (mut parts, body) = request.into_parts();
@@ -497,24 +658,26 @@ impl Request {
         }
         let extensions = std::mem::take(&mut parts.extensions);
         Self {
-            state: Arc::new(RequestState {
+            state: RequestOwner::Ordinary(Arc::new(RequestState {
                 parts,
-                extensions: Arc::new(Mutex::new(extensions)),
-                body: Arc::new(Mutex::new(BodyState::Unread(Some(body)))),
+                extensions: RequestExtensions::Ordinary(Arc::new(Mutex::new(extensions))),
+                body: RequestBody::Ordinary(Arc::new(Mutex::new(BodyState::Unread(Some(body))))),
                 cancellation,
-            }),
+                endpoint_bytes: Mutex::new(None),
+            })),
         }
     }
     /// Rebuild only immutable native metadata while sharing the exact body/extension owner.
     fn with_parts(&self, mut parts: http::request::Parts) -> Self {
         parts.extensions = Extensions::new();
         Self {
-            state: Arc::new(RequestState {
+            state: RequestOwner::Ordinary(Arc::new(RequestState {
                 parts,
                 extensions: self.state.extensions.clone(),
                 body: self.state.body.clone(),
                 cancellation: self.state.cancellation.clone(),
-            }),
+                endpoint_bytes: Mutex::new(None),
+            })),
         }
     }
     /// Borrow the original method without cloning request parts.
@@ -560,6 +723,22 @@ impl Request {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(value);
     }
+    /// Install a request extension only if its type has no existing value.
+    /// A losing publisher gets its original value back after the lock is released.
+    pub fn try_insert_extension<T: Clone + Send + Sync + 'static>(
+        &self,
+        value: T,
+    ) -> Result<(), T> {
+        let mut extensions = self.state.extensions.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if extensions.get::<T>().is_some() {
+            return Err(value);
+        }
+        let replaced = extensions.insert(value);
+        drop(extensions);
+        drop(replaced);
+        Ok(())
+    }
     /// Decode a native structured header, distinguishing absence from malformed syntax.
     pub fn typed_header<H: Header>(&self) -> Result<Option<H>, ServerError> {
         self.headers()
@@ -593,7 +772,107 @@ impl Request {
     }
     /// Read finite encoded bytes under the selected bound, with exclusive ownership.
     pub async fn read_bytes(&self, limit: BodyLimit) -> Result<Bytes, ServerError> {
-        read_bounded(self.claim()?, limit).await
+        match self.read_admitted_body(self.claim()?, limit).await? {
+            AdmittedBody::Ordinary(bytes) => Ok(bytes),
+            AdmittedBody::Prepared(view) => Ok(Bytes::from_owner(view)),
+        }
+    }
+    pub(crate) fn install_endpoint_bytes(&self, leases: crate::prepared_endpoint::EndpointByteLeases) {
+        *self.state.endpoint_bytes.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(leases);
+    }
+    pub(crate) fn install_shared_endpoint_bytes(
+        &self,
+        leases: crate::prepared_endpoint::EndpointByteLeases,
+    ) -> Result<(), MemoryError> {
+        let RequestBody::Prepared(base) = &self.state.body else {
+            return Err(MemoryError::UnsupportedRunContract);
+        };
+        *base.endpoint_bytes.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(leases);
+        Ok(())
+    }
+    fn take_endpoint_bytes(
+        &self,
+        select: impl Fn(&mut crate::prepared_endpoint::EndpointByteLeases) -> &mut Option<crate::prepared_endpoint::AdmittedByteLease>,
+    ) -> Result<Option<BufferLease<'static>>, ServerError> {
+        {
+            let mut leases = self.state.endpoint_bytes.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(lease) = leases.as_mut().and_then(|leases| select(leases).as_mut()) {
+                return lease.0.take().map(Some).ok_or(ServerError::BodyClaimed);
+            }
+        }
+        if let RequestBody::Prepared(base) = &self.state.body {
+            let mut leases = base.endpoint_bytes.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(lease) = leases.as_mut().and_then(|leases| select(leases).as_mut()) {
+                return lease.0.take().map(Some).ok_or(ServerError::BodyClaimed);
+            }
+        }
+        Ok(None)
+    }
+    /// Read the native body once into its preadmitted physical buffer.
+    /// The returned view holds the actual backing independently of this request.
+    pub async fn read_prepared_bytes(&self) -> Result<BufferView<'static>, ServerError> {
+        self.read_prepared_bytes_with_optional_limit(None).await
+    }
+
+    /// Read into the admitted body slot with the caller's additional logical limit.
+    pub async fn read_prepared_bytes_limited(
+        &self,
+        limit: BodyLimit,
+    ) -> Result<BufferView<'static>, ServerError> {
+        self.read_prepared_bytes_with_optional_limit(Some(limit)).await
+    }
+
+    async fn read_prepared_bytes_with_optional_limit(
+        &self,
+        limit: Option<BodyLimit>,
+    ) -> Result<BufferView<'static>, ServerError> {
+        let buffer = self.take_endpoint_bytes(|leases| &mut leases.body)?
+            .ok_or(ServerError::Memory(MemoryError::UnsupportedRunContract))?;
+        let limit = limit.map_or_else(|| buffer.capacity().get(), |limit| limit.bytes());
+        read_prepared_bounded(self.claim()?, buffer, limit).await
+    }
+    async fn read_admitted_body(&self, body: Body, limit: BodyLimit) -> Result<AdmittedBody, ServerError> {
+        match self.take_endpoint_bytes(|leases| &mut leases.body)? {
+            Some(buffer) => {
+                let limit = limit.bytes().min(buffer.capacity().get());
+                read_prepared_bounded(body, buffer, limit).await.map(AdmittedBody::Prepared)
+            }
+            None => read_bounded(body, limit).await.map(AdmittedBody::Ordinary),
+        }
+    }
+    /// Take the selected fixed byte destination for explicit decoding into it.
+    pub fn take_prepared_decoded_buffer(&self) -> Result<BufferLease<'static>, ServerError> {
+        self.take_endpoint_bytes(|leases| &mut leases.decoded)?
+            .ok_or(ServerError::Memory(MemoryError::UnsupportedRunContract))
+    }
+    /// Take the selected fixed output destination, for writing and transfer to a reply or stream.
+    ///
+    /// ```
+    /// use effect::memory::BufferView;
+    /// use effect_server::{Reply, Request, ServerError, native::http::HeaderValue, reply};
+    ///
+    /// fn response<E: Send + 'static, R: Send + Sync + 'static>(
+    ///     request: &Request,
+    ///     payload: &[u8],
+    ///     media: HeaderValue,
+    /// ) -> Result<Reply<E, R>, ServerError> {
+    ///     let mut out = request.take_prepared_output_buffer()?;
+    ///     out.extend_from_slice(payload).map_err(ServerError::Memory)?;
+    ///     let view = BufferView::new(out.share());
+    ///     Ok(reply! { lease(view, media); })
+    /// }
+    /// ```
+    pub fn take_prepared_output_buffer(&self) -> Result<BufferLease<'static>, ServerError> {
+        self.take_endpoint_bytes(|leases| &mut leases.output)?
+            .ok_or(ServerError::Memory(MemoryError::UnsupportedRunContract))
+    }
+    /// Take the selected generated-header slot, independently of the body output.
+    pub fn take_prepared_response_header_buffer(&self) -> Result<Option<BufferLease<'static>>, ServerError> {
+        self.take_endpoint_bytes(|leases| &mut leases.response_headers)
     }
     /// Decode strict UTF-8; replacement characters are not inserted for malformed bytes.
     pub async fn read_text(&self, limit: BodyLimit) -> Result<String, ServerError> {
@@ -661,7 +940,8 @@ impl Request {
         &self,
         policy: ByteFormPolicy,
     ) -> Result<Arc<BytePairsOutcome>, ServerError> {
-        self.read_partial_byte_form_with_segment_limit(policy, None).await
+        self.read_partial_byte_form_with_segment_limit(policy, None)
+            .await
     }
 
     /// Read a partial byte form with an optional encoded-segment limit.
@@ -670,7 +950,10 @@ impl Request {
         policy: ByteFormPolicy,
         segment_limit: Option<NonZeroUsize>,
     ) -> Result<Arc<BytePairsOutcome>, ServerError> {
-        let cell = self.claim_form(FormReadPolicy::PartialBytes { policy, segment_limit })?;
+        let cell = self.claim_form(FormReadPolicy::PartialBytes {
+            policy,
+            segment_limit,
+        })?;
         let mut parsed = cell.lock().await;
         if let Some(result) = &parsed.result {
             return shared_partial_bytes(result);
@@ -678,11 +961,17 @@ impl Request {
         let body = parsed.body.take().ok_or(ServerError::Disconnected)?;
         parsed.result = Some(Err(Arc::new(ServerError::Disconnected)));
         let result: Result<Arc<BytePairsOutcome>, Arc<ServerError>> = async {
-            let bytes = read_bounded(body, policy.body).await?;
-            let outcome = if segment_limit.is_some_and(|limit| bytes.split(|byte| *byte == b'&').count() > limit.get()) {
-                BytePairsOutcome { values: BTreeMap::new(), diagnostic: Some(ServerError::Limit("form segments".into())) }
+            let bytes = self.read_admitted_body(body, policy.body).await?;
+            let bytes = bytes.as_ref();
+            let outcome = if segment_limit
+                .is_some_and(|limit| bytes.split(|byte| *byte == b'&').count() > limit.get())
+            {
+                BytePairsOutcome {
+                    values: BTreeMap::new(),
+                    diagnostic: Some(ServerError::Limit("form segments".into())),
+                }
             } else {
-                decode_url_encoded_pairs_partial(&bytes)
+                decode_url_encoded_pairs_partial(bytes)
             };
             if outcome.values.len() > policy.fields.get() {
                 return Err(ServerError::Limit("form fields".into()));
@@ -695,8 +984,8 @@ impl Request {
         .await
         .map_err(Arc::new);
         let result = result.map(ParsedFormData::PartialBytes);
-        parsed.result = Some(result.clone());
-        shared_partial_bytes(&result)
+        parsed.result = Some(result);
+        shared_partial_bytes(parsed.result.as_ref().ok_or(ServerError::Disconnected)?)
     }
 
     /// Inspect an already completed partial byte-form parse without claiming a body.
@@ -716,16 +1005,86 @@ impl Request {
     #[must_use]
     pub fn peek_completed_form_fields(&self) -> Option<ByteFormData> {
         let cell = {
-            let state = self.state.body.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            match &*state { BodyState::Form { result, .. } => result.clone(), _ => return None }
+            let state = self
+                .state
+                .body
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &*state {
+                BodyState::Form { result, .. } => self.state.body.form_cell(result)?,
+                BodyState::Unread(_) | BodyState::Exclusive | BodyState::Routing => return None,
+            }
         };
         let parsed = cell.try_lock().ok()?;
         let values = match parsed.result.as_ref()?.as_ref().ok()? {
-            ParsedFormData::Text(data) => data.values.iter().map(|(key, values)| (key.as_bytes().to_vec(), values.iter().map(|v| v.as_bytes().to_vec()).collect())).collect(),
-            ParsedFormData::Bytes(data) | ParsedFormData::MultipartFields(data) => data.values.clone(),
+            ParsedFormData::Text(data) => data
+                .values
+                .iter()
+                .map(|(key, values)| {
+                    (
+                        key.as_bytes().to_vec(),
+                        values.iter().map(|v| v.as_bytes().to_vec()).collect(),
+                    )
+                })
+                .collect(),
+            ParsedFormData::PreparedText { form, .. } => {
+                let mut values = BytePairs::new();
+                for (name, value) in form.pairs() {
+                    if let Some(repeated) = values.get_mut(name.as_bytes()) {
+                        repeated.push(value.as_bytes().to_vec());
+                    } else {
+                        values.insert(name.as_bytes().to_vec(), vec![value.as_bytes().to_vec()]);
+                    }
+                }
+                values
+            }
+            ParsedFormData::Bytes(data) | ParsedFormData::MultipartFields(data) => {
+                data.values.clone()
+            }
             ParsedFormData::PartialBytes(data) => data.values.clone(),
         };
         Some(ByteFormData { values })
+    }
+
+    /// Borrow acknowledged body fields in their stored order without reparsing
+    /// or copying. An absent or failed parse yields `false`. A busy owner yields
+    /// a memory refusal. The visitor must not access the form it is borrowing.
+    pub fn visit_completed_form_fields(
+        &self,
+        mut visit: impl FnMut(&[u8], &[u8]) -> Result<(), ServerError>,
+    ) -> Result<bool, ServerError> {
+        use effect::memory::MemoryError;
+        use std::sync::TryLockError;
+        let cell = {
+            let state = match self.state.body.try_lock() {
+                Ok(state) => state,
+                Err(TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(TryLockError::WouldBlock) => return Err(ServerError::Memory(MemoryError::Busy)),
+            };
+            match &*state {
+                BodyState::Form { result, .. } => self.state.body.form_cell(result),
+                BodyState::Unread(_) | BodyState::Exclusive | BodyState::Routing => None,
+            }
+        };
+        let Some(cell) = cell else { return Ok(false) };
+        let parsed = cell.try_lock().map_err(|_| ServerError::Memory(MemoryError::Busy))?;
+        let Some(Ok(form)) = parsed.result.as_ref() else { return Ok(false) };
+        let mut visit_bytes = |pairs: &BytePairs| {
+            pairs.iter().try_for_each(|(name, values)| {
+                values.iter().try_for_each(|value| visit(name, value))
+            })
+        };
+        match form {
+            ParsedFormData::Text(data) => data.values.iter().try_for_each(|(name, values)| {
+                values.iter().try_for_each(|value| visit(name.as_bytes(), value.as_bytes()))
+            }),
+            ParsedFormData::PreparedText { form, .. } => form.pairs().try_for_each(|(name, value)| {
+                visit(name.as_bytes(), value.as_bytes())
+            }),
+            ParsedFormData::Bytes(data) | ParsedFormData::MultipartFields(data) => visit_bytes(&data.values),
+            ParsedFormData::PartialBytes(data) => visit_bytes(&data.values),
+        }?;
+        Ok(true)
     }
 
     /// Inspect a completed partial byte form with the selected segment limit.
@@ -736,12 +1095,27 @@ impl Request {
         segment_limit: Option<NonZeroUsize>,
     ) -> Option<Result<Arc<BytePairsOutcome>, ServerError>> {
         let cell = {
-            let state = self.state.body.lock()
+            let state = self
+                .state
+                .body
+                .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match &*state {
-                BodyState::Form { policy: existing, result }
-                    if *existing == (FormReadPolicy::PartialBytes { policy, segment_limit }) => result.clone(),
-                _ => return None,
+                BodyState::Form {
+                    policy: existing,
+                    result,
+                } if *existing
+                    == (FormReadPolicy::PartialBytes {
+                        policy,
+                        segment_limit,
+                    }) =>
+                {
+                    self.state.body.form_cell(result)?
+                }
+                BodyState::Unread(_)
+                | BodyState::Exclusive
+                | BodyState::Routing
+                | BodyState::Form { .. } => return None,
             }
         };
         let parsed = cell.try_lock().ok()?;
@@ -759,7 +1133,11 @@ impl Request {
         fields: NonZeroUsize,
         values: ByteFieldBounds,
     ) -> Result<Arc<ByteFormData>, ServerError> {
-        let cell = self.claim_form(FormReadPolicy::MultipartFields { policy, fields, values })?;
+        let cell = self.claim_form(FormReadPolicy::MultipartFields {
+            policy,
+            fields,
+            values,
+        })?;
         let mut parsed = cell.lock().await;
         if let Some(result) = &parsed.result {
             return shared_multipart_fields(result);
@@ -767,10 +1145,12 @@ impl Request {
         let body = parsed.body.take().ok_or(ServerError::Disconnected)?;
         parsed.result = Some(Err(Arc::new(ServerError::Disconnected)));
         let result = collect_multipart_fields(body, self.headers(), policy, fields, values)
-            .await.map(Arc::new).map_err(Arc::new)
+            .await
+            .map(Arc::new)
+            .map_err(Arc::new)
             .map(ParsedFormData::MultipartFields);
-        parsed.result = Some(result.clone());
-        shared_multipart_fields(&result)
+        parsed.result = Some(result);
+        shared_multipart_fields(parsed.result.as_ref().ok_or(ServerError::Disconnected)?)
     }
 
     /// Collect multipart fields with an additional shared memory allowance.
@@ -784,15 +1164,52 @@ impl Request {
         values: ByteFieldBounds,
         file_memory: usize,
     ) -> Result<Arc<ByteFormData>, ServerError> {
-        let cell = self.claim_form(FormReadPolicy::AccountedMultipartFields { policy, fields, values, file_memory })?;
+        let cell = self.claim_form(FormReadPolicy::AccountedMultipartFields {
+            policy,
+            fields,
+            values,
+            file_memory,
+        })?;
         let mut parsed = cell.lock().await;
-        if let Some(result) = &parsed.result { return shared_multipart_fields(result); }
+        if let Some(result) = &parsed.result {
+            return shared_multipart_fields(result);
+        }
         let body = parsed.body.take().ok_or(ServerError::Disconnected)?;
         parsed.result = Some(Err(Arc::new(ServerError::Disconnected)));
-        let result = collect_accounted_multipart_fields(body, self.headers(), policy, fields, values, file_memory)
-            .await.map(Arc::new).map_err(Arc::new).map(ParsedFormData::MultipartFields);
-        parsed.result = Some(result.clone());
-        shared_multipart_fields(&result)
+        let result = collect_accounted_multipart_fields(
+            body,
+            self.headers(),
+            policy,
+            fields,
+            values,
+            file_memory,
+        )
+        .await
+        .map(Arc::new)
+        .map_err(Arc::new)
+        .map(ParsedFormData::MultipartFields);
+        parsed.result = Some(result);
+        shared_multipart_fields(parsed.result.as_ref().ok_or(ServerError::Disconnected)?)
+    }
+
+    /// Consume an accounted multipart body into a caller-admitted field destination.
+    /// Files are drained under the same accounting as the owned field collector.
+    pub async fn read_accounted_multipart_into<T: MultipartFieldDestination>(
+        &self,
+        policy: MultipartPolicy,
+        field_bytes: NonZeroUsize,
+        file_memory: usize,
+        destination: &mut T,
+    ) -> Result<(), ServerError> {
+        collect_accounted_multipart_into(
+            self.claim()?,
+            self.headers(),
+            policy,
+            field_bytes,
+            file_memory,
+            destination,
+        )
+        .await
     }
 
     /// Inspect a completed multipart field collection without claiming the body.
@@ -805,22 +1222,35 @@ impl Request {
         values: ByteFieldBounds,
     ) -> Option<Result<Arc<ByteFormData>, ServerError>> {
         let cell = {
-            let state = self.state.body.lock()
+            let state = self
+                .state
+                .body
+                .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match &*state {
-                BodyState::Form { policy: existing, result }
-                    if *existing == (FormReadPolicy::MultipartFields { policy, fields, values }) => result.clone(),
-                _ => return None,
+                BodyState::Form {
+                    policy: existing,
+                    result,
+                } if *existing
+                    == (FormReadPolicy::MultipartFields {
+                        policy,
+                        fields,
+                        values,
+                    }) =>
+                {
+                    self.state.body.form_cell(result)?
+                }
+                BodyState::Unread(_)
+                | BodyState::Exclusive
+                | BodyState::Routing
+                | BodyState::Form { .. } => return None,
             }
         };
         let parsed = cell.try_lock().ok()?;
         parsed.result.as_ref().map(shared_multipart_fields)
     }
 
-    fn claim_form(
-        &self,
-        policy: FormReadPolicy,
-    ) -> Result<Arc<tokio::sync::Mutex<ParsedForm>>, ServerError> {
+    fn claim_form(&self, policy: FormReadPolicy) -> Result<FormCell<'_>, ServerError> {
         let mut state = self
             .state
             .body
@@ -828,23 +1258,91 @@ impl Request {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match &mut *state {
             BodyState::Unread(body) => {
-                let body = body.take().ok_or(ServerError::BodyClaimed)?;
-                let result = Arc::new(tokio::sync::Mutex::new(ParsedForm {
-                    body: Some(body),
-                    result: None,
-                }));
-                *state = BodyState::Form {
-                    policy,
-                    result: result.clone(),
-                };
-                Ok(result)
+                if let RequestBody::Prepared(base) = &self.state.body {
+                    let mut parsed = base
+                        .form
+                        .try_lock()
+                        .map_err(|_| ServerError::Memory(MemoryError::Busy))?;
+                    parsed.body = Some(body.take().ok_or(ServerError::BodyClaimed)?);
+                    *state = BodyState::Form {
+                        policy,
+                        result: None,
+                    };
+                    Ok(FormCell::Prepared(&base.form))
+                } else {
+                    let body = body.take().ok_or(ServerError::BodyClaimed)?;
+                    let result = Arc::new(tokio::sync::Mutex::new(ParsedForm {
+                        body: Some(body),
+                        result: None,
+                    }));
+                    *state = BodyState::Form {
+                        policy,
+                        result: Some(result.clone()),
+                    };
+                    Ok(FormCell::Ordinary(result))
+                }
             }
             BodyState::Form {
                 policy: existing,
                 result,
-            } if *existing == policy => Ok(result.clone()),
+            } if *existing == policy => self
+                .state
+                .body
+                .form_cell(result)
+                .ok_or(ServerError::Memory(MemoryError::ConstructionUnbound)),
             BodyState::Form { .. } => Err(ServerError::FormPolicyConflict),
             BodyState::Exclusive | BodyState::Routing => Err(ServerError::BodyClaimed),
+        }
+    }
+
+    /// Validate the complete compatible form, then borrow a single decoded value.
+    /// Repetitions are rejected before the reader runs. With a selected decoded
+    /// slot, this shares a prepared snapshot with later compatible form readers.
+    pub async fn with_form_value<A>(
+        &self,
+        policy: FormPolicy,
+        name: &str,
+        read: impl FnOnce(Option<&str>) -> Result<A, ServerError>,
+    ) -> Result<A, ServerError> {
+        let cell = self.claim_form(FormReadPolicy::Text {
+            policy,
+            reject_raw_semicolons: false,
+        })?;
+        let snapshot = {
+            let mut parsed = cell.lock().await;
+            self.parse_text_form(&mut parsed, policy, false, true)
+                .await?;
+            match parsed.result.as_ref().ok_or(ServerError::Disconnected)? {
+                Ok(ParsedFormData::Text(form)) => TextFormRead::Ordinary(form.clone()),
+                Ok(ParsedFormData::PreparedText { form, .. }) => {
+                    TextFormRead::Prepared(form.try_clone()?)
+                }
+                Ok(
+                    ParsedFormData::Bytes(_)
+                    | ParsedFormData::PartialBytes(_)
+                    | ParsedFormData::MultipartFields(_),
+                ) => return Err(ServerError::FormPolicyConflict),
+                Err(error) => return Err(ServerError::SharedInput(error.clone())),
+            }
+        };
+        match snapshot {
+            TextFormRead::Ordinary(form) => {
+                match form.values.get(name).map(Vec::as_slice).unwrap_or(&[]) {
+                    [] => read(None),
+                    [value] => read(Some(value)),
+                    _ => Err(ServerError::Duplicate(name.to_owned())),
+                }
+            }
+            TextFormRead::Prepared(form) => {
+                let mut selected = form
+                    .pairs()
+                    .filter_map(|(field, value)| (field == name).then_some(value));
+                let value = selected.next();
+                if selected.next().is_some() {
+                    return Err(ServerError::Duplicate(name.to_owned()));
+                }
+                read(value)
+            }
         }
     }
 
@@ -858,13 +1356,41 @@ impl Request {
             reject_raw_semicolons,
         })?;
         let mut parsed = cell.lock().await;
-        if let Some(result) = &parsed.result {
-            return shared_text(result);
+        self.parse_text_form(&mut parsed, policy, reject_raw_semicolons, false)
+            .await?;
+        shared_text(parsed.result.as_mut().ok_or(ServerError::Disconnected)?)
+    }
+
+    async fn parse_text_form(
+        &self,
+        parsed: &mut ParsedForm,
+        policy: FormPolicy,
+        reject_raw_semicolons: bool,
+        prefer_prepared: bool,
+    ) -> Result<(), ServerError> {
+        if parsed.result.is_some() {
+            return Ok(());
         }
+        if parsed.body.is_none() {
+            return Err(ServerError::Disconnected);
+        }
+        let output = if prefer_prepared {
+            self.take_endpoint_bytes(|leases| &mut leases.decoded)?
+        } else {
+            None
+        };
         let body = parsed.body.take().ok_or(ServerError::Disconnected)?;
-        let result: Result<Arc<FormData>, Arc<ServerError>> = async {
-            let bytes = read_bounded(body, policy.body).await?;
-            let text = std::str::from_utf8(&bytes)
+        let result = async {
+            let bytes = self.read_admitted_body(body, policy.body).await?;
+            if let Some(output) = output {
+                let form =
+                    PreparedForm::parse(bytes.as_ref(), output, policy, reject_raw_semicolons)?;
+                return Ok(ParsedFormData::PreparedText {
+                    form,
+                    materialized: None,
+                });
+            }
+            let text = std::str::from_utf8(bytes.as_ref())
                 .map_err(|_| ServerError::Invalid("form UTF-8".into()))?;
             let values = decode_text_pairs(text.as_bytes(), reject_raw_semicolons)?;
             if values.len() > policy.fields.get() {
@@ -873,13 +1399,12 @@ impl Request {
             for (name, values) in &values {
                 policy.values.check(name, values)?;
             }
-            Ok(Arc::new(FormData { values }))
+            Ok(ParsedFormData::Text(Arc::new(FormData { values })))
         }
         .await
         .map_err(Arc::new);
-        let result = result.map(ParsedFormData::Text);
-        parsed.result = Some(result.clone());
-        shared_text(&result)
+        parsed.result = Some(result);
+        Ok(())
     }
 
     async fn read_byte_form_with(
@@ -897,8 +1422,8 @@ impl Request {
         }
         let body = parsed.body.take().ok_or(ServerError::Disconnected)?;
         let result: Result<Arc<ByteFormData>, Arc<ServerError>> = async {
-            let bytes = read_bounded(body, policy.body).await?;
-            let values = decode_url_encoded_pairs(&bytes, reject_raw_semicolons)?;
+            let bytes = self.read_admitted_body(body, policy.body).await?;
+            let values = decode_url_encoded_pairs(bytes.as_ref(), reject_raw_semicolons)?;
             if values.len() > policy.fields.get() {
                 return Err(ServerError::Limit("form fields".into()));
             }
@@ -910,8 +1435,8 @@ impl Request {
         .await
         .map_err(Arc::new);
         let result = result.map(ParsedFormData::Bytes);
-        parsed.result = Some(result.clone());
-        shared_bytes(&result)
+        parsed.result = Some(result);
+        shared_bytes(parsed.result.as_ref().ok_or(ServerError::Disconnected)?)
     }
 
     /// Move a bounded multipart parser to an owned callback; parts borrow it and cannot escape.
@@ -961,14 +1486,58 @@ pub struct RoutingRequest {
     parts: http::request::Parts,
     /// Original encoded body stays single-owned rather than buffered for routing.
     request: Request,
+    initial_snapshot: Option<crate::prepared_request_storage::SnapshotVacancy>,
+}
+/// An admitted metadata snapshot for a checked routing stage.
+pub struct RoutingSnapshotReservation(pub(crate) Option<crate::prepared_request_storage::SnapshotVacancy>);
+impl RoutingSnapshotReservation {
+    /// Publish the stage's current metadata, including edits made since admission.
+    pub fn publish(self, routing: &RoutingRequest) -> Result<Request, MemoryError> {
+        match self.0 {
+            Some(vacancy) => routing.request_with_vacancy(vacancy),
+            None => Ok(routing.request()),
+        }
+    }
 }
 impl RoutingRequest {
+    pub(crate) fn from_reserved_native(native: http::Request<Body>, cancellation: Cancellation, reservation: crate::prepared_request_storage::PreparedRequestStorageReservation, initial_snapshot: crate::prepared_request_storage::SnapshotVacancy) -> Result<Self, effect::memory::MemoryError> {
+        let request = Request::from_reserved_native(native, cancellation, reservation)?;
+        let parts = request.state.parts.clone();
+        Ok(Self { parts, request, initial_snapshot: Some(initial_snapshot) })
+    }
+    pub(crate) fn take_initial_request(&mut self) -> Result<Request, effect::memory::MemoryError> {
+        let vacancy = self.initial_snapshot.take().ok_or(effect::memory::MemoryError::ConstructionUnbound)?;
+        self.request_with_vacancy(vacancy)
+    }
+    /// Create a pre-routing owner using caller-selected finite request storage.
+    /// On refusal, the unadmitted native request and cancellation are consumed
+    /// and physical reservations are returned before the error is returned.
+    pub fn try_from_native_in(native: http::Request<Body>, cancellation: Cancellation, pool: &Arc<crate::PreparedRequestStoragePool>) -> Result<Self, effect::memory::MemoryError> {
+        let request = Request::try_from_native_in(native, cancellation, pool)?;
+        let parts = request.state.parts.clone();
+        Ok(Self { parts, request, initial_snapshot: None })
+    }
+    pub(crate) fn reserve_snapshot(&self) -> Result<crate::prepared_request_storage::SnapshotVacancy, effect::memory::MemoryError> {
+        match &self.request.state {
+            RequestOwner::Prepared { pool, .. } => pool.reserve_snapshot(),
+            RequestOwner::Ordinary(_) => Err(effect::memory::MemoryError::UnsupportedRunContract),
+        }
+    }
+    pub(crate) fn request_with_vacancy(&self, vacancy: crate::prepared_request_storage::SnapshotVacancy) -> Result<Request, effect::memory::MemoryError> {
+        let RequestOwner::Prepared { pool, .. } = &self.request.state else { return Err(effect::memory::MemoryError::UnsupportedRunContract); };
+        self.request.publish_parts(self.parts.clone(), vacancy, Arc::clone(pool))
+    }
+    /// Retain a fresh metadata snapshot with the same actual body and extensions.
+    pub fn try_request(&self) -> Result<Request, effect::memory::MemoryError> {
+        self.request.try_with_parts(&self.parts)
+    }
     /// Create a pre-routing owner without reading or copying body bytes.
     pub(crate) fn from_native(native: http::Request<Body>, cancellation: Cancellation) -> Self {
         let request = Request::from_native(native, cancellation);
         let parts = request.state.parts.clone();
-        Self { parts, request }
+        Self { parts, request, initial_snapshot: None }
     }
+    pub(crate) fn cancellation(&self) -> &Cancellation { self.request.cancellation() }
     /// Borrow mutable native metadata. Method/URI changes affect the actual native router.
     /// Insert service metadata through `request().insert_extension` to share it with selected R.
     pub fn parts_mut(&mut self) -> &mut http::request::Parts {
@@ -984,8 +1553,18 @@ impl RoutingRequest {
         self.request.with_parts(self.parts.clone())
     }
     /// Transfer unread bytes to native routing once; compatible parsed forms remain shared.
-    pub(crate) fn into_native(mut self) -> http::Request<Body> {
+    pub(crate) fn into_native(self) -> http::Request<Body> {
         let request = self.request();
+        self.into_native_with_request(request)
+    }
+    #[allow(clippy::result_large_err)] // Preserve the complete routing owner on physical refusal.
+    pub(crate) fn into_native_with_vacancy(self, vacancy: crate::prepared_request_storage::SnapshotVacancy) -> Result<http::Request<Body>, (effect::memory::MemoryError, Self)> {
+        match self.request_with_vacancy(vacancy) {
+            Ok(request) => Ok(self.into_native_with_request(request)),
+            Err(error) => Err((error, self)),
+        }
+    }
+    fn into_native_with_request(mut self, request: Request) -> http::Request<Body> {
         let body = {
             let mut state = request
                 .state
@@ -1043,6 +1622,13 @@ impl<R: HasTaskSpawner> HasTaskSpawner for RequestEnv<R> {
     /// Delegate task execution to the selected application capability.
     fn task_spawner(&self) -> &Self::Tasks {
         self.services.task_spawner()
+    }
+}
+impl<R: effect::HasHttpTransport> effect::HasHttpTransport for RequestEnv<R> {
+    type Transport = R::Transport;
+
+    fn http_transport(&self) -> &Self::Transport {
+        self.services.http_transport()
     }
 }
 /// Lazy typed request input, suitable for explicit environment/error projection.
@@ -1233,61 +1819,146 @@ async fn collect_accounted_multipart_fields(
     bounds: ByteFieldBounds,
     file_memory: usize,
 ) -> Result<ByteFormData, ServerError> {
+    let mut destination = OwnedMultipartFields {
+        fields,
+        bounds,
+        values: BTreeMap::new(),
+        pending_name: Vec::new(),
+        pending_value: Vec::new(),
+    };
+    collect_accounted_multipart_into(
+        body, headers, policy, bounds.bytes, file_memory, &mut destination,
+    ).await?;
+    Ok(ByteFormData { values: destination.values })
+}
+
+/// A bounded destination for one accounted multipart field at a time.
+pub trait MultipartFieldDestination: Send {
+    /// Begin a non-file field with a nonempty name.
+    fn begin_field(&mut self, name: &[u8]) -> Result<(), ServerError>;
+    /// Append raw bytes of the current field.
+    fn append_field(&mut self, bytes: &[u8]) -> Result<(), ServerError>;
+    /// Complete the current field and check aggregate limits.
+    fn finish_field(&mut self) -> Result<(), ServerError>;
+}
+
+struct OwnedMultipartFields {
+    fields: NonZeroUsize,
+    bounds: ByteFieldBounds,
+    values: BytePairs,
+    pending_name: Vec<u8>,
+    pending_value: Vec<u8>,
+}
+
+impl MultipartFieldDestination for OwnedMultipartFields {
+    fn begin_field(&mut self, name: &[u8]) -> Result<(), ServerError> {
+        self.pending_name = name.to_vec();
+        Ok(())
+    }
+
+    fn append_field(&mut self, bytes: &[u8]) -> Result<(), ServerError> {
+        self.pending_value.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn finish_field(&mut self) -> Result<(), ServerError> {
+        let entries = self.values.entry(std::mem::take(&mut self.pending_name)).or_default();
+        entries.push(std::mem::take(&mut self.pending_value));
+        self.bounds.check(entries)?;
+        if self.values.len() > self.fields.get() {
+            return Err(ServerError::Limit("form fields".into()));
+        }
+        Ok(())
+    }
+}
+
+async fn collect_accounted_multipart_into<T: MultipartFieldDestination>(
+    body: Body,
+    headers: &HeaderMap,
+    policy: MultipartPolicy,
+    field_bytes: NonZeroUsize,
+    file_memory: usize,
+    destination: &mut T,
+) -> Result<(), ServerError> {
     let mut request = http::Request::new(Body::new(Limited::new(body, policy.body.bytes())));
     *request.headers_mut() = headers.clone();
-    request.extensions_mut().insert(axum::extract::DefaultBodyLimit::disable());
-    let mut parser = Multipart::from_request(request, &()).await
+    request
+        .extensions_mut()
+        .insert(axum::extract::DefaultBodyLimit::disable());
+    let mut parser = Multipart::from_request(request, &())
+        .await
         .map_err(|error| ServerError::MultipartRejection(error.to_string()))?;
     let mut remaining = file_memory.saturating_add(10 * 1024 * 1024) as u128;
     let mut file_remaining = file_memory as u128;
     let mut headers_remaining = 10_000usize;
     let mut part_count = 0usize;
-    let mut collected: BytePairs = BTreeMap::new();
     while let Some(mut part) = parser.next_field().await.map_err(ServerError::Multipart)? {
         part_count += 1;
-        if part_count > policy.parts.get() { return Err(ServerError::Limit("multipart count".into())); }
+        if part_count > policy.parts.get() {
+            return Err(ServerError::Limit("multipart count".into()));
+        }
         let header_count = part.headers().values().count();
-        if header_count > headers_remaining { return Err(ServerError::Limit("multipart headers".into())); }
+        if header_count > headers_remaining {
+            return Err(ServerError::Limit("multipart headers".into()));
+        }
         let mut header_bytes = 0usize;
         let mut header_memory = 400u128;
         for name in part.headers().keys() {
             header_memory += name.as_str().len() as u128 + 200;
             for value in part.headers().get_all(name).iter() {
-                header_bytes = header_bytes.saturating_add(name.as_str().len()).saturating_add(value.as_bytes().len());
+                header_bytes = header_bytes
+                    .saturating_add(name.as_str().len())
+                    .saturating_add(value.as_bytes().len());
                 header_memory += value.as_bytes().len() as u128;
             }
         }
-        if header_bytes > policy.header_bytes.get() { return Err(ServerError::Limit("multipart headers".into())); }
-        if header_memory > remaining { return Err(ServerError::Limit("multipart memory".into())); }
-        let name = part.name().unwrap_or("").as_bytes().to_vec();
+        if header_bytes > policy.header_bytes.get() {
+            return Err(ServerError::Limit("multipart headers".into()));
+        }
+        if header_memory > remaining {
+            return Err(ServerError::Limit("multipart memory".into()));
+        }
+        let name = part.name().unwrap_or("").as_bytes();
+        let named = !name.is_empty();
         let file = part.file_name().is_some_and(|name| !name.is_empty());
-        if !name.is_empty() && file { headers_remaining -= header_count; }
-        if !name.is_empty() {
+        if named && file {
+            headers_remaining -= header_count;
+        }
+        if named {
             let charge = name.len() as u128 + 200 + if file { header_memory + 300 } else { 0 };
-            remaining = remaining.checked_sub(charge).ok_or_else(|| ServerError::Limit("multipart memory".into()))?;
+            remaining = remaining
+                .checked_sub(charge)
+                .ok_or_else(|| ServerError::Limit("multipart memory".into()))?;
+        }
+        if named && !file {
+            destination.begin_field(name)?;
         }
         let mut length = 0usize;
-        let mut value = Vec::new();
         while let Some(chunk) = part.chunk().await.map_err(ServerError::Multipart)? {
-            length = length.checked_add(chunk.len()).ok_or_else(|| ServerError::Limit("multipart part".into()))?;
-            if length > policy.part_bytes.get() { return Err(ServerError::Limit("multipart part".into())); }
-            if !name.is_empty() && !file {
-                if length > policy.field_bytes.get() || length > bounds.bytes.get() { return Err(ServerError::Limit("multipart field".into())); }
-                remaining = remaining.checked_sub(chunk.len() as u128).ok_or_else(|| ServerError::Limit("multipart memory".into()))?;
-                value.extend_from_slice(&chunk);
+            length = length
+                .checked_add(chunk.len())
+                .ok_or_else(|| ServerError::Limit("multipart part".into()))?;
+            if length > policy.part_bytes.get() {
+                return Err(ServerError::Limit("multipart part".into()));
+            }
+            if named && !file {
+                if length > policy.field_bytes.get() || length > field_bytes.get() {
+                    return Err(ServerError::Limit("multipart field".into()));
+                }
+                remaining = remaining
+                    .checked_sub(chunk.len() as u128)
+                    .ok_or_else(|| ServerError::Limit("multipart memory".into()))?;
+                destination.append_field(&chunk)?;
             }
         }
-        if !name.is_empty() && file && (length as u128) <= file_remaining {
+        if named && file && (length as u128) <= file_remaining {
             file_remaining -= length as u128;
             remaining = remaining.saturating_sub(length as u128);
-        } else if !name.is_empty() && !file {
-            let entries = collected.entry(name).or_default();
-            entries.push(value);
-            bounds.check(entries)?;
-            if collected.len() > fields.get() { return Err(ServerError::Limit("form fields".into())); }
+        } else if named && !file {
+            destination.finish_field()?;
         }
     }
-    Ok(ByteFormData { values: collected })
+    Ok(())
 }
 
 async fn collect_multipart_fields(
@@ -1299,27 +1970,39 @@ async fn collect_multipart_fields(
 ) -> Result<ByteFormData, ServerError> {
     let mut request = http::Request::new(Body::new(Limited::new(body, policy.body.bytes())));
     *request.headers_mut() = headers.clone();
-    request.extensions_mut().insert(axum::extract::DefaultBodyLimit::disable());
-    let parser = Multipart::from_request(request, &()).await
+    request
+        .extensions_mut()
+        .insert(axum::extract::DefaultBodyLimit::disable());
+    let parser = Multipart::from_request(request, &())
+        .await
         .map_err(|error| ServerError::MultipartRejection(error.to_string()))?;
-    let mut reader = MultipartReader { parser, policy, count: 0 };
+    let mut reader = MultipartReader {
+        parser,
+        policy,
+        count: 0,
+    };
     let mut collected: BytePairs = BTreeMap::new();
-    while let Some(part) = reader.next(|mut part| Box::pin(async move {
-        let name = part.name().unwrap_or("").as_bytes().to_vec();
-        if name.is_empty() || part.file_name().is_some_and(|name| !name.is_empty()) {
-            return Ok(None);
-        }
-        let mut value = Vec::new();
-        while let Some(chunk) = part.chunk().await? {
-            if chunk.len() > policy.field_bytes.get().saturating_sub(value.len())
-                || chunk.len() > bounds.bytes.get().saturating_sub(value.len())
-            {
-                return Err(ServerError::Limit("multipart field".into()));
-            }
-            value.extend_from_slice(&chunk);
-        }
-        Ok(Some((name, value)))
-    })).await? {
+    while let Some(part) = reader
+        .next(|mut part| {
+            Box::pin(async move {
+                let name = part.name().unwrap_or("").as_bytes().to_vec();
+                if name.is_empty() || part.file_name().is_some_and(|name| !name.is_empty()) {
+                    return Ok(None);
+                }
+                let mut value = Vec::new();
+                while let Some(chunk) = part.chunk().await? {
+                    if chunk.len() > policy.field_bytes.get().saturating_sub(value.len())
+                        || chunk.len() > bounds.bytes.get().saturating_sub(value.len())
+                    {
+                        return Err(ServerError::Limit("multipart field".into()));
+                    }
+                    value.extend_from_slice(&chunk);
+                }
+                Ok(Some((name, value)))
+            })
+        })
+        .await?
+    {
         if let Some((name, value)) = part {
             let entries = collected.entry(name).or_default();
             entries.push(value);
@@ -1330,6 +2013,36 @@ async fn collect_multipart_fields(
         }
     }
     Ok(ByteFormData { values: collected })
+}
+
+enum AdmittedBody {
+    Ordinary(Bytes),
+    Prepared(BufferView<'static>),
+}
+impl AsRef<[u8]> for AdmittedBody {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Ordinary(bytes) => bytes.as_ref(),
+            Self::Prepared(view) => view.as_ref(),
+        }
+    }
+}
+
+async fn read_prepared_bounded(
+    mut body: Body,
+    mut buffer: BufferLease<'static>,
+    limit: usize,
+) -> Result<BufferView<'static>, ServerError> {
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|error| ServerError::Transport(effect::Defect::new(error.to_string())))?;
+        if let Some(bytes) = frame.data_ref() {
+            if bytes.len() > limit.saturating_sub(buffer.len()) {
+                return Err(ServerError::Limit("body bytes".into()));
+            }
+            buffer.extend_from_slice(bytes).map_err(ServerError::Memory)?;
+        }
+    }
+    Ok(BufferView::new(buffer.share()))
 }
 
 /// Collect a finite body only when its selected decoder permits buffering.
@@ -1388,13 +2101,9 @@ pub fn decode_url_encoded_pairs_partial(encoded: &[u8]) -> BytePairsOutcome {
         if segment.is_empty() {
             continue;
         }
-        let (raw_key, raw_value) = match segment.iter().position(|byte| *byte == b'=') {
-            Some(index) => (&segment[..index], &segment[index + 1..]),
-            None => (segment, &segment[..0]),
-        };
-        let pair = decode_url_encoded_component(raw_key).and_then(|key| {
-            decode_url_encoded_component(raw_value).map(|value| (key, value))
-        });
+        let (raw_key, raw_value) = split_form_segment(segment);
+        let pair = decode_url_encoded_component(raw_key)
+            .and_then(|key| decode_url_encoded_component(raw_value).map(|value| (key, value)));
         match pair {
             Ok((key, value)) => outcome.values.entry(key).or_default().push(value),
             Err(error) => {
@@ -1419,22 +2128,57 @@ fn visit_url_encoded_component_pairs(
         if segment.is_empty() {
             continue;
         }
-        let (raw_key, raw_value) = match segment.iter().position(|byte| *byte == b'=') {
-            Some(index) => (&segment[..index], &segment[index + 1..]),
-            None => (segment, &segment[..0]),
-        };
+        let (raw_key, raw_value) = split_form_segment(segment);
         visit(raw_key, raw_value)?;
     }
     Ok(())
 }
 
+fn split_form_segment(segment: &[u8]) -> (&[u8], &[u8]) {
+    match segment.iter().position(|byte| *byte == b'=') {
+        Some(index) => {
+            // position is inside this same byte slice; the tail contains '='.
+            let (key, tail) = segment.split_at(index);
+            let (_, value) = tail.split_at(1);
+            (key, value)
+        }
+        None => (segment, &[]),
+    }
+}
+
 fn decode_url_encoded_component(raw: &[u8]) -> Result<Vec<u8>, ServerError> {
     let mut decoded = Vec::with_capacity(raw.len());
+    visit_decoded_component(raw, |byte| {
+        decoded.push(byte);
+        Ok(())
+    })?;
+    Ok(decoded)
+}
+
+/// Append one byte-valued URL-encoded component to prepared output.
+/// A malformed escape or a capacity failure restores the original prefix.
+pub fn append_decoded_url_encoded_component(
+    raw: &[u8],
+    output: &mut effect::memory::Buffer<'_>,
+) -> Result<(), ServerError> {
+    let start = output.len();
+    let mut output = std::mem::DropGuard::new(output, move |output| output.truncate(start));
+    visit_decoded_component(raw, |byte| {
+        output.extend_from_slice(&[byte]).map_err(ServerError::Memory)
+    })?;
+    let _ = std::mem::DropGuard::dismiss(output);
+    Ok(())
+}
+
+fn visit_decoded_component(
+    raw: &[u8],
+    mut emit: impl FnMut(u8) -> Result<(), ServerError>,
+) -> Result<(), ServerError> {
     let mut index = 0_usize;
     while let Some(byte) = raw.get(index) {
         match byte {
             b'+' => {
-                decoded.push(b' ');
+                emit(b' ')?;
                 index += 1;
             }
             b'%' => {
@@ -1448,16 +2192,16 @@ fn decode_url_encoded_component(raw: &[u8]) -> Result<Vec<u8>, ServerError> {
                     .copied()
                     .and_then(hex_digit)
                     .ok_or_else(|| ServerError::Invalid("percent encoding".into()))?;
-                decoded.push(high * 16 + low);
+                emit(high * 16 + low)?;
                 index += 3;
             }
             other => {
-                decoded.push(*other);
+                emit(*other)?;
                 index += 1;
             }
         }
     }
-    Ok(decoded)
+    Ok(())
 }
 
 fn decode_text_pairs(
@@ -1489,11 +2233,28 @@ fn hex_digit(byte: u8) -> Option<u8> {
 }
 
 fn shared_text(
-    result: &Result<ParsedFormData, Arc<ServerError>>,
+    result: &mut Result<ParsedFormData, Arc<ServerError>>,
 ) -> Result<Arc<FormData>, ServerError> {
     match result {
         Ok(ParsedFormData::Text(data)) => Ok(data.clone()),
-        Ok(ParsedFormData::Bytes(_) | ParsedFormData::PartialBytes(_) | ParsedFormData::MultipartFields(_)) => Err(ServerError::FormPolicyConflict),
+        Ok(ParsedFormData::PreparedText { form, materialized }) => Ok(materialized
+            .get_or_insert_with(|| {
+                let mut values = BTreeMap::<String, Vec<String>>::new();
+                for (name, value) in form.pairs() {
+                    if let Some(repeated) = values.get_mut(name) {
+                        repeated.push(value.to_owned());
+                    } else {
+                        values.insert(name.to_owned(), vec![value.to_owned()]);
+                    }
+                }
+                Arc::new(FormData { values })
+            })
+            .clone()),
+        Ok(
+            ParsedFormData::Bytes(_)
+            | ParsedFormData::PartialBytes(_)
+            | ParsedFormData::MultipartFields(_),
+        ) => Err(ServerError::FormPolicyConflict),
         Err(error) => Err(ServerError::SharedInput(error.clone())),
     }
 }
@@ -1503,7 +2264,12 @@ fn shared_bytes(
 ) -> Result<Arc<ByteFormData>, ServerError> {
     match result {
         Ok(ParsedFormData::Bytes(data)) => Ok(data.clone()),
-        Ok(ParsedFormData::Text(_) | ParsedFormData::PartialBytes(_) | ParsedFormData::MultipartFields(_)) => Err(ServerError::FormPolicyConflict),
+        Ok(
+            ParsedFormData::Text(_)
+            | ParsedFormData::PreparedText { .. }
+            | ParsedFormData::PartialBytes(_)
+            | ParsedFormData::MultipartFields(_),
+        ) => Err(ServerError::FormPolicyConflict),
         Err(error) => Err(ServerError::SharedInput(error.clone())),
     }
 }
@@ -1513,7 +2279,12 @@ fn shared_partial_bytes(
 ) -> Result<Arc<BytePairsOutcome>, ServerError> {
     match result {
         Ok(ParsedFormData::PartialBytes(data)) => Ok(data.clone()),
-        Ok(ParsedFormData::Text(_) | ParsedFormData::Bytes(_) | ParsedFormData::MultipartFields(_)) => Err(ServerError::FormPolicyConflict),
+        Ok(
+            ParsedFormData::Text(_)
+            | ParsedFormData::PreparedText { .. }
+            | ParsedFormData::Bytes(_)
+            | ParsedFormData::MultipartFields(_),
+        ) => Err(ServerError::FormPolicyConflict),
         Err(error) => Err(ServerError::SharedInput(error.clone())),
     }
 }

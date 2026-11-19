@@ -88,7 +88,7 @@ fn cleanup_outcome() -> Exit<Payload, Payload> {
         first: CleanupFailure::ReleaseFailure(Payload(Cell::new(Marker::Cleanup))),
         rest: vec![CleanupFailure::ReleaseFailure(Payload(Cell::new(
             Marker::Later,
-        )))],
+        )))].into(),
     })
 }
 

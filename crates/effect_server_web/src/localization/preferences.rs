@@ -5,13 +5,19 @@ use crate::{
     effect_finalizer, effect_future, effect_map, effect_map_error, effect_recover, effect_sync,
     effect_try_sync,
 };
+use effect::memory::{Bytes, MemoryError, PreparedMemory, RegionId};
 use effect::{
     AdmissionCapacity, AdmissionError, AsyncQueue, Effect, Exit, HasClock, HasTaskSpawner,
-    ProviderAdmission, QueueCapacity, QueueError, QueueShutdown, Scope, SharedValue,
+    PreparedCleanupConfig, PreparedPanicPool, PreparedQueue, PreparedQueueCapacity,
+    PreparedQueueItem, PreparedSharedValuePool, ProviderAdmission, QueueCapacity, QueueError,
+    QueueShutdown, Scope, SharedValue,
 };
 use effect::{effect, effect_timeout};
+use std::future::{Future, poll_fn};
 use std::num::NonZeroUsize;
+use std::ops::Deref;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::Duration;
 
 /// Deliberate local persistence shutdown semantics. Pending writes are not durable;
@@ -67,6 +73,8 @@ pub enum PreferenceError<W: Send + 'static> {
     Admission(AdmissionError),
     /// Policy was rejected before worker acquisition.
     Definition(LocalizationError),
+    /// The selected prepared preference workspace declined the operation.
+    Memory(MemoryError),
 }
 /// Local submission acknowledgment, not a persistence durability claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,15 +103,207 @@ impl<U: Send + Sync + 'static, W: Send + 'static> Clone for PreferenceStatus<U, 
         }
     }
 }
+
+/// One independently prepared locale preference queue and its retained writer errors.
+#[must_use]
+pub struct PreparedLocalePreferences<U: Send + Sync + 'static, W: Send + 'static> {
+    queue: Mutex<Option<PreparedJobQueue<U>>>,
+    failures: PreparedSharedValuePool<W>,
+    policy: PreferencePolicy,
+}
+
+type PreparedJobQueue<U> = Arc<PreparedQueue<PreferenceJob<U>>>;
+
+impl<U: Send + Sync + 'static, W: Send + 'static> PreparedLocalePreferences<U, W> {
+    /// Region demand for jobs, waiters and typed failure payloads.
+    ///
+    /// In addition to `retained_failures`, reserve slots for the current status
+    /// and the next write. Cleanup and panic storage are supplied independently.
+    pub fn storage_bytes(
+        policy: PreferencePolicy,
+        retained_failures: NonZeroUsize,
+    ) -> Result<Bytes, MemoryError> {
+        PreparedQueue::<PreferenceJob<U>>::demand(
+            QueueCapacity::Bounded(policy.buffered),
+            Self::capacity(policy)?,
+        )?
+        .region_bytes
+        .checked_add(PreparedSharedValuePool::<W>::storage_bytes(
+            Self::failure_slots(retained_failures)?,
+        )?)
+    }
+
+    /// Prepare the physical jobs and offer/take controls for one hosted worker.
+    pub fn prepare(
+        memory: &PreparedMemory<'static>,
+        region: RegionId,
+        policy: PreferencePolicy,
+        retained_failures: NonZeroUsize,
+        cleanup: &PreparedCleanupConfig<QueueError>,
+        panics: &PreparedPanicPool,
+    ) -> Result<Self, MemoryError> {
+        Ok(Self {
+            queue: Mutex::new(Some(Arc::new(PreparedQueue::prepare(
+                memory,
+                region,
+                QueueCapacity::Bounded(policy.buffered),
+                Self::capacity(policy)?,
+                cleanup,
+                panics,
+            )?))),
+            failures: PreparedSharedValuePool::prepare(
+                memory,
+                region,
+                Self::failure_slots(retained_failures)?,
+            )?,
+            policy,
+        })
+    }
+
+    fn capacity(policy: PreferencePolicy) -> Result<PreparedQueueCapacity, MemoryError> {
+        let producers = policy.maximum_offers.get();
+        // Besides buffered/suspending offers, one item can be in the writer
+        // and one remains in last-success status until a replacement commits.
+        let payloads = policy
+            .buffered
+            .get()
+            .checked_add(producers)
+            .and_then(|payloads| payloads.checked_add(2))
+            .ok_or(MemoryError::ArithmeticOverflow)?;
+        Ok(PreparedQueueCapacity {
+            payloads,
+            producers,
+            takers: 1,
+        })
+    }
+
+    fn failure_slots(retained_failures: NonZeroUsize) -> Result<usize, MemoryError> {
+        retained_failures
+            .get()
+            .checked_add(2)
+            .ok_or(MemoryError::ArithmeticOverflow)
+    }
+}
+
+enum OwnedJob<U: Send + Sync + 'static> {
+    Ordinary(Arc<PreferenceJob<U>>),
+    Prepared(PreparedQueueItem<PreferenceJob<U>>),
+}
+impl<U: Send + Sync + 'static> Deref for OwnedJob<U> {
+    type Target = PreferenceJob<U>;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Ordinary(job) => job,
+            Self::Prepared(job) => job,
+        }
+    }
+}
+
+struct State<U: Send + Sync + 'static, W: Send + 'static> {
+    persisted: Option<OwnedJob<U>>,
+    failure: Option<SharedValue<W>>,
+}
+
+enum JobQueue<U: Send + Sync + 'static> {
+    Ordinary(AsyncQueue<Arc<PreferenceJob<U>>>, ProviderAdmission),
+    Prepared(PreparedJobQueue<U>),
+}
+impl<U: Send + Sync + 'static> Clone for JobQueue<U> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Ordinary(queue, permit) => Self::Ordinary(queue.clone(), permit.clone()),
+            Self::Prepared(queue) => Self::Prepared(queue.clone()),
+        }
+    }
+}
+
+impl<U: Send + Sync + 'static> JobQueue<U> {
+    fn take<W: Send + 'static, R: Send + Sync + 'static>(
+        &self,
+    ) -> Effect<OwnedJob<U>, PreferenceError<W>, R> {
+        match self {
+            Self::Ordinary(queue, _) => effect_map! {
+                program: effect_map_error! { program: queue.take(), map: PreferenceError::Queue, },
+                map: OwnedJob::Ordinary,
+            },
+            Self::Prepared(queue) => {
+                let queue = queue.clone();
+                effect_future! {
+                    exit_with_context; body: move |_: Arc<R>, context| {
+                        let queue = queue.clone();
+                        async move {
+                            let cancelled = match context.try_cancelled() {
+                                Ok(cancelled) => cancelled,
+                                Err(error) => return Exit::Fail(PreferenceError::Memory(error)),
+                            };
+                            let take = match queue.take_native() {
+                                Ok(take) => take,
+                                Err(error) => return Exit::Fail(PreferenceError::Memory(error)),
+                            };
+                            let outcome = await_queue(cancelled, take).await.map_error(PreferenceError::Queue);
+                            match crate::split_exit(outcome) {
+                                Ok(item) => Exit::Success(OwnedJob::Prepared(item)),
+                                Err(failure) => failure,
+                            }
+                        }
+                    },
+                }
+            }
+        }
+    }
+
+    fn close<W: Send + 'static, R: Send + Sync + 'static>(
+        &self,
+        shutdown: PreferenceShutdown,
+    ) -> Effect<(), PreferenceError<W>, R> {
+        let mode = match shutdown {
+            PreferenceShutdown::DiscardPending => QueueShutdown::Discard,
+        };
+        match self {
+            Self::Ordinary(queue, _) => effect_map_error! {
+                program: queue.shutdown(mode), map: PreferenceError::Queue,
+            },
+            Self::Prepared(queue) => {
+                let queue = queue.clone();
+                effect_future! {
+                    exit_with_context; body: move |_: Arc<R>, _| {
+                        let queue = queue.clone();
+                        async move {
+                            match queue.shutdown_now(mode) {
+                                Ok(exit) => exit.map_error(PreferenceError::Queue),
+                                Err(error) => Exit::Fail(PreferenceError::Memory(error)),
+                            }
+                        }
+                    },
+                }
+            }
+        }
+    }
+}
+
+async fn await_queue<A>(
+    cancelled: impl Future<Output = ()>,
+    queue: impl Future<Output = Exit<A, QueueError>>,
+) -> Exit<A, QueueError> {
+    let mut cancelled = std::pin::pin!(cancelled);
+    let mut queue = std::pin::pin!(queue);
+    poll_fn(|context| {
+        if cancelled.as_mut().poll(context).is_ready() {
+            return Poll::Ready(Exit::Interrupted);
+        }
+        queue.as_mut().poll(context)
+    })
+    .await
+}
+
 /// Shared scoped queue/status/admission handle; exactly one worker is acquired.
 #[must_use]
 pub struct LocalePreferences<U: Send + Sync + 'static, W: Send + 'static> {
     /// Core queue retaining only immutable jobs.
-    queue: AsyncQueue<Arc<PreferenceJob<U>>>,
-    /// Core bound for suspended offers, separate from buffered job capacity.
-    offers: ProviderAdmission,
+    queue: JobQueue<U>,
     /// Protected last acknowledgment/failure; short synchronous updates only.
-    status: Arc<Mutex<PreferenceStatus<U, W>>>,
+    status: Arc<Mutex<State<U, W>>>,
+    prepared: Option<Arc<PreparedLocalePreferences<U, W>>>,
     /// Deliberate local admission/shutdown policy.
     policy: PreferencePolicy,
 }
@@ -112,8 +312,8 @@ impl<U: Send + Sync + 'static, W: Send + 'static> Clone for LocalePreferences<U,
     fn clone(&self) -> Self {
         Self {
             queue: self.queue.clone(),
-            offers: self.offers.clone(),
             status: self.status.clone(),
+            prepared: self.prepared.clone(),
             policy: self.policy,
         }
     }
@@ -133,31 +333,79 @@ impl<U: Send + Sync + 'static, W: Send + 'static> LocalePreferences<U, W> {
         E: Send + 'static,
         R: HasTaskSpawner + Send + Sync + 'static,
     {
+        Self::scoped_with(scope, policy, None, same_user, writer, inject)
+    }
+
+    /// Run the existing preference policy with queue and error cells from a prepared region.
+    pub fn scoped_prepared<E, R>(
+        scope: Scope<E>,
+        storage: PreparedLocalePreferences<U, W>,
+        same_user: impl Fn(&U, &U) -> bool + Send + Sync + 'static,
+        writer: impl Fn(Arc<U>, CultureId) -> Effect<(), W, R> + Send + Sync + 'static,
+        inject: impl Fn(PreferenceError<W>) -> E + Send + Sync + 'static,
+    ) -> Effect<Self, E, R>
+    where
+        E: Send + 'static,
+        R: HasTaskSpawner + Send + Sync + 'static,
+    {
+        Self::scoped_with(
+            scope,
+            storage.policy,
+            Some(Arc::new(storage)),
+            same_user,
+            writer,
+            inject,
+        )
+    }
+
+    fn scoped_with<E, R>(
+        scope: Scope<E>,
+        policy: PreferencePolicy,
+        prepared: Option<Arc<PreparedLocalePreferences<U, W>>>,
+        same_user: impl Fn(&U, &U) -> bool + Send + Sync + 'static,
+        writer: impl Fn(Arc<U>, CultureId) -> Effect<(), W, R> + Send + Sync + 'static,
+        inject: impl Fn(PreferenceError<W>) -> E + Send + Sync + 'static,
+    ) -> Effect<Self, E, R>
+    where
+        E: Send + 'static,
+        R: HasTaskSpawner + Send + Sync + 'static,
+    {
         let same_user = Arc::new(same_user);
         let writer = Arc::new(writer);
         let inject = Arc::new(inject);
-        let validation_inject = inject.clone();
+        let initial_inject = inject.clone();
+        let open = effect_try_sync! {
+            body: move || {
+                let policy = policy.validate().map_err(PreferenceError::Definition)?;
+                let queue = match &prepared {
+                    None => JobQueue::Ordinary(
+                        AsyncQueue::new(QueueCapacity::Bounded(policy.buffered)),
+                        ProviderAdmission::new(AdmissionCapacity::Bounded(policy.maximum_offers)),
+                    ),
+                    Some(storage) => {
+                        let mut queue = storage.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let queue = queue.take().ok_or(PreferenceError::Memory(MemoryError::Busy))?;
+                        JobQueue::Prepared(queue)
+                    }
+                };
+                Ok(Self {
+                    queue,
+                    status: Arc::new(Mutex::new(State { persisted: None, failure: None })),
+                    prepared: prepared.clone(),
+                    policy,
+                })
+            },
+            on_error: move |error| initial_inject(error),
+        };
         effect! {
-         bind;
-         program: effect_try_sync! { body: move || policy.validate(), on_error: move |error| validation_inject(PreferenceError::Definition(error)), },
-         body: move |policy| {
-                    let preferences = Self {
-                        queue: AsyncQueue::new(QueueCapacity::Bounded(policy.buffered)),
-                        offers: ProviderAdmission::new(AdmissionCapacity::Bounded(policy.maximum_offers)),
-                        status: Arc::new(Mutex::new(PreferenceStatus {
-                            persisted: None,
-                            failure: None,
-                        })),
-                        policy,
-                    };
+        bind;
+        program: open,
+        body: move |preferences: Self| {
                     let queue = preferences.queue.clone();
                     let shutdown_inject = inject.clone();
                     let close = effect_finalizer! {
         scope: scope, body: effect_map_error! {
-            program: queue
-                            .shutdown(match policy.shutdown {
-                                PreferenceShutdown::DiscardPending => QueueShutdown::Discard,
-                            }), map: move |error| shutdown_inject(PreferenceError::Queue(error)), },
+            program: queue.close(policy.shutdown), map: move |error| shutdown_inject(error), },
         };
                     let worker_preferences = preferences.clone();
                     let writer = writer.clone();
@@ -173,46 +421,59 @@ impl<U: Send + Sync + 'static, W: Send + 'static> LocalePreferences<U, W> {
                             loop {
                                 let job = match context.run(preferences.queue.take(), env.clone()).await {
                                     Exit::Success(job) => job,
-                                    Exit::Fail(QueueError::Shutdown) => return Exit::Success(()),
+                                    Exit::Fail(PreferenceError::Queue(QueueError::Shutdown)) => return Exit::Success(()),
+                                    Exit::Fail(error) => return Exit::Fail(inject(error)),
                                     Exit::Die(defect) => return Exit::Die(defect),
                                     Exit::Interrupted => return Exit::Interrupted,
                                     Exit::FinalizationFailed(failure) => {
                                         return Exit::<(), _>::FinalizationFailed(failure)
-                                            .map_error(|error| inject(PreferenceError::Queue(error)));
+                                            .map_error(|error| inject(error));
                                     }
                                 };
-                                let duplicate = {
+                                let previous_user = {
                                     let status = preferences
                                         .status
                                         .lock()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                    status.failure.is_none()
-                                        && status.persisted.as_ref().is_some_and(|previous| {
-                                            previous.culture == job.culture
-                                                && same_user(&previous.user, &job.user)
-                                        })
+                                    status.persisted.as_ref()
+                                        .filter(|previous| status.failure.is_none() && previous.culture == job.culture)
+                                        .map(|previous| previous.user.clone())
                                 };
-                                if duplicate {
+                                if previous_user.is_some_and(|previous| same_user(&previous, &job.user)) {
                                     continue;
                                 }
+                                let error_cell = match &preferences.prepared {
+                                    Some(storage) => match storage.failures.reserve() {
+                                        Ok(cell) => Some(cell),
+                                        Err(error) => return Exit::Fail(inject(PreferenceError::Memory(error))),
+                                    },
+                                    None => None,
+                                };
                                 match context
                                     .run(writer(job.user.clone(), job.culture.clone()), env.clone())
                                     .await
                                 {
                                     Exit::Success(()) => {
-                                        let mut status = preferences
+                                        let retired = {
+                                            let mut status = preferences
                                             .status
                                             .lock()
                                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                        status.persisted = Some(job);
-                                        status.failure = None;
+                                            (status.persisted.replace(job), status.failure.take())
+                                        };
+                                        drop(retired);
                                     }
                                     Exit::Fail(error) => {
-                                        preferences
+                                        let error = match error_cell {
+                                            Some(cell) => cell.publish(error),
+                                            None => SharedValue::new(error),
+                                        };
+                                        let retired = preferences
                                             .status
                                             .lock()
                                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                            .failure = Some(SharedValue::new(error))
+                                            .failure.replace(error);
+                                        drop(retired);
                                     }
                                     Exit::Die(defect) => return Exit::Die(defect),
                                     Exit::Interrupted => return Exit::Interrupted,
@@ -236,7 +497,7 @@ impl<U: Send + Sync + 'static, W: Send + 'static> LocalePreferences<U, W> {
                         effect_map! { program: scope.fork(worker.clone()), map: move |_| preferences.clone(), }
                     },
          }
-                },
+            },
          }
     }
     /// Move one immutable job through bounded immediate/queue admission. Busy is
@@ -246,12 +507,28 @@ impl<U: Send + Sync + 'static, W: Send + 'static> LocalePreferences<U, W> {
         user: Arc<U>,
         culture: CultureId,
     ) -> Effect<PreferenceSubmission, PreferenceError<W>, R> {
-        let queue = self.queue.clone();
+        match &self.queue {
+            JobQueue::Ordinary(queue, offers) => {
+                self.submit_ordinary(queue.clone(), offers.clone(), user, culture)
+            }
+            JobQueue::Prepared(queue) => {
+                prepared_offer(queue.clone(), user, culture, self.policy.offer_deadline)
+            }
+        }
+    }
+
+    fn submit_ordinary<R: HasClock + HasTaskSpawner + Send + Sync + 'static>(
+        &self,
+        queue: AsyncQueue<Arc<PreferenceJob<U>>>,
+        offers: ProviderAdmission,
+        user: Arc<U>,
+        culture: CultureId,
+    ) -> Effect<PreferenceSubmission, PreferenceError<W>, R> {
         let job = Arc::new(PreferenceJob { user, culture });
         let deadline = self.policy.offer_deadline;
         effect_recover! {
             program: crate::admission::independent(
-            self.offers.clone(),
+            offers,
             move || {
                 effect_map! {
                     program: effect_timeout! {
@@ -275,14 +552,76 @@ impl<U: Send + Sync + 'static, W: Send + 'static> LocalePreferences<U, W> {
             | PreferenceError::Admission(
                 AdmissionError::Closed | AdmissionError::Overflow,
             )
-            | PreferenceError::Definition(_)) => effect_try_sync! { once; body: { let __dsl_result = Err(error); move || __dsl_result }, on_error: ::core::convert::identity, },
+            | PreferenceError::Definition(_) | PreferenceError::Memory(_)) => effect_try_sync! { once; body: { let __dsl_result = Err(error); move || __dsl_result }, on_error: ::core::convert::identity, },
         }, }
     }
     /// Read protected immutable status without retaining request-scoped capabilities.
     pub fn status(&self) -> PreferenceStatus<U, W> {
-        self.status
+        let status = self
+            .status
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let persisted = status.persisted.as_ref().map(|job| match job {
+            OwnedJob::Ordinary(job) => job.clone(),
+            OwnedJob::Prepared(job) => Arc::new(PreferenceJob {
+                user: job.user.clone(),
+                culture: job.culture.clone(),
+            }),
+        });
+        PreferenceStatus {
+            persisted,
+            failure: status.failure.clone(),
+        }
+    }
+}
+
+fn prepared_offer<U, W, R>(
+    queue: PreparedJobQueue<U>,
+    user: Arc<U>,
+    culture: CultureId,
+    deadline: Duration,
+) -> Effect<PreferenceSubmission, PreferenceError<W>, R>
+where
+    U: Send + Sync + 'static,
+    W: Send + 'static,
+    R: HasClock + HasTaskSpawner + Send + Sync + 'static,
+{
+    let submit = effect_future! {
+        exit_with_context; body: move |_: Arc<R>, context| {
+            let queue = queue.clone();
+            let user = user.clone();
+            let culture = culture.clone();
+            async move {
+                let cancelled = match context.try_cancelled() {
+                    Ok(cancelled) => cancelled,
+                    Err(error) => return Exit::Fail(PreferenceError::Memory(error)),
+                };
+                let offer = match queue.reserve_native_offer() {
+                    Ok(reservation) => reservation.start(move || PreferenceJob { user, culture }),
+                    Err(MemoryError::NoSlot | MemoryError::Busy) => return Exit::Success(PreferenceSubmission::Busy),
+                    Err(error) => return Exit::Fail(PreferenceError::Memory(error)),
+                };
+                let outcome = await_queue(cancelled, offer).await.map_error(PreferenceError::Queue);
+                match crate::split_exit(outcome) {
+                    Ok(()) => Exit::Success(PreferenceSubmission::Accepted),
+                    Err(failure) => failure,
+                }
+            }
+        },
+    };
+    effect_recover! {
+        program: effect_timeout! {
+            program: submit,
+            duration: deadline,
+            on_timeout: || PreferenceError::TimedOut,
+        },
+        recover: |error| match error {
+            PreferenceError::TimedOut => effect_sync! { body { PreferenceSubmission::Busy }, },
+            error @ (PreferenceError::Writer(_) | PreferenceError::Queue(_) | PreferenceError::Admission(_)
+                | PreferenceError::Definition(_) | PreferenceError::Memory(_)) => effect_try_sync! {
+                once; body: { let __dsl_result = Err(error); move || __dsl_result },
+                on_error: ::core::convert::identity,
+            },
+        },
     }
 }

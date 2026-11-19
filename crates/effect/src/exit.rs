@@ -58,8 +58,8 @@ pub struct Finalization<E> {
     pub primary: PrimaryOutcome<E>,
     /// First cleanup failure; makes this collection nonempty. Type: `CleanupFailure<E>`.
     pub first: CleanupFailure<E>,
-    /// Later cleanup failures in observation order. Type: `Vec<CleanupFailure<E>>`.
-    pub rest: Vec<CleanupFailure<E>>,
+    /// Later cleanup failures in observation order. Ordinary storage is Vec-backed; prepared storage uses finite reserved backing.
+    pub rest: crate::CleanupFailures<E>,
 }
 
 /// Complete terminal outcome. Recovery of expected errors leaves other channels intact.

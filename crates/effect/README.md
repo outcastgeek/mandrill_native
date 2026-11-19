@@ -12,6 +12,59 @@ services, layers/streams, managed transport contracts, pools/caches, optional
 Tokio/Rayon/native/tracing providers, and an integrated application. R carries
 all selected providers together. [PORTING.md](PORTING.md) maps source contracts;
 [RUNTIMES.md](RUNTIMES.md) describes ownership, provider limits and execution costs.
+The [macro expansion reference](../effect_macros/README.md) maps DSL forms to
+their typed operations and explains evaluation order and ownership.
+
+The additive [`memory`](src/memory/README.md) capability provides fallible owned or
+borrowed fixed backing, explicit prepare/seal policies, prepared slots and shared
+output leases, bounded writers/indexes and transactional admission/control quota.
+The [bounded receipt application](examples/bounded_receipt.rs) composes its five
+memory macros. These APIs currently bound their selected storage, not the existing
+interpreter or all providers; full integration and later runtime validation remain
+in progress. Ordinary execution is unchanged.
+
+The concrete [`effect_prepare!` native-root path](src/internal/runtime/PREPARED.md)
+pre-admits counted root/output/context records and compiler-derived Future frames.
+Its [native receipt application](examples/prepared_native_receipt.rs) retains result
+ownership through delivery. Prepared companions share fallibly; ordinary
+`NativeContext: Clone` stays unchanged. The [typed graph companion](src/internal/runtime/prepared/graph/README.md)
+also lowers computation/resource/Layer grammar before ordinary callback erasure.
+Finite Layer construction contracts provide linear scope permits before the build
+callback; explicit scope comparisons remain checked results, never hidden Die or
+capacity errors in `E = !`. The receipt now uses two scoped pricing services.
+Missing opaque/dynamic adapters remain required work, not permanent exclusions.
+This is not completed all13 integration or runtime/memory/performance qualification.
+
+### Prepared queue, publication and reference operations
+
+The existing `effect_future!` grammar supports `prepared_queue_offer`,
+`prepared_queue_take`, `prepared_pubsub_publish`, `prepared_subscription_take`
+and `prepared_subscription_set`. Select the capability with a borrowed `queue`,
+`channel`, `subscription` or `reference` role, and supply borrowed `cleanup`,
+`on_capacity` and `on_error` roles. Offer, publish and set also take a delayed
+`body |env: &R| { ... }`. Physical operation, payload and target error-carrier
+owners are admitted before that body runs.
+`on_capacity` receives `MemoryError`; `on_error` receives `QueueError` for
+queue modes, `PreparedPubSubError` for publication and subscription set,
+and `PubSubError` for subscription take.
+
+The existing `effect_ref!` grammar supports `prepared_modify`, `prepared_update`
+and `prepared_in_place` on a borrowed prepared atomic reference;
+`prepared_synchronized` and `prepared_synchronized_pure` use `reference`,
+`modify` and `on_error`; `prepared_subscription_read` and
+`prepared_subscription_snapshot` use `reference` and `on_error`. The
+synchronized effectful form accepts an existing prepared computation body;
+its `on_error` receives `PreparedSemaphoreError`. Subscription reference
+read and snapshot map `PreparedPubSubError`.
+
+Prepared queue payloads retain their cells until dropped or moved out with
+`PreparedQueueItem::into_inner`. Logical unbounded queue capacity still has the
+caller-selected finite physical admission limit. Published views retain their
+prepared payload backing. Subscriber records use separately counted startup
+System Arc controls; allocator headers and rounding are additional. These
+companions do not make ordinary `Stream` or `pull_chunk` prepared operations.
+The [café example](examples/prepared_cafe_queue.rs) illustrates the current
+source surface; it has been checked, not runtime-qualified.
 
 
 ## A consumer workflow
@@ -166,7 +219,7 @@ source lines, its first code token must start after the opening brace's line.
 This includes nested groups inside macro inputs. One-line groups are allowed;
 normal comments are omitted, doc-comment attributes are skipped, and literal
 interiors are not traversed. Run the focused check with
-`cargo +1.99.0 test --locked -p effect-macros --test macro_layout -j 2`.
+`cargo +1.100.0 test --locked -p effect-macros --test macro_layout -j 2`.
 The same check runs with `cargo test -p effect-macros`; stable rustfmt does not
 currently enforce this custom macro-input rule.
 
@@ -749,6 +802,13 @@ and diagnostics at construction. Provider accessors should be infallible;
 accessor unwinds are isolated, but an inaccessible logger/tracer cannot supply
 its own diagnostic service.
 
+`PreparedDiagnostics` gives Logger and Tracer fixed event slots and leases
+drained messages until the consumer releases its snapshot. It counts discarded
+events without formatting a second diagnostic. `PreparedMetricRecorder` uses
+the same `MetricRecorder` contract and keeps series names, labels and consistent
+snapshots in the prepared region. Select `PreparedConsole` to stage formatted
+text in a region before passing it to the environment's console.
+
 HTTP/Fetch and WebSocket workflows obtain transports from R. Native providers
 retain their reactor/client, return owned operations, make aborted operations
 settle, and await disposal. No global HTTP client, socket implementation, or
@@ -777,12 +837,24 @@ async file I/O, validation, bounded retry, scoped cache/children/staging file,
 Rayon CPU work, Tokio blocking work, tracing, cancellation, and complete Exit
 reporting. All deployment counts and timing policy are required configuration.
 
+The application defaults to `--memory-mode system`. Select `bounded-allocation`
+or `prepared-reuse` with `--memory-bytes`, `--input-bytes`, `--samples`,
+`--output-bytes` and `--memory-runs`. Byte arguments are exact bytes. Managed
+modes provision one region before the runtime providers start. Bounded
+allocation obtains fixed-size data storage from that region during execution.
+Prepared reuse checks out data storage provisioned at startup. Both cap the
+physical read, decoded samples, staged file bytes, and formatted terminal text.
+Input and staging capacity failures occur before their respective file work
+when storage cannot be admitted. The compute, metadata, synchronization, and
+rename stages are shared. Runtime, cache, and provider ownership remains
+separate from the data region's budget.
+
 ## Migration
 
 JSON Schema export uses a safe AST approximation. In-memory workflow engines
 remain volatile.
 
-The Effect crates and their native consumers require Rust 1.99.0.
+The Effect crates and their native consumers require Rust 1.100.0.
 `Effect<A, E, R>` retains its runtime-independent capability boundary. An
 application can supply asynchronous, CPU and blocking providers in one `R`.
 No executor is selected by schema or procedural-macro expansion.
@@ -836,6 +908,26 @@ rather than claiming constraints it cannot represent.
 
 ### Encoding
 
+`PreparedCodec` exposes owned codec directions as the same lazy prepared graph
+descriptions. Its `Arc<Self>` receiver retains startup codec metadata; the
+input, optional context and any writer stay owned by the description until it
+runs or is dropped. For example, with an already prepared managed input:
+
+```rust,ignore
+let direction = <PureCodec<u64, SharedPreparedJsonValue> as
+    PreparedCodec<u64, SharedPreparedJsonValue, (), ()>>::decode(
+        Arc::clone(&codec), input, Some(context),
+    );
+// Compose `direction` into a prepared graph before admission.
+```
+
+Independent validation and direct writing require their actual witnesses; they
+never replay encoding. Validation returns the original owned value on success.
+Missing witnesses on this interface report
+`MissingValidator` or `MissingWriter`. The older `PureCodec::write_into`
+retains its existing missing-writer diagnostic. Prepared control flow does not
+by itself bound allocations in payloads, callbacks, or providers.
+
 A direct writer is an explicit witness. `write_into` writes one value into a
 caller-owned checked container, and `write`/`write_once` finish a document under
 `JsonWriterPolicy`. Effectful writing owns the output across suspension.
@@ -849,6 +941,56 @@ The existing SchemaBinary identity and format version are unchanged.
 Its existing numeric representation rejects exact JSON numbers that cannot be
 represented losslessly; it does not coerce newly supported arbitrary decimal
 numbers into a floating-point value or silently change durable bytes.
+
+`SchemaBinary::encode_json_into` appends the same format to a prepared buffer.
+Its byte limit applies to the append, and failure or unwind restores the original
+prefix. Union error storage uses actual prepared array slots and frames:
+
+```rust,ignore
+let capacity = PreparedJsonArrayCapacity { arrays: concurrent_unions, elements: max_variants };
+let demand = capacity.demand::<BinaryError>()?;
+let frames = memory.frames(region, demand.frames, demand.frame_layout)?;
+let errors: PreparedJsonArrayPool<BinaryError> = memory! { schema_array;
+    memory: memory, region: region, capacity: capacity, frames: frames
+}?;
+let traversal_capacity = PreparedBinaryTraversalCapacity {
+    traversals: concurrent_traversals,
+    frames_per_traversal,
+};
+let traversal_bytes = traversal_capacity.storage_bytes()?;
+let traversal = Arc::new(PreparedBinaryTraversalPool::prepare(
+    memory, region, traversal_capacity,
+)?);
+let binary = binary.with_issue_memory(Arc::clone(&issues)).with_traversal_pool(traversal);
+let mut buffer = memory.buffer(region, Bytes::new(output_capacity))?;
+binary.encode_json_into(&value, &mut buffer, &errors)?;
+binary.encode_prepared_into(&managed_value, &mut buffer, &errors)?;
+let decoded = binary.decode_prepared(buffer.as_slice(), schema.parser(), schema_policy.parse)?;
+// `managed_codec` has the same AST identity as `binary`.
+binary.encode_prepared_typed_into(&managed_codec, &typed_value, Some(&context), &mut buffer, &errors)?;
+let typed = binary.decode_prepared_typed(
+    &managed_codec, input, schema.parser(), schema_policy.parse, Some(&context),
+)?;
+```
+
+This prepares output, union-failure and call-scoped traversal backing. The
+selected binary operations require a traversal pool and use its actual finite
+frame cells; exhaustion returns a memory refusal. `traversal_bytes` reports the
+region demand; startup `Arc` headers and allocator overhead are separate. The
+issue service supplies selected diagnostic paths and text. Native JSON input and
+regex search caches have separate costs.
+The managed input stays borrowed throughout encoding. Its Any/object traversal
+uses retained input order, which may differ from ordinary map key order; the
+ordinary decoder still constructs JSON values. `decode_prepared` instead admits
+one managed document and counting writer before decoding, and publishes only
+after identity, value, trailing bytes and normalized representation checks pass.
+Ordinary operations retain their native traversal and diagnostic storage.
+The managed typed bridge checks the codec's AST identity before calling it. Its
+encoder reserves a traversal cell before the codec callback and retains that
+same cell through binary output; the decoder forwards the optional codec context
+independently of the supplied parse policy. Codec output, parser documents,
+union errors and traversal cells each need their own actual pool capacity.
+The ordinary effectful binary adapter still uses native JSON and `Vec` storage.
 
 ### Caching, callbacks and cleanup
 
@@ -933,7 +1075,7 @@ exhaustive matches; registration identity is checked under the graph gate.
 These stories keep application identities and caller policies visible. SQL,
 Server and Identity finish their demonstrated workflow and exit. Web and OTel
 serve until Ctrl-C; their outer owners then join host/resource and provider
-shutdown. Run from the workspace root on Rust 1.99:
+shutdown. Run from the workspace root on Rust 1.100.0:
 
 | Task | Input, outcome and DSL role |
 | --- | --- |
@@ -945,11 +1087,11 @@ shutdown. Run from the workspace root on Rust 1.99:
 | [Wait for either outlet](../effect_otel/examples/await_pickup.rs) | Two actual ticket-status files show current availability, then identify the first ready outlet or return a wait-window error. Native I/O, concurrent snapshots, polling/retry schedules, race and timeout use the existing Tokio providers. |
 
 ```sh
-DATABASE_URL=turso::memory: cargo +1.99.0 run -p effect-sql --features turso,macros --example cafe_orders
-CAFE_CHUNK_BYTES=4096 CAFE_JSON_BYTES=1024 CAFE_DRAIN_MS=3000 CAFE_TELEMETRY_CAPACITY=32 cargo +1.99.0 run -p effect-server --example serve_cafe_orders
-CAFE_DATABASE=target/receipt-accounts.db cargo +1.99.0 run -p effect-server-identity --features sqlx-turso --example customer_account
-cargo +1.99.0 run -p effect-otel --features server --example watch_order_progress -- 127.0.0.1:8080 HISTORY.csv 256 32 32 16 8 5000 inline
-cargo +1.99.0 run -p effect-otel --features server --example await_pickup -- NORTH.status SOUTH.status 2000 20
+DATABASE_URL=turso::memory: cargo +1.100.0 run -p effect-sql --features turso,macros --example cafe_orders
+CAFE_CHUNK_BYTES=4096 CAFE_JSON_BYTES=1024 CAFE_DRAIN_MS=3000 CAFE_TELEMETRY_CAPACITY=32 cargo +1.100.0 run -p effect-server --example serve_cafe_orders
+CAFE_DATABASE=target/receipt-accounts.db cargo +1.100.0 run -p effect-server-identity --features sqlx-turso --example customer_account
+cargo +1.100.0 run -p effect-otel --features server --example watch_order_progress -- 127.0.0.1:8080 HISTORY.csv 256 32 32 16 8 5000 inline
+cargo +1.100.0 run -p effect-otel --features server --example await_pickup -- NORTH.status SOUTH.status 2000 20
 ```
 
 Timeline CSV contains no header: for example, `0,accepted`, `400,preparing`,

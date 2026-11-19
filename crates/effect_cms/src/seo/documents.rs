@@ -24,9 +24,13 @@
 //! These are pure calculations over caller-supplied definitions and values.
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use effect::memory::{Buffer, MemoryError};
+use std::num::NonZeroUsize;
+use std::ops::ControlFlow;
 use serde::Serialize;
 
-use crate::definitions::{ResourceDefinition, ResourceKind, SitemapChangeFrequency};
+use crate::byte_text::BufferWriter;
+use crate::definitions::{Registry, ResourceDefinition, ResourceKind, SitemapChangeFrequency};
 
 /// One sitemap entry.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -98,6 +102,112 @@ pub fn definition_sitemap_index(definitions_list: &[ResourceDefinition]) -> Site
         entries.push(sitemap_entry(definition, &definition.kind));
     }
     SitemapIndexVM { entries }
+}
+
+/// Failure to produce the sitemap index in its selected prepared destination.
+#[derive(Debug)]
+pub enum SitemapWriteError {
+    /// The prepared output buffer was unavailable or could not fit the document.
+    Memory(MemoryError),
+    /// Another contributing definition exceeded the configured index length.
+    EntryLimit { maximum: NonZeroUsize },
+    /// The configured validator needs the mutable owned index model.
+    OwnedIndexValidator,
+    /// The native JSON adapter failed independently of the prepared buffer limit.
+    Encoding(serde_json::Error),
+}
+
+impl std::fmt::Display for SitemapWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Memory(error) => error.fmt(formatter),
+            Self::EntryLimit { maximum } => write!(formatter, "sitemap index exceeds {maximum} entries"),
+            Self::OwnedIndexValidator => formatter.write_str("sitemap validator requires an owned index"),
+            Self::Encoding(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for SitemapWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Memory(error) => Some(error),
+            Self::Encoding(error) => Some(error),
+            Self::EntryLimit { .. } | Self::OwnedIndexValidator => None,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct SitemapEntryRef<'a> {
+    kind: &'a str,
+    route_name: &'a str,
+    change_frequency: &'a str,
+    priority: f64,
+}
+
+fn append_sitemap_entry(
+    output: &mut Buffer<'_>,
+    definition: &ResourceDefinition,
+) -> Result<(), SitemapWriteError> {
+    let mut writer = BufferWriter::new(output);
+    let entry = SitemapEntryRef {
+        kind: definition.kind.as_str(),
+        route_name: &definition.sitemap.route_name,
+        change_frequency: definition.sitemap.change_frequency.as_str(),
+        priority: definition.sitemap.priority,
+    };
+    serde_json::to_writer(&mut writer, &entry).map_err(|error| {
+        writer.memory_error().map_or(
+            SitemapWriteError::Encoding(error),
+            SitemapWriteError::Memory,
+        )
+    })
+}
+
+/// Write one bounded sitemap index directly from the registered definitions.
+///
+/// Entries retain registration order and ordinary JSON field names. The caller's
+/// original output prefix survives refusal or unwind, and no index vector or
+/// detached definition copy is constructed by this writer.
+pub fn write_sitemap_index(
+    registry: &dyn Registry,
+    maximum_entries: NonZeroUsize,
+    output: &mut Buffer<'_>,
+) -> Result<(), SitemapWriteError> {
+    let start = output.len();
+    let mut output = std::mem::DropGuard::new(output, move |output| output.truncate(start));
+    output.extend_from_slice(b"{\"Entries\":[").map_err(SitemapWriteError::Memory)?;
+    let mut count = 0;
+    let mut failure = None;
+    let _ = registry.visit_prepared_definitions(&mut |definition| {
+        if !definition.sitemap.enabled || definition.sitemap.route_name.trim().is_empty() {
+            return ControlFlow::Continue(());
+        }
+        if count == maximum_entries.get() {
+            failure = Some(SitemapWriteError::EntryLimit { maximum: maximum_entries });
+            return ControlFlow::Break(());
+        }
+        if count != 0
+            && let Err(error) = output.extend_from_slice(b",")
+        {
+            failure = Some(SitemapWriteError::Memory(error));
+            return ControlFlow::Break(());
+        }
+        if let Err(error) = append_sitemap_entry(&mut output, definition) {
+            failure = Some(error);
+            return ControlFlow::Break(());
+        }
+        count += 1;
+        ControlFlow::Continue(())
+    }).map_err(SitemapWriteError::Memory)?;
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    output.extend_from_slice(b"]}").map_err(SitemapWriteError::Memory)?;
+    let _ = std::mem::DropGuard::dismiss(output);
+    Ok(())
 }
 
 /// Build one sitemap entry.

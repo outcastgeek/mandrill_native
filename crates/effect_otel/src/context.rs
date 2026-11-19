@@ -1,5 +1,9 @@
 //! Explicit distributed contexts and native propagation without global state.
 
+mod prepared;
+
+pub use prepared::{PreparedPropagationCapacity, PreparedPropagationCarriers};
+
 use crate::NativeError;
 use effect::http::{HttpRequest, HttpResponse, HttpTransport, TransportFuture};
 use effect::{Cancellation, Defect};
@@ -89,6 +93,7 @@ impl std::fmt::Debug for OtelContext {
 pub struct Propagation {
     /// SDK implementation supplies wire syntax and custom carrier semantics.
     native: Arc<dyn TextMapPropagator + Send + Sync>,
+    carriers: Option<Arc<PreparedPropagationCarriers>>,
 }
 
 impl Propagation {
@@ -97,7 +102,15 @@ impl Propagation {
     pub fn new(propagator: impl TextMapPropagator + Send + Sync + 'static) -> Self {
         Self {
             native: Arc::new(propagator),
+            carriers: None,
         }
+    }
+
+    /// Select regional outbound staging and incoming Server HTTP carrier snapshots.
+    #[must_use]
+    pub fn with_prepared_carriers(mut self, carriers: Arc<PreparedPropagationCarriers>) -> Self {
+        self.carriers = Some(carriers);
+        self
     }
 
     /// Inject the explicit snapshot into a borrowed custom carrier.
@@ -107,14 +120,32 @@ impl Propagation {
         context: &OtelContext,
         carrier: &mut dyn Injector,
     ) -> Result<(), NativeError> {
+        self.inject_with(carrier, |native, carrier| {
+            native.inject_context(context.native(), carrier);
+        })
+    }
+
+    fn inject_with(
+        &self,
+        carrier: &mut dyn Injector,
+        inject: impl FnOnce(&dyn TextMapPropagator, &mut dyn Injector),
+    ) -> Result<(), NativeError> {
         catch_unwind(AssertUnwindSafe(|| {
-            self.native.inject_context(context.native(), carrier)
+            if let Some(carriers) = &self.carriers {
+                let mut staging = carriers.reserve()?;
+                inject(self.native.as_ref(), &mut staging);
+                staging.emit(carrier)?;
+            } else {
+                inject(self.native.as_ref(), carrier);
+            }
+            Ok(())
         }))
-        .map_err(|panic| NativeError::Native(Defect::from_panic(panic)))
+        .map_err(|panic| NativeError::Native(Defect::from_panic(panic)))?
     }
 
     /// Extract a carrier against an explicit base (including its baggage).
     /// Malformed/absent values follow the selected propagator's native behavior.
+    /// Custom extractors own their carrier storage.
     pub fn extract(
         &self,
         base: &OtelContext,
@@ -125,18 +156,33 @@ impl Propagation {
         }))
         .map_err(|panic| NativeError::Native(Defect::from_panic(panic)))
     }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn extract_headers(
+        &self,
+        base: &OtelContext,
+        headers: &http::HeaderMap,
+    ) -> Result<OtelContext, NativeError> {
+        if let Some(carriers) = &self.carriers {
+            let mut snapshot = carriers.reserve()?;
+            snapshot.capture_headers(headers)?;
+            self.extract(base, &snapshot)
+        } else {
+            self.extract(base, &crate::server::HeaderExtractor::new(headers))
+        }
+    }
 }
 
 /// Core HTTP carrier; writes only propagated metadata, never request payloads.
 struct CoreHeaders<'a> {
     /// Fresh mutable headers owned by this outbound request invocation.
-    headers: &'a mut effect::http::HttpHeaders,
+    headers: &'a mut Arc<effect::http::HttpHeaders>,
 }
 
 impl Injector for CoreHeaders<'_> {
     /// Replace the selected protocol field using the native propagator's value.
     fn set(&mut self, key: &str, value: String) {
-        self.headers.insert(Arc::from(key), Arc::from(value));
+        Arc::make_mut(self.headers).insert(Arc::from(key), Arc::from(value));
     }
 }
 
@@ -171,18 +217,19 @@ impl<T: HttpTransport + ?Sized> HttpTransport for PropagatingTransport<T> {
         mut request: HttpRequest,
         cancellation: Cancellation,
     ) -> TransportFuture<HttpResponse> {
-        let mut headers = request.options.headers.as_ref().clone();
-        let context = OtelContext::from_native(&opentelemetry::Context::current());
-        if let Err(error) = self.propagation.inject(
-            &context,
-            &mut CoreHeaders {
-                headers: &mut headers,
-            },
-        ) {
+        let mut carrier = CoreHeaders {
+            headers: &mut request.options.headers,
+        };
+        if let Err(error) = self
+            .propagation
+            .inject_with(&mut carrier, |native, carrier| {
+                // Drop the native thread-local borrow before invoking a user propagator.
+                let context = OtelContext::from_native(&opentelemetry::Context::current());
+                native.inject_context(context.native(), carrier);
+            })
+        {
             return Box::pin(async move { Err(error.into_defect()) });
         }
-        // Header metadata needs a fresh mutable owner; the application body is not copied.
-        request.options.headers = Arc::new(headers);
         self.transport.send(request, cancellation)
     }
 }

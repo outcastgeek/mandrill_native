@@ -14,6 +14,12 @@ use native_async_runtime::{AdmissionError, Completion, RuntimeHandle};
 use std::future::Future;
 use std::sync::Arc;
 
+mod prepared;
+pub use prepared::{
+    PreparedNativeRefusal, PreparedNativeSubmission, PreparedNativeSubmitter, PreparedNativeTasks,
+    PreparedNativeWork,
+};
+
 /// The native owner retains shutdown authority. This adapter only submits.
 #[derive(Clone)]
 pub struct NativeTasks {
@@ -21,6 +27,24 @@ pub struct NativeTasks {
     diagnostics: Diagnostics,
 }
 impl NativeTasks {
+    /// Prepare the compatible physical task path. This is not the ordinary
+    /// native/Tokio submit API with a quota wrapped around it. Creation remains
+    /// worker-local; native parent/service stop/drain includes accepted work.
+    pub fn prepare<C, F, T, D>(
+        handle: RuntimeHandle,
+        memory: &effect::memory::PreparedMemory<'static>,
+        region: effect::memory::RegionId,
+        capacity: usize,
+        envelope: effect::prepared_provider::ProviderNativeEnvelope,
+    ) -> Result<PreparedNativeTasks<C, F, T, D>, effect::prepared_provider::ProviderStartupError>
+    where
+        C: FnOnce(effect::prepared_provider::PreparedCancellation) -> F + Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+        D: effect::prepared_provider::ProviderWorkingSet,
+    {
+        PreparedNativeTasks::prepare(handle, memory, region, capacity, envelope)
+    }
     /// Construct a `NativeTasks` from its required inputs and explicit policies.
     ///
     /// # Parameters

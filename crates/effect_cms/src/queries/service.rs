@@ -12,14 +12,17 @@
 use std::sync::Arc;
 
 use effect::Effect;
-use effect_server::Request;
+use effect_server::{Request, ServerError};
 
 use crate::definitions::{Registry, ResourceKind};
+use crate::forms::{PreparedMergedForm, PreparedMergedForms};
 
-use super::detail_query::{DetailOptions, DetailService, ResourceDetailQuery};
+use super::detail_query::{
+    DetailOptions, DetailService, PreparedDetailLimits, ResourceDetailQuery,
+};
 use super::list_query::{
-    CanonicalRouteParams, ListOptions, ListService, ParseNamedPageFunc, RequestLanguageFunc,
-    ResourceListQuery,
+    CanonicalRouteParams, ListOptions, ListService, ParseNamedPageFunc, PreparedListLimits,
+    RequestLanguageFunc, ResourceListQuery,
 };
 
 /// Configures query admission.
@@ -59,6 +62,18 @@ impl QueryService {
         self.list.list_query(request, kind)
     }
 
+    /// Admit a list query with prepared decoding and explicit page and projection limits.
+    pub fn list_query_prepared<R: Send + Sync + 'static>(
+        &self,
+        request: &Request,
+        kind: &ResourceKind,
+        storage: Arc<PreparedMergedForms>,
+        limits: PreparedListLimits,
+    ) -> Effect<ResourceListQuery, ServerError, R> {
+        self.list
+            .list_query_prepared(request, kind, storage, limits)
+    }
+
     /// Admit the detail query for a request and kind.
     ///
     /// The returned effect is lazy and carries the caller's error family and
@@ -73,6 +88,29 @@ impl QueryService {
         R: Send + Sync + 'static,
     {
         self.detail.detail_query(request, kind)
+    }
+
+    /// Admit a detail query with prepared decoding and explicit metadata limits.
+    pub fn detail_query_prepared<R: Send + Sync + 'static>(
+        &self,
+        request: &Request,
+        storage: Arc<PreparedMergedForms>,
+        limits: PreparedDetailLimits,
+    ) -> Effect<ResourceDetailQuery, ServerError, R> {
+        self.detail.detail_query_prepared(request, storage, limits)
+    }
+
+    pub(crate) fn admit_prepared(
+        &self,
+        request: &Request,
+        kind: &ResourceKind,
+        fields: &PreparedMergedForm,
+        list: PreparedListLimits,
+        detail: PreparedDetailLimits,
+    ) -> Result<(ResourceListQuery, ResourceDetailQuery), ServerError> {
+        let list = self.list.admit_prepared(request, kind, fields, list)?;
+        let detail = self.detail.admit_prepared(request, fields, detail)?;
+        Ok((list, detail))
     }
 }
 

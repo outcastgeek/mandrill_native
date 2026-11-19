@@ -13,6 +13,7 @@ mod internal;
 mod persistable;
 mod persisted_cache;
 mod persisted_queue;
+mod prepared_store;
 mod rate_limiter;
 mod result_store;
 
@@ -43,6 +44,10 @@ pub use persisted_queue::{
     QueueMessagePolicy, QueueOffer, QueueOfferOutcome, QueueOperation, QueueOwner, QueueRecord,
     QueueRecordState, QueueRequeue, QueueRequeueAttempts, QueueRequeueOutcome, QueueRetry,
     QueueScan, QueueSettlement, QueueSettlementAction, QueueStoreCapacity,
+};
+pub use prepared_store::{
+    PreparedBatchReadItem, PreparedMemoryKeyValueStore, PreparedStoreBatch, PreparedStoreCapacity,
+    PreparedStoreEntry, PreparedStoreError, PreparedStoreRead, PreparedStoredValue,
 };
 pub use rate_limiter::{
     AdaptiveFeedback, AdaptiveSignal, AdaptiveWindowPolicy, FeedbackOutcome, HasRateLimitStore,

@@ -63,7 +63,7 @@ use effect::{Effect, effect, effect_sync};
 use super::presentation::{new_presentation_shortcode_catalog, render_shortcode_link_html};
 use super::shortcode::{
     ContentRenderOptions, RenderedContentFragment, ShortcodeCatalog, ShortcodeResolver,
-    ShortcodeToken, shortcode_arg,
+    ShortcodeToken, shortcode_arg, shortcode_arg_ref,
 };
 use crate::localization::{LocalizedRowOptions, normalize_authoring_language};
 
@@ -308,9 +308,14 @@ where
             return effect_sync! { body: RenderedContentFragment::default, };
         };
         let name = self.options.name.trim().to_owned();
-        let value = shortcode_arg(&token, &borrowed_keys(&self.options.value_keys));
-        let label_keys = default_content_link_label_keys(&self.options.label_keys);
-        let label = shortcode_arg(&token, &borrowed_keys(&label_keys));
+        let value = shortcode_arg_ref(&token, self.options.value_keys.iter().map(String::as_str))
+            .to_owned();
+        let label = if self.options.label_keys.is_empty() {
+            shortcode_arg_ref(&token, DEFAULT_LABEL_KEYS.iter().copied())
+        } else {
+            shortcode_arg_ref(&token, self.options.label_keys.iter().map(String::as_str))
+        }
+        .to_owned();
         let request = ContentLinkShortcodeRequest {
             token,
             value,
@@ -593,22 +598,6 @@ fn select_localized_row<'rows, T>(
         return Some(row);
     }
     first_row
-}
-
-/// The configured label keys, or the default keys.
-fn default_content_link_label_keys(keys: &[String]) -> Vec<String> {
-    if keys.is_empty() {
-        return DEFAULT_LABEL_KEYS
-            .iter()
-            .map(|key| (*key).to_owned())
-            .collect();
-    }
-    keys.to_vec()
-}
-
-/// Borrow string keys as the argument-key slices the shortcode helper takes.
-fn borrowed_keys(keys: &[String]) -> Vec<&str> {
-    keys.iter().map(String::as_str).collect()
 }
 
 /// The generic cache key of a resolved link.

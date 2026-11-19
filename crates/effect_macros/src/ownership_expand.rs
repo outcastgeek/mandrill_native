@@ -42,6 +42,23 @@ pub(crate) fn ownership(name: &str, input: Input) -> syn::Result<TokenStream> {
     let mode = input.mode(
         &[
             "scoped",
+            "prepare",
+            "plan",
+            "plan_future",
+            "prepare_future",
+            "prepared_future",
+            "prepared",
+            "prepare_pool",
+            "prepared_pool",
+            "admitted_pool",
+            "admitted_close",
+            "admitted",
+            "prepared_close",
+            "reserve_closed",
+            "reserve_permit",
+            "reserve_close",
+            "prepared_checkpoint",
+            "prepared_release",
             "merge",
             "provide",
             "release",
@@ -49,6 +66,7 @@ pub(crate) fn ownership(name: &str, input: Input) -> syn::Result<TokenStream> {
             "partitioned_make",
             "ensuring",
             "release_exit_future",
+            "release_prepared_exit_future",
             "release_sync",
             "release_try_sync",
             "release_future",
@@ -63,6 +81,261 @@ pub(crate) fn ownership(name: &str, input: Input) -> syn::Result<TokenStream> {
     )?;
     let mut fields = input.fields;
     let path = crate::expand::effect_crate_path()?;
+    if name == "effect_resource" && mode == "plan_future" {
+        let acquire = fields.take("acquire")?;
+        let release = fields.role("release", 4, BodyCategory::Native)?;
+        let mapper = fields.role("on_capacity", 1, BodyCategory::Native)?;
+        return fields.finish_inferred(quote!(T, E, R, F, Pending, M),
+            &[("acquire", quote!(#path::Effect<T, E, R>)), ("release", quote!(F)), ("on_capacity", quote!(M))],
+            quote!(#path::PreparedFutureResourcePlan<T, E, R, F, Pending, M>),
+            quote!(T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static, Pending: ::core::future::Future<Output = #path::Exit<(), E>> + Send + 'static, F: for<'outcome> Fn(T, #path::PrimaryOutcomeRef<'outcome, E>, ::std::sync::Arc<R>, #path::NativeContext) -> Pending + Send + Sync + 'static, M: Fn(#path::memory::MemoryError) -> E + Send + Sync + 'static),
+            quote!(#path::PreparedFutureResourcePlan::new(#acquire, #release, #mapper)));
+    }
+    if name == "effect_resource" && mode == "prepare_future" {
+        let plan = fields.take("plan")?;
+        let memory = fields.transform("memory", |value, _| Ok(quote!(&(#value))))?;
+        let metadata = fields.take("metadata")?;
+        let resources = fields.take("resources")?;
+        return fields.finish_inferred(quote!(T, E, R, F, Pending, M),
+            &[("plan", quote!(#path::PreparedFutureResourcePlan<T, E, R, F, Pending, M>)), ("memory", quote!(&#path::memory::PreparedMemory<'static>)), ("metadata", quote!(#path::memory::RegionId)), ("resources", quote!(usize))],
+            quote!(::core::result::Result<#path::PreparedFutureResourceBinding<T, E, R, F, Pending, M>, #path::memory::MemoryError>),
+            quote!(T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static, Pending: ::core::future::Future<Output = #path::Exit<(), E>> + Send + 'static, F: for<'outcome> Fn(T, #path::PrimaryOutcomeRef<'outcome, E>, ::std::sync::Arc<R>, #path::NativeContext) -> Pending + Send + Sync + 'static, M: Fn(#path::memory::MemoryError) -> E + Send + Sync + 'static),
+            quote!((#plan).prepare(#memory, #metadata, #resources)));
+    }
+    if name == "effect_scope_acquire" && mode == "prepared_future" {
+        let binding = fields.take("binding")?;
+        let scope = fields.take("scope")?;
+        return fields.finish_inferred(quote!(T, E, R, F, Pending, M),
+            &[("binding", quote!(#path::PreparedFutureResourceBinding<T, E, R, F, Pending, M>)), ("scope", quote!(#path::PreparedScope<E>))],
+            quote!(#path::Effect<#path::PreparedResourceValue<T>, E, R>),
+            quote!(T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static, Pending: ::core::future::Future<Output = #path::Exit<(), E>> + Send + 'static, F: for<'outcome> Fn(T, #path::PrimaryOutcomeRef<'outcome, E>, ::std::sync::Arc<R>, #path::NativeContext) -> Pending + Send + Sync + 'static, M: Fn(#path::memory::MemoryError) -> E + Send + Sync + 'static),
+            quote!((#binding).acquire_scoped(#scope)));
+    }
+    if name == "effect_resource" && mode == "plan" {
+        let acquire = fields.take("acquire")?;
+        let release = release(&mut fields, "release", true)?;
+        let mapper = fields.role("on_capacity", 1, BodyCategory::Native)?;
+        return fields.finish_inferred(quote!(T, E, R, F, M),
+            &[("acquire", quote!(#path::Effect<T, E, R>)), ("release", quote!(F)), ("on_capacity", quote!(M))],
+            quote!(#path::PreparedResourcePlan<T, E, R, F, M>),
+            quote!(T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static, F: for<'outcome> Fn(T, #path::PrimaryOutcomeRef<'outcome, E>) -> #path::Release<E, R> + Send + Sync + 'static, M: Fn(#path::memory::MemoryError) -> E + Send + Sync + 'static),
+            quote!(#path::PreparedResourcePlan::new(#acquire, #release, #mapper)));
+    }
+    if name == "effect_resource" && mode == "prepare" {
+        let plan = fields.take("plan")?;
+        let memory = fields.transform("memory", |value, _| Ok(quote!(&(#value))))?;
+        let metadata = fields.take("metadata")?;
+        let resources = fields.take("resources")?;
+        return fields.finish_inferred(quote!(T, E, R, F, M),
+            &[("plan", quote!(#path::PreparedResourcePlan<T, E, R, F, M>)), ("memory", quote!(&#path::memory::PreparedMemory<'static>)), ("metadata", quote!(#path::memory::RegionId)), ("resources", quote!(usize))],
+            quote!(::core::result::Result<#path::PreparedResourceBinding<T, E, R, F, M>, #path::memory::MemoryError>),
+            quote!(T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static, F: for<'outcome> Fn(T, #path::PrimaryOutcomeRef<'outcome, E>) -> #path::Release<E, R> + Send + Sync + 'static, M: Fn(#path::memory::MemoryError) -> E + Send + Sync + 'static),
+            quote!((#plan).prepare(#memory, #metadata, #resources)));
+    }
+    if name == "effect_scope_acquire" && mode == "reserve_permit" {
+        let scope = fields.transform("scope", |expr, _| Ok(quote!(&(#expr))))?;
+        return fields.finish_inferred(quote!(E),&[("scope",quote!(&#path::PreparedScope<E>))],quote!(::core::result::Result<#path::PreparedScopePermit<E>,#path::memory::MemoryError>),quote!(E: Send + 'static),quote!(#path::PreparedScopePermit::reserve(#scope)));
+    }
+    if name == "effect_scope_acquire" && mode == "admitted" {
+        let binding = fields.transform("binding", |value, _| Ok(quote!(&(#value))))?;
+        let scope = fields.take("scope")?;
+        return fields.finish(quote!((#binding).admit_acquire_scoped(#scope)));
+    }
+    if name == "effect_scope_acquire" && mode == "prepared" {
+        let binding = fields.take("binding")?;
+        let scope = fields.take("scope")?;
+        return fields.finish_inferred(quote!(T, E, R, F, M),
+            &[("binding", quote!(#path::PreparedResourceBinding<T, E, R, F, M>)), ("scope", quote!(#path::PreparedScope<E>))],
+            quote!(#path::Effect<#path::PreparedResourceValue<T>, E, R>),
+            quote!(T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static, F: for<'outcome> Fn(T, #path::PrimaryOutcomeRef<'outcome, E>) -> #path::Release<E, R> + Send + Sync + 'static, M: Fn(#path::memory::MemoryError) -> E + Send + Sync + 'static),
+            quote!((#binding).acquire_scoped(#scope)));
+    }
+    if name == "effect_scope" && mode == "prepare_pool" {
+        let memory = fields.transform("memory", |value, _| Ok(quote!(&(#value))))?;
+        let metadata = fields.take("metadata")?;
+        let scopes = fields.take("scopes")?;
+        let limits = fields.take("limits")?;
+        let callbacks = fields.take("callbacks")?;
+        if fields.contains("panic_diagnostics") {
+            let diagnostics = fields.take("panic_diagnostics")?;
+            let pool = if fields.contains("cleanup") {
+                let cleanup = fields.take("cleanup")?;
+                quote!(#path::PreparedScopePool::prepare(#memory, #metadata, #scopes, #limits, #callbacks).map(|pool| pool.with_cleanup(#cleanup)))
+            } else {
+                quote!(#path::PreparedScopePool::prepare(#memory, #metadata, #scopes, #limits, #callbacks))
+            };
+            return fields.finish(
+                quote!((#pool).and_then(|pool| pool.with_panic_diagnostics(#diagnostics))),
+            );
+        }
+        if fields.contains("cleanup") {
+            let cleanup = fields.take("cleanup")?;
+            return fields.finish(quote!(#path::PreparedScopePool::prepare(#memory, #metadata, #scopes, #limits, #callbacks).map(|pool| pool.with_cleanup(#cleanup))));
+        }
+        return fields.finish_inferred(quote!(E),
+            &[("memory", quote!(&#path::memory::PreparedMemory<'static>)), ("metadata", quote!(#path::memory::RegionId)), ("scopes", quote!(usize)), ("limits", quote!(#path::PreparedScopeLimits)), ("callbacks", quote!(#path::memory::FramePool<'static>))],
+            quote!(::core::result::Result<#path::PreparedScopePool<E>, #path::memory::MemoryError>), quote!(E: Send + 'static),
+            quote!(#path::PreparedScopePool::prepare(#memory, #metadata, #scopes, #limits, #callbacks)));
+    }
+    if name == "effect_scope" && mode == "admitted_pool" {
+        let pool = fields.transform("pool", |value, _| Ok(quote!(&(#value))))?;
+        let body = fields.role("body", 1, BodyCategory::Effect)?;
+        return fields.finish_inferred(quote!(A, E, R, F),
+            &[("pool", quote!(&#path::PreparedScopePool<E>)), ("body", quote!(F))],
+            quote!(::core::result::Result<#path::Effect<A, E, R>, #path::PreparedScopeAdmissionError>),
+            quote!(A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static, F: FnOnce(#path::PreparedScope<E>) -> #path::Effect<A, E, R> + Send + 'static),
+            quote!((#pool).admit_scoped(#body)));
+    }
+    if name == "effect_scope" && mode == "prepared_pool" {
+        let pool = fields.take("pool")?;
+        let mapper = fields.role("on_capacity", 1, BodyCategory::Native)?;
+        let (body_name, output, result) = if fields.contains("try_body") {
+            let body = fields.role("try_body", 1, BodyCategory::Native)?;
+            (
+                "try_body",
+                quote!((#pool).try_scoped(#body, #mapper)),
+                quote!(::core::result::Result<#path::Effect<A, E, R>, #path::memory::MemoryError>),
+            )
+        } else {
+            let body = fields.role("body", 1, BodyCategory::Effect)?;
+            (
+                "body",
+                quote!((#pool).scoped(#body, #mapper)),
+                quote!(#path::Effect<A, E, R>),
+            )
+        };
+        return fields.finish_inferred(quote!(A, E, R, F, M),
+            &[("pool", quote!(#path::PreparedScopePool<E>)), (body_name, quote!(F)), ("on_capacity", quote!(M))],
+            quote!(#path::Effect<A, E, R>),
+            quote!(A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static, F: Fn(#path::PreparedScope<E>) -> #result + Send + Sync + 'static, M: Fn(#path::memory::MemoryError) -> E + Send + Sync + 'static), output);
+    }
+    if name == "effect_scope" && mode == "prepare" {
+        let memory = fields.transform("memory", |value, _| Ok(quote!(&(#value))))?;
+        let metadata = fields.take("metadata")?;
+        let limits = fields.take("limits")?;
+        let callbacks = fields.take("callbacks")?;
+        if fields.contains("panic_diagnostics") {
+            let diagnostics = fields.take("panic_diagnostics")?;
+            let owner = if fields.contains("cleanup") {
+                let cleanup = fields.take("cleanup")?;
+                quote!(#path::PreparedScopeOwner::prepare_with_cleanup(#memory, #metadata, #limits, #callbacks, #cleanup))
+            } else {
+                quote!(#path::PreparedScopeOwner::prepare(#memory, #metadata, #limits, #callbacks))
+            };
+            return fields.finish(
+                quote!((#owner).and_then(|owner| owner.with_panic_diagnostics(#diagnostics))),
+            );
+        }
+        if fields.contains("cleanup") {
+            let cleanup = fields.take("cleanup")?;
+            return fields.finish(quote!(#path::PreparedScopeOwner::prepare_with_cleanup(#memory, #metadata, #limits, #callbacks, #cleanup)));
+        }
+        return fields.finish_inferred(quote!(E),
+            &[("memory", quote!(&#path::memory::PreparedMemory<'static>)), ("metadata", quote!(#path::memory::RegionId)), ("limits", quote!(#path::PreparedScopeLimits)), ("callbacks", quote!(#path::memory::FramePool<'static>))],
+            quote!(::core::result::Result<#path::PreparedScopeOwner<E>, #path::memory::MemoryError>), quote!(E: Send + 'static),
+            quote!(#path::PreparedScopeOwner::prepare(#memory, #metadata, #limits, #callbacks)));
+    }
+    if name == "effect_scope" && mode == "prepared" {
+        let owner = fields.take("owner")?;
+        let body = fields.role("body", 1, BodyCategory::Effect)?;
+        return fields.finish_inferred(quote!(A, E, R, F),
+            &[("owner", quote!(#path::PreparedScopeOwner<E>)), ("body", quote!(F))],
+            quote!(::core::result::Result<#path::Effect<A, E, R>, #path::memory::MemoryError>),
+            quote!(A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static, F: FnOnce(#path::PreparedScope<E>) -> #path::Effect<A, E, R> + Send + 'static),
+            quote!((#owner).into_effect(#body)));
+    }
+    if name == "effect_scope" && mode == "reserve_close" {
+        let owner = fields.take("owner")?;
+        let frames = fields.take("frames")?;
+        let context = fields.take("context")?;
+        return fields.finish_inferred(quote!(A,E,V),
+            &[("owner",quote!(#path::PreparedScopeOwner<E>)),("frames",quote!(&#path::memory::FramePool<'static>)),("context",quote!(&#path::PreparedRunContext<V,E>))],
+            quote!(::core::result::Result<#path::PreparedScopeClose<A,E,V>,#path::memory::MemoryError>),
+            quote!(A: Send + 'static,E: Send + 'static,V: Send + 'static),
+            quote!((#owner).reserve_close(#frames,#context)));
+    }
+    if name == "effect_scope" && mode == "reserve_closed" {
+        let scope = fields.take("scope")?;
+        let frames = fields.take("frames")?;
+        let context = fields.take("context")?;
+        return fields.finish_inferred(
+            quote!(V, E),
+            &[
+                ("scope", quote!(&#path::PreparedScope<E>)),
+                ("frames", quote!(&#path::memory::FramePool<'static>)),
+                ("context", quote!(&#path::PreparedRunContext<V,E>)),
+            ],
+            quote!(::core::result::Result<#path::PreparedCloseWait<E>,#path::memory::MemoryError>),
+            quote!(V: Send + 'static,E: Send + 'static),
+            quote!((#scope).reserve_closed(#frames,#context)),
+        );
+    }
+    if name == "effect_scope" && mode == "admitted_close" {
+        let scope = fields.transform("scope", |value, _| Ok(quote!(&(#value))))?;
+        let mapper = fields.role("on_capacity", 1, BodyCategory::Native)?;
+        return fields.finish(quote!((#scope).admit_close(#mapper)));
+    }
+    if name == "effect_scope" && mode == "prepared_close" {
+        let scope = fields.take("scope")?;
+        let mapper = fields.role("on_capacity", 1, BodyCategory::Native)?;
+        return fields.finish_inferred(quote!(E, R, M),
+            &[("scope", quote!(#path::PreparedScope<E>)), ("on_capacity", quote!(M))],
+            quote!(#path::Effect<#path::ScopeCloseStatus, E, R>),
+            quote!(E: Send + 'static, R: Send + Sync + 'static, M: Fn(#path::memory::MemoryError) -> E + Send + Sync + 'static),
+            quote!((#scope).close(#mapper)));
+    }
+    if name == "effect_scope" && mode == "prepared_checkpoint" {
+        let scope = fields.transform("scope", |value, _| Ok(quote!(&(#value))))?;
+        return fields.finish_inferred(quote!(E), &[("scope", quote!(&#path::PreparedScope<E>))],
+            quote!(::core::result::Result<#path::PreparedCheckpoint<E>, #path::memory::MemoryError>), quote!(E: Send + 'static), quote!((#scope).checkpoint()));
+    }
+    if name == "effect_scope" && mode == "prepared_release" {
+        let checkpoint = fields.take("checkpoint")?;
+        return fields.finish_inferred(
+            quote!(E, R),
+            &[("checkpoint", quote!(#path::PreparedCheckpoint<E>))],
+            quote!(#path::Effect<(), E, R>),
+            quote!(E: Send + 'static, R: Send + Sync + 'static),
+            quote!((#checkpoint).release()),
+        );
+    }
+    if name == "effect_finalizer" && mode == "plan" {
+        let factory = fields.role("release", 0, BodyCategory::Native)?;
+        return fields.finish_inferred(quote!(E, R, F), &[("release", quote!(F))],
+            quote!(#path::PreparedReleasePlan<E, R, F>),
+            quote!(E: Send + 'static, R: Send + Sync + 'static, F: Fn() -> #path::Release<E, R> + Send + Sync + 'static),
+            quote!(#path::PreparedReleasePlan::new(#factory)));
+    }
+    if name == "effect_finalizer" && mode == "prepare" {
+        let memory = fields.transform("memory", |value, _| Ok(quote!(&(#value))))?;
+        let metadata = fields.take("metadata")?;
+        let factory = fields.role("release", 0, BodyCategory::Native)?;
+        return fields.finish_inferred(quote!(E, R, F),
+            &[("memory", quote!(&#path::memory::PreparedMemory<'static>)), ("metadata", quote!(#path::memory::RegionId)), ("release", quote!(F))],
+            quote!(::core::result::Result<#path::PreparedRelease<E, R, F>, #path::memory::MemoryError>),
+            quote!(E: Send + 'static, R: Send + Sync + 'static, F: Fn() -> #path::Release<E, R> + Send + Sync + 'static),
+            quote!(#path::PreparedRelease::prepare(#memory, #metadata, #factory)));
+    }
+    if name == "effect_finalizer" && mode == "admitted" {
+        let scope = fields.take("scope")?;
+        let release = fields.transform("release", |value, _| Ok(quote!(&(#value))))?;
+        let mapper = fields.role("on_capacity", 1, BodyCategory::Native)?;
+        return fields.finish_inferred(quote!(E, R, F, M),
+            &[("scope", quote!(#path::PreparedScope<E>)), ("release", quote!(&#path::PreparedRelease<E, R, F>)), ("on_capacity", quote!(M))],
+            quote!(::core::result::Result<#path::Effect<(), E, R>, #path::memory::MemoryError>),
+            quote!(E: Send + 'static, R: Send + Sync + 'static, F: Fn() -> #path::Release<E, R> + Send + Sync + 'static, M: Fn(#path::memory::MemoryError) -> E + Send + Sync + 'static),
+            quote!((#release).admit_registration(#scope, #mapper)));
+    }
+    if name == "effect_finalizer" && mode == "prepared" {
+        let scope = fields.take("scope")?;
+        let release = fields.take("release")?;
+        let mapper = fields.role("on_capacity", 1, BodyCategory::Native)?;
+        return fields.finish_inferred(quote!(E, R, F, M),
+            &[("scope", quote!(#path::PreparedScope<E>)), ("release", quote!(#path::PreparedRelease<E, R, F>)), ("on_capacity", quote!(M))],
+            quote!(#path::Effect<(), E, R>),
+            quote!(E: Send + 'static, R: Send + Sync + 'static, F: Fn() -> #path::Release<E, R> + Send + Sync + 'static, M: Fn(#path::memory::MemoryError) -> E + Send + Sync + 'static),
+            quote!((#release).register(#scope, #mapper)));
+    }
     if name == "effect_permit" && mode == "partitioned_make" {
         let capacity = fields.take("capacity")?;
         return fields.finish_inferred(
@@ -157,6 +430,14 @@ pub(crate) fn ownership(name: &str, input: Input) -> syn::Result<TokenStream> {
                 C: Into<#path::Release<E, R>> + 'static),
             quote!((#program).ensuring_with(move |primary| (#release)(primary).into())),
         );
+    }
+    if name == "effect_resource" && mode == "release_prepared_exit_future" {
+        let callback = fields.role("body", 1, BodyCategory::Native)?;
+        let mapper = fields.role("on_capacity", 1, BodyCategory::Native)?;
+        return fields.finish_inferred(quote!(E, R, F, Pending, M),
+            &[("body", quote!(F)), ("on_capacity", quote!(M))], quote!(#path::Release<E, R>),
+            quote!(E: Send + 'static, R: Send + Sync + 'static, Pending: ::core::future::Future<Output = #path::Exit<(), E>> + Send + 'static, F: FnOnce(#path::Cancellation) -> Pending + Send + 'static, M: FnOnce(#path::memory::MemoryError) -> E + Send + 'static),
+            quote!(#path::Release::from_prepared_exit_future(#callback, #mapper)));
     }
     if name == "effect_resource" && mode == "release_exit_future" {
         let callback = fields.role("body", 1, BodyCategory::Native)?;
@@ -416,6 +697,12 @@ pub(crate) fn ownership(name: &str, input: Input) -> syn::Result<TokenStream> {
 }
 /// Lower existing state/load callbacks, keeping borrowed validation and tracked transitions typed.
 pub(crate) fn state(name: &str, input: Input) -> syn::Result<TokenStream> {
+    if name == "effect_ref" && crate::prepared_program_expand::is_prepared_ref(&input) {
+        return crate::prepared_program_expand::prepared_ref(
+            input,
+            &crate::expand::effect_crate_path()?,
+        );
+    }
     let mode = input.mode(
         &[
             "modify",
@@ -429,6 +716,41 @@ pub(crate) fn state(name: &str, input: Input) -> syn::Result<TokenStream> {
     )?;
     let mut fields = input.fields;
     let path = crate::expand::effect_crate_path()?;
+    let prepared_inspection = name == "pool" && mode == "exists_idle" && fields.contains("memory");
+    if name == "weak_cache" && mode == "default" && fields.contains("memory") {
+        let scope = fields.take("scope")?;
+        let storage = fields.take("memory")?;
+        if fields.contains("refusals") {
+            let refusals = fields.take("refusals")?;
+            return fields.finish_inferred(
+                quote!(K, A, E, R),
+                &[
+                    ("scope", quote!(#path::Scope<#path::SharedValue<E>>)),
+                    ("memory", quote!(#path::PreparedWeakCacheStorage<K, A, E>)),
+                    ("refusals", quote!(#path::PreparedCacheRefusals<E>)),
+                ],
+                quote!(#path::Effect<#path::WeakCache<K, A, E>, #path::SharedValue<E>, R>),
+                quote!(K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static,
+                    R: #path::HasClock + #path::HasTaskSpawner + Send + Sync + 'static),
+                quote!(#path::WeakCache::make_with_prepared_refusals(#scope, #storage, #refusals)),
+            );
+        }
+        let on_capacity = fields.role("on_capacity", 1, BodyCategory::Native)?;
+        return fields.finish_inferred(
+            quote!(K, A, E, R, M),
+            &[
+                ("scope", quote!(#path::Scope<#path::SharedValue<E>>)),
+                ("memory", quote!(#path::PreparedWeakCacheStorage<K, A, E>)),
+                ("on_capacity", quote!(M)),
+            ],
+            quote!(#path::Effect<#path::WeakCache<K, A, E>, #path::SharedValue<E>, R>),
+            quote!(K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static,
+                R: #path::HasClock + #path::HasTaskSpawner + Send + Sync + 'static,
+                M: Fn(#path::memory::MemoryError) -> E + Send + Sync + 'static),
+            quote!(#path::WeakCache::make_with_prepared_storage(#scope, #storage, #on_capacity)),
+        );
+    }
+    let prepared_storage = name == "pool" && mode == "default" && fields.contains("memory");
     let output = match name {
         "schedule" => {
             let state = fields.take("state")?;
@@ -476,17 +798,24 @@ pub(crate) fn state(name: &str, input: Input) -> syn::Result<TokenStream> {
         "pool" if mode == "exists_idle" => {
             let pool = fields.transform("pool", |pool, _| Ok(quote!(&(#pool))))?;
             let predicate = fields.role("predicate", 1, BodyCategory::Native)?;
-            quote!((#pool).exists_idle(#predicate))
+            if prepared_inspection {
+                let snapshots = fields.take("memory")?;
+                let mapper = fields.role("on_capacity", 1, BodyCategory::Native)?;
+                quote!((#pool).exists_idle_prepared(#snapshots, #predicate, #mapper))
+            } else {
+                quote!((#pool).exists_idle(#predicate))
+            }
         }
         "pool" => {
             let scope = fields.take("scope")?;
-            let capacity = fields.take("capacity")?;
+            let capacity = fields.take(if prepared_storage { "memory" } else { "capacity" })?;
             let ttl = fields.take("idle_ttl")?;
             let create = program(&mut fields, "create")?;
             // Borrowed validate input may only supply owned data to its returned Effect.
             let validate = fields.role("validate", 1, BodyCategory::EffectFactory)?;
             let dispose = fields.role("dispose", 1, BodyCategory::Effect)?;
-            quote!(#path::Pool::make(#scope, #capacity, #ttl, #create, #validate, #dispose))
+            let constructor = if prepared_storage { quote!(make_with_prepared_storage) } else { quote!(make) };
+            quote!(#path::Pool::#constructor(#scope, #capacity, #ttl, #create, #validate, #dispose))
         }
         "weak_cache" => {
             let cache = fields.transform("cache", |cache, _| Ok(quote!(&(#cache))))?;
@@ -501,8 +830,20 @@ pub(crate) fn state(name: &str, input: Input) -> syn::Result<TokenStream> {
         }
         "request_resolver" => {
             let scope = fields.take("scope")?;
-            let run = fields.role("run", 2, BodyCategory::Effect)?;
-            quote!(#path::RequestResolver::make(#scope, #run))
+            if fields.contains("run_prepared") {
+                let index = fields.take("memory")?;
+                let on_capacity = fields.role("on_capacity", 1, BodyCategory::Native)?;
+                let run = fields.role("run_prepared", 2, BodyCategory::Effect)?;
+                quote!(#path::RequestResolver::make_with_prepared_batches(#scope, #index, #on_capacity, #run))
+            } else if fields.contains("memory") {
+                let index = fields.take("memory")?;
+                let on_capacity = fields.role("on_capacity", 1, BodyCategory::Native)?;
+                let run = fields.role("run", 2, BodyCategory::Effect)?;
+                quote!(#path::RequestResolver::make_with_prepared_index(#scope, #index, #on_capacity, #run))
+            } else {
+                let run = fields.role("run", 2, BodyCategory::Effect)?;
+                quote!(#path::RequestResolver::make(#scope, #run))
+            }
         }
         _ => {
             return Err(syn::Error::new(
@@ -568,6 +909,21 @@ pub(crate) fn state(name: &str, input: Input) -> syn::Result<TokenStream> {
                 M: Fn(#path::SemaphoreError) -> E + Send + Sync + 'static),
             output,
         )
+    } else if prepared_inspection {
+        fields.finish_inferred(
+            quote!(T, E, R, F, M),
+            &[
+                ("pool", quote!(&#path::Pool<T, E>)),
+                ("memory", quote!(::std::sync::Arc<#path::PreparedPoolSnapshots<T, E>>)),
+                ("predicate", quote!(F)),
+                ("on_capacity", quote!(M)),
+            ],
+            quote!(#path::Effect<bool, E, R>),
+            quote!(T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static,
+                F: Fn(&T) -> bool + Send + Sync + 'static,
+                M: Fn(#path::memory::MemoryError) -> E + Send + Sync + 'static),
+            output,
+        )
     } else if name == "pool" && mode == "exists_idle" {
         fields.finish_inferred(
             quote!(T, E, R, F),
@@ -581,11 +937,16 @@ pub(crate) fn state(name: &str, input: Input) -> syn::Result<TokenStream> {
             output,
         )
     } else if name == "pool" && mode == "default" {
+        let capacity = if prepared_storage {
+            ("memory", quote!(#path::PreparedPoolStorage<E>))
+        } else {
+            ("capacity", quote!(#path::PoolCapacity))
+        };
         fields.finish_inferred(
             quote!(T, E, R, F, G),
             &[
                 ("scope", quote!(#path::Scope<E>)),
-                ("capacity", quote!(#path::PoolCapacity)),
+                capacity,
                 (
                     "idle_ttl",
                     quote!(::core::option::Option<::std::time::Duration>),
@@ -618,6 +979,91 @@ pub(crate) fn state(name: &str, input: Input) -> syn::Result<TokenStream> {
         fields.finish(output)
     }
 }
+fn prepared_stream(
+    mode: &str,
+    mut fields: Fields,
+    path: &TokenStream,
+) -> syn::Result<TokenStream> {
+    if mode == "pull_prepared" {
+        let source = fields.take("pull")?;
+        return fields.finish_inferred(
+            quote!(P),
+            &[("pull", quote!(P))],
+            quote!(#path::PreparedStream<P>),
+            quote!(P: #path::PreparedStreamPull),
+            quote!(#path::PreparedStream::new(#source)),
+        );
+    }
+    let memory = fields.take("memory")?;
+    let capacity = fields.role("on_capacity", 1, BodyCategory::Native)?;
+    if mode == "iterable_prepared" {
+        let iterator = fields.take("iterable")?;
+        return fields.finish_inferred(
+            quote!(I, E, M),
+            &[("iterable", quote!(I)), ("memory", quote!(#path::PreparedChunkPool<I::Item>)), ("on_capacity", quote!(M))],
+            quote!(#path::PreparedStream<impl #path::PreparedStreamPull<Item = I::Item, Error = E>>),
+            quote!(I: ::core::iter::Iterator + Send, I::Item: Send + 'static,
+                E: Send + 'static, M: Fn(#path::memory::MemoryError) -> E + Send),
+            quote!(#path::PreparedStream::from_iterable(#iterator, #memory, #capacity)),
+        );
+    }
+    let source = fields.take("stream")?;
+    if mode == "map_prepared" {
+        let map = fields.role("map", 1, BodyCategory::Native)?;
+        return fields.finish_inferred(
+            quote!(P, B, F, Fut, M),
+            &[("stream", quote!(#path::PreparedStream<P>)), ("memory", quote!(#path::PreparedChunkPool<B>)),
+              ("map", quote!(F)), ("on_capacity", quote!(M))],
+            quote!(#path::PreparedStream<impl #path::PreparedStreamPull<Item = B, Error = P::Error>>),
+            quote!(P: #path::PreparedStreamPull, B: Send + 'static,
+                F: FnMut(P::Item) -> Fut + Send,
+                Fut: ::core::future::Future<Output = #path::Exit<B, P::Error>> + Send,
+                M: Fn(#path::memory::MemoryError) -> P::Error + Send),
+            quote!((#source).map(#memory, #map, #capacity)),
+        );
+    }
+    fields.finish_inferred(
+        quote!(P, M),
+        &[("stream", quote!(#path::PreparedStream<P>)),
+          ("memory", quote!(#path::PreparedChunkPool<P::Item>)), ("on_capacity", quote!(M))],
+        quote!(#path::PreparedStream<impl #path::PreparedStreamPull<Item = P::Item, Error = P::Error>>),
+        quote!(P: #path::PreparedStreamPull, M: Fn(#path::memory::MemoryError) -> P::Error + Send),
+        quote!((#source).rechunk(#memory, #capacity)),
+    )
+}
+
+fn prepared_sink(
+    mode: &str,
+    mut fields: Fields,
+    path: &TokenStream,
+) -> syn::Result<TokenStream> {
+    let source = fields.take("stream")?;
+    let memory = fields.take("memory")?;
+    let capacity = fields.role("on_capacity", 1, BodyCategory::Native)?;
+    let mut types = vec![("stream", quote!(&'a mut #path::PreparedStream<P>)), ("on_capacity", quote!(M))];
+    let bounds = quote!(P: #path::PreparedStreamPull + 'a,
+        M: FnOnce(#path::memory::MemoryError) -> P::Error + Send + 'a);
+    if mode == "collect_prepared" {
+        types.push(("memory", quote!(&'a #path::PreparedChunkPool<P::Item>)));
+        return fields.finish_inferred(
+            quote!('a, P, M), &types,
+            quote!(impl ::core::future::Future<Output = #path::Exit<#path::PreparedChunkValues<P::Item>, P::Error>> + Send + 'a),
+            bounds,
+            quote!((#source).collect(#memory, #capacity)),
+        );
+    }
+    let initial = fields.role("initial", 0, BodyCategory::Native)?;
+    let step = fields.role("step", 2, BodyCategory::Native)?;
+    types.extend([("memory", quote!(&'a #path::PreparedFoldPool<S>)), ("initial", quote!(I)), ("step", quote!(F))]);
+    fields.finish_inferred(
+        quote!('a, P, S, I, F, M), &types,
+        quote!(impl ::core::future::Future<Output = #path::Exit<#path::PreparedFoldValue<S>, P::Error>> + Send + 'a),
+        quote!(#bounds, S: Send + 'static, I: FnOnce() -> S + Send + 'a,
+            F: FnMut(&mut S, P::Item) -> ::core::result::Result<(), P::Error> + Send + 'a),
+        quote!((#source).fold(#memory, #initial, #step, #capacity)),
+    )
+}
+
 /// Stream descriptors and consumers retain pull demand, owning scope and ordered release.
 pub(crate) fn demand(name: &str, input: Input) -> syn::Result<TokenStream> {
     let mode = input.mode(
@@ -634,12 +1080,26 @@ pub(crate) fn demand(name: &str, input: Input) -> syn::Result<TokenStream> {
             "pull",
             "connection",
             "socket",
+            "iterable_prepared",
+            "pull_prepared",
+            "map_prepared",
+            "rechunk",
+            "collect_prepared",
+            "fold_prepared",
         ],
         "default",
     )?;
     let mut fields = input.fields;
     let native_pull = name == "stream" && fields.contains("pull") && !fields.inline("read");
     let path = crate::expand::effect_crate_path()?;
+    if matches!(name, "stream")
+        && matches!(mode.as_str(), "iterable_prepared" | "pull_prepared" | "map_prepared" | "rechunk")
+    {
+        return prepared_stream(&mode, fields, &path);
+    }
+    if name == "sink" && matches!(mode.as_str(), "collect_prepared" | "fold_prepared") {
+        return prepared_sink(&mode, fields, &path);
+    }
     if name == "effect_socket"
         && matches!(mode.as_str(), "default" | "socket")
         && !fields.contains("options")

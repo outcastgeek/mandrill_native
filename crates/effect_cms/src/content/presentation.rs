@@ -39,7 +39,7 @@ use maud::{Markup, html};
 
 use super::shortcode::{
     ContentRenderOptions, RenderedContentFragment, ShortcodeCatalog, ShortcodeResolver,
-    ShortcodeToken, shortcode_arg,
+    ShortcodeToken, shortcode_arg_ref,
 };
 
 /// The presentation shortcode catalog: `callout` and `cta`.
@@ -104,40 +104,16 @@ where
     }
 }
 
-/// The callout arguments the decision reads.
-struct CalloutInput {
-    /// The requested tone.
-    tone: String,
-    /// The callout title.
-    title: String,
-    /// The callout body.
-    body: String,
-}
-
-/// The call-to-action arguments the decision reads.
-struct CtaInput {
-    /// The call-to-action title.
-    title: String,
-    /// The call-to-action body.
-    body: String,
-    /// The call-to-action target.
-    href: String,
-    /// The call-to-action link label.
-    label: String,
-}
-
 /// Resolve one `callout` token.
 fn resolve_callout(token: &ShortcodeToken) -> RenderedContentFragment {
-    let input = CalloutInput {
-        body: shortcode_arg(token, &["body", "text", "value"]),
-        title: shortcode_arg(token, &["title", "heading"]),
-        tone: shortcode_arg(token, &["tone", "variant"]),
-    };
-    if input.title.is_empty() && input.body.is_empty() {
+    let body = shortcode_arg_ref(token, ["body", "text", "value"]);
+    let title = shortcode_arg_ref(token, ["title", "heading"]);
+    let tone = shortcode_arg_ref(token, ["tone", "variant"]);
+    if title.is_empty() && body.is_empty() {
         return RenderedContentFragment::default();
     }
     RenderedContentFragment {
-        html: render_callout_shortcode_html(&input.tone, &input.title, &input.body),
+        html: render_callout_shortcode_html(tone, title, body),
         block: true,
         ..RenderedContentFragment::default()
     }
@@ -145,20 +121,20 @@ fn resolve_callout(token: &ShortcodeToken) -> RenderedContentFragment {
 
 /// Resolve one `cta` token.
 fn resolve_cta(token: &ShortcodeToken) -> RenderedContentFragment {
-    let mut input = CtaInput {
-        title: shortcode_arg(token, &["title", "heading"]),
-        body: shortcode_arg(token, &["body", "text", "description"]),
-        href: shortcode_arg(token, &["href", "url", "link"]),
-        label: shortcode_arg(token, &["label", "cta", "button"]),
-    };
-    if input.title.is_empty() && input.body.is_empty() && input.href.is_empty() {
+    let title = shortcode_arg_ref(token, ["title", "heading"]);
+    let body = shortcode_arg_ref(token, ["body", "text", "description"]);
+    let href = shortcode_arg_ref(token, ["href", "url", "link"]);
+    let label = shortcode_arg_ref(token, ["label", "cta", "button"]);
+    if title.is_empty() && body.is_empty() && href.is_empty() {
         return RenderedContentFragment::default();
     }
-    if input.label.is_empty() {
-        input.label = "Learn more".to_owned();
-    }
+    let label = if label.is_empty() {
+        "Learn more"
+    } else {
+        label
+    };
     RenderedContentFragment {
-        html: render_cta_shortcode_html(&input.title, &input.body, &input.href, &input.label),
+        html: render_cta_shortcode_html(title, body, href, label),
         block: true,
         ..RenderedContentFragment::default()
     }

@@ -140,7 +140,9 @@ pub mod authority;
 pub mod capabilities;
 pub mod definition;
 pub mod policies;
-pub use definition::{ConfiguredComponents, IdentityComponents, IdentityDefinition};
+pub use definition::{
+    ConfiguredComponents, IdentityComponents, IdentityDefinition, PreparedIdentityInvocation,
+};
 pub mod components;
 pub mod endpoints;
 pub mod services;

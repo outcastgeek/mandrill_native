@@ -27,7 +27,7 @@ impl Fold for Lower {
                 .unwrap_or_else(|| parse_quote!(()));
             parse_quote!(return Ok(#value))
         } else if let Expr::While(mut step) = expr {
-            step.cond = Box::new(self.fold_expr(*step.cond));
+            step.cond = Box::map(step.cond, |condition| self.fold_expr(condition));
             step.body = self.fold_block(step.body);
             let context = &self.context;
             step.body
@@ -35,7 +35,7 @@ impl Fold for Lower {
                 .insert(0, parse_quote!(#context.cooperate().await?;));
             Expr::While(step)
         } else if let Expr::ForLoop(mut step) = expr {
-            step.expr = Box::new(self.fold_expr(*step.expr));
+            step.expr = Box::map(step.expr, |iterable| self.fold_expr(iterable));
             step.body = self.fold_block(step.body);
             let context = &self.context;
             step.body

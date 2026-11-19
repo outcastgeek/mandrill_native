@@ -108,7 +108,8 @@ impl<A: Send + 'static, Encoded: Send + 'static> PureCodec<A, Encoded> {
         }
     }
 
-    pub(crate) fn with_context_ast(
+    #[doc(hidden)]
+    pub fn with_context_ast(
         ast: SchemaAst,
         decode: impl Fn(&Encoded, Option<&ParseContext>) -> Result<A, SchemaIssue>
         + Send
@@ -147,14 +148,16 @@ impl<A: Send + 'static, Encoded: Send + 'static> PureCodec<A, Encoded> {
             equivalent: None,
         }
     }
-    pub(crate) fn with_context_type_validator(
+    #[doc(hidden)]
+    pub fn with_context_type_validator(
         mut self,
         validate: impl Fn(&A, Option<&ParseContext>) -> Result<(), SchemaIssue> + Send + Sync + 'static,
     ) -> Self {
         self.validate_type = Some(Arc::new(validate));
         self
     }
-    pub(crate) fn decode_in_ref(
+    #[doc(hidden)]
+    pub fn decode_in_ref(
         &self,
         value: &Encoded,
         context: Option<&ParseContext>,
@@ -164,7 +167,8 @@ impl<A: Send + 'static, Encoded: Send + 'static> PureCodec<A, Encoded> {
         }
         (self.decode)(value, context)
     }
-    pub(crate) fn encode_in_ref(
+    #[doc(hidden)]
+    pub fn encode_in_ref(
         &self,
         value: &A,
         context: Option<&ParseContext>,
@@ -174,7 +178,8 @@ impl<A: Send + 'static, Encoded: Send + 'static> PureCodec<A, Encoded> {
         }
         (self.encode)(value, context)
     }
-    pub(crate) fn validate_in_ref(
+    #[doc(hidden)]
+    pub fn validate_in_ref(
         &self,
         value: &A,
         context: Option<&ParseContext>,
@@ -251,7 +256,11 @@ impl<A: Send + 'static, Encoded: Send + 'static> PureCodec<A, Encoded> {
     /// Decode a borrowed value with the caller's active traversal state.
     /// Nested codecs share its paths and budgets; the encoded representation is
     /// checked by the boundary that created the context.
-    pub fn decode_ref_in(&self, encoded: &Encoded, context: &ParseContext) -> Result<A, SchemaIssue> {
+    pub fn decode_ref_in(
+        &self,
+        encoded: &Encoded,
+        context: &ParseContext,
+    ) -> Result<A, SchemaIssue> {
         self.decode_in_ref(encoded, Some(context))
     }
 
@@ -315,7 +324,7 @@ impl<A: Send + 'static, Encoded: Send + 'static> PureCodec<A, Encoded> {
     }
 }
 
-impl<A: Send + 'static> PureCodec<A, JsonValue> {
+impl<A: Send + 'static, Encoded: Send + 'static> PureCodec<A, Encoded> {
     /// Install an independent direct JSON writer for one borrowed value.
     ///
     /// The callback must validate its own constraints, append exactly one value to the
@@ -370,6 +379,9 @@ impl<A: Send + 'static> PureCodec<A, JsonValue> {
         self.write_into(value, &mut writer)?;
         writer.finish()
     }
+}
+
+impl<A: Send + 'static> PureCodec<A, JsonValue> {
     /// Prepare metadata, strictly parse UTF-8 JSON under `policy`, then decode it.
     ///
     /// Invalid UTF-8, syntax, structural bounds or schema constraints return a typed
@@ -395,6 +407,9 @@ impl<A: Send + 'static> PureCodec<A, JsonValue> {
         self.decode_ref_in(&encoded, context)
     }
 
+}
+
+impl<A: Send + 'static, Encoded: Send + 'static> PureCodec<A, Encoded> {
     /// Tie a recursive codec using weak self-references without an ownership cycle.
     ///
     /// `shape` describes recursive metadata; `build` constructs the directional body
@@ -578,7 +593,7 @@ impl<A: Send + 'static> PureCodec<A, JsonValue> {
         self,
         decode: impl Fn(A) -> Result<B, SchemaIssue> + Send + Sync + 'static,
         encode: impl Fn(&B) -> Result<A, SchemaIssue> + Send + Sync + 'static,
-    ) -> PureCodec<B, JsonValue> {
+    ) -> PureCodec<B, Encoded> {
         let ast = self
             .ast()
             .derive(SchemaShape::EncodedView(self.ast().clone()));
@@ -611,6 +626,9 @@ impl<A: Send + 'static> PureCodec<A, JsonValue> {
         }
     }
 
+}
+
+impl<A: Send + 'static> PureCodec<A, JsonValue> {
     /// Expose the pure JSON decoder through the legacy one-way Schema error mapping; no reverse encoder or effectful blocking bridge is inferred.
     pub fn to_schema<E: Send + 'static>(
         &self,

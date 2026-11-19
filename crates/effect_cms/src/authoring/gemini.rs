@@ -19,24 +19,30 @@
 //! Provider failures keep the transport/status cause in their own variants; the
 //! expected error type is never required to be `Clone` or `Sync`.
 
-use std::collections::BTreeMap;
 use crate::commands::InputBytes;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::byte_text::BufferWriter;
 use effect::http::{FetchFailure, HttpHeaders, HttpMethod, HttpRequest, RequestOptions};
+use effect::memory::{
+    Buffer, Bytes, FixedVector, MemoryError, PreparedMemory, RegionId, SlotLease, SlotPool,
+};
 use effect::{
-    Effect, HasHttpTransport, effect, effect_die, effect_map, effect_scope, effect_sync,
-    effect_try_sync,
+    Effect, Exit, HasHttpTransport, effect, effect_die, effect_future, effect_map, effect_scope,
+    effect_sync, effect_try_sync,
 };
 use effect_server::Request;
 use serde_json::{Value, json};
+use std::num::NonZeroUsize;
 
 use super::contracts::{
     AuthoringTranslationField, AuthoringTranslationInput, AuthoringTranslationResult,
+    AuthoringTranslator,
 };
 use super::translation::{
-    normalize_authoring_fields, parse_authoring_translation_fields_json,
+    normalize_authoring_fields, parse_authoring_translation_fields_json, write_normalized_fields,
 };
 
 /// The source's default Gemini authoring translation model.
@@ -48,8 +54,9 @@ pub const GEMINI_API_BASE_URL: &str = "https://generativelanguage.googleapis.com
 /// The Gemini authoring translator.
 #[derive(Clone)]
 pub struct GeminiTranslator {
-    api_key: String,
-    model: String,
+    api_key: Arc<str>,
+    model: Arc<str>,
+    workspace: Option<Arc<PreparedGeminiWorkspace>>,
 }
 
 impl std::fmt::Debug for GeminiTranslator {
@@ -83,6 +90,8 @@ pub enum GeminiTranslatorError {
     NoContent,
     /// The provider's field JSON could not be parsed.
     ParseResponse(String),
+    /// Prepared working-set admission or native response envelope was exceeded.
+    Memory(MemoryError),
 }
 
 impl std::fmt::Display for GeminiTranslatorError {
@@ -100,7 +109,11 @@ impl std::fmt::Display for GeminiTranslatorError {
             Self::RequestEncode(error) => {
                 write!(formatter, "failed to encode generation request: {error}")
             }
-            Self::Fetch(failure) => write!(formatter, "failed to translate fields: {}", fetch_text(failure)),
+            Self::Fetch(failure) => write!(
+                formatter,
+                "failed to translate fields: {}",
+                fetch_text(failure)
+            ),
             Self::Provider(error) => write!(formatter, "failed to translate fields: {error}"),
             Self::ResponseDecode(error) => write!(
                 formatter,
@@ -110,11 +123,94 @@ impl std::fmt::Display for GeminiTranslatorError {
             Self::ParseResponse(error) => {
                 write!(formatter, "failed to parse translation response: {error}")
             }
+            Self::Memory(error) => error.fmt(formatter),
         }
     }
 }
 
 impl std::error::Error for GeminiTranslatorError {}
+
+/// The selected authoring input, request construction and decode envelope.
+#[derive(Clone, Copy)]
+#[must_use]
+pub struct GeminiWorkingLimits {
+    /// Maximum supplied field entries before normalization.
+    pub fields: NonZeroUsize,
+    /// Aggregate scope, language and field bytes before copies or normalization.
+    pub input_bytes: NonZeroUsize,
+    /// Maximum encoded JSON for the normalized field list.
+    pub field_json_bytes: NonZeroUsize,
+    /// Maximum UTF-8 bytes in the provider prompt.
+    pub prompt_bytes: NonZeroUsize,
+    /// Maximum encoded provider request body bytes.
+    pub request_bytes: NonZeroUsize,
+    /// Maximum provider-owned response bytes accepted for Effectful decode.
+    pub response_bytes: NonZeroUsize,
+}
+
+/// Region-backed request construction and concurrent provider call slots.
+pub struct PreparedGeminiWorkspace {
+    field_json: SlotPool<'static, Buffer<'static>>,
+    prompts: SlotPool<'static, Buffer<'static>>,
+    requests: SlotPool<'static, Buffer<'static>>,
+    fields: SlotPool<'static, FixedVector<'static, AuthoringTranslationField>>,
+    limits: GeminiWorkingLimits,
+}
+
+impl PreparedGeminiWorkspace {
+    /// Size three physical buffers for each admitted call.
+    ///
+    /// The native HTTP boundary owns its single bounded request copy and its response
+    /// allocation. The existing transport API returns that response as a complete body.
+    pub fn storage_bytes(
+        calls: NonZeroUsize,
+        limits: GeminiWorkingLimits,
+    ) -> Result<Bytes, MemoryError> {
+        let fields = std::alloc::Layout::array::<AuthoringTranslationField>(limits.fields.get())
+            .map_err(|_| MemoryError::InvalidLayout)?;
+        SlotPool::<Buffer<'static>>::storage_bytes(calls.get())?
+            .checked_mul(3)?
+            .checked_add(
+                SlotPool::<FixedVector<'static, AuthoringTranslationField>>::storage_bytes(
+                    calls.get(),
+                )?,
+            )?
+            .checked_add(
+                Bytes::new(limits.field_json_bytes.get())
+                    .checked_add(Bytes::new(limits.prompt_bytes.get()))?
+                    .checked_add(Bytes::new(limits.request_bytes.get()))?
+                    .checked_add(Bytes::new(fields.size()))?
+                    .checked_mul(calls.get())?,
+            )
+    }
+
+    /// Prepare the input and request workspaces in the selected region.
+    pub fn prepare(
+        memory: &PreparedMemory<'static>,
+        region: RegionId,
+        calls: NonZeroUsize,
+        limits: GeminiWorkingLimits,
+    ) -> Result<Self, MemoryError> {
+        Self::storage_bytes(calls, limits)?;
+        Ok(Self {
+            field_json: memory.buffers(
+                region,
+                calls.get(),
+                Bytes::new(limits.field_json_bytes.get()),
+            )?,
+            prompts: memory.buffers(region, calls.get(), Bytes::new(limits.prompt_bytes.get()))?,
+            requests: memory.buffers(
+                region,
+                calls.get(),
+                Bytes::new(limits.request_bytes.get()),
+            )?,
+            fields: memory.slots(region, calls.get(), |_| {
+                FixedVector::prepare(memory.allocator(region)?, limits.fields.get())
+            })?,
+            limits,
+        })
+    }
+}
 
 /// The provider's structured non-success response.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -176,18 +272,33 @@ pub fn new_gemini_translator_with_model(
         model.to_owned()
     };
     Ok(GeminiTranslator {
-        api_key: api_key.to_owned(),
-        model,
+        api_key: Arc::from(api_key),
+        model: Arc::from(model),
+        workspace: None,
     })
 }
 
 impl GeminiTranslator {
+    /// Install this translator as the existing CMS authoring provider callback.
+    #[must_use]
+    pub fn authoring_port<R: HasHttpTransport + Send + Sync + 'static>(
+        self,
+    ) -> AuthoringTranslator<GeminiTranslatorError, R> {
+        Arc::new(move |request, timeout, input| self.translate_fields(request, timeout, input))
+    }
+
+    /// Use the same provider and transport with prepared request workspaces.
+    #[must_use]
+    pub fn with_prepared_workspace(mut self, workspace: Arc<PreparedGeminiWorkspace>) -> Self {
+        self.workspace = Some(workspace);
+        self
+    }
+
     /// Translate one field set.
     ///
     /// `timeout` is the per-call deadline the workflow applied; a zero duration
     /// performs the provider call without the deadline header. The request is the
     /// caller's request-scoped context and is not read by this provider.
-    #[must_use]
     pub fn translate_fields<R>(
         &self,
         _request: &Request,
@@ -197,6 +308,9 @@ impl GeminiTranslator {
     where
         R: HasHttpTransport + Send + Sync + 'static,
     {
+        if let Some(workspace) = &self.workspace {
+            return self.translate_prepared(timeout, input, workspace.clone());
+        }
         let fields = normalize_authoring_fields(&input.fields.to_vec());
         if fields.is_empty() {
             let target_language = input.target_language.trim().to_owned();
@@ -223,7 +337,11 @@ impl GeminiTranslator {
         };
         let scope = {
             let scope = input.scope.trim();
-            if scope.is_empty() { InputBytes::from("content") } else { scope }
+            if scope.is_empty() {
+                InputBytes::from("content")
+            } else {
+                scope
+            }
         };
         let prompt = translation_prompt(
             &crate::byte_text::encoding_text(source_language.as_bytes()),
@@ -247,36 +365,7 @@ impl GeminiTranslator {
                 return translator_failure(GeminiTranslatorError::RequestEncode(error.to_string()));
             }
         };
-        let mut headers = HttpHeaders::new();
-        headers.insert(Arc::from("content-type"), Arc::from("application/json"));
-        headers.insert(
-            Arc::from("x-goog-api-key"),
-            Arc::from(self.api_key.as_str()),
-        );
-        if !timeout.is_zero() {
-            let seconds = timeout.as_secs_f64().ceil();
-            let seconds = if seconds.is_finite() && seconds >= 0.0 {
-                format!("{seconds:.0}")
-            } else {
-                String::new()
-            };
-            if !seconds.is_empty() {
-                headers.insert(Arc::from("x-server-timeout"), Arc::from(seconds));
-            }
-        }
-        let url = format!(
-            "{GEMINI_API_BASE_URL}v1beta/models/{}:generateContent",
-            self.model
-        );
-        let http_request = HttpRequest {
-            url: Arc::from(url),
-            options: RequestOptions {
-                method: HttpMethod::Post,
-                headers: Arc::new(headers),
-                body: Some(Arc::from(body)),
-            },
-        };
-        let fetch = fetch_generation::<R>(http_request);
+        let fetch = fetch_generation::<R>(self.http_request(timeout, Arc::from(body)));
         let fields = fields.clone();
         effect! {
             bind;
@@ -296,6 +385,272 @@ impl GeminiTranslator {
             },
         }
     }
+
+    fn http_request(&self, timeout: Duration, body: Arc<[u8]>) -> HttpRequest {
+        let mut headers = HttpHeaders::new();
+        headers.insert(Arc::from("content-type"), Arc::from("application/json"));
+        headers.insert(Arc::from("x-goog-api-key"), self.api_key.clone());
+        if !timeout.is_zero() {
+            let seconds = timeout.as_secs_f64().ceil();
+            let seconds = if seconds.is_finite() && seconds >= 0.0 {
+                format!("{seconds:.0}")
+            } else {
+                String::new()
+            };
+            if !seconds.is_empty() {
+                headers.insert(Arc::from("x-server-timeout"), Arc::from(seconds));
+            }
+        }
+        let url = format!(
+            "{GEMINI_API_BASE_URL}v1beta/models/{}:generateContent",
+            self.model
+        );
+        HttpRequest {
+            url: Arc::from(url),
+            options: RequestOptions {
+                method: HttpMethod::Post,
+                headers: Arc::new(headers),
+                body: Some(body),
+            },
+        }
+    }
+
+    fn translate_prepared<R: HasHttpTransport + Send + Sync + 'static>(
+        &self,
+        timeout: Duration,
+        input: AuthoringTranslationInput,
+        workspace: Arc<PreparedGeminiWorkspace>,
+    ) -> Effect<AuthoringTranslationResult, GeminiTranslatorError, R> {
+        let translator = self.clone();
+        let input = effect_sync! { once; body: move || input, };
+        effect_future! {
+            exit_with_context;
+            body: move |env: Arc<R>, context| {
+                let input = input.clone();
+                let workspace = workspace.clone();
+                let translator = translator.clone();
+                        async move {
+                            let input = match context.run(input, env.clone()).await {
+                                Exit::Success(input) => input,
+                                Exit::Fail(error) => return Exit::Fail(error),
+                                Exit::Die(defect) => return Exit::Die(defect),
+                                Exit::Interrupted => return Exit::Interrupted,
+                                Exit::FinalizationFailed(failure) => return Exit::FinalizationFailed(failure),
+                            };
+                            if context.cancellation().is_requested() {
+                                return Exit::Interrupted;
+                            }
+                            let result = prepare_generation(&workspace, input);
+                            let (body, fields, target) = match result {
+                                Ok(PreparedGeneration::Empty(target_language)) => return Exit::Success(AuthoringTranslationResult {
+                                    target_language, fields: Default::default(),
+                                }),
+                                Ok(PreparedGeneration::Ready { body, fields, target }) => (body, fields, target),
+                                Err(error) => return Exit::Fail(error),
+                            };
+                            let request = translator.http_request(timeout, Arc::from(body.as_slice()));
+                            let response = context.run(fetch_generation(request), env).await;
+                            let outcome = match response {
+                                Exit::Success((status, text)) => {
+                                    if let Err(error) = check_bytes(text.len(), workspace.limits.response_bytes) {
+                                        return Exit::Fail(error);
+                                    }
+                                    match response_result(status, &text, fields.0.as_slice(), &target) {
+                                        Ok(result) => Exit::Success(result),
+                                        Err(error) => Exit::Fail(error),
+                                    }
+                                }
+                                Exit::Fail(error) => Exit::Fail(error),
+                                Exit::Die(defect) => Exit::Die(defect),
+                                Exit::Interrupted => Exit::Interrupted,
+                                Exit::FinalizationFailed(failure) => Exit::FinalizationFailed(failure),
+                            };
+                            // Retain admission through native cleanup and the bounded decoder.
+                            drop(body);
+                            outcome
+                        }
+            },
+        }
+    }
+}
+
+enum PreparedGeneration {
+    Empty(InputBytes),
+    Ready {
+        body: effect::memory::BufferLease<'static>,
+        fields: NormalizedFields,
+        target: InputBytes,
+    },
+}
+
+struct NormalizedFields(SlotLease<'static, FixedVector<'static, AuthoringTranslationField>>);
+impl Drop for NormalizedFields {
+    fn drop(&mut self) {
+        self.0.clear();
+    }
+}
+
+fn check_bytes(length: usize, limit: NonZeroUsize) -> Result<(), GeminiTranslatorError> {
+    if length <= limit.get() {
+        Ok(())
+    } else {
+        Err(GeminiTranslatorError::Memory(MemoryError::ValueTooLarge {
+            requested: Bytes::new(length),
+            capacity: Bytes::new(limit.get()),
+        }))
+    }
+}
+
+fn prepare_generation(
+    workspace: &PreparedGeminiWorkspace,
+    input: AuthoringTranslationInput,
+) -> Result<PreparedGeneration, GeminiTranslatorError> {
+    let mut body = workspace
+        .requests
+        .try_checkout()
+        .map_err(GeminiTranslatorError::Memory)?;
+    let mut field_json = workspace
+        .field_json
+        .try_checkout()
+        .map_err(GeminiTranslatorError::Memory)?;
+    let mut prompt = workspace
+        .prompts
+        .try_checkout()
+        .map_err(GeminiTranslatorError::Memory)?;
+    let mut fields = NormalizedFields(
+        workspace
+            .fields
+            .try_checkout()
+            .map_err(GeminiTranslatorError::Memory)?,
+    );
+
+    let base_bytes = input
+        .scope
+        .len()
+        .checked_add(input.source_language.len())
+        .and_then(|total| total.checked_add(input.target_language.len()))
+        .ok_or(GeminiTranslatorError::Memory(
+            MemoryError::ArithmeticOverflow,
+        ))?;
+    input.fields.with(|input_fields| {
+        if input_fields.len() > workspace.limits.fields.get() {
+            return Err(GeminiTranslatorError::Memory(MemoryError::NoSlot));
+        }
+        let total = input_fields
+            .iter()
+            .try_fold(base_bytes, |total, field| {
+                total
+                    .checked_add(field.name.len())?
+                    .checked_add(field.value.len())?
+                    .checked_add(field.format.len())
+            })
+            .ok_or(GeminiTranslatorError::Memory(
+                MemoryError::ArithmeticOverflow,
+            ))?;
+        check_bytes(total, workspace.limits.input_bytes)?;
+        write_normalized_fields(input_fields, |field| {
+            fields
+                .0
+                .push(field)
+                .map_err(|_| GeminiTranslatorError::Memory(MemoryError::NoSlot))
+        })
+    })?;
+    let target = input.target_language.trim();
+    if fields.0.is_empty() {
+        return Ok(PreparedGeneration::Empty(target));
+    }
+    let source = input.source_language.trim();
+    if source.is_empty() || target.is_empty() {
+        return Err(GeminiTranslatorError::SourceAndTargetRequired);
+    }
+
+    field_json.clear();
+    let mut field_writer = BufferWriter::new(&mut field_json);
+    if let Err(error) = serde_json::to_writer(&mut field_writer, fields.0.as_slice()) {
+        return Err(field_writer.memory_error().map_or_else(
+            || GeminiTranslatorError::FieldsEncode(error.to_string()),
+            GeminiTranslatorError::Memory,
+        ));
+    }
+    let field_text = std::str::from_utf8(field_json.as_slice())
+        .map_err(|error| GeminiTranslatorError::FieldsEncode(error.to_string()))?;
+    let scope = input.scope.trim();
+    let scope = if scope.is_empty() {
+        b"content"
+    } else {
+        scope.as_bytes()
+    };
+    prompt.clear();
+    let mut prompt_writer = BufferWriter::new(&mut prompt);
+    if write_translation_prompt(
+        &crate::byte_text::encoding_text(source.as_bytes()),
+        &crate::byte_text::encoding_text(target.as_bytes()),
+        &crate::byte_text::encoding_text(scope),
+        field_text,
+        &mut prompt_writer,
+    )
+    .is_err()
+    {
+        return Err(prompt_writer.memory_error().map_or_else(
+            || GeminiTranslatorError::RequestEncode("translation prompt formatting".into()),
+            GeminiTranslatorError::Memory,
+        ));
+    }
+
+    let prompt = std::str::from_utf8(prompt.as_slice())
+        .map_err(|error| GeminiTranslatorError::RequestEncode(error.to_string()))?;
+    body.clear();
+    encode_generation_body(prompt, &mut body)?;
+    Ok(PreparedGeneration::Ready {
+        body,
+        fields,
+        target,
+    })
+}
+
+fn encode_generation_body(
+    prompt: &str,
+    buffer: &mut Buffer<'_>,
+) -> Result<(), GeminiTranslatorError> {
+    #[derive(serde::Serialize)]
+    struct Part<'a> {
+        text: &'a str,
+    }
+    #[derive(serde::Serialize)]
+    struct Content<'a> {
+        parts: [Part<'a>; 1],
+        role: &'static str,
+    }
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Configuration {
+        response_mime_type: &'static str,
+        temperature: f32,
+    }
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Generation<'a> {
+        contents: [Content<'a>; 1],
+        generation_config: Configuration,
+    }
+
+    let request = Generation {
+        contents: [Content {
+            parts: [Part { text: prompt }],
+            role: "user",
+        }],
+        generation_config: Configuration {
+            response_mime_type: "application/json",
+            temperature: 0.2,
+        },
+    };
+    let mut writer = BufferWriter::new(buffer);
+    serde_json::to_writer(&mut writer, &request).map_err(|error| {
+        writer.memory_error().map_or_else(
+            || GeminiTranslatorError::RequestEncode(error.to_string()),
+            GeminiTranslatorError::Memory,
+        )
+    })
 }
 
 // Lift one provider failure without requiring `Clone` from the error type.
@@ -323,7 +678,26 @@ fn translation_prompt(
     scope: &str,
     fields_json: &str,
 ) -> String {
-    format!(
+    let mut prompt = String::new();
+    let _ = write_translation_prompt(
+        source_language,
+        target_language,
+        scope,
+        fields_json,
+        &mut prompt,
+    );
+    prompt
+}
+
+fn write_translation_prompt(
+    source_language: &str,
+    target_language: &str,
+    scope: &str,
+    fields_json: &str,
+    output: &mut impl std::fmt::Write,
+) -> std::fmt::Result {
+    write!(
+        output,
         "Translate the provided authoring fields from {source_language} to {target_language}.
 
 Scope: {scope}
@@ -351,9 +725,7 @@ Fields JSON:
 }
 
 /// Fetch the provider response under the caller's HTTP capability.
-fn fetch_generation<R>(
-    http_request: HttpRequest,
-) -> Effect<(u16, String), GeminiTranslatorError, R>
+fn fetch_generation<R>(http_request: HttpRequest) -> Effect<(u16, String), GeminiTranslatorError, R>
 where
     R: HasHttpTransport + Send + Sync + 'static,
 {
@@ -396,7 +768,9 @@ fn response_result(
     target_language: &InputBytes,
 ) -> Result<AuthoringTranslationResult, GeminiTranslatorError> {
     if !(200..300).contains(&status) {
-        return Err(GeminiTranslatorError::Provider(provider_error(status, text)));
+        return Err(GeminiTranslatorError::Provider(provider_error(
+            status, text,
+        )));
     }
     decode_response(text, fields, target_language)
 }
@@ -410,9 +784,8 @@ fn decode_response(
     if text.is_empty() {
         return Err(GeminiTranslatorError::NoContent);
     }
-    let value: Value = serde_json::from_str(text).map_err(|error| {
-        GeminiTranslatorError::ResponseDecode(format!("{error}\n{text}"))
-    })?;
+    let value: Value = serde_json::from_str(text)
+        .map_err(|error| GeminiTranslatorError::ResponseDecode(format!("{error}\n{text}")))?;
     let candidates = match value.get("candidates") {
         None | Some(Value::Null) => &[][..],
         Some(Value::Array(candidates)) => candidates.as_slice(),

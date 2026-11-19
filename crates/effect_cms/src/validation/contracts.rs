@@ -385,213 +385,189 @@ fn map_issue(issue: &SchemaIssue) -> ValidationIssue {
 fn issue_path(issue: &SchemaIssue) -> String {
     let mut parts: Vec<String> = Vec::with_capacity(issue.path().len());
     for segment in issue.path() {
-        match segment {
-            IssueSegment::Field(name)
-            | IssueSegment::Variant(name)
-            | IssueSegment::PropertyName(name) => parts.push(name.to_string()),
-            IssueSegment::Index(index) => parts.push(index.to_string()),
-            IssueSegment::Alternative(_) => {}
+        if let Some(name) = segment.text() {
+            parts.push(name.to_owned());
+        } else if let IssueSegment::Index(index) = segment {
+            parts.push(index.to_string());
         }
     }
     let path = parts.join(".");
-    if let SchemaIssueKind::UnknownField(name) = issue.kind() {
-        if path.is_empty() {
-            return name.to_string();
-        }
-        return format!("{path}.{name}");
+    let unknown = if let SchemaIssueKind::UnknownField(name) = issue.kind() {
+        Some(name.as_ref())
+    } else if let SchemaIssueKind::PreparedUnknownField(name) = issue.kind() {
+        Some(name.as_str())
+    } else {
+        None
+    };
+    match unknown {
+        Some(name) if path.is_empty() => name.to_owned(),
+        Some(name) => format!("{path}.{name}"),
+        None => path,
     }
-    path
 }
+
+pub(super) type DiagnosticLengths = [Option<(&'static str, usize)>; 2];
 
 fn issue_diagnostic(
     kind: &SchemaIssueKind,
-) -> (
-    ValidationIssueCode,
-    BTreeMap<String, ValidationArgument>,
-    String,
-) {
+) -> (ValidationIssueCode, BTreeMap<String, ValidationArgument>, String) {
+    with_issue_diagnostic(kind, |code, message, lengths| {
+        let args = lengths.into_iter().flatten()
+            .map(|(name, value)| (name.to_owned(), length_argument(value)))
+            .collect();
+        (ValidationIssueCode::from(code), args, message.to_string())
+    })
+}
+
+pub(super) fn with_issue_diagnostic<R>(
+    kind: &SchemaIssueKind,
+    visit: impl FnOnce(&'static str, fmt::Arguments<'_>, DiagnosticLengths) -> R,
+) -> R {
+    macro_rules! diagnostic {
+        ($code:expr, $($message:tt)+) => {
+            visit($code, format_args!($($message)+), [None, None])
+        };
+    }
     match kind {
-        SchemaIssueKind::MissingField(name) => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_REQUIRED),
-            BTreeMap::new(),
-            format!("missing required field: {name}"),
+        SchemaIssueKind::Memory(error) => diagnostic!(
+            VALIDATION_ISSUE_SCHEMA, "validation storage refused: {error}",
         ),
-        SchemaIssueKind::UnknownField(name) => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_INVALID_OPTION),
-            BTreeMap::new(),
-            format!("unknown field: {name}"),
+        SchemaIssueKind::MissingField(name) => diagnostic!(
+            VALIDATION_ISSUE_REQUIRED, "missing required field: {name}",
         ),
-        SchemaIssueKind::DuplicateField(name) => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_DUPLICATE),
-            BTreeMap::new(),
-            format!("duplicate field: {name}"),
+        SchemaIssueKind::UnknownField(name) => diagnostic!(
+            VALIDATION_ISSUE_INVALID_OPTION, "unknown field: {name}",
+        ),
+        SchemaIssueKind::PreparedUnknownField(name) => diagnostic!(
+            VALIDATION_ISSUE_INVALID_OPTION, "unknown field: {}", name.as_str(),
+        ),
+        SchemaIssueKind::DuplicateField(name) => diagnostic!(
+            VALIDATION_ISSUE_DUPLICATE, "duplicate field: {name}",
+        ),
+        SchemaIssueKind::PreparedDuplicateField(name) => diagnostic!(
+            VALIDATION_ISSUE_DUPLICATE, "duplicate field: {}", name.as_str(),
         ),
         SchemaIssueKind::LiteralMismatch
         | SchemaIssueKind::InvalidTag
         | SchemaIssueKind::NoAlternative
-        | SchemaIssueKind::AmbiguousAlternatives { .. } => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_INVALID_OPTION),
-            BTreeMap::new(),
-            "value is not one of the permitted values".to_owned(),
+        | SchemaIssueKind::AmbiguousAlternatives { .. } => diagnostic!(
+            VALIDATION_ISSUE_INVALID_OPTION, "value is not one of the permitted values",
         ),
-        SchemaIssueKind::PatternMismatch => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_INVALID_FORMAT),
-            BTreeMap::new(),
-            "value does not match the required format".to_owned(),
+        SchemaIssueKind::PatternMismatch => diagnostic!(
+            VALIDATION_ISSUE_INVALID_FORMAT, "value does not match the required format",
         ),
-        SchemaIssueKind::TypeMismatch { expected, actual } => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_SCHEMA),
-            BTreeMap::new(),
-            format!("expected {expected:?} but received {actual:?}"),
+        SchemaIssueKind::TypeMismatch { expected, actual } => diagnostic!(
+            VALIDATION_ISSUE_SCHEMA, "expected {expected:?} but received {actual:?}",
         ),
-        SchemaIssueKind::VersionMismatch { expected, actual } => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_SCHEMA),
-            BTreeMap::new(),
-            format!("expected version {expected} but received {actual:?}"),
+        SchemaIssueKind::VersionMismatch { expected, actual } => diagnostic!(
+            VALIDATION_ISSUE_SCHEMA, "expected version {expected} but received {actual:?}",
         ),
-        SchemaIssueKind::LengthMismatch { expected, actual } => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_SCHEMA),
-            BTreeMap::new(),
-            format!("expected length {expected} but received {actual}"),
+        SchemaIssueKind::LengthMismatch { expected, actual } => diagnostic!(
+            VALIDATION_ISSUE_SCHEMA, "expected length {expected} but received {actual}",
         ),
-        SchemaIssueKind::OutOfRange => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_SCHEMA),
-            BTreeMap::new(),
-            "numeric value is outside the permitted range".to_owned(),
+        SchemaIssueKind::OutOfRange => diagnostic!(
+            VALIDATION_ISSUE_SCHEMA, "numeric value is outside the permitted range",
         ),
-        SchemaIssueKind::NonFinite => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_SCHEMA),
-            BTreeMap::new(),
-            "numeric value must be finite".to_owned(),
+        SchemaIssueKind::NonFinite => diagnostic!(
+            VALIDATION_ISSUE_SCHEMA, "numeric value must be finite",
         ),
-        SchemaIssueKind::InvalidValue { code } => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_SCHEMA),
-            BTreeMap::new(),
-            format!("invalid value: {code}"),
+        SchemaIssueKind::InvalidValue { code } => diagnostic!(
+            VALIDATION_ISSUE_SCHEMA, "invalid value: {code}",
         ),
-        SchemaIssueKind::Constraint { name, operand } => constraint_diagnostic(name, operand),
-        SchemaIssueKind::JsonSyntax { detail } => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_INVALID_FORMAT),
-            BTreeMap::new(),
-            format!("invalid JSON: {detail}"),
+        SchemaIssueKind::Constraint { name, operand } => with_constraint_diagnostic(name, operand, visit),
+        SchemaIssueKind::JsonSyntax { detail } => diagnostic!(
+            VALIDATION_ISSUE_INVALID_FORMAT, "invalid JSON: {detail}",
         ),
-        SchemaIssueKind::JsonEncoding { detail } => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_INVALID_FORMAT),
-            BTreeMap::new(),
-            format!("value could not be encoded as JSON: {detail}"),
+        SchemaIssueKind::PreparedJsonSyntax { detail } => diagnostic!(
+            VALIDATION_ISSUE_INVALID_FORMAT, "invalid JSON: {}", detail.as_str(),
         ),
-        SchemaIssueKind::UnsupportedRepresentation { kind } => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_SCHEMA),
-            BTreeMap::new(),
-            format!("unsupported representation: {kind}"),
+        SchemaIssueKind::JsonEncoding { detail } => diagnostic!(
+            VALIDATION_ISSUE_INVALID_FORMAT, "value could not be encoded as JSON: {detail}",
         ),
-        SchemaIssueKind::LimitExceeded { resource } => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_SCHEMA),
-            BTreeMap::new(),
-            format!("validation limit exceeded: {resource:?}"),
+        SchemaIssueKind::PreparedJsonEncoding { detail } => diagnostic!(
+            VALIDATION_ISSUE_INVALID_FORMAT, "value could not be encoded as JSON: {}", detail.as_str(),
         ),
-        SchemaIssueKind::ResourceDemand {
-            resource,
-            limit,
-            observed,
-        } => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_SCHEMA),
-            BTreeMap::new(),
-            format!("validation demand {observed} for {resource:?} exceeds limit {limit}"),
+        SchemaIssueKind::UnsupportedRepresentation { kind } => diagnostic!(
+            VALIDATION_ISSUE_SCHEMA, "unsupported representation: {kind}",
         ),
-        SchemaIssueKind::PatternBudget => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_SCHEMA),
-            BTreeMap::new(),
-            "validation pattern budget exceeded".to_owned(),
+        SchemaIssueKind::LimitExceeded { resource } => diagnostic!(
+            VALIDATION_ISSUE_SCHEMA, "validation limit exceeded: {resource:?}",
         ),
-        SchemaIssueKind::InvalidDefinition => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_SCHEMA),
-            BTreeMap::new(),
-            "contract definition is invalid".to_owned(),
+        SchemaIssueKind::ResourceDemand { resource, limit, observed } => diagnostic!(
+            VALIDATION_ISSUE_SCHEMA, "validation demand {observed} for {resource:?} exceeds limit {limit}",
         ),
-        SchemaIssueKind::MissingValidator => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_SCHEMA),
-            BTreeMap::new(),
-            "contract validation path is unavailable".to_owned(),
+        SchemaIssueKind::PatternBudget => diagnostic!(
+            VALIDATION_ISSUE_SCHEMA, "validation pattern budget exceeded",
         ),
-        SchemaIssueKind::InputConsumed => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_SCHEMA),
-            BTreeMap::new(),
-            "validation input was already consumed".to_owned(),
+        SchemaIssueKind::InvalidDefinition => diagnostic!(
+            VALIDATION_ISSUE_SCHEMA, "contract definition is invalid",
         ),
-        SchemaIssueKind::MergeConflict => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_SCHEMA),
-            BTreeMap::new(),
-            "encoded values conflict".to_owned(),
+        SchemaIssueKind::MissingValidator => diagnostic!(
+            VALIDATION_ISSUE_SCHEMA, "contract validation path is unavailable",
         ),
-        SchemaIssueKind::Multiple => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_SCHEMA),
-            BTreeMap::new(),
-            "multiple contract issues".to_owned(),
+        SchemaIssueKind::MissingWriter => diagnostic!(
+            VALIDATION_ISSUE_SCHEMA, "contract encoding path is unavailable",
+        ),
+        SchemaIssueKind::InputConsumed => diagnostic!(
+            VALIDATION_ISSUE_SCHEMA, "validation input was already consumed",
+        ),
+        SchemaIssueKind::MergeConflict => diagnostic!(
+            VALIDATION_ISSUE_SCHEMA, "encoded values conflict",
+        ),
+        SchemaIssueKind::Multiple => diagnostic!(
+            VALIDATION_ISSUE_SCHEMA, "multiple contract issues",
         ),
     }
 }
 
-fn constraint_diagnostic(
+fn with_constraint_diagnostic<R>(
     name: &str,
     operand: &str,
-) -> (
-    ValidationIssueCode,
-    BTreeMap<String, ValidationArgument>,
-    String,
-) {
+    visit: impl FnOnce(&'static str, fmt::Arguments<'_>, DiagnosticLengths) -> R,
+) -> R {
     match name {
         "stringLength" => match string_length_limits(operand) {
-            Some((minimum, _)) if minimum > 0 => {
-                let mut args = BTreeMap::new();
-                args.insert("min".to_owned(), length_argument(minimum));
-                (
-                    ValidationIssueCode::from(VALIDATION_ISSUE_MIN_LENGTH),
-                    args,
-                    format!("value must contain at least {minimum} rune(s)"),
-                )
-            }
-            Some((_, maximum)) => {
-                let mut args = BTreeMap::new();
-                args.insert("max".to_owned(), length_argument(maximum));
-                (
-                    ValidationIssueCode::from(VALIDATION_ISSUE_MAX_LENGTH),
-                    args,
-                    format!("value must contain at most {maximum} rune(s)"),
-                )
-            }
-            None => (
-                ValidationIssueCode::from(VALIDATION_ISSUE_SCHEMA),
-                BTreeMap::new(),
-                format!("string length constraint failed: {operand}"),
+            Some((minimum, _)) if minimum > 0 => visit(
+                VALIDATION_ISSUE_MIN_LENGTH,
+                format_args!("value must contain at least {minimum} rune(s)"),
+                [Some(("min", minimum)), None],
+            ),
+            Some((_, maximum)) => visit(
+                VALIDATION_ISSUE_MAX_LENGTH,
+                format_args!("value must contain at most {maximum} rune(s)"),
+                [Some(("max", maximum)), None],
+            ),
+            None => visit(
+                VALIDATION_ISSUE_SCHEMA,
+                format_args!("string length constraint failed: {operand}"),
+                [None, None],
             ),
         },
-        "minimum" | "exclusiveMinimum" => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_SCHEMA),
-            BTreeMap::new(),
-            format!("value must be at least {operand}"),
+        "minimum" | "exclusiveMinimum" => visit(
+            VALIDATION_ISSUE_SCHEMA,
+            format_args!("value must be at least {operand}"),
+            [None, None],
         ),
-        "maximum" | "exclusiveMaximum" => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_SCHEMA),
-            BTreeMap::new(),
-            format!("value must be at most {operand}"),
+        "maximum" | "exclusiveMaximum" => visit(
+            VALIDATION_ISSUE_SCHEMA,
+            format_args!("value must be at most {operand}"),
+            [None, None],
         ),
         "arrayLength" | "propertyCount" => {
-            let mut args = BTreeMap::new();
-            if let Some((minimum, maximum)) = string_length_limits(operand) {
-                args.insert("min".to_owned(), length_argument(minimum));
-                args.insert("max".to_owned(), length_argument(maximum));
-            }
-            (
-                ValidationIssueCode::from(VALIDATION_ISSUE_SCHEMA),
-                args,
-                format!("{name} constraint failed: {operand}"),
+            let lengths = string_length_limits(operand)
+                .map_or([None, None], |(minimum, maximum)| [
+                    Some(("max", maximum)), Some(("min", minimum)),
+                ]);
+            visit(
+                VALIDATION_ISSUE_SCHEMA,
+                format_args!("{name} constraint failed: {operand}"),
+                lengths,
             )
         }
-        _ => (
-            ValidationIssueCode::from(VALIDATION_ISSUE_SCHEMA),
-            BTreeMap::new(),
-            format!("{name} constraint failed: {operand}"),
+        _ => visit(
+            VALIDATION_ISSUE_SCHEMA,
+            format_args!("{name} constraint failed: {operand}"),
+            [None, None],
         ),
     }
 }

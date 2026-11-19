@@ -8,7 +8,11 @@ use std::pin::pin;
 use std::sync::{Arc, Mutex};
 
 mod internal;
+mod prepared;
 pub use internal::StreamBufferOptions;
+pub use prepared::{
+    PreparedChunk, PreparedChunkPool, PreparedChunkValues, PreparedStream, PreparedStreamPull,
+};
 
 /// A batch of stream items transferred together from a reader.
 ///
@@ -543,7 +547,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Stream<A, E
                         }
                     };
                     let on_error = Arc::clone(&on_error);
-                    crate::internal::runtime::Step::Suspended(Box::pin(async move {
+                    crate::internal::runtime::Step::suspended(Box::pin(async move {
                         let work = async {
                             let lock = pin!(stream.lock());
                             let cancelled = pin!(context.cancellation.cancelled());

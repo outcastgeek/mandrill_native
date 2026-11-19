@@ -87,7 +87,7 @@ fn typed_defect_identity_survives_finalization_and_error_mapping() {
         Exit::FinalizationFailed(Finalization {
             primary: PrimaryOutcome::Failed(Translated::Rejected),
             first: CleanupFailure::ReleaseDefect(Defect::from_panic(Box::new(PanicPayload))),
-            rest: Vec::new(),
+            rest: effect::CleanupFailures::default(),
         })
     );
 }

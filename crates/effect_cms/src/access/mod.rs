@@ -49,6 +49,7 @@ mod flow;
 mod policy;
 mod principal;
 mod responses;
+mod work;
 
 pub use self::flow::{
     AccessOutcome, ManagedSurfaceAccessGuard, PrincipalAccessGuard, PrincipalAccessGuardOptions,
@@ -70,6 +71,7 @@ pub use self::responses::{
     new_translated_status_access_response,
 };
 pub(crate) use self::responses::{hex_escape_non_ascii, resolved_redirect_target};
+pub use self::work::{AccessWorkLimits, PreparedAccessWork};
 
 /// Compile-time witness that the guard flow keeps the owner's effect and outcome
 /// shapes for any caller error family and environment.

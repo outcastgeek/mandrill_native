@@ -11,12 +11,14 @@ use crate::{
     localization::{IntoLocalization, PinnedCatalog},
     security::Security,
 };
-use crate::{effect_die, effect_future, effect_map, effect_sync, effect_try_sync};
+use crate::{effect_die, effect_future, effect_map, effect_map_error, effect_sync, effect_try_sync};
 use effect::effect;
+use effect::memory::Admission;
 use effect::{Effect, Exit, HasCancellation, HasClock, HasTaskSpawner, Scope, effect_scope};
 use effect_server::{
-    HasRequest, HasTokio, HttpProtocols, Pipeline, Request, RequestBinding, RequestCompletion,
-    RequestHook, Router, Server, ServerError, ServerHost, ServerPolicy,
+    HasRequest, HasTokio, HttpProtocols, Pipeline, PreparedEndpointBytePools, PreparedHostResult,
+    PreparedServer, Request, RequestBinding, RequestCompletion, RequestHook, Router, Server,
+    ServerError, ServerHost, ServerPolicy, StaticOverloadReply,
 };
 use effect_server::{pipeline, router, server};
 use std::net::SocketAddr;
@@ -39,6 +41,8 @@ type Observer<E, R> =
 /// Selected request projection retaining startup capabilities and the sole Effect environment.
 type RequestEnvironment<C, E, R> =
     Arc<dyn Fn(Arc<C>, Request) -> Effect<Arc<R>, E, R> + Send + Sync>;
+type PreparedServerFactory<E, R> =
+    Arc<dyn Fn(Server<E, R>) -> Result<PreparedServer<E, R>, ServerError> + Send + Sync>;
 
 /// Reusable complete Web definition. C is immutable startup capability data; R
 /// remains the sole environment/provider selection in every application Effect.
@@ -78,6 +82,115 @@ pub struct Web<C: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'st
     configuration: Vec<WebError>,
     /// Selected immutable finite output definitions; engines stay in scoped sources.
     output_definition: Option<crate::output_cache::OutputCacheDefinition>,
+}
+
+/// A Web description that prepares the host's physical owners before traffic.
+#[must_use]
+pub struct PreparedWeb<C: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> {
+    definition: Web<C, E, R>,
+    prepare_server: PreparedServerFactory<E, R>,
+    admission: Option<Arc<Admission<'static, 1>>>,
+    byte_pools: Option<Arc<PreparedEndpointBytePools>>,
+    overload: Option<StaticOverloadReply>,
+}
+impl<C: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Clone for PreparedWeb<C, E, R> {
+    fn clone(&self) -> Self {
+        Self {
+            definition: self.definition.clone(),
+            prepare_server: self.prepare_server.clone(),
+            admission: self.admission.clone(),
+            byte_pools: self.byte_pools.clone(),
+            overload: self.overload,
+        }
+    }
+}
+
+impl<C: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> PreparedWeb<C, E, R> {
+    /// Apply a shared work-unit limit to actual prepared request-control records.
+    pub fn with_admission(mut self, admission: Admission<'static, 1>) -> Self {
+        self.admission = Some(Arc::new(admission));
+        self
+    }
+    /// Select physical byte slots for shared request work across middleware and endpoints.
+    pub fn with_byte_pools(mut self, pools: Arc<PreparedEndpointBytePools>) -> Self {
+        self.byte_pools = Some(pools);
+        self
+    }
+
+    /// Select the static response for prepared capacity refusal.
+    pub fn with_overload(mut self, reply: StaticOverloadReply) -> Self {
+        self.overload = Some(reply);
+        self
+    }
+
+    /// Use the configured host in the original Web startup scope.
+    /// The returned guard retains the host's terminal owners and complete Exit.
+    pub fn with_host<A: Send + 'static>(
+        &self,
+        use_host: impl Fn(ServerHost) -> Effect<A, E, R> + Send + Sync + 'static,
+    ) -> Effect<PreparedHostResult<A, E, R>, E, R>
+    where
+        R: HasRequest + HasClock + HasTaskSpawner + HasCancellation + HasTokio,
+    {
+        let definition = self.definition.clone();
+        let prepare_server = self.prepare_server.clone();
+        let admission = self.admission.clone();
+        let byte_pools = self.byte_pools.clone();
+        let overload = self.overload;
+        let use_host = Arc::new(use_host);
+        effect_scope! {
+            body |scope: Scope<E>| {
+                let definition = definition.clone();
+                let prepare_server = prepare_server.clone();
+                let admission = admission.clone();
+                let byte_pools = byte_pools.clone();
+                let use_host = use_host.clone();
+                let errors = definition.errors.clone();
+                let server = definition.prepare(scope)?;
+                let host = effect_try_sync! {
+                    once;
+                    body: move || {
+                        let server = match overload {
+                            Some(reply) => server! { source: server, overload(reply) },
+                            None => server,
+                        };
+                        let mut prepared = prepare_server(server).map_err(web_server_error)?;
+                        if !prepared.has_prepared_request_storage() {
+                            return Err(WebError::Configuration("prepared request storage required".into()));
+                        }
+                        if let Some(admission) = admission {
+                            let admission = admission.try_clone().map_err(WebError::Memory)?;
+                            prepared = prepared.with_request_control_admission(admission)
+                                .map_err(WebError::Memory)?;
+                        }
+                        if let Some(pools) = byte_pools {
+                            prepared = prepared.with_request_byte_pools(pools).map_err(WebError::Memory)?;
+                        }
+                        prepared.with_host(move |host| use_host(host))
+                            .map_err(WebError::Memory)
+                    },
+                    on_error: move |error| errors(error),
+                }?;
+                effect_map_error! { program: host, map: |never| match never {}, }?
+            },
+        }
+    }
+
+    /// Serve until root cancellation, retaining the complete guarded outcome.
+    pub fn run(&self) -> Effect<PreparedHostResult<(), E, R>, E, R>
+    where
+        R: HasRequest + HasClock + HasTaskSpawner + HasCancellation + HasTokio,
+    {
+        self.with_host(wait_for_cancellation)
+    }
+}
+
+pub(crate) fn web_server_error(error: ServerError) -> WebError {
+    if let ServerError::Memory(error) = error {
+        WebError::Memory(error)
+    } else {
+        WebError::Configuration(error.to_string())
+    }
 }
 impl<C: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Clone for Web<C, E, R> {
     /// Share inert startup/route/policy descriptions, never active host/request values.
@@ -176,6 +289,23 @@ impl<C: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Web<
             installers: Vec::new(),
             configuration: Vec::new(),
             output_definition: None,
+        }
+    }
+    /// Select a typed startup factory for this definition's prepared Server.
+    /// The factory receives the fully configured server before listener creation.
+    pub fn with_memory(
+        self,
+        prepare_server: impl Fn(Server<E, R>) -> Result<PreparedServer<E, R>, ServerError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> PreparedWeb<C, E, R> {
+        PreparedWeb {
+            definition: self,
+            prepare_server: Arc::new(prepare_server),
+            admission: None,
+            byte_pools: None,
+            overload: None,
         }
     }
     /// Select one checked reusable browser/security description, validated at startup.
@@ -388,7 +518,10 @@ impl<C: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Web<
                                    Ok(security) => security.clone(),
                                    Err(error) => return Exit::Fail((definition.errors)(error.clone())),
                                };
-                               server = install_security(server, security, definition.errors.clone());
+                               server = match install_security(server, security, definition.errors.clone()) {
+                                   Ok(server) => server,
+                                   Err(error) => return Exit::Fail((definition.errors)(error)),
+                               };
                            }
                            for feature in &definition.features {
                                let hooks = match context
@@ -483,12 +616,16 @@ impl<C: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Web<
     where
         R: HasRequest + HasClock + HasTaskSpawner + HasCancellation + HasTokio,
     {
-        self.with_host(|_| {
-            effect_future! {
-                with_env; body: |environment: Arc<R>, _| async move {
-                environment.cancellation().cancelled().await
-            }, }
-        })
+        self.with_host(wait_for_cancellation)
+    }
+}
+fn wait_for_cancellation<E: Send + 'static, R: HasCancellation + Send + Sync + 'static>(
+    _: ServerHost,
+) -> Effect<(), E, R> {
+    effect_future! {
+        with_env; body: |environment: Arc<R>, _| async move {
+            environment.cancellation().cancelled().await
+        },
     }
 }
 /// Install typed security onto actual Server hooks. Response metadata is staged
@@ -497,7 +634,13 @@ fn install_security<E: Send + 'static, R: HasRequest + Send + Sync + 'static>(
     mut server: Server<E, R>,
     security: Arc<Security<E, R>>,
     errors: Arc<dyn Fn(WebError) -> E + Send + Sync>,
-) -> Server<E, R> {
+) -> Result<Server<E, R>, WebError> {
+    let static_csp = security.csp.as_ref()
+        .filter(|csp| !csp.needs_nonce())
+        .map(|csp| csp.header(None))
+        .transpose()?;
+    let static_hsts = security.hsts.map(crate::security::HstsPolicy::header).transpose()?;
+    let static_headers = Arc::new((static_csp, static_hsts));
     let native_security = security.clone();
     server = server! {
         source: server,
@@ -519,27 +662,25 @@ fn install_security<E: Send + 'static, R: HasRequest + Send + Sync + 'static>(
     };
     let routing_security = security.clone();
     let routing_errors = errors.clone();
-    server = server! {
-        source: server,
-        before_routing(move |routing, _| {
+    let needs_updated_head = security.method_override.is_some() && security.forwarded_from.is_some();
+    server = server.before_routing_checked(needs_updated_head, move |routing, request, updated, _| {
         // Mutable head and encoded body move once into the native stage. The Server
         // supplies the original interpreter, socket peer, cancellation and reactor.
-        let routing = std::sync::Mutex::new(Some(routing));
+        let inputs = std::sync::Mutex::new(Some((routing, request, updated)));
         let security = routing_security.clone();
         let errors = routing_errors.clone();
         effect_future! {
             exit_with_context; body: move |env, context| {
-            let routing = routing
+            let inputs = inputs
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
             let security = security.clone();
             let errors = errors.clone();
             async move {
-                let Some(mut routing) = routing else {
+                let Some((mut routing, request, updated)) = inputs else {
                     return Exit::Die(effect::Defect::new("web routing stage already consumed"));
                 };
-                let request = routing.request();
                 if let Some(forwarding) = &security.forwarded_from {
                     let peer = request
                         .with_extensions(|extensions| extensions.get::<SocketAddr>().copied());
@@ -570,21 +711,35 @@ fn install_security<E: Send + 'static, R: HasRequest + Send + Sync + 'static>(
                     request.insert_extension(nonce);
                 }
                 if let Some(override_policy) = &security.method_override {
-                    match override_policy.resolve(&routing.request()).await {
+                    let request = match updated {
+                        Some(updated) => match updated.publish(&routing) {
+                            Ok(request) => request,
+                            Err(error) => return Exit::Success(Err(error)),
+                        },
+                        None => request,
+                    };
+                    match override_policy.resolve(&request).await {
                         Ok(Some(method)) => routing.parts_mut().method = method,
                         Ok(None) => {}
-                        Err(_) => {
+                        Err(error) => {
+                            let reported = if let ServerError::SharedInput(shared) = &error {
+                                shared.as_ref()
+                            } else {
+                                &error
+                            };
+                            if let ServerError::Memory(reason) = reported {
+                                return Exit::Success(Err(*reason));
+                            }
                             return Exit::Fail(errors(WebError::Metadata(
                                 "method override input".into(),
                             )));
                         }
                     }
                 }
-                Exit::Success(routing)
+                Exit::Success(Ok(routing))
             }
         }, }
-        }),
-    };
+    });
     let response_security = security.clone();
     let response_errors = errors.clone();
     server = server! {
@@ -592,6 +747,7 @@ fn install_security<E: Send + 'static, R: HasRequest + Send + Sync + 'static>(
            after_response(move |request, response| {
            let security = response_security.clone();
            let errors = response_errors.clone();
+           let static_headers = static_headers.clone();
            let present = request
                .with_extensions(|extensions| extensions.get::<crate::csp::ResponseNonce>().cloned());
            let nonce = match present {
@@ -621,7 +777,16 @@ fn install_security<E: Send + 'static, R: HasRequest + Send + Sync + 'static>(
                let Some(mut response) = response else {
                    return effect_die! { defect: effect::Defect::new("web response wrapper already consumed"), };
                };
-               match security.wrap_headers(response.headers_mut(), nonce.as_ref(), secure) {
+               let headers = security.wrap_headers_with(response.headers_mut(), secure, |csp| {
+                   if let Some(header) = &static_headers.0 {
+                       return Ok(header.clone());
+                   }
+                   match request.take_prepared_response_header_buffer().map_err(web_server_error)? {
+                       Some(buffer) => csp.header_prepared(nonce.as_ref(), buffer),
+                       None => csp.header(nonce.as_ref()),
+                   }
+               }, || Ok(static_headers.1.clone()));
+               match headers {
                    Ok(()) => effect_try_sync! { once; body: { let __dsl_result = Ok(response); move || __dsl_result }, on_error: ::core::convert::identity, },
                    Err(error) => effect_try_sync! { once; body: { let __dsl_result = Err(errors(error)); move || __dsl_result }, on_error: ::core::convert::identity, },
                }
@@ -680,10 +845,10 @@ fn install_security<E: Send + 'static, R: HasRequest + Send + Sync + 'static>(
             };
         }
     }
-    server! {
+    Ok(server! {
         source: server,
         middleware(guards),
-    }
+    })
 }
 
 /// Apply only verified forwarding to the actual native routing head. Header/URI
@@ -713,13 +878,9 @@ fn forwarded_head(
         );
     }
     if parts.scheme.is_some() && parts.authority.is_none() {
-        let values = routing
-            .parts()
-            .headers
-            .get_all(http::header::HOST)
-            .iter()
-            .collect::<Vec<_>>();
-        let [value] = values.as_slice() else {
+        let hosts = routing.parts().headers.get_all(http::header::HOST);
+        let mut values = hosts.iter();
+        let (Some(value), None) = (values.next(), values.next()) else {
             return Err(WebError::Metadata("forwarded native Host".into()));
         };
         parts.authority = Some(

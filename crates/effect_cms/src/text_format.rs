@@ -1,142 +1,330 @@
 //! Percent-style formatting for explicitly supplied string operands.
 
-use std::fmt::Write as _;
+use std::fmt;
 
-fn quote(value: &str, ascii: bool, raw: bool) -> String {
-    if raw && value.chars().all(|c| c != '`' && c != '\u{feff}' && (c == '\t' || (c >= ' ' && c != '\u{7f}'))) {
-        return format!("`{value}`");
+#[expect(
+    clippy::expect_used,
+    reason = "the constant printable-character expression is reviewed"
+)]
+fn quote(output: &mut dyn fmt::Write, value: &str, ascii: bool, raw: bool) -> fmt::Result {
+    if raw
+        && value
+            .chars()
+            .all(|c| c != '`' && c != '\u{feff}' && (c == '\t' || (c >= ' ' && c != '\u{7f}')))
+    {
+        return write!(output, "`{value}`");
     }
-    static PRINTABLE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
-        regex::Regex::new(r"^[\p{L}\p{M}\p{N}\p{P}\p{S} ]$").expect("printable Unicode categories"));
-    let mut out = String::from("\"");
+    static PRINTABLE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^[\p{L}\p{M}\p{N}\p{P}\p{S} ]$").expect("printable Unicode categories")
+    });
+    output.write_char('"')?;
     for c in value.chars() {
         match c {
-            '"' => out.push_str("\\\""), '\\' => out.push_str("\\\\"),
-            '\u{7}' => out.push_str("\\a"), '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"), '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"), '\t' => out.push_str("\\t"), '\u{b}' => out.push_str("\\v"),
+            '"' => output.write_str("\\\"")?,
+            '\\' => output.write_str("\\\\")?,
+            '\u{7}' => output.write_str("\\a")?,
+            '\u{8}' => output.write_str("\\b")?,
+            '\u{c}' => output.write_str("\\f")?,
+            '\n' => output.write_str("\\n")?,
+            '\r' => output.write_str("\\r")?,
+            '\t' => output.write_str("\\t")?,
+            '\u{b}' => output.write_str("\\v")?,
             _ => {
                 let mut encoded = [0; 4];
-                if (!ascii || c.is_ascii()) && PRINTABLE.is_match(c.encode_utf8(&mut encoded)) { out.push(c); }
-                else if (c as u32) < 0x20 || c == '\u{7f}' { let _ = write!(out, "\\x{:02x}", c as u32); }
-                else if (c as u32) <= 0xffff { let _ = write!(out, "\\u{:04x}", c as u32); }
-                else { let _ = write!(out, "\\U{:08x}", c as u32); }
+                if (!ascii || c.is_ascii()) && PRINTABLE.is_match(c.encode_utf8(&mut encoded)) {
+                    output.write_char(c)?;
+                } else if (c as u32) < 0x20 || c == '\u{7f}' {
+                    write!(output, "\\x{:02x}", c as u32)?;
+                } else if (c as u32) <= 0xffff {
+                    write!(output, "\\u{:04x}", c as u32)?;
+                } else {
+                    write!(output, "\\U{:08x}", c as u32)?;
+                }
             }
         }
     }
-    out.push('"');
-    out
+    output.write_char('"')
 }
 
-fn padded(value: String, width: Option<usize>, left: bool, zero: bool) -> String {
-    let count = width.unwrap_or_default().saturating_sub(value.chars().count());
-    let pad = if zero && !left { "0" } else { " " }.repeat(count);
-    if left { value + &pad } else { pad + &value }
-}
-
-fn number(chars: &[char], at: &mut usize) -> Option<usize> {
-    let start = *at;
-    let mut value = 0usize;
-    while let Some(c) = chars.get(*at).filter(|c| c.is_ascii_digit()) {
-        if value > 1_000_000 { *at = chars.len(); return None; }
-        value = value.saturating_mul(10).saturating_add(*c as usize - '0' as usize);
-        *at += 1;
+#[derive(Default)]
+struct CharCount(usize);
+impl fmt::Write for CharCount {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.0 = self.0.checked_add(text.chars().count()).ok_or(fmt::Error)?;
+        Ok(())
     }
-    (start != *at).then_some(value)
 }
 
-fn index(chars: &[char], at: &mut usize, next: &mut usize, reordered: &mut bool, valid: &mut bool, count: usize) -> bool {
-    if chars.get(*at) != Some(&'[') { return false; }
-    *reordered = true;
-    let start = *at;
-    *at += 1;
-    if chars.len() - start < 3 { *valid = false; return false; }
-    if let Some(close) = chars[*at..].iter().position(|c| *c == ']') {
-        let close = *at + close;
-        let value = number(&chars[..close], at);
-        let parsed = value.is_some() && *at == close;
-        if let Some(value)=value.filter(|value|parsed && *value>0 && *value<=count) { *next=value-1; } else { *valid=false; }
-        *at = close + 1;
-        parsed
-    } else { *at = start + 1; *valid = false; false }
+fn padding(output: &mut dyn fmt::Write, mut count: usize, zero: bool) -> fmt::Result {
+    let block = if zero {
+        "00000000000000000000000000000000"
+    } else {
+        "                                "
+    };
+    while count >= block.len() {
+        output.write_str(block)?;
+        count -= block.len();
+    }
+    output.write_str(block.get(..count).ok_or(fmt::Error)?)
+}
+
+fn write_padded(
+    output: &mut dyn fmt::Write,
+    width: Option<usize>,
+    left: bool,
+    zero: bool,
+    render: impl Fn(&mut dyn fmt::Write) -> fmt::Result,
+) -> fmt::Result {
+    let Some(width) = width else {
+        return render(output);
+    };
+    let mut size = CharCount::default();
+    render(&mut size)?;
+    let count = width.saturating_sub(size.0);
+    if left {
+        render(output)?;
+        padding(output, count, false)
+    } else {
+        padding(output, count, zero)?;
+        render(output)
+    }
+}
+
+fn next(input: &mut &str) -> Option<char> {
+    let character = input.chars().next()?;
+    *input = input.get(character.len_utf8()..)?;
+    Some(character)
+}
+
+fn strip(input: &mut &str, prefix: char) -> bool {
+    if let Some(rest) = input.strip_prefix(prefix) {
+        *input = rest;
+        true
+    } else {
+        false
+    }
+}
+
+fn number(input: &mut &str) -> Option<usize> {
+    let initial = *input;
+    let mut value = 0usize;
+    while let Some(digit) = input.as_bytes().first().copied().filter(u8::is_ascii_digit) {
+        if value > 1_000_000 {
+            *input = "";
+            return None;
+        }
+        value = value
+            .saturating_mul(10)
+            .saturating_add(usize::from(digit - b'0'));
+        let _ = next(input);
+    }
+    (initial.len() != input.len()).then_some(value)
+}
+
+struct Operand {
+    next: usize,
+    reordered: bool,
+}
+
+fn index(input: &mut &str, operand: &mut Operand, valid: &mut bool, count: usize) -> bool {
+    if !strip(input, '[') {
+        return false;
+    }
+    operand.reordered = true;
+    if input.chars().take(2).count() < 2 {
+        *valid = false;
+        return false;
+    }
+    let Some((mut digits, tail)) = input.split_once(']') else {
+        *valid = false;
+        return false;
+    };
+    let value = number(&mut digits);
+    let parsed = value.is_some() && digits.is_empty();
+    if let Some(value) = value.filter(|value| parsed && *value > 0 && *value <= count) {
+        operand.next = value - 1;
+    } else {
+        *valid = false;
+    }
+    *input = tail;
+    parsed
+}
+
+fn precision_prefix(value: &str, precision: Option<usize>) -> &str {
+    let Some(limit) = precision else { return value };
+    let end = value
+        .char_indices()
+        .nth(limit)
+        .map_or(value.len(), |(start, _)| start);
+    value.get(..end).unwrap_or(value)
+}
+
+#[derive(Default)]
+struct Flags {
+    left: bool,
+    zero: bool,
+    sharp: bool,
+    plus: bool,
+    space: bool,
+}
+impl Flags {
+    fn read(input: &mut &str) -> Self {
+        let mut flags = Self::default();
+        while let Some(character) = input.chars().next() {
+            match character {
+                '-' => flags.left = true,
+                '0' => flags.zero = true,
+                '#' => flags.sharp = true,
+                '+' => flags.plus = true,
+                ' ' => flags.space = true,
+                _ => break,
+            }
+            let _ = next(input);
+        }
+        flags
+    }
 }
 
 pub(crate) fn format_one_string(label: &str, language: &str) -> String {
-    format_strings(label,&[language])
+    format_strings(label, &[language])
 }
 
 pub(crate) fn format_strings(label: &str, arguments: &[&str]) -> String {
-    let chars: Vec<char> = label.chars().collect();
-    let mut out = String::new();
-    let mut at = 0;
-    let mut next = 0;
-    let mut reordered = false;
-    while at < chars.len() {
-        if chars[at] != '%' { out.push(chars[at]); at += 1; continue; }
-        at += 1;
-        let (mut left, mut zero, mut sharp, mut plus, mut space) = (false, false, false, false, false);
-        while let Some(c) = chars.get(at) {
-            match c { '-' => left = true, '0' => zero = true, '#' => sharp = true, '+' => plus = true, ' ' => space = true, _ => break }
-            at += 1;
+    let mut output = String::new();
+    let _ = write_format_strings(label, arguments, &mut output);
+    output
+}
+
+/// Format directly into the selected destination, without a temporary quoted,
+/// padded, or hexadecimal operand. A finite writer can reject any expansion.
+pub(crate) fn write_format_strings(
+    mut input: &str,
+    arguments: &[&str],
+    output: &mut dyn fmt::Write,
+) -> fmt::Result {
+    let mut operand = Operand {
+        next: 0,
+        reordered: false,
+    };
+    while let Some(character) = next(&mut input) {
+        if character != '%' {
+            output.write_char(character)?;
+            continue;
         }
+        let flags = Flags::read(&mut input);
         let mut valid = true;
-        let mut after_index = index(&chars, &mut at, &mut next, &mut reordered, &mut valid, arguments.len());
-        let width = if chars.get(at) == Some(&'*') {
-            at += 1; next += 1; after_index = false; out.push_str("%!(BADWIDTH)"); None
+        let mut after_index = index(&mut input, &mut operand, &mut valid, arguments.len());
+        let width = if strip(&mut input, '*') {
+            operand.next = operand.next.saturating_add(1);
+            after_index = false;
+            output.write_str("%!(BADWIDTH)")?;
+            None
         } else {
-            let width = number(&chars, &mut at);
-            if after_index && width.is_some() { valid = false; }
+            let width = number(&mut input);
+            if after_index && width.is_some() {
+                valid = false;
+            }
             width
         };
-        let precision = if at + 1 < chars.len() && chars.get(at) == Some(&'.') {
-            at += 1;
-            if after_index { valid = false; }
-            after_index = index(&chars, &mut at, &mut next, &mut reordered, &mut valid, arguments.len());
-            if chars.get(at) == Some(&'*') {
-                at += 1; next += 1; after_index = false; out.push_str("%!(BADPREC)"); None
-            } else { Some(number(&chars, &mut at).unwrap_or_default()) }
-        } else { None };
-        if !after_index { index(&chars, &mut at, &mut next, &mut reordered, &mut valid, arguments.len()); }
-        let Some(&verb) = chars.get(at) else { out.push_str("%!(NOVERB)"); break; };
-        at += 1;
-        if verb == '%' { out.push('%'); continue; }
-        if !valid { let _ = write!(out, "%!{verb}(BADINDEX)"); continue; }
-        if next >= arguments.len() { let _ = write!(out, "%!{verb}(MISSING)"); continue; }
-        let language=arguments[next];
-        next += 1;
-        let text: String = language.chars().take(precision.unwrap_or(usize::MAX)).collect();
-        let rendered = match verb {
-            's' => text,
-            'v' if !sharp => text,
-            'v' => quote(&text, false, false),
-            'q' => quote(&text, plus, sharp),
-            'T' => "string".chars().take(precision.unwrap_or(usize::MAX)).collect(),
-            'x' | 'X' => {
-                let bytes = &language.as_bytes()[..language.len().min(precision.unwrap_or(usize::MAX))];
-                let prefix = if verb == 'x' { "0x" } else { "0X" };
-                let mut hex = String::new();
-                for (i, byte) in bytes.iter().enumerate() {
-                    if space && i > 0 { hex.push(' '); }
-                    if sharp && (space || i == 0) { hex.push_str(prefix); }
-                    if verb == 'x' { let _ = write!(hex, "{byte:02x}"); } else { let _ = write!(hex, "{byte:02X}"); }
+        let precision =
+            if input.get(1..).is_some_and(|tail| !tail.is_empty()) && strip(&mut input, '.') {
+                if after_index {
+                    valid = false;
                 }
-                hex
-            }
-            _ => {
-                let value = if sharp && verb == 'w' { quote(&text, false, false) } else { text };
-                let value = padded(value, width, left, zero);
-                let _ = write!(out, "%!{verb}(string={value})");
-                continue;
+                after_index = index(&mut input, &mut operand, &mut valid, arguments.len());
+                if strip(&mut input, '*') {
+                    operand.next = operand.next.saturating_add(1);
+                    after_index = false;
+                    output.write_str("%!(BADPREC)")?;
+                    None
+                } else {
+                    Some(number(&mut input).unwrap_or_default())
+                }
+            } else {
+                None
+            };
+        if !after_index {
+            index(&mut input, &mut operand, &mut valid, arguments.len());
+        }
+        let Some(verb) = next(&mut input) else {
+            output.write_str("%!(NOVERB)")?;
+            break;
+        };
+        if verb == '%' {
+            output.write_char('%')?;
+            continue;
+        }
+        if !valid {
+            write!(output, "%!{verb}(BADINDEX)")?;
+            continue;
+        }
+        let Some(&argument) = arguments.get(operand.next) else {
+            write!(output, "%!{verb}(MISSING)")?;
+            continue;
+        };
+        operand.next += 1;
+        let render = |output: &mut dyn fmt::Write| {
+            let text = precision_prefix(argument, precision);
+            match verb {
+                's' => output.write_str(text),
+                'v' if !flags.sharp => output.write_str(text),
+                'v' => quote(output, text, false, false),
+                'q' => quote(output, text, flags.plus, flags.sharp),
+                'T' => output.write_str(precision_prefix("string", precision)),
+                'x' | 'X' => write_hex(output, argument, precision, &flags, verb == 'x'),
+                'w' if flags.sharp => quote(output, text, false, false),
+                _ => output.write_str(text),
             }
         };
-        out.push_str(&padded(rendered, width, left, zero));
-    }
-    if !reordered && next < arguments.len() {
-        out.push_str("%!(EXTRA ");
-        for (index,value) in arguments[next..].iter().enumerate(){
-            if index>0{out.push_str(", ");}out.push_str("string=");out.push_str(value);
+        let unknown = !matches!(verb, 's' | 'v' | 'q' | 'T' | 'x' | 'X');
+        if unknown {
+            write!(output, "%!{verb}(string=")?;
         }
-        out.push(')');
+        write_padded(output, width, flags.left, flags.zero, render)?;
+        if unknown {
+            output.write_char(')')?;
+        }
     }
-    out
+    if let Some(extra) = arguments.get(operand.next..)
+        && !operand.reordered
+        && !extra.is_empty()
+    {
+        output.write_str("%!(EXTRA ")?;
+        for (index, value) in extra.iter().enumerate() {
+            if index > 0 {
+                output.write_str(", ")?;
+            }
+            write!(output, "string={value}")?;
+        }
+        output.write_char(')')?;
+    }
+    Ok(())
+}
+
+fn write_hex(
+    output: &mut dyn fmt::Write,
+    argument: &str,
+    limit: Option<usize>,
+    flags: &Flags,
+    lowercase: bool,
+) -> fmt::Result {
+    let prefix = if lowercase { "0x" } else { "0X" };
+    for (index, byte) in argument
+        .bytes()
+        .take(limit.unwrap_or(usize::MAX))
+        .enumerate()
+    {
+        if flags.space && index > 0 {
+            output.write_char(' ')?;
+        }
+        if flags.sharp && (flags.space || index == 0) {
+            output.write_str(prefix)?;
+        }
+        if lowercase {
+            write!(output, "{byte:02x}")?;
+        } else {
+            write!(output, "{byte:02X}")?;
+        }
+    }
+    Ok(())
 }

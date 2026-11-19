@@ -1,6 +1,6 @@
 //! Replay one ticket's accepted/preparing/ready history to its customer.
 //!
-//! Run: `cargo +1.99.0 run -p effect --example track_coffee_order`.
+//! Run: `cargo +1.100.0 run -p effect --example track_coffee_order`.
 //! Input: a request for ticket ` 104 ` and Maya's saved two-cup order.
 //! Output: accepted, preparing, then Maya's pickup announcement. The inline
 //! middleware normalizes the number and displays each pulled status exactly once.

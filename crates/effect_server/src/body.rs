@@ -24,6 +24,78 @@ pub struct BodyPolicy {
     /// Maximum data bytes transferred by one write operation.
     pub chunk_bytes: NonZeroUsize,
 }
+/// Caller-selected logical limits at the native response boundary.
+#[derive(Clone, Copy, Debug)]
+pub struct PreparedResponseLimits {
+    /// Maximum number of response header occurrences.
+    pub head_fields: usize,
+    /// Maximum sum of response header names and values in bytes.
+    pub head_bytes: usize,
+    /// Maximum visible bytes in each individual DATA frame.
+    pub data_frame_bytes: usize,
+    /// Maximum number of trailer occurrences per frame.
+    pub trailer_fields: usize,
+    /// Maximum sum of trailer names and values in bytes per frame.
+    pub trailer_bytes: usize,
+}
+/// The caller-selected output boundary which rejected a response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputLimit {
+    /// The response has too many header occurrences.
+    HeadFields,
+    /// Header names and values exceed their selected byte total.
+    HeadBytes,
+    /// One DATA frame exceeds its selected visible byte limit.
+    DataFrameBytes,
+    /// One trailer frame has too many field occurrences.
+    TrailerFields,
+    /// Trailer names and values exceed their selected byte total.
+    TrailerBytes,
+}
+impl OutputLimit {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::HeadFields => 4,
+            Self::HeadBytes => 5,
+            Self::DataFrameBytes => 6,
+            Self::TrailerFields => 7,
+            Self::TrailerBytes => 8,
+        }
+    }
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            4 => Some(Self::HeadFields),
+            5 => Some(Self::HeadBytes),
+            6 => Some(Self::DataFrameBytes),
+            7 => Some(Self::TrailerFields),
+            8 => Some(Self::TrailerBytes),
+            _ => None,
+        }
+    }
+}
+pub(crate) fn check_output_headers(
+    headers: &HeaderMap,
+    fields: usize,
+    bytes: usize,
+    field_error: OutputLimit,
+    byte_error: OutputLimit,
+) -> Result<(), OutputLimit> {
+    let mut count = 0usize;
+    let mut total = 0usize;
+    for (name, value) in headers.iter() {
+        count = count.checked_add(1).ok_or(field_error)?;
+        if count > fields {
+            return Err(field_error);
+        }
+        total = total.checked_add(name.as_str().len())
+            .and_then(|n| n.checked_add(value.as_bytes().len()))
+            .ok_or(byte_error)?;
+        if total > bytes {
+            return Err(byte_error);
+        }
+    }
+    Ok(())
+}
 /// Outcome at the native delivery boundary, before asynchronous scope cleanup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodyOutcome {
@@ -44,8 +116,9 @@ pub struct BodyCompletion {
     /// Request cancellation is signaled by disconnect, never async cleanup in Drop.
     cancellation: Cancellation,
     /// Only the actual committed transport body may signal request disconnection.
-    armed: Arc<std::sync::atomic::AtomicBool>,
+    armed: Arc<OrdinaryBodyState>,
 }
+struct OrdinaryBodyState { armed: std::sync::atomic::AtomicBool, limit: std::sync::atomic::AtomicU8 }
 impl BodyCompletion {
     /// Create one completion signal for a native response.
     pub(crate) fn new(cancellation: Cancellation) -> Self {
@@ -53,12 +126,12 @@ impl BodyCompletion {
         Self {
             state,
             cancellation,
-            armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            armed: Arc::new(OrdinaryBodyState { armed: std::sync::atomic::AtomicBool::new(false), limit: std::sync::atomic::AtomicU8::new(0) }),
         }
     }
     /// Arm cancellation when response ownership reaches the actual transport boundary.
     pub(crate) fn arm(&self) {
-        self.armed.store(true, std::sync::atomic::Ordering::Release);
+        self.armed.armed.store(true, std::sync::atomic::Ordering::Release);
     }
     /// Borrow the acknowledged delivery state without waiting.
     #[must_use]
@@ -82,6 +155,16 @@ impl BodyCompletion {
     pub(crate) fn fail(&self) {
         self.settle(BodyOutcome::Failed);
     }
+    fn fail_limit(&self, limit: OutputLimit) {
+        self.state.send_if_modified(|current| {
+            if *current == BodyOutcome::Open {
+                self.armed.limit.store(limit.code(), std::sync::atomic::Ordering::Release);
+                *current = BodyOutcome::Failed;
+                true
+            } else { false }
+        });
+    }
+    fn output_limit(&self) -> Option<OutputLimit> { OutputLimit::from_code(self.armed.limit.load(std::sync::atomic::Ordering::Acquire)) }
     /// Publish one terminal transition; concurrent Drop cannot replace completion.
     fn settle(&self, outcome: BodyOutcome) {
         let changed = self.state.send_if_modified(|current| {
@@ -94,9 +177,93 @@ impl BodyCompletion {
         });
         if changed
             && outcome == BodyOutcome::Disconnected
-            && self.armed.load(std::sync::atomic::Ordering::Acquire)
+            && self.armed.armed.load(std::sync::atomic::Ordering::Acquire)
         {
             let _ = self.cancellation.request();
+        }
+    }
+}
+/// Internal signal; the public ordinary BodyCompletion contract remains unchanged.
+#[derive(Clone)]
+pub(crate) enum BodySignal {
+    Ordinary(BodyCompletion),
+    Prepared(crate::prepared_body_completion::BodyRef),
+}
+pub(crate) enum BodySignalWait {
+    Ordinary(BodyCompletion),
+    Prepared(crate::prepared_body_completion::BodyWait),
+}
+pub(crate) struct BodyPoolAccess<E: Send + 'static>(pub(crate) Arc<crate::prepared_body_completion::BodyPool>, pub(crate) Arc<effect::PreparedCleanupConfig<E>>);
+impl<E: Send + 'static> Clone for BodyPoolAccess<E> { fn clone(&self) -> Self { Self(self.0.clone(), self.1.clone()) } }
+impl BodySignalWait {
+    pub(crate) fn signal(&self) -> BodySignal {
+        match self {
+            Self::Ordinary(completion) => BodySignal::Ordinary(completion.clone()),
+            Self::Prepared(wait) => BodySignal::Prepared(wait.signal()),
+        }
+    }
+    pub(crate) async fn wait(self) -> BodyOutcome {
+        match self {
+            Self::Ordinary(completion) => completion.wait().await,
+            Self::Prepared(wait) => wait.await,
+        }
+    }
+}
+impl BodySignal {
+    pub(crate) fn ordinary(cancellation: Cancellation) -> Self {
+        Self::Ordinary(BodyCompletion::new(cancellation))
+    }
+    pub(crate) fn admit_wait(&self) -> Result<BodySignalWait, effect::memory::MemoryError> {
+        match self {
+            Self::Ordinary(completion) => Ok(BodySignalWait::Ordinary(completion.clone())),
+            Self::Prepared(completion) => completion.admit_wait().map(BodySignalWait::Prepared),
+        }
+    }
+    pub(crate) fn arm(&self) {
+        match self {
+            Self::Ordinary(completion) => completion.arm(),
+            Self::Prepared(completion) => completion.arm(),
+        }
+    }
+    pub(crate) fn outcome(&self) -> BodyOutcome {
+        match self {
+            Self::Ordinary(completion) => completion.outcome(),
+            Self::Prepared(completion) => completion.outcome(),
+        }
+    }
+    pub(crate) fn fail(&self) {
+        match self {
+            Self::Ordinary(completion) => completion.fail(),
+            Self::Prepared(completion) => completion.settle(BodyOutcome::Failed),
+        }
+    }
+    pub(crate) fn fail_limit(&self, limit: OutputLimit) { match self { Self::Ordinary(c) => c.fail_limit(limit), Self::Prepared(c) => c.fail_limit(limit) } }
+    pub(crate) fn output_limit(&self) -> Option<OutputLimit> { match self { Self::Ordinary(c) => c.output_limit(), Self::Prepared(c) => c.output_limit() } }
+    fn settle(&self, outcome: BodyOutcome) {
+        match self {
+            Self::Ordinary(completion) => completion.settle(outcome),
+            Self::Prepared(completion) => completion.settle(outcome),
+        }
+    }
+}
+pub(crate) struct BodyAdmission<E: Send + 'static> {
+    pub(crate) completion: crate::prepared_body_completion::BodyRef,
+    pub(crate) wait: crate::prepared_body_completion::BodyWait,
+    pub(crate) channel: Option<crate::prepared_streaming_channel::BodyChannelVacancy>,
+    pub(crate) resources: Option<crate::prepared_body_completion::PreparedBodyExitResources<E>>,
+}
+pub(crate) fn admitted_signal<E: Send + 'static>(
+    cancellation: Cancellation,
+    admission: Option<BodyAdmission<E>>,
+) -> (BodySignal, BodySignalWait) {
+    match admission {
+        Some(BodyAdmission { completion, wait, channel, resources }) => { drop(channel); drop(resources); (BodySignal::Prepared(completion), BodySignalWait::Prepared(wait)) },
+        None => {
+            let completion = BodyCompletion::new(cancellation);
+            (
+                BodySignal::Ordinary(completion.clone()),
+                BodySignalWait::Ordinary(completion),
+            )
         }
     }
 }
@@ -117,11 +284,18 @@ struct WriterState {
 /// Effect-owned bounded body writer; handles share only one checked native sink.
 pub struct BodyWriter<E: Send + 'static, R: Send + Sync + 'static> {
     /// Single sink owner shared with generated callbacks.
-    state: Arc<WriterState>,
+    state: WriterStorage<E>,
     /// Explicit native-input to application error mapping.
     map_error: Arc<dyn Fn(ServerError) -> E + Send + Sync>,
     /// R remains the sole application/provider selector.
     environment: PhantomData<fn() -> R>,
+}
+enum WriterStorage<E: Send + 'static> {
+    Ordinary(Arc<WriterState>),
+    Prepared { writer: crate::prepared_streaming_channel::Writer, cleanup: Arc<effect::PreparedCleanupConfig<E>>, policy: BodyPolicy },
+}
+impl<E: Send + 'static> Clone for WriterStorage<E> {
+    fn clone(&self) -> Self { match self { Self::Ordinary(state) => Self::Ordinary(state.clone()), Self::Prepared { writer, cleanup, policy } => Self::Prepared { writer: writer.clone(), cleanup: cleanup.clone(), policy: *policy } } }
 }
 impl<E: Send + 'static, R: Send + Sync + 'static> Clone for BodyWriter<E, R> {
     /// Share sink ownership without cloning E or body payloads.
@@ -134,17 +308,45 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Clone for BodyWriter<E, R> {
     }
 }
 impl<E: Send + 'static, R: Send + Sync + 'static> BodyWriter<E, R> {
+    pub(crate) fn reserve_json_writer(&self, policy: effect::JsonWriterPolicy) -> Result<effect::PreparedJsonWriterSinkReservation<NativeJsonSink>, effect::memory::MemoryError> {
+        match &self.state {
+            WriterStorage::Prepared { writer, .. } => writer.json_writers().ok_or(effect::memory::MemoryError::UnsupportedRunContract)?.reserve_sink(policy),
+            WriterStorage::Ordinary(_) => Err(effect::memory::MemoryError::UnsupportedRunContract),
+        }
+    }
     /// Move one owned chunk into an awaited write. Reusing this one-shot Effect is a core defect.
     pub fn write(&self, bytes: Bytes) -> Effect<(), E, R> {
-        let state = self.state.clone();
-        let map = self.map_error.clone();
-        effect_try_future! {
-        once; body: move |_| async move {
-            if bytes.len() > state.policy.chunk_bytes.get() {
-                return Err(ServerError::Limit("response chunk bytes".into()));
+        match &self.state {
+            WriterStorage::Ordinary(state) => {
+                let state = state.clone(); let map = self.map_error.clone();
+                effect_try_future! { once; body: move |_| async move {
+                    if bytes.len() > state.policy.chunk_bytes.get() { return Err(ServerError::Limit("response chunk bytes".into())); }
+                    send_frame(&state, Frame::data(bytes)).await
+                }, on_error: move |error| map(error), }
             }
-            send_frame(&state, Frame::data(bytes)).await
-        }, on_error: move |error| map(error), }
+            WriterStorage::Prepared { writer, cleanup, policy } => {
+                let writer = writer.clone(); let cleanup = cleanup.clone(); let policy = *policy; let map = self.map_error.clone();
+                crate::endpoint::native_once(move |_, _| async move {
+                    let mapper = match effect::PreparedExitMapper::admit(&cleanup) { Ok(mapper) => mapper, Err(error) => return Exit::Fail(map(ServerError::Memory(error))) };
+                    let permit = match writer.begin() { Ok(permit) => permit, Err(effect::memory::MemoryError::Closed) => return Exit::Fail(map(ServerError::Disconnected)), Err(error) => return Exit::Fail(map(ServerError::Memory(error))) };
+                    if bytes.len() > policy.chunk_bytes.get() { return Exit::Fail(map(ServerError::Limit("response chunk bytes".into()))); }
+                    match permit.send(Frame::data(bytes)).await {
+                        crate::prepared_streaming_channel::WriteStatus::Accepted => Exit::Success(()),
+                        crate::prepared_streaming_channel::WriteStatus::Disconnected => Exit::Fail(map(ServerError::Disconnected)),
+                        crate::prepared_streaming_channel::WriteStatus::QueueFailed(exit) => mapper.map(exit, |_| map(ServerError::Disconnected)),
+                    }
+                })
+            }
+        }
+    }
+    /// Transfer a region byte owner into an awaited write without copying.
+    /// The native Bytes bridge allocates one owner control.
+    pub fn write_lease(&self, view: effect::memory::BufferView<'static>) -> Effect<(), E, R> {
+        self.write(Bytes::from_owner(view))
+    }
+    /// Transfer a prepared native frame into an awaited write.
+    pub fn write_frame(&self, frame: crate::PreparedNativeFrame) -> Effect<(), E, R> {
+        self.write(frame.into_bytes())
     }
     /// Flush at a native polling boundary. HTTP framing/coalescing remains transport-owned.
     pub fn flush(&self) -> Effect<(), E, R> {
@@ -155,12 +357,42 @@ impl<E: Send + 'static, R: Send + Sync + 'static> BodyWriter<E, R> {
         if trailers.is_empty() {
             return effect_sync! { body: || (), };
         }
-        let state = self.state.clone();
-        let map = self.map_error.clone();
-        effect_try_future! { once; body: move |_| async move { send_frame(&state, Frame::trailers(trailers)).await }, on_error: move |error| map(error), }
+        match &self.state {
+            WriterStorage::Ordinary(state) => { let state = state.clone(); let map = self.map_error.clone(); effect_try_future! { once; body: move |_| async move { send_frame(&state, Frame::trailers(trailers)).await }, on_error: move |error| map(error), } }
+            WriterStorage::Prepared { writer, cleanup, .. } => { let writer = writer.clone(); let cleanup = cleanup.clone(); let map = self.map_error.clone(); crate::endpoint::native_once(move |_, _| async move {
+                let mapper = match effect::PreparedExitMapper::admit(&cleanup) { Ok(mapper) => mapper, Err(error) => return Exit::Fail(map(ServerError::Memory(error))) };
+                let permit = match writer.begin() { Ok(permit) => permit, Err(effect::memory::MemoryError::Closed) => return Exit::Fail(map(ServerError::Disconnected)), Err(error) => return Exit::Fail(map(ServerError::Memory(error))) };
+                match permit.send(Frame::trailers(trailers)).await {
+                    crate::prepared_streaming_channel::WriteStatus::Accepted => Exit::Success(()),
+                    crate::prepared_streaming_channel::WriteStatus::Disconnected => Exit::Fail(map(ServerError::Disconnected)),
+                    crate::prepared_streaming_channel::WriteStatus::QueueFailed(exit) => mapper.map(exit, |_| map(ServerError::Disconnected)),
+                }
+            }) }
+        }
     }
     /// Emit a checked SSE record with LF framing and no injected field lines.
     pub fn sse(&self, record: SseRecord, policy: SsePolicy) -> Effect<(), E, R> {
+        if let WriterStorage::Prepared { writer, cleanup, policy: body_policy } = &self.state
+            && let Some(pool) = writer.bytes_pool()
+        {
+            let pool = Arc::clone(pool);
+            let writer = writer.clone();
+            let cleanup = cleanup.clone();
+            let body_policy = *body_policy;
+            let map = self.map_error.clone();
+            return crate::endpoint::native_once(move |_, _| async move {
+                let len = match record.prepared_len(policy) { Ok(len) => len, Err(error) => return Exit::Fail(map(error)) };
+                let mapper = match effect::PreparedExitMapper::admit(&cleanup) { Ok(mapper) => mapper, Err(error) => return Exit::Fail(map(ServerError::Memory(error))) };
+                let permit = match writer.begin() { Ok(permit) => permit, Err(effect::memory::MemoryError::Closed) => return Exit::Fail(map(ServerError::Disconnected)), Err(error) => return Exit::Fail(map(ServerError::Memory(error))) };
+                if len > body_policy.chunk_bytes.get() { return Exit::Fail(map(ServerError::Limit("response chunk bytes".into()))); }
+                let bytes = match pool.try_fill(len, |output| record.prepared_encode(output)) { Ok(bytes) => bytes, Err(error) => return Exit::Fail(map(ServerError::Memory(error))) };
+                match permit.send(Frame::data(bytes)).await {
+                    crate::prepared_streaming_channel::WriteStatus::Accepted => Exit::Success(()),
+                    crate::prepared_streaming_channel::WriteStatus::Disconnected => Exit::Fail(map(ServerError::Disconnected)),
+                    crate::prepared_streaming_channel::WriteStatus::QueueFailed(exit) => mapper.map(exit, |_| map(ServerError::Disconnected)),
+                }
+            });
+        }
         let writer = self.clone();
         let map = self.map_error.clone();
         effect! {
@@ -171,11 +403,10 @@ impl<E: Send + 'static, R: Send + Sync + 'static> BodyWriter<E, R> {
     }
     /// Close producer access; the effect still awaits the native body's terminal poll.
     pub(crate) fn finish(&self) {
-        self.state
-            .sender
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+        match &self.state {
+            WriterStorage::Ordinary(state) => { let sender = state.sender.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take(); drop(sender); }
+            WriterStorage::Prepared { writer, .. } => writer.finish(),
+        }
     }
 }
 /// Send one frame and await native acceptance before the next producer step.
@@ -200,7 +431,7 @@ struct DeliveryBody {
     /// Native terminal error/EOF is published at most once.
     ended: bool,
     /// Terminal delivery signal observed by the enclosing request Effect.
-    completion: BodyCompletion,
+    completion: BodySignal,
 }
 impl HttpBody for DeliveryBody {
     /// Native encoded bytes, moved rather than copied.
@@ -249,23 +480,66 @@ impl Drop for DeliveryBody {
         self.completion.settle(BodyOutcome::Disconnected);
     }
 }
+/// Allocation-free marker for an already recorded native channel failure.
+#[derive(Debug)]
+struct PreparedBodyFailure;
+impl std::fmt::Display for PreparedBodyFailure { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("prepared body failed") } }
+impl std::error::Error for PreparedBodyFailure {}
+/// The prepared receiver retains queue and acknowledgement owners through pull.
+struct PreparedDeliveryBody {
+    receiver: crate::prepared_streaming_channel::NativeReceiver,
+    completion: BodySignal,
+    ended: bool,
+}
+impl HttpBody for PreparedDeliveryBody {
+    type Data = Bytes;
+    type Error = PreparedBodyFailure;
+    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        if self.ended { return Poll::Ready(None); }
+        match self.receiver.poll_pull(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(crate::prepared_streaming_channel::Pull::Item(frame)) => Poll::Ready(Some(Ok(frame))),
+            Poll::Ready(crate::prepared_streaming_channel::Pull::End) => { self.ended = true; if self.completion.outcome() == BodyOutcome::Failed { Poll::Ready(Some(Err(PreparedBodyFailure))) } else { self.completion.settle(BodyOutcome::Completed); Poll::Ready(None) } },
+            Poll::Ready(crate::prepared_streaming_channel::Pull::Failed) => { self.ended = true; self.completion.fail(); Poll::Ready(Some(Err(PreparedBodyFailure))) },
+        }
+    }
+    fn is_end_stream(&self) -> bool { self.ended }
+    fn size_hint(&self) -> SizeHint { SizeHint::default() }
+}
+impl Drop for PreparedDeliveryBody { fn drop(&mut self) { self.completion.settle(BodyOutcome::Disconnected); } }
+pub(crate) fn prepared_channel<E: Send + 'static, R: Send + Sync + 'static>(
+    policy: BodyPolicy, map_error: Arc<dyn Fn(ServerError) -> E + Send + Sync>, completion: BodySignal,
+    vacancy: crate::prepared_streaming_channel::BodyChannelVacancy, cleanup: Arc<effect::PreparedCleanupConfig<E>>,
+) -> (Body, BodyWriter<E, R>, crate::prepared_streaming_channel::Writer, crate::prepared_streaming_channel::SettlementWait) {
+    let (receiver, writer, settlement) = vacancy.split();
+    let body = Body::new(PreparedDeliveryBody { receiver, completion, ended: false });
+    let handle = BodyWriter { state: WriterStorage::Prepared { writer: writer.clone(), cleanup, policy }, map_error, environment: PhantomData };
+    (body, handle, writer, settlement)
+}
+#[derive(Debug)]
+pub(crate) enum ObservedBodyError { Native(axum::Error), Limit(OutputLimit) }
+impl std::fmt::Display for ObservedBodyError { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { match self { Self::Native(error) => write!(f, "{error}"), Self::Limit(limit) => write!(f, "output limit exceeded: {limit:?}") } } }
+impl std::error::Error for ObservedBodyError { fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { match self { Self::Native(error) => Some(error), Self::Limit(_) => None } } }
 /// Wrap any native body so response construction cannot prematurely finalize its resources.
 pub(crate) struct ObservedBody {
     /// Native body remains the authoritative data/trailer producer.
     pub(crate) body: Body,
     /// Shared lifecycle gate retained by the request owner.
-    pub(crate) completion: BodyCompletion,
+    pub(crate) completion: BodySignal,
+    pub(crate) limits: Option<PreparedResponseLimits>,
+    pub(crate) failed: bool,
 }
 impl HttpBody for ObservedBody {
     /// Native body output remains bytes.
     type Data = Bytes;
     /// Preserve native body failures at the committed transport boundary.
-    type Error = axum::Error;
+    type Error = ObservedBodyError;
     /// Forward frames and publish only actual terminal consumption.
     fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        if self.failed { return Poll::Ready(None); }
         match Pin::new(&mut self.body).poll_frame(cx) {
             Poll::Ready(None) => {
                 self.completion.settle(BodyOutcome::Completed);
@@ -273,14 +547,28 @@ impl HttpBody for ObservedBody {
             }
             Poll::Ready(Some(Err(error))) => {
                 self.completion.settle(BodyOutcome::Failed);
-                Poll::Ready(Some(Err(error)))
+                Poll::Ready(Some(Err(ObservedBodyError::Native(error))))
             }
-            frame @ Poll::Ready(_) | frame @ Poll::Pending => frame,
+            Poll::Ready(Some(Ok(frame))) => {
+                let error = self.limits.and_then(|limits| {
+                    if frame.data_ref().is_some_and(|data| data.len() > limits.data_frame_bytes) { return Some(OutputLimit::DataFrameBytes); }
+                    frame.trailers_ref().and_then(|headers| check_output_headers(headers, limits.trailer_fields, limits.trailer_bytes, OutputLimit::TrailerFields, OutputLimit::TrailerBytes).err())
+                });
+                if let Some(error) = error {
+                    self.failed = true;
+                    self.completion.fail_limit(error);
+                    drop(frame);
+                    let body = std::mem::replace(&mut self.body, Body::empty());
+                    drop(body);
+                    Poll::Ready(Some(Err(ObservedBodyError::Limit(error))))
+                } else { Poll::Ready(Some(Ok(frame))) }
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
     /// Native empty bodies complete immediately when mounted, with no pending data to deliver.
     fn is_end_stream(&self) -> bool {
-        self.body.is_end_stream()
+        self.failed || self.body.is_end_stream()
     }
     /// Preserve native finite-body sizing.
     fn size_hint(&self) -> SizeHint {
@@ -299,17 +587,16 @@ impl Drop for ObservedBody {
 }
 /// Build a native body and a bounded writer sharing one lifecycle gate.
 pub(crate) fn channel<E: Send + 'static, R: Send + Sync + 'static>(
-    request: &Request,
     policy: BodyPolicy,
     map_error: Arc<dyn Fn(ServerError) -> E + Send + Sync>,
-) -> (Body, BodyWriter<E, R>, BodyCompletion) {
+    completion: BodySignal,
+) -> (Body, BodyWriter<E, R>, BodySignal) {
     let (sender, receiver) = mpsc::channel(policy.frames.get());
-    let completion = BodyCompletion::new(request.cancellation().clone());
     let writer = BodyWriter {
-        state: Arc::new(WriterState {
+        state: WriterStorage::Ordinary(Arc::new(WriterState {
             sender: Mutex::new(Some(sender)),
             policy,
-        }),
+        })),
         map_error,
         environment: PhantomData,
     };
@@ -417,6 +704,16 @@ impl<E: Send + 'static, R: Send + Sync + 'static> BodyProgram<E, R> {
             }),
         }
     }
+    /// Pull and write owned region byte views, retaining the backing in native DATA.
+    #[must_use]
+    pub fn leases(source: Stream<effect::memory::BufferView<'static>, E, R>) -> Self {
+        Self::source(source, |view, writer| writer.write_lease(view))
+    }
+    /// Pull and write prepared native DATA without copying the frames again.
+    #[must_use]
+    pub fn frames(source: Stream<crate::PreparedNativeFrame, E, R>) -> Self {
+        Self::source(source, |frame, writer| writer.write_frame(frame))
+    }
     /// Execute with the supplied owner; no run boundary or native task is introduced.
     pub(crate) fn execute(&self, writer: BodyWriter<E, R>, scope: Scope<E>) -> Effect<(), E, R> {
         (self.body)(writer, scope)
@@ -442,6 +739,48 @@ pub struct SseRecord {
     pub data: String,
 }
 impl SseRecord {
+    // Visit exactly the same fields and normalized data lines as `frame`.
+    fn prepared_fragments(&self, mut visit: impl FnMut(&[u8])) {
+        if let Some(event) = &self.event { visit(b"event: "); visit(event.as_bytes()); visit(b"\n"); }
+        if let Some(id) = &self.id { visit(b"id: "); visit(id.as_bytes()); visit(b"\n"); }
+        if let Some(retry) = self.retry {
+            let mut digits = std::fmt::NumBuffer::new();
+            visit(b"retry: ");
+            visit(retry.as_millis().format_into(&mut digits).as_bytes());
+            visit(b"\n");
+        }
+        let data = self.data.as_bytes();
+        let mut start = 0usize;
+        let mut i = 0usize;
+        while let Some(&byte) = data.get(i) {
+            if byte == b'\r' || byte == b'\n' {
+                visit(b"data: "); visit(data.get(start..i).unwrap_or_default()); visit(b"\n");
+                i += 1;
+                if byte == b'\r' && data.get(i) == Some(&b'\n') { i += 1; }
+                start = i;
+            } else { i += 1; }
+        }
+        visit(b"data: "); visit(data.get(start..).unwrap_or_default()); visit(b"\n\n");
+    }
+    fn prepared_len(&self, policy: SsePolicy) -> Result<usize, ServerError> {
+        if self.event.as_ref().is_some_and(|event| event.contains(['\r', '\n'])) { return Err(ServerError::Invalid("SSE event".into())); }
+        if let Some(id) = &self.id { validate_cursor(id, policy)?; }
+        let mut len = Some(0usize);
+        self.prepared_fragments(|fragment| { len = len.and_then(|value| value.checked_add(fragment.len())); });
+        let len = len.ok_or_else(|| ServerError::Limit("SSE frame".into()))?;
+        if len > policy.frame_bytes.get() { return Err(ServerError::Limit("SSE frame".into())); }
+        Ok(len)
+    }
+    fn prepared_encode(&self, output: &mut [u8]) -> Result<(), effect::memory::MemoryError> {
+        let mut offset = 0usize;
+        let mut valid = true;
+        self.prepared_fragments(|fragment| {
+            if let Some(end) = offset.checked_add(fragment.len()) && let Some(target) = output.get_mut(offset..end) {
+                target.copy_from_slice(fragment); offset = end;
+            } else { valid = false; }
+        });
+        if valid && offset == output.len() { Ok(()) } else { Err(effect::memory::MemoryError::InvalidRange) }
+    }
     /// Encode an SSE event without hidden retries, event names or cursor defaults.
     pub fn frame(self, policy: SsePolicy) -> Result<Bytes, ServerError> {
         let mut output = String::new();
@@ -514,47 +853,51 @@ pub(crate) fn sse_content_type() -> HeaderValue {
 }
 
 /// Checked native JSON destination. Its synchronous calls must run on R's blocking provider.
-pub(crate) struct NativeJsonSink {
-    /// Same bounded transport owner as Effect-owned body writes.
-    state: Arc<WriterState>,
+pub(crate) struct NativeJsonSink { state: JsonSinkState }
+enum JsonSinkState {
+    Ordinary(Arc<WriterState>),
+    Prepared { sink: crate::prepared_streaming_channel::BlockingSink, chunk_bytes: usize },
+}
+pub(crate) struct JsonWitness<E: Send + 'static> {
+    pub(crate) receiver: effect::PreparedReceiver<crate::prepared_streaming_channel::RawBlockingFailure>,
+    pub(crate) mapper: effect::PreparedExitMapper<E>,
+    pub(crate) cleanup: effect::CleanupFailures<E>,
 }
 impl NativeJsonSink {
-    /// Retain a sink handle without selecting another runtime or copying body data.
-    pub(crate) fn from_writer<E: Send + 'static, R: Send + Sync + 'static>(
-        writer: &BodyWriter<E, R>,
-    ) -> Self {
-        Self {
-            state: writer.state.clone(),
+    pub(crate) fn ordinary_from_writer<E: Send + 'static, R: Send + Sync + 'static>(writer: &BodyWriter<E, R>) -> Option<Self> {
+        match &writer.state { WriterStorage::Ordinary(state) => Some(Self { state: JsonSinkState::Ordinary(state.clone()) }), WriterStorage::Prepared { .. } => None }
+    }
+    /// Preadmit all prepared sink authorities before the codec runs.
+    pub(crate) fn from_writer<E: Send + 'static, R: Send + Sync + 'static>(writer: &BodyWriter<E, R>) -> Result<(Self, Option<JsonWitness<E>>), effect::memory::MemoryError> {
+        match &writer.state {
+            WriterStorage::Ordinary(state) => Ok((Self { state: JsonSinkState::Ordinary(state.clone()) }, None)),
+            WriterStorage::Prepared { writer, cleanup, policy } => {
+                let mapper = effect::PreparedExitMapper::admit(cleanup)?;
+                let carrier = cleanup.reserve_failures()?;
+                let (sink, receiver) = writer.blocking_sink()?;
+                Ok((Self { state: JsonSinkState::Prepared { sink, chunk_bytes: policy.chunk_bytes.get() } }, Some(JsonWitness { receiver, mapper, cleanup: carrier })))
+            }
         }
     }
 }
 impl effect::JsonWriterSink for NativeJsonSink {
-    /// Convert a borrowed codec fragment into owned native bytes on the selected blocking worker.
-    /// This unavoidable native ownership conversion copies only the current bounded fragment.
     fn write(&mut self, bytes: &[u8]) -> Result<(), effect::SchemaIssue> {
-        let sender = self
-            .state
-            .sender
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .ok_or_else(json_sink_issue)?;
-        for chunk in bytes.chunks(self.state.policy.chunk_bytes.get()) {
-            let (accepted, wait) = oneshot::channel();
-            sender
-                .blocking_send(Delivery {
-                    frame: Frame::data(Bytes::copy_from_slice(chunk)),
-                    accepted,
-                })
-                .map_err(|_| json_sink_issue())?;
-            wait.blocking_recv().map_err(|_| json_sink_issue())?;
+        match &mut self.state {
+            JsonSinkState::Ordinary(state) => {
+                let sender = state.sender.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().ok_or_else(json_sink_issue)?;
+                for chunk in bytes.chunks(state.policy.chunk_bytes.get()) {
+                    let (accepted, wait) = oneshot::channel();
+                    sender.blocking_send(Delivery { frame: Frame::data(Bytes::copy_from_slice(chunk)), accepted }).map_err(|_| json_sink_issue())?;
+                    wait.blocking_recv().map_err(|_| json_sink_issue())?;
+                }
+            }
+            JsonSinkState::Prepared { sink, chunk_bytes } => {
+                for chunk in bytes.chunks(*chunk_bytes) { sink.write_chunk(chunk).map_err(|()| json_sink_issue())?; }
+            }
         }
         Ok(())
     }
-    /// Structural completion belongs to the document; body completion is still awaited separately.
-    fn finish(&mut self) -> Result<(), effect::SchemaIssue> {
-        Ok(())
-    }
+    fn finish(&mut self) -> Result<(), effect::SchemaIssue> { Ok(()) }
 }
 /// Typed schema failure for a disconnected/closed checked native JSON destination.
 fn json_sink_issue() -> effect::SchemaIssue {

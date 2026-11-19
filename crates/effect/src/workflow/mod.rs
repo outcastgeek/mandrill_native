@@ -39,8 +39,10 @@ pub use durable_queue::{
 };
 pub use execution::{TypedWorkflowDefinition, WorkflowRunError, WorkflowRunResult, WorkflowStep};
 pub use memory_workflow_engine::{
-    MemoryWorkflowEngine, WorkflowMigration, WorkflowReplayPolicy, WorkflowShutdownPolicy,
-    WorkflowShutdownReport,
+    MemoryWorkflowEngine, PreparedMemoryWorkflowEngine, PreparedWorkflowCapacity,
+    PreparedWorkflowError, PreparedWorkflowHistoryCursor, PreparedWorkflowHistoryError,
+    PreparedWorkflowHistoryPage, WorkflowHistoryRecord, WorkflowMigration, WorkflowReplayPolicy,
+    WorkflowShutdownPolicy, WorkflowShutdownReport,
 };
 pub use workflow_engine::{
     CancellationOutcome, ChildWait, DeadlineClear, DeadlineWait, DeadlineWake,
@@ -51,7 +53,7 @@ pub use workflow_types::{
     CompensationState, EncodedWorkflowOutcome, RecordedActivity, RecordedChild,
     RecordedCompensation, RecordedDeadline, RecordedRace, RecordedSignal, WorkflowActivityId,
     WorkflowCompensationId, WorkflowDeadlineId, WorkflowDefinition, WorkflowDefinitionId,
-    WorkflowHandle, WorkflowIdentityError, WorkflowOutcomeKind, WorkflowRaceId,
+    WorkflowHandle, WorkflowHead, WorkflowIdentityError, WorkflowOutcomeKind, WorkflowRaceId,
     WorkflowRegistration, WorkflowRunId, WorkflowSignalId, WorkflowSnapshot, WorkflowStatus,
     WorkflowVersion, WorkflowWait, WorkflowWakeReason,
 };

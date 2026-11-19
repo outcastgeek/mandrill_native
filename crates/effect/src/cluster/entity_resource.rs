@@ -256,7 +256,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> EntityResou
                 );
                 let owner = owner.clone();
                 let factory = Arc::clone(&factory);
-                Step::Composed(Box::pin(async move {
+                Step::composed(Box::pin(async move {
                     let result = std::panic::AssertUnwindSafe(async {
                         factory(EntityPlanContext {
                             context: bridge,

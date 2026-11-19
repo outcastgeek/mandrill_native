@@ -1,7 +1,11 @@
 //! Recipe and continuation links are destroyed iteratively, including abandoned runs.
 use std::collections::HashMap;
+use std::ptr::NonNull;
 use std::sync::Mutex;
 use std::thread::ThreadId;
+
+mod prepared;
+pub(crate) use prepared::{DestructionNode, enqueue_prepared};
 
 #[derive(Default)]
 /// Typed queue used by internal destruction.
@@ -12,7 +16,17 @@ struct Queue {
 
 // Per-thread queues live outside TLS, so deep graphs remain safe during TLS teardown.
 // The mutex only protects queue bookkeeping, never user destruction or execution.
-static QUEUES: Mutex<Option<HashMap<ThreadId, Queue>>> = Mutex::new(None);
+struct Queues {
+    system: Option<HashMap<ThreadId, Queue>>,
+    prepared: Option<NonNull<DestructionNode>>,
+}
+// SAFETY: prepared links are accessed only under QUEUES. Every linked node owns
+// a static, Send, pre-reserved storage owner until its release callback runs.
+unsafe impl Send for Queues {}
+static QUEUES: Mutex<Queues> = Mutex::new(Queues {
+    system: None,
+    prepared: None,
+});
 
 /// Private ownership wrapper. No payload erasure/downcasts occur during interpretation.
 ///
@@ -77,7 +91,10 @@ impl Drop for DrainGuard {
             let mut queues = QUEUES
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            queues.as_mut().and_then(|queues| queues.remove(&self.0))
+            queues
+                .system
+                .as_mut()
+                .and_then(|queues| queues.remove(&self.0))
         };
         // Also releases queued captures if a user destructor unwinds.
         drop(pending);
@@ -98,6 +115,7 @@ impl<T: Send + 'static> Drop for FlatDrop<T> {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let queue = queues
+                .system
                 .get_or_insert_with(HashMap::new)
                 .entry(id)
                 .or_default();
@@ -114,6 +132,7 @@ impl<T: Send + 'static> Drop for FlatDrop<T> {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 queues
+                    .system
                     .as_mut()
                     .and_then(|queues| queues.get_mut(&id))
                     .and_then(|queue| queue.pending.pop())

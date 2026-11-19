@@ -1,6 +1,6 @@
 # Build and run the OTel examples
 
-Run these commands from the workspace root (the directory containing the root `Cargo.toml`) with Rust 1.99.0 installed. `cargo run` also builds the selected example.
+Run these commands from the workspace root (the directory containing the root `Cargo.toml`) with Rust 1.100.0 installed. `cargo run` also builds the selected example.
 
 Both targets use package `effect-otel` with `--features server`, including `await_pickup`: its executable workflow is enabled by that feature. No external telemetry collector or environment variables are required.
 
@@ -9,11 +9,11 @@ Both targets use package `effect-otel` with `--features server`, including `awai
 [Source](await_pickup.rs). Four arguments are required, in order: north status file, south status file, positive wait-window milliseconds, positive poll-interval milliseconds. Each UTF-8 file contains `104,pending` or `104,ready` with no header. Create one pending outlet and one ready outlet:
 
 ```sh
-cargo +1.99.0 build --locked -p effect-otel --features server --example await_pickup
+cargo +1.100.0 build --locked -p effect-otel --features server --example await_pickup
 pickup_dir=$(mktemp -d "${TMPDIR:-/tmp}/effect-pickup.XXXXXX")
 printf '104,pending\n' > "$pickup_dir/north.status"
 printf '104,ready\n' > "$pickup_dir/south.status"
-cargo +1.99.0 run --locked -p effect-otel --features server --example await_pickup -- "$pickup_dir/north.status" "$pickup_dir/south.status" 2000 20
+cargo +1.100.0 run --locked -p effect-otel --features server --example await_pickup -- "$pickup_dir/north.status" "$pickup_dir/south.status" 2000 20
 ```
 
 The example prints both availability snapshots, reports `Ticket 104 is ready at south.`, releases its native providers, and exits. With both files pending, staff can update either file while it polls. If neither becomes ready within the supplied window, the run returns a wait-window error. Missing or malformed files fail; only transient native I/O is retried.
@@ -23,10 +23,10 @@ The example prints both availability snapshots, reports `Ticket 104 is ready at 
 [Source](watch_order_progress.rs). This is a persistent HTTP/SSE host. Create a UTF-8 history CSV without a header, then run it:
 
 ```sh
-cargo +1.99.0 build --locked -p effect-otel --features server --example watch_order_progress
+cargo +1.100.0 build --locked -p effect-otel --features server --example watch_order_progress
 timeline_dir=$(mktemp -d "${TMPDIR:-/tmp}/effect-timeline.XXXXXX")
 printf '0,accepted\n400,preparing\n800,ready\n' > "$timeline_dir/history.csv"
-cargo +1.99.0 run --locked -p effect-otel --features server --example watch_order_progress -- 127.0.0.1:8080 "$timeline_dir/history.csv" 256 32 32 16 8 5000 inline
+cargo +1.100.0 run --locked -p effect-otel --features server --example watch_order_progress -- 127.0.0.1:8080 "$timeline_dir/history.csv" 256 32 32 16 8 5000 inline
 ```
 
 All nine positional arguments are required:
@@ -56,8 +56,8 @@ The response emits `order-status` SSE events with data `accepted`, `preparing` a
 Press Ctrl-C in the host terminal to drain requests and providers. Successful cleanup prints `Order timeline host closed; all subscriptions released.` To use the other supported writer forms, stop the previous host, then run either command in the original terminal using the same history file:
 
 ```sh
-cargo +1.99.0 run --locked -p effect-otel --features server --example watch_order_progress -- 127.0.0.1:8080 "$timeline_dir/history.csv" 256 32 32 16 8 5000 extracted
-cargo +1.99.0 run --locked -p effect-otel --features server --example watch_order_progress -- 127.0.0.1:8080 "$timeline_dir/history.csv" 256 32 32 16 8 5000 body
+cargo +1.100.0 run --locked -p effect-otel --features server --example watch_order_progress -- 127.0.0.1:8080 "$timeline_dir/history.csv" 256 32 32 16 8 5000 extracted
+cargo +1.100.0 run --locked -p effect-otel --features server --example watch_order_progress -- 127.0.0.1:8080 "$timeline_dir/history.csv" 256 32 32 16 8 5000 body
 ```
 
 Run these individually, stopping one before starting the next. All three modes mount the same route and replay the same supplied history.

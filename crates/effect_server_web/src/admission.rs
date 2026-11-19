@@ -16,6 +16,8 @@ use effect::{
     AdmissionCapacity, AdmissionError, AdmissionPermit, Effect, Exit, HasClock, HasTaskSpawner,
     ProviderAdmission, Scope,
 };
+#[cfg(any(feature = "identity", feature = "otel"))]
+use effect::{PreparedAdmissionError, PreparedProviderAdmission};
 use effect::{KeyDomain, StableKey};
 use effect::{effect, effect_timeout};
 use http::{HeaderMap, HeaderValue};
@@ -263,6 +265,7 @@ where
 /// A rate-limit decision through the selected core store and explicit UTC instant.
 /// Denied/ImpossibleCost/AdaptationRequired invoke the selected rejection Effect. Store
 /// capacity/backend/uncertainty remain typed E via `on_error`.
+/// HTTP consumers can select a 429 response for a rate-policy rejection.
 pub fn enforce_rate<A, E, R, D>(
     limiter: &RateLimiter<D>,
     partition: StableKey<D>,
@@ -301,5 +304,33 @@ pub(crate) fn independent<A: Send + 'static, E: Send + 'static, R: Send + Sync +
     effect_using! {
         acquire: effect_try_sync! { body { owner.admit() }, on_error: capacity, },
         body: move |_permit| work(),
+    }
+}
+
+/// Admit prepared controls before invoking the selected stage. The permit
+/// lives in the driver until the existing stage returns its complete outcome.
+#[cfg(any(feature = "identity", feature = "otel"))]
+pub(crate) fn prepared_independent<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static>(
+    owner: Arc<PreparedProviderAdmission>,
+    work: impl Fn() -> Effect<A, E, R> + Clone + Send + Sync + 'static,
+    capacity: impl Fn(PreparedAdmissionError) -> E + Clone + Send + Sync + 'static,
+) -> Effect<A, E, R> {
+    effect_future! {
+        exit_with_context;
+        body: move |env, context| {
+            let owner = owner.clone();
+            let work = work.clone();
+            let capacity = capacity.clone();
+            async move {
+                if context.cancellation().is_requested() {
+                    return Exit::Interrupted;
+                }
+                let _permit = match owner.admit() {
+                    Ok(permit) => permit,
+                    Err(error) => return Exit::Fail(capacity(error)),
+                };
+                context.run(work(), env).await
+            }
+        },
     }
 }

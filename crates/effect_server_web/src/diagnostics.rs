@@ -8,14 +8,15 @@ use crate::{
     effect_die, effect_finalizer, effect_future, effect_map, effect_map_error, effect_resource,
     effect_try_blocking, effect_try_sync, effect_using,
 };
+use effect::memory::{Bytes, MemoryError, PreparedMemory, RegionId, SharedSlot, SlotPool};
 use effect::stream;
 use effect::{
     AdmissionCapacity, Effect, Exit, HasBlockingExecutor, HasClock, HasTaskSpawner,
-    ProviderAdmission, PubSubError, PubSubOverflow, Scope, SharedValue, Stream, SubscriptionRef,
-    effect,
+    PreparedSharedValuePool, PreparedWatchPool, PreparedWatchReceiver, ProviderAdmission,
+    PubSubError, PubSubOverflow, Scope, SharedValue, Stream, SubscriptionRef, effect,
 };
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 /// A supported native measurement or a precisely documented unavailable family.
@@ -66,6 +67,8 @@ pub enum DiagnosticsError<E: Send + 'static> {
     Source(E),
     /// Core bounded publication/subscription state failed.
     Subscription(PubSubError),
+    /// Selected operational workspace could not retain a diagnostic version or subscriber.
+    Memory(MemoryError),
     /// Native process syscall or unit conversion failed.
     Native(std::io::Error),
     /// Invalid explicit interval/admission configuration.
@@ -224,11 +227,85 @@ impl<E: Send + 'static> Clone for RuntimeStatus<E> {
         }
     }
 }
+struct PreparedRuntimeVersion<E: Send + 'static> {
+    sample: RuntimeSnapshot,
+    failure: Option<SharedValue<E>>,
+}
+type RuntimeReceiver<E> = PreparedWatchReceiver<Option<PreparedRuntimeVersion<E>>>;
+
+/// Independent latest-version and observer capacity for runtime diagnostics.
+pub struct PreparedDiagnostics<E: Send + 'static> {
+    watch: PreparedWatchPool<Option<PreparedRuntimeVersion<E>>>,
+    errors: PreparedSharedValuePool<E>,
+    cursors: SlotPool<'static, CursorSlot<E>>,
+}
+
+impl<E: Send + 'static> PreparedDiagnostics<E> {
+    /// Region layout for a host sampler, including one internal reader.
+    pub fn storage_bytes(
+        subscribers: NonZeroUsize,
+        versions: NonZeroUsize,
+    ) -> Result<Bytes, MemoryError> {
+        if versions.get() < 2 {
+            return Err(MemoryError::NoSlot);
+        }
+        let listeners = subscribers
+            .get()
+            .checked_add(1)
+            .ok_or(MemoryError::ArithmeticOverflow)?;
+        PreparedWatchPool::<Option<PreparedRuntimeVersion<E>>>::storage_bytes(
+            1,
+            listeners,
+            versions.get(),
+        )?
+        .checked_add(PreparedSharedValuePool::<E>::storage_bytes(versions.get())?)?
+        .checked_add(SlotPool::<CursorSlot<E>>::storage_bytes(subscribers.get())?)
+    }
+
+    /// Provision version and observer banks before invoking the native source.
+    pub fn prepare(
+        memory: &PreparedMemory<'static>,
+        region: RegionId,
+        subscribers: NonZeroUsize,
+        versions: NonZeroUsize,
+    ) -> Result<Self, MemoryError> {
+        Self::storage_bytes(subscribers, versions)?;
+        let listeners = subscribers
+            .get()
+            .checked_add(1)
+            .ok_or(MemoryError::ArithmeticOverflow)?;
+        Ok(Self {
+            watch: PreparedWatchPool::prepare(memory, region, 1, listeners, versions.get())?,
+            errors: PreparedSharedValuePool::prepare(memory, region, versions.get())?,
+            cursors: memory.slots(region, subscribers.get(), |_| Ok(Mutex::new(None)))?,
+        })
+    }
+}
+
+enum RuntimeSource<E: Send + 'static> {
+    Ordinary(SubscriptionRef<RuntimeStatus<E>>),
+    Prepared {
+        receiver: Arc<Mutex<RuntimeReceiver<E>>>,
+        storage: Arc<PreparedDiagnostics<E>>,
+    },
+}
+impl<E: Send + 'static> Clone for RuntimeSource<E> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Ordinary(state) => Self::Ordinary(state.clone()),
+            Self::Prepared { receiver, storage } => Self::Prepared {
+                receiver: receiver.clone(),
+                storage: storage.clone(),
+            },
+        }
+    }
+}
+
 /// Host-scoped real sampler and latest-value bounded subscriptions.
 #[must_use]
 pub struct RuntimeSampler<E: Send + 'static> {
     /// Existing atomic snapshot/subscription owner.
-    state: SubscriptionRef<RuntimeStatus<E>>,
+    state: RuntimeSource<E>,
     /// Explicit elapsed collection period exposed to application renderers.
     pub interval: Duration,
 }
@@ -259,22 +336,20 @@ impl<E: Send + 'static> RuntimeSampler<E> {
                     let scope = scope.clone();
                     let initial_source = source.clone();
                     let sample = effect_map_error! { program: { let __dsl_factory = move || initial_source(); effect! { __dsl_factory()? } }, map: DiagnosticsError::Source, }?;
-                    let sampler = Self {
-                        state: SubscriptionRef::new(
-                            RuntimeStatus {
-                                sample: Arc::new(sample),
-                                failure: None,
-                            },
-                            subscription_capacity,
-                            PubSubOverflow::DropOldest,
-                        ),
-                        interval,
-                    };
-                    let worker_sampler = sampler.clone();
+                    let state = SubscriptionRef::new(
+                        RuntimeStatus {
+                            sample: Arc::new(sample),
+                            failure: None,
+                        },
+                        subscription_capacity,
+                        PubSubOverflow::DropOldest,
+                    );
+                    let sampler = Self { state: RuntimeSource::Ordinary(state.clone()), interval };
+                    let worker_state = state.clone();
                     let worker_source = source.clone();
                     let worker = effect_future! {
                         exit_with_context; body: move |env: Arc<R>, context| {
-                        let sampler = worker_sampler.clone();
+                        let state = worker_state.clone();
                         let source = worker_source.clone();
                         async move {
                             loop {
@@ -295,7 +370,7 @@ impl<E: Send + 'static> RuntimeSampler<E> {
                                     },
                                     Exit::Fail(error) => {
                                         let old = match context
-                                            .run(sampler.state.read(), env.clone())
+                                            .run(state.read(), env.clone())
                                             .await
                                         {
                                             Exit::Success(old) => old,
@@ -324,9 +399,7 @@ impl<E: Send + 'static> RuntimeSampler<E> {
                                 let published = context
                                     .run(
                                         effect_map_error! {
-                                            program: sampler
-                                            .state
-                                            .set(status), map: DiagnosticsError::Subscription, },
+                                            program: state.set(status), map: DiagnosticsError::Subscription, },
                                         env.clone(),
                                     )
                                     .await;
@@ -337,17 +410,104 @@ impl<E: Send + 'static> RuntimeSampler<E> {
                         }
                     }, };
                     effect_finalizer! {
-        scope: scope, body: effect_map! { program: effect_map_error! { program: sampler.state.shutdown(effect::PubSubShutdown::Discard), map: DiagnosticsError::Subscription, }, map: |_| (), },
+        scope: scope, body: effect_map! { program: effect_map_error! { program: state.shutdown(effect::PubSubShutdown::Discard), map: DiagnosticsError::Subscription, }, map: |_| (), },
         }?;
                     scope.fork(worker)?;
                     sampler
                 }
     }
+    /// Acquire a latest-value sampler with independent physical publication slots.
+    pub fn scoped_prepared<R: HasClock + HasTaskSpawner + Send + Sync + 'static>(
+        scope: Scope<DiagnosticsError<E>>,
+        interval: Duration,
+        storage: Arc<PreparedDiagnostics<E>>,
+        source: impl Fn() -> Effect<RuntimeSnapshot, E, R> + Send + Sync + 'static,
+    ) -> Effect<Self, DiagnosticsError<E>, R> {
+        if interval.is_zero() {
+            return effect_try_sync! { body: || Err(DiagnosticsError::Definition), on_error: ::core::convert::identity, };
+        }
+        let source = Arc::new(source);
+        effect_future! {
+            exit_with_context; body: move |env: Arc<R>, context| {
+                let scope = scope.clone();
+                let storage = storage.clone();
+                let source = source.clone();
+                async move {
+                    let (sender, receiver) = match storage.watch.try_watch(None) {
+                        Ok(state) => state,
+                        Err((error, _)) => return Exit::Fail(DiagnosticsError::Memory(error)),
+                    };
+                    let publication = match sender.reserve_publication() {
+                        Ok(publication) => publication,
+                        Err(error) => return Exit::Fail(DiagnosticsError::Memory(error)),
+                    };
+                    let sample = match crate::split_exit(context.run(source(), env.clone()).await) {
+                        Ok(sample) => sample,
+                        Err(failure) => return failure.map_error(DiagnosticsError::Source),
+                    };
+                    publication.publish(Some(PreparedRuntimeVersion { sample: sample.clone(), failure: None }));
+                    let sender = Arc::new(sender);
+                    let worker_storage = storage.clone();
+                    let worker = effect_future! {
+                        exit_with_context; body: move |env: Arc<R>, context| {
+                            let sender = sender.clone();
+                            let storage = worker_storage.clone();
+                            let source = source.clone();
+                            let mut sample = sample.clone();
+                            async move {
+                                loop {
+                                    let sleep = context.run(Effect::<(), DiagnosticsError<E>, R>::sleep(interval), env.clone()).await;
+                                    if !matches!(sleep, Exit::Success(())) {
+                                        return sleep;
+                                    }
+                                    let publication = match sender.reserve_publication() {
+                                        Ok(publication) => publication,
+                                        Err(error) => return Exit::Fail(DiagnosticsError::Memory(error)),
+                                    };
+                                    let shared_error = match storage.errors.reserve() {
+                                        Ok(shared_error) => shared_error,
+                                        Err(error) => return Exit::Fail(DiagnosticsError::Memory(error)),
+                                    };
+                                    let failure = match context.run(source(), env.clone()).await {
+                                        Exit::Success(next) => { sample = next; None },
+                                        Exit::Fail(error) => Some(shared_error.publish(error)),
+                                        failure @ (Exit::Die(_) | Exit::Interrupted | Exit::FinalizationFailed(_)) => {
+                                            return discard_value(failure.map_error(DiagnosticsError::Source));
+                                        }
+                                    };
+                                    publication.publish(Some(PreparedRuntimeVersion { sample: sample.clone(), failure }));
+                                }
+                            }
+                        },
+                    };
+                    match crate::split_exit(context.run(scope.fork(worker), env).await) {
+                        Ok(_) => Exit::Success(Self { state: RuntimeSource::Prepared { receiver: Arc::new(Mutex::new(receiver)), storage }, interval }),
+                        Err(failure) => failure,
+                    }
+                }
+            },
+        }
+    }
+
     /// Read the same latest immutable status used by initial views and subscriptions.
     pub fn status<R: Send + Sync + 'static>(
         &self,
     ) -> Effect<Arc<RuntimeStatus<E>>, DiagnosticsError<E>, R> {
-        effect_map_error! { program: self.state.read(), map: DiagnosticsError::Subscription, }
+        match &self.state {
+            RuntimeSource::Ordinary(state) => {
+                effect_map_error! { program: state.read(), map: DiagnosticsError::Subscription, }
+            }
+            RuntimeSource::Prepared { receiver, .. } => {
+                let state = receiver.clone();
+                effect_try_sync! {
+                    body: move || {
+                        let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        latest(&mut state)
+                    },
+                    on_error: DiagnosticsError::Memory,
+                }
+            }
+        }
     }
     /// Existing core stream pins an atomic current sample, then bounded changes.
     /// Lag/backpressure/termination follow the selected core subscription owner.
@@ -363,6 +523,12 @@ impl<E: Send + 'static> RuntimeSampler<E> {
         &self,
         inject: impl Fn(DiagnosticsError<E>) -> F + Send + Sync + 'static,
     ) -> Stream<Arc<RuntimeStatus<E>>, F, R> {
+        let state = match &self.state {
+            RuntimeSource::Ordinary(state) => state,
+            RuntimeSource::Prepared { receiver, storage } => {
+                return prepared_changes(receiver.clone(), storage.clone(), Arc::new(inject));
+            }
+        };
         let inject = Arc::new(inject);
         let acquire_inject = inject.clone();
         let pull_inject = inject.clone();
@@ -370,8 +536,7 @@ impl<E: Send + 'static> RuntimeSampler<E> {
         stream! {
             pull: effect_map! {
                 program: effect_map_error! {
-                program: self.state
-                .subscribe(), map: move |error| acquire_inject(DiagnosticsError::Subscription(error)), }, map: |snapshot| Cursor {
+                program: state.subscribe(), map: move |error| acquire_inject(DiagnosticsError::Subscription(error)), }, map: |snapshot| Cursor {
                     initial: std::sync::Mutex::new(Some(snapshot.value)),
                     subscription: snapshot.subscription,
                 }, },
@@ -428,4 +593,106 @@ struct Cursor<E: Send + 'static> {
     initial: std::sync::Mutex<Option<Arc<RuntimeStatus<E>>>>,
     /// Core bounded subscription retained by the request/body scope.
     subscription: effect::Subscription<RuntimeStatus<E>>,
+}
+
+fn latest<E: Send + 'static>(
+    receiver: &mut RuntimeReceiver<E>,
+) -> Result<Arc<RuntimeStatus<E>>, MemoryError> {
+    let view = receiver.borrow_and_update()?.ok_or(MemoryError::Closed)?;
+    let value = view.borrow().ok_or(MemoryError::Closed)?;
+    let version = value
+        .get()
+        .and_then(Option::as_ref)
+        .ok_or(MemoryError::Closed)?;
+    Ok(Arc::new(RuntimeStatus {
+        sample: Arc::new(version.sample.clone()),
+        failure: version.failure.clone(),
+    }))
+}
+
+struct PreparedCursor<E: Send + 'static> {
+    first: bool,
+    receiver: RuntimeReceiver<E>,
+}
+
+type CursorSlot<E> = Mutex<Option<PreparedCursor<E>>>;
+
+struct CursorOwner<E: Send + 'static>(Option<SharedSlot<'static, CursorSlot<E>>>);
+impl<E: Send + 'static> Clone for CursorOwner<E> {
+    #[allow(clippy::expect_used)] // A live cursor retains its slot; only the owner-count bound can fail.
+    fn clone(&self) -> Self {
+        Self(Some(
+            self.shared()
+                .try_clone()
+                .expect("diagnostic cursor owner limit"),
+        ))
+    }
+}
+impl<E: Send + 'static> CursorOwner<E> {
+    #[allow(clippy::expect_used)] // Retirement consumes the live owner.
+    fn shared(&self) -> &SharedSlot<'static, CursorSlot<E>> {
+        self.0.as_ref().expect("live diagnostic cursor")
+    }
+}
+impl<E: Send + 'static> Drop for CursorOwner<E> {
+    fn drop(&mut self) {
+        if let Some(mut slot) = self.0.take().and_then(SharedSlot::into_last) {
+            drop(
+                slot.get_mut()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take(),
+            );
+        }
+    }
+}
+
+fn prepared_changes<E: Send + 'static, F: Send + 'static, R: Send + Sync + 'static>(
+    root: Arc<Mutex<RuntimeReceiver<E>>>,
+    storage: Arc<PreparedDiagnostics<E>>,
+    inject: Arc<impl Fn(DiagnosticsError<E>) -> F + Send + Sync + 'static>,
+) -> Stream<Arc<RuntimeStatus<E>>, F, R> {
+    let acquire_inject = inject.clone();
+    let acquire = effect_try_sync! {
+        body: move || {
+            let mut slot = storage.cursors.try_checkout()?;
+            let receiver = root.lock().unwrap_or_else(std::sync::PoisonError::into_inner).try_clone()?;
+            *slot.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PreparedCursor { first: true, receiver });
+            Ok(CursorOwner(Some(slot.share())))
+        },
+        on_error: move |error| acquire_inject(DiagnosticsError::Memory(error)),
+    };
+    stream! {
+        pull: acquire,
+        read: move |resource| {
+            let state = match resource.with(CursorOwner::clone) {
+                Ok(state) => state,
+                Err(defect) => return effect_die! { defect: defect, },
+            };
+            let inject = inject.clone();
+            effect_future! {
+                exit_with_context; body: move |_, _| {
+                    let state = state.clone();
+                    let inject = inject.clone();
+                    async move {
+                        let cursor = state.shared().lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+                        let Some(cursor) = cursor else {
+                            return Exit::Fail(inject(DiagnosticsError::Memory(MemoryError::Busy)));
+                        };
+                        let mut cursor = std::mem::DropGuard::new(cursor, |cursor| {
+                            *state.shared().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cursor);
+                        });
+                        if !cursor.first && cursor.receiver.changed().await.is_err() {
+                            return Exit::Success(effect::Chunk::End);
+                        }
+                        cursor.first = false;
+                        match latest(&mut cursor.receiver) {
+                            Ok(value) => Exit::Success(effect::Chunk::Values(vec![value])),
+                            Err(error) => Exit::Fail(inject(DiagnosticsError::Memory(error))),
+                        }
+                    }
+                },
+            }
+        },
+        release: |_cursor| crate::effect_sync! { body { () }, },
+    }
 }

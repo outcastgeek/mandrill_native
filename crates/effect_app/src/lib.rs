@@ -9,7 +9,10 @@
 //! defects, interruption, and cleanup failure.
 
 use effect::{effect_map_error, span};
+mod input_memory;
+mod managed;
 pub mod native;
+mod output_memory;
 use effect::{
     AdmissionCapacity, Cache, CacheCapacity, CacheConfig, Cancellation, Console,
     DiagnosticCapacity, DiagnosticOverflow, Diagnostics, Effect, Exit, HasBlockingExecutor,
@@ -20,6 +23,12 @@ use effect::{
 };
 use effect_rayon::RayonCpu;
 use effect_tokio::{TokioBlocking, TokioClock, TokioTasks};
+pub use input_memory::InputLoadError;
+pub use managed::{
+    AppMemoryLimits, AppMemoryMode, ManagedAppEnv, ManagedAppError, ManagedLiveApp,
+    ManagedStartupError, managed_application,
+};
+pub use output_memory::{OutputBytes, OutputMemoryError};
 use serde::Deserialize;
 use std::fs::File;
 use std::io::Write;
@@ -330,43 +339,99 @@ fn metadata() -> Effect<u64, AppError, AppEnv> {
 /// Type: `Effect<Report, Error, AppEnv>`.
 /// Returns a lazy `Effect` with the declared success, error, and environment types.
 pub fn application() -> Effect<Report, Error, AppEnv> {
+    application_stages(system_input(), |sum| {
+        effect::effect_sync! { body: move || StagedOutput::System(sum), }
+    })
+}
+
+enum LoadedSamples {
+    System(Vec<i64>),
+    Managed(input_memory::Samples),
+}
+
+impl LoadedSamples {
+    fn sum(&self) -> Result<i128, AppError> {
+        let samples = match self {
+            Self::System(samples) => samples.as_slice(),
+            Self::Managed(samples) => samples.as_slice(),
+        };
+        samples.iter().try_fold(i128::default(), |sum, sample| {
+            sum.checked_add(i128::from(*sample))
+                .ok_or(AppError::ArithmeticOverflow)
+        })
+    }
+}
+
+enum StagedOutput {
+    System(i128),
+    Managed(OutputBytes),
+}
+
+impl StagedOutput {
+    fn write(&self, mut file: &File) -> std::io::Result<()> {
+        match self {
+            Self::System(sum) => writeln!(file, "{sum}"),
+            Self::Managed(bytes) => file.write_all(bytes.as_bytes()),
+        }?;
+        file.sync_all()
+    }
+}
+
+fn system_input() -> Effect<LoadedSamples, Error, AppEnv> {
+    effect! {
+        let (retries, delay) = service! { env |env: &AppEnv| { (env.retries, env.retry_delay) }, }?;
+        let bytes = effect_retry! {
+            program: fetch(), schedule: effect::Schedule::recurs(retries).intersect(effect::Schedule::spaced(delay)),
+        }?;
+        let json = effect_try_sync! {
+            once; body { String::from_utf8(bytes) },
+            on_error |error| { SharedValue::new(AppError::Resource(effect::Defect::from_utf8(error))) },
+        }?;
+        let input = effect_map_error! { program: schema().parse(Arc::<str>::from(json), AppError::JsonSyntax), map: SharedValue::new, }?;
+        LoadedSamples::System(input.samples)
+    }
+}
+
+fn shared_error<E: From<AppError> + Send + 'static>(error: AppError) -> SharedValue<E> {
+    SharedValue::new(E::from(error))
+}
+
+fn application_stages<E: From<AppError> + Send + 'static>(
+    input: Effect<LoadedSamples, SharedValue<E>, AppEnv>,
+    prepare_output: impl Fn(i128) -> Effect<StagedOutput, SharedValue<E>, AppEnv>
+    + Clone
+    + Send
+    + Sync
+    + 'static,
+) -> Effect<Report, SharedValue<E>, AppEnv> {
     span! {
         name: stringify!(application),
         effect: effect_scope! {
-        body |scope: Scope<Error>| {
+        body |scope: Scope<SharedValue<E>>| {
             let scope = scope.clone();
+            let input = input.clone();
+            let prepare_output = prepare_output.clone();
             let files = service! { env |env: &AppEnv| { Arc::clone(&env.files) }, }?;
-            let policy = service! { env |env: &AppEnv| { (env.retries, env.retry_delay, env.metadata_capacity, env.metadata_ttl) }, }?;
-            let (retries, delay, capacity, ttl) = policy;
-            let bytes = effect_retry! {
-                program: fetch(), schedule: effect::Schedule::recurs(retries).intersect(effect::Schedule::spaced(delay)),
-            }?;
-            let json = effect_try_sync! {
-                once; body { String::from_utf8(bytes) },
-                on_error |error| { SharedValue::new(AppError::Resource(effect::Defect::from_utf8(error))) },
-            }?;
-            let input = effect_map_error! { program: schema().parse(Arc::<str>::from(json), AppError::JsonSyntax), map: SharedValue::new, }?;
-            let cache = Cache::make(scope.clone(), CacheConfig { equal: Arc::new(|left: &DocumentId, right: &DocumentId| left == right), ttl: Some(ttl), capacity: CacheCapacity::Bounded(capacity), cache_failure: Arc::new(|_: &AppError| false) }, |_| metadata())?;
+            let (capacity, ttl) = service! { env |env: &AppEnv| { (env.metadata_capacity, env.metadata_ttl) }, }?;
+            let samples = input?;
+            let cache = Cache::make(scope.clone(), CacheConfig { equal: Arc::new(|left: &DocumentId, right: &DocumentId| left == right), ttl: Some(ttl), capacity: CacheCapacity::Bounded(capacity), cache_failure: Arc::new(|_: &E| false) }, |_| effect_map_error! { program: metadata(), map: E::from, })?;
             let compute = scope.fork(effect_try_cpu! {
                 once;
-                body |_cancel| {
-                    input.samples.into_iter().try_fold(i128::default(), |sum, sample| {
-                        sum.checked_add(i128::from(sample)).ok_or(AppError::ArithmeticOverflow)
-                    })
-                },
-                on_error: SharedValue::new,
+                body |_cancel| { samples.sum() },
+                on_error: shared_error::<E>,
             })?;
             let inspect = scope.fork(cache.get(DocumentId::Input))?;
             let sum = compute.join()?;
             let input_bytes = inspect.join()?;
             let input_bytes = effect_try_sync! {
                 body { input_bytes.with(|bytes| *bytes) },
-                on_error |defect| { SharedValue::new(AppError::Resource(defect)) },
+                on_error |defect| { shared_error::<E>(AppError::Resource(defect)) },
             }?;
+            let output = prepare_output(sum)?;
             let create_files = Arc::clone(&files);
             let acquire = effect_try_blocking! {
                 body |_cancel| { File::options().write(true).create_new(true).open(&create_files.staging) },
-                on_error |error| { SharedValue::new(AppError::Io(error)) },
+                on_error |error| { shared_error::<E>(AppError::Io(error)) },
             };
             let release_files = Arc::clone(&files);
             let staging = effect_scope_acquire! {
@@ -381,7 +446,7 @@ pub fn application() -> Effect<Report, Error, AppEnv> {
                                 match tokio::fs::remove_file(&files.staging).await {
                                     Ok(()) => Ok(()),
                                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                                    Err(error) => Err(SharedValue::new(AppError::Io(error))),
+                                    Err(error) => Err(shared_error::<E>(AppError::Io(error))),
                                 }
                             }
                         },
@@ -392,12 +457,9 @@ pub fn application() -> Effect<Report, Error, AppEnv> {
             effect_try_blocking! {
                 once;
                 body |_cancel| {
-                    stage.with(|file| {
-                        let mut file = file;
-                        writeln!(file, "{sum}").and_then(|()| file.sync_all())
-                    }).map_err(AppError::Resource)?.map_err(AppError::Io)
+                    stage.with(|file| output.write(file)).map_err(AppError::Resource)?.map_err(AppError::Io)
                 },
-                on_error: SharedValue::new,
+                on_error: shared_error::<E>,
             }?;
             let commit_files = Arc::clone(&files);
             effect_try_future! {
@@ -406,7 +468,7 @@ pub fn application() -> Effect<Report, Error, AppEnv> {
                     let files = Arc::clone(&commit_files);
                     async move { tokio::fs::rename(&files.staging, &files.output).await }
                 },
-                on_error |error| { SharedValue::new(AppError::Io(error)) },
+                on_error |error| { shared_error::<E>(AppError::Io(error)) },
             }?;
             Report { sum, input_bytes }
         },

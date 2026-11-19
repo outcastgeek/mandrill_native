@@ -27,9 +27,11 @@
 //! connection.
 
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use effect::{Effect, effect_try_sync};
+use effect::memory::{Buffer, BufferView, SlotPool};
 use effect_server::Request;
 
 use crate::definitions::{
@@ -40,7 +42,8 @@ use crate::localization::TranslateKeyFunc;
 use crate::routing::CanonicalRoutePathBuilder;
 
 use super::documents::{
-    SitemapDocumentVM, SitemapIndexVM, definition_sitemap_index, sitemap_document_for_kind,
+    SitemapDocumentVM, SitemapIndexVM, SitemapWriteError, definition_sitemap_index,
+    sitemap_document_for_kind, write_sitemap_index,
 };
 use super::props::SEOVM;
 use super::publication::{Prepared, publish};
@@ -252,6 +255,30 @@ where
                     validator: options.validate_sitemap_index.clone(),
                 })
                 .map_err(SEOError::Validation)
+            },
+        }
+    }
+
+    /// Serialize the sitemap index into a checked-out prepared output buffer.
+    ///
+    /// The mutable owned-index validator remains available through `sitemap_index`.
+    /// This writer rejects that configuration before admission or registry work.
+    pub fn sitemap_index_prepared<R: Send + Sync + 'static>(
+        &self,
+        outputs: Arc<SlotPool<'static, Buffer<'static>>>,
+        maximum_entries: NonZeroUsize,
+    ) -> Effect<BufferView<'static>, SitemapWriteError, R> {
+        let resources = self.resources.clone();
+        let has_owned_validator = self.options.validate_sitemap_index.is_some();
+        effect_try_sync! {
+            body {
+                if has_owned_validator {
+                    return Err(SitemapWriteError::OwnedIndexValidator);
+                }
+                let mut output = outputs.try_checkout().map_err(SitemapWriteError::Memory)?;
+                output.clear();
+                write_sitemap_index(resources.as_ref(), maximum_entries, &mut output)?;
+                Ok(BufferView::new(output.share()))
             },
         }
     }

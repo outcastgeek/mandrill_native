@@ -545,9 +545,14 @@ impl<A: Send + 'static, D: HasConfigSource + Send + Sync + 'static, E: Send + Sy
                             map |issue| { ConfigError::Invalid { path: path.clone(), issue } },
                         }?
                     }
-                    None => effect_try_sync! {
-                        body { Err::<A, _>(ConfigError::Missing { path: path.clone() }) },
-                    }?,
+                    None => {
+                        // ConfigError retains prepared schema ownership; boxing would allocate.
+                        #[allow(clippy::result_large_err)]
+                        let missing = effect_try_sync! {
+                            body { Err::<A, _>(ConfigError::Missing { path: path.clone() }) },
+                        };
+                        missing?
+                    },
                 },
             }
         }

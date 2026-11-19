@@ -212,11 +212,14 @@ fn finish_codec(
 /// schema/JSON depth, pattern and cumulative issue budgets. Optional mapping
 /// changes SchemaIssue only; encoding remains a separate directional operation.
 pub(crate) fn parse(input: Input) -> syn::Result<TokenStream> {
-    input.mode(&[], "default")?;
+    let mode = input.mode(&["prepared"], "default")?;
     let mut fields = input.fields;
     let codec = fields.transform("codec", |codec, _| Ok(quote!(&(#codec))))?;
     let text = fields.take("text")?;
-    let output = if fields.contains("policy") {
+    let output = if mode == "prepared" {
+        let parser = fields.take("parser")?;
+        quote!((#codec).parse_prepared(#parser, #text))
+    } else if fields.contains("policy") {
         let policy = fields.take("policy")?;
         quote!((#codec).parse(#text, #policy))
     } else {

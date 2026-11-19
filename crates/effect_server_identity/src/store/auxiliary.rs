@@ -18,6 +18,7 @@ use uuid::Uuid;
 pub struct ChallengePurpose(String);
 impl ChallengePurpose {
     /// Reject empty/oversize discriminators before persistence or allocation by SQL.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     pub fn new(value: String, max_bytes: NonZeroU16) -> Result<Self, RecordError> {
         if value.trim().is_empty() || value.len() > usize::from(max_bytes.get()) {
             return Err(RecordError::Bound);
@@ -60,6 +61,7 @@ impl<A: Send + 'static, C: RecordCodec<A>> ChallengeRepository<A, C> {
         format!("{owner}:{}:{}", purpose.as_str().len(), purpose.as_str())
     }
     /// Acknowledge one purpose-bound challenge only after expiry/quota/unique-ID insertion.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     pub async fn issue(
         &self,
         owner: UserId,
@@ -82,6 +84,7 @@ impl<A: Send + 'static, C: RecordCodec<A>> ChallengeRepository<A, C> {
     }
     /// Consume exactly one matching unexpired owner/purpose/revision at the durable
     /// boundary. Protocol verification must still validate this typed native payload.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     pub async fn consume(
         &self,
         owner: UserId,
@@ -157,6 +160,7 @@ impl<A: Send + 'static, C: RecordCodec<A>> RequestRepository<A, C> {
         self.records.belongs_to(configuration)
     }
     /// Acknowledge durable acceptance before a transport/worker receives the payload.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     pub async fn accept(
         &self,
         owner: &str,
@@ -175,6 +179,7 @@ impl<A: Send + 'static, C: RecordCodec<A>> RequestRepository<A, C> {
         })
     }
     /// Inspect acknowledged state after uncertainty; absence is distinct from outage.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     pub async fn find(
         &self,
         owner: &str,
@@ -185,6 +190,7 @@ impl<A: Send + 'static, C: RecordCodec<A>> RequestRepository<A, C> {
     }
     /// Record caller-defined status only at the exact prior accepted revision.
     /// A callback result's meaning belongs to the selected application service.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     pub async fn update(
         &self,
         owner: &str,

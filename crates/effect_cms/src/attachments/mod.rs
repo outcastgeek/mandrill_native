@@ -64,9 +64,11 @@ use crate::commands::InputBytes;
 
 mod inputs;
 mod items;
+mod prepared;
 mod request;
 
 pub use self::inputs::{MediaAttachmentRoleOptions, RoleNormalizer, RoleNormalizerRef};
+pub use self::prepared::{PreparedAttachmentCapacity, PreparedAttachmentInput, PreparedAttachmentInputs, PreparedAttachmentPool};
 pub use self::request::{InitializeForm, MediaFormPolicy, initialize_media_form};
 pub use self::items::{
     MEDIA_ATTACHMENT_ROLE_DOWNLOAD, MEDIA_ATTACHMENT_ROLE_GALLERY, MEDIA_ATTACHMENT_ROLE_HERO,

@@ -80,6 +80,44 @@ where
     .with_host(use_host))
 }
 
+#[cfg(feature = "prometheus")]
+use effect::memory::{
+    Buffer, BufferLease, BufferView, Bytes, MemoryError, PreparedMemory, RegionId, SlotPool,
+};
+#[cfg(feature = "prometheus")]
+use std::sync::Arc;
+
+/// Independent response owners for the isolated operational metrics listener.
+#[cfg(feature = "prometheus")]
+pub struct PreparedMetricsOutput<E> {
+    buffers: SlotPool<'static, Buffer<'static>>,
+    errors: Arc<dyn Fn(MemoryError) -> E + Send + Sync>,
+}
+
+#[cfg(feature = "prometheus")]
+impl<E> PreparedMetricsOutput<E> {
+    /// Checked encoded-output bytes and physical pool metadata.
+    pub fn storage_bytes(scrapes: usize, output_bytes: Bytes) -> Result<Bytes, MemoryError> {
+        SlotPool::<Buffer<'static>>::storage_bytes(scrapes)?
+            .checked_add(output_bytes.checked_mul(scrapes)?)
+    }
+
+    /// Prepare actual response owners before any metrics gather runs.
+    pub fn prepare(
+        memory: &PreparedMemory<'static>,
+        region: RegionId,
+        scrapes: usize,
+        output_bytes: Bytes,
+        errors: impl Fn(MemoryError) -> E + Send + Sync + 'static,
+    ) -> Result<Self, MemoryError> {
+        Self::storage_bytes(scrapes, output_bytes)?;
+        Ok(Self {
+            buffers: memory.buffers(region, scrapes, output_bytes)?,
+            errors: Arc::new(errors),
+        })
+    }
+}
+
 /// Host the supported native Prometheus registry/encoder on a separate loopback
 /// listener. The registry belongs to the caller's native OTel Prometheus reader or
 /// native Prometheus collectors; Web installs no global registry/provider/exporter.
@@ -100,35 +138,107 @@ where
     E: Send + 'static,
     R: HasTokio + HasCancellation + HasTaskSpawner + Send + Sync + 'static,
 {
+    let (registry, maximum_bytes) = exporter;
+    prometheus_host(
+        policy,
+        exposure,
+        protocols,
+        scrape_path,
+        (registry, maximum_bytes, None),
+        errors,
+        use_host,
+    )
+}
+
+/// Host the same native exporter with its encoded response leased from an
+/// independent prepared operational region. Native registry gather is unchanged.
+#[cfg(feature = "prometheus")]
+pub fn with_prepared_prometheus_host<A, E, R>(
+    policy: ServerPolicy<E, R>,
+    exposure: LoopbackExposure,
+    protocols: HttpProtocols,
+    scrape_path: &str,
+    exporter: (
+        prometheus::Registry,
+        std::num::NonZeroUsize,
+        Arc<PreparedMetricsOutput<E>>,
+    ),
+    errors: impl Fn(prometheus::Error) -> E + Send + Sync + 'static,
+    use_host: impl Fn(ServerHost) -> Effect<A, E, R> + Send + Sync + 'static,
+) -> Result<Effect<A, E, R>, ServerError>
+where
+    A: Send + 'static,
+    E: Send + 'static,
+    R: HasTokio + HasCancellation + HasTaskSpawner + Send + Sync + 'static,
+{
+    let (registry, maximum_bytes, output) = exporter;
+    prometheus_host(
+        policy,
+        exposure,
+        protocols,
+        scrape_path,
+        (registry, maximum_bytes, Some(output)),
+        errors,
+        use_host,
+    )
+}
+
+#[cfg(feature = "prometheus")]
+fn prometheus_host<A, E, R>(
+    policy: ServerPolicy<E, R>,
+    exposure: LoopbackExposure,
+    protocols: HttpProtocols,
+    scrape_path: &str,
+    exporter: (
+        prometheus::Registry,
+        std::num::NonZeroUsize,
+        Option<Arc<PreparedMetricsOutput<E>>>,
+    ),
+    errors: impl Fn(prometheus::Error) -> E + Send + Sync + 'static,
+    use_host: impl Fn(ServerHost) -> Effect<A, E, R> + Send + Sync + 'static,
+) -> Result<Effect<A, E, R>, ServerError>
+where
+    A: Send + 'static,
+    E: Send + 'static,
+    R: HasTokio + HasCancellation + HasTaskSpawner + Send + Sync + 'static,
+{
     use crate::effect_try_sync;
-    use effect::effect_map;
     use effect_server::{endpoint, registered, reply};
     use prometheus::Encoder;
-    let (registry, maximum_bytes) = exporter;
-    let errors = std::sync::Arc::new(errors);
-    let render = effect_map! {
-        program: effect_try_sync! {
+    let (registry, maximum_bytes, storage) = exporter;
+    let render = effect_try_sync! {
         body: move || {
+            let bytes = match &storage {
+                Some(storage) => {
+                    let mut output = storage.buffers.try_checkout().map_err(|error| (storage.errors)(error))?;
+                    output.clear();
+                    MetricsBytes::Prepared(output)
+                }
+                None => MetricsBytes::Ordinary(Vec::new()),
+            };
+            let mut output = BoundedMetrics { maximum: maximum_bytes.get(), bytes, failure: None };
             let encoder = prometheus::TextEncoder::new();
             let families = registry.gather();
-            let mut output = BoundedMetrics {
-                maximum: maximum_bytes.get(),
-                bytes: Vec::new(),
-            };
-            encoder.encode(&families, &mut output)?;
+            if let Err(error) = encoder.encode(&families, &mut output) {
+                let failure = output.failure;
+                drop(output);
+                if let Some((storage, failure)) = storage.as_ref().zip(failure) {
+                    return Err((storage.errors)(failure));
+                }
+                return Err(errors(error));
+            }
             let media = http::HeaderValue::from_str(encoder.format_type())
-                .map_err(|error| prometheus::Error::Msg(error.to_string()))?;
-            Ok::<_, prometheus::Error>((bytes::Bytes::from(output.bytes), media))
+                .map_err(|error| errors(prometheus::Error::Msg(error.to_string())))?;
+            let source = match output.bytes {
+                MetricsBytes::Prepared(buffer) => reply! { lease(BufferView::new(buffer.share()), media) },
+                MetricsBytes::Ordinary(bytes) => reply! { bytes(bytes::Bytes::from(bytes), media) },
+            };
+            Ok(reply! {
+                header(http::header::CACHE_CONTROL, http::HeaderValue::from_static("no-store")),
+                source(source),
+            })
         },
-        on_error: move |error| errors(error),
-        },
-        map: |(bytes, media)| reply! {
-            header(
-                http::header::CACHE_CONTROL,
-                http::HeaderValue::from_static("no-store"),
-        ),
-            bytes(bytes, media),
-        },
+        on_error: ::core::convert::identity,
     };
     let routes = router! {
         methods(effect_server::HttpMethodSet::new(vec![http::Method::GET])?, scrape_path, registered! {
@@ -147,31 +257,44 @@ where
     }?
     .with_host(use_host))
 }
-/// Finite native encoding sink. It enforces caller policy while the official
-/// Prometheus encoder supplies every wire-format rule; Web implements no serializer.
+#[cfg(feature = "prometheus")]
+enum MetricsBytes {
+    Ordinary(Vec<u8>),
+    Prepared(BufferLease<'static>),
+}
+
+/// Finite native encoding sink. The official encoder supplies every wire rule.
 #[cfg(feature = "prometheus")]
 struct BoundedMetrics {
-    /// Explicit maximum encoded scrape response bytes.
     maximum: usize,
-    /// Finite bytes supplied exclusively by the native encoder.
-    bytes: Vec<u8>,
+    bytes: MetricsBytes,
+    failure: Option<MemoryError>,
 }
 #[cfg(feature = "prometheus")]
 impl std::io::Write for BoundedMetrics {
-    /// Reject a write before allocation when the caller's finite byte bound is exceeded.
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if self
-            .bytes
-            .len()
+        let used = match &self.bytes {
+            MetricsBytes::Ordinary(bytes) => bytes.len(),
+            MetricsBytes::Prepared(buffer) => buffer.len(),
+        };
+        if used
             .checked_add(bytes.len())
             .is_none_or(|length| length > self.maximum)
         {
             return Err(std::io::Error::other("metrics encoded byte bound"));
         }
-        self.bytes.extend_from_slice(bytes);
+        match &mut self.bytes {
+            MetricsBytes::Ordinary(output) => output.extend_from_slice(bytes),
+            MetricsBytes::Prepared(output) => {
+                if let Err(error) = output.extend_from_slice(bytes) {
+                    self.failure = Some(error);
+                    return Err(std::io::ErrorKind::WriteZero.into());
+                }
+            }
+        }
         Ok(bytes.len())
     }
-    /// The finite in-memory sink has no independent flush or provider lifecycle.
+
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }

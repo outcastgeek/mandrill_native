@@ -8,6 +8,7 @@ use crate::{
     IdentityError, authority::IdentityClock, capabilities::NativeBackend,
     definition::IdentityComponents,
 };
+use effect::{PreparedSemaphorePermit, SharedValue};
 use identity_rs::identity::{
     IdentityOptions, IdentityResult,
     error::IdentityErrorDescriber,
@@ -24,12 +25,15 @@ use identity_rs::identity::{
 };
 use std::{num::NonZeroUsize, sync::Arc};
 
-/// Retained explicitly selected service. Clone shares only its configuration Arc.
-pub struct Retained<T>(Arc<T>);
+mod prepared_crypto;
+pub use prepared_crypto::{PreparedIdentityCrypto, PreparedPasswordWork};
+
+/// Retained explicitly selected service with optional invocation ownership.
+pub struct Retained<T>(Arc<T>, Option<SharedValue<PreparedSemaphorePermit>>);
 impl<T> Retained<T> {
     /// Retain one explicitly selected generation for both native composition and D18.
     pub fn new(service: T) -> Self {
-        Self(Arc::new(service))
+        Self(Arc::new(service), None)
     }
     /// Borrow its original native component without reacquiring a default.
     #[must_use]
@@ -40,7 +44,7 @@ impl<T> Retained<T> {
 impl<T> Clone for Retained<T> {
     /// Retain the original native component without cloning application payloads.
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self(self.0.clone(), self.1.clone())
     }
 }
 
@@ -484,7 +488,7 @@ impl<P> ProtectedUserStore<P> {
     /// Retain the selected native protector without generating/loading a hidden key provider.
     pub fn new(protector: P) -> Self {
         Self {
-            protector: Retained(Arc::new(protector)),
+            protector: Retained::new(protector),
         }
     }
 }
@@ -522,6 +526,8 @@ pub struct NativeUserComponents<SS, UV, PH, PV, LN, D, AP, SP> {
     generator: fn() -> Result<AuthenticatorKey, ()>,
     /// Selected native finite blocking-work bound.
     password_concurrency: NonZeroUsize,
+    /// Shared prepared worker budget, when this definition selects one.
+    prepared_crypto: Option<Arc<PreparedIdentityCrypto>>,
     /// Actual native factor provider, selected once.
     authenticator: Retained<AP>,
     /// Application admission restriction, selected once.
@@ -554,18 +560,30 @@ impl<SS, UV: UserValidator<IdentityUser>, PH, PV: PasswordValidator<IdentityUser
         password_validator.configure_options(options.password);
         Ok(Self {
             store,
-            validator: Retained(Arc::new(validator)),
-            hasher: Retained(Arc::new(hasher)),
-            password_validator: Retained(Arc::new(password_validator)),
-            normalizer: Retained(Arc::new(normalizer)),
+            validator: Retained::new(validator),
+            hasher: Retained::new(hasher),
+            password_validator: Retained::new(password_validator),
+            normalizer: Retained::new(normalizer),
             errors,
             options,
             generator,
             password_concurrency,
-            authenticator: Retained(Arc::new(authenticator)),
-            admission: Retained(Arc::new(admission)),
+            prepared_crypto: None,
+            authenticator: Retained::new(authenticator),
+            admission: Retained::new(admission),
             scheme,
         })
+    }
+
+    /// Select one application-owned worker budget without changing the native
+    /// hash algorithm, manager work limit, or password validation.
+    pub fn with_prepared_crypto(
+        mut self,
+        crypto: Arc<PreparedIdentityCrypto>,
+    ) -> Result<Self, IdentityError> {
+        crypto.validate(self.password_concurrency)?;
+        self.prepared_crypto = Some(crypto);
+        Ok(self)
     }
 }
 impl<B, P, SS, UV, PH, PV, LN, D, AP, SP> IdentityComponents<B, P>
@@ -592,12 +610,38 @@ where
         &self,
         backend: B,
         clock: IdentityClock,
-        _policies: Arc<P>,
+        policies: Arc<P>,
     ) -> Result<Self::Native, IdentityError> {
+        let work = <Self as IdentityComponents<B, P>>::reserve_password_work(self)?;
+        self.construct_with_password_work(backend, clock, policies, work)
+    }
+
+    fn reserve_password_work(&self) -> Result<Option<PreparedPasswordWork>, IdentityError> {
+        self.prepared_crypto
+            .as_ref()
+            .map(|crypto| crypto.reserve(self.password_concurrency))
+            .transpose()
+    }
+
+    fn construct_with_password_work(
+        &self,
+        backend: B,
+        clock: IdentityClock,
+        _policies: Arc<P>,
+        work: Option<PreparedPasswordWork>,
+    ) -> Result<Self::Native, IdentityError> {
+        let mut hasher = self.hasher.clone();
+        match (&self.prepared_crypto, work) {
+            (Some(owner), Some(work)) => {
+                hasher.1 = Some(work.admitted_hasher(owner, self.password_concurrency)?);
+            }
+            (None, None) => {}
+            (Some(_), None) | (None, Some(_)) => return Err(IdentityError::WrongConfiguration),
+        }
         let users = UserManager::with_components_and_error_describer(
             self.store.bind(backend),
             self.validator.clone(),
-            self.hasher.clone(),
+            hasher,
             self.password_validator.clone(),
             self.normalizer.clone(),
             self.errors.clone(),

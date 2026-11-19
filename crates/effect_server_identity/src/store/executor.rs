@@ -5,13 +5,23 @@
 //! across processes. Every collection query supplies its native contract bound.
 
 use super::error::{NativeCommandFailure, ProviderFailure};
-use sqlx::{Arguments, AssertSqlSafe, TursoArguments, TursoConnection, TursoRow};
+use super::schema::{SecurityFailure, SecurityScope, SecurityText};
+use effect::memory::MemoryError;
+use identity_rs::identity::StoreError;
+use sqlx::{Arguments, AssertSqlSafe, Row, TursoArguments, TursoConnection, TursoRow};
 use std::sync::{Arc, Mutex as DiagnosticMutex};
 use tokio::sync::Mutex;
 
 /// Private connection-operation diagnostic owner, independent of environment state.
 #[derive(Clone, Default)]
-pub(crate) struct OperationDiagnostics(Arc<DiagnosticMutex<Option<ProviderFailure>>>);
+pub(crate) struct OperationDiagnostics(Arc<DiagnosticMutex<Failures>>);
+
+#[derive(Default)]
+struct Failures {
+    provider: Option<ProviderFailure>,
+    memory: Option<MemoryError>,
+}
+
 impl OperationDiagnostics {
     /// Retain the first provider failure before projecting its native category.
     fn retain(&self, error: sqlx::Error) -> ProviderFailure {
@@ -20,8 +30,8 @@ impl OperationDiagnostics {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if retained.is_none() {
-            *retained = Some(error.clone());
+        if retained.provider.is_none() {
+            retained.provider = Some(error.clone());
         }
         error
     }
@@ -30,12 +40,29 @@ impl OperationDiagnostics {
         &self,
         category: identity_rs::identity::StoreError,
     ) -> effect_sql::SqlError {
-        let provider = self
+        let mut retained = self
             .0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(error) = retained.memory.take() {
+            return effect_sql::SqlError::Memory(error);
+        }
+        let provider = retained.provider.take();
         effect_sql::SqlError::Binding(Box::new(NativeCommandFailure { category, provider }))
+    }
+
+    fn security_error(&self, error: SecurityFailure) -> StoreError {
+        match error {
+            SecurityFailure::Native(error) => error,
+            SecurityFailure::Memory(error) => {
+                let mut retained = self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                retained.memory.get_or_insert(error);
+                StoreError::BackendUnavailable
+            }
+        }
     }
 }
 
@@ -45,18 +72,29 @@ pub(crate) struct StoreConnection<'a> {
     connection: Mutex<&'a mut TursoConnection>,
     /// Private per-operation failure retention; never shared by unrelated calls.
     diagnostics: OperationDiagnostics,
+    security: SecurityScope,
 }
 impl<'a> StoreConnection<'a> {
     /// Borrow an existing kernel owner; this acquires no pool lease or transaction.
-    pub(crate) fn new(connection: &'a mut TursoConnection) -> Self {
+    pub(super) fn new(connection: &'a mut TursoConnection, security: SecurityScope) -> Self {
         Self {
             connection: Mutex::new(connection),
             diagnostics: OperationDiagnostics::default(),
+            security,
         }
     }
     /// Retain a diagnostic handle across an owned async body without copying payloads.
     pub(crate) fn diagnostics(&self) -> OperationDiagnostics {
         self.diagnostics.clone()
+    }
+
+    pub(super) fn encode_security<T: serde::Serialize + ?Sized>(
+        &self,
+        value: &T,
+    ) -> Result<SecurityText, StoreError> {
+        self.security
+            .encode(value)
+            .map_err(|error| self.diagnostics.security_error(error))
     }
     /// Execute bound trusted schema SQL and preserve acknowledged affected rows.
     pub(crate) async fn execute(
@@ -91,6 +129,8 @@ impl<'a> StoreConnection<'a> {
             .map_err(|error| self.diagnostics.retain(error))?;
         Ok(StoreRows {
             rows: rows.into_iter(),
+            security: self.security.clone(),
+            diagnostics: self.diagnostics.clone(),
         })
     }
 }
@@ -99,12 +139,31 @@ impl<'a> StoreConnection<'a> {
 pub(crate) struct StoreRows {
     /// SQLx has already settled statement execution before releasing its borrow.
     rows: std::vec::IntoIter<TursoRow>,
+    security: SecurityScope,
+    diagnostics: OperationDiagnostics,
 }
 impl StoreRows {
+    pub(super) fn remaining(&self) -> usize {
+        self.rows.len()
+    }
+
     /// Move the next native row. Provider failures occurred at the awaited query;
     /// decoding failures are preserved by each native persistence decoder.
     pub(crate) async fn next(&mut self) -> Result<Option<TursoRow>, sqlx::Error> {
         Ok(self.rows.next())
+    }
+
+    pub(super) fn decode_security<T: serde::de::DeserializeOwned>(
+        &self,
+        row: &TursoRow,
+        column: usize,
+    ) -> Result<T, StoreError> {
+        let payload = row
+            .try_get::<&str, _>(column)
+            .map_err(|_| StoreError::CorruptStoredData)?;
+        self.security
+            .decode(payload)
+            .map_err(|error| self.diagnostics.security_error(error))
     }
 }
 
@@ -146,6 +205,18 @@ store_value!(
     &str,
     &[u8]
 );
+
+impl StoreValue for SecurityText {
+    fn append(self, arguments: &mut TursoArguments) -> Result<(), sqlx::Error> {
+        match self {
+            Self::Ordinary(text) => text.append(arguments),
+            Self::Prepared(buffer) => buffer
+                .text()
+                .map_err(|error| sqlx::Error::Encode(Box::new(error)))?
+                .append(arguments),
+        }
+    }
+}
 
 /// Tuple arities follow only the native store statements, retaining bind order.
 macro_rules! store_params {

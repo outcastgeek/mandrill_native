@@ -9,6 +9,12 @@ use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
+mod prepared;
+pub use prepared::{
+    PreparedMemoryProjectionStore, PreparedProjectionCapacity, PreparedProjectionError,
+    PreparedProjectionReservation, PreparedProjectionSnapshot, PreparedProjectionWrite,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// A capacity or checkpoint conflict in the process-local projection store.
 pub enum MemoryProjectionError {

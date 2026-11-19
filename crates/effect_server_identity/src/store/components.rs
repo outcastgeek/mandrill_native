@@ -6,8 +6,12 @@
 
 use super::{
     SqlxIdentityStore,
-    records::{RecordCategory, RecordCodec, RecordError, RecordPolicy, SqlRecordAdapter},
+    records::{
+        PreparedRecordCodec, PreparedRecordMemory, RecordCategory, RecordCodec, RecordError,
+        RecordPolicy, RecordWriter, SqlRecordAdapter,
+    },
 };
+use effect::memory::MemoryError;
 use identity_rs::identity::{
     ticket::{AuthenticationTicket, AuthenticationTicketFormat, TicketError},
     tokens::data_protection::{
@@ -72,6 +76,26 @@ impl RecordCodec<KeyDocument> for KeyDocumentCodec {
     }
 }
 
+impl PreparedRecordCodec<KeyDocument> for KeyDocumentCodec {
+    fn encode_prepared(
+        &self,
+        value: &KeyDocument,
+        writer: &mut RecordWriter<'_>,
+    ) -> Result<(), RecordError> {
+        writer
+            .extend_from_slice(value.xml().as_bytes())
+            .map_err(|_| RecordError::Bound)
+    }
+
+    fn decode_prepared(
+        &self,
+        version: NonZeroU16,
+        bytes: &[u8],
+    ) -> Result<KeyDocument, RecordError> {
+        self.decode(version, bytes)
+    }
+}
+
 /// Immutable request-retained native key generation, implementing the synchronous
 /// borrowed source contract without a global source, SQL query or dropped lock guard.
 #[derive(Clone)]
@@ -121,6 +145,14 @@ impl KeyRepository {
             publication: tokio::sync::Mutex::new(()),
         }
     }
+    /// Select bounded, reusable record bytes for this native repository.
+    pub fn with_prepared_memory(
+        mut self,
+        memory: Arc<PreparedRecordMemory>,
+    ) -> Result<Self, MemoryError> {
+        self.records = self.records.with_prepared_memory(memory)?;
+        Ok(self)
+    }
     /// Borrow the underlying selected key-record adapter for definition configuration checks.
     pub fn records(&self) -> &SqlRecordAdapter<KeyDocument, KeyDocumentCodec> {
         &self.records
@@ -136,11 +168,13 @@ impl KeyRepository {
     }
     /// Load acknowledged XML asynchronously, validate its native readable generation,
     /// then atomically publish it. Failure leaves the last good generation retained.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     pub async fn reload(&self, now: OffsetDateTime) -> Result<KeyRingSnapshot, RecordError> {
+        let mut buffer = self.records.reserve_buffer()?;
         let _publication = self.publication.lock().await;
         let record = self
             .records
-            .find(&self.owner, self.id, now)
+            .find_reserved(&self.owner, self.id, now, buffer.as_mut())
             .await?
             .ok_or(RecordError::Conflict)?;
         let ring = DataProtectionKeyRing::parse_xml(record.value.xml())
@@ -157,26 +191,29 @@ impl KeyRepository {
     }
     /// Create/conditionally replace a validated caller-supplied key document. Native
     /// XML is parsed before I/O; only acknowledged writes publish the new generation.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     pub async fn persist(
         &self,
         expected: Option<Uuid>,
         document: KeyDocument,
     ) -> Result<KeyRingSnapshot, RecordError> {
+        self.records.check_selected_size(document.xml().len())?;
+        let buffer = self.records.reserve_buffer()?;
         let _publication = self.publication.lock().await;
+        let admission = self.records.reserve_write_with(buffer)?;
         let ring =
             DataProtectionKeyRing::parse_xml(document.xml()).map_err(|_| RecordError::Corrupt)?;
-        let revision = match expected {
-            Some(expected) => {
-                self.records
-                    .replace(&self.owner, self.id, expected, None, document)
-                    .await?
-            }
-            None => {
-                self.records
-                    .create(&self.owner, self.id, None, document)
-                    .await?
-            }
-        };
+        let (revision, _) = self
+            .records
+            .write_reserved(
+                &self.owner,
+                self.id,
+                (expected, None),
+                document,
+                admission,
+                None,
+            )
+            .await?;
         let snapshot = KeyRingSnapshot {
             ring: Arc::new(ring),
             revision,
@@ -218,6 +255,26 @@ impl RecordCodec<StoredTicket> for StoredTicketCodec {
         }
         let protected = String::from_utf8(bytes.to_vec()).map_err(|_| RecordError::Corrupt)?;
         Ok(StoredTicket { protected })
+    }
+}
+
+impl PreparedRecordCodec<StoredTicket> for StoredTicketCodec {
+    fn encode_prepared(
+        &self,
+        value: &StoredTicket,
+        writer: &mut RecordWriter<'_>,
+    ) -> Result<(), RecordError> {
+        writer
+            .extend_from_slice(value.protected.as_bytes())
+            .map_err(|_| RecordError::Bound)
+    }
+
+    fn decode_prepared(
+        &self,
+        version: NonZeroU16,
+        bytes: &[u8],
+    ) -> Result<StoredTicket, RecordError> {
+        self.decode(version, bytes)
     }
 }
 /// Stored session persistence with explicit native protection and revocation semantics.
@@ -268,6 +325,14 @@ impl<T: AuthenticationTicketFormat + 'static> SessionRepository<T> {
             format: Arc::new(format),
         }
     }
+    /// Select bounded, reusable record bytes for this native repository.
+    pub fn with_prepared_memory(
+        mut self,
+        memory: Arc<PreparedRecordMemory>,
+    ) -> Result<Self, MemoryError> {
+        self.records = self.records.with_prepared_memory(memory)?;
+        Ok(self)
+    }
     /// Borrow the selected adapter for a definition's configuration fence.
     #[must_use]
     pub fn records(&self) -> &SqlRecordAdapter<StoredTicket, StoredTicketCodec> {
@@ -275,6 +340,7 @@ impl<T: AuthenticationTicketFormat + 'static> SessionRepository<T> {
     }
     /// Protect with the native serializer/algorithm, then acknowledge stored-session acceptance.
     /// Caller supplies expiry deliberately; protected native-ticket expiry is checked again on load.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     pub async fn store(
         &self,
         owner: &str,
@@ -282,27 +348,41 @@ impl<T: AuthenticationTicketFormat + 'static> SessionRepository<T> {
         expires_at: OffsetDateTime,
         ticket: &AuthenticationTicket,
     ) -> Result<Uuid, SessionError> {
+        let admission = self
+            .records
+            .reserve_write()
+            .map_err(SessionError::Storage)?;
         let protected = self
             .format
             .protect(ticket)
             .await
             .map_err(SessionError::Ticket)?;
         self.records
-            .create(owner, id, Some(expires_at), StoredTicket { protected })
+            .write_reserved(
+                owner,
+                id,
+                (None, Some(expires_at)),
+                StoredTicket { protected },
+                admission,
+                None,
+            )
             .await
+            .map(|(revision, _)| revision)
             .map_err(SessionError::Storage)
     }
     /// Load current unrevoked storage, then authenticate/decode/check native ticket expiry.
     /// This alone is not current-user eligibility; the trusted authentication workflow revalidates it.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     pub async fn load(
         &self,
         owner: &str,
         id: Uuid,
         now: OffsetDateTime,
     ) -> Result<Option<AuthenticationTicket>, SessionError> {
+        let mut buffer = self.records.reserve_buffer().map_err(SessionError::Storage)?;
         let Some(record) = self
             .records
-            .find(owner, id, now)
+            .find_reserved(owner, id, now, buffer.as_mut())
             .await
             .map_err(SessionError::Storage)?
         else {
@@ -314,6 +394,7 @@ impl<T: AuthenticationTicketFormat + 'static> SessionRepository<T> {
             .map_err(SessionError::Ticket)
     }
     /// Revoke exactly the stored revision and await acknowledgment before reporting logout.
+    #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
     pub async fn revoke(
         &self,
         owner: &str,

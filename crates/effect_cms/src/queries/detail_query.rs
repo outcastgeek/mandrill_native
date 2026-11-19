@@ -22,13 +22,17 @@
 //! outcome factory is introduced.
 
 use crate::commands::InputBytes;
-use effect::{Effect, effect_sync};
-use effect_server::Request;
+use crate::forms::{PreparedMergedForm, PreparedMergedForms};
+use effect::memory::Bytes;
+use effect::{Effect, effect_sync, effect_try_sync};
+use effect_server::{Request, ServerError};
+use std::sync::Arc;
 
 use crate::definitions::{RESOURCE_ID_PATH_PARAM, RESOURCE_SLUG_PATH_PARAM, ResourceKind};
 
 use super::list_query::{
-    CanonicalRouteParams, RequestLanguageFunc, first_non_blank, path_value, request_query_value,
+    CanonicalRouteParams, QueryValuesRef, RequestLanguageFunc, check_capacity, check_request_bytes,
+    path_value, request_query_map,
 };
 
 /// One admitted detail query.
@@ -51,6 +55,15 @@ pub struct DetailOptions {
     pub request_language: Option<RequestLanguageFunc>,
     /// Canonical detail route parameter names.
     pub detail_params: CanonicalRouteParams,
+}
+
+/// Selected metadata limits for detail-query admission.
+#[derive(Clone, Copy)]
+pub struct PreparedDetailLimits {
+    /// Maximum bytes in the request path and encoded query.
+    pub request: Bytes,
+    /// Maximum bytes retained from the language resolver.
+    pub locale: Bytes,
 }
 
 /// Admits detail queries.
@@ -81,7 +94,48 @@ impl DetailService {
     {
         let options = self.options.clone();
         let request = request.clone();
-        effect_sync! { body: move || admit_detail_query(&options, &request), }
+        effect_sync! {
+            body: move || {
+                let fields = request_query_map(&request);
+                let (mut admitted, locale) = admit_detail_query(&options, &request, QueryValuesRef::Ordinary(&fields));
+                admitted.locale = locale.trim();
+                admitted
+            },
+        }
+    }
+
+    /// Admit the detail query without ordinary query-decoding tables.
+    /// The path and query limit is checked before resolving the consumer locale.
+    pub fn detail_query_prepared<R: Send + Sync + 'static>(
+        &self,
+        request: &Request,
+        storage: Arc<PreparedMergedForms>,
+        limits: PreparedDetailLimits,
+    ) -> Effect<ResourceDetailQuery, ServerError, R> {
+        let service = self.clone();
+        let request = request.clone();
+        effect_try_sync! {
+            body: move || {
+                check_request_bytes(&request, limits.request)?;
+                let fields = storage.read_query(&request)?;
+                service.admit_prepared(&request, &fields, limits)
+            },
+        }
+    }
+
+    pub(super) fn admit_prepared(
+        &self,
+        request: &Request,
+        fields: &PreparedMergedForm,
+        limits: PreparedDetailLimits,
+    ) -> Result<ResourceDetailQuery, ServerError> {
+        check_request_bytes(request, limits.request)?;
+        let (mut admitted, locale) =
+            admit_detail_query(&self.options, request, QueryValuesRef::Prepared(fields));
+        let locale = crate::validation::trim_unicode_whitespace(locale.as_bytes());
+        check_capacity(locale.len(), limits.locale.get())?;
+        admitted.locale = InputBytes::from(locale);
+        Ok(admitted)
     }
 }
 
@@ -92,58 +146,55 @@ pub fn new_detail_service(options: DetailOptions) -> DetailService {
 }
 
 /// Detail admission over one request.
-fn admit_detail_query(options: &DetailOptions, request: &Request) -> ResourceDetailQuery {
+fn admit_detail_query(
+    options: &DetailOptions,
+    request: &Request,
+    fields: QueryValuesRef<'_>,
+) -> (ResourceDetailQuery, InputBytes) {
     let params = &options.detail_params;
-    let id_param = first_non_blank(&[params.id_param.clone(), RESOURCE_ID_PATH_PARAM.to_owned()]);
-    let slug_param = first_non_blank(&[
-        params.slug_param.clone(),
-        RESOURCE_SLUG_PATH_PARAM.to_owned(),
-    ]);
-    let id = first_non_blank_bytes(&[
-        path_value(request, &id_param).into(),
-        request_query_value(request, &id_param),
-    ]);
-    let slug = first_non_blank_bytes(&[
-        path_value(request, &slug_param).into(),
-        request_query_value(request, &slug_param),
-    ]);
-    let parent = detail_param_value(
+    let id = detail_param_value(
         request,
-        &[
-            params.parent_param.clone(),
-            params.parent_name_param.clone(),
-        ],
+        fields,
+        parameter_or(&params.id_param, RESOURCE_ID_PATH_PARAM),
     );
-    let locale = match &options.request_language {
-        Some(resolve) => resolve(request).trim().to_owned(),
-        None => InputBytes::default(),
-    };
-    ResourceDetailQuery {
+    let slug = detail_param_value(
+        request,
+        fields,
+        parameter_or(&params.slug_param, RESOURCE_SLUG_PATH_PARAM),
+    );
+    let parent = [params.parent_param.trim(), params.parent_name_param.trim()]
+        .into_iter()
+        .filter(|param| !param.is_empty())
+        .map(|param| detail_param_value(request, fields, param))
+        .find(|value| !value.is_empty())
+        .unwrap_or_default();
+    let locale = options
+        .request_language
+        .as_ref()
+        .map_or_else(InputBytes::default, |resolve| resolve(request));
+    let query = ResourceDetailQuery {
         id,
         slug,
         parent,
-        locale,
+        locale: InputBytes::default(),
+    };
+    (query, locale)
+}
+
+fn parameter_or<'a>(parameter: &'a str, default: &'a str) -> &'a str {
+    let parameter = parameter.trim();
+    if parameter.is_empty() {
+        default
+    } else {
+        parameter
     }
 }
 
-/// The first path or query value across the supplied parameter names.
-fn detail_param_value(request: &Request, params: &[String]) -> InputBytes {
-    let mut values: Vec<InputBytes> = Vec::with_capacity(params.len() * 2);
-    for param in params {
-        let param = param.trim();
-        if param.is_empty() {
-            continue;
-        }
-        values.push(path_value(request, param).into());
-        values.push(request_query_value(request, param));
+fn detail_param_value(request: &Request, fields: QueryValuesRef<'_>, param: &str) -> InputBytes {
+    let path = path_value(request, param);
+    if path.is_empty() {
+        fields.trimmed(param)
+    } else {
+        path.into()
     }
-    first_non_blank_bytes(&values)
-}
-
-fn first_non_blank_bytes(values: &[InputBytes]) -> InputBytes {
-    values
-        .iter()
-        .map(InputBytes::trim)
-        .find(|value| !value.is_empty())
-        .unwrap_or_default()
 }

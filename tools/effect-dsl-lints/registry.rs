@@ -14,6 +14,11 @@ pub fn facade(name: &str) -> bool {
     )
 }
 pub const MACROS: &[&str] = &[
+    "memory",
+    "memory_lease",
+    "memory_vec",
+    "memory_write",
+    "effect_drop_guard",
     "effect",
     "schema",
     "schema_enum",
@@ -107,6 +112,7 @@ pub const MACROS: &[&str] = &[
     "effect_resource",
     "effect_using",
     "effect_scope",
+    "effect_prepare",
     "effect_scope_acquire",
     "effect_finalizer",
     "layer",
@@ -138,6 +144,7 @@ const EFFECT: &[&str] = &[
     "try_sync",
     "try_sync_once",
     "from_future",
+    "from_prepared_future",
     "from_future_once",
     "from_future_with_env",
     "try_future",
@@ -160,6 +167,7 @@ const EFFECT: &[&str] = &[
     "from_exit_future",
     "from_exit_future_with_env",
     "from_exit_future_with_context",
+    "from_prepared_exit_future_with_context",
     "service",
     "defer",
     "flat_map",
@@ -208,6 +216,7 @@ const OWNERS: &[(&str, &[&str])] = &[
         ],
     ),
     ("TxRef", &["update"]),
+    ("TransactionDomain", &["prepare"]),
     (
         "AtomProgram",
         &["from_body", "map_error", "map", "flat_map", "defer"],
@@ -244,6 +253,7 @@ const OWNERS: &[(&str, &[&str])] = &[
         ],
     ),
     ("Sink", &["for_each", "fold"]),
+    ("PreparedStream", &["new", "from_iterable", "map", "rechunk", "collect", "fold"]),
     ("ResourceBinding", &["new", "use_with"]),
     ("Release", &["from_effect", "sync", "try_sync", "new"]),
     (
@@ -254,20 +264,55 @@ const OWNERS: &[(&str, &[&str])] = &[
         "Layer",
         &["new", "scoped", "merge", "provide", "provide_to"],
     ),
+    ("PreparedScope", &["close", "admit_close", "reserve_closed"]),
+    ("ScopePermit", &["reserve", "bind", "try_bind"]),
+    ("PreparedScopeOwner", &["prepare", "prepare_with_cleanup", "into_effect", "reserve_close"]),
+    ("PreparedRunPlan", &["new", "prepare"]),
+    ("PreparedRun", &["admit", "admit_with_prepared_trace"]),
+    ("PreparedRunContext", &["native", "reserve_native"]),
+    ("PreparedNativeReservation", &["native"]),
+    (
+        "PreparedGraphPlan",
+        &["new", "new_with_input", "prepare", "with_construction"],
+    ),
+    ("ConstructedGraphPlan", &["prepare"]),
+    ("ConstructedGraph", &["admit", "admit_with_prepared_trace"]),
+    ("PreparedGraph", &["admit", "admit_with_prepared_trace"]),
+    ("PreparedScopePool", &["prepare", "scoped", "try_scoped", "admit_scoped"]),
+    ("PreparedResourceBinding", &["acquire_scoped", "admit_acquire_scoped"]),
+    ("PreparedFutureResourceBinding", &["acquire_scoped", "admit_acquire_scoped"]),
+    ("PreparedCheckpoint", &["release"]),
+    ("PreparedRelease", &["prepare", "register", "admit_registration"]),
+    ("PreparedResourcePlan", &["new"]),
+    ("PreparedFutureResourcePlan", &["new"]),
+    ("PreparedReleasePlan", &["new"]),
     ("Semaphore", &["acquire"]),
     ("PartitionedSemaphore", &["acquire", "acquire_with"]),
     ("Schedule", &["unfold"]),
     ("AtomicRef", &["modify", "modify_in_place", "update"]),
+    ("PreparedAtomicRef", &["modify_now", "modify_in_place_now", "update_now"]),
+    ("PreparedSynchronizedRef", &["admit_write"]),
+    ("PreparedSynchronizedWrite", &["snapshot", "commit", "release"]),
+    ("PreparedQueue", &["offer_try_with_context", "take_with_context"]),
+    ("PreparedPubSub", &["admit_publication"]),
+    ("PreparedPublication", &["run_candidate_with_context"]),
+    ("PreparedSubscription", &["take_with_context"]),
+    ("PreparedSubscriptionRef", &["admit_set", "read_now", "subscribe_now"]),
+    ("PreparedExitMapper", &["admit", "map"]),
     ("SynchronizedRef", &["modify_effect"]),
-    ("Pool", &["make", "exists_idle"]),
-    ("WeakCache", &["get", "get_partition"]),
+    ("Pool", &["make", "make_with_prepared_storage", "exists_idle", "exists_idle_prepared"]),
+    ("WeakCache", &["get", "get_partition", "make_with_prepared_storage", "make_with_prepared_refusals"]),
     ("PartitionedWeakCache", &["get", "get_partition"]),
-    ("RequestResolver", &["make"]),
+    (
+        "RequestResolver",
+        &["make", "make_with_prepared_index", "make_with_prepared_batches"],
+    ),
     ("ServiceOperation", &["new", "try_sync", "try_future"]),
     ("ServiceResource", &["new"]),
     ("ServiceBody", &["from_body"]),
-    ("Cache", &["make_with_options", "make_with_shared_key"]),
-    ("DependencyCache", &["make", "make_with_shared_key"]),
+    ("Cache", &["make_with_options", "make_with_shared_key", "make_with_prepared_index", "make_prepared", "make_prepared_with_refusals", "make_prepared_independent"]),
+    ("DependencyCache", &["make", "make_with_shared_key", "make_with_prepared_index"]),
+    ("PreparedDependencyCache", &["make", "make_prepared", "make_prepared_with_refusals", "make_prepared_independent"]),
     ("HydrationSet", &["new", "insert"]),
     ("ClusterSingleton", &["run"]),
     ("ClusterSchedule", &["new"]),
@@ -278,6 +323,9 @@ const OWNERS: &[(&str, &[&str])] = &[
     ),
     ("Persistable", &["new", "with_policy"]),
     ("RpcOperation", &["unary", "with_idempotency_key"]),
+    ("PreparedRpcOperation", &["new"]),
+    ("MemoryClusterMessageStore", &["prepare"]),
+    ("MemoryWorkflowEngine", &["prepare"]),
     ("RpcHandler", &["new", "provide_some"]),
     ("RpcStreamOperation", &["new"]),
     ("RpcStreamHandler", &["new", "provide_some"]),
@@ -352,7 +400,7 @@ const OWNERS: &[(&str, &[&str])] = &[
             "parse",
         ],
     ),
-    ("ConfiguredCodec", &["parse"]),
+    ("ConfiguredCodec", &["parse", "parse_prepared"]),
     ("EffectSchema", &["parse"]),
     (
         "RecordBuilder",
@@ -364,12 +412,26 @@ const OWNERS: &[(&str, &[&str])] = &[
             "finish",
         ],
     ),
+    ("PreparedRecordBuilder", &["new", "field", "optional", "optional_with_default", "finish"]),
+    ("PreparedEffectRecordBuilder", &["new", "field", "optional", "default_with", "default_with_context", "finish", "finish_in"]),
+    ("PreparedGenericRecordBacking", &["new"]),
     (
         "NativeRecordBuilder",
         &["new", "field", "optional", "default_with_context", "finish"],
     ),
     ("TaggedEnumBuilder", &["new", "variant", "finish"]),
+    ("PreparedTaggedEnumBuilder", &["new", "variant", "finish"]),
     ("SqlStatement", &["builder", "trusted"]),
+    ("PreparedSqlRowsPool", &["prepare"]),
+    ("PreparedSqlRowLanes", &["prepare"]),
+    ("PreparedSqlStatementPool", &["prepare", "reserve"]),
+    ("PreparedSqlSessionPool", &["prepare"]),
+    ("PreparedSqlBatchPool", &["prepare", "reserve"]),
+    ("PreparedSqlBatchBuilder", &["try_push", "finish"]),
+    ("PreparedSqlStatementBuilder", &["text", "identifier", "null", "integer", "real", "text_param", "blob", "finish"]),
+    ("SqlClient", &["query_into_rows_atomic", "batch_into_rows_atomic", "query_bytes_into_rows_atomic", "batch_bytes_into_rows_atomic"]),
+    ("SqlTransaction", &["query_into_rows_atomic", "batch_into_rows_atomic", "query_bytes_into_rows_atomic", "batch_bytes_into_rows_atomic"]),
+    ("SqlKernel", &["reserve_prepared_session", "reserve_prepared_rows"]),
     (
         "StatementBuilder",
         &[
@@ -383,7 +445,9 @@ const OWNERS: &[(&str, &[&str])] = &[
         ],
     ),
     ("MutationBuilder", &["new", "value", "update", "insert"]),
-    ("RowDecoder", &["from_program", "pure"]),
+    ("RowDecoder", &["from_program", "pure", "pure_with_env"]),
+    ("PreparedEndpointPlan", &["from_graph"]),
+    ("PreparedInputEndpointPlan", &["from_graph"]),
     (
         "Endpoint",
         &[
@@ -403,6 +467,8 @@ const OWNERS: &[(&str, &[&str])] = &[
             "json",
             "json_codec",
             "bytes",
+            "lease",
+            "frame",
             "stream",
             "representations",
             "redirect",
@@ -497,6 +563,7 @@ const OWNERS: &[(&str, &[&str])] = &[
             "respond",
             "set_header",
             "stage",
+            "prepared_stage",
             "append",
         ],
     ),
@@ -520,9 +587,12 @@ const OWNERS: &[(&str, &[&str])] = &[
             "around_request",
             "around_selection",
             "websockets",
+            "with_http1_header_timeout",
+            "with_overload_reply",
         ],
     ),
-    ("BodyProgram", &["new", "from_body", "source"]),
+    ("PreparedServer", &["prepare_with_request_controls"]),
+    ("BodyProgram", &["new", "from_body", "source", "leases", "frames"]),
     ("BodyWriter", &["source"]),
     (
         "IdentityStores",
@@ -608,16 +678,17 @@ const OWNERS: &[(&str, &[&str])] = &[
     ("EndpointGroup", &["new"]),
     ("Csp", &["new", "directive", "replace", "append"]),
     ("Security", &["new", "validate"]),
-    ("ReadThrough", &["scoped"]),
-    ("DependentReadThrough", &["scoped", "scoped_by"]),
+    ("ReadThrough", &["scoped", "scoped_prepared"]),
+    ("DependentReadThrough", &["scoped", "scoped_by", "scoped_prepared", "scoped_prepared_by"]),
     ("NamedArgument", &["new"]),
     ("Localization", &["new"]),
     ("Probe", &["new", "process_liveness"]),
-    ("Availability", &["new", "with_dashboard"]),
+    ("Availability", &["new", "with_dashboard", "with_prepared_output"]),
     (
         "Web",
         &[
             "new",
+            "with_memory",
             "security",
             "localization",
             "observe",
@@ -664,13 +735,34 @@ fn native_owner(krate: &str, owner: &str) -> bool {
             "eventlog::event_builder::EventBinaryFormats",
             "transactional::transaction::Transaction",
             "transactional::tx_ref::TxRef",
+            "transactional::tx_ref::TransactionDomain",
             "reactivity::atom_program::AtomProgram",
             "workflow::durable::Durable",
             "workflow::compensation::WorkflowCompensation",
             "cluster::entity_resource::EntityResourcePlan",
             "stream::Stream",
+            "stream::prepared::PreparedStream",
             "sink::Sink",
             "resource::ResourceBinding",
+            "scope::prepared::PreparedScope",
+            "scope::prepared::PreparedScopeOwner",
+            "internal::runtime::prepared::PreparedRunPlan",
+            "internal::runtime::prepared::PreparedRun",
+            "internal::runtime::prepared::PreparedRunContext",
+            "internal::runtime::prepared::PreparedNativeReservation",
+            "internal::runtime::prepared::graph::run::PreparedGraphPlan",
+            "internal::runtime::prepared::graph::run::PreparedGraph",
+            "internal::runtime::prepared::graph::run::ConstructedGraphPlan",
+            "internal::runtime::prepared::graph::run::ConstructedGraph",
+            "internal::runtime::prepared::graph::scope_binding::ScopePermit",
+            "scope::prepared::pool::PreparedScopePool",
+            "scope::prepared::resource::PreparedResourceBinding",
+            "scope::prepared::resource::future::PreparedFutureResourceBinding",
+            "scope::prepared::PreparedCheckpoint",
+            "scope::prepared::PreparedRelease",
+            "scope::prepared::PreparedReleasePlan",
+            "scope::prepared::resource::PreparedResourcePlan",
+            "scope::prepared::resource::future::PreparedFutureResourcePlan",
             "resource::Release",
             "scope::Scope",
             "layer::Layer",
@@ -687,6 +779,7 @@ fn native_owner(krate: &str, owner: &str) -> bool {
             "service::ServiceBody",
             "cache::Cache",
             "dependency_cache::DependencyCache",
+            "dependency_cache::prepared::PreparedDependencyCache",
             "reactivity::hydration::HydrationSet",
             "cluster::singleton::ClusterSingleton",
             "cluster::schedule::ClusterSchedule",
@@ -694,6 +787,7 @@ fn native_owner(krate: &str, owner: &str) -> bool {
             "workflow::durable_queue::DurableQueue",
             "persistence::persistable::Persistable",
             "rpc::definition::RpcOperation",
+            "rpc::prepared_client::PreparedRpcOperation",
             "rpc::definition::RpcHandler",
             "rpc::streaming::RpcStreamOperation",
             "rpc::streaming_server::RpcStreamHandler",
@@ -715,17 +809,33 @@ fn native_owner(krate: &str, owner: &str) -> bool {
             "cluster::entity_definition::EntityDefinition",
             "cluster::entity::EntityDispatcher",
             "cluster::entity_definition::ClusterDefinition",
+            "cluster::memory_store::MemoryClusterMessageStore",
             "workflow::execution::TypedWorkflowDefinition",
+            "workflow::memory_workflow_engine::MemoryWorkflowEngine",
             "workflow::activity::TypedWorkflowActivity",
             "schema::codec::Codec",
             "schema::codec::PureCodec",
             "schema::codec::EffectSchema",
             "schema::parse_context::ConfiguredCodec",
             "schema::schema_builder::RecordBuilder",
+            "schema::prepared_record::PreparedRecordBuilder",
+            "schema::prepared_effect_record::PreparedEffectRecordBuilder",
+            "schema::prepared_effect_record::PreparedGenericRecordBacking",
             "schema::native_codec::NativeRecordBuilder",
             "schema::enum_builder::TaggedEnumBuilder",
+            "schema::prepared_enum::PreparedTaggedEnumBuilder",
         ],
         "effect_sql" => &[
+            "prepared_rows::PreparedSqlRowsPool",
+            "prepared_rows::PreparedSqlRowLanes",
+            "prepared_statement::PreparedSqlStatementPool",
+            "prepared_statement::PreparedSqlStatementBuilder",
+            "kernel::PreparedSqlSessionPool",
+            "prepared_batch::PreparedSqlBatchPool",
+            "prepared_batch::PreparedSqlBatchBuilder",
+            "client::SqlClient",
+            "client::SqlTransaction",
+            "kernel::SqlKernel",
             "statement::SqlStatement",
             "statement::StatementBuilder",
             "statement::MutationBuilder",
@@ -733,6 +843,8 @@ fn native_owner(krate: &str, owner: &str) -> bool {
         ],
         "effect_server" => &[
             "endpoint::Endpoint",
+            "prepared_endpoint::PreparedEndpointPlan",
+            "prepared_endpoint::PreparedInputEndpointPlan",
             "reply::Reply",
             "reply::ReplyDraft",
             "route::Route",
@@ -743,6 +855,7 @@ fn native_owner(krate: &str, owner: &str) -> bool {
             "reply::Representation",
             "reply::Representations",
             "host::Server",
+            "prepared_terminal::PreparedServer",
             "body::BodyProgram",
             "body::BodyWriter",
         ],
@@ -768,7 +881,7 @@ fn native_owner(krate: &str, owner: &str) -> bool {
         _ => &[],
     };
     let prefix = format!("{krate}::");
-    owners.contains(&owner.strip_prefix(&prefix).unwrap_or(owner))
+    owners.contains(&owner.trim_prefix(&prefix))
 }
 
 pub fn implementation_entry(krate: &str, owner: &str, name: &str) -> bool {
@@ -795,9 +908,11 @@ pub fn intended_dsl(owner: Option<&str>, method: &str) -> String {
             "sync" | "sync_once" => "effect_sync",
             "try_sync" | "try_sync_once" => "effect_try_sync",
             "from_future"
+            | "from_prepared_future"
             | "from_future_once"
             | "from_future_with_env"
-            | "from_exit_future_with_context" => "effect_future",
+            | "from_exit_future_with_context"
+            | "from_prepared_exit_future_with_context" => "effect_future",
             "try_future" | "try_future_once" | "try_future_with_env" => "effect_try_future",
             "map" => "effect_map",
             "map_error" => "effect_map_error",
@@ -830,6 +945,7 @@ pub fn intended_dsl(owner: Option<&str>, method: &str) -> String {
             }
             .into();
         }
+        Some("PreparedStream") if matches!(method, "collect" | "fold") => return "sink!".into(),
         _ => {}
     }
     MACRO_OWNERS
@@ -868,6 +984,22 @@ pub fn protected(krate: &str, owner: Option<&str>, name: &str, kind: DefKind, pa
         return matches!(kind, DefKind::Fn | DefKind::AssocFn);
     }
     if let Some(owner) = owner {
+        // These public owners reserve only their explicitly listed lowering
+        // entry points for the DSL. Their other methods remain callable.
+        if matches!(
+            owner,
+            "SqlClient" | "SqlTransaction" | "PreparedInputEndpointPlan"
+                | "PreparedResourcePlan" | "PreparedFutureResourcePlan" | "PreparedReleasePlan"
+                | "PreparedStream" | "TransactionDomain" | "PreparedRpcOperation"
+                | "MemoryClusterMessageStore" | "MemoryWorkflowEngine"
+        ) {
+            return OWNERS
+                .iter()
+                .any(|(ty, methods)| *ty == owner && methods.contains(&name));
+        }
+        if owner == "SqlKernel" {
+            return matches!(name, "reserve_prepared_session" | "reserve_prepared_rows");
+        }
         if owner == "ScopedBody" {
             return matches!(name, "from_body" | "from_effect");
         }
@@ -896,7 +1028,42 @@ pub fn protected(krate: &str, owner: Option<&str>, name: &str, kind: DefKind, pa
                     || path.starts_with("effect::internal::macro_future::"))
                 || matches!(
                     path,
-                    "effect::workflow::durable::activity"
+                    "effect::internal::runtime::prepared::graph::success"
+                        | "effect::internal::runtime::prepared::graph::ready"
+                        | "effect::internal::runtime::prepared::graph::sync"
+                        | "effect::internal::runtime::prepared::graph::try_sync"
+                        | "effect::internal::runtime::prepared::graph::outcome::either"
+                        | "effect::internal::runtime::prepared::graph::outcome::capture"
+                        | "effect::internal::runtime::prepared::graph::outcome::map_error"
+                        | "effect::internal::runtime::prepared::graph::looping::while_loop"
+                        | "effect::internal::runtime::prepared::graph::future::native_future"
+                        | "effect::internal::runtime::prepared::graph::provider_result::provider_result"
+                        | "effect::internal::runtime::prepared::graph::import::import"
+                        | "effect::internal::runtime::prepared::graph::import::environment::import_with_environment"
+                        | "effect::internal::runtime::prepared::graph::scheduled::scheduled"
+                        | "effect::internal::runtime::prepared::graph::scoped::scope"
+                        | "effect::internal::runtime::prepared::graph::scoped::scope_construct"
+                        | "effect::internal::runtime::prepared::graph::fork::race::race"
+                        | "effect::internal::runtime::prepared::graph::fork::race::race_on"
+                        | "effect::internal::runtime::prepared::graph::fork::PreparedFiber::join"
+                        | "effect::internal::runtime::prepared::graph::service"
+                        | "effect::internal::runtime::prepared::graph::resource::resource"
+                        | "effect::internal::runtime::prepared::graph::layer::build"
+                        | "effect::internal::runtime::prepared::graph::layer::construct::construct"
+                        | "effect::internal::runtime::prepared::graph::layer::construct::try_construct"
+                        | "effect::internal::runtime::prepared::graph::scope_binding::recipe"
+                        | "effect::internal::runtime::prepared::graph::scope_binding::finalizer_recipe"
+                        | "effect::internal::runtime::prepared::graph::scope_binding::construction"
+                        | "effect::internal::runtime::prepared::graph::layer::with_layer"
+                        | "effect::internal::runtime::prepared::graph::layer::scoped::scoped"
+                        | "effect::internal::runtime::prepared::graph::layer::composition::merge"
+                        | "effect::internal::runtime::prepared::graph::layer::composition::provide"
+                        | "effect::internal::runtime::prepared::graph::environment::provide_some"
+                        | "effect::internal::runtime::prepared::graph::bind"
+                        | "effect::internal::runtime::prepared::graph::control::defer"
+                        | "effect::internal::runtime::prepared::graph::control::branch_left"
+                        | "effect::internal::runtime::prepared::graph::control::branch_right"
+                        | "effect::workflow::durable::activity"
                         | "effect::websocket::with_connection"
                         | "effect::websocket::with_connection_map_error"
                         | "effect::websocket::with_socket"
@@ -905,7 +1072,8 @@ pub fn protected(krate: &str, owner: Option<&str>, name: &str, kind: DefKind, pa
         }
         "effect_sql" => matches!(
             path,
-            "effect_sql::client::sql_with"
+            "effect_sql::prepared_rows::prepare_native_rows"
+                | "effect_sql::client::sql_with"
                 | "effect_sql::row::column"
                 | "effect_sql::row::native_column"
                 | "effect_sql::row::optional_column"
@@ -926,11 +1094,36 @@ pub fn protected(krate: &str, owner: Option<&str>, name: &str, kind: DefKind, pa
 
 /// Exact export-to-native-rule reconciliation, shared across every mode and role form.
 pub const MACRO_OWNERS: &[(&str, &[&str])] = &[
+    (
+        "memory",
+        &[
+            "MemoryConfiguration",
+            "HasMemory",
+            "PreparedSchemaMemory",
+            "PreparedIssueMemory",
+            "PreparedJsonArrayPool",
+            "PreparedArrayOperationPool",
+            "PreparedMapOperationPool",
+            "PreparedSequenceOperationPool",
+            "PreparedObjectOperationPool",
+            "PreparedRecordOperationPool",
+            "PreparedBinaryUnionPool",
+            "PreparedNumericScratchPool",
+            "PreparedMemoryConfigSource",
+            "PreparedConfig",
+            "PreparedEffectConfig",
+            "PreparedConfigStoreSource",
+        ],
+    ),
+    ("memory_lease", &["Effect", "HasMemoryPool", "SlotPool"]),
+    ("memory_vec", &["RegionAllocator"]),
+    ("memory_write", &["Text", "SlotLease"]),
+    ("effect_drop_guard", &["DropGuard"]),
     ("effect", &["Effect", "Workflow", "@workflow"]),
-    ("schema", &["RecordBuilder", "NativeRecordBuilder"]),
+    ("schema", &["RecordBuilder", "NativeRecordBuilder", "PreparedRecordBuilder", "PreparedEffectRecordBuilder", "PreparedGenericRecordBacking", "PreparedTaggedEnumBuilder", "PureCodec", "PreparedJsonArrayCodec", "PreparedJsonMapCodec", "PreparedSequenceCodec", "PreparedObjectCodec", "PreparedBinaryCodec"]),
     ("schema_enum", &["TaggedEnumBuilder", "PureCodec"]),
     ("persistable", &["Persistable"]),
-    ("transaction", &["Transaction", "TxRef"]),
+    ("transaction", &["Transaction", "TxRef", "TransactionDomain"]),
     ("event", &["EventDefinition", "AggregateEvent"]),
     ("event_group", &["EventGroup"]),
     ("projection", &["Projection", "ProjectionCases"]),
@@ -941,6 +1134,7 @@ pub const MACRO_OWNERS: &[(&str, &[&str])] = &[
             "TypedWorkflowDefinition",
             "WorkflowDefinition",
             "WorkflowCompensation",
+            "MemoryWorkflowEngine",
         ],
     ),
     (
@@ -953,7 +1147,7 @@ pub const MACRO_OWNERS: &[(&str, &[&str])] = &[
     ),
     ("workflow_definition", &["WorkflowDefinition"]),
     ("activity_definition", &["WorkflowActivity"]),
-    ("rpc_operation", &["RpcOperation", "RpcHandler"]),
+    ("rpc_operation", &["RpcOperation", "RpcHandler", "PreparedRpcOperation"]),
     (
         "rpc_stream_operation",
         &["RpcStreamOperation", "RpcStreamHandler"],
@@ -984,7 +1178,7 @@ pub const MACRO_OWNERS: &[(&str, &[&str])] = &[
         ],
     ),
     ("cache", &["Cache"]),
-    ("dependency_cache", &["DependencyCache"]),
+    ("dependency_cache", &["DependencyCache", "PreparedDependencyCache"]),
     ("atom", &["AtomProgram"]),
     ("hydration", &["HydrationSet"]),
     ("entity_resource", &["EntityResourcePlan"]),
@@ -992,16 +1186,16 @@ pub const MACRO_OWNERS: &[(&str, &[&str])] = &[
     ("cluster_schedule", &["ClusterSchedule"]),
     ("persisted_queue", &["PersistedQueue"]),
     ("durable_queue", &["DurableQueue"]),
-    ("stream", &["Stream"]),
+    ("stream", &["Stream", "PreparedStream"]),
     ("handled_event", &["HandledEvent", "AggregateEvent"]),
-    ("cluster", &["ClusterDefinition"]),
-    ("sql", &["SqlStatement", "StatementBuilder"]),
+    ("cluster", &["ClusterDefinition", "MemoryClusterMessageStore"]),
+    ("sql", &["@prepare_native_rows", "SqlStatement", "StatementBuilder", "PreparedSqlRowsPool", "PreparedSqlRowLanes", "PreparedSqlStatementPool", "PreparedSqlStatementBuilder", "PreparedSqlSessionPool", "PreparedSqlBatchPool", "PreparedSqlBatchBuilder", "SqlClient", "SqlTransaction", "SqlKernel"]),
     ("sql_insert", &["MutationBuilder"]),
     ("sql_update", &["MutationBuilder"]),
     ("row", &["RowDecoder", "@row"]),
     ("sql_with", &["@sql_with", "Effect"]),
-    ("server", &["Server"]),
-    ("endpoint", &["Endpoint"]),
+    ("server", &["Server", "PreparedServer"]),
+    ("endpoint", &["Endpoint", "PreparedEndpointPlan", "PreparedInputEndpointPlan", "PreparedGraphPlan"]),
     ("registered", &["Registered", "Registration"]),
     ("reply", &["Reply", "ReplyDraft"]),
     ("representations", &["Representation", "Representations"]),
@@ -1039,7 +1233,7 @@ pub const MACRO_OWNERS: &[(&str, &[&str])] = &[
     ("otel", &["Otel", "SpanOptions", "Effect"]),
     ("effect_sync", &["Effect"]),
     ("effect_try_sync", &["Effect"]),
-    ("effect_future", &["Effect"]),
+    ("effect_future", &["Effect", "PreparedQueue", "PreparedPubSub", "PreparedPublication", "PreparedSubscription", "PreparedSubscriptionRef", "PreparedExitMapper"]),
     ("effect_die", &["Effect"]),
     ("effect_try_future", &["Effect"]),
     ("effect_cpu", &["Effect"]),
@@ -1063,11 +1257,42 @@ pub const MACRO_OWNERS: &[(&str, &[&str])] = &[
     ("effect_all_concurrent", &["Effect"]),
     ("effect_retry", &["Effect"]),
     ("effect_repeat", &["Effect"]),
-    ("effect_resource", &["ResourceBinding", "Release"]),
+    ("effect_resource", &["ResourceBinding", "Release", "PreparedResourcePlan", "PreparedFutureResourcePlan"]),
     ("effect_using", &["ResourceBinding", "Release"]),
-    ("effect_scope", &["Scope"]),
-    ("effect_scope_acquire", &["Scope"]),
-    ("effect_finalizer", &["Scope"]),
+    (
+        "effect_prepare",
+        &[
+            "PreparedRunPlan",
+            "PreparedRun",
+            "PreparedRunContext",
+            "PreparedNativeReservation",
+            "PreparedGraphPlan",
+            "PreparedGraph",
+            "ConstructedGraphPlan",
+            "ConstructedGraph",
+            "Ready",
+        ],
+    ),
+    (
+        "effect_scope",
+        &[
+            "Scope",
+            "PreparedScope",
+            "PreparedScopeOwner",
+            "PreparedScopePool",
+            "PreparedCheckpoint",
+        ],
+    ),
+    (
+        "effect_scope_acquire",
+        &[
+            "ScopePermit",
+            "Scope",
+            "PreparedResourceBinding",
+            "PreparedFutureResourceBinding",
+        ],
+    ),
+    ("effect_finalizer", &["Scope", "PreparedRelease", "PreparedReleasePlan"]),
     ("layer", &["Layer"]),
     ("effect_with_layer", &["Layer"]),
     (
@@ -1080,11 +1305,11 @@ pub const MACRO_OWNERS: &[(&str, &[&str])] = &[
         ],
     ),
     ("schedule", &["Schedule"]),
-    ("effect_ref", &["AtomicRef", "SynchronizedRef"]),
+    ("effect_ref", &["AtomicRef", "SynchronizedRef", "PreparedAtomicRef", "PreparedSynchronizedRef", "PreparedSynchronizedWrite", "PreparedSubscriptionRef"]),
     ("pool", &["Pool"]),
     ("weak_cache", &["WeakCache", "PartitionedWeakCache"]),
     ("request_resolver", &["RequestResolver"]),
-    ("sink", &["Sink"]),
+    ("sink", &["Sink", "PreparedStream"]),
     ("effect_stream_for_each", &["Stream"]),
     (
         "effect_socket",

@@ -138,7 +138,7 @@ fn driver(root: &Path, compiler: &OsStr, version: &str, sysroot: &Path) -> io::R
             .status()?;
         if !status.success() {
             return Err(io::Error::other(
-                "custom lint driver failed to compile; install rustc-dev for Rust 1.99.1",
+                "custom lint driver failed to compile; install rustc-dev for Rust 1.100.0",
             ));
         }
     }
@@ -181,9 +181,9 @@ fn run() -> io::Result<i32> {
     if workspace && !query {
         coverage::verify(root)?;
         let version = output(compiler, &["-vV"])?;
-        if !version.lines().any(|line| line == "release: 1.99.1") {
+        if !version.lines().any(|line| line == "release: 1.100.0") {
             return Err(io::Error::other(
-                "DSL lint driver requires the workspace Rust 1.99.1 compiler",
+                "DSL lint driver requires the workspace Rust 1.100.0 compiler",
             ));
         }
         let sysroot = PathBuf::from(output(compiler, &["--print", "sysroot"])?.trim());

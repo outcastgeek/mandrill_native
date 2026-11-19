@@ -16,9 +16,16 @@ mod codec_expand;
 mod descriptor_expand;
 mod durable_expand;
 mod expand;
+mod memory_expand;
 mod ownership_expand;
 mod parse;
 mod persistable_expand;
+mod prepared_expand;
+mod prepared_future_expand;
+mod prepared_layer_expand;
+mod prepared_program_expand;
+mod prepared_resource_expand;
+mod prepared_scope_expand;
 mod restricted_expand;
 mod schema_enum_expand;
 mod schema_expand;
@@ -26,6 +33,59 @@ mod transaction_expand;
 
 use proc_macro::TokenStream;
 use syn::parse_macro_input;
+
+/// Declare an inert owned memory configuration, or delegate HasMemory from an
+/// environment. Configuration fields are evaluated once in written order. Use
+/// explicit prepare/seal calls; configuration never runs application work.
+#[proc_macro]
+pub fn memory(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as memory_expand::Configuration);
+    memory_expand::configuration(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Lazily check out R's explicitly selected prepared pool and map capacity errors.
+/// This uses the ordinary Effect kernel; it does not claim prepared interpreter
+/// execution or early transport admission by itself.
+#[proc_macro]
+pub fn memory_lease(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as domain_expand::Fields);
+    memory_expand::lease(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Fallibly reserve a vector in the selected allocator; optional init runs in
+/// index order and preserves its typed failure separately from memory refusal.
+#[proc_macro]
+pub fn memory_vec(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as domain_expand::Fields);
+    memory_expand::vector(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Write fmt::Arguments directly into an existing bounded fmt::Write owner.
+/// The destination is borrowed, not moved; no intermediate String is created.
+#[proc_macro]
+pub fn memory_write(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as domain_expand::Fields);
+    memory_expand::writer(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Synchronous, concrete DropGuard rollback. Bind the result to protect ownership;
+/// dismiss only when the receiving owner can accept it without a fallible gap.
+/// Async cleanup still belongs to awaited scopes/resources, not this destructor.
+#[proc_macro]
+pub fn effect_drop_guard(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as domain_expand::Fields);
+    memory_expand::drop_guard(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
 
 /// Construct a lazy reusable Effect with macro-local `?` binding.
 ///
@@ -58,6 +118,11 @@ pub fn effect(input: TokenStream) -> TokenStream {
 /// Build typed pure JSON records/enums or owned native effectful records with explicit policies.
 ///
 /// A record form supplies `struct Type { field: codec, ... }` and `policy:`.
+/// Managed pure records use `prepared; struct Type { ... }` and explicitly
+/// supply `policy:`, `output:`, `issues:`, and `validation:` prepared owners.
+/// The ordinary pure optional tuple forms remain available.
+/// Managed tagged enums use `prepared; enum ...` with explicit `tag_field:`,
+/// `content_field:`, `policy:`, `output:`, and `validation:` owners.
 /// Native records additionally supply both `representation:` and `unknown_fields:`;
 /// all field codecs share Encoded, DecodeEnv and EncodeEnv. Generated constructors
 /// move field values; generated destructuring moves the application value without
@@ -120,6 +185,7 @@ pub fn persistable(input: TokenStream) -> TokenStream {
 /// Named `map_error;` maps expected journal errors. `modify;` receives a borrowed snapshot
 /// and returns Result<(replacement, result), E>; `update;` returns Result<replacement,E>.
 /// Both delegate TxRef::update in the same journal. No native Future or Effect is admitted.
+/// `prepare_domain;` takes `memory`, `region` and `capacity` to select prepared STM storage.
 #[proc_macro]
 /// # Parameters
 /// - `input` (`TokenStream`): The input value or factory consumed by this operation.
@@ -129,7 +195,7 @@ pub fn persistable(input: TokenStream) -> TokenStream {
 /// Returns the expanded Rust tokens.
 pub fn transaction(input: TokenStream) -> TokenStream {
     let tokens: proc_macro2::TokenStream = input.into();
-    let result = if restricted_expand::has_mode(&tokens, &["map_error", "modify", "update"]) {
+    let result = if restricted_expand::has_mode(&tokens, &["map_error", "modify", "update", "prepare_domain"]) {
         syn::parse2(tokens).and_then(restricted_expand::transaction)
     } else {
         syn::parse::Parser::parse2(syn::Block::parse_within, tokens)
@@ -182,6 +248,7 @@ pub fn projection(input: TokenStream) -> TokenStream {
 /// `result; value: result,` consumes one owned native Result as a durable success
 /// or typed failure. It accepts values rather than Effects or Futures; construction
 /// does not execute work, and repeated execution retains the native consumed-input defect.
+/// `prepare_engine;` takes `memory`, `region`, and `capacity` at engine startup.
 #[proc_macro]
 /// # Parameters
 /// - `input` (`TokenStream`): The input value or factory consumed by this operation.
@@ -193,7 +260,7 @@ pub fn workflow(input: TokenStream) -> TokenStream {
     let tokens: proc_macro2::TokenStream = input.into();
     let result = if restricted_expand::has_mode(
         &tokens,
-        &["map_error", "for_each", "retry", "compensate", "result"],
+        &["map_error", "for_each", "retry", "compensate", "result", "prepare_engine"],
     ) {
         syn::parse2(tokens).and_then(restricted_expand::workflow)
     } else {
@@ -263,6 +330,7 @@ pub fn activity_definition(input: TokenStream) -> TokenStream {
 /// Calling the handler returns an Effect under the original application environment.
 /// Optional pure `project |outer| { Inner }` projects each handler Effect through
 /// existing provision while retaining request ownership and operation identity.
+/// `prepared_codec` selects the prepared unary operation with `id`, `version`, and `limits`.
 #[proc_macro]
 pub fn rpc_operation(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as descriptor_expand::NamedFields);
@@ -570,6 +638,8 @@ mod stream_expand;
 /// map_effect/map_error/project transform an explicit stream.
 /// Native async factories return owned iterators; release is mandatory. Mapped opening,
 /// pull and cleanup errors stay owned by the existing scope; no second stream engine.
+/// `iterable_prepared`, `pull_prepared`, `map_prepared` and `rechunk` construct typed
+/// native pull pipelines using the caller's prepared batch pools.
 #[proc_macro]
 pub fn stream(input: TokenStream) -> TokenStream {
     let tokens: proc_macro2::TokenStream = input.into();
@@ -597,7 +667,8 @@ pub fn handled_event(input: TokenStream) -> TokenStream {
 /// Build a checked catalog with explicit `policy` and `entities: [...]`. Resource-aware
 /// entity definitions acquire only at activation. Activation returns an Effect using the supplied
 /// owner/scope and the existing dispatcher, preserving typed acquisition/registration
-/// failures and accepted-address checks. This creates no cluster runner or store.
+/// failures and accepted-address checks. `memory`, `region` and `store_capacity`
+/// select the prepared volatile message and activation store startup form.
 #[proc_macro]
 pub fn cluster(input: TokenStream) -> TokenStream {
     let fields = parse_macro_input!(input as domain_expand::Fields);
@@ -857,6 +928,9 @@ pub fn effect_try_sync(input: TokenStream) -> TokenStream {
 
 /// Delay `body |cancel| { future }` with the native Future owner. Use an explicit `async move` tail for awaits. `once;` owns captures once; `with_env;` receives `Arc<R>`, Cancellation on every run. R selects capabilities.
 /// `exit_with_context;` receives `Arc<R>` and NativeContext and returns a future of the complete typed Exit.
+/// `prepared;` requires explicit `on_capacity` mapping and checked work/cleanup
+/// frames from run_with_frames. Its future and completion storage are reserved
+/// before factory invocation; this alone is not full prepared interpreter execution.
 /// Inline roles are braced; `role: helper` reuses the same typed boundary.
 #[proc_macro]
 pub fn effect_future(input: TokenStream) -> TokenStream {
@@ -1124,7 +1198,31 @@ pub fn effect_using(input: TokenStream) -> TokenStream {
         .into()
 }
 
-/// Create a fresh owner per run with Effect `body |scope|`. Its existing close joins ordered finalizers and retains primary/cleanup failures; construction registers nothing.
+/// Concrete native-root plan/prepare/admit with compiler-derived layouts and
+/// physical checked ownership before invocation. Opaque Effect graphs are not
+/// silently classified prepared. Prepared callbacks use non-Clone companions.
+/// `provider_result; result: ...` adapts an already finally-settled unique provider
+/// result into the same typed graph continuation, preserving A and attaching D;
+/// it does not submit/wait for work or expose a public bare value extraction.
+/// Graph `construction` plus native `reserve` pre-admits finite typed foreign
+/// sites before project/build callbacks. `import; key: ...` consumes an admitted
+/// dynamic prepared run; construction-selected `scheduled` uses actual provider
+/// ownership without reading an unpublished projected environment.
+/// `description; program: ...` lowers the existing Effect DSL to one typed
+/// prepared description without preparing or admitting a graph.
+#[proc_macro]
+pub fn effect_prepare(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    prepared_expand::expand(definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Default mode creates a fresh owner per run with Effect `body |scope|`.
+/// Its existing close joins ordered finalizers and retains primary/cleanup failures.
+/// `prepare;` provisions finite scope storage; `prepared; owner:` transfers one
+/// dedicated prepared owner with checked sharing before body invocation. Explicit
+/// checkpoint/release/close modes reuse the same scope engine, not a new evaluator.
 /// Inline roles are braced; `role: helper` reuses the same typed boundary.
 #[proc_macro]
 pub fn effect_scope(input: TokenStream) -> TokenStream {
@@ -1145,6 +1243,9 @@ pub fn effect_scope_acquire(input: TokenStream) -> TokenStream {
 }
 
 /// Register `program` or Effect `body` in explicit `scope`. `release; release { Release }` registers a fresh factory. The scope retains the registration environment and owns protected close/late-registration behavior.
+/// `plan;` exposes an inert typed factory/layout descriptor; `prepare;` stores its
+/// captures in counted memory. `prepared;` registers that factory in a prepared
+/// scope with explicit capacity mapping and immediate cleanup on refusal/closure.
 /// Inline roles are braced; `role: helper` reuses the same typed boundary.
 #[proc_macro]
 pub fn effect_finalizer(input: TokenStream) -> TokenStream {
@@ -1205,6 +1306,8 @@ pub fn effect_ref(input: TokenStream) -> TokenStream {
 }
 
 /// Create a scoped pool with explicit capacity/idle_ttl, Effect create, borrowed validate and owned dispose roles. Borrowed validation is inspected before returning owned delayed work. `exists_idle;` supplies pool/predicate. Existing admission, TTL and protected disposal remain authoritative.
+/// Add `memory: snapshots, on_capacity: map_memory_error` to `exists_idle;` to inspect
+/// the idle set using a caller-prepared table. The predicate runs after the pool lock releases.
 /// Inline roles are braced; `role: helper` reuses the same typed boundary.
 #[proc_macro]
 pub fn pool(input: TokenStream) -> TokenStream {
@@ -1236,6 +1339,8 @@ pub fn request_resolver(input: TokenStream) -> TokenStream {
 
 /// Require for_each/fold/fold_effect mode. Effect body consumes owned items; folds require native initial factory and two-input step. Pure fold executes via delayed sync-once step over the existing fold engine; construction opens no stream.
 /// Inline roles are braced; `role: helper` reuses the same typed boundary.
+/// `collect_prepared` and `fold_prepared` borrow a prepared stream and its configured
+/// output or accumulator pool, returning a native future with a lease-backed outcome.
 #[proc_macro]
 pub fn sink(input: TokenStream) -> TokenStream {
     let definition = parse_macro_input!(input as callback_expand::Input);
@@ -1274,7 +1379,7 @@ pub fn codec(input: TokenStream) -> TokenStream {
         .into()
 }
 
-/// Parse text using explicit ConfiguredCodec in `codec`, preserving its directional decode environment and configured schema/JSON/pattern/issue budgets. Optional on_error maps SchemaIssue; parsing remains lazy.
+/// Parse text using explicit ConfiguredCodec in `codec`, preserving its directional decode environment and configured schema/JSON/pattern/issue budgets. `prepared; parser: ...` selects its explicitly prepared managed-document parser. Optional on_error maps SchemaIssue; parsing remains lazy.
 /// Inline roles are braced; `role: helper` reuses the same typed boundary.
 #[proc_macro]
 pub fn effect_schema_parse(input: TokenStream) -> TokenStream {

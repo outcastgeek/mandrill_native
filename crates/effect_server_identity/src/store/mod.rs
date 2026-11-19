@@ -47,15 +47,26 @@ pub struct SqlxIdentityStore {
     /// Optional-capability selection fence, private to this configuration.
     pub(crate) identity: Arc<StorageIdentity>,
     /// Present only on a private invocation clone, never a process/global service.
-    pub(crate) invocation: Option<Arc<invocation::InvocationDiagnostics>>,
+    pub(crate) invocation: Option<invocation::InvocationOwner>,
+    invocations: Option<Arc<invocation::PreparedIdentityInvocations>>,
+    security: Option<Arc<schema::PreparedSecurityRecords>>,
+    security_scope: schema::SecurityScope,
 }
 impl SqlxIdentityStore {
     /// Select an authoritative local pool and explicit policy without I/O. Apply
     /// the catalog before accepting traffic; this constructor creates no schema.
+    #[expect(
+        clippy::result_large_err,
+        reason = "retains owned SQL diagnostics without an extra heap allocation"
+    )]
     pub fn new(pool: sqlx::TursoPool, policy: IdentityStoragePolicy) -> Result<Self, SqlError> {
         Self::from_kernel(SqlKernel::new(pool), policy)
     }
     /// Retain an application's existing kernel; no nested runtime/pool is created.
+    #[expect(
+        clippy::result_large_err,
+        reason = "retains owned SQL diagnostics without an extra heap allocation"
+    )]
     pub fn from_kernel(kernel: SqlKernel, policy: IdentityStoragePolicy) -> Result<Self, SqlError> {
         kernel.require_authoritative()?;
         let options = kernel.pool().connect_options();
@@ -79,6 +90,9 @@ impl SqlxIdentityStore {
             policy,
             identity: Arc::new(StorageIdentity),
             invocation: None,
+            invocations: None,
+            security: None,
+            security_scope: schema::SecurityScope::default(),
         })
     }
     /// Share the same store/backend configuration with native browser and selected
@@ -105,6 +119,55 @@ impl SqlxIdentityStore {
     pub fn invocation(&self) -> invocation::StoreInvocation {
         invocation::StoreInvocation::new(self)
     }
+    /// Select startup-backed diagnostics for fallible NativeBackend scopes.
+    #[must_use]
+    pub fn with_prepared_invocations(
+        mut self,
+        pool: Arc<invocation::PreparedIdentityInvocations>,
+    ) -> Self {
+        self.invocations = Some(pool);
+        self
+    }
+
+    /// Select the prepared native security codec for this backend and its
+    /// invocation clones. Existing native model validators remain in use.
+    #[must_use]
+    pub fn with_prepared_security_records(
+        mut self,
+        records: Arc<schema::PreparedSecurityRecords>,
+    ) -> Self {
+        self.security = Some(records);
+        self.security_scope = schema::SecurityScope::default();
+        self
+    }
+
+    /// Admit the diagnostic carrier before a selected workflow constructs its native manager.
+    pub fn try_invocation(
+        &self,
+    ) -> Result<invocation::StoreInvocation, effect::memory::MemoryError> {
+        let security = self.try_security_scope()?;
+        let invocation = match &self.invocations {
+            Some(pool) => invocation::StoreInvocation::new_prepared(self, pool),
+            None => Ok(self.invocation()),
+        }?;
+        Ok(invocation.with_security(security))
+    }
+
+    fn try_security_scope(&self) -> Result<schema::SecurityScope, effect::memory::MemoryError> {
+        if self.security_scope.is_prepared() {
+            return self.security_scope.try_clone();
+        }
+        match &self.security {
+            Some(records) => records.reserve(),
+            None => Ok(schema::SecurityScope::default()),
+        }
+    }
+
+    fn security_scope(&self) -> Result<schema::SecurityScope, identity_rs::identity::StoreError> {
+        self.try_security_scope()
+            .map_err(|error| self.narrow(SqlError::Memory(error)))
+    }
+
     /// Retain the full settled SQL outcome before returning a native category.
     pub(crate) fn narrow(&self, error: SqlError) -> identity_rs::identity::StoreError {
         let category = error::sql_category(&error);
@@ -125,11 +188,19 @@ impl SqlxIdentityStore {
     }
     /// Build the standalone Identity catalog. Applications sharing a journal with
     /// business SQL should instead include migration_step in their complete catalog.
+    #[expect(
+        clippy::result_large_err,
+        reason = "retains owned SQL diagnostics without an extra heap allocation"
+    )]
     pub fn migration_catalog() -> Result<MigrationCatalog, SqlError> {
         MigrationCatalog::new(SQLX_JOURNAL, vec![Self::migration_step()])
     }
     /// Apply only the standalone catalog through the shared SQLx journal/authority.
     /// Rejection/dirty history/commit uncertainty is returned without automatic replay.
+    #[expect(
+        clippy::result_large_err,
+        reason = "retains owned SQL diagnostics without an extra heap allocation"
+    )]
     pub async fn initialize(&self) -> Result<(), SqlError> {
         let migrator = SqlMigrator::new(self.kernel.clone(), Self::migration_catalog()?)?;
         migrator.initialize().await?;

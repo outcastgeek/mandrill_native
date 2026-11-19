@@ -1,6 +1,7 @@
 //! Scoped batching and sharing of request loads.
 
 use crate::internal::runtime::{self, Step};
+use crate::memory::MemoryError;
 use crate::{
     Defect, Effect, Exit, HasTaskSpawner, Release, Request, RequestKey, Scope, SharedValue,
 };
@@ -17,8 +18,38 @@ use std::sync::{Arc, Mutex};
 pub type ResolveManyEffect<A, E, R> =
     Effect<Vec<Exit<SharedValue<A>, RequestResolverError<E>>>, RequestResolverError<E>, R>;
 
+mod batch_input {
+    pub trait Sealed {}
+    impl<T> Sealed for Vec<T> {}
+    impl<T, const N: usize> Sealed for [T; N] {}
+}
+
+/// Owned, ordered resolver input. Arrays supply inline storage and existing
+/// callers may also transfer a `Vec`. Both report the same positions they move.
+pub trait RequestBatchInput<Q, A, E>:
+    batch_input::Sealed
+    + AsRef<[Request<Q, A, E>]>
+    + IntoIterator<Item = Request<Q, A, E>>
+    + Send
+    + 'static
+{
+}
+
+impl<Q: Send + 'static, A: 'static, E: 'static> RequestBatchInput<Q, A, E>
+    for Vec<Request<Q, A, E>>
+{
+}
+
+impl<Q: Send + 'static, A: 'static, E: 'static, const N: usize> RequestBatchInput<Q, A, E>
+    for [Request<Q, A, E>; N]
+{
+}
+
 mod internal;
 use internal::ResolverState;
+pub use internal::{
+    PreparedRequestBatch, PreparedResolvedBatch, PreparedResolverCapacity, PreparedResolverIndex,
+};
 
 /// Process-local identity of one resolver/cache environment. The application
 /// creates and shares this token through R; it is never a durable request key.
@@ -79,6 +110,8 @@ pub enum RequestResolverError<E: Send + 'static> {
     WrongEnvironment,
     /// The provider has closed admission for new work.
     Closed,
+    /// Prepared resolver storage refused this operation.
+    Memory(MemoryError),
     /// An owned input was already consumed.
     InputConsumed,
     /// The operation ended without recording a terminal result.
@@ -100,6 +133,7 @@ impl<E: Send + 'static> Clone for RequestResolverError<E> {
             },
             Self::WrongEnvironment => Self::WrongEnvironment,
             Self::Closed => Self::Closed,
+            Self::Memory(error) => Self::Memory(*error),
             Self::InputConsumed => Self::InputConsumed,
             Self::Uncompleted => Self::Uncompleted,
         }
@@ -126,6 +160,7 @@ impl<E: Send + 'static> std::fmt::Debug for RequestResolverError<E> {
                 .finish(),
             Self::WrongEnvironment => formatter.write_str("WrongEnvironment"),
             Self::Closed => formatter.write_str("Closed"),
+            Self::Memory(error) => formatter.debug_tuple("Memory").field(error).finish(),
             Self::InputConsumed => formatter.write_str("InputConsumed"),
             Self::Uncompleted => formatter.write_str("Uncompleted"),
         }
@@ -156,6 +191,41 @@ impl<E: Send + 'static> std::error::Error for RequestResolverError<E> {}
 /// - `R`: Environment type.
 type BatchRunner<Q, A, E, R> =
     dyn Fn(crate::RequestGroup, Vec<Q>) -> Effect<Vec<Exit<A, E>>, E, R> + Send + Sync;
+type PreparedBatchRunner<Q, A, E, R> = dyn Fn(
+        crate::RequestGroup,
+        PreparedRequestBatch<Q, A, E>,
+    ) -> Effect<PreparedRequestBatch<Q, A, E>, E, R>
+    + Send
+    + Sync;
+
+enum ResolverRunner<
+    Q: Send + 'static,
+    A: Send + 'static,
+    E: Send + 'static,
+    R: Send + Sync + 'static,
+> {
+    Ordinary(Arc<BatchRunner<Q, A, E, R>>),
+    Prepared(Arc<PreparedBatchRunner<Q, A, E, R>>),
+}
+
+impl<Q: Send + 'static, A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Clone
+    for ResolverRunner<Q, A, E, R>
+{
+    fn clone(&self) -> Self {
+        match self {
+            Self::Ordinary(run) => Self::Ordinary(Arc::clone(run)),
+            Self::Prepared(run) => Self::Prepared(Arc::clone(run)),
+        }
+    }
+}
+
+impl<Q: Send + 'static, A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static>
+    ResolverRunner<Q, A, E, R>
+{
+    fn is_prepared(&self) -> bool {
+        matches!(self, Self::Prepared(_))
+    }
+}
 
 /// A live resolver is bound to the request scope token and Scope that
 /// constructed it. Distinct R values may share that token when they represent
@@ -228,23 +298,82 @@ impl<
         + Sync
         + 'static,
     ) -> Effect<Self, RequestResolverError<E>, R> {
-        let run: Arc<BatchRunner<Q, A, E, R>> = Arc::new(run);
+        Self::make_configured(scope, None, ResolverRunner::Ordinary(Arc::new(run)))
+    }
+
+    /// Acquire a scoped resolver with a preprovisioned pending index and finite batch admission.
+    pub fn make_with_prepared_index(
+        scope: Scope<RequestResolverError<E>>,
+        index: PreparedResolverIndex<Q, A, E>,
+        on_capacity: impl Fn(MemoryError) -> RequestResolverError<E> + Send + Sync + 'static,
+        run: impl Fn(crate::RequestGroup, Vec<Q>) -> Effect<Vec<Exit<A, E>>, E, R>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Effect<Self, RequestResolverError<E>, R> {
+        Self::make_configured(
+            scope,
+            Some(Arc::new((index, Arc::new(on_capacity)))),
+            ResolverRunner::Ordinary(Arc::new(run)),
+        )
+    }
+
+    /// Acquire a resolver whose loader reads and writes its already admitted batch storage.
+    pub fn make_with_prepared_batches(
+        scope: Scope<RequestResolverError<E>>,
+        index: PreparedResolverIndex<Q, A, E>,
+        on_capacity: impl Fn(MemoryError) -> RequestResolverError<E> + Send + Sync + 'static,
+        run: impl Fn(
+            crate::RequestGroup,
+            PreparedRequestBatch<Q, A, E>,
+        ) -> Effect<PreparedRequestBatch<Q, A, E>, E, R>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Effect<Self, RequestResolverError<E>, R> {
+        Self::make_configured(
+            scope,
+            Some(Arc::new((index, Arc::new(on_capacity)))),
+            ResolverRunner::Prepared(Arc::new(run)),
+        )
+    }
+
+    fn make_configured(
+        scope: Scope<RequestResolverError<E>>,
+        prepared: Option<Arc<internal::PreparedConfiguration<Q, A, E>>>,
+        run: ResolverRunner<Q, A, E, R>,
+    ) -> Effect<Self, RequestResolverError<E>, R> {
         Effect::new(move |env: Arc<R>, context, finish| {
-            let state: Arc<ResolverState<Q, A, E, R>> = Arc::new(ResolverState::new(
+            let state = match ResolverState::new(
                 scope.clone(),
                 env.request_scope().clone(),
-                Arc::clone(&run),
-            ));
+                run.clone(),
+                prepared.clone(),
+            ) {
+                Ok(state) => Arc::new(state),
+                Err(error) => {
+                    let error = prepared
+                        .as_ref()
+                        .map_or(RequestResolverError::Memory(error), |config| {
+                            (config.1)(error)
+                        });
+                    return runtime::finish(finish, Exit::Fail(error));
+                }
+            };
             let finalizer_state = Arc::downgrade(&state);
-            let register = scope.add_release(move || {
-                let state = finalizer_state.clone();
-                Release::sync(move || {
-                    if let Some(state) = state.upgrade() {
-                        state.close();
-                    }
-                })
-            });
-            Step::Suspended(Box::pin(async move {
+            let register = crate::effect_finalizer! {
+                release;
+                scope: scope,
+                release: move || {
+                    let state = finalizer_state.clone();
+                    Release::sync(move || {
+                        if let Some(state) = state.upgrade() {
+                            state.close();
+                        }
+                    })
+                },
+            };
+            Step::suspended(Box::pin(async move {
                 let protected = context.protected();
                 let registered = runtime::evaluate_context(register, env, &protected).await;
                 runtime::finish(
@@ -274,6 +403,24 @@ impl<
     /// # Returns
     /// Type: `ResolveManyEffect<A, E, R>`.
     pub fn resolve_many(&self, requests: Vec<Request<Q, A, E>>) -> ResolveManyEffect<A, E, R> {
+        self.resolve_batch(requests)
+    }
+
+    /// Resolve owned requests into the selected fixed result slot, in input order.
+    /// The result retains that slot until the caller drops it. Configure the
+    /// resolver with `PreparedResolverIndex::prepare_with_batches` first.
+    pub fn resolve_many_prepared(
+        &self,
+        requests: impl RequestBatchInput<Q, A, E>,
+    ) -> Effect<PreparedResolvedBatch<A, E>, RequestResolverError<E>, R> {
+        self.resolve_batch(requests)
+    }
+
+    fn resolve_batch<I, Out>(&self, requests: I) -> Effect<Out, RequestResolverError<E>, R>
+    where
+        I: RequestBatchInput<Q, A, E>,
+        Out: internal::ResultCollector<A, E>,
+    {
         let resolver = Arc::clone(&self.inner);
         let requests = Mutex::new(Some(requests));
         Effect::new(move |env, context, finish| {
@@ -285,7 +432,7 @@ impl<
                 return runtime::finish(finish, Exit::Fail(RequestResolverError::InputConsumed));
             };
             let resolver = Arc::clone(&resolver);
-            Step::Suspended(Box::pin(async move {
+            Step::suspended(Box::pin(async move {
                 let outcome = AssertUnwindSafe(resolver.resolve(requests, env, context))
                     .catch_unwind()
                     .await
@@ -325,16 +472,15 @@ impl<
                 return runtime::finish(finish, Exit::Fail(RequestResolverError::InputConsumed));
             };
             let resolver = Arc::clone(&resolver);
-            Step::Suspended(Box::pin(async move {
+            Step::suspended(Box::pin(async move {
                 let work = async {
-                    match resolver
-                        .resolve(vec![request], env, context)
-                        .await
-                        .into_failure()
-                    {
-                        Ok(mut outcomes) => outcomes
-                            .pop()
-                            .unwrap_or(Exit::Fail(RequestResolverError::Uncompleted)),
+                    let outcome = resolver
+                        .resolve::<_, Option<_>>([request], env, context)
+                        .await;
+                    match outcome.into_failure() {
+                        Ok(outcome) => {
+                            outcome.unwrap_or(Exit::Fail(RequestResolverError::Uncompleted))
+                        }
                         Err(failure) => failure,
                     }
                 };

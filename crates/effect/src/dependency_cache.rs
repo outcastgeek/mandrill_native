@@ -3,11 +3,17 @@
 
 use crate::{
     Cache, CacheAdmission, CacheCapacity, CacheConfig, CacheLookup, CacheOptions, CacheTtl, Effect,
-    HasClock, HasTaskSpawner, Scope, SharedValue,
+    HasClock, HasTaskSpawner, PreparedCacheIndex, Scope, SharedValue,
 };
 use crate::{cache, effect, effect_die, effect_map, effect_map_error, effect_try_sync};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+mod prepared;
+pub use prepared::{
+    PreparedDependencies, PreparedDependencyCache, PreparedDependencyPayloadIndex,
+    PreparedDependencyPolicy, PreparedDependencyPool, PreparedDependencyStorage, PreparedDependencyValue,
+    PreparedDependencyWriter,
+};
 type Equal<A> = Arc<dyn Fn(&A, &A) -> bool + Send + Sync>;
 /// Loader failures and explicit admission or dependency-width rejections.
 #[derive(Debug, PartialEq, Eq)]
@@ -26,6 +32,8 @@ pub enum DependencyCacheError<E> {
         /// Caller-supplied maximum number of active loads.
         maximum: usize,
     },
+    /// Selected physical cache metadata refused a reservation.
+    Memory(crate::memory::MemoryError),
 }
 /// A shared loaded payload and the dependency identities used to invalidate it.
 pub struct DependencyValue<A: Send + 'static, D> {
@@ -34,6 +42,9 @@ pub struct DependencyValue<A: Send + 'static, D> {
     /// Owned immutable dependency identities supplied with this successful load.
     pub dependencies: Arc<[D]>,
 }
+/// Prepared index for the same typed dependency-cache engine.
+pub type PreparedDependencyCacheIndex<K, D, A, E> =
+    PreparedCacheIndex<K, DependencyValue<A, D>, DependencyCacheError<E>>;
 /// Explicit retention, admission, dependency equality and outcome-expiry policies.
 ///
 /// No runtime or capacity is inferred. Equality callbacks must be stable for the
@@ -120,6 +131,25 @@ impl<K: Send + Sync + 'static, D: Send + Sync + 'static, A: Send + 'static, E: S
         policy: DependencyCachePolicy<K, D, A, E>,
         load: impl Fn(Arc<K>) -> Effect<(A, Vec<D>), E, R> + Send + Sync + 'static,
     ) -> Effect<Self, SharedValue<DependencyCacheError<E>>, R> {
+        Self::make_with_policy(scope, policy, None, load)
+    }
+
+    /// Select fixed index, diagnostic and maintenance storage for a retained dependency cache.
+    pub fn make_with_prepared_index<R: HasClock + HasTaskSpawner + Send + Sync + 'static>(
+        scope: Scope<SharedValue<DependencyCacheError<E>>>,
+        policy: DependencyCachePolicy<K, D, A, E>,
+        index: PreparedDependencyCacheIndex<K, D, A, E>,
+        load: impl Fn(Arc<K>) -> Effect<(A, Vec<D>), E, R> + Send + Sync + 'static,
+    ) -> Effect<Self, SharedValue<DependencyCacheError<E>>, R> {
+        Self::make_with_policy(scope, policy, Some(index), load)
+    }
+
+    fn make_with_policy<R: HasClock + HasTaskSpawner + Send + Sync + 'static>(
+        scope: Scope<SharedValue<DependencyCacheError<E>>>,
+        policy: DependencyCachePolicy<K, D, A, E>,
+        index: Option<PreparedDependencyCacheIndex<K, D, A, E>>,
+        load: impl Fn(Arc<K>) -> Effect<(A, Vec<D>), E, R> + Send + Sync + 'static,
+    ) -> Effect<Self, SharedValue<DependencyCacheError<E>>, R> {
         let maximum_active = policy.maximum_active;
         let failure = Arc::clone(&policy.cache_failure);
         Self::make_configured_with_shared_key(
@@ -131,7 +161,8 @@ impl<K: Send + Sync + 'static, D: Send + Sync + 'static, A: Send + 'static, E: S
                 cache_failure: Arc::new(move |error| match error {
                     DependencyCacheError::Load(error) => failure(error),
                     DependencyCacheError::DependencyCapacity { .. }
-                    | DependencyCacheError::ActiveCapacity { .. } => false,
+                    | DependencyCacheError::ActiveCapacity { .. }
+                    | DependencyCacheError::Memory(_) => false,
                 }),
             },
             CacheOptions {
@@ -145,6 +176,7 @@ impl<K: Send + Sync + 'static, D: Send + Sync + 'static, A: Send + 'static, E: S
             },
             policy.maximum_dependencies,
             policy.dependency_equal,
+            index,
             load,
         )
     }
@@ -171,6 +203,25 @@ impl<K: Send + Sync + 'static, D: Send + Sync + 'static, A: Send + 'static, E: S
         policy: DependencyCacheCoalescingPolicy<K, D>,
         load: impl Fn(Arc<K>) -> Effect<(A, Vec<D>), E, R> + Send + Sync + 'static,
     ) -> Effect<Self, SharedValue<DependencyCacheError<E>>, R> {
+        Self::make_coalescing_with_policy(scope, policy, None, load)
+    }
+
+    /// Select the same fixed storage for an active-coalescing cache with no retention.
+    pub fn make_coalescing_with_prepared_index<R: HasClock + HasTaskSpawner + Send + Sync + 'static>(
+        scope: Scope<SharedValue<DependencyCacheError<E>>>,
+        policy: DependencyCacheCoalescingPolicy<K, D>,
+        index: PreparedDependencyCacheIndex<K, D, A, E>,
+        load: impl Fn(Arc<K>) -> Effect<(A, Vec<D>), E, R> + Send + Sync + 'static,
+    ) -> Effect<Self, SharedValue<DependencyCacheError<E>>, R> {
+        Self::make_coalescing_with_policy(scope, policy, Some(index), load)
+    }
+
+    fn make_coalescing_with_policy<R: HasClock + HasTaskSpawner + Send + Sync + 'static>(
+        scope: Scope<SharedValue<DependencyCacheError<E>>>,
+        policy: DependencyCacheCoalescingPolicy<K, D>,
+        index: Option<PreparedDependencyCacheIndex<K, D, A, E>>,
+        load: impl Fn(Arc<K>) -> Effect<(A, Vec<D>), E, R> + Send + Sync + 'static,
+    ) -> Effect<Self, SharedValue<DependencyCacheError<E>>, R> {
         let maximum_active = policy.maximum_active;
         Self::make_configured_with_shared_key(
             scope,
@@ -191,6 +242,7 @@ impl<K: Send + Sync + 'static, D: Send + Sync + 'static, A: Send + 'static, E: S
             },
             policy.maximum_dependencies,
             policy.dependency_equal,
+            index,
             load,
         )
     }
@@ -203,17 +255,15 @@ impl<K: Send + Sync + 'static, D: Send + Sync + 'static, A: Send + 'static, E: S
         options: CacheOptions<DependencyValue<A, D>, DependencyCacheError<E>>,
         maximum_dependencies: NonZeroUsize,
         equal: Equal<D>,
+        index: Option<PreparedDependencyCacheIndex<K, D, A, E>>,
         load: impl Fn(Arc<K>) -> Effect<(A, Vec<D>), E, R> + Send + Sync + 'static,
     ) -> Effect<Self, SharedValue<DependencyCacheError<E>>, R> {
         let load = Arc::new(load);
-        let cache = cache! {
-            scope: scope,
-            config: config,
-            options: options,
-            load |key: Arc<K>| {
-                let load = Arc::clone(&load);
+        let load = move |key: Arc<K>| {
+            let load = Arc::clone(&load);
+            effect! {
                 let (value, dependencies) = effect_map_error! {
-                    program: load(key),
+                    program: load(Arc::clone(&key)),
                     map: DependencyCacheError::Load,
                 }?;
                     if dependencies.len() > maximum_dependencies.get() {
@@ -227,6 +277,22 @@ impl<K: Send + Sync + 'static, D: Send + Sync + 'static, A: Send + 'static, E: S
                             dependencies: dependencies.into(),
                         }
                     }
+            }
+        };
+        let cache = match index {
+            Some(index) => cache! {
+                scope: scope,
+                config: config,
+                options: options,
+                prepared_index: index,
+                on_capacity: DependencyCacheError::Memory,
+                load_shared: load,
+            },
+            None => cache! {
+                scope: scope,
+                config: config,
+                options: options,
+                load_shared: load,
             },
         };
         effect_map! { program: cache, map: move |cache| Self {

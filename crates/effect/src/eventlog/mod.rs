@@ -17,6 +17,8 @@ mod event_log_remote;
 mod event_observation;
 mod memory_event_journal;
 mod memory_projection_store;
+mod prepared_event_log;
+mod prepared_projection;
 mod projection;
 mod replica_cursor;
 mod replica_protection;
@@ -44,8 +46,21 @@ pub use event_log_remote::{
     ReplicaImportError, ReplicaImportPermit, ReplicaSync, ReplicaSyncError,
 };
 pub use event_observation::{EventObservation, EventObservationError, EventObservationReport};
-pub use memory_event_journal::{MemoryEventJournal, MemoryJournalCapacity, MemoryJournalError};
-pub use memory_projection_store::{MemoryProjectionError, MemoryProjectionStore};
+pub use memory_event_journal::{
+    MemoryEventJournal, MemoryJournalCapacity, MemoryJournalError, PreparedAppendDecision,
+    PreparedEncodedEventOutcome, PreparedEventAppend, PreparedEventHeader, PreparedEventInspection,
+    PreparedJournalEntry, PreparedJournalError, PreparedJournalRead, PreparedJournalReadOutcome,
+    PreparedMemoryEventJournal, PreparedMemoryJournalCapacity,
+};
+pub use memory_projection_store::{
+    MemoryProjectionError, MemoryProjectionStore, PreparedMemoryProjectionStore,
+    PreparedProjectionCapacity, PreparedProjectionError, PreparedProjectionReservation,
+    PreparedProjectionSnapshot, PreparedProjectionWrite,
+};
+pub use prepared_event_log::{PreparedEventCodec, PreparedEventLog, PreparedEventWriter};
+pub use prepared_projection::{
+    PreparedProjection, PreparedProjectionAdvance, PreparedProjectionAdvanceError,
+};
 pub use projection::{
     AtomicProjectionStore, HasAtomicProjectionStore, Projection, ProjectionAdvance,
     ProjectionAdvanceError, ProjectionId, ProjectionKey, ProjectionSnapshot, ProjectionVersion,

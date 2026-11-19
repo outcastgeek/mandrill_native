@@ -1,14 +1,14 @@
 # Build and run the native Server example
 
-Run these commands from the workspace root (the directory containing the root `Cargo.toml`) with Rust 1.99.0 installed. `cargo run` also builds the selected example.
+Run these commands from the workspace root (the directory containing the root `Cargo.toml`) with Rust 1.100.0 installed. `cargo run` also builds the selected example.
 
 ## `serve_cafe_orders`
 
 [Source](serve_cafe_orders.rs). Package `effect-server`; its default features provide the native HTTP transport. No additional features or positional arguments are required.
 
 ```sh
-cargo +1.99.0 build --locked -p effect-server --example serve_cafe_orders
-CAFE_CHUNK_BYTES=4096 CAFE_JSON_BYTES=1024 CAFE_TELEMETRY_CAPACITY=32 CAFE_DRAIN_MS=3000 cargo +1.99.0 run --locked -p effect-server --example serve_cafe_orders
+cargo +1.100.0 build --locked -p effect-server --example serve_cafe_orders
+CAFE_CHUNK_BYTES=4096 CAFE_JSON_BYTES=1024 CAFE_TELEMETRY_CAPACITY=32 CAFE_DRAIN_MS=3000 cargo +1.100.0 run --locked -p effect-server --example serve_cafe_orders
 ```
 
 All four environment variables are required:

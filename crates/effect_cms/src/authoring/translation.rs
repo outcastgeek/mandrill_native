@@ -99,18 +99,29 @@ pub fn normalize_authoring_fields(
     fields: &[AuthoringTranslationField],
 ) -> Vec<AuthoringTranslationField> {
     let mut normalized = Vec::with_capacity(fields.len());
+    let Ok(()) = write_normalized_fields(fields, |field| {
+        normalized.push(field);
+        Ok::<_, std::convert::Infallible>(())
+    });
+    normalized
+}
+
+pub(super) fn write_normalized_fields<E>(
+    fields: &[AuthoringTranslationField],
+    mut write: impl FnMut(AuthoringTranslationField) -> Result<(), E>,
+) -> Result<(), E> {
     for field in fields {
         let name = field.name.trim();
         if name.is_empty() || field.value.trim().is_empty() {
             continue;
         }
-        normalized.push(AuthoringTranslationField {
+        write(AuthoringTranslationField {
             name: name.to_owned(),
             value: field.value.clone(),
             format: field.format.trim().to_owned(),
-        });
+        })?;
     }
-    normalized
+    Ok(())
 }
 
 /// The normalized field-format lookup.
@@ -152,11 +163,12 @@ pub fn parse_authoring_translation_fields_json(
 
 /// Trim one Markdown JSON fence, matching the source's prefix/suffix order.
 fn trim_authoring_json_fence(raw: &str) -> String {
-    let trimmed = raw.trim();
-    let trimmed = trimmed.strip_prefix("```json").unwrap_or(trimmed);
-    let trimmed = trimmed.strip_prefix("```").unwrap_or(trimmed);
-    let trimmed = trimmed.strip_suffix("```").unwrap_or(trimmed);
-    trimmed.trim().to_owned()
+    raw.trim()
+        .trim_prefix("```json")
+        .trim_prefix("```")
+        .trim_suffix("```")
+        .trim()
+        .to_owned()
 }
 
 /// Repair backslash escapes that JSON does not recognize inside strings.

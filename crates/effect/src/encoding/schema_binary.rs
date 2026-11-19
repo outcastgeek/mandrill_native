@@ -5,8 +5,11 @@ use crate::{effect, effect_map_error, effect_try_sync};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
+mod bank;
 mod internal;
-use internal::{Cursor, Output};
+pub use bank::{PreparedBinaryUnionCapacity, PreparedBinaryUnionPool};
+use internal::{Cursor, DecodeBackend, Output};
+pub use internal::{PreparedBinaryTraversalCapacity, PreparedBinaryTraversalPool};
 
 /// Format 1 is independent of the frame envelope and application revision.
 /// It begins with a format octet, a big-endian schema version and a length-
@@ -107,6 +110,8 @@ pub enum BinaryError {
     InvalidNumber,
     /// The key already exists or occurred twice. Carries `String`.
     DuplicateKey(String),
+    /// The duplicate key retained in prepared text backing.
+    PreparedDuplicateKey(crate::schema::PreparedDiagnosticText),
     /// The binary payload ends before the next value is complete.
     Truncated {
         /// Byte position of the incomplete value. Type: `usize`.
@@ -125,6 +130,10 @@ pub enum BinaryError {
     LimitExceeded(SchemaResource),
     /// No union variant is available. Carries `Vec<Self>`.
     NoUnionVariant(Vec<Self>),
+    /// No union alternative matched; failures retain their prepared array owner.
+    PreparedNoUnionVariant(crate::schema::SharedPreparedJsonArray<Self>),
+    /// Prepared backing admission or output failed.
+    Memory(crate::memory::MemoryError),
     /// The value failed schema validation. Retains the `SchemaIssue` detail.
     Schema(SchemaIssue),
 }
@@ -143,6 +152,19 @@ impl std::fmt::Display for BinaryError {
 }
 
 impl std::error::Error for BinaryError {}
+impl BinaryError {
+    /// Borrow a duplicate key regardless of native or prepared storage.
+    #[must_use]
+    pub fn duplicate_key(&self) -> Option<&str> {
+        if let Self::DuplicateKey(key) = self {
+            Some(key)
+        } else if let Self::PreparedDuplicateKey(key) = self {
+            Some(key.as_str())
+        } else {
+            None
+        }
+    }
+}
 
 impl From<SchemaIssue> for BinaryError {
     ///
@@ -163,6 +185,8 @@ pub struct SchemaBinary {
     ast: SchemaAst,
     identity: BinaryIdentity,
     limits: BinaryLimits,
+    issues: Option<Arc<crate::schema::PreparedIssueMemory>>,
+    traversal: Option<Arc<PreparedBinaryTraversalPool>>,
 }
 
 impl SchemaBinary {
@@ -181,7 +205,21 @@ impl SchemaBinary {
             ast,
             identity,
             limits,
+            issues: None,
+            traversal: None,
         }
+    }
+    /// Select prepared diagnostic ownership for prepared binary operations.
+    #[must_use]
+    pub fn with_issue_memory(mut self, issues: Arc<crate::schema::PreparedIssueMemory>) -> Self {
+        self.issues = Some(issues);
+        self
+    }
+    /// Select fixed call-scoped traversal backing for prepared binary operations.
+    #[must_use]
+    pub fn with_traversal_pool(mut self, pool: Arc<PreparedBinaryTraversalPool>) -> Self {
+        self.traversal = Some(pool);
+        self
     }
 
     #[must_use]
@@ -209,12 +247,60 @@ impl SchemaBinary {
     /// # Returns
     /// Type: `Result<Vec<u8>, BinaryError>`.
     pub fn encode_json(&self, value: &JsonValue) -> Result<Vec<u8>, BinaryError> {
-        let mut output = Output::new(self.limits);
+        let mut bytes = Vec::new();
+        let mut output = Output::new(self.limits, &mut bytes);
         output.byte(SCHEMA_BINARY_FORMAT_VERSION)?;
         output.u64(self.identity.version.get())?;
         output.text(&self.identity.name)?;
         output.value(&self.ast, value, 1)?;
-        Ok(output.bytes)
+        drop(output);
+        Ok(bytes)
+    }
+
+    /// Append one format-1 value to prepared backing, restoring its initial
+    /// prefix on failure or unwind. The logical byte limit applies to the append.
+    pub fn encode_json_into(
+        &self,
+        value: &JsonValue,
+        buffer: &mut crate::memory::Buffer<'_>,
+        errors: &crate::schema::PreparedJsonArrayPool<BinaryError>,
+    ) -> Result<(), BinaryError> {
+        let mut output = Output::prepared(
+            self.limits,
+            buffer,
+            errors,
+            self.issues.as_deref(),
+            self.traversal.as_deref(),
+        );
+        output.byte(SCHEMA_BINARY_FORMAT_VERSION)?;
+        output.u64(self.identity.version.get())?;
+        output.text(&self.identity.name)?;
+        output.value(&self.ast, value, 1)?;
+        output.commit();
+        Ok(())
+    }
+
+    /// Append a managed JSON subtree using the same format and rollback rules.
+    /// Object traversal follows the managed document's retained input order.
+    pub fn encode_prepared_into(
+        &self,
+        value: &crate::schema::SharedPreparedJsonValue,
+        buffer: &mut crate::memory::Buffer<'_>,
+        errors: &crate::schema::PreparedJsonArrayPool<BinaryError>,
+    ) -> Result<(), BinaryError> {
+        let mut output = Output::prepared(
+            self.limits,
+            buffer,
+            errors,
+            self.issues.as_deref(),
+            self.traversal.as_deref(),
+        );
+        output.byte(SCHEMA_BINARY_FORMAT_VERSION)?;
+        output.u64(self.identity.version.get())?;
+        output.text(&self.identity.name)?;
+        output.prepared_value(&self.ast, value.view(), 1)?;
+        output.commit();
+        Ok(())
     }
 
     /// Decode into independently owned JSON values. No view into `input` or
@@ -250,6 +336,49 @@ impl SchemaBinary {
         Ok(value)
     }
 
+    /// Decode into an admitted managed document and count its normalized JSON bytes.
+    /// The input and traversal retain their existing binary limits; the selected
+    /// parse policy independently bounds the managed representation. This path
+    /// requires a selected prepared traversal pool.
+    pub fn decode_prepared(
+        &self,
+        input: &[u8],
+        output: &crate::schema::PreparedJsonParserPool,
+        policy: crate::schema::ParsePolicy,
+    ) -> Result<crate::schema::SharedPreparedJsonValue, BinaryError> {
+        let mut owner = output
+            .admit_document(policy)
+            .map_err(internal::backing_error)?;
+        let issues = output.issue_memory().or(self.issues.as_deref());
+        let mut backend = DecodeBackend::Managed {
+            owner: &mut owner,
+            issues,
+        };
+        let mut cursor = Cursor::new(input, self.limits)?;
+        let version = cursor.byte()?;
+        if version != SCHEMA_BINARY_FORMAT_VERSION {
+            return Err(BinaryError::UnsupportedFormat(version));
+        }
+        let version = cursor.u64()?;
+        if version != self.identity.version.get() {
+            return Err(BinaryError::SchemaVersionMismatch {
+                expected: self.identity.version.get(),
+                actual: version,
+            });
+        }
+        if cursor.text()?.as_bytes() != self.identity.name.as_bytes() {
+            return Err(BinaryError::SchemaNameMismatch);
+        }
+        let value = cursor.value_node(&self.ast, 1, &mut backend, self.traversal.as_deref())?;
+        if cursor.offset != input.len() {
+            return Err(BinaryError::TrailingBytes {
+                offset: cursor.offset,
+            });
+        }
+        let root = value.managed_root()?;
+        owner.finish(root).map_err(internal::backing_error)
+    }
+
     /// Encode a typed value with the declared binary identity and resource bounds.
     ///
     /// # Type parameters
@@ -281,6 +410,58 @@ impl SchemaBinary {
         codec
             .decode_ref(&self.decode_json(input)?)
             .map_err(Into::into)
+    }
+
+    /// Encode through a managed codec after reserving the actual traversal cell.
+    /// The supplied context is forwarded to the genuine codec encoder once.
+    pub fn encode_prepared_typed_into<A: Send + 'static>(
+        &self,
+        codec: &PureCodec<A, crate::schema::SharedPreparedJsonValue>,
+        value: &A,
+        context: Option<&crate::schema::ParseContext>,
+        buffer: &mut crate::memory::Buffer<'_>,
+        errors: &crate::schema::PreparedJsonArrayPool<BinaryError>,
+    ) -> Result<(), BinaryError> {
+        self.require_codec(codec)?;
+        let reservation = self
+            .traversal
+            .as_deref()
+            .ok_or(BinaryError::Memory(
+                crate::memory::MemoryError::UnsupportedRunContract,
+            ))?
+            .reserve()
+            .map_err(BinaryError::Memory)?;
+        // The reservation contains no borrowed frames. The stack is initialized
+        // only after `encoded` exists, so it retires before that owner on unwind.
+        let encoded = codec.encode_in_ref(value, context)?;
+        let mut output = Output::prepared(
+            self.limits,
+            buffer,
+            errors,
+            self.issues.as_deref(),
+            self.traversal.as_deref(),
+        );
+        output.byte(SCHEMA_BINARY_FORMAT_VERSION)?;
+        output.u64(self.identity.version.get())?;
+        output.text(&self.identity.name)?;
+        output.prepared_value_reserved(&self.ast, encoded.view(), 1, reservation)?;
+        output.commit();
+        Ok(())
+    }
+
+    /// Decode an admitted managed document through the genuine typed decoder.
+    /// The parse policy and the optional codec context remain independent.
+    pub fn decode_prepared_typed<A: Send + 'static>(
+        &self,
+        codec: &PureCodec<A, crate::schema::SharedPreparedJsonValue>,
+        input: &[u8],
+        output: &crate::schema::PreparedJsonParserPool,
+        policy: crate::schema::ParsePolicy,
+        context: Option<&crate::schema::ParseContext>,
+    ) -> Result<A, BinaryError> {
+        self.require_codec(codec)?;
+        let encoded = self.decode_prepared(input, output, policy)?;
+        codec.decode_in_ref(&encoded, context).map_err(Into::into)
     }
 
     /// Adapt this same binary format to owned effectful directions with separate `D` and `E`.
@@ -347,17 +528,201 @@ impl SchemaBinary {
     /// - `A`: Bounds: `Send + 'static`.
     ///
     /// # Parameters
-    /// - `codec` (`&PureCodec<A, JsonValue>`): The codec supplied to this operation.
+    /// - `codec` (`&PureCodec<A, Encoded>`): The codec supplied to this operation.
     ///
     /// # Returns
     /// Type: `Result<(), BinaryError>`.
-    fn require_codec<A: Send + 'static>(
+    fn require_codec<A: Send + 'static, Encoded: Send + 'static>(
         &self,
-        codec: &PureCodec<A, JsonValue>,
+        codec: &PureCodec<A, Encoded>,
     ) -> Result<(), BinaryError> {
         if self.ast.identity() != codec.ast().identity() {
             return Err(BinaryError::CodecSchemaMismatch);
         }
         Ok(())
+    }
+}
+
+/// Actual storage selected for prepared binary directions.
+pub struct PreparedBinaryCodecResources {
+    /// Physical output byte cells.
+    pub bytes: Arc<super::PreparedBytePool>,
+    /// Actual union error arrays and retained frames.
+    pub errors: Arc<crate::PreparedJsonArrayPool<BinaryError>>,
+    /// Finite union builder bank controls.
+    pub banks: Arc<PreparedBinaryUnionPool>,
+    /// Managed decode document and counting writer pool.
+    pub output: Arc<crate::PreparedJsonParserPool>,
+    /// Explicit managed decode policy.
+    pub policy: crate::ParsePolicy,
+}
+/// Owned prepared binary directions over one managed-value codec.
+/// F selects the expected root error family before graph construction.
+pub struct PreparedBinaryCodec<
+    C,
+    A: Send + 'static,
+    D: Send + Sync + 'static,
+    E: Send + Sync + 'static,
+    F = fn(BinaryError) -> BinaryError,
+> {
+    binary: SchemaBinary,
+    codec: Arc<C>,
+    resources: PreparedBinaryCodecResources,
+    map: F,
+    marker: std::marker::PhantomData<fn() -> A>,
+    environments: std::marker::PhantomData<fn() -> (D, E)>,
+}
+impl<C, A, D, E> PreparedBinaryCodec<C, A, D, E>
+where
+    A: Send + 'static,
+    D: Send + Sync + 'static,
+    E: Send + Sync + 'static,
+    C: crate::PreparedCodec<A, crate::SharedPreparedJsonValue, D, E, Error = BinaryError>,
+{
+    /// Select physical storage and preserve the BinaryError root family.
+    pub fn new(
+        binary: SchemaBinary,
+        codec: Arc<C>,
+        bytes: Arc<super::PreparedBytePool>,
+        errors: Arc<crate::PreparedJsonArrayPool<BinaryError>>,
+        banks: Arc<PreparedBinaryUnionPool>,
+        output: Arc<crate::PreparedJsonParserPool>,
+        policy: crate::ParsePolicy,
+    ) -> Result<Self, BinaryError> {
+        Self::new_mapped(
+            binary,
+            codec,
+            PreparedBinaryCodecResources {
+                bytes,
+                errors,
+                banks,
+                output,
+                policy,
+            },
+            std::convert::identity::<BinaryError>,
+        )
+    }
+}
+impl<C, A, D, E, F> PreparedBinaryCodec<C, A, D, E, F>
+where
+    A: Send + 'static,
+    D: Send + Sync + 'static,
+    E: Send + Sync + 'static,
+{
+    /// Select one root error family without converting an existing graph.
+    /// AST mismatch is returned directly before any description is built.
+    pub fn new_mapped<X>(
+        binary: SchemaBinary,
+        codec: Arc<C>,
+        resources: PreparedBinaryCodecResources,
+        map: F,
+    ) -> Result<Self, BinaryError>
+    where
+        X: Send + 'static,
+        F: Fn(BinaryError) -> X + Send + Sync + 'static,
+        C: crate::PreparedCodec<A, crate::SharedPreparedJsonValue, D, E, Error = X>,
+    {
+        if binary.ast.identity() != codec.ast().identity() {
+            return Err(BinaryError::CodecSchemaMismatch);
+        }
+        Ok(Self {
+            binary,
+            codec,
+            resources,
+            map,
+            marker: std::marker::PhantomData,
+            environments: std::marker::PhantomData,
+        })
+    }
+}
+impl<C, A, D, E, F, X> crate::PreparedCodec<A, super::PreparedBytes, D, E>
+    for PreparedBinaryCodec<C, A, D, E, F>
+where
+    A: Send + 'static,
+    D: Send + Sync + 'static,
+    E: Send + Sync + 'static,
+    X: Send + 'static,
+    F: Fn(BinaryError) -> X + Send + Sync + 'static,
+    C: crate::PreparedCodec<A, crate::SharedPreparedJsonValue, D, E, Error = X>,
+{
+    type Error = X;
+    fn ast(&self) -> &SchemaAst {
+        &self.binary.ast
+    }
+    fn map_schema_issue(&self, issue: SchemaIssue) -> X {
+        (self.map)(BinaryError::Schema(issue))
+    }
+    fn has_validator(&self) -> bool {
+        self.codec.has_validator()
+    }
+    fn has_default_validator(&self) -> bool {
+        self.codec.has_default_validator()
+    }
+    fn validate_default_ref(
+        &self,
+        value: &A,
+        context: Option<&crate::ParseContext>,
+    ) -> Result<(), X> {
+        self.codec.validate_default_ref(value, context)
+    }
+    fn decode(
+        self: Arc<Self>,
+        bytes: super::PreparedBytes,
+        context: Option<crate::ParseContext>,
+    ) -> impl crate::__private::prepared_graph::Description<Value = A, Error = X, Env = D> {
+        let codec = Arc::clone(&self.codec);
+        crate::effect_prepare! { description; program: effect! {
+            let value = effect_try_sync! { once; body: move || self.binary.decode_prepared(bytes.as_slice(),&self.resources.output,self.resources.policy).map_err(&self.map), }?;
+            let result = <C as crate::PreparedCodec<A,crate::SharedPreparedJsonValue,D,E>>::decode(codec,value,context)?;
+            result
+        }, }
+    }
+    fn encode(
+        self: Arc<Self>,
+        value: A,
+        context: Option<crate::ParseContext>,
+    ) -> impl crate::__private::prepared_graph::Description<
+        Value = super::PreparedBytes,
+        Error = X,
+        Env = E,
+    > {
+        let prepare = Arc::clone(&self);
+        let codec = Arc::clone(&self.codec);
+        crate::effect_prepare! { description; program: effect! {
+            let (mut bytes,traversal,bank) = effect_try_sync! { once; body: move || {
+                (|| -> Result<_,BinaryError> {
+                    let bytes=prepare.resources.bytes.checkout().map_err(BinaryError::Memory)?;
+                    let traversal=prepare.binary.traversal.as_deref().ok_or(BinaryError::Memory(crate::memory::MemoryError::UnsupportedRunContract))?.reserve().map_err(BinaryError::Memory)?;
+                    let bank=prepare.resources.banks.admit(&prepare.resources.errors).map_err(BinaryError::Memory)?;
+                    Ok((bytes,traversal,bank))
+                })().map_err(&prepare.map)
+            }, }?;
+            let encoded = <C as crate::PreparedCodec<A,crate::SharedPreparedJsonValue,D,E>>::encode(codec,value,context)?;
+            let bytes = effect_try_sync! { once; body: move || {
+                (|| -> Result<_,BinaryError> {
+                    let buffer=bytes.buffer_mut().ok_or(BinaryError::Memory(crate::memory::MemoryError::Closed))?;
+                    let mut output=Output::prepared(self.binary.limits,buffer,&self.resources.errors,self.binary.issues.as_deref(),self.binary.traversal.as_deref()).with_bank(&bank);
+                    output.byte(SCHEMA_BINARY_FORMAT_VERSION)?;
+                    output.u64(self.binary.identity.version.get())?;
+                    output.text(&self.binary.identity.name)?;
+                    output.prepared_value_reserved(&self.binary.ast,encoded.view(),1,traversal)?;
+                    output.commit();
+                    drop(output);
+                    Ok(bytes)
+                })().map_err(&self.map)
+            }, }?;
+            bytes
+        }, }
+    }
+    fn validate(
+        self: Arc<Self>,
+        value: A,
+        context: Option<crate::ParseContext>,
+    ) -> impl crate::__private::prepared_graph::Description<Value = A, Error = X, Env = E> {
+        <C as crate::PreparedCodec<A, crate::SharedPreparedJsonValue, D, E>>::validate(
+            Arc::clone(&self.codec),
+            value,
+            context,
+        )
     }
 }

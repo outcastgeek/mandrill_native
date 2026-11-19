@@ -389,6 +389,28 @@ pub struct WorkflowSnapshot {
     /// Recorded reason this workflow run became runnable. Type: `Option<WorkflowWakeReason>`.
     pub wake_reason: Option<WorkflowWakeReason>,
 }
+
+/// The run header used for fenced execution and recovery without its histories.
+/// Encoded identity, input and outcome bytes retain their existing shared owners.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowHead {
+    /// Execution ownership counter observed with its status.
+    pub execution: u64,
+    /// Stable run and definition identity.
+    pub handle: WorkflowHandle,
+    /// Signature used to validate replay compatibility.
+    pub compatibility: Arc<[u8]>,
+    /// Original encoded input.
+    pub encoded_input: Arc<[u8]>,
+    /// Current lifecycle status and any terminal encoded outcome.
+    pub status: WorkflowStatus,
+    /// Scheduled absolute deadline, when present.
+    pub deadline: Option<RecordedDeadline>,
+    /// Condition currently suspending the run.
+    pub waiting_on: Option<WorkflowWait>,
+    /// Recorded cause of the transition from suspended to runnable.
+    pub wake_reason: Option<WorkflowWakeReason>,
+}
 /// Expected status and execution identity for an atomic workflow transition.
 ///
 /// Status alone is insufficient: a newer body may again be Running. Carry this
@@ -403,6 +425,47 @@ pub struct WorkflowCheckpoint {
 }
 impl WorkflowSnapshot {
     /// Capture this snapshot's status and execution counter together for a later fenced transition.
+    #[must_use]
+    pub fn checkpoint(&self) -> WorkflowCheckpoint {
+        WorkflowCheckpoint {
+            status: self.status.clone(),
+            execution: self.execution,
+        }
+    }
+
+    /// Read the header while leaving all replay histories in the snapshot.
+    #[must_use]
+    pub fn head(&self) -> WorkflowHead {
+        WorkflowHead {
+            execution: self.execution,
+            handle: self.handle.clone(),
+            compatibility: Arc::clone(&self.compatibility),
+            encoded_input: Arc::clone(&self.encoded_input),
+            status: self.status.clone(),
+            deadline: self.deadline.clone(),
+            waiting_on: self.waiting_on.clone(),
+            wake_reason: self.wake_reason.clone(),
+        }
+    }
+
+    /// Transfer the header owners from an already materialized snapshot.
+    #[must_use]
+    pub fn into_head(self) -> WorkflowHead {
+        WorkflowHead {
+            execution: self.execution,
+            handle: self.handle,
+            compatibility: self.compatibility,
+            encoded_input: self.encoded_input,
+            status: self.status,
+            deadline: self.deadline,
+            waiting_on: self.waiting_on,
+            wake_reason: self.wake_reason,
+        }
+    }
+}
+
+impl WorkflowHead {
+    /// Capture the exact status and execution identity for a fenced transition.
     #[must_use]
     pub fn checkpoint(&self) -> WorkflowCheckpoint {
         WorkflowCheckpoint {

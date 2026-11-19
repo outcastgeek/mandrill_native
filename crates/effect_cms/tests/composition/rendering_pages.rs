@@ -80,3 +80,93 @@ fn dashboard_actions_filter_invalid_and_preserve_order()->Result<(),String>{
     let location=DashboardActionLocation::new("header");let actions=vec![dashboards::ActionVM{label:" ".into(),href:"/skip".into(),location:location.clone(),..Default::default()},dashboards::ActionVM{label:"Create".into(),href:"/new".into(),location:location.clone(),..Default::default()},dashboards::ActionVM{label:"Other".into(),href:"/other".into(),location:DashboardActionLocation::new("tool"),..Default::default()}];
     let mapped=dashboards::map_dashboard_actions(&actions,&location,Some(|a:dashboards::ActionVM|a.href)).ok_or("mapped actions")?;assert_eq!(mapped,vec!["/new"]);assert_eq!(dashboards::first_dashboard_action(&actions,&location).ok_or("first")?.label,"Create");assert!(dashboards::dashboard_actions_for_location(&actions,&DashboardActionLocation::new("absent")).is_none());Ok(())
 }
+
+#[test]
+fn prepared_form_and_maud_reply_cross_the_native_http_boundary() -> Result<(), String> {
+    use effect::effect;
+    use effect::memory::{BufferView, Bytes, MemoryError, MemoryPlan, Partition, RegionId};
+    use effect_cms::forms::{
+        InitializeForm, MergedFormCapacity, MergedFormPolicy, PreparedMergedForms,
+    };
+    use effect_server::{BodyLimit, MultipartPolicy, ServerError};
+    use std::num::NonZeroUsize;
+
+    let region = RegionId::named("cms-http-fixture");
+    let total = Bytes::new(128 * 1024);
+    let capacity = [Partition { id: region, capacity: total }];
+    let memory = MemoryPlan::new(total, &capacity)
+        .and_then(|plan| plan.metadata(region))
+        .and_then(MemoryPlan::prepare)
+        .map_err(|error| error.to_string())?;
+    let one = NonZeroUsize::MIN;
+    let forms = Arc::new(
+        PreparedMergedForms::prepare(&memory, region, MergedFormCapacity {
+            forms: one,
+            pairs: one.saturating_add(3),
+            bytes: Bytes::new(128),
+            query_segments: one.saturating_add(3),
+            body_segments: one.saturating_add(3),
+        }).map_err(|error| error.to_string())?,
+    );
+    let output = Arc::new(memory.buffers(region, 1, Bytes::new(1024))
+        .map_err(|error| error.to_string())?);
+    let memory = memory.seal();
+    let urlencoded = policy();
+    let form_policy = MergedFormPolicy {
+        urlencoded,
+        multipart: MultipartPolicy {
+            body: BodyLimit::new(one),
+            part_bytes: one,
+            header_bytes: one,
+            parts: one,
+            field_bytes: one,
+        },
+        multipart_fields: one,
+        multipart_values: urlencoded.values,
+        file_memory: 0,
+    };
+
+    let response = native_http::deliver_at(
+        Arc::new(move |request| {
+            let request = request.clone();
+            let forms = forms.clone();
+            let output = output.clone();
+            effect! {
+                let request = request.clone();
+                let forms = forms.clone();
+                let output = output.clone();
+                let first = forms.read(&request, form_policy, InitializeForm::ParseForm, std::convert::identity)?;
+                assert_eq!(first.values(b"title").collect::<Vec<_>>(), [b"<news>".as_slice()]);
+                let probe = forms.read::<ServerError, native_http::Env>(
+                    &request, form_policy, InitializeForm::ParseForm, std::convert::identity,
+                );
+                let held = probe.result()?;
+                assert!(matches!(held, Err(ServerError::Memory(MemoryError::NoSlot))));
+                drop(first);
+                let restored = forms.read(&request, form_policy, InitializeForm::ParseForm, std::convert::identity)?;
+                assert!(restored.diagnostic().is_none());
+                effect_try_sync! {
+                    once;
+                    body: move || {
+                        let mut output = output.try_checkout().map_err(ServerError::Memory)?;
+                        output.clear();
+                        let markup = html! { h1 { "<news>" } };
+                        write_maud_markup(&mut output, markup, Bytes::new(4096)).map_err(ServerError::Memory)?;
+                        let held = BufferView::new(output.share());
+                        Ok(effect_server::reply! { lease(held, http::HeaderValue::from_static("text/html")); })
+                    },
+                }?
+            }
+        }),
+        Arc::new(std::convert::identity),
+        http::Method::GET,
+        "/?title=%3Cnews%3E".into(),
+        String::new(),
+        None,
+    )?;
+    assert_eq!(response.status, http::StatusCode::OK);
+    assert_eq!(response.headers[http::header::CONTENT_TYPE], "text/html");
+    assert_eq!(response.body, "<h1>&lt;news&gt;</h1>");
+    assert_eq!(memory.report().reserved, total);
+    Ok(())
+}

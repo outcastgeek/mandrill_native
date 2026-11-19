@@ -75,8 +75,8 @@ pub use self::contracts::{
 };
 pub use self::gemini::{
     DEFAULT_GEMINI_AUTHORING_TRANSLATION_MODEL, GEMINI_API_BASE_URL, GeminiProviderError,
-    GeminiTranslator, GeminiTranslatorError, new_gemini_translator,
-    new_gemini_translator_with_model,
+    GeminiTranslator, GeminiTranslatorError, GeminiWorkingLimits, PreparedGeminiWorkspace,
+    new_gemini_translator, new_gemini_translator_with_model,
 };
 pub use self::patch::{
     AuthoringTranslationPatch, TranslationSignalValue, authoring_translation_failure_patch,
@@ -85,7 +85,9 @@ pub use self::patch::{
     write_authoring_translation_signal_patch, write_signal_patch,
 };
 pub use self::request::{
-    AuthoringTranslationRequestError, parse_authoring_translation_request_from_form, parse_authoring_translation_request_with_form,
+    AuthoringTranslationRequestError, parse_authoring_translation_request_from_form,
+    parse_authoring_translation_request_prepared, parse_authoring_translation_request_with_form,
+    project_prepared_authoring_request,
 };
 pub use self::route::{AUTHORING_ROUTE_CATEGORY, AuthoringRouteService, AuthoringRouteServiceOptions};
 pub use self::runtime::{
@@ -94,7 +96,7 @@ pub use self::runtime::{
     AuthoringPatchDelivery, authoring_write_failure_reply, AuthoringService, AuthoringTranslationHandlerOptions, DEFAULT_AUTHORING_TRANSLATION_TIMEOUT,
     LocalizedAuthoringService, LocalizedAuthoringTranslationHandlerOptions,
     localized_authoring_translation_patch_options, new_authoring_translation_handler,
-    new_localized_authoring_translation_handler,
+    new_localized_authoring_translation_handler, new_prepared_authoring_translation_handler,
 };
 pub use self::translation::{
     authoring_field_format_map, build_authoring_translation_patch, normalize_authoring_fields,

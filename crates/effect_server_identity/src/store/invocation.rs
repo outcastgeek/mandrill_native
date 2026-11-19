@@ -6,6 +6,7 @@
 
 use super::SqlxIdentityStore;
 use crate::{effect_future, effect_uninterruptible};
+use effect::memory::{Bytes, MemoryError, PreparedMemory, RegionId, SharedSlot, SlotPool};
 use effect::{Effect, Exit};
 use effect_sql::SqlError;
 use std::{
@@ -37,6 +38,84 @@ impl InvocationDiagnostics {
             .take()
     }
 }
+/// Startup-provisioned diagnostic carriers for selected native Identity workflows.
+pub struct PreparedIdentityInvocations {
+    cells: SlotPool<'static, Option<InvocationDiagnostics>>,
+}
+impl PreparedIdentityInvocations {
+    /// Region space for complete carriers, with allocator headers budgeted by the owner.
+    pub fn storage_bytes(capacity: usize) -> Result<Bytes, MemoryError> {
+        SlotPool::<Option<InvocationDiagnostics>>::storage_bytes(capacity)
+    }
+
+    /// Prepare one reusable carrier per concurrently live invocation.
+    pub fn prepare(
+        memory: &PreparedMemory<'static>,
+        region: RegionId,
+        capacity: usize,
+    ) -> Result<Self, MemoryError> {
+        Ok(Self {
+            cells: memory.slots(region, capacity, |_| Ok(None))?,
+        })
+    }
+
+    fn reserve(&self) -> Result<InvocationOwner, MemoryError> {
+        let mut cell = self.cells.try_checkout()?;
+        *cell = Some(InvocationDiagnostics {
+            failure: Mutex::new(None),
+        });
+        Ok(InvocationOwner::Prepared(Some(cell.share())))
+    }
+}
+
+pub(crate) enum InvocationOwner {
+    Ordinary(Arc<InvocationDiagnostics>),
+    Prepared(Option<SharedSlot<'static, Option<InvocationDiagnostics>>>),
+}
+impl Clone for InvocationOwner {
+    #[expect(
+        clippy::expect_used,
+        reason = "an existing carrier only fails to clone if its reference count is unrepresentable"
+    )]
+    fn clone(&self) -> Self {
+        match self {
+            Self::Ordinary(cell) => Self::Ordinary(cell.clone()),
+            Self::Prepared(cell) => Self::Prepared(cell.as_ref().map(|cell| {
+                cell.try_clone()
+                    .expect("identity invocation reference count")
+            })),
+        }
+    }
+}
+impl InvocationOwner {
+    fn cell(&self) -> Option<&InvocationDiagnostics> {
+        match self {
+            Self::Ordinary(cell) => Some(cell),
+            Self::Prepared(cell) => cell.as_ref().and_then(|cell| (**cell).as_ref()),
+        }
+    }
+
+    pub(crate) fn retain(&self, error: SqlError) {
+        if let Some(cell) = self.cell() {
+            cell.retain(error);
+        }
+    }
+
+    pub(crate) fn take(&self) -> Option<SqlError> {
+        self.cell().and_then(InvocationDiagnostics::take)
+    }
+}
+impl Drop for InvocationOwner {
+    fn drop(&mut self) {
+        if let Self::Prepared(cell) = self
+            && let Some(cell) = cell.take()
+            && let Some(mut cell) = cell.into_last()
+        {
+            drop(cell.take());
+        }
+    }
+}
+
 /// Native application rejection or restored original SQL failure.
 /// Defects/interruption/finalization remain Exit channels, not expected errors.
 #[derive(Debug)]
@@ -70,17 +149,35 @@ pub struct StoreInvocation {
     /// Scoped replacement handle sharing the installed pool and policy.
     store: SqlxIdentityStore,
     /// Private carrier survives through native manager settlement.
-    diagnostics: Arc<InvocationDiagnostics>,
+    diagnostics: InvocationOwner,
 }
 impl StoreInvocation {
     /// Establish a fresh private carrier for this original store configuration.
     pub(crate) fn new(backend: &SqlxIdentityStore) -> Self {
-        let diagnostics = Arc::new(InvocationDiagnostics {
-            failure: Mutex::new(None),
-        });
+        Self::with_diagnostics(
+            backend,
+            InvocationOwner::Ordinary(Arc::new(InvocationDiagnostics {
+                failure: Mutex::new(None),
+            })),
+        )
+    }
+
+    pub(crate) fn new_prepared(
+        backend: &SqlxIdentityStore,
+        pool: &PreparedIdentityInvocations,
+    ) -> Result<Self, MemoryError> {
+        Ok(Self::with_diagnostics(backend, pool.reserve()?))
+    }
+
+    fn with_diagnostics(backend: &SqlxIdentityStore, diagnostics: InvocationOwner) -> Self {
         let mut store = backend.shared_backend();
         store.invocation = Some(diagnostics.clone());
         Self { store, diagnostics }
+    }
+
+    pub(super) fn with_security(mut self, security: super::schema::SecurityScope) -> Self {
+        self.store.security_scope = security;
+        self
     }
     /// Supply the scoped store to an explicitly selected native component factory.
     /// Sharing its service handle copies no account, password or request payload.

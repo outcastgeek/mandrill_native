@@ -37,6 +37,10 @@
 //! - Every HTML-producing path uses Maud; manual HTML construction is not
 //!   permitted once rendering owners exist.
 //!
+//! Prepared applications reserve their CMS workspaces at startup with
+//! [`PreparedCmsMemory`] and project the capability through [`HasCmsMemory`].
+//! The Server endpoint owns prepared request and reply buffers.
+//!
 //! [`add`] is the pre-existing crate scaffold preserved verbatim. It is
 //! recorded as preserved inventory, not as a CMS contract.
 
@@ -45,8 +49,13 @@ mod json_text;
 mod url_text;
 mod form_media;
 mod composition;
+pub mod memory;
 
 pub use composition::*;
+pub use content::{PreparedCmsContent, PreparedCmsContentCapacity};
+pub use memory::{
+    CmsEventFrames, CmsMemoryCapacity, HasCmsMemory, PreparedCmsMemory, read_prepared_cms_form,
+};
 
 pub mod access;
 pub mod attachments;

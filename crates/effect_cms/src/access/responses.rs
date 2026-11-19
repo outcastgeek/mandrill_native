@@ -43,6 +43,7 @@
 use std::sync::Arc;
 
 use effect::{Effect, effect, effect_sync};
+use effect_server::native::bytes::Bytes;
 use effect_server::{BodyStatus, HtmlContent, Reply, Request, reply};
 use http::{HeaderName, HeaderValue, Method, StatusCode};
 use maud::html;
@@ -92,11 +93,12 @@ where
     E: Send + 'static,
     R: Send + Sync + 'static,
 {
-    let text = status
-        .native()
-        .canonical_reason()
-        .unwrap_or_default()
-        .to_owned();
+    let text = match status.native() {
+        StatusCode::UNAUTHORIZED => Bytes::from_static(b"Unauthorized\n"),
+        StatusCode::FORBIDDEN => Bytes::from_static(b"Forbidden\n"),
+        StatusCode::FOUND => Bytes::from_static(b"Found\n"),
+        status => Bytes::from(format!("{}\n", status.canonical_reason().unwrap_or_default())),
+    };
     // The body is the status text followed by a newline.
     reply! {
         status(status);
@@ -104,7 +106,7 @@ where
             HeaderName::from_static("x-content-type-options"),
             HeaderValue::from_static("nosniff")
         );
-        text(format!("{text}\n"));
+        bytes(text, HeaderValue::from_static("text/plain; charset=utf-8"));
     }
 }
 

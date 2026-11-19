@@ -1,6 +1,6 @@
 //! Issue pickup labels for ticket 104, then retrieve the same recorded result.
 //!
-//! Run: `cargo +1.99.0 run -p effect --example prepare_coffee_orders`.
+//! Run: `cargo +1.100.0 run -p effect --example prepare_coffee_orders`.
 //! Input: Maya requests two cups. Output: one label-issuance message and two
 //! identical pickup results. Replaying the run does not issue the labels again.
 //! The supplied in-memory workflow engine records only within this process.

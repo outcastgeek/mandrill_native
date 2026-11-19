@@ -1,9 +1,10 @@
 //! Completed reply descriptions, lazy representation selection and finite witnesses.
 
 use crate::{
-    BodyCompletion, BodyPolicy, BodyProgram, BodyStatus, ConditionalOutcome, Request,
+    BodyPolicy, BodyProgram, BodyStatus, ConditionalOutcome, Request,
     ResourceValidators, ServerError,
 };
+use crate::body::{BodyAdmission, BodySignal, BodySignalWait};
 use crate::{effect_future, effect_resource, effect_sync, effect_try_future, stream};
 use axum::body::Body;
 use bytes::Bytes;
@@ -270,6 +271,15 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Reply<E, R> {
         reply.body = ReplyBody::Finite(bytes);
         reply
     }
+    /// Transfer a region byte owner into the response without copying the bytes.
+    /// The native Bytes bridge allocates one owner control.
+    pub fn lease(view: effect::memory::BufferView<'static>, media: HeaderValue) -> Self {
+        Self::bytes(Bytes::from_owner(view), media)
+    }
+    /// Transfer prepared native bytes directly into the response.
+    pub fn frame(frame: crate::PreparedNativeFrame, media: HeaderValue) -> Self {
+        Self::bytes(frame.into_bytes(), media)
+    }
     /// Complete an incremental body; producer evaluation remains lazy.
     pub fn stream(body: BodyProgram<E, R>, media: HeaderValue) -> Self {
         let mut reply = Self::empty();
@@ -434,8 +444,9 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Reply<E, R> {
         scope: Scope<E>,
         policy: BodyPolicy,
         map_error: Arc<dyn Fn(ServerError) -> E + Send + Sync>,
+        body_admission: Option<BodyAdmission<E>>,
     ) -> Effect<PreparedReply<E, R>, E, R> {
-        let owned = Arc::new(std::sync::Mutex::new(Some(self)));
+        let owned = Arc::new(std::sync::Mutex::new(Some((self, body_admission))));
         effect_future! {
                    exit_with_context; body: move |env: Arc<R>, context| {
                    let reply = owned
@@ -446,7 +457,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Reply<E, R> {
                    let scope = scope.clone();
                    let map_error = map_error.clone();
                    async move {
-                       let Some(mut reply) = reply else {
+                       let Some((mut reply, mut body_admission)) = reply else {
                            return Exit::Die(effect::Defect::new("reply already consumed"));
                        };
                        loop {
@@ -569,8 +580,34 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Reply<E, R> {
                                    }
                                }
                                ReplyBody::Program(program) => {
+                                   if body_admission.as_ref().is_some_and(|admission| admission.channel.is_some()) {
+                                       let Some(BodyAdmission { completion, wait, channel: Some(channel), resources: Some(resources) }) = body_admission.take() else {
+                                           return Exit::Die(effect::LibraryDefect::PreparedConstructionUnbound.into());
+                                       };
+                                       let completion = BodySignal::Prepared(completion);
+                                       let (body, writer, raw_writer, settlement) = crate::body::prepared_channel(policy, map_error.clone(), completion.clone(), channel, resources.config.clone());
+                                       let trailers = reply.trailers;
+                                       let trailer_writer = writer.clone();
+                                       let production = effect! { bind; program: program.execute(writer, scope.clone()), body: move |()| trailer_writer.trailers(trailers.clone()), };
+                                       let finish_completion = completion.clone();
+                                       let finish_map = map_error.clone();
+                                       let close = std::mem::DropGuard::new(raw_writer.clone(), |writer| writer.finish());
+                                       let finish = crate::endpoint::native_once(move |environment, context| async move {
+                                           let produced = context.run(production, environment).await;
+                                           if !matches!(produced, Exit::Success(())) { finish_completion.fail(); }
+                                           drop(close);
+                                           let body_outcome = BodySignalWait::Prepared(wait).wait().await;
+                                           settlement.await;
+                                           finish_prepared_channel(produced, body_outcome, raw_writer, resources, &finish_map)
+                                       });
+                                       let mut response = http::Response::new(body);
+                                       *response.status_mut() = reply.status;
+                                       *response.headers_mut() = reply.headers;
+                                       return Exit::Success(PreparedReply { response, finish, completion });
+                                   }
+                                   let (completion, wait) = crate::body::admitted_signal(request.cancellation().clone(), body_admission.take());
                                    let (body, writer, completion) =
-                                       crate::body::channel(&request, policy, map_error.clone());
+                                       crate::body::channel(policy, map_error.clone(), completion);
                                    let trailers = reply.trailers;
                                    let trailer_writer = writer.clone();
                                    let production = effect! {
@@ -594,30 +631,11 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Reply<E, R> {
                                            }
                                        },
                                    };
-                                   let gate = completion.clone();
-                                   let map = map_error.clone();
+                                   let wait = completion_wait_effect(wait, map_error.clone());
                                    let finish = effect! {
-        bind;
-        program: finish,
-        body: move |()| {
-                                       let gate = gate.clone();
-                                       let map = map.clone();
-                                       effect_try_future! {
-                                           body: move |_| {
-                                               let gate = gate.clone();
-                                               async move {
-                                                   match gate.wait().await {
-                                                       crate::BodyOutcome::Completed => Ok(()),
-                                                       crate::BodyOutcome::Open
-                                                       | crate::BodyOutcome::Disconnected
-                                                       | crate::BodyOutcome::Failed => {
-                                                           Err(ServerError::Disconnected)
-                                                       }
-                                                   }
-                                               }
-                                           }, on_error: move |error| map(error), }
-                                   },
-        };
+                                       bind; program: finish,
+                                       body: move |()| wait.clone(),
+                                   };
                                    let mut response = http::Response::new(body);
                                    *response.status_mut() = reply.status;
                                    *response.headers_mut() = reply.headers;
@@ -654,6 +672,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Reply<E, R> {
                                                    reply.headers,
                                                    request,
                                                    map_error,
+                                           body_admission.take(),
                                                ));
                                            }
                                            Err(error) => return Exit::Fail(map_error(error)),
@@ -682,6 +701,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Reply<E, R> {
                                            reply.headers,
                                            request,
                                            map_error,
+                                           body_admission.take(),
                                        ));
                                    }
                                    let file = Arc::new(std::sync::Mutex::new(Some(file)));
@@ -758,6 +778,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Reply<E, R> {
                                        reply.headers,
                                        request,
                                        map_error,
+                                           body_admission.take(),
                                    ));
                                }
                                ReplyBody::Native(body) => {
@@ -767,6 +788,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Reply<E, R> {
                                        reply.headers,
                                        request,
                                        map_error,
+                                           body_admission.take(),
                                    ));
                                }
                                ReplyBody::NativeOwned(body, work) => {
@@ -776,6 +798,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Reply<E, R> {
                                        reply.headers,
                                        request,
                                        map_error,
+                                           body_admission.take(),
                                    );
                                    prepared.finish = effect! {
         bind;
@@ -826,7 +849,7 @@ pub(crate) struct PreparedReply<E: Send + 'static, R: Send + Sync + 'static> {
     /// Managed body program and delivery gate run before request scope closure.
     pub(crate) finish: Effect<(), E, R>,
     /// Native boundary state for completion observers.
-    pub(crate) completion: BodyCompletion,
+    pub(crate) completion: BodySignal,
 }
 /// A concrete media/language representation with a lazy typed renderer.
 pub struct Representation<A, E: Send + 'static, R: Send + Sync + 'static> {
@@ -1059,7 +1082,7 @@ fn split_quoted(text: &str, separator: char) -> Result<Vec<&str>, ServerError> {
             continue;
         }
         if character == '"' {
-            quoted = !quoted;
+            quoted.toggle();
         } else if character == separator && !quoted {
             output.push(text.get(start..index).unwrap_or(""));
             start = index.saturating_add(character.len_utf8());
@@ -1172,32 +1195,91 @@ fn native_prepared<E: Send + 'static, R: Send + Sync + 'static>(
     headers: HeaderMap,
     request: Request,
     map: Arc<dyn Fn(ServerError) -> E + Send + Sync>,
+    body_admission: Option<BodyAdmission<E>>,
 ) -> PreparedReply<E, R> {
-    let completion = BodyCompletion::new(request.cancellation().clone());
+    let (completion, wait) = crate::body::admitted_signal(request.cancellation().clone(), body_admission);
     let observed = crate::body::ObservedBody {
         body,
         completion: completion.clone(),
+        limits: None,
+        failed: false,
     };
     let mut response = http::Response::new(Body::new(observed));
     *response.status_mut() = status;
     *response.headers_mut() = headers;
-    let gate = completion.clone();
-    let finish = effect_try_future! {
-    body: move |_| {
-        let gate = gate.clone();
-        async move {
-            match gate.wait().await {
-                crate::BodyOutcome::Completed => Ok(()),
-                crate::BodyOutcome::Open
-                | crate::BodyOutcome::Failed
-                | crate::BodyOutcome::Disconnected => Err(ServerError::Disconnected),
-            }
-        }
-    }, on_error: move |error| map(error), };
+    let finish = completion_wait_effect(wait, map);
     PreparedReply {
         response,
         finish,
         completion,
+    }
+}
+// Aggregate the physically retained channel outcomes in publication order.
+fn finish_prepared_channel<E: Send + 'static>(
+    produced: Exit<(), E>, body: crate::BodyOutcome,
+    writer: crate::prepared_streaming_channel::Writer,
+    resources: crate::prepared_body_completion::PreparedBodyExitResources<E>,
+    map: &Arc<dyn Fn(ServerError) -> E + Send + Sync>,
+) -> Exit<(), E> {
+    use crate::prepared_streaming_channel::{BodyChannelFailure as Failure, FailurePhase};
+    let mut failures = [writer.take_failure(), writer.take_failure(), writer.take_failure()];
+    let mut promoted = false;
+    let mut primary = produced;
+    if matches!(primary, Exit::Success(())) {
+        if let Some(slot) = failures.iter_mut().find(|item| matches!(item, Some((FailurePhase::Native, _))))
+            && let Some((_, failure)) = slot.take() {
+            let (next_primary, remaining) = match failure {
+                Failure::Memory(error) => (Exit::Fail(map(ServerError::Memory(error))), None),
+                Failure::MemoryWithCleanup { primary, cleanup } => (Exit::Fail(map(ServerError::Memory(primary))), Some(Failure::Queue(cleanup))),
+                Failure::Queue(Exit::FinalizationFailed(details)) => {
+                    let effect::Finalization { primary, first, rest } = details;
+                    let primary = match primary { effect::PrimaryOutcome::Succeeded => Exit::Success(()), effect::PrimaryOutcome::Failed(_) => Exit::Fail(map(ServerError::Disconnected)), effect::PrimaryOutcome::Defected(defect) => Exit::Die(defect), effect::PrimaryOutcome::WasInterrupted => Exit::Interrupted };
+                    let cleanup = Exit::FinalizationFailed(effect::Finalization { primary: effect::PrimaryOutcome::Succeeded, first, rest });
+                    (primary, Some(Failure::Queue(cleanup)))
+                }
+                Failure::Queue(Exit::Success(())) => (Exit::Success(()), None),
+                Failure::Queue(Exit::Fail(_)) => (Exit::Fail(map(ServerError::Disconnected)), None),
+                Failure::Queue(Exit::Die(defect)) => (Exit::Die(defect), None),
+                Failure::Queue(Exit::Interrupted) => (Exit::Interrupted, None),
+            };
+            primary = next_primary;
+            *slot = remaining.map(|failure| (FailurePhase::Native, failure));
+            promoted = true;
+        }
+        if !promoted && !matches!(body, crate::BodyOutcome::Completed) {
+            primary = Exit::Fail(map(ServerError::Disconnected));
+        }
+    }
+    let mut accumulator = effect::PreparedCleanupAccumulator::from_reserved(primary, resources.cleanup);
+    for (failure, mapper) in failures.into_iter().zip(resources.mappers) {
+        if let Some((_, failure)) = failure {
+            match failure {
+                Failure::Queue(exit) => accumulator.append_cleanup(mapper.map(exit, |_| map(ServerError::Disconnected))),
+                Failure::Memory(error) => accumulator.append_cleanup(Exit::Fail(map(ServerError::Memory(error)))),
+                Failure::MemoryWithCleanup { primary, cleanup } => {
+                    accumulator.append_cleanup(Exit::Fail(map(ServerError::Memory(primary))));
+                    accumulator.append_cleanup(mapper.map(cleanup, |_| map(ServerError::Disconnected)));
+                }
+            }
+        }
+    }
+    accumulator.finish()
+}
+fn completion_wait_effect<E: Send + 'static, R: Send + Sync + 'static>(
+    wait: BodySignalWait,
+    map: Arc<dyn Fn(ServerError) -> E + Send + Sync>,
+) -> Effect<(), E, R> {
+    match wait {
+        BodySignalWait::Ordinary(gate) => effect_try_future! {
+            body: move |_| { let gate = gate.clone(); async move {
+                match gate.wait().await { crate::BodyOutcome::Completed => Ok(()), crate::BodyOutcome::Open | crate::BodyOutcome::Failed | crate::BodyOutcome::Disconnected => Err(ServerError::Disconnected) }
+            } }, on_error: move |error| map(error),
+        },
+        BodySignalWait::Prepared(wait) => effect_try_future! {
+            once; body: move |_| async move {
+                match wait.await { crate::BodyOutcome::Completed => Ok(()), crate::BodyOutcome::Open | crate::BodyOutcome::Failed | crate::BodyOutcome::Disconnected => Err(ServerError::Disconnected) }
+            }, on_error: move |error| map(error),
+        },
     }
 }
 /// Resolve a native validated single byte range, including suffix/clamping/If-Range.
@@ -1319,25 +1401,60 @@ where
         let body = BodyProgram::new(move |writer| {
             let value = value.clone();
             let codec = codec.clone();
-            let sink = crate::body::NativeJsonSink::from_writer(&writer);
+            if let Some(sink) = crate::body::NativeJsonSink::ordinary_from_writer(&writer) {
+                return crate::endpoint::native_once(move |env: Arc<R>, context| async move {
+                    let mapper = env.clone();
+                    let encode = Effect::try_blocking_once(
+                        move |_| {
+                            let value = value.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take().ok_or_else(|| effect::SchemaIssue::new(effect::SchemaIssueKind::InvalidDefinition))?;
+                            let mut writer = effect::JsonWriter::with_sink(policy, sink);
+                            codec.codec.write_into(&value, &mut writer)?;
+                            writer.finish_sink()
+                        },
+                        move |issue| mapper.server_error(ServerError::Schema(issue)),
+                    );
+                    context.run(encode, env).await
+                });
+            }
             crate::endpoint::native_once(move |env: Arc<R>, context| async move {
-                let mapper = env.clone();
-                let encode = Effect::try_blocking_once(
-                    move |_| {
-                        let value = value
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take()
-                            .ok_or_else(|| {
-                                effect::SchemaIssue::new(effect::SchemaIssueKind::InvalidDefinition)
-                            })?;
-                        let mut writer = effect::JsonWriter::with_sink(policy, sink);
-                        codec.codec.write_into(&value, &mut writer)?;
-                        writer.finish_sink()
-                    },
-                    move |issue| mapper.server_error(ServerError::Schema(issue)),
-                );
-                context.run(encode, env).await
+                let reservation = match writer.reserve_json_writer(policy) {
+                    Ok(reservation) => reservation,
+                    Err(error) => return Exit::Fail(env.server_error(ServerError::Memory(error))),
+                };
+                let (sink, witness) = match crate::body::NativeJsonSink::from_writer(&writer) {
+                    Ok(admitted) => admitted,
+                    Err(error) => return Exit::Fail(env.server_error(ServerError::Memory(error))),
+                };
+                let mut json_writer = reservation.publish(sink);
+                let encode = Effect::blocking_once(move |_| {
+                    let value = value.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take().ok_or_else(|| effect::SchemaIssue::new(effect::SchemaIssueKind::InvalidDefinition))?;
+                    codec.codec.write_into(&value, &mut json_writer)?;
+                    json_writer.finish_sink()
+                });
+                let worker = context.run(encode, env.clone()).await;
+                match witness {
+                    None => match worker { Exit::Success(Ok(())) => Exit::Success(()), Exit::Success(Err(issue)) => Exit::Fail(env.server_error(ServerError::Schema(issue))), Exit::Fail(error) => Exit::Fail(error), Exit::Die(defect) => Exit::Die(defect), Exit::Interrupted => Exit::Interrupted, Exit::FinalizationFailed(failure) => Exit::FinalizationFailed(failure) },
+                    Some(witness) => {
+                        let failure = witness.receiver.await.ok();
+                        let primary = match worker {
+                            Exit::Success(result) if failure.is_some() => { drop(result); Exit::Success(()) },
+                            Exit::Success(Ok(())) => Exit::Success(()),
+                            Exit::Success(Err(issue)) => Exit::Fail(env.server_error(ServerError::Schema(issue))),
+                            Exit::Fail(error) => Exit::Fail(error), Exit::Die(defect) => Exit::Die(defect), Exit::Interrupted => Exit::Interrupted, Exit::FinalizationFailed(failure) => Exit::FinalizationFailed(failure),
+                        };
+                        match failure {
+                            None => primary,
+                            Some(failure) => {
+                                let native = match failure {
+                                    crate::prepared_streaming_channel::RawBlockingFailure::Memory(error) => Exit::Fail(env.server_error(ServerError::Memory(error))),
+                                    crate::prepared_streaming_channel::RawBlockingFailure::Disconnected => Exit::Fail(env.server_error(ServerError::Disconnected)),
+                                    crate::prepared_streaming_channel::RawBlockingFailure::Queue(exit) => witness.mapper.map(exit, |_| env.server_error(ServerError::Disconnected)),
+                                };
+                                if matches!(primary, Exit::Success(())) { native } else { let mut combined = effect::PreparedCleanupAccumulator::from_reserved(primary, witness.cleanup); combined.append_cleanup(native); combined.finish() }
+                            }
+                        }
+                    }
+                }
             })
         });
         Self::json(body)

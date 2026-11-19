@@ -415,11 +415,17 @@ fn read_through(
     let scope = fields.expression("scope")?;
     let retain = fields.expression("retain")?;
     let admission = fields.expression("admission")?;
+    let prepared = match fields.optional("memory") {
+        Some((memory, false)) => Some((fields.bind("memory", quote!(#memory))?, fields.expression("refusals")?)),
+        Some((memory, true)) => return Err(syn::Error::new_spanned(memory, "memory expects a startup prepared value")),
+        None => None,
+    };
     let (keys, keys_inline) = fields.take("keys")?;
     let keys = pure_callback(keys, keys_inline);
     let keys = fields.bind("keys", keys)?;
+    let dependency_selector = dependent.then(|| fields.optional("select_dependencies")).flatten();
     let (loader, inline) = fields.take("loader")?;
-    let loader = callback(loader, inline, path, true)?;
+    let loader = callback(loader, inline, path, !dependent || prepared.is_none() || dependency_selector.is_some())?;
     let loader = fields.bind("loader", loader)?;
     let (failures, inline) = fields.take("cache_failures")?;
     let failures = pure_callback(failures, inline);
@@ -433,16 +439,26 @@ fn read_through(
         let dependencies = pure_callback(dependencies, inline);
         let dependencies = fields.bind("dependencies", dependencies)?;
         let maximum = fields.expression("maximum_dependencies")?;
-        match fields.optional("select_dependencies") {
-            Some((select, inline)) => {
+        match (prepared, dependency_selector) {
+            (None, Some((select, inline))) => {
                 let select = pure_callback(select, inline);
                 let select = fields.bind("select_dependencies", select)?;
                 quote!(#path::cache::DependentReadThrough::scoped_by(#scope, #retain, #admission, #maximum, (#keys, #dependencies, #failures), #loader, #select))
             }
-            None => {
+            (None, None) => {
                 quote!(#path::cache::DependentReadThrough::scoped(#scope, #retain, #admission, #maximum, (#keys, #dependencies, #failures), #loader))
             }
+            (Some((memory, refusals)), None) => {
+                quote!(#path::cache::DependentReadThrough::scoped_prepared(#scope, #retain, #admission, #maximum, (#keys, #dependencies, #failures), (#memory, #refusals), #loader))
+            }
+            (Some((memory, refusals)), Some((select, inline))) => {
+                let select = pure_callback(select, inline);
+                let select = fields.bind("select_dependencies", select)?;
+                quote!(#path::cache::DependentReadThrough::scoped_prepared_by(#scope, #retain, #admission, #maximum, (#keys, #dependencies, #failures), (#memory, #refusals), (#loader, #select)))
+            }
         }
+    } else if let Some((memory, refusals)) = prepared {
+        quote!(#path::cache::ReadThrough::scoped_prepared(#scope, #keys, #retain, #admission, (#memory, #refusals), #failures, #loader))
     } else {
         quote!(#path::cache::ReadThrough::scoped(#scope, #keys, #retain, #admission, #failures, #loader))
     };
@@ -545,6 +561,16 @@ fn availability(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStre
         Some((value, _)) => Some(fields.bind("dashboard", quote!(#value))?),
         None => None,
     };
+    let prepared_output = match fields.optional("prepared_output") {
+        Some((value, false)) => Some(fields.bind("prepared_output", quote!(#value))?),
+        Some((_, true)) => {
+            return Err(syn::Error::new(
+                Span::call_site(),
+                "availability prepared output requires an expression",
+            ));
+        }
+        None => None,
+    };
     let mut probes = Vec::new();
     let mut ready = false;
     let mut literals = BTreeSet::new();
@@ -599,6 +625,10 @@ fn availability(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStre
         }
         None => constructed,
     };
+    let result = match prepared_output {
+        Some(output) => quote!((#result).map(|availability| availability.with_prepared_output(#output))),
+        None => result,
+    };
     Ok(quote!((|| { #(#bindings)* #result })()))
 }
 /// D20 complete root assembly. Static required fields are checked here while
@@ -617,6 +647,16 @@ fn web(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> {
     let protocols = fields.expression("protocols")?;
     let (routes, inline) = fields.take("routes")?;
     let routes = fields.bind("routes", pure_callback(routes, inline))?;
+    let memory = fields.optional("memory");
+    let admission = fields.optional("admission");
+    let byte_pools = fields.optional("byte_pools");
+    let overload = fields.optional("overload");
+    if memory.is_none() && (admission.is_some() || overload.is_some() || byte_pools.is_some()) {
+        return Err(syn::Error::new(
+            Span::call_site(),
+            "web admission, byte pools, and overload require selected memory",
+        ));
+    }
     let builder = Ident::new("__web_application", Span::mixed_site());
     let mut methods = Vec::new();
     for name in [
@@ -654,6 +694,31 @@ fn web(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> {
             let method = Ident::new(name, Span::mixed_site());
             methods.push(quote!(let #builder = #builder.#method(#value);));
         }
+    }
+    if let Some((value, inline)) = memory {
+        let memory = fields.bind("memory", pure_callback(value, inline))?;
+        methods.push(quote!(let #builder = #builder.with_memory(#memory);));
+    }
+    if let Some((value, inline)) = admission {
+        if inline {
+            return Err(syn::Error::new(Span::call_site(), "web admission requires an expression"));
+        }
+        let admission = fields.bind("admission", quote!(#value))?;
+        methods.push(quote!(let #builder = #builder.with_admission(#admission);));
+    }
+    if let Some((value, inline)) = byte_pools {
+        if inline {
+            return Err(syn::Error::new(Span::call_site(), "web byte pools require an expression"));
+        }
+        let pools = fields.bind("byte_pools", quote!(#value))?;
+        methods.push(quote!(let #builder = #builder.with_byte_pools(#pools);));
+    }
+    if let Some((value, inline)) = overload {
+        if inline {
+            return Err(syn::Error::new(Span::call_site(), "web overload requires an expression"));
+        }
+        let overload = fields.bind("overload", quote!(#value))?;
+        methods.push(quote!(let #builder = #builder.with_overload(#overload);));
     }
     let bindings = fields.finish()?;
     Ok(

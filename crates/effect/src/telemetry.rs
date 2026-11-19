@@ -8,6 +8,14 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod prepared_trace;
+mod prepared_diagnostics;
+pub use prepared_diagnostics::{
+    PreparedDiagnostic, PreparedDiagnosticCapacity, PreparedDiagnosticError,
+    PreparedDiagnosticSnapshot, PreparedDiagnostics,
+};
+pub use prepared_trace::{PreparedTraceCapacity, PreparedTraceContext, PreparedTracePool};
+
 /// Type alias for annotations in telemetry.
 pub type Annotations = BTreeMap<Arc<str>, Arc<str>>;
 static EMPTY_ANNOTATIONS: Annotations = Annotations::new();
@@ -73,9 +81,15 @@ impl std::fmt::Debug for SharedAnnotations {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone)]
 /// Stable identity used by telemetry operations.
-pub struct SpanId(Arc<str>);
+pub struct SpanId(SpanIdText);
+
+#[derive(Clone)]
+enum SpanIdText {
+    Shared(Arc<str>),
+    Decimal([u8; 20]),
+}
 impl SpanId {
     #[must_use]
     /// Construct a `SpanId` from its required inputs and explicit policies.
@@ -86,15 +100,52 @@ impl SpanId {
     /// # Returns
     /// Type: `Self`.
     pub fn new(id: impl Into<Arc<str>>) -> Self {
-        Self(id.into())
+        Self(SpanIdText::Shared(id.into()))
     }
+    /// Retain a native numeric span identity in line, with the same textual
+    /// equality and hash as an equivalent shared decimal identity.
+    #[must_use]
+    pub fn from_u64(id: u64) -> Self {
+        let mut number = std::fmt::NumBuffer::new();
+        let text = id.format_into(&mut number);
+        let mut bytes = [0; 20];
+        bytes.split_at_mut(text.len()).0.copy_from_slice(text.as_bytes());
+        Self(SpanIdText::Decimal(bytes))
+    }
+
     #[must_use]
     /// Borrow the textual representation without allocating a new string.
     ///
     /// # Returns
     /// Type: `&str`.
     pub fn as_str(&self) -> &str {
-        &self.0
+        match &self.0 {
+            SpanIdText::Shared(text) => text,
+            SpanIdText::Decimal(text) => {
+                str::from_utf8(text).unwrap_or_default().trim_end_matches('\0')
+            }
+        }
+    }
+}
+impl std::borrow::Borrow<str> for SpanId {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+impl PartialEq for SpanId {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+impl Eq for SpanId {}
+impl std::hash::Hash for SpanId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(self.as_str(), state);
+    }
+}
+impl std::fmt::Debug for SpanId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("SpanId").field(&self.as_str()).finish()
     }
 }
 #[derive(Clone, Default, Debug)]
@@ -247,6 +298,17 @@ impl Diagnostics {
         }
     }
 }
+
+fn isolate_diagnostic<T>(
+    ordinary: &Diagnostics,
+    prepared: Option<&PreparedDiagnostics>,
+    callback: impl FnOnce() -> Result<T, Defect>,
+) -> Option<T> {
+    match prepared {
+        Some(prepared) => prepared.isolate(callback),
+        None => ordinary.isolate(callback),
+    }
+}
 /// Type alias for redact in telemetry.
 type Redact = Arc<dyn Fn(&Annotations) -> Result<Annotations, Defect> + Send + Sync>;
 /// Type alias for write log in telemetry.
@@ -262,6 +324,7 @@ pub struct Logger {
     redact: Redact,
     write: WriteLog,
     diagnostics: Diagnostics,
+    prepared_diagnostics: Option<PreparedDiagnostics>,
 }
 impl Logger {
     #[must_use]
@@ -286,7 +349,21 @@ impl Logger {
             redact: Arc::new(redact),
             write: Arc::new(write),
             diagnostics,
+            prepared_diagnostics: None,
         }
+    }
+
+    /// Route logging instrumentation failures to the selected regional sink.
+    #[must_use]
+    pub fn with_prepared_diagnostics(mut self, diagnostics: PreparedDiagnostics) -> Self {
+        self.prepared_diagnostics = Some(diagnostics);
+        self
+    }
+
+    /// Borrow the selected regional instrumentation sink, when configured.
+    #[must_use]
+    pub const fn prepared_diagnostics(&self) -> Option<&PreparedDiagnostics> {
+        self.prepared_diagnostics.as_ref()
     }
     #[must_use]
     /// # Returns
@@ -305,12 +382,14 @@ impl Logger {
         if event.level < self.minimum {
             return;
         }
-        if let Some(annotations) = self
-            .diagnostics
-            .isolate(|| (self.redact)(&event.context.annotations))
+        if let Some(annotations) = isolate_diagnostic(
+            &self.diagnostics,
+            self.prepared_diagnostics.as_ref(),
+            || (self.redact)(&event.context.annotations),
+        )
         {
             event.context.annotations = SharedAnnotations::new(annotations);
-            let _ = self.diagnostics.isolate(|| (self.write)(&event));
+            let _ = isolate_diagnostic(&self.diagnostics, self.prepared_diagnostics.as_ref(), || (self.write)(&event));
         }
     }
 }
@@ -359,10 +438,11 @@ pub struct SpanFinish {
 #[derive(Clone)]
 /// An environment-supplied span service that records begin and end events.
 pub struct Tracer {
-    redact: Redact,
+    redact: Option<Redact>,
     start: StartSpan,
     finish: FinishSpan,
     diagnostics: Diagnostics,
+    prepared_diagnostics: Option<PreparedDiagnostics>,
 }
 impl Tracer {
     #[must_use]
@@ -384,7 +464,8 @@ impl Tracer {
     ) -> Self {
         Self {
             diagnostics,
-            redact: Arc::new(redact),
+            prepared_diagnostics: None,
+            redact: Some(Arc::new(redact)),
             start: Arc::new(start),
             finish: Arc::new(finish),
         }
@@ -395,6 +476,41 @@ impl Tracer {
     pub const fn diagnostics(&self) -> &Diagnostics {
         &self.diagnostics
     }
+
+    /// Use a backend start that acquires its own storage before redacting.
+    /// The callback receives the original annotations and must apply its
+    /// selected redaction before sending any metadata to a native sink.
+    #[must_use]
+    pub fn new_with_start(
+        diagnostics: Diagnostics,
+        start: impl Fn(&SpanStart) -> Result<Option<SpanId>, Defect> + Send + Sync + 'static,
+        finish: impl Fn(&SpanFinish) -> Result<(), Defect> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            diagnostics,
+            prepared_diagnostics: None,
+            redact: None,
+            start: Arc::new(start),
+            finish: Arc::new(finish),
+        }
+    }
+
+    /// Route span instrumentation failures to the selected regional sink.
+    #[must_use]
+    pub fn with_prepared_diagnostics(mut self, diagnostics: PreparedDiagnostics) -> Self {
+        self.prepared_diagnostics = Some(diagnostics);
+        self
+    }
+
+    /// Borrow the selected regional instrumentation sink, when configured.
+    #[must_use]
+    pub const fn prepared_diagnostics(&self) -> Option<&PreparedDiagnostics> {
+        self.prepared_diagnostics.as_ref()
+    }
+
+    fn isolate<T>(&self, callback: impl FnOnce() -> Result<T, Defect>) -> Option<T> {
+        isolate_diagnostic(&self.diagnostics, self.prepared_diagnostics.as_ref(), callback)
+    }
     ///
     /// # Parameters
     /// - `start` (`SpanStart`): The start supplied to this operation.
@@ -403,11 +519,12 @@ impl Tracer {
     /// Type: `Option<SpanId>`.
     /// Returns the value when present, or `None`.
     fn begin(&self, mut start: SpanStart) -> Option<SpanId> {
-        start.annotations = SharedAnnotations::new(
-            self.diagnostics
-                .isolate(|| (self.redact)(&start.annotations))?,
-        );
-        self.diagnostics.isolate(|| (self.start)(&start)).flatten()
+        if let Some(redact) = &self.redact {
+            start.annotations = SharedAnnotations::new(
+                self.isolate(|| redact(&start.annotations))?,
+            );
+        }
+        self.isolate(|| (self.start)(&start)).flatten()
     }
     ///
     /// # Parameters
@@ -416,7 +533,7 @@ impl Tracer {
     /// # Returns
     /// Type: `()`.
     fn end(&self, finish: SpanFinish) {
-        let _ = self.diagnostics.isolate(|| (self.finish)(&finish));
+        let _ = self.isolate(|| (self.finish)(&finish));
     }
 }
 /// Selects the tracing capability supplied by an application environment.
@@ -498,9 +615,15 @@ impl<E: Send + 'static, R: HasLogger + Send + Sync + 'static> Effect<(), E, R> {
 ///
 /// # Type parameters
 /// - `R`: Environment type. Bound or type: `HasTracer + HasClock + Send + Sync + 'static`.
+struct ActiveSpan {
+    tracer: Tracer,
+    id: SpanId,
+    started: Duration,
+}
+
 struct SpanGuard<R: HasTracer + HasClock + Send + Sync + 'static> {
     env: Arc<R>,
-    id: Option<SpanId>,
+    live: Option<ActiveSpan>,
 }
 impl<R: HasTracer + HasClock + Send + Sync + 'static> SpanGuard<R> {
     ///
@@ -511,17 +634,12 @@ impl<R: HasTracer + HasClock + Send + Sync + 'static> SpanGuard<R> {
     /// # Returns
     /// Type: `()`.
     fn finish(&mut self, outcome: SpanOutcome, cleanup_failed: bool) {
-        if let Some(id) = self.id.take() {
+        if let Some(ActiveSpan { tracer, id, started }) = self.live.take() {
             let _ = catch_unwind(AssertUnwindSafe(|| {
-                let tracer = self.env.tracer();
-                if let Some(time) = tracer.diagnostics.isolate(|| Ok(self.env.clock().now())) {
-                    tracer.end(SpanFinish {
-                        id,
-                        outcome,
-                        cleanup_failed,
-                        time,
-                    });
-                }
+                // A clock failure is diagnostic. Retirement must still reach
+                // the same backend even when it cannot get a fresh time sample.
+                let time = tracer.isolate(|| Ok(self.env.clock().now())).unwrap_or(started);
+                tracer.end(SpanFinish { id, outcome, cleanup_failed, time });
             }));
         }
     }
@@ -552,25 +670,23 @@ impl<A: Send + 'static, E: Send + 'static, R: HasTracer + HasClock + Send + Sync
     pub fn with_span(self, name: impl Into<Arc<str>>) -> Self {
         let name = name.into();
         Self::new(move |env, mut context, finish| {
-            let id = catch_unwind(AssertUnwindSafe(|| {
+            let live = catch_unwind(AssertUnwindSafe(|| {
                 let tracer = env.tracer();
-                let time = tracer.diagnostics.isolate(|| Ok(env.clock().now()))?;
-                tracer.begin(SpanStart {
+                let time = tracer.isolate(|| Ok(env.clock().now()))?;
+                let id = tracer.begin(SpanStart {
                     name: Arc::clone(&name),
                     parent: context.trace.span.clone(),
                     annotations: context.trace.annotations.clone(),
                     time,
-                })
+                })?;
+                Some(ActiveSpan { tracer: tracer.clone(), id, started: time })
             }))
             .ok()
             .flatten();
-            let mut guard = SpanGuard {
-                env: Arc::clone(&env),
-                id: id.clone(),
-            };
-            if id.is_some() {
-                context.trace.span = id;
+            if let Some(span) = &live {
+                context.trace.span = Some(span.id.clone());
             }
+            let mut guard = SpanGuard { env: Arc::clone(&env), live };
             let publish_context = context.clone();
             self.clone().execute(
                 env,

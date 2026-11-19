@@ -28,7 +28,9 @@
 use crate::commands::InputBytes;
 use std::sync::Arc;
 
-use effect::{Effect, effect_sync};
+use effect::memory::MemoryError;
+use effect::{Effect, effect, effect_sync, effect_try_sync};
+use crate::content::PreparedCmsContent;
 
 use crate::attachments::{MediaAttachmentFormItem, MediaAttachmentStoreRecord, media_shortcode};
 
@@ -36,8 +38,11 @@ use crate::attachments::{MediaAttachmentFormItem, MediaAttachmentStoreRecord, me
 use super::attachmentflow::{
     MediaAttachmentAssetLoader, MediaAttachmentItemBuilder, MediaAttachmentItemLoader,
     MediaAttachmentListOptions, MediaAttachmentReplaceOptions, MediaAttachmentRowBuilder,
-    MediaAttachmentRowLister, MediaAttachmentRowRecord, MediaAttachmentRowReplacer,
-    list_media_attachment_form_items, replace_media_attachments_from_request,
+    MediaAttachmentRowLister, MediaAttachmentRowReplacer,
+    PreparedAttachmentReplaceOptions, PreparedAttachmentRowBuilder, PreparedAttachmentRowReplacer,
+    PreparedAttachmentRows, list_media_attachment_form_items, list_prepared_admitted,
+    list_prepared_media_attachment_form_items, replace_media_attachments_from_request,
+    replace_prepared_media_attachments_from_request, reserve_attachment_list,
 };
 
 mod definition;
@@ -53,7 +58,8 @@ pub use self::definition::{
 };
 pub use self::form::{
     default_media_asset_form_input, media_asset_form_input_from_form,
-    media_asset_form_input_from_record, media_asset_form_input_from_request,
+    media_asset_form_input_from_prepared_form, media_asset_form_input_from_prepared_request, media_asset_form_input_from_record,
+    media_asset_form_input_from_request,
 };
 pub(crate) use self::form::media_request_form;
 pub use self::model::{
@@ -243,37 +249,56 @@ where
     E: Send + 'static,
     R: Send + Sync + 'static,
 {
-    let (Some(assets), Some(attachments)) =
-        (options.assets.clone(), options.attachments.clone())
-    else {
-        return effect_sync! { body: || Vec::new() };
-    };
-    if options.owner_content_id.is_empty() {
-        return effect_sync! { body: || Vec::new() };
+    if options.assets.is_none() || options.attachments.is_none() || options.owner_content_id.is_empty() {
+        return effect_sync! { body: Vec::new };
     }
-    let owner_type = options.owner_type.clone();
-    let owner_content_id = options.owner_content_id.clone();
-    let list_rows: MediaAttachmentRowLister<MediaAttachmentStoreRecord, E, R> =
-        Arc::new(move || {
-            attachments.list_by_owner(owner_type.clone(), owner_content_id.clone())
-        });
-    let load_assets_by_id: MediaAttachmentAssetLoader<MediaAssetRecord, E, R> =
-        Arc::new(move |ids| assets.get_by_ids(ids));
-    let row_record: MediaAttachmentRowRecord<MediaAttachmentStoreRecord> =
-        Arc::new(|row| {
-            if row.media_asset_id.is_empty() {
-                None
-            } else {
-                Some(row)
-            }
-        });
-    list_media_attachment_form_items(MediaAttachmentListOptions {
+    list_media_attachment_form_items(store_list_options(options))
+}
+
+fn store_list_options<E, R>(
+    options: &MediaStoreAttachmentOptions<E, R>,
+) -> MediaAttachmentListOptions<MediaAssetRecord, MediaAttachmentStoreRecord, E, R>
+where
+    E: Send + 'static,
+    R: Send + Sync + 'static,
+{
+    let kind = options.owner_type.clone();
+    let owner = options.owner_content_id.clone();
+    let list_rows = options.attachments.as_ref().map(|attachments| {
+        let attachments = attachments.clone();
+        Arc::new(move || attachments.list_by_owner(kind.clone(), owner.clone()))
+            as MediaAttachmentRowLister<MediaAttachmentStoreRecord, E, R>
+    });
+    let load_assets_by_id = options.assets.as_ref().map(|assets| {
+        let assets = assets.clone();
+        Arc::new(move |ids| assets.get_by_ids(ids)) as MediaAttachmentAssetLoader<MediaAssetRecord, E, R>
+    });
+    MediaAttachmentListOptions {
         owner_content_id: options.owner_content_id.clone(),
-        list_rows: Some(list_rows),
-        row_record: Some(row_record),
-        load_assets_by_id: Some(load_assets_by_id),
+        list_rows,
+        row_record: Some(Arc::new(|row| (!row.media_asset_id.is_empty()).then_some(row))),
+        load_assets_by_id,
         build_item: Some(store_media_attachment_item_builder(options)),
-    })
+    }
+}
+
+/// List the owner's attachments with the grouped CMS workspace and existing stores.
+pub fn list_prepared_media_attachment_form_items_from_store<E, R>(
+    options: &MediaStoreAttachmentOptions<E, R>,
+    memory: &PreparedCmsContent,
+    on_memory: impl Fn(MemoryError) -> E + Send + Sync + 'static,
+) -> Effect<PreparedAttachmentRows<MediaAttachmentFormItem>, E, R>
+where
+    E: Send + 'static,
+    R: Send + Sync + 'static,
+{
+    list_prepared_media_attachment_form_items(
+        store_list_options(options),
+        memory.attachment_records.clone(),
+        memory.attachment_items.clone(),
+        memory.attachment_metadata,
+        on_memory,
+    )
 }
 
 /// Replace one owner's stored attachments from the request form selection.
@@ -332,6 +357,82 @@ where
             load_replaced_items: Some(load_replaced_items),
         },
     )
+}
+
+/// Reserve all local replacement and presentation storage before calling the existing stores.
+pub fn replace_prepared_media_attachments_from_store_request<E, R>(
+    options: &MediaStoreAttachmentOptions<E, R>,
+    memory: &PreparedCmsContent,
+    on_memory: impl Fn(MemoryError) -> E + Send + Sync + 'static,
+) -> Effect<PreparedAttachmentRows<MediaAttachmentFormItem>, E, R>
+where
+    E: Send + 'static,
+    R: Send + Sync + 'static,
+{
+    let (Some(_assets), Some(attachments)) = (options.assets.clone(), options.attachments.clone()) else {
+        return list_prepared_media_attachment_form_items_from_store(options, memory, on_memory);
+    };
+    let on_memory = Arc::new(on_memory);
+    let kind = options.owner_type.clone();
+    let owner = options.owner_content_id.clone();
+    let replace: PreparedAttachmentRowReplacer<MediaAttachmentStoreRecord, E, R> = Arc::new(move |rows| {
+        let rows = effect_sync! { once; body: move || rows, };
+        let attachments = attachments.clone();
+        let kind = kind.clone();
+        let owner = owner.clone();
+        effect! {
+            let rows = rows.clone();
+            let attachments = attachments.clone();
+            let kind = kind.clone();
+            let owner = owner.clone();
+            let mut rows = rows?;
+            attachments.replace_by_owner(kind, owner, rows.take_consumer_rows())?;
+            drop(rows);
+        }
+    });
+    let build: PreparedAttachmentRowBuilder<MediaAttachmentStoreRecord> = Arc::new(|row| {
+        Some(MediaAttachmentStoreRecord {
+            id: InputBytes::default(),
+            media_asset_id: InputBytes::from(row.asset_id),
+            role: InputBytes::from(row.role),
+            title_override: InputBytes::from(row.title_override),
+            caption: InputBytes::from(row.caption),
+            alt_override: InputBytes::from(row.alt_override),
+        })
+    });
+    let replace_error = on_memory.clone();
+    let replace = replace_prepared_media_attachments_from_request(
+        PreparedAttachmentReplaceOptions {
+            request: options.request.clone(),
+            form: options.form.clone(),
+            normalize_role: options.normalize_role.clone(),
+            inputs: memory.attachments.clone(),
+            rows: memory.attachment_replacements.clone(),
+            build_row: Some(build),
+            replace_rows: Some(replace),
+            load_replaced_items: None,
+        },
+        move |error| replace_error(error),
+    );
+    let records = memory.attachment_records.clone();
+    let items = memory.attachment_items.clone();
+    let list_error = on_memory.clone();
+    let admit = effect_try_sync! {
+        body: move || reserve_attachment_list(&records, &items),
+        on_error: move |error| list_error(error),
+    };
+    let list = store_list_options(options);
+    let metadata_bytes = memory.attachment_metadata;
+    effect! {
+        let admit = admit.clone();
+        let replace = replace.clone();
+        let list = list.clone();
+        let on_memory = on_memory.clone();
+        let batch = admit?;
+        let _ = replace?;
+        let batch = effect_sync! { once; body: move || batch, };
+        list_prepared_admitted(list, batch, metadata_bytes, on_memory)?
+    }
 }
 
 /// Resolve one asset URL through the optional resolver and trim the result.

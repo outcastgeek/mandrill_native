@@ -77,6 +77,9 @@ pub struct SchemaReference {
 }
 
 impl SchemaReference {
+    pub(crate) fn shape_owner(&self) -> Option<Arc<SchemaShape>> {
+        self.target.upgrade()
+    }
     #[must_use]
     /// Borrow the stable name used to identify this definition.
     ///
@@ -111,6 +114,9 @@ pub struct SchemaProperty {
 }
 
 impl SchemaProperty {
+    pub(crate) fn shared_name(&self) -> Arc<str> {
+        Arc::clone(&self.name)
+    }
     /// Construct a `SchemaProperty` from its required inputs and explicit policies.
     ///
     /// # Parameters
@@ -261,6 +267,7 @@ pub struct SchemaAst {
 }
 
 impl SchemaAst {
+    pub(crate) fn shape_owner(&self) -> Arc<SchemaShape> { Arc::clone(&self.shape) }
     #[must_use]
     /// Describe a value whose structure cannot be exported as a schema AST.
     ///

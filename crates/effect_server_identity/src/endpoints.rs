@@ -8,8 +8,12 @@
 //! selected callbacks provide their actual native state and native router/service.
 //! Paths, decoding policies, permitted modes and public response fields stay explicit.
 
-use effect::{Effect, effect, service};
-use effect_server::{HasRequest, HttpMethodSet, Reply, Request, Router, ServerError};
+use crate::IdentityError;
+use crate::capabilities::{NativeBackend, StoreSelection};
+use crate::definition::{IdentityComponents, IdentityDefinition, PreparedIdentityInvocation};
+use effect::memory::{BufferLease, BufferView};
+use effect::{Effect, Exit, effect, effect_future, effect_try_future, effect_try_sync, service};
+use effect_server::{BodyLimit, HasRequest, HttpMethodSet, Reply, Request, Router, ServerError};
 use effect_server::{endpoint, registered, reply, router};
 use std::sync::Arc;
 
@@ -208,6 +212,164 @@ impl<
         }?)
     }
 }
+/// Actual encoded and decoded owners given to an admitted Identity decoder.
+pub struct PreparedIdentityInput {
+    /// The original request's metadata and extension authority.
+    pub request: Request,
+    /// The encoded body in the Server's selected physical buffer.
+    pub encoded: BufferView<'static>,
+    /// The selected destination for decoded bytes, moved into decoder output
+    /// when the workflow still needs to borrow them.
+    pub decoded: BufferLease<'static>,
+}
+
+type PreparedInput<I, E, R> = dyn Fn(PreparedIdentityInput) -> Effect<I, E, R> + Send + Sync;
+type PreparedWorkflow<D, B, I, O, E, R> =
+    dyn Fn(Arc<D>, PreparedIdentityInvocation<B>, I) -> Effect<O, E, R> + Send + Sync;
+type PreparedRenderer<O, E, R> =
+    dyn Fn(O, BufferLease<'static>) -> Effect<Reply<E, R>, E, R> + Send + Sync;
+
+/// A typed Identity route using the host's already-admitted request byte pools
+/// and the definition's prepared invocation. The route takes the admitted
+/// decoded and output buffers before its optional guard. Authorization
+/// precedes the route's own invocation reservation and input decoder. The
+/// workflow passes its affine invocation to
+/// `IdentityDefinition::invoke_prepared_once` and the renderer can transfer its
+/// selected output buffer into the response.
+pub struct PreparedWorkflowGroup<
+    D,
+    B: NativeBackend,
+    I: Send + 'static,
+    O: Send + 'static,
+    E: Send + 'static,
+    R: Send + Sync + 'static,
+> {
+    route: (http::Method, String),
+    limit: BodyLimit,
+    input: Arc<PreparedInput<I, E, R>>,
+    workflow: Arc<PreparedWorkflow<D, B, I, O, E, R>>,
+    render: Arc<PreparedRenderer<O, E, R>>,
+    guard: Option<Arc<RequestGuard<D, E, R>>>,
+}
+
+impl<
+    D,
+    B: NativeBackend,
+    I: Send + 'static,
+    O: Send + 'static,
+    E: Send + 'static,
+    R: Send + Sync + 'static,
+> PreparedWorkflowGroup<D, B, I, O, E, R>
+{
+    /// Register the route against a prepared Server/Web host selecting encoded,
+    /// decoded and output byte pools. The typed callbacks are inert at startup.
+    pub fn new(
+        route: (http::Method, String),
+        limit: BodyLimit,
+        input: impl Fn(PreparedIdentityInput) -> Effect<I, E, R> + Send + Sync + 'static,
+        workflow: impl Fn(Arc<D>, PreparedIdentityInvocation<B>, I) -> Effect<O, E, R>
+        + Send
+        + Sync
+        + 'static,
+        render: impl Fn(O, BufferLease<'static>) -> Effect<Reply<E, R>, E, R> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            route,
+            limit,
+            input: Arc::new(input),
+            workflow: Arc::new(workflow),
+            render: Arc::new(render),
+            guard: None,
+        }
+    }
+
+    /// Preserve a caller-selected resource authorization check before reading input.
+    #[must_use]
+    pub fn with_guard(
+        mut self,
+        guard: impl Fn(Arc<D>, Request) -> Effect<(), E, R> + Send + Sync + 'static,
+    ) -> Self {
+        self.guard = Some(Arc::new(guard));
+        self
+    }
+}
+
+impl<S, C, P, M, I, O, E, R> IdentityGroup<IdentityDefinition<S, C, P, M>, E, R>
+    for PreparedWorkflowGroup<IdentityDefinition<S, C, P, M>, S::Backend, I, O, E, R>
+where
+    S: StoreSelection,
+    C: IdentityComponents<S::Backend, P>,
+    P: Send + Sync + 'static,
+    M: Fn(IdentityError) -> E + Send + Sync + 'static,
+    I: Send + 'static,
+    O: Send + 'static,
+    E: Send + 'static,
+    R: HasRequest + Send + Sync + 'static,
+{
+    fn build(
+        self,
+        identity: Arc<IdentityDefinition<S, C, P, M>>,
+    ) -> Result<Router<E, R>, EndpointError> {
+        let Self {
+            route: (method, path),
+            limit,
+            input,
+            workflow,
+            render,
+            guard,
+        } = self;
+        let program = effect! {
+            let input = input.clone();
+            let workflow = workflow.clone();
+            let render = render.clone();
+            let guard = guard.clone();
+            let identity = identity.clone();
+            let request = service! { env |env: &R| { env.request().clone() }, }?;
+            let buffers = request.clone();
+            let errors = identity.clone();
+            let (decoded, output) = effect_try_sync! {
+                once;
+                body { Ok::<_, ServerError>((buffers.take_prepared_decoded_buffer()?, buffers.take_prepared_output_buffer()?)) },
+                on_error: move |error| errors.map_error(IdentityError::Input(error)),
+            }?;
+            if let Some(guard) = guard { guard(identity.clone(), request.clone())?; }
+            let admit = identity.clone();
+            let invocation = effect_future! {
+                exit_with_context;
+                body: move |_: Arc<R>, _| {
+                    let admit = admit.clone();
+                    async move {
+                        match admit.reserve_prepared_invocation() {
+                            Ok(token) => Exit::Success(token),
+                            Err(error) => error.into_exit().map_error(|error| admit.map_error(error)),
+                        }
+                    }
+                },
+            }?;
+            let body = request.clone();
+            let errors = identity.clone();
+            let encoded = effect_try_future! {
+                once;
+                body |_cancel| {
+                    async move { body.read_prepared_bytes_limited(limit).await }
+                },
+                on_error: move |error| errors.map_error(IdentityError::Input(error)),
+            }?;
+            let value = input(PreparedIdentityInput { request, encoded, decoded })?;
+            let value = workflow(identity, invocation, value)?;
+            render(value, output)?
+        };
+        Ok(router! {
+            methods(HttpMethodSet::new(vec![method])?, path.as_str(),
+                registered! {
+                    endpoint: endpoint! {
+                        effect(program),
+                    },
+                });
+        }?)
+    }
+}
+
 /// One public native HTTP handler composed as an actual scoped Effect route.
 /// The selected callback uses IdentityDefinition::native_http to bind its native
 /// state/service to the invocation backend. Native protocol decoding and response

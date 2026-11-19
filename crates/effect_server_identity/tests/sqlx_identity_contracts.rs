@@ -767,3 +767,133 @@ async fn defect_macro_retains_the_original_channel() {
     assert_eq!(constructed.load(Ordering::SeqCst), 1);
     assert_eq!(recovered.load(Ordering::SeqCst), 0);
 }
+
+/// A codec whose legacy methods refuse, so only the selected physical path can pass.
+struct PreparedTextCodec(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl RecordCodec<String> for PreparedTextCodec {
+    fn version(&self) -> NonZeroU16 {
+        NonZeroU16::MIN
+    }
+
+    fn encode(&self, _: &String) -> Result<Vec<u8>, RecordError> {
+        Err(RecordError::Corrupt)
+    }
+
+    fn decode(&self, _: NonZeroU16, _: &[u8]) -> Result<String, RecordError> {
+        Err(RecordError::Corrupt)
+    }
+}
+
+impl effect_server_identity::store::records::PreparedRecordCodec<String> for PreparedTextCodec {
+    fn encode_prepared(
+        &self,
+        value: &String,
+        writer: &mut effect_server_identity::store::records::RecordWriter<'_>,
+    ) -> Result<(), RecordError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        writer
+            .extend_from_slice(value.as_bytes())
+            .map_err(|_| RecordError::Bound)
+    }
+
+    fn decode_prepared(&self, version: NonZeroU16, bytes: &[u8]) -> Result<String, RecordError> {
+        if version != self.version() {
+            return Err(RecordError::Corrupt);
+        }
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| RecordError::Corrupt)
+    }
+}
+
+#[tokio::test]
+async fn prepared_record_refuses_sql_and_width_before_publication()
+-> Result<(), Box<dyn std::error::Error>> {
+    use effect::memory::{
+        Admission, Bytes, CapacityUnit, MemoryPlan, Partition, RegionId, ResourceCapacity,
+    };
+    use effect_server_identity::store::records::PreparedRecordMemory;
+    use effect_sql::{SqlError, kernel::SqlKernel};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let initialized = backend().await?;
+    let pool = initialized.kernel().pool().clone();
+    let region = RegionId::named("identity-record-fixture");
+    let bytes = Bytes::new(128 * 1024);
+    let partitions = [Partition {
+        id: region,
+        capacity: bytes,
+    }];
+    let memory = MemoryPlan::new(bytes, &partitions)?
+        .metadata(region)?
+        .prepare()?;
+    let pending = Arc::new(Admission::prepare(
+        &memory,
+        region,
+        [ResourceCapacity {
+            unit: CapacityUnit::Slots,
+            work: 1,
+            control: 0,
+        }],
+    )?);
+    let records = Arc::new(PreparedRecordMemory::prepare(
+        &memory,
+        region,
+        NonZeroUsize::MIN,
+        NonZeroUsize::MIN.saturating_add(3),
+    )?);
+    let _memory = memory.seal();
+    let kernel = SqlKernel::new(pool.clone()).with_pending_checkout_admission(pending.clone())?;
+    let selected = SqlxIdentityStore::from_kernel(
+        kernel,
+        IdentityStoragePolicy {
+            challenge_capacity: NonZeroUsize::MIN,
+            utc_now: OffsetDateTime::now_utc,
+        },
+    )?;
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let adapter = SqlRecordAdapter::new(
+        selected,
+        RecordCategory::Consent,
+        RecordPolicy {
+            max_bytes: NonZeroUsize::MIN.saturating_add(3),
+            page_limit: NonZeroU16::MIN,
+        },
+        PreparedTextCodec(call_count.clone()),
+    )
+    .with_prepared_memory(records)?;
+
+    let owner = "prepared-record-fixture";
+    let id = Uuid::new_v4();
+    let held = pending.reserve([1], [0])?;
+    let refused = adapter.create(owner, id, None, String::from("abcd")).await;
+    assert!(matches!(
+        refused,
+        Err(RecordError::Sql(SqlError::Memory(_)))
+    ));
+    assert_eq!(call_count.load(Ordering::Relaxed), 0);
+    drop(held);
+    assert!(matches!(
+        adapter
+            .create(owner, id, None, String::from("excess"))
+            .await,
+        Err(RecordError::Bound)
+    ));
+    let now = OffsetDateTime::now_utc();
+    assert!(adapter.find(owner, id, now).await?.is_none());
+    let revision = adapter
+        .create(owner, id, None, String::from("abcd"))
+        .await?;
+    let found = adapter
+        .find(owner, id, now)
+        .await?
+        .ok_or("acknowledged record missing")?;
+    assert_eq!(found.revision, revision);
+    assert_eq!(found.value, "abcd");
+    assert_eq!(call_count.load(Ordering::Relaxed), 2);
+    pool.close().await;
+    Ok(())
+}

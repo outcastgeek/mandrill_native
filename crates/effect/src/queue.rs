@@ -308,7 +308,7 @@ impl<A> Changes<A> {
         Exit::FinalizationFailed(Finalization {
             primary,
             first,
-            rest,
+            rest: rest.into(),
         })
     }
 }
@@ -571,7 +571,7 @@ impl<A: Send + 'static> AsyncQueue<A> {
                             .finish(failure);
                         return runtime::finish(finish, outcome);
                     }
-                    Step::Suspended(Box::pin(async move {
+                    Step::suspended(Box::pin(async move {
                         let outcome = registered.wait(context.cancellation).await;
                         runtime::finish(finish, outcome)
                     }))
@@ -607,7 +607,7 @@ impl<A: Send + 'static> AsyncQueue<A> {
                             .finish(failure);
                         return runtime::finish(finish, outcome);
                     }
-                    Step::Suspended(Box::pin(async move {
+                    Step::suspended(Box::pin(async move {
                         let outcome = registered.wait(context.cancellation).await;
                         runtime::finish(finish, outcome)
                     }))

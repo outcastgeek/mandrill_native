@@ -42,13 +42,7 @@ pub(crate) fn expand_with_path(
 pub(crate) fn effect_crate_path() -> syn::Result<TokenStream> {
     let resolved = crate_name(EFFECT_PACKAGE_NAME);
     if resolved.is_err() {
-        for package in [
-            "effect-sql",
-            "effect-server",
-            "effect-server-identity",
-            "effect-server-web",
-            "effect-otel",
-        ] {
+        for package in crate::extension_support::EFFECT_FACADE_PACKAGES {
             if crate_name(package).is_ok() {
                 let extension = crate::extension_support::crate_path(package)?;
                 return Ok(quote!(#extension::__private::effect));

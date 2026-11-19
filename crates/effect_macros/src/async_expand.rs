@@ -138,7 +138,7 @@ impl Fold for Lower {
             let path = &self.path;
             parse_quote_spanned!(expr.return_token.span.resolved_at(proc_macro2::Span::mixed_site())=> return #path::Exit::Success(#value))
         } else if let Expr::Break(mut expr) = expr {
-            expr.expr = expr.expr.map(|value| Box::new(self.fold_expr(*value)));
+            expr.expr = expr.expr.map(|value| Box::map(value, |value| self.fold_expr(value)));
             match self.target(&expr.label, false) {
                 Some(checkpoint) => {
                     let close = self.close(checkpoint);
@@ -171,7 +171,7 @@ impl Fold for Lower {
             let _ = self.targets.pop();
             Expr::Loop(expr)
         } else if let Expr::While(mut expr) = expr {
-            expr.cond = Box::new(self.fold_expr(*expr.cond));
+            expr.cond = Box::map(expr.cond, |condition| self.fold_expr(condition));
             let checkpoint = self.checkpoint();
             self.targets.push(Target {
                 label: expr.label.as_ref().map(|label| label.name.clone()),
@@ -182,7 +182,7 @@ impl Fold for Lower {
             let _ = self.targets.pop();
             Expr::While(expr)
         } else if let Expr::ForLoop(mut expr) = expr {
-            expr.expr = Box::new(self.fold_expr(*expr.expr));
+            expr.expr = Box::map(expr.expr, |iterable| self.fold_expr(iterable));
             let checkpoint = self.checkpoint();
             self.targets.push(Target {
                 label: expr.label.as_ref().map(|label| label.name.clone()),

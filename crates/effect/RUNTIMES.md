@@ -12,6 +12,7 @@ closures so its resources and producers keep that environment alive.
 | `TokioTasks` | Arc<Runtime>, explicit AdmissionCapacity | Multi-thread runtime with more than one actual worker; independent tasks, prompt admission, no inline user work; stop/drain joins retained drivers |
 | `TokioBlocking` | Arc<Runtime>, capacity, Diagnostics | spawn_blocking owns jobs; cancellation does not abort a running callback; stop/drain waits settlement and worker diagnostics |
 | `TokioClock` | Arc<Runtime> | Timer constructed under the supplied reactor; owned future retains the runtime; checked deadlines and cancellation |
+| `PreparedTokioClock` | Arc<Runtime>, prepared region, positive timer capacity | Actual Tokio sleep frames are reserved before construction, with the enclosing prepared graph's cancellation registration |
 | `RayonCpu` | Arc<ThreadPool>, capacity, Diagnostics | pool.spawn owns a synchronous job; no install/block_on fallback; stop/drain joins jobs and diagnostics |
 | `NativeTasks` | Existing RuntimeHandle, Diagnostics | Native owner retains shutdown/terminal authority; typed admission mapping; bridge requests cancellation and awaits work |
 | `TracingBackend` | tracing::Dispatch, positive active-span capacity, Diagnostics | Explicit dispatcher across threads, explicit parents, bounded span ownership, redaction and outcome recording |
@@ -22,6 +23,14 @@ protected releases, and provider drains settle. `ProviderAdmission` distinguishe
 capacity slots from physically retained drivers. Capacity is released before
 Effect completion is published; drain waits through publication/worker diagnostics.
 This permits sequential work with capacity one without premature shutdown.
+
+`TokioClock::prepare` provisions the actual pinned sleep frames for the selected
+adapter. `reserve_sleep` checks out one frame before the wait establishes its
+deadline or registers with Tokio. `with_context` borrows the enclosing prepared
+graph's cancellation listener. Completion, cancellation, and abandonment
+deregister the native sleep before releasing its runtime owner. Size the
+supplied time-enabled runtime and its driver separately from the prepared
+frame pool.
 
 The existing native runtime owns its own admission permit through its done
 callback. Its capacity therefore covers that full native operation lifetime;

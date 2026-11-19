@@ -36,7 +36,11 @@ pub(crate) fn sql_category(error: &SqlError) -> StoreError {
         }
         SqlError::RowAbsent => StoreError::NotFound,
         SqlError::Decode(_) => StoreError::CorruptStoredData,
-        SqlError::Configuration(_)
+        SqlError::Memory(_)
+        | SqlError::RowLimit { .. }
+        | SqlError::PreparedStatement(_)
+        | SqlError::PreparedRow(_)
+        | SqlError::Configuration(_)
         | SqlError::Identifier(_)
         | SqlError::InactiveSession
         | SqlError::Migration {

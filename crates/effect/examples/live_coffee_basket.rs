@@ -1,6 +1,6 @@
 //! Maya adds and removes drinks, reserves stock, and restores her saved basket.
 //!
-//! Run: `cargo +1.99.0 run -p effect --example live_coffee_basket`.
+//! Run: `cargo +1.100.0 run -p effect --example live_coffee_basket`.
 //! Basket, BasketTotal, and Stock are café models. Effect supplies tracked reads,
 //! atomic stock commits, reactive query subscriptions, and hydration boundaries.
 //! Expected totals: 3 drinks/$12.75, then 2/$8.00; restored basket is 2/$8.00.

@@ -3,7 +3,7 @@
 //! Supply a UTF-8 CSV with no header: `elapsed_ms,status`, in increasing time order.
 //! Accepted statuses: `accepted`, `preparing`, `ready`. For example, rows
 //! `0,accepted`, `400,preparing`, `800,ready` produce those three SSE updates.
-//! Run: `cargo +1.99.0 run -p effect-otel --features server --example watch_order_progress -- 127.0.0.1:8080 HISTORY.csv 256 32 32 16 8 5000 inline`.
+//! Run: `cargo +1.100.0 run -p effect-otel --features server --example watch_order_progress -- 127.0.0.1:8080 HISTORY.csv 256 32 32 16 8 5000 inline`.
 //! Read: `curl -N http://127.0.0.1:8080/orders/104/events`. The final argument
 //! selects one writer (`inline`, `extracted`, or `body`) for the same route.
 //! The timeline is input data; this example does not prepare physical drinks.

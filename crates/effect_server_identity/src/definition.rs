@@ -3,13 +3,14 @@
 use crate::{
     IdentityError,
     authority::{
-        GrantPolicy, IdentityAuthority, IdentityClock, PendingLoginGrant, RecentSelfGrant,
-        SelfGrant,
+        AuthorityIdentity, GrantPolicy, IdentityAuthority, IdentityClock, PendingLoginGrant,
+        RecentSelfGrant, SelfGrant,
     },
     capabilities::{NativeBackend, StoreSelection},
+    components::PreparedPasswordWork,
 };
 use crate::{effect_future, effect_uninterruptible};
-use effect::{Effect, Exit};
+use effect::{Effect, Exit, PreparedAdmissionPermit, PreparedProviderAdmission};
 use std::{
     future::Future,
     marker::PhantomData,
@@ -31,6 +32,25 @@ pub trait IdentityComponents<B: NativeBackend, P>: Send + Sync + 'static {
         clock: IdentityClock,
         policies: Arc<P>,
     ) -> Result<Self::Native, IdentityError>;
+
+    /// Reserve selected shared password work before constructing a manager.
+    fn reserve_password_work(&self) -> Result<Option<PreparedPasswordWork>, IdentityError> {
+        Ok(None)
+    }
+
+    /// Use the already-admitted worker ownership when composing the manager.
+    fn construct_with_password_work(
+        &self,
+        backend: B,
+        clock: IdentityClock,
+        policies: Arc<P>,
+        work: Option<PreparedPasswordWork>,
+    ) -> Result<Self::Native, IdentityError> {
+        if work.is_some() {
+            return Err(IdentityError::WrongConfiguration);
+        }
+        self.construct(backend, clock, policies)
+    }
 }
 /// Retained application/native configuration and its typed pure composition factory.
 pub struct ConfiguredComponents<C, F, N> {
@@ -132,6 +152,52 @@ where
 {
     mapper
 }
+#[derive(Clone)]
+enum WorkflowAdmission {
+    Ordinary(Arc<tokio::sync::Semaphore>),
+    Prepared(Arc<PreparedProviderAdmission>),
+}
+
+enum WorkflowPermit {
+    Ordinary {
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    },
+    Prepared {
+        _permit: PreparedAdmissionPermit,
+    },
+}
+
+struct Invocation<B: NativeBackend> {
+    backend: B,
+    password: Option<PreparedPasswordWork>,
+    _permit: WorkflowPermit,
+}
+
+/// One affine, definition-bound admission for a prepared Identity invocation.
+/// This owns workflow, selected password capacity and invocation-store controls.
+pub struct PreparedIdentityInvocation<B: NativeBackend> {
+    invocation: Invocation<B>,
+    identity: Arc<AuthorityIdentity>,
+    admission: Arc<PreparedProviderAdmission>,
+}
+
+impl WorkflowAdmission {
+    async fn acquire(&self) -> Result<WorkflowPermit, IdentityError> {
+        match self {
+            Self::Ordinary(semaphore) => semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map(|permit| WorkflowPermit::Ordinary { _permit: permit })
+                .map_err(|_| IdentityError::Configuration("identity admission closed")),
+            Self::Prepared(owner) => owner
+                .admit()
+                .map(|permit| WorkflowPermit::Prepared { _permit: permit })
+                .map_err(IdentityError::Admission),
+        }
+    }
+}
+
 /// Inert typed definition retaining native selections and application error mapping.
 /// Clone copies configuration handles only; request/credential inputs move per invocation.
 pub struct IdentityDefinition<S: StoreSelection, C, P, M> {
@@ -146,7 +212,7 @@ pub struct IdentityDefinition<S: StoreSelection, C, P, M> {
     /// Private authority retaining one definition generation and explicit freshness.
     authority: IdentityAuthority<S::Backend>,
     /// Explicit shared whole-workflow admission; native manager work limits remain selected separately.
-    admission: Arc<tokio::sync::Semaphore>,
+    admission: WorkflowAdmission,
 }
 impl<S: StoreSelection, C, P, M> Clone for IdentityDefinition<S, C, P, M> {
     /// Retain installed service handles without cloning storage/request/credential values.
@@ -189,8 +255,17 @@ impl<
             policies: Arc::new(policies),
             errors: Arc::new(errors),
             authority,
-            admission: Arc::new(tokio::sync::Semaphore::new(admission.get())),
+            admission: WorkflowAdmission::Ordinary(Arc::new(tokio::sync::Semaphore::new(
+                admission.get(),
+            ))),
         })
+    }
+    /// Select prepared controls for all native invocations of this definition.
+    /// Admission precedes construction of the invocation-specific native services.
+    #[must_use]
+    pub fn with_prepared_admission(mut self, owner: Arc<PreparedProviderAdmission>) -> Self {
+        self.admission = WorkflowAdmission::Prepared(owner);
+        self
     }
     /// Borrow the selected optional capabilities; missing results stay typed.
     pub fn storage(&self) -> &S {
@@ -207,6 +282,88 @@ impl<
     /// Borrow private grant issuance/revalidation over this real backend generation.
     pub fn authority(&self) -> &IdentityAuthority<S::Backend> {
         &self.authority
+    }
+
+    /// Reserve the complete selected invocation before decoding request data.
+    pub fn reserve_prepared_invocation(
+        &self,
+    ) -> Result<PreparedIdentityInvocation<S::Backend>, IdentityError>
+    where
+        C: IdentityComponents<S::Backend, P>,
+    {
+        let WorkflowAdmission::Prepared(owner) = &self.admission else {
+            return Err(IdentityError::Configuration(
+                "prepared identity admission required",
+            ));
+        };
+        let permit = owner.admit().map_err(IdentityError::Admission)?;
+        Ok(PreparedIdentityInvocation {
+            invocation: self.invocation(WorkflowPermit::Prepared { _permit: permit })?,
+            identity: Arc::clone(&self.authority.identity),
+            admission: Arc::clone(owner),
+        })
+    }
+
+    pub(crate) fn map_error<E>(&self, error: IdentityError) -> E
+    where
+        M: Fn(IdentityError) -> E,
+    {
+        (self.errors)(error)
+    }
+
+    fn invocation(&self, permit: WorkflowPermit) -> Result<Invocation<S::Backend>, IdentityError>
+    where
+        C: IdentityComponents<S::Backend, P>,
+    {
+        let password = self.components.reserve_password_work()?;
+        let backend = self.storage.backend().try_scoped()?;
+        Ok(Invocation {
+            backend,
+            password,
+            _permit: permit,
+        })
+    }
+
+    fn accept_prepared(
+        &self,
+        admitted: PreparedIdentityInvocation<S::Backend>,
+    ) -> Result<Invocation<S::Backend>, IdentityError> {
+        if !Arc::ptr_eq(&admitted.identity, &self.authority.identity)
+            || !matches!(&self.admission, WorkflowAdmission::Prepared(owner) if Arc::ptr_eq(owner, &admitted.admission))
+        {
+            return Err(IdentityError::WrongConfiguration);
+        }
+        Ok(admitted.invocation)
+    }
+
+    async fn run_invocation<A, F, Fut>(
+        &self,
+        invocation: Invocation<S::Backend>,
+        operation: F,
+    ) -> Result<A, IdentityError>
+    where
+        C: IdentityComponents<S::Backend, P>,
+        F: FnOnce(C::Native, IdentityAuthority<S::Backend>, Arc<P>) -> Fut,
+        Fut: Future<Output = Result<A, IdentityError>>,
+    {
+        let Invocation {
+            backend,
+            password,
+            _permit,
+        } = invocation;
+        let native = self.components.construct_with_password_work(
+            backend.clone(),
+            self.authority.clock(),
+            Arc::clone(&self.policies),
+            password,
+        )?;
+        let result = operation(
+            native,
+            self.authority.with_backend(backend.clone()),
+            Arc::clone(&self.policies),
+        )
+        .await;
+        backend.capture_outcome(result)
     }
     /// Lift one whole native async operation lazily with fresh environment-selected
     /// inputs. Every native store call settles its own transaction; no nested runtime
@@ -231,26 +388,13 @@ impl<
             let operation = operation.clone();
             async move {
                 let result = async {
-                    let _admission = definition
-                        .admission
-                        .clone()
-                        .acquire_owned()
+                    let invocation =
+                        definition.invocation(definition.admission.acquire().await?)?;
+                    definition
+                        .run_invocation(invocation, |native, authority, policies| {
+                            operation(native, env, authority, policies)
+                        })
                         .await
-                        .map_err(|_| IdentityError::Configuration("identity admission closed"))?;
-                    let backend = definition.storage.backend().scoped();
-                    let native = definition.components.construct(
-                        backend.clone(),
-                        definition.authority.clock(),
-                        definition.policies.clone(),
-                    )?;
-                    let result = operation(
-                        native,
-                        env,
-                        definition.authority.with_backend(backend.clone()),
-                        definition.policies.clone(),
-                    )
-                    .await;
-                    backend.capture_outcome(result)
                 }
                 .await;
                 match result {
@@ -294,10 +438,50 @@ impl<
         F: Fn(C::Native, I, IdentityAuthority<S::Backend>, Arc<P>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<A, IdentityError>> + Send + 'static,
     {
+        self.invoke_once_with(None, input, operation)
+    }
+
+    /// Consume the exact predecode admission without acquiring a second slot.
+    pub fn invoke_prepared_once<I, A, E, R, F, Fut>(
+        &self,
+        admission: PreparedIdentityInvocation<S::Backend>,
+        input: I,
+        operation: F,
+    ) -> Effect<A, E, R>
+    where
+        I: Send + 'static,
+        A: Send + 'static,
+        E: Send + 'static,
+        R: Send + Sync + 'static,
+        C: IdentityComponents<S::Backend, P>,
+        M: Fn(IdentityError) -> E,
+        F: Fn(C::Native, I, IdentityAuthority<S::Backend>, Arc<P>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<A, IdentityError>> + Send + 'static,
+    {
+        self.invoke_once_with(Some(admission), input, operation)
+    }
+
+    fn invoke_once_with<I, A, E, R, F, Fut>(
+        &self,
+        admission: Option<PreparedIdentityInvocation<S::Backend>>,
+        input: I,
+        operation: F,
+    ) -> Effect<A, E, R>
+    where
+        I: Send + 'static,
+        A: Send + 'static,
+        E: Send + 'static,
+        R: Send + Sync + 'static,
+        C: IdentityComponents<S::Backend, P>,
+        M: Fn(IdentityError) -> E,
+        F: Fn(C::Native, I, IdentityAuthority<S::Backend>, Arc<P>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<A, IdentityError>> + Send + 'static,
+    {
         let definition = self.clone();
         let operation = Arc::new(operation);
-        let pending = Mutex::new(Some(input));
-        Effect::from_exit_future_with_context(move |_: Arc<R>, _| {
+        let pending = Mutex::new(Some((input, admission)));
+        effect_uninterruptible! {
+            program: effect_future! { exit_with_context; body: move |_: Arc<R>, _| {
             let candidate = pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -305,32 +489,21 @@ impl<
             let definition = definition.clone();
             let operation = operation.clone();
             async move {
-                let Some(input) = candidate else {
+                let Some((input, admission)) = candidate else {
                     return Exit::Die(effect::Defect::from(
                         effect::LibraryDefect::FutureFactoryConsumed,
                     ));
                 };
                 let result = async {
-                    let _admission = definition
-                        .admission
-                        .clone()
-                        .acquire_owned()
+                    let invocation = match admission {
+                        Some(admitted) => definition.accept_prepared(admitted)?,
+                        None => definition.invocation(definition.admission.acquire().await?)?,
+                    };
+                    definition
+                        .run_invocation(invocation, |native, authority, policies| {
+                            operation(native, input, authority, policies)
+                        })
                         .await
-                        .map_err(|_| IdentityError::Configuration("identity admission closed"))?;
-                    let backend = definition.storage.backend().scoped();
-                    let native = definition.components.construct(
-                        backend.clone(),
-                        definition.authority.clock(),
-                        definition.policies.clone(),
-                    )?;
-                    let result = operation(
-                        native,
-                        input,
-                        definition.authority.with_backend(backend.clone()),
-                        definition.policies.clone(),
-                    )
-                    .await;
-                    backend.capture_outcome(result)
                 }
                 .await;
                 match result {
@@ -340,8 +513,7 @@ impl<
                         .map_error(|error| (definition.errors)(error)),
                 }
             }
-        })
-        .uninterruptible()
+        }, }, }
     }
     /// Lift an application/native operation over this exact retained D17 selection.
     /// Typed getters preserve explicit absence and actual configuration ownership;

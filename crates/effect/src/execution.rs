@@ -1,5 +1,8 @@
 //! Capabilities for task submission and cancellation.
 
+use crate::admission::{CapacityPermit, Settlement};
+use crate::internal::runtime_storage::ReservedOnce;
+use crate::memory::PreparedUnitFuture;
 use crate::{Cancellation, Defect, LibraryDefect};
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -16,7 +19,34 @@ pub(crate) enum TaskEvent {
 }
 
 /// Type alias for task notification in execution.
-type TaskNotification = Box<dyn FnMut(TaskEvent) + Send>;
+enum TaskNotification {
+    Ordinary(Box<dyn FnMut(TaskEvent) + Send>),
+    Prepared(ReservedOnce<PreparedTaskCompletion, ()>),
+}
+
+pub(crate) enum PreparedTaskCompletion {
+    Ready,
+    Lost(Defect),
+}
+
+enum TaskBody {
+    Ordinary(TaskFuture),
+    Prepared(PreparedUnitFuture),
+}
+
+impl TaskBody {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        match self {
+            Self::Ordinary(future) => future.as_mut().poll(cx),
+            Self::Prepared(future) => Pin::new(future).poll(cx),
+        }
+    }
+}
+
+enum TaskSettlement {
+    Ordinary(Settlement),
+    Prepared(Option<CapacityPermit>),
+}
 
 /// Ownership-aware work submitted by Effect to an environment's task provider.
 ///
@@ -26,9 +56,9 @@ type TaskNotification = Box<dyn FnMut(TaskEvent) + Send>;
 /// as an implementation of cooperative Effect cancellation.
 #[must_use = "accepted scheduled work must remain owned through settlement"]
 pub struct ScheduledTask {
-    pending: Option<TaskFuture>,
+    pending: Option<TaskBody>,
     started: bool,
-    settlement: crate::admission::Settlement,
+    settlement: TaskSettlement,
     notification: Option<TaskNotification>,
 }
 
@@ -45,10 +75,22 @@ impl ScheduledTask {
     ) -> Self {
         let settlement = crate::admission::Settlement::default();
         Self {
-            pending: Some(pending(settlement.clone())),
-            settlement,
+            pending: Some(TaskBody::Ordinary(pending(settlement.clone()))),
+            settlement: TaskSettlement::Ordinary(settlement),
             started: false,
-            notification: Some(Box::new(notification)),
+            notification: Some(TaskNotification::Ordinary(Box::new(notification))),
+        }
+    }
+
+    pub(crate) fn prepared(
+        pending: PreparedUnitFuture,
+        notification: ReservedOnce<PreparedTaskCompletion, ()>,
+    ) -> Self {
+        Self {
+            pending: Some(TaskBody::Prepared(pending)),
+            started: false,
+            settlement: TaskSettlement::Prepared(None),
+            notification: Some(TaskNotification::Prepared(notification)),
         }
     }
 
@@ -57,9 +99,21 @@ impl ScheduledTask {
     ///
     /// # Returns
     /// Type: `Self`.
-    pub(crate) fn on_settled(self, action: impl FnOnce() + Send + 'static) -> Self {
-        self.settlement.add(action);
+    pub(crate) fn with_permit(mut self, permit: CapacityPermit) -> Self {
+        match &mut self.settlement {
+            TaskSettlement::Ordinary(settlement) => settlement.add(move || drop(permit)),
+            TaskSettlement::Prepared(settlement) => {
+                *settlement = Some(permit);
+            }
+        }
         self
+    }
+
+    fn release(&mut self) {
+        match &mut self.settlement {
+            TaskSettlement::Ordinary(settlement) => settlement.release(),
+            TaskSettlement::Prepared(settlement) => drop(settlement.take()),
+        }
     }
 
     ///
@@ -69,10 +123,21 @@ impl ScheduledTask {
     /// # Returns
     /// Type: `()`.
     fn fail(&mut self, defect: Defect) {
-        drop(self.pending.take());
-        self.settlement.release();
-        if let Some(mut notification) = self.notification.take() {
-            notification(TaskEvent::Lost(defect));
+        let mut retirement = std::mem::DropGuard::new(self, |task| task.publish_loss(defect));
+        drop(retirement.pending.take());
+    }
+
+    fn publish_loss(&mut self, defect: Defect) {
+        self.release();
+        if let Some(notification) = self.notification.take() {
+            match notification {
+                TaskNotification::Ordinary(mut notification) => {
+                    notification(TaskEvent::Lost(defect))
+                }
+                TaskNotification::Prepared(notification) => {
+                    notification.call(PreparedTaskCompletion::Lost(defect))
+                }
+            }
         }
     }
 }
@@ -92,19 +157,24 @@ impl Future for ScheduledTask {
         let this = self.get_mut();
         if !this.started {
             this.started = true;
-            if let Some(notification) = &mut this.notification {
+            if let Some(TaskNotification::Ordinary(notification)) = &mut this.notification {
                 notification(TaskEvent::Started);
             }
         }
         let Some(pending) = &mut this.pending else {
             return Poll::Ready(());
         };
-        match catch_unwind(AssertUnwindSafe(|| pending.as_mut().poll(cx))) {
+        match catch_unwind(AssertUnwindSafe(|| pending.poll(cx))) {
             Ok(Poll::Pending) => Poll::Pending,
             Ok(Poll::Ready(())) => {
-                this.settlement.release();
-                this.notification = None;
-                this.pending = None;
+                this.release();
+                if matches!(this.notification, Some(TaskNotification::Ordinary(_))) {
+                    this.notification = None;
+                }
+                drop(this.pending.take());
+                if let Some(TaskNotification::Prepared(notification)) = this.notification.take() {
+                    notification.call(PreparedTaskCompletion::Ready);
+                }
                 Poll::Ready(())
             }
             Err(panic) => {

@@ -29,8 +29,12 @@
 //! `\u003c`, `\u003e`, `\u0026` and the two JavaScript line separators. The result is
 //! JSON text bound for a script element; it is data, not authored markup.
 
-use serde::Serialize;
+use effect::memory::{Buffer, MemoryError};
+use serde::{Serialize, ser::SerializeSeq};
 use serde_json::{Map, Value, ser::Formatter};
+use std::num::{NonZeroU8, NonZeroUsize};
+
+use crate::byte_text::BufferWriter;
 
 /// One rendered meta tag.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -405,6 +409,165 @@ pub fn json_ld(data: &Map<String, Value>) -> String {
         Ok(()) => String::from_utf8(buffer).unwrap_or_default(),
         Err(_) => String::new(),
     }
+}
+
+/// Explicit structural bounds for writing caller-provided JSON-LD.
+#[derive(Clone, Copy)]
+pub struct JsonLdLimits {
+    /// Maximum number of values, including the root object.
+    pub nodes: NonZeroUsize,
+    /// Maximum nesting depth, with the root at depth one.
+    pub depth: NonZeroU8,
+}
+
+/// Failure to write a complete JSON-LD document.
+#[derive(Debug)]
+pub enum JsonLdWriteError {
+    Memory(MemoryError),
+    StructureLimit,
+    Encoding(serde_json::Error),
+}
+
+impl std::fmt::Display for JsonLdWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Memory(error) => write!(formatter, "{error}"),
+            Self::StructureLimit => formatter.write_str("JSON-LD structure exceeds its limit"),
+            Self::Encoding(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for JsonLdWriteError {}
+
+/// Write a borrowed JSON-LD object with the existing HTML-safe escapes.
+pub fn write_json_ld(
+    data: &Map<String, Value>,
+    limits: JsonLdLimits,
+    output: &mut Buffer<'_>,
+) -> Result<(), JsonLdWriteError> {
+    let mut remaining = limits.nodes.get() - 1;
+    for value in data.values() {
+        check_json_value(value, limits.depth.get() - 1, &mut remaining)?;
+    }
+    write_json_document(data, output)
+}
+
+fn check_json_value(
+    value: &Value,
+    levels: u8,
+    remaining: &mut usize,
+) -> Result<(), JsonLdWriteError> {
+    if levels == 0 || *remaining == 0 {
+        return Err(JsonLdWriteError::StructureLimit);
+    }
+    *remaining -= 1;
+    match value {
+        Value::Array(values) => {
+            for child in values {
+                check_json_value(child, levels - 1, remaining)?;
+            }
+        }
+        Value::Object(values) => {
+            for child in values.values() {
+                check_json_value(child, levels - 1, remaining)?;
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+    Ok(())
+}
+
+fn write_json_document(
+    document: &impl Serialize,
+    output: &mut Buffer<'_>,
+) -> Result<(), JsonLdWriteError> {
+    let start = output.len();
+    let mut output = std::mem::DropGuard::new(output, move |output| output.truncate(start));
+    {
+        let mut writer = BufferWriter::new(&mut output);
+        let mut serializer = serde_json::Serializer::with_formatter(&mut writer, HtmlSafeFormatter);
+        document.serialize(&mut serializer).map_err(|error| {
+            writer
+                .memory_error()
+                .map_or(JsonLdWriteError::Encoding(error), JsonLdWriteError::Memory)
+        })?;
+    }
+    let _ = std::mem::DropGuard::dismiss(output);
+    Ok(())
+}
+
+/// Write item-list JSON-LD in the established key order without collecting an item array.
+pub fn write_item_list_json_ld(
+    name: &str,
+    url: &str,
+    entries: &[ItemListEntry],
+    maximum_entries: NonZeroUsize,
+    output: &mut Buffer<'_>,
+) -> Result<(), JsonLdWriteError> {
+    if entries.len() > maximum_entries.get() {
+        return Err(JsonLdWriteError::StructureLimit);
+    }
+    write_json_document(
+        &ItemListRef {
+            context: "https://schema.org",
+            kind: "ItemList",
+            items: ItemsRef(entries),
+            name: name.trim(),
+            url: url.trim(),
+        },
+        output,
+    )
+}
+
+#[derive(Serialize)]
+struct ItemListRef<'a> {
+    #[serde(rename = "@context")]
+    context: &'static str,
+    #[serde(rename = "@type")]
+    kind: &'static str,
+    #[serde(rename = "itemListElement")]
+    items: ItemsRef<'a>,
+    name: &'a str,
+    url: &'a str,
+}
+
+struct ItemsRef<'a>(&'a [ItemListEntry]);
+
+impl Serialize for ItemsRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut output = serializer.serialize_seq(None)?;
+        let mut position = 0i64;
+        for entry in self.0 {
+            let url = entry.url.trim();
+            let name = entry.name.trim();
+            if url.is_empty() && name.is_empty() {
+                continue;
+            }
+            position = position.saturating_add(1);
+            let item = ItemRef {
+                kind: "ListItem",
+                name,
+                url,
+                position: if entry.position > 0 {
+                    entry.position
+                } else {
+                    position
+                },
+            };
+            output.serialize_element(&item)?;
+        }
+        output.end()
+    }
+}
+
+#[derive(Serialize)]
+struct ItemRef<'a> {
+    #[serde(rename = "@type")]
+    kind: &'static str,
+    name: &'a str,
+    position: i64,
+    url: &'a str,
 }
 
 /// A JSON formatter that escapes HTML-sensitive string characters.

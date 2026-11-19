@@ -28,6 +28,7 @@
 //! function rather than duplicating the rule.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use effect_server::BodyStatus;
 use http::StatusCode;
@@ -50,6 +51,7 @@ use super::responses::{
     new_redirect_access_response, new_status_key_access_response,
     new_translated_status_access_response,
 };
+use super::work::PreparedAccessWork;
 
 /// The configured management roles.
 #[derive(Clone, Debug, Default)]
@@ -103,6 +105,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Default for ManagementAccessPo
 /// The management access policy.
 pub struct ManagementAccessPolicy<E: Send + 'static, R: Send + Sync + 'static> {
     resource_rules: BTreeMap<ResourceKind, PrincipalAccessRule>,
+    default_resource_rule: PrincipalAccessRule,
     can_manage_media: PrincipalAccessRule,
     can_use_authoring_ai: PrincipalAccessRule,
     require_media_manager: PrincipalAccessGuard<E, R>,
@@ -218,6 +221,7 @@ where
 
     ManagementAccessPolicy {
         resource_rules,
+        default_resource_rule: principal_has_any_role(&[]),
         can_manage_media,
         can_use_authoring_ai,
         require_media_manager,
@@ -227,6 +231,15 @@ where
 }
 
 impl<E: Send + 'static, R: Send + Sync + 'static> ManagementAccessPolicy<E, R> {
+    /// Select shared prepared admission for this policy's existing guards.
+    #[must_use]
+    pub fn with_prepared_work(mut self, work: Arc<PreparedAccessWork<E>>) -> Self {
+        self.require_media_manager.prepared = Some(work.clone());
+        self.require_authoring_translation_access.guard.prepared = Some(work.clone());
+        self.require_managed_surface_access.prepared = Some(work);
+        self
+    }
+
     /// The rule for one resource kind.
     ///
     /// A kind with no configured roles receives the empty role rule, which admits
@@ -235,7 +248,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> ManagementAccessPolicy<E, R> {
     pub fn can_manage_resource(&self, kind: &ResourceKind) -> PrincipalAccessRule {
         match self.resource_rules.get(kind) {
             Some(rule) => rule.clone(),
-            None => principal_has_any_role(&[]),
+            None => self.default_resource_rule.clone(),
         }
     }
 

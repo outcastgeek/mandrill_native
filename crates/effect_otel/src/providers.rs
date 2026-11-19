@@ -5,7 +5,11 @@ use crate::{
     effect_future, effect_map_error, effect_scope_acquire, effect_try_blocking,
     effect_uninterruptible,
 };
-use effect::{Deferred, Effect, Exit, HasBlockingExecutor, ResourceValue, Scope};
+use effect::{
+    Deferred, Effect, Exit, HasBlockingExecutor, PreparedAdmissionError, PreparedProviderAdmission,
+    ResourceValue, Scope,
+};
+use effect_tracing::SpanAdmission;
 use opentelemetry_sdk::logs::{LoggerProviderBuilder, SdkLoggerProvider};
 use opentelemetry_sdk::metrics::{MeterProviderBuilder, SdkMeterProvider};
 use opentelemetry_sdk::trace::{SdkTracerProvider, TracerProviderBuilder};
@@ -13,6 +17,21 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+mod prepared_export;
+mod prepared_lifecycle;
+mod prepared_shutdown;
+pub use prepared_export::{
+    ExportBuffer, ExportConfigurationError, PreparedBatchLimits, PreparedExport,
+    PreparedExportBatch, PreparedExportCapacity, PreparedProviderLimits,
+};
+pub use prepared_lifecycle::{
+    PreparedOwnedProviders, PreparedProviderLifecycle, PreparedProviderLifecycleError,
+};
+pub use prepared_shutdown::{
+    PreparedLifecycleCause, PreparedLifecycleError, PreparedLifecycleFailure, PreparedShutdown,
+    PreparedShutdownRefusal, PreparedShutdownWorkers,
+};
 
 /// Native signal identity used by lifecycle diagnostics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,6 +165,7 @@ pub struct BorrowedProviders {
     open: Option<Arc<AtomicBool>>,
     /// Core admission joins in-flight checked SDK operations before owned shutdown.
     admission: effect::ProviderAdmission,
+    prepared_admission: Option<Arc<PreparedProviderAdmission>>,
 }
 impl BorrowedProviders {
     /// Borrow providers by sharing their handles; retain the originals in the host.
@@ -161,6 +181,7 @@ impl BorrowedProviders {
             logs: logs.clone(),
             open: None,
             admission: effect::ProviderAdmission::new(effect::AdmissionCapacity::Unbounded),
+            prepared_admission: None,
         }
     }
     /// Reject new extension native operations once owned shutdown starts.
@@ -178,14 +199,53 @@ impl BorrowedProviders {
     }
     /// Reserve a native invocation atomically with owned close admission.
     /// The core permit is retained until synchronous callback/export observation ends.
-    pub(crate) fn admit(&self) -> Result<effect::AdmissionPermit, NativeError> {
+    pub(crate) fn admit(&self) -> Result<SpanAdmission, NativeError> {
         self.ensure_open()?;
-        self.admission.admit().map_err(|error| match error {
+        if let Some(admission) = &self.prepared_admission {
+            return admission
+                .admit()
+                .map(SpanAdmission::Prepared)
+                .map_err(|error| match error {
+                    PreparedAdmissionError::Admission(error) => Self::admission_error(error),
+                    // This admission path only retains already-prepared count state.
+                    PreparedAdmissionError::Memory(_) => {
+                        Self::admission_error(effect::AdmissionError::Overflow)
+                    }
+                });
+        }
+        self.admission
+            .admit()
+            .map(SpanAdmission::Ordinary)
+            .map_err(Self::admission_error)
+    }
+
+    fn admission_error(error: effect::AdmissionError) -> NativeError {
+        match error {
             effect::AdmissionError::Closed => NativeError::ProviderClosed,
             effect::AdmissionError::Full | effect::AdmissionError::Overflow => {
                 NativeError::Native(effect::Defect::from(error))
             }
-        })
+        }
+    }
+
+    fn flush_signal(&self, signal: Signal) -> opentelemetry_sdk::error::OTelSdkResult {
+        match signal {
+            Signal::Logs => self.logs.force_flush(),
+            Signal::Traces => self.traces.force_flush(),
+            Signal::Metrics => self.metrics.force_flush(),
+        }
+    }
+
+    fn shutdown_signal(
+        &self,
+        signal: Signal,
+        timeout: Duration,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
+        match signal {
+            Signal::Logs => self.logs.shutdown_with_timeout(timeout),
+            Signal::Traces => self.traces.shutdown_with_timeout(timeout),
+            Signal::Metrics => self.metrics.shutdown_with_timeout(timeout),
+        }
     }
     /// Borrow native trace configuration; caller explicitly owns native escape use.
     #[must_use]
@@ -237,6 +297,7 @@ pub struct ProviderFactories {
     /// Caller selects log processors/exporters without any implicit collector.
     logger:
         Arc<dyn Fn(LoggerProviderBuilder) -> Result<SdkLoggerProvider, NativeError> + Send + Sync>,
+    admission: effect::AdmissionCapacity,
 }
 impl ProviderFactories {
     /// Supply all native SDK hooks; factories execute only on Effect acquisition.
@@ -259,6 +320,7 @@ impl ProviderFactories {
             trace: Arc::new(trace),
             meter: Arc::new(meter),
             logger: Arc::new(logger),
+            admission: effect::AdmissionCapacity::Unbounded,
         }
     }
 }
@@ -424,6 +486,18 @@ fn build(
     factories: &ProviderFactories,
     policy: ShutdownPolicy,
 ) -> Result<OwnedProviders, LifecycleError> {
+    let providers = build_providers(factories, policy)?;
+    Ok(OwnedProviders {
+        providers,
+        closing: Arc::new(Mutex::new(None)),
+        policy,
+    })
+}
+
+fn build_providers(
+    factories: &ProviderFactories,
+    policy: ShutdownPolicy,
+) -> Result<BorrowedProviders, LifecycleError> {
     let traces = factory(Signal::Traces, || {
         (factories.trace)(SdkTracerProvider::builder())
     })
@@ -459,30 +533,25 @@ fn build(
             return Err(LifecycleError::from_failures(failures));
         }
     };
-    Ok(OwnedProviders {
-        providers: BorrowedProviders {
-            traces,
-            metrics,
-            logs,
-            open: Some(Arc::new(AtomicBool::new(true))),
-            admission: effect::ProviderAdmission::new(effect::AdmissionCapacity::Unbounded),
-        },
-        closing: Arc::new(Mutex::new(None)),
-        policy,
+    Ok(BorrowedProviders {
+        traces,
+        metrics,
+        logs,
+        open: Some(Arc::new(AtomicBool::new(true))),
+        admission: effect::ProviderAdmission::new(factories.admission),
+        prepared_admission: None,
     })
 }
 
+const TERMINAL_SIGNALS: [Signal; 3] = [Signal::Logs, Signal::Traces, Signal::Metrics];
+
 /// Attempt every native flush so a first failure never suppresses later signals.
 fn flush_all(providers: &BorrowedProviders, failures: &mut Vec<LifecycleFailure>) {
-    sdk_call(Signal::Logs, LifecyclePhase::Flush, failures, || {
-        providers.logs.force_flush()
-    });
-    sdk_call(Signal::Traces, LifecyclePhase::Flush, failures, || {
-        providers.traces.force_flush()
-    });
-    sdk_call(Signal::Metrics, LifecyclePhase::Flush, failures, || {
-        providers.metrics.force_flush()
-    });
+    for signal in TERMINAL_SIGNALS {
+        sdk_call(signal, LifecyclePhase::Flush, failures, || {
+            providers.flush_signal(signal)
+        });
+    }
 }
 /// Release all provider owners in declared log/trace/meter order.
 fn shutdown_all(
@@ -491,15 +560,11 @@ fn shutdown_all(
     policy: ShutdownPolicy,
     failures: &mut Vec<LifecycleFailure>,
 ) {
-    shutdown_one(Signal::Logs, started, policy, failures, |budget| {
-        providers.logs.shutdown_with_timeout(budget)
-    });
-    shutdown_one(Signal::Traces, started, policy, failures, |budget| {
-        providers.traces.shutdown_with_timeout(budget)
-    });
-    shutdown_one(Signal::Metrics, started, policy, failures, |budget| {
-        providers.metrics.shutdown_with_timeout(budget)
-    });
+    for signal in TERMINAL_SIGNALS {
+        shutdown_one(signal, started, policy, failures, |budget| {
+            providers.shutdown_signal(signal, budget)
+        });
+    }
 }
 /// Pass the remaining duration and attempt release even after the budget expires.
 fn shutdown_one(

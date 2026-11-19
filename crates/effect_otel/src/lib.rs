@@ -11,6 +11,13 @@
 //! down. [`OwnedProviders`] has an explicit, joined, typed shutdown and can be
 //! acquired in an Effect scope. SDK background tasks retain the runtime contract
 //! of the caller's chosen processors/exporters.
+//!
+//! [`ProviderFactories::prepared_export`] selects finite SDK trace/log queues and
+//! batch sizes, borrowed record checks before those queues retain payloads, and a
+//! metric reader with an explicit stream cardinality. [`PreparedExport`] stages
+//! each encoded batch in its actual region and keeps that lease through one
+//! sender call. SDK records, native allocations and the supplied transport have
+//! their own ownership and limits.
 
 extern crate self as effect_otel;
 
@@ -34,7 +41,10 @@ mod providers;
 pub mod server;
 mod signals;
 
-pub use context::{OtelContext, PropagatingTransport, Propagation};
+pub use context::{
+    OtelContext, PreparedPropagationCapacity, PreparedPropagationCarriers, PropagatingTransport,
+    Propagation,
+};
 /// Describe a lazy span on the same lifetime path as `effect::span!`.
 ///
 /// Required `name: Into<Arc<str>>` and exactly one `body { ... }` or
@@ -51,17 +61,24 @@ pub use context::{OtelContext, PropagatingTransport, Propagation};
 pub use effect_macros::otel;
 pub use metrics::{
     LatencyUnit, MetricDefinition, MetricPolicy, NativeInstrument, NativeInstrumentKind,
-    OtelMetricError, OtelMetricRecorder,
+    OtelMetricError, OtelMetricRecorder, PreparedOtelMetricCapacity,
 };
 /// Native context, kinds, links and status keep the SDK's exact representations.
 pub use opentelemetry::trace::{Link, SpanContext, SpanKind, Status};
 /// Native types remain available for explicit, checked interoperation.
 pub use opentelemetry::{KeyValue, Value};
 pub use providers::{
-    BorrowedProviders, LifecycleCause, LifecycleError, LifecycleFailure, LifecyclePhase,
-    OwnedProviders, ProviderFactories, ShutdownPolicy, Signal,
+    BorrowedProviders, ExportBuffer, ExportConfigurationError, LifecycleCause, LifecycleError,
+    LifecycleFailure, LifecyclePhase, OwnedProviders, PreparedBatchLimits, PreparedExport,
+    PreparedExportBatch, PreparedExportCapacity, PreparedLifecycleCause, PreparedLifecycleError,
+    PreparedLifecycleFailure, PreparedOwnedProviders, PreparedProviderLifecycle,
+    PreparedProviderLifecycleError, PreparedProviderLimits, PreparedShutdown, PreparedShutdownRefusal,
+    PreparedShutdownWorkers, ProviderFactories, ShutdownPolicy, Signal,
 };
-pub use signals::{HasOtel, LogRouting, NativeError, Otel, OtelBackend, Redaction, SpanOptions};
+pub use signals::{
+    HasOtel, LogRouting, NativeError, Otel, OtelBackend, PreparedAttributeWriter,
+    PreparedOtelRedaction, PreparedOtelSignalCapacity, Redaction, SpanOptions,
+};
 
 /// Hygienic macro lowering support; not an alternate application interpreter.
 #[doc(hidden)]

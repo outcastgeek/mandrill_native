@@ -81,7 +81,7 @@ impl Latch {
         let latch = self.clone();
         Effect::new(move |_, context, finish| {
             let latch = latch.clone();
-            Step::Suspended(Box::pin(async move {
+            Step::suspended(Box::pin(async move {
                 loop {
                     let changed = latch.state.changed.listen();
                     if context.cancelled() {
@@ -96,5 +96,133 @@ impl Latch {
                 }
             }))
         })
+    }
+}
+
+/// Startup-provisioned latch whose listener slots have an explicit finite capacity.
+/// It is separate from the ordinary allocating `Latch` and uses fallible sharing.
+pub struct PreparedLatch {
+    state: crate::memory::SharedSlot<'static, PreparedLatchState>,
+}
+struct PreparedLatchState {
+    opened: AtomicBool,
+    changed: crate::memory::prepared_notification::Event,
+}
+/// One admitted listener. Dropping it returns its physical listener slot.
+pub struct PreparedLatchWait {
+    listener: crate::memory::prepared_notification::Registration,
+    state: crate::memory::SharedSlot<'static, PreparedLatchState>,
+}
+impl PreparedLatch {
+    /// Prepare one latch and its caller-selected number of concurrent listeners.
+    pub fn prepare(
+        memory: &crate::memory::PreparedMemory<'static>,
+        region: crate::memory::RegionId,
+        capacity: usize,
+    ) -> Result<Self, crate::memory::MemoryError> {
+        let changed =
+            crate::memory::prepared_notification::Event::prepare(memory, region, capacity)?;
+        let mut changed = Some(changed);
+        let pool = memory.slots(region, 1, |_| {
+            Ok(PreparedLatchState {
+                opened: AtomicBool::new(false),
+                changed: changed.take().ok_or(crate::memory::MemoryError::NoSlot)?,
+            })
+        })?;
+        Ok(Self {
+            state: pool.checkout()?.share(),
+        })
+    }
+    /// Pool layout bytes, excluding partition allocator headers and padding.
+    pub fn storage_bytes(
+        capacity: usize,
+    ) -> Result<crate::memory::Bytes, crate::memory::MemoryError> {
+        crate::memory::SlotPool::<PreparedLatchState>::storage_bytes(1)?.checked_add(
+            crate::memory::prepared_notification::Event::storage_bytes(capacity)?,
+        )
+    }
+    /// Retain the existing prepared latch without allocating a control block.
+    pub fn try_clone(&self) -> Result<Self, crate::memory::MemoryError> {
+        Ok(Self {
+            state: self.state.try_clone()?,
+        })
+    }
+    /// Reset an exclusively owned latch after all retained handles and waiters
+    /// have retired. The listener pool itself remains prepared for reuse.
+    pub fn reset(&mut self) -> Result<(), crate::memory::MemoryError> {
+        if !self.state.is_unique() {
+            return Err(crate::memory::MemoryError::Busy);
+        }
+        self.state.opened.store(false, Ordering::Release);
+        Ok(())
+    }
+    /// Open once, publishing before notifying current waiters.
+    #[must_use]
+    pub fn open_now(&self) -> bool {
+        let first = !self.state.opened.swap(true, Ordering::AcqRel);
+        if first {
+            self.state.changed.notify_all();
+        }
+        first
+    }
+    /// Reserve one actual listener before the operation that will wait starts.
+    /// The returned future alone does not observe cancellation.
+    pub fn wait(&self) -> Result<PreparedLatchWait, crate::memory::MemoryError> {
+        let state = self.state.try_clone()?;
+        let listener = state.changed.listen()?;
+        Ok(PreparedLatchWait { listener, state })
+    }
+}
+impl std::future::Future for PreparedLatchWait {
+    type Output = ();
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.state.opened.load(Ordering::Acquire) {
+            return std::task::Poll::Ready(());
+        }
+        let _notification = this.listener.poll(cx);
+        if this.state.opened.load(Ordering::Acquire) {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
+
+impl PreparedLatchWait {
+    /// Drive an admitted wait with the graph's already-reserved cancellation listener.
+    /// Reserve this wait before the operation's business factory runs. The graph's
+    /// `effect_future! { exit_with_context; ... }` supplies the prepared context.
+    pub async fn with_context<E: Send + 'static>(
+        mut self,
+        mut context: crate::__private::prepared_graph::FutureContext<E>,
+    ) -> Exit<(), E> {
+        std::future::poll_fn(|cx| {
+            if context.is_requested() {
+                return std::task::Poll::Ready(Exit::Interrupted);
+            }
+            let observation = {
+                let cancelled = std::pin::pin!(context.cancelled());
+                std::future::Future::poll(cancelled, cx)
+            };
+            if matches!(
+                observation,
+                std::task::Poll::Ready(crate::PreparedCancellationObservation::Requested)
+            ) {
+                return std::task::Poll::Ready(Exit::Interrupted);
+            }
+            let opened = std::future::Future::poll(std::pin::Pin::new(&mut self), cx).is_ready();
+            if context.is_requested() {
+                std::task::Poll::Ready(Exit::Interrupted)
+            } else if opened {
+                std::task::Poll::Ready(Exit::Success(()))
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await
     }
 }

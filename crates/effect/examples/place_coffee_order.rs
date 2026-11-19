@@ -1,6 +1,6 @@
 //! Submit a two-cup order and retrieve its accepted pickup ticket through local RPC.
 //!
-//! Run: `cargo +1.99.0 run -p effect --example place_coffee_order`.
+//! Run: `cargo +1.100.0 run -p effect --example place_coffee_order`.
 //! Input: ` Maya ` requests two oat lattes. Output: accepted ticket 104 for Maya.
 //! Request middleware trims the pickup name; the handler validates cup count
 //! and saves the actual ticket in the selected local order desk.

@@ -35,6 +35,7 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
+use effect::memory::MemoryError;
 use effect::{Effect, effect, effect_map_error, effect_ref, effect_try_future, effect_try_sync};
 use effect_server::{ByteFormData, ByteFormPolicy, Request, ServerError, decode_url_encoded_pairs};
 use http::Method;
@@ -48,7 +49,8 @@ use crate::definitions::{
     ResourceAction, ResourceDefinition, ResourceFilterDefinition, ResourceFilterKey, ResourceKind,
     UnknownResourceKind,
 };
-use crate::queries::{QueryService, ResourceDetailQuery, ResourceListQuery};
+use crate::forms::PreparedMergedForms;
+use crate::queries::{PreparedDetailLimits, PreparedListLimits, QueryService, ResourceDetailQuery, ResourceListQuery, check_request_bytes};
 
 use super::bindings::Options;
 use super::result::{
@@ -260,12 +262,70 @@ impl<E> ActionValidationOutcome<E> {
     }
 }
 
+/// Action validation with its report held by prepared result backing.
+pub enum PreparedActionValidationOutcome<E> {
+    /// Accepted input and its validation report.
+    Accepted {
+        input: CommandInputHandle,
+        result: super::PreparedValidationResult,
+    },
+    /// Rejected input, report and original rejection cause.
+    Rejected {
+        input: Option<CommandInputHandle>,
+        result: super::PreparedValidationResult,
+        cause: ActionValidationCause<E>,
+    },
+    /// The result validator stopped publication.
+    Stopped {
+        result: super::PreparedValidationResult,
+        cause: E,
+    },
+}
+
+/// Failure before publishing a prepared action validation outcome.
+#[derive(Debug)]
+pub enum PreparedActionValidationError<E> {
+    /// Admission or result storage refused the operation.
+    Memory(MemoryError),
+    /// The existing validation workflow failed.
+    Validation(ActionValidationCause<E>),
+}
+
+fn prepare_action_outcome<E>(
+    outcome: ActionValidationOutcome<E>,
+    reservation: super::ValidationResultReservation,
+) -> Result<PreparedActionValidationOutcome<E>, MemoryError> {
+    Ok(match outcome {
+        ActionValidationOutcome::Accepted(accepted) => {
+            let (input, result) = accepted.into_parts();
+            PreparedActionValidationOutcome::Accepted { input, result: reservation.publish(result)? }
+        }
+        ActionValidationOutcome::Rejected(rejected) => PreparedActionValidationOutcome::Rejected {
+            input: rejected.input,
+            result: reservation.publish(rejected.result)?,
+            cause: rejected.cause,
+        },
+        ActionValidationOutcome::Stopped(stopped) => PreparedActionValidationOutcome::Stopped {
+            result: reservation.publish(stopped.result)?,
+            cause: stopped.cause,
+        },
+    })
+}
+
 /// The W6 action-validation service.
 pub struct ActionValidationService<E: Send + 'static, R: Send + Sync + 'static> {
     resources: Arc<dyn Registry + Send + Sync>,
     queries: Option<QueryService>,
     form_policy: ByteFormPolicy,
     options: Options<CommandInput, E, R>,
+    prepared_input: Option<Arc<PreparedValidationInput<E>>>,
+}
+
+pub(crate) struct PreparedValidationInput<E> {
+    pub(crate) storage: Arc<PreparedMergedForms>,
+    pub(crate) list: PreparedListLimits,
+    pub(crate) detail: PreparedDetailLimits,
+    pub(crate) on_capacity: Arc<dyn Fn(ServerError) -> E + Send + Sync>,
 }
 
 impl<E: Send + 'static, R: Send + Sync + 'static> Clone for ActionValidationService<E, R> {
@@ -275,6 +335,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Clone for ActionValidationServ
             queries: self.queries.clone(),
             form_policy: self.form_policy,
             options: self.options.clone(),
+            prepared_input: self.prepared_input.clone(),
         }
     }
 }
@@ -300,7 +361,13 @@ where
             queries,
             form_policy,
             options,
+            prepared_input: None,
         }
+    }
+
+    pub(crate) fn with_prepared_input(mut self, prepared: Arc<PreparedValidationInput<E>>) -> Self {
+        self.prepared_input = Some(prepared);
+        self
     }
 
     /// Validate that the definition declares an action.
@@ -395,11 +462,12 @@ where
                     ActionValidationCause::Contract(error),
                 ),
                 Ok(()) => {
-                    let built = effect_map_error! {
-                        program: service.input_effect(request.as_ref(), &kind, &action),
-                        map: ActionValidationCause::Contract,
-                    }.either()?;
+                    let built = service.input_effect(request.as_ref(), &kind, &action).either()?;
                     match built {
+                        Err(error @ ActionValidationCause::Consumer(_)) => effect_try_sync! {
+                            once;
+                            body: move || Err(error),
+                        }?,
                         Err(error) => service.rejected(
                             None,
                             &action,
@@ -416,22 +484,61 @@ where
         }
     }
 
+    /// Reserve issue, argument and byte storage before invoking action validation.
+    ///
+    /// The existing binder and validator contracts produce the original typed
+    /// outcome. Its projection publishes into the held cell before mutation callers
+    /// can consume it. Caller-owned validator payloads retain their normal ownership.
+    pub fn validate_action_input_prepared(
+        &self,
+        request: Option<&Request>,
+        kind: &ResourceKind,
+        action: &ResourceAction,
+        results: Arc<super::PreparedValidationResults>,
+    ) -> Effect<PreparedActionValidationOutcome<E>, PreparedActionValidationError<E>, R> {
+        let service = self.clone();
+        let request = request.cloned();
+        let kind = kind.clone();
+        let action = action.clone();
+        effect! {
+            let service = service.clone();
+            let request = request.clone();
+            let kind = kind.clone();
+            let action = action.clone();
+            let results = results.clone();
+            let reservation = effect_try_sync! {
+                body { results.reserve() }, on_error: PreparedActionValidationError::Memory,
+            }?;
+            let outcome = effect_map_error! {
+                program: service.validate_action_input(request.as_ref(), &kind, &action),
+                map: PreparedActionValidationError::Validation,
+            }?;
+            effect_try_sync! {
+                once;
+                body: move || prepare_action_outcome(outcome, reservation),
+                on_error: PreparedActionValidationError::Memory,
+            }?
+        }
+    }
+
     fn input_effect(
         &self,
         request: Option<&Request>,
         kind: &ResourceKind,
         action: &ResourceAction,
-    ) -> Effect<CommandInput, ActionValidationError, R>
+    ) -> Effect<CommandInput, ActionValidationCause<E>, R>
     where
         R: Send + Sync + 'static,
     {
-        build_command_input(
-            self.queries.clone(),
-            request,
-            kind,
-            action,
-            self.form_policy,
-        )
+        match &self.prepared_input {
+            Some(prepared) => build_prepared_command_input(
+                self.queries.clone(), request, kind, action, self.form_policy, prepared.clone()
+            ),
+            None => effect_map_error! {
+                program: build_command_input(self.queries.clone(), request, kind, action, self.form_policy),
+                map: ActionValidationCause::Contract,
+            },
+        }
     }
 
     fn finish_effect(
@@ -749,6 +856,64 @@ where
             detail_query,
             form_values: merged_form_values(body.as_ref(), &query_values),
         }
+    }
+}
+
+fn build_prepared_command_input<E, R>(
+    queries: Option<QueryService>,
+    request: Option<&Request>,
+    kind: &ResourceKind,
+    action: &ResourceAction,
+    form_policy: ByteFormPolicy,
+    prepared: Arc<PreparedValidationInput<E>>,
+) -> Effect<CommandInput, ActionValidationCause<E>, R>
+where
+    E: Send + 'static,
+    R: Send + Sync + 'static,
+{
+    let request = request.cloned();
+    let kind = kind.clone();
+    let action = action.clone();
+    let capacity = prepared.on_capacity.clone();
+    effect_try_future! {
+        body: move |_| {
+            let prepared = prepared.clone();
+            let request = request.clone();
+            let kind = kind.clone();
+            let action = action.clone();
+            let queries = queries.clone();
+            async move {
+                let request = request.ok_or_else(|| ServerError::Invalid("request is nil".into()))?;
+                check_request_bytes(&request, prepared.list.request.min(prepared.detail.request))?;
+                let form = prepared.storage.read_validation(&request, form_policy).await?;
+                if let Some(diagnostic) = form.validation_diagnostic() {
+                    return Err(ServerError::Invalid(diagnostic.to_string()));
+                }
+                let (list_query, detail_query) = match queries {
+                    Some(queries) => queries.admit_prepared(
+                        &request, &kind, &form, prepared.list, prepared.detail
+                    )?,
+                    None => (ResourceListQuery::default(), ResourceDetailQuery::default()),
+                };
+                let mut form_values = BTreeMap::new();
+                let mut prior = None;
+                for (key, value) in form.validation_pairs() {
+                    if prior == Some(key) {
+                        continue;
+                    }
+                    prior = Some(key);
+                    form_values.insert(InputBytes::from(key), InputBytes::from(trim_unicode_whitespace(value)));
+                }
+                Ok(CommandInput { kind, action, list_query, detail_query, form_values })
+            }
+        },
+        on_error: move |error| {
+            if matches!(&error, ServerError::Memory(_) | ServerError::Limit(_)) {
+                ActionValidationCause::Consumer(capacity(error))
+            } else {
+                ActionValidationCause::Contract(ActionValidationError::invalid_request(format!("parse form: {error}")))
+            }
+        },
     }
 }
 

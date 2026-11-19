@@ -81,9 +81,13 @@ use crate::definitions::{
 };
 
 use super::list_query::{
-    PAGE_QUERY_PARAM, ParseNamedPageFunc, RequestLanguageFunc, SEARCH_QUERY_PARAM,
-    request_query_value, request_query_value_untrimmed,
+    PAGE_QUERY_PARAM, ParseNamedPageFunc, QueryValuesRef, RequestLanguageFunc, SEARCH_QUERY_PARAM,
+    check_capacity, check_request_bytes, request_query_value, request_query_value_untrimmed,
 };
+use crate::forms::{PreparedMergedForm, PreparedMergedForms};
+use effect::memory::{Bytes, MemoryError};
+use effect_server::ServerError;
+use std::num::NonZeroUsize;
 
 /// The `choices` lookup mode.
 pub const RELATION_LOOKUP_CHOICES: &str = "choices";
@@ -699,9 +703,11 @@ impl RelationSelection {
     /// The published selection identity, empty for an unadmitted selection.
     #[must_use]
     pub fn identity(&self) -> String {
-        self.value
-            .as_ref()
-            .map_or_else(String::new, |value| value.identity.clone())
+        self.identity_ref().to_owned()
+    }
+
+    fn identity_ref(&self) -> &str {
+        self.value.as_ref().map_or("", |value| value.identity.as_str())
     }
 
     /// Whether this selection was admitted for the supplied declaration.
@@ -715,12 +721,12 @@ impl RelationSelection {
         let Some(source) = descriptor.source_kind() else {
             return false;
         };
-        let Some(definition) = descriptor.definition() else {
+        let Some(definition) = descriptor.definition_ref() else {
             return false;
         };
         value.source == *source
             && value.relation == definition.name
-            && same_relation_definition(&value.declaration, &definition)
+            && same_relation_definition(&value.declaration, definition)
     }
 }
 
@@ -778,6 +784,10 @@ impl RelationLookupRecord {
             .as_ref()
             .map(|value| value.selection.clone())
             .unwrap_or_default()
+    }
+
+    fn selection_ref(&self) -> Option<&RelationSelection> {
+        self.value.as_ref().map(|value| &value.selection)
     }
 
     /// The supplied label.
@@ -1133,9 +1143,41 @@ pub struct RelationLookupOptions {
     pub request_language: Option<RequestLanguageFunc>,
 }
 
+/// Selected bounds for a relation page, selected targets and metadata.
+#[derive(Clone, Copy)]
+pub struct PreparedRelationLimits {
+    /// Maximum size of a page requested from the bound provider.
+    pub page_size: NonZeroUsize,
+    /// Maximum selected targets admitted for independent hydration.
+    pub selections: NonZeroUsize,
+    /// Maximum bytes in the request path and encoded query.
+    pub request: Bytes,
+    /// Maximum input metadata and maximum published provider metadata.
+    pub metadata: Bytes,
+}
+
+/// Resources used by the selected relation lookup path.
+pub struct PreparedRelationLookup<E> {
+    storage: Arc<PreparedMergedForms>,
+    limits: PreparedRelationLimits,
+    on_refusal: Arc<dyn Fn(ServerError) -> E + Send + Sync>,
+}
+
+impl<E> PreparedRelationLookup<E> {
+    /// Bind prepared query storage and the consumer's typed refusal mapping.
+    pub fn new(
+        storage: Arc<PreparedMergedForms>,
+        limits: PreparedRelationLimits,
+        on_refusal: impl Fn(ServerError) -> E + Send + Sync + 'static,
+    ) -> Self {
+        Self { storage, limits, on_refusal: Arc::new(on_refusal) }
+    }
+}
+
 /// The scoped relation lookup service.
 pub struct RelationLookupService<E: Send + 'static, R: Send + Sync + 'static> {
     value:Option<Arc<RelationLookupServiceValue<E,R>>>,
+    prepared: Option<Arc<PreparedRelationLookup<E>>>,
 }
 struct RelationLookupServiceValue<E:Send+'static,R:Send+Sync+'static>{
     resources: Arc<dyn Registry + Send + Sync>,
@@ -1163,12 +1205,31 @@ impl<E: Send + 'static, R: Send + Sync + 'static> RelationLookupService<E, R> {
                 "relation lookup service: definitions, bound lookup and positive configured page size are required",
             ));
         }
-        Ok(Self {value:Some(Arc::new(RelationLookupServiceValue{resources,binding,options}))})
+        Ok(Self {
+            value: Some(Arc::new(RelationLookupServiceValue { resources, binding, options })),
+            prepared: None,
+        })
+    }
+
+    /// Select bounded decoding and fanout for the existing lookup entry point.
+    #[must_use]
+    pub fn with_prepared_work(mut self, prepared: Arc<PreparedRelationLookup<E>>) -> Self {
+        self.prepared = Some(prepared);
+        self
     }
 }
 
-impl<E:Send+'static,R:Send+Sync+'static> Clone for RelationLookupService<E,R>{fn clone(&self)->Self{Self{value:self.value.clone()}}}
-impl<E:Send+'static,R:Send+Sync+'static> Default for RelationLookupService<E,R>{fn default()->Self{Self{value:None}}}
+impl<E: Send + 'static, R: Send + Sync + 'static> Clone for RelationLookupService<E, R> {
+    fn clone(&self) -> Self {
+        Self { value: self.value.clone(), prepared: self.prepared.clone() }
+    }
+}
+
+impl<E: Send + 'static, R: Send + Sync + 'static> Default for RelationLookupService<E, R> {
+    fn default() -> Self {
+        Self { value: None, prepared: None }
+    }
+}
 
 /// Construct the scoped relation lookup service.
 ///
@@ -1584,7 +1645,8 @@ struct RelationResolution<E: Send + 'static, R: Send + Sync + 'static> {
 
 /// One admitted lookup query.
 struct RelationAdmission<E: Send + 'static, R: Send + Sync + 'static> {
-    resolution: RelationResolution<E, R>,
+    request: Request,
+    lookup: RelationLookupFunc<E, R>,
     query: RelationQuery,
 }
 
@@ -1598,27 +1660,11 @@ struct RelationObserved<E: Send + 'static, R: Send + Sync + 'static> {
     revision: InputBytes,
 }
 
-impl<E: Send + 'static, R: Send + Sync + 'static> Clone for RelationResolution<E, R> {
-    fn clone(&self) -> Self {
-        Self {
-            request: self.request.clone(),
-            descriptor: self.descriptor.clone(),
-            admit: Arc::clone(&self.admit),
-            lookup: Arc::clone(&self.lookup),
-            options: self.options.clone(),
-            source_id: self.source_id.clone(),
-            revision: self.revision.clone(),
-            mode: self.mode.clone(),
-            selected: self.selected.clone(),
-            decode_error: self.decode_error.clone(),
-        }
-    }
-}
-
 impl<E: Send + 'static, R: Send + Sync + 'static> Clone for RelationAdmission<E, R> {
     fn clone(&self) -> Self {
         Self {
-            resolution: self.resolution.clone(),
+            request: self.request.clone(),
+            lookup: self.lookup.clone(),
             query: self.query.clone(),
         }
     }
@@ -1641,31 +1687,70 @@ where
         let service = self.clone();
         effect! {
             let service = service.clone();
-            let input = input.clone();
+            let prepared = service.prepared.clone();
             // Resolution reads the request cancellation source and queries the
             // consumer's definition registry, so it runs as part of the description's
             // execution: a registry update between construction and running is seen,
             // and constructing the description performs no work.
-            let admitted = match resolve_relation_lookup(&service, input) {
-                Ok(resolution) => admit_relation_query(resolution)?,
+            let (resolution, fields) = match prepare_lookup_fields(&service, &input, prepared.as_deref()) {
+                Ok(fields) => (resolve_relation_lookup(&service, &input), fields),
+                Err(outcome) => (Err(outcome), None),
+            };
+            let admitted = match resolution {
+                Ok(resolution) => admit_relation_query(resolution, fields.as_ref(), prepared.as_deref())?,
                 Err(outcome) => Err(outcome),
             };
             let observed = match admitted {
                 Ok(admission) => execute_relation_lookup(admission)?,
                 Err(outcome) => Err(outcome),
             };
-            Some(match observed {
-                Ok(observed) => publish_relation_lookup(observed),
+            let outcome = match observed {
+                Ok(observed) => publish_relation_lookup(observed, prepared.as_deref()),
                 Err(outcome) => outcome,
-            })
+            };
+            drop(fields);
+            Some(outcome)
         }
     }
+}
+
+fn prepare_lookup_fields<E: Send + 'static, R: Send + Sync + 'static>(
+    service: &RelationLookupService<E, R>,
+    input: &RelationLookupInput<E>,
+    prepared: Option<&PreparedRelationLookup<E>>,
+) -> Result<Option<PreparedMergedForm>, RelationLookupOutcome<E>> {
+    let (Some(service), Some(request), Some(prepared)) =
+        (service.value.as_ref(), input.request.as_ref(), prepared)
+    else {
+        return Ok(None);
+    };
+    if request.cancellation().is_requested() || input.decode_error.is_some() {
+        return Ok(None);
+    }
+    let limits = prepared.limits;
+    let fields = (|| {
+        check_request_bytes(request, limits.request)?;
+        if input.selected.len() > limits.selections.get()
+            || service.options.default_page_size.unsigned_abs() > limits.page_size.get() as u64
+        {
+            return Err(ServerError::Memory(MemoryError::NoSlot));
+        }
+        let mut metadata = [
+            input.source.as_str().len(), input.relation.len(), input.source_id.as_bytes().len(),
+            input.revision.as_bytes().len(), input.mode.as_str().len(),
+        ].into_iter().chain(input.selected.iter().map(|selection| selection.identity_ref().len()));
+        let bytes = metadata.try_fold(Bytes::new(0), |bytes, size| bytes.checked_add(Bytes::new(size)))
+            .map_err(ServerError::Memory)?;
+        check_capacity(bytes.get(), limits.metadata.get())?;
+        prepared.storage.read_query(request)
+    })();
+    fields.map(Some).map_err(|error| failed_consumer((prepared.on_refusal)(error)))
 }
 
 /// Resolve the input against the definitions and the constructor-bound capability.
 fn resolve_relation_lookup<E: Send + 'static, R: Send + Sync + 'static>(
     service: &RelationLookupService<E, R>,
-    input: RelationLookupInput<E>,
+    input: &RelationLookupInput<E>,
 ) -> Result<RelationResolution<E, R>, RelationLookupOutcome<E>> {
     let Some(service)=service.value.as_ref() else{return Err(rejected("relation lookup service is not constructed"))};
     let Some(binding) = service.binding.value.as_ref() else {
@@ -1681,17 +1766,22 @@ fn resolve_relation_lookup<E: Send + 'static, R: Send + Sync + 'static>(
     if request.cancellation().is_requested() {
         return Err(failed_cancelled());
     }
-    let definition = match service.resources.definition(&input.source) {
-        Ok(definition) => definition,
-        Err(error) => return Err(rejected(&error.to_string())),
-    };
-    let descriptor = match resolve_resource_relation(&definition, input.relation.as_str()) {
+    let mut descriptor = None;
+    service
+        .resources
+        .visit_definition(&input.source, &mut |definition| {
+            descriptor = Some(resolve_resource_relation(definition, input.relation.as_str()));
+        })
+        .map_err(|error| rejected(&error.to_string()))?;
+    let descriptor = match descriptor.ok_or_else(|| {
+        rejected(&crate::definitions::UnknownResourceKind::new(input.source.clone()).to_string())
+    })? {
         Ok(descriptor) => descriptor,
         Err(error) => return Err(rejected(&error.to_string())),
     };
     let relation_name = descriptor
-        .definition()
-        .map_or_else(String::new, |definition| definition.name);
+        .definition_ref()
+        .map_or("", |definition| definition.name.as_str());
     if binding.source != input.source || binding.relation != relation_name {
         return Err(rejected(
             "relation lookup does not match its constructor-bound source and relation",
@@ -1703,17 +1793,19 @@ fn resolve_relation_lookup<E: Send + 'static, R: Send + Sync + 'static>(
         admit: Arc::clone(&binding.admit),
         lookup: Arc::clone(&binding.lookup),
         options: service.options.clone(),
-        source_id: input.source_id,
-        revision: input.revision,
-        mode: input.mode,
-        selected: input.selected,
-        decode_error: input.decode_error,
+        source_id: input.source_id.clone(),
+        revision: input.revision.clone(),
+        mode: input.mode.clone(),
+        selected: input.selected.clone(),
+        decode_error: input.decode_error.clone(),
     })
 }
 
 /// Admit the lookup query and run the consumer's scope admission.
 fn admit_relation_query<E, R>(
     resolution: RelationResolution<E, R>,
+    fields: Option<&PreparedMergedForm>,
+    prepared: Option<&PreparedRelationLookup<E>>,
 ) -> Effect<Result<RelationAdmission<E, R>, RelationLookupOutcome<E>>, E, R>
 where
     E: fmt::Display + Send + 'static,
@@ -1751,7 +1843,11 @@ where
     let page = match &resolution.options.parse_named_page {
         Some(parse) => parse(&request, PAGE_QUERY_PARAM),
         None => {
-            let raw = request_query_value_untrimmed(&request, PAGE_QUERY_PARAM);
+            let raw = fields.map_or_else(
+                || request_query_value_untrimmed(&request, PAGE_QUERY_PARAM),
+                |fields| fields.values(PAGE_QUERY_PARAM.as_bytes()).next()
+                    .map(InputBytes::from).unwrap_or_default(),
+            );
             if raw.is_empty() {
                 1
             } else {
@@ -1777,9 +1873,9 @@ where
             ))
         }, };
     }
-    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
     for selection in &resolution.selected {
-        if !selection.matches(&resolution.descriptor) || !seen.insert(selection.identity()) {
+        if !selection.matches(&resolution.descriptor) || !seen.insert(selection.identity_ref()) {
             return effect_sync! { body: move || {
                 Err(rejected(
                     "selected target is invalid, duplicated or belongs to a different relation declaration",
@@ -1787,29 +1883,43 @@ where
             }, };
         }
     }
+    drop(seen);
     let locale = match &resolution.options.request_language {
-        Some(resolve) => resolve(&request).trim().to_owned(),
+        Some(resolve) => {
+            let locale = resolve(&request);
+            let locale = crate::validation::trim_unicode_whitespace(locale.as_bytes());
+            if let Some(prepared) = prepared
+                && let Err(error) = check_capacity(locale.len(), prepared.limits.metadata.get())
+            {
+                let outcome = failed_consumer((prepared.on_refusal)(error));
+                return effect_sync! { once; body: move || Err(outcome), };
+            }
+            InputBytes::from(locale)
+        }
         None => InputBytes::default(),
     };
-    let search = request_query_value(&request, SEARCH_QUERY_PARAM);
+    let search = fields.map_or_else(
+        || request_query_value(&request, SEARCH_QUERY_PARAM),
+        |fields| QueryValuesRef::Prepared(fields).trimmed(SEARCH_QUERY_PARAM),
+    );
     let query = RelationQuery::admit(
-        resolution.descriptor.clone(),
-        resolution.source_id.clone(),
-        resolution.revision.clone(),
+        resolution.descriptor,
+        resolution.source_id,
+        resolution.revision,
         search,
         locale,
-        resolution.mode.clone(),
+        resolution.mode,
         page,
         page_size,
-        resolution.selected.clone(),
+        resolution.selected,
     );
     if request.cancellation().is_requested() {
         return effect_sync! { body: move || Err(failed_cancelled()), };
     }
-    let admission = RelationAdmission { resolution, query };
-    let admit = Arc::clone(&admission.resolution.admit);
+    let admission = RelationAdmission { request: resolution.request, lookup: resolution.lookup, query };
+    let admit = resolution.admit;
     let callback_query = admission.query.clone();
-    let check = admission.resolution.request.clone();
+    let check = admission.request.clone();
     effect! {
         let admission = admission.clone();
         let check = check.clone();
@@ -1845,12 +1955,12 @@ where
     E: Send + 'static,
     R: Send + Sync + 'static,
 {
-    if admission.resolution.request.cancellation().is_requested() {
+    if admission.request.cancellation().is_requested() {
         return effect_sync! { body: move || Err(failed_cancelled()), };
     }
-    let lookup = Arc::clone(&admission.resolution.lookup);
+    let lookup = Arc::clone(&admission.lookup);
     let callback_query = admission.query.clone();
-    let request = admission.resolution.request.clone();
+    let request = admission.request.clone();
     effect! {
         let admission = admission.clone();
         let request = request.clone();
@@ -1931,6 +2041,7 @@ fn finish_observation<E: Send + 'static, R: Send + Sync + 'static>(
 /// Publish the validated observation as a closed outcome.
 fn publish_relation_lookup<E: Send + 'static, R: Send + Sync + 'static>(
     observed: RelationObserved<E, R>,
+    prepared: Option<&PreparedRelationLookup<E>>,
 ) -> RelationLookupOutcome<E> {
     let RelationObserved {
         admission,
@@ -1948,7 +2059,7 @@ fn publish_relation_lookup<E: Send + 'static, R: Send + Sync + 'static>(
     if !descriptor.is_valid() {
         return failed_message("relation lookup publication does not match its admitted query");
     }
-    if admission.resolution.request.cancellation().is_requested() {
+    if admission.request.cancellation().is_requested() {
         return failed_cancelled();
     }
     let row_count = i64::try_from(rows.len()).unwrap_or(i64::MAX);
@@ -1958,36 +2069,41 @@ fn publish_relation_lookup<E: Send + 'static, R: Send + Sync + 'static>(
     if !query_arc.revision.is_empty() && revision != query_arc.revision {
         return failed_message("relation lookup source revision changed");
     }
+    if let Some(prepared) = prepared
+        && let Err(error) = check_published_relation(&rows, &selected, &missing, &revision, prepared.limits)
+    {
+        return failed_consumer((prepared.on_refusal)(error));
+    }
     if let Err(message) = validate_relation_records(&descriptor, &rows) {
         return failed_message(message);
     }
     if let Err(message) = validate_relation_records(&descriptor, &selected) {
         return failed_message(message);
     }
-    let requested: BTreeSet<String> = query_arc
+    let requested: BTreeSet<&str> = query_arc
         .selected
         .iter()
-        .map(RelationSelection::identity)
+        .map(RelationSelection::identity_ref)
         .collect();
-    let mut accounted: BTreeSet<String> = BTreeSet::new();
+    let mut accounted: BTreeSet<&str> = BTreeSet::new();
     for record in &selected {
-        let identity = record.selection().identity();
-        if !requested.contains(&identity) || !accounted.insert(identity) {
+        let identity = record.selection_ref().map_or("", RelationSelection::identity_ref);
+        if !requested.contains(identity) || !accounted.insert(identity) {
             return failed_message("relation lookup hydrated an unrequested or repeated selection");
         }
     }
     for selection in &missing {
-        let identity = selection.identity();
+        let identity = selection.identity_ref();
         if !selection.belongs_to(&descriptor)
-            || !requested.contains(&identity)
-            || !accounted.insert(identity.clone())
+            || !requested.contains(identity)
+            || !accounted.insert(identity)
         {
             return failed_message(
                 "relation lookup returned an invalid, repeated or overlapping missing selection",
             );
         }
         for record in &rows {
-            if record.selection().identity() == identity {
+            if record.selection_ref().is_some_and(|selection| selection.identity_ref() == identity) {
                 return failed_message("relation lookup marked a visible page record unavailable");
             }
         }
@@ -1995,6 +2111,8 @@ fn publish_relation_lookup<E: Send + 'static, R: Send + Sync + 'static>(
     if accounted.len() != requested.len() {
         return failed_message("relation lookup omitted requested selection availability");
     }
+    drop(accounted);
+    drop(requested);
     let has_records = !rows.is_empty() || !selected.is_empty();
     let result = RelationLookupResult {
         publication: Some(Arc::new(RelationLookupPublication {
@@ -2013,18 +2131,36 @@ fn publish_relation_lookup<E: Send + 'static, R: Send + Sync + 'static>(
     }
 }
 
+fn check_published_relation(
+    rows: &[RelationLookupRecord],
+    selected: &[RelationLookupRecord],
+    missing: &[RelationSelection],
+    revision: &InputBytes,
+    limits: PreparedRelationLimits,
+) -> Result<(), ServerError> {
+    let fanout = selected.len().checked_add(missing.len())
+        .ok_or(ServerError::Memory(MemoryError::ArithmeticOverflow))?;
+    if fanout > limits.selections.get() {
+        return Err(ServerError::Memory(MemoryError::NoSlot));
+    }
+    let mut sizes = rows.iter().chain(selected).filter_map(|record| record.value.as_ref())
+        .flat_map(|record| [record.selection.identity_ref().len(), record.label.len(), record.href.len()])
+        .chain(missing.iter().map(|selection| selection.identity_ref().len()));
+    let bytes = sizes.try_fold(Bytes::new(revision.as_bytes().len()), |bytes, size| bytes.checked_add(Bytes::new(size)))
+        .map_err(ServerError::Memory)?;
+    check_capacity(bytes.get(), limits.metadata.get())
+}
+
 /// Validate one record collection against the admitted declaration.
 fn validate_relation_records(
     descriptor: &ResourceRelationDescriptor,
     records: &[RelationLookupRecord],
 ) -> Result<(), &'static str> {
-    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
     for record in records {
-        let selection = record.selection();
-        if !record.is_valid()
-            || !selection.belongs_to(descriptor)
-            || !seen.insert(selection.identity())
-        {
+        if !record.selection_ref().is_some_and(|selection| {
+            selection.belongs_to(descriptor) && seen.insert(selection.identity_ref())
+        }) {
             return Err(
                 "relation lookup returned an invalid, repeated or mismatched target record",
             );

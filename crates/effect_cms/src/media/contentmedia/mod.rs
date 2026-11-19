@@ -7,6 +7,12 @@
 use serde::{Deserialize, Serialize};
 
 mod decode;
+mod prepared;
+
+pub use prepared::{
+    MediaDecodeLimits, PreparedContentMedia, PreparedContentVideo, PreparedMediaDecoder, PreparedMediaError,
+    write_content_media_json, write_content_video_json,
+};
 
 use crate::attachments::{MediaAttachmentFormItem, normalize_media_attachment_role};
 use crate::commands::InputBytes;
@@ -137,7 +143,7 @@ pub fn marshal_content_media_json(
     if items.is_empty() {
         return Ok("[]".to_owned());
     }
-    serde_json::to_string(items).map(escape_json_html)
+    encoded_json(items)
 }
 
 /// Parse a stored hero video.
@@ -189,25 +195,15 @@ pub fn parse_content_media_json(
 pub fn marshal_content_video_json(
     video: Option<&ContentVideo>,
 ) -> Result<Option<String>, serde_json::Error> {
-    video
-        .map(serde_json::to_string)
-        .transpose()
-        .map(|encoded| encoded.map(escape_json_html))
+    video.map(encoded_json).transpose()
 }
 
-fn escape_json_html(json: String) -> String {
-    let mut escaped = String::with_capacity(json.len());
-    for character in json.chars() {
-        match character {
-            '<' => escaped.push_str("\\u003c"),
-            '>' => escaped.push_str("\\u003e"),
-            '&' => escaped.push_str("\\u0026"),
-            '\u{2028}' => escaped.push_str("\\u2028"),
-            '\u{2029}' => escaped.push_str("\\u2029"),
-            _ => escaped.push(character),
-        }
-    }
-    escaped
+fn encoded_json<T: Serialize + ?Sized>(value: &T) -> Result<String, serde_json::Error> {
+    let mut bytes = Vec::new();
+    prepared::encode_json(value, &mut bytes)?;
+    String::from_utf8(bytes).map_err(|error| serde_json::Error::io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData, error,
+    )))
 }
 
 /// Derive the hero image and video from presented attachment rows.

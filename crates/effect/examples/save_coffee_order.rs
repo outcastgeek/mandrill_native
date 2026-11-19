@@ -1,6 +1,6 @@
 //! Maya corrects an online coffee order, saves her draft, and reloads it later.
 //!
-//! Run: `cargo +1.99.0 run -p effect --example save_coffee_order`.
+//! Run: `cargo +1.100.0 run -p effect --example save_coffee_order`.
 //! CoffeeOrder, Drink, Milk, Size, and OrderProblem are application models.
 //! Effect's schemas validate their wire shape; the café validates business rules.
 //! The draft store is local memory and does not survive restarting this example.

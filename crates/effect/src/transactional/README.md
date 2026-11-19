@@ -8,10 +8,25 @@ A cell occupies domain capacity while a `TxRef`, transaction description, or sub
 
 `TxSubscriptionRef` exposes committed values through the common reactive source contract. Subscription captures its initial version and value together, then registers a waiter before checking for the next version. Rolled-back writes are not published.
 
+`TransactionDomain::prepare` selects region-backed cell records, attempt
+journals and retry registrations. Use `PreparedTxValuePool` and
+`PreparedTxRef` for immutable payloads that retain their region after a
+replacement or reference drop. Build reusable transaction descriptions before
+executing them. An arbitrary caller callback can still allocate its own
+pointees or construct new descriptions.
+
+`PreparedTxQueueStorage` reserves the FIFO's item payloads and immutable queue
+snapshots. `PreparedTxQueue::prepare_item` checks out an item slot before it can
+be offered. Empty takes retry through the journal's prepared observation path.
+Offer and take build reusable transactions and share item owners across versions
+without cloning the payloads. A taken item retains its slot after the queue
+advances. Size the snapshot count for the committed version and all simultaneous
+staged or retained versions.
+
 Run the [coffee basket story](../../examples/live_coffee_basket.rs) to reserve all selected drinks together:
 
 ```sh
-cargo +1.99.0 run --locked -p effect --example live_coffee_basket
+cargo +1.100.0 run --locked -p effect --example live_coffee_basket
 ```
 
 See the [provider-neutral example](../../tests/fixtures/shared/provider_program.rs),

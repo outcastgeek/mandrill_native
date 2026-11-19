@@ -196,81 +196,32 @@ impl TrustedForwarding {
                 authority: None,
             });
         }
-        let (chain, scheme, authority) = match self.header {
+        let (client, scheme, authority) = match self.header {
             ForwardedHeader::Legacy => {
                 let chain = header_list(headers, "x-forwarded-for", self.hops)?;
                 let scheme = header_list(headers, "x-forwarded-proto", self.hops)?
-                    .last()
-                    .cloned();
+                    .next_back();
                 let authority = header_list(headers, "x-forwarded-host", self.hops)?
-                    .last()
-                    .cloned();
-                (chain, scheme, authority)
+                    .next_back();
+                (self.follow_chain(peer.ip(), chain.rev().map(Ok))?, scheme, authority)
             }
             ForwardedHeader::Standard => {
                 let entries = header_list(headers, "forwarded", self.hops)?;
-                let mut chain = Vec::new();
-                let mut scheme = None;
-                let mut authority = None;
+                // Validate all entries in wire order before following only the trusted suffix.
+                let mut last = None;
                 for entry in entries {
-                    let mut address = None;
-                    let mut entry_scheme = None;
-                    let mut entry_host = None;
-                    for pair in entry.split(';') {
-                        let (name, value) = pair
-                            .trim()
-                            .split_once('=')
-                            .ok_or_else(|| WebError::Metadata("Forwarded pair".into()))?;
-                        let value = forwarded_value(value)?;
-                        match name.to_ascii_lowercase().as_str() {
-                            "for" => {
-                                if address.replace(value.to_owned()).is_some() {
-                                    return Err(WebError::Metadata(
-                                        "duplicate Forwarded for".into(),
-                                    ));
-                                }
-                            }
-                            "proto" => {
-                                if entry_scheme.replace(value.to_owned()).is_some() {
-                                    return Err(WebError::Metadata(
-                                        "duplicate Forwarded proto".into(),
-                                    ));
-                                }
-                            }
-                            "host" => {
-                                if entry_host.replace(value.to_owned()).is_some() {
-                                    return Err(WebError::Metadata(
-                                        "duplicate Forwarded host".into(),
-                                    ));
-                                }
-                            }
-                            "by" => {}
-                            _ => {}
-                        }
-                    }
-                    chain.push(address.ok_or_else(|| WebError::Metadata("Forwarded for".into()))?);
-                    scheme = entry_scheme;
-                    authority = entry_host;
+                    last = Some(forwarded_entry(entry)?);
                 }
-                (chain, scheme, authority)
+                let chain = header_items(headers, "forwarded")
+                    .rev()
+                    .map(|entry| forwarded_entry(entry).map(|value| value.client));
+                let client = self.follow_chain(peer.ip(), chain)?;
+                (client, last.and_then(|entry| entry.scheme), last.and_then(|entry| entry.authority))
             }
         };
-        let mut client = peer.ip();
-        for address in chain.iter().rev() {
-            if !self.peers.contains(&client) {
-                break;
-            }
-            client = address
-                .strip_prefix('[')
-                .and_then(|value| value.strip_suffix(']'))
-                .unwrap_or(address)
-                .parse::<IpAddr>()
-                .or_else(|_| address.parse::<SocketAddr>().map(|a| a.ip()))
-                .map_err(|_| WebError::Metadata("forwarded client address".into()))?;
-        }
         let scheme = scheme
             .map(|value| {
-                if matches!(value.as_str(), "http" | "https") {
+                if matches!(value, "http" | "https") {
                     Ok(Arc::from(value))
                 } else {
                     Err(WebError::Metadata("forwarded scheme".into()))
@@ -293,6 +244,61 @@ impl TrustedForwarding {
             authority,
         })
     }
+
+    fn follow_chain<'a>(
+        &self,
+        mut client: IpAddr,
+        addresses: impl Iterator<Item = Result<&'a str, WebError>>,
+    ) -> Result<IpAddr, WebError> {
+        for address in addresses {
+            if !self.peers.contains(&client) {
+                break;
+            }
+            let address = address?;
+            client = address
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                .unwrap_or(address)
+                .parse::<IpAddr>()
+                .or_else(|_| address.parse::<SocketAddr>().map(|a| a.ip()))
+                .map_err(|_| WebError::Metadata("forwarded client address".into()))?;
+        }
+        Ok(client)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ForwardedEntry<'a> {
+    client: &'a str,
+    scheme: Option<&'a str>,
+    authority: Option<&'a str>,
+}
+
+fn forwarded_entry(entry: &str) -> Result<ForwardedEntry<'_>, WebError> {
+    let mut client = None;
+    let mut scheme = None;
+    let mut authority = None;
+    for pair in entry.split(';') {
+        let (name, value) = pair
+            .trim()
+            .split_once('=')
+            .ok_or_else(|| WebError::Metadata("Forwarded pair".into()))?;
+        let value = forwarded_value(value)?;
+        let (target, duplicate) = if name.eq_ignore_ascii_case("for") {
+            (&mut client, "duplicate Forwarded for")
+        } else if name.eq_ignore_ascii_case("proto") {
+            (&mut scheme, "duplicate Forwarded proto")
+        } else if name.eq_ignore_ascii_case("host") {
+            (&mut authority, "duplicate Forwarded host")
+        } else {
+            continue;
+        };
+        if target.replace(value).is_some() {
+            return Err(WebError::Metadata(duplicate.into()));
+        }
+    }
+    let client = client.ok_or_else(|| WebError::Metadata("Forwarded for".into()))?;
+    Ok(ForwardedEntry { client, scheme, authority })
 }
 /// Strict RFC token/quoted value handling. Supported address/host values never
 /// need quoted escapes; rejecting them prevents ambiguous proxy-chain parsing.
@@ -318,24 +324,33 @@ fn forwarded_value(value: &str) -> Result<&str, WebError> {
     Ok(value)
 }
 /// Read a bounded comma-separated native header list before interpreting addresses.
-fn header_list(
-    headers: &HeaderMap,
+fn header_list<'a>(
+    headers: &'a HeaderMap,
     name: &'static str,
     maximum: NonZeroUsize,
-) -> Result<Vec<String>, WebError> {
-    let mut values = Vec::new();
+) -> Result<impl DoubleEndedIterator<Item = &'a str>, WebError> {
+    let mut count = 0;
     for header in headers.get_all(name) {
         let header = header
             .to_str()
             .map_err(|_| WebError::Metadata(name.into()))?;
         for value in header.split(',') {
-            if values.len() == maximum.get() || value.trim().is_empty() {
+            if count == maximum.get() || value.trim().is_empty() {
                 return Err(WebError::Metadata(name.into()));
             }
-            values.push(value.trim().to_owned());
+            count += 1;
         }
     }
-    Ok(values)
+    Ok(header_items(headers, name))
+}
+
+fn header_items<'a>(
+    headers: &'a HeaderMap,
+    name: &'static str,
+) -> impl DoubleEndedIterator<Item = &'a str> {
+    headers.get_all(name).into_iter().flat_map(|header| {
+        header.to_str().ok().into_iter().flat_map(|value| value.split(',').map(str::trim))
+    })
 }
 /// Prepared HSTS policy. Max age is explicitly supplied in whole seconds.
 #[derive(Clone, Copy)]
@@ -428,6 +443,13 @@ impl MethodOverride {
             field,
         })
     }
+    /// Physical bytes for one complete prepared fallback form. Use this size
+    /// for the decoded slots shared by prepared Web requests and endpoints.
+    pub fn prepared_form_storage_bytes(
+        &self,
+    ) -> Result<Option<effect::memory::Bytes>, effect::memory::MemoryError> {
+        self.form.map(FormPolicy::prepared_storage_bytes).transpose()
+    }
     /// Resolve the selected method with header precedence. Form fallback consumes
     /// only URL-encoded media through the existing compatible Request owner; other
     /// media remains unread, and duplicate/malformed native content types fail.
@@ -438,70 +460,43 @@ impl MethodOverride {
         if request.method() != Method::POST {
             return Ok(None);
         }
-        let headers = request
-            .headers()
-            .get_all(&self.header)
-            .iter()
-            .collect::<Vec<_>>();
-        let selected = match headers.as_slice() {
-            [] => None,
-            [value] => Some(
-                value
-                    .to_str()
-                    .map_err(|_| effect_server::ServerError::Invalid("method override".into()))?
-                    .to_owned(),
-            ),
-            _ => {
+        let headers = request.headers().get_all(&self.header);
+        let mut values = headers.iter();
+        if let Some(value) = values.next() {
+            if values.next().is_some() {
                 return Err(effect_server::ServerError::Duplicate(
                     "method override".into(),
                 ));
             }
-        };
-        let selected = match (selected, self.form) {
-            (Some(value), _) => Some(value),
-            (None, None) => None,
-            (None, Some(policy)) => {
-                let content_type =
-                    request.singleton_header::<effect_server::native::headers::ContentType>()?;
-                if !content_type.is_some_and(|value| {
-                    value.to_string().split(';').next().is_some_and(|media| {
-                        media
-                            .trim()
-                            .eq_ignore_ascii_case("application/x-www-form-urlencoded")
-                    })
-                }) {
-                    return Ok(None);
-                }
-                let form = request.read_form(policy).await?;
-                match form
-                    .values
-                    .get(self.field.as_ref())
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[])
-                {
-                    [] => None,
-                    [value] => Some(value.clone()),
-                    _ => {
-                        return Err(effect_server::ServerError::Duplicate(
-                            self.field.to_string(),
-                        ));
-                    }
-                }
-            }
-        };
-        selected
-            .map(|value| {
-                let method = Method::from_bytes(value.as_bytes())
-                    .map_err(|_| effect_server::ServerError::Invalid("method override".into()))?;
-                if self.allowed.contains(&method) {
-                    Ok(method)
-                } else {
-                    Err(effect_server::ServerError::Invalid(
-                        "method override allowlist".into(),
-                    ))
-                }
-            })
-            .transpose()
+            let value = value
+                .to_str()
+                .map_err(|_| effect_server::ServerError::Invalid("method override".into()))?;
+            return self.allowed_method(value).map(Some);
+        }
+        let Some(policy) = self.form else { return Ok(None) };
+        let content_type = request.singleton_header::<effect_server::native::headers::ContentType>()?;
+        if content_type.is_none() || !request.headers().get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/x-www-form-urlencoded"))
+        {
+            return Ok(None);
+        }
+        request.with_form_value(policy, &self.field, |value| {
+            value.map(|value| self.allowed_method(value)).transpose()
+        }).await
+    }
+
+    fn allowed_method(&self, value: &str) -> Result<Method, effect_server::ServerError> {
+        let method = Method::from_bytes(value.as_bytes())
+            .map_err(|_| effect_server::ServerError::Invalid("method override".into()))?;
+        if self.allowed.contains(&method) {
+            Ok(method)
+        } else {
+            Err(effect_server::ServerError::Invalid(
+                "method override allowlist".into(),
+            ))
+        }
     }
 }
 /// Application-owned request guard; `false` is an explicit rejection decision,
@@ -614,12 +609,26 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Security<E, R> {
         nonce: Option<&ResponseNonce>,
         secure_transport: bool,
     ) -> Result<(), WebError> {
-        let mut replaced = std::collections::BTreeSet::new();
-        for (name, value) in &self.headers {
-            if replaced.insert(name.as_str()) {
-                headers.remove(name);
+        self.wrap_headers_with(
+            headers,
+            secure_transport,
+            |csp| csp.header(nonce),
+            || self.hsts.map(HstsPolicy::header).transpose(),
+        )
+    }
+
+    pub(crate) fn wrap_headers_with(
+        &self,
+        headers: &mut HeaderMap,
+        secure_transport: bool,
+        bind_csp: impl FnOnce(&Csp) -> Result<HeaderValue, WebError>,
+        bind_hsts: impl FnOnce() -> Result<Option<HeaderValue>, WebError>,
+    ) -> Result<(), WebError> {
+        for name in self.headers.keys() {
+            headers.remove(name);
+            for value in self.headers.get_all(name) {
+                headers.append(name.clone(), value.clone());
             }
-            headers.append(name.clone(), value.clone());
         }
         if let Some(defaults) = &self.browser_defaults {
             headers.insert(
@@ -630,10 +639,10 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Security<E, R> {
             headers.insert("x-frame-options", defaults.frame.clone());
         }
         if let Some(csp) = &self.csp {
-            headers.insert("content-security-policy", csp.header(nonce)?);
+            headers.insert("content-security-policy", bind_csp(csp)?);
         }
-        if secure_transport && let Some(hsts) = self.hsts {
-            headers.insert(http::header::STRICT_TRANSPORT_SECURITY, hsts.header()?);
+        if secure_transport && let Some(hsts) = bind_hsts()? {
+            headers.insert(http::header::STRICT_TRANSPORT_SECURITY, hsts);
         }
         Ok(())
     }

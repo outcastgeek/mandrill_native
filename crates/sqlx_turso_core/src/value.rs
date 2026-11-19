@@ -1,5 +1,6 @@
 use sqlx_core::impl_encode_for_option;
 use std::{borrow::Cow, sync::Arc};
+#[cfg(feature = "time")]
 use time::macros::format_description;
 
 use sqlx_core::{
@@ -12,7 +13,67 @@ use sqlx_core::{
     value::ValueRef,
 };
 
-use crate::{Turso, TursoAdapterError, TursoTypeInfo};
+use crate::{Turso, TursoAdapterError, TursoTypeInfo, prepared_rows::RowBytes};
+use std::{
+    fmt,
+    ops::{Deref, Range},
+};
+
+#[derive(Clone)]
+pub(crate) enum TextValue {
+    Native(String),
+    Prepared(Arc<RowBytes>, Range<usize>),
+}
+impl Deref for TextValue {
+    type Target = str;
+    #[expect(
+        clippy::unreachable,
+        reason = "prepared spans are checked while copying valid UTF-8 and frozen before publication"
+    )]
+    fn deref(&self) -> &str {
+        match self {
+            Self::Native(s) => s,
+            Self::Prepared(bytes, range) => std::str::from_utf8(
+                bytes
+                    .0
+                    .get(range.clone())
+                    .unwrap_or_else(|| unreachable!("validated text span")),
+            )
+            .unwrap_or_else(|_| unreachable!("validated UTF-8")),
+        }
+    }
+}
+impl fmt::Debug for TextValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+#[derive(Clone)]
+pub(crate) enum BlobValue {
+    Native(Vec<u8>),
+    Prepared(Arc<RowBytes>, Range<usize>),
+}
+impl Deref for BlobValue {
+    type Target = [u8];
+    #[expect(
+        clippy::unreachable,
+        reason = "prepared spans are checked before frozen byte publication"
+    )]
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Native(s) => s,
+            Self::Prepared(bytes, range) => bytes
+                .0
+                .get(range.clone())
+                .unwrap_or_else(|| unreachable!("validated blob span")),
+        }
+    }
+}
+impl fmt::Debug for BlobValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
 
 /// Owned Turso value
 #[derive(Clone, Debug, Default)]
@@ -27,8 +88,8 @@ pub(crate) enum TursoValueKind {
     Null,
     Integer(i64),
     Real(f64),
-    Text(String),
-    Blob(Vec<u8>),
+    Text(TextValue),
+    Blob(BlobValue),
 }
 
 impl TursoValue {
@@ -54,13 +115,17 @@ impl TursoValue {
             },
             turso::Value::Text(value) => Self {
                 type_info: TursoTypeInfo::new("TEXT"),
-                kind: TursoValueKind::Text(value),
+                kind: TursoValueKind::Text(TextValue::Native(value)),
             },
             turso::Value::Blob(value) => Self {
                 type_info: TursoTypeInfo::new("BLOB"),
-                kind: TursoValueKind::Blob(value),
+                kind: TursoValueKind::Blob(BlobValue::Native(value)),
             },
         }
+    }
+
+    pub(crate) fn prepared(kind: TursoValueKind, type_info: TursoTypeInfo) -> Self {
+        Self { kind, type_info }
     }
 
     pub(crate) fn with_type_info(mut self, type_info: TursoTypeInfo) -> Self {
@@ -88,14 +153,14 @@ impl TursoValue {
     pub(crate) fn text(value: impl Into<String>) -> Self {
         Self {
             type_info: TursoTypeInfo::new("TEXT"),
-            kind: TursoValueKind::Text(value.into()),
+            kind: TursoValueKind::Text(TextValue::Native(value.into())),
         }
     }
 
     pub(crate) fn blob(value: impl Into<Vec<u8>>) -> Self {
         Self {
             type_info: TursoTypeInfo::new("BLOB"),
-            kind: TursoValueKind::Blob(value.into()),
+            kind: TursoValueKind::Blob(BlobValue::Native(value.into())),
         }
     }
 
@@ -104,9 +169,34 @@ impl TursoValue {
             TursoValueKind::Null => turso::Value::Null,
             TursoValueKind::Integer(value) => turso::Value::Integer(value),
             TursoValueKind::Real(value) => turso::Value::Real(value),
-            TursoValueKind::Text(value) => turso::Value::Text(value),
-            TursoValueKind::Blob(value) => turso::Value::Blob(value),
+            TursoValueKind::Text(TextValue::Native(value)) => turso::Value::Text(value),
+            TursoValueKind::Text(value) => turso::Value::Text(value.to_string()),
+            TursoValueKind::Blob(BlobValue::Native(value)) => turso::Value::Blob(value),
+            TursoValueKind::Blob(value) => turso::Value::Blob(value.to_vec()),
         }
+    }
+
+    /// Retain native buffers by move; reserve only copies of prepared spans.
+    pub(crate) fn try_into_turso(self) -> Result<turso::Value, std::collections::TryReserveError> {
+        Ok(match self.kind {
+            TursoValueKind::Null => turso::Value::Null,
+            TursoValueKind::Integer(value) => turso::Value::Integer(value),
+            TursoValueKind::Real(value) => turso::Value::Real(value),
+            TursoValueKind::Text(TextValue::Native(value)) => turso::Value::Text(value),
+            TursoValueKind::Text(value) => {
+                let mut copy = String::new();
+                copy.try_reserve_exact(value.len())?;
+                copy.push_str(&value);
+                turso::Value::Text(copy)
+            }
+            TursoValueKind::Blob(BlobValue::Native(value)) => turso::Value::Blob(value),
+            TursoValueKind::Blob(value) => {
+                let mut copy = Vec::new();
+                copy.try_reserve_exact(value.len())?;
+                copy.extend_from_slice(&value);
+                turso::Value::Blob(copy)
+            }
+        })
     }
 }
 

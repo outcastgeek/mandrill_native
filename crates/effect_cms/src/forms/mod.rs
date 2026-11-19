@@ -59,6 +59,7 @@ mod draft;
 mod localized_tabs;
 mod mode;
 mod page;
+mod prepared_input;
 mod relation_form;
 mod sections;
 mod service;
@@ -104,6 +105,8 @@ pub use self::localized_tabs::{
 pub use self::mode::{
     Action, ModeDecision, decide_mode, filter_form_actions, filter_submit_actions, hidden_action,
 };
+pub use self::prepared_input::{MergedFormCapacity, PreparedMergedForm, PreparedMergedForms};
+pub use crate::form_media::{InitializeForm, MergedFormPolicy};
 pub use self::page::{
     EditPageFunc, FormPageBinding, FormPageSource, NewPageFunc, PageFunc, RehydratePageFunc,
     ResourceFormFrame, bind_form_page_source, build_resource_form_page,

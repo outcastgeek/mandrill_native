@@ -1,30 +1,77 @@
 //! Lifetime ownership and ordered asynchronous finalization.
+#![doc = include_str!("scope/README.md")]
 
 use crate::LibraryDefect;
-use crate::internal::destruction::FlatDrop;
+use crate::internal::runtime_storage::{Consume, Once, Settlement};
+use crate::memory::{FrameReservation, RuntimeFrame};
+
+mod link;
+mod prepared;
+mod storage;
 use crate::internal::notification::notify_all;
 use crate::internal::outcome;
 use crate::internal::runtime::{self, Finish, Step};
 use crate::{Defect, Effect, Exit, Release, ResourceBinding, ResourceValue};
 use event_listener::Event;
+use link::ScopeLink;
+pub(crate) use prepared::PreparedScopeEntry;
+pub use prepared::{
+    PreparedCheckpoint, PreparedCleanupDemand, PreparedCloseWait, PreparedFutureResourceBinding,
+    PreparedFutureResourcePlan, PreparedRelease, PreparedReleasePlan, PreparedResourceBinding,
+    PreparedResourceDemand, PreparedResourcePlan, PreparedResourceValue, PreparedScope,
+    PreparedScopeAdmissionError, PreparedScopeClose, PreparedScopeCloseDemand, PreparedScopeDemand,
+    PreparedScopeLimits, PreparedScopeOwner, PreparedScopePool,
+};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
-/// Type alias for finalizer in scope.
-///
-/// # Type parameters
-/// - `E`: Domain-error type.
-type Finalizer<E> = Box<dyn FnOnce(Finish<(), E>) -> Step + Send>;
+pub(crate) struct UnitRetirement<E: Send + 'static> {
+    // A weak link prevents the Fiber retained by its finalizer from retaining
+    // the scope. The cookie is compared only; the finalizer owns the Fiber
+    // while it is present, so its address cannot be reused for another entry.
+    scope: std::sync::Weak<Inner<E>>,
+    tag: usize,
+}
+impl<E: Send + 'static> UnitRetirement<E> {
+    pub(crate) fn retire(self) {
+        let Some(scope) = self.scope.upgrade() else {
+            return;
+        };
+        let removed = {
+            let mut state = scope
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.phase != Phase::Open {
+                None
+            } else {
+                state.finalizers.remove_tag(self.tag)
+            }
+        };
+        // Scope close may already have taken the entry. In that case its normal
+        // cleanup owns it. Never run abandon or destroy captures under the gate.
+        if let Some(mut registered) = removed {
+            registered.abandon = None;
+            drop(registered);
+        }
+    }
+}
+pub(crate) use storage::FinalizerBatch;
+
 /// Typed registered used by scope.
 ///
 /// # Type parameters
 /// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 pub(crate) struct Registered<E: Send + 'static> {
-    operation: Option<FlatDrop<Finalizer<E>>>,
-    abandon: Option<Box<dyn FnOnce() + Send>>,
+    operation: Option<Once<Finish<(), E>, Step>>,
+    abandon: Option<Once<(), ()>>,
+    retirement_tag: Option<usize>,
 }
 
 impl<E: Send + 'static> Registered<E> {
+    pub(crate) fn set_retirement_tag(&mut self, tag: usize) {
+        self.retirement_tag = Some(tag);
+    }
     /// # Type parameters
     /// - `E`: Domain-error type.
     ///
@@ -35,8 +82,20 @@ impl<E: Send + 'static> Registered<E> {
     /// Type: `Self`.
     pub(crate) fn new(callback: impl FnOnce(Finish<(), E>) -> Step + Send + 'static) -> Self {
         Self {
-            operation: Some(FlatDrop::new(Box::new(callback))),
+            operation: Some(Once::system(callback)),
             abandon: None,
+            retirement_tag: None,
+        }
+    }
+
+    fn from_prepared<T: Consume<Finish<(), E>, Step> + Send + 'static>(
+        reservation: FrameReservation<'static, T>,
+        callback: T,
+    ) -> Self {
+        Self {
+            operation: Some(Once::prepared(reservation, callback)),
+            abandon: None,
+            retirement_tag: None,
         }
     }
 
@@ -54,7 +113,22 @@ impl<E: Send + 'static> Registered<E> {
         abandon: impl FnOnce() + Send + 'static,
     ) -> Self {
         let mut registered = Self::new(callback);
-        registered.abandon = Some(Box::new(abandon));
+        registered.abandon = Some(Once::system(move |()| abandon()));
+        registered
+    }
+
+    pub(crate) fn with_prepared_abandon<T, A>(
+        operation: FrameReservation<'static, T>,
+        release: T,
+        abandon: FrameReservation<'static, A>,
+        abandoned: A,
+    ) -> Self
+    where
+        T: Consume<Finish<(), E>, Step> + Send + 'static,
+        A: Consume<(), ()> + Send + 'static,
+    {
+        let mut registered = Self::from_prepared(operation, release);
+        registered.abandon = Some(Once::prepared(abandon, abandoned));
         registered
     }
 
@@ -66,12 +140,56 @@ impl<E: Send + 'static> Registered<E> {
     ///
     /// # Returns
     /// Type: `Step`.
-    pub(crate) fn execute(mut self, finish: Finish<(), E>) -> Step {
+    pub(crate) fn from_prepared_settlement<T, G, A>(
+        reservation: FrameReservation<'static, Settlement<T, G>>,
+        value: Settlement<T, G>,
+        abandon: FrameReservation<'static, A>,
+        abandoned: A,
+    ) -> Self
+    where
+        T: Consume<Finish<(), E>, Step> + Send + 'static,
+        G: Send + 'static,
+        A: Consume<(), ()> + Send + 'static,
+    {
+        Self {
+            operation: Some(Once::prepared_settlement(reservation, value)),
+            abandon: Some(Once::prepared(abandon, abandoned)),
+            retirement_tag: None,
+        }
+    }
+    pub(crate) fn execute(self, finish: Finish<(), E>) -> Step {
+        self.execute_with(move |frame| match frame {
+            None => finish,
+            Some(frame) => runtime::continuation_retained(
+                move |outcome| finish.call(outcome).unwrap_or(Step::Done),
+                Some(frame),
+            ),
+        })
+    }
+    pub(crate) fn execute_with(
+        self,
+        build: impl FnOnce(Option<RuntimeFrame>) -> Finish<(), E>,
+    ) -> Step {
+        self.execute_with_missing(build, runtime::finish)
+    }
+    pub(crate) fn execute_prepared_with(
+        self,
+        build: impl FnOnce(Option<RuntimeFrame>) -> Finish<(), E>,
+    ) -> Step {
+        self.execute_with_missing(build, |finish, outcome| {
+            finish.call(outcome).unwrap_or(Step::Done)
+        })
+    }
+    fn execute_with_missing(
+        mut self,
+        build: impl FnOnce(Option<RuntimeFrame>) -> Finish<(), E>,
+        missing: impl FnOnce(Finish<(), E>, Exit<(), E>) -> Step,
+    ) -> Step {
         self.abandon = None;
-        match self.operation.take().and_then(FlatDrop::take) {
-            Some(callback) => callback(finish),
-            None => runtime::finish(
-                finish,
+        match self.operation.take() {
+            Some(callback) => callback.call_with(build).unwrap_or(Step::Done),
+            None => missing(
+                build(None),
                 Exit::Die(Defect::from(LibraryDefect::ScopeFinalizerConsumed)),
             ),
         }
@@ -84,9 +202,14 @@ impl<E: Send + 'static> Drop for Registered<E> {
     /// Type: `()`.
     fn drop(&mut self) {
         if let Some(abandon) = self.abandon.take() {
-            abandon();
+            let _ = abandon.call(());
         }
     }
+}
+
+enum RegistrationError<E: Send + 'static> {
+    Closed(Registered<E>),
+    Full(Registered<E>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,7 +226,11 @@ enum Phase {
 /// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct State<E: Send + 'static> {
     phase: Phase,
-    finalizers: Vec<Registered<E>>,
+    prepared_waiters: prepared::closed::Waiters,
+    finalizers: FinalizerBatch<E>,
+    reserved_entries: usize,
+    segments_in_use: usize,
+    segment_limit: Option<usize>,
     outcome: Option<Exit<(), E>>,
     /// Explicit native early-close transfer awaiting its enclosing scoped owner.
     scoped_outcome_transferred: bool,
@@ -150,6 +277,12 @@ impl<E: Send + 'static> Clone for Scope<E> {
 }
 
 impl<E: Send + 'static> Scope<E> {
+    pub(crate) fn unit_retirement(&self, tag: usize) -> UnitRetirement<E> {
+        UnitRetirement {
+            scope: Arc::downgrade(&self.inner),
+            tag,
+        }
+    }
     /// # Type parameters
     /// - `E`: Domain-error type. Bound: `Send + 'static`.
     ///
@@ -157,16 +290,26 @@ impl<E: Send + 'static> Scope<E> {
     /// Type: `Self`.
     pub(crate) fn new() -> Self {
         Self {
-            inner: Arc::new(Inner {
-                state: Mutex::new(State {
-                    phase: Phase::Open,
-                    scoped_outcome_transferred: false,
-                    finalizers: Vec::new(),
-                    outcome: None,
-                    status: ScopeCloseStatus::Clean,
-                }),
-                changed: Event::new(),
-            }),
+            inner: Arc::new(Self::new_inner(FinalizerBatch::system())),
+        }
+    }
+    fn new_state(finalizers: FinalizerBatch<E>) -> State<E> {
+        State {
+            phase: Phase::Open,
+            prepared_waiters: prepared::closed::Waiters::new(),
+            scoped_outcome_transferred: false,
+            finalizers,
+            reserved_entries: 0,
+            segments_in_use: 0,
+            segment_limit: None,
+            outcome: None,
+            status: ScopeCloseStatus::Clean,
+        }
+    }
+    fn new_inner(finalizers: FinalizerBatch<E>) -> Inner<E> {
+        Inner {
+            state: Mutex::new(Self::new_state(finalizers)),
+            changed: Event::new(),
         }
     }
 
@@ -225,12 +368,15 @@ impl<E: Send + 'static> Scope<E> {
     /// # Returns
     /// Type: `usize`.
     pub(crate) fn checkpoint(&self) -> usize {
-        self.inner
+        let state = self
+            .inner
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
             .finalizers
-            .len()
+            .system_checkpoint()
+            .unwrap_or_else(|| state.finalizers.len())
     }
     /// # Type parameters
     /// - `A`: Application value type.
@@ -241,21 +387,21 @@ impl<E: Send + 'static> Scope<E> {
     ///
     /// # Returns
     /// Type: `Result<Vec<Registered<E>>, Exit<A, E>>`.
-    pub(crate) fn take_since<A>(
-        &self,
-        checkpoint: usize,
-    ) -> Result<Vec<Registered<E>>, Exit<A, E>> {
+    pub(crate) fn take_since<A>(&self, checkpoint: usize) -> Result<FinalizerBatch<E>, Exit<A, E>> {
         let mut state = self
             .inner
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.phase != Phase::Open || checkpoint > state.finalizers.len() {
+        if state.phase != Phase::Open {
             return Err(Exit::Die(Defect::from(
                 LibraryDefect::ScopeRegistrationClosed,
             )));
         }
-        Ok(state.finalizers.split_off(checkpoint))
+        state
+            .finalizers
+            .system_suffix(checkpoint)
+            .ok_or_else(|| Exit::Die(Defect::from(LibraryDefect::ScopeRegistrationClosed)))
     }
     /// # Type parameters
     /// - `A`: Application value type. Bounds: `Send + 'static`.
@@ -504,11 +650,13 @@ impl<E: Send + 'static> Scope<E> {
     /// # Returns
     /// Type: `ScopeCloseStatus`.
     pub async fn closed(&self) -> ScopeCloseStatus {
+        Self::closed_inner(&self.inner).await
+    }
+    async fn closed_inner(inner: &Inner<E>) -> ScopeCloseStatus {
         loop {
-            let changed = self.inner.changed.listen();
+            let changed = inner.changed.listen();
             {
-                let state = self
-                    .inner
+                let state = inner
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -525,7 +673,10 @@ impl<E: Send + 'static> Scope<E> {
     /// Type: `ScopeCloseStatus`.
     /// Returns `ScopeCloseStatus`.
     fn status(&self) -> ScopeCloseStatus {
-        self.inner
+        Self::status_inner(&self.inner)
+    }
+    fn status_inner(inner: &Inner<E>) -> ScopeCloseStatus {
+        inner
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -551,16 +702,21 @@ impl<E: Send + 'static> Scope<E> {
     ) -> Step {
         match self.try_register(finalizer) {
             Ok(()) => runtime::finish(finish, Exit::Success(value)),
-            Err(finalizer) => finalizer.execute(runtime::continuation(move |cleanup| {
-                drop(value);
-                runtime::finish(
-                    finish,
-                    outcome::append_cleanup(
-                        Exit::Die(Defect::from(LibraryDefect::ScopeRegistrationClosed)),
-                        cleanup,
-                    ),
+            Err(finalizer) => finalizer.execute_with(move |frame| {
+                runtime::continuation_retained(
+                    move |cleanup| {
+                        drop(value);
+                        runtime::finish(
+                            finish,
+                            outcome::append_cleanup(
+                                Exit::Die(Defect::from(LibraryDefect::ScopeRegistrationClosed)),
+                                cleanup,
+                            ),
+                        )
+                    },
+                    frame,
                 )
-            })),
+            }),
         }
     }
 
@@ -573,18 +729,32 @@ impl<E: Send + 'static> Scope<E> {
     /// # Returns
     /// Type: `Result<(), Registered<E>>`.
     pub(crate) fn try_register(&self, finalizer: Registered<E>) -> Result<(), Registered<E>> {
-        {
-            let mut state = self
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.phase == Phase::Open {
-                state.finalizers.push(finalizer);
-                Ok(())
-            } else {
-                Err(finalizer)
+        Self::register_inner(&self.inner, finalizer).map_err(|error| match error {
+            RegistrationError::Closed(finalizer) | RegistrationError::Full(finalizer) => finalizer,
+        })
+    }
+    fn register_inner(
+        inner: &Inner<E>,
+        finalizer: Registered<E>,
+    ) -> Result<(), RegistrationError<E>> {
+        let mut state = inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.phase == Phase::Open {
+            if state
+                .finalizers
+                .available()
+                .is_some_and(|available| available <= state.reserved_entries)
+            {
+                return Err(RegistrationError::Full(finalizer));
             }
+            state
+                .finalizers
+                .push(finalizer)
+                .map_err(RegistrationError::Full)
+        } else {
+            Err(RegistrationError::Closed(finalizer))
         }
     }
 
@@ -601,34 +771,7 @@ impl<E: Send + 'static> Scope<E> {
     /// Type: `Step`.
     /// Returns `Step`.
     fn join_close<A: Send + 'static>(self, primary: Exit<A, E>, finish: Finish<A, E>) -> Step {
-        let work = {
-            let mut state = self
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match state.phase {
-                Phase::Open => {
-                    state.phase = Phase::Closing;
-                    Some(std::mem::take(&mut state.finalizers))
-                }
-                Phase::Closing | Phase::Closed => None,
-            }
-        };
-        match work {
-            Some(work) => {
-                let guard = DrainGuard {
-                    scope: self,
-                    work,
-                    settled: false,
-                };
-                drain(guard, primary, Exit::Success(()), finish)
-            }
-            None => Step::Suspended(Box::pin(async move {
-                let _ = self.closed().await;
-                runtime::finish(finish, primary)
-            })),
-        }
+        ScopeLink::System(self.inner).join_close(primary, finish)
     }
 
     ///
@@ -640,10 +783,9 @@ impl<E: Send + 'static> Scope<E> {
     ///
     /// # Returns
     /// Type: `()`.
-    fn settle(&self, outcome: Exit<(), E>) {
-        {
-            let mut state = self
-                .inner
+    fn settle_inner(inner: &Inner<E>, outcome: Exit<(), E>) {
+        let replaced = {
+            let mut state = inner
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -652,10 +794,16 @@ impl<E: Send + 'static> Scope<E> {
             } else {
                 ScopeCloseStatus::Failed
             };
-            state.outcome = Some(outcome);
+            let replaced = state.outcome.replace(outcome);
             state.phase = Phase::Closed;
-        }
-        notify_all(&self.inner.changed);
+            replaced
+        };
+        let _prepared = prepared::closed::NotifyOnDrop { inner };
+        notify_all(&inner.changed);
+        // Recovery settlement can replace a prior user E after a wake unwinds.
+        // Never destroy it under the phase gate; prepared notification remains
+        // armed through its destructor as well as through existing Event wakes.
+        drop(replaced);
     }
 
     ///
@@ -690,8 +838,10 @@ impl<E: Send + 'static> Scope<E> {
     /// Mark transfer only when this owner actually moves a settled cleanup exit.
     /// A failed second take never creates a scoped acknowledgement.
     fn take_outcome_transferring(&self, transfer: bool) -> Exit<(), E> {
-        let mut state = self
-            .inner
+        Self::take_outcome_inner(&self.inner, transfer)
+    }
+    fn take_outcome_inner(inner: &Inner<E>, transfer: bool) -> Exit<(), E> {
+        let mut state = inner
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -708,9 +858,17 @@ impl<E: Send + 'static> Scope<E> {
     /// # Returns
     /// Type: `()`.
     fn abandon_open(&self) {
+        Self::abandon_inner(&self.inner);
+    }
+    fn discard_inner(inner: &Inner<E>, work: FinalizerBatch<E>, reason: LibraryDefect) {
+        // Captures invalidate outside the gate. Settling is an unwind guard,
+        // not a statement skipped if a user resource destructor panics.
+        let _settlement = LossSettlement { inner, reason };
+        drop(work);
+    }
+    fn abandon_inner(inner: &Inner<E>) {
         let discarded = {
-            let mut state = self
-                .inner
+            let mut state = inner
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -720,9 +878,17 @@ impl<E: Send + 'static> Scope<E> {
             state.phase = Phase::Closing;
             std::mem::take(&mut state.finalizers)
         };
-        // User captures can have destructors. Never run them under the gate.
-        drop(discarded);
-        self.settle(Exit::Die(Defect::from(LibraryDefect::ScopeOwnerDropped)));
+        Self::discard_inner(inner, discarded, LibraryDefect::ScopeOwnerDropped);
+    }
+}
+
+struct LossSettlement<'a, E: Send + 'static> {
+    inner: &'a Inner<E>,
+    reason: LibraryDefect,
+}
+impl<E: Send + 'static> Drop for LossSettlement<'_, E> {
+    fn drop(&mut self) {
+        Scope::<E>::settle_inner(self.inner, Exit::Die(Defect::from(self.reason)));
     }
 }
 
@@ -751,8 +917,8 @@ impl<E: Send + 'static> Drop for OwnerGuard<E> {
 /// # Type parameters
 /// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct DrainGuard<E: Send + 'static> {
-    scope: Scope<E>,
-    work: Vec<Registered<E>>,
+    scope: ScopeLink<E>,
+    work: FinalizerBatch<E>,
     settled: bool,
 }
 
@@ -764,10 +930,11 @@ impl<E: Send + 'static> Drop for DrainGuard<E> {
         if !self.settled {
             // Invalidate resources synchronously before broadcasting loss;
             // deferred destruction of deep capture graphs can finish later.
-            drop(std::mem::take(&mut self.work));
-            self.scope.settle(Exit::Die(Defect::from(
+            Scope::<E>::discard_inner(
+                self.scope.inner(),
+                std::mem::take(&mut self.work),
                 LibraryDefect::ScopeCloseDriverDropped,
-            )));
+            );
         }
     }
 }
@@ -786,6 +953,33 @@ impl<E: Send + 'static> Drop for DrainGuard<E> {
 /// # Returns
 /// Type: `Step`.
 /// Returns `Step`.
+/// Prepared close uses independently reserved cleanup storage while retaining
+/// the same phase transition and finalizer order as ordinary close.
+fn drain_prepared<A: Send + 'static, E: Send + 'static>(
+    mut guard: DrainGuard<E>,
+    primary: Exit<A, E>,
+    mut cleanup: crate::PreparedCleanupAccumulator<(), E>,
+    finish: Finish<A, E>,
+) -> Step {
+    runtime::more(move || match guard.work.pop() {
+        Some(finalizer) => finalizer.execute_with(move |frame| {
+            runtime::continuation_retained(
+                move |result| {
+                    cleanup.append_cleanup(result);
+                    drain_prepared(guard, primary, cleanup, finish)
+                },
+                frame,
+            )
+        }),
+        None => {
+            guard.scope.settle(cleanup.finish());
+            guard.settled = true;
+            drop(guard);
+            runtime::finish(finish, primary)
+        }
+    })
+}
+
 fn drain<A: Send + 'static, E: Send + 'static>(
     mut guard: DrainGuard<E>,
     primary: Exit<A, E>,
@@ -793,17 +987,19 @@ fn drain<A: Send + 'static, E: Send + 'static>(
     finish: Finish<A, E>,
 ) -> Step {
     runtime::more(move || match guard.work.pop() {
-        Some(finalizer) => {
-            let after_release = runtime::continuation(move |result| {
-                drain(
-                    guard,
-                    primary,
-                    outcome::append_cleanup(cleanup, result),
-                    finish,
-                )
-            });
-            finalizer.execute(after_release)
-        }
+        Some(finalizer) => finalizer.execute_with(move |frame| {
+            runtime::continuation_retained(
+                move |result| {
+                    drain(
+                        guard,
+                        primary,
+                        outcome::append_cleanup(cleanup, result),
+                        finish,
+                    )
+                },
+                frame,
+            )
+        }),
         None => {
             guard.scope.settle(cleanup);
             guard.settled = true;

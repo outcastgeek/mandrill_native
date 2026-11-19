@@ -67,6 +67,7 @@ use effect_server::{Request, ServerError};
 mod drafts;
 mod json;
 mod normalizer;
+mod prepared_drafts;
 mod request;
 
 pub use self::drafts::{
@@ -75,6 +76,10 @@ pub use self::drafts::{
     LocalizedTextDraft, RowAccessor, ValueRowAccessor,
 };
 pub use self::normalizer::{ContractLanguageNormalizerOptions, FormatNormalizer, FormatNormalizerRef, Normalizer, NormalizerRef};
+pub use self::prepared_drafts::{
+    LocalizedDraftCapacity, LocalizedDraftFields, LocalizedDraftSnapshot, LocalizedDraftView,
+    PreparedLocalizedDrafts,
+};
 pub use self::request::{LocalizedFieldValues, LocalizedFormPolicy};
 
 /// Compile-time witness that both request-collection helpers keep their required

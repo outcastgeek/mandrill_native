@@ -56,6 +56,9 @@
 mod actions;
 mod bindings;
 mod service;
+mod work;
+
+pub use self::work::{CommandWorkLimits, PreparedCommandWork};
 
 pub use self::actions::{
     ActionLabelKeys, ActionLabelResolver, SubmitActionVM, TranslateActionLabelKeyFunc,

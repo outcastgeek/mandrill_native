@@ -37,12 +37,13 @@
 
 use std::sync::Arc;
 
-use effect::{Effect, effect, effect_sync};
+use effect::{Effect, effect, effect_sync, effect_try_sync, effect_using};
 use effect_server::{BodyStatus, Reply, Request};
 use http::StatusCode;
 
 use super::principal::{AccessPrincipal, PrincipalAccessRule};
 use super::responses::{AccessResponse, ManagedSurfaceAccessGuardOptions, fallback_status_reply};
+use super::work::PreparedAccessWork;
 
 /// Resolves the authenticated principal for one request.
 ///
@@ -182,11 +183,12 @@ where
 pub struct PrincipalAccessGuard<E: Send + 'static, R: Send + Sync + 'static> {
     options: PrincipalAccessGuardOptions<E, R>,
     resolver: PrincipalResolver<E, R>,
+    pub(super) prepared: Option<Arc<PreparedAccessWork<E>>>,
 }
 
 /// A reusable principal access requirement with a fixed redirect policy.
 pub struct PrincipalAccessRequirement<E: Send + 'static, R: Send + Sync + 'static> {
-    guard: PrincipalAccessGuard<E, R>,
+    pub(super) guard: PrincipalAccessGuard<E, R>,
     allow_redirect: bool,
 }
 
@@ -194,6 +196,7 @@ pub struct PrincipalAccessRequirement<E: Send + 'static, R: Send + Sync + 'stati
 pub struct ManagedSurfaceAccessGuard<E: Send + 'static, R: Send + Sync + 'static> {
     options: ManagedSurfaceAccessGuardOptions<E, R>,
     resolver: PrincipalResolver<E, R>,
+    pub(super) prepared: Option<Arc<PreparedAccessWork<E>>>,
 }
 
 /// The validated unauthorized status for the fallback reply.
@@ -228,17 +231,20 @@ fn guard_principal_access<E, R>(
     options: PrincipalAccessOptions<E, R>,
     unauthenticated: Option<AccessResponse<E, R>>,
     resolver: &PrincipalResolver<E, R>,
+    prepared: Option<Arc<PreparedAccessWork<E>>>,
 ) -> Effect<AccessOutcome<E, R>, E, R>
 where
     E: Send + 'static,
     R: Send + Sync + 'static,
 {
+    let request_for_reservation = request.clone();
     let request = request.clone();
     let explicit = options.principal.clone();
     let can_access = options.can_access.clone();
     let render_forbidden = options.render_forbidden.clone();
     let resolver = Arc::clone(resolver);
-    effect! {
+    let work = prepared.clone();
+    let program = effect! {
         // The factory closure is reusable, so every value a nested step closure
         // captures is first copied into a factory-local slot. A nested step then
         // takes the slot, never the factory's own required input.
@@ -254,6 +260,7 @@ where
         let forbidden_for_render = render_forbidden.clone();
         let request_for_unauthorized = request.clone();
         let unauthorized_for_render = unauthenticated.clone();
+        let work = work.clone();
         let resolved = match explicit.as_ref() {
             Some(principal) => Some(principal.clone()),
             None => {
@@ -262,6 +269,10 @@ where
             }
         };
         let outcome = if let Some(principal) = resolved {
+            if let Some(work) = &work {
+                let checked = work.check_principal(&principal).map_err(|error| (work.on_capacity)(error));
+                effect_try_sync! { once; body: move || checked, }?;
+            }
             let allowed = match &can_access_for_rule {
                 Some(rule) => rule(&principal),
                 None => true,
@@ -285,6 +296,17 @@ where
             AccessOutcome::denied(reply)
         };
         outcome
+    };
+    let Some(prepared) = prepared else {
+        return program;
+    };
+    let on_capacity = prepared.on_capacity.clone();
+    effect_using! {
+        acquire: effect_try_sync! {
+            body: move || prepared.reserve(&request_for_reservation),
+            on_error: move |error| on_capacity(error),
+        },
+        body: move |_| program.clone(),
     }
 }
 
@@ -307,7 +329,7 @@ where
     } else {
         options.render_unauthorized.clone()
     };
-    guard_principal_access(request, options, unauthenticated, resolver)
+    guard_principal_access(request, options, unauthenticated, resolver, None)
 }
 
 /// Require a principal for a managed surface.
@@ -328,7 +350,7 @@ where
         return effect_sync! { body: AccessOutcome::<E, R>::bypassed, };
     }
     let unauthenticated = options.redirect_unauthenticated.clone();
-    guard_principal_access(request, options, unauthenticated, resolver)
+    guard_principal_access(request, options, unauthenticated, resolver, None)
 }
 
 /// Construct a reusable principal access guard.
@@ -337,7 +359,11 @@ pub fn new_principal_access_guard<E: Send + 'static, R: Send + Sync + 'static>(
     options: PrincipalAccessGuardOptions<E, R>,
     resolver: PrincipalResolver<E, R>,
 ) -> PrincipalAccessGuard<E, R> {
-    PrincipalAccessGuard { options, resolver }
+    PrincipalAccessGuard {
+        options,
+        resolver,
+        prepared: None,
+    }
 }
 
 /// Construct a reusable principal access requirement with a fixed redirect policy.
@@ -359,7 +385,11 @@ pub fn new_managed_surface_access_guard<E: Send + 'static, R: Send + Sync + 'sta
     options: ManagedSurfaceAccessGuardOptions<E, R>,
     resolver: PrincipalResolver<E, R>,
 ) -> ManagedSurfaceAccessGuard<E, R> {
-    ManagedSurfaceAccessGuard { options, resolver }
+    ManagedSurfaceAccessGuard {
+        options,
+        resolver,
+        prepared: None,
+    }
 }
 
 impl<E, R> PrincipalAccessGuard<E, R>
@@ -380,7 +410,18 @@ where
             render_unauthorized: self.options.render_unauthorized.clone(),
             render_forbidden: self.options.render_forbidden.clone(),
         };
-        require_principal_access(request, allow_redirect, options, &self.resolver)
+        let unauthenticated = if allow_redirect {
+            options.redirect_unauthenticated.clone()
+        } else {
+            options.render_unauthorized.clone()
+        };
+        guard_principal_access(
+            request,
+            options,
+            unauthenticated,
+            &self.resolver,
+            self.prepared.clone(),
+        )
     }
 }
 
@@ -412,6 +453,9 @@ where
         can_manage: Option<&PrincipalAccessRule>,
         render_key: bool,
     ) -> Effect<AccessOutcome<E, R>, E, R> {
+        if !manage {
+            return effect_sync! { body: AccessOutcome::<E, R>::bypassed, };
+        }
         let forbidden = if render_key {
             self.options
                 .render_forbidden_key
@@ -430,6 +474,13 @@ where
             render_unauthorized: None,
             render_forbidden: forbidden,
         };
-        require_managed_principal_access(request, manage, options, &self.resolver)
+        let unauthenticated = options.redirect_unauthenticated.clone();
+        guard_principal_access(
+            request,
+            options,
+            unauthenticated,
+            &self.resolver,
+            self.prepared.clone(),
+        )
     }
 }

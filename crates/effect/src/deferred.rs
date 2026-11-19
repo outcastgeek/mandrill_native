@@ -232,7 +232,7 @@ impl<A: Send + 'static, E: Send + 'static> Deferred<A, E> {
         let deferred = self.clone();
         Effect::new(move |_, context, finish| {
             let deferred = deferred.clone();
-            Step::Suspended(Box::pin(async move {
+            Step::suspended(Box::pin(async move {
                 let outcome = match deferred.wait(context.cancellation, Self::take_owned).await {
                     Ok(Some(outcome)) => outcome,
                     Ok(None) => Exit::Interrupted,
@@ -258,7 +258,7 @@ impl<A: Send + 'static, E: Send + 'static> Deferred<A, E> {
         let deferred = self.clone();
         Effect::new(move |_, context, finish| {
             let deferred = deferred.clone();
-            Step::Suspended(Box::pin(async move {
+            Step::suspended(Box::pin(async move {
                 let outcome = match deferred.wait(context.cancellation, Self::share).await {
                     Ok(Some(outcome)) => Exit::Success(outcome),
                     Ok(None) => Exit::Interrupted,

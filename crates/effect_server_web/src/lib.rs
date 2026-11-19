@@ -46,6 +46,7 @@ pub mod security;
 /// `health`, `liveness`, `process_liveness` and corresponding optional probe calls.
 /// Nonempty readiness is required. Optional `traffic_ready` shares the collection
 /// deadline, and `dashboard` accepts only prepared operator-authorized routes.
+/// `prepared_output` selects a fixed response pool for the operational aliases.
 pub use effect_macros::availability;
 /// D22 checked `directive(name, sources);`, `append(name, sources);`, and
 /// `replace(name, sources);` operations. Source lists are typed `CspSources`;
@@ -88,6 +89,12 @@ pub use effect_macros::security;
 /// observers project owned metadata in their pure prefix before deferred binds.
 /// Each inline invocation returns a one-shot Effect that moves owned values without
 /// Clone bounds; the enclosing callback remains reusable with fresh invocation inputs.
+/// `memory` selects a startup factory from the fully configured Server to a
+/// PreparedServer with a selected request storage pool. This form returns a
+/// PreparedWeb whose host retains its guarded
+/// outcome. Optional `admission` and `overload` select a request-control quota and
+/// a static response for immediate capacity refusal. `byte_pools` selects the
+/// shared request byte backing admitted before routing and middleware work.
 pub use effect_macros::web;
 
 /// Expansion support for renamed downstream dependencies. This module is not an
@@ -105,6 +112,8 @@ pub mod __private {
 pub enum WebError {
     /// A named policy has inconsistent or malformed inputs.
     Configuration(String),
+    /// Selected prepared storage rejected a startup or admission operation.
+    Memory(effect::memory::MemoryError),
     /// Native metadata could not be parsed safely under the selected policy.
     Metadata(String),
     /// Selected localization acquisition/selection failed before response commitment.
@@ -126,6 +135,7 @@ impl std::fmt::Display for WebError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Configuration(name) => write!(f, "invalid web policy: {name}"),
+            Self::Memory(error) => error.fmt(f),
             Self::Metadata(name) => write!(f, "invalid web metadata: {name}"),
             Self::Availability(error) => write!(f, "availability: {error}"),
             Self::Localization(error) => write!(f, "localization: {error}"),
@@ -160,4 +170,14 @@ pub(crate) fn restore_exit<A: Send + 'static, E: Send + 'static, R: Send + Sync 
             }
         }
     }, }
+}
+
+pub(crate) fn split_exit<A, B, E>(exit: effect::Exit<A, E>) -> Result<A, effect::Exit<B, E>> {
+    match exit {
+        effect::Exit::Success(value) => Ok(value),
+        effect::Exit::Fail(error) => Err(effect::Exit::Fail(error)),
+        effect::Exit::Die(defect) => Err(effect::Exit::Die(defect)),
+        effect::Exit::Interrupted => Err(effect::Exit::Interrupted),
+        effect::Exit::FinalizationFailed(failure) => Err(effect::Exit::FinalizationFailed(failure)),
+    }
 }

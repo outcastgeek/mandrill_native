@@ -5,7 +5,7 @@ use super::{
     TransactionPolicy, TxRef,
 };
 use crate::{Effect, ResourceValue, Scope};
-use crate::{effect_scope_acquire, transaction};
+use crate::transaction;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -131,9 +131,6 @@ impl TxSemaphore {
     where
         R: HasTransactionDomain + Send + Sync + 'static,
     {
-        let semaphore = self.clone();
-        effect_scope_acquire! {
-        scope: scope, acquire: self.acquire::<TxSemaphoreError>(permits).atomically(policy), release: move |()| semaphore.release(permits).atomically(policy),
-        }
+        self.acquire(permits).acquire_scoped(scope, self.release(permits), policy)
     }
 }

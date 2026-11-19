@@ -17,9 +17,15 @@ pub(crate) fn has_mode(tokens: &TokenStream, modes: &[&str]) -> bool {
 /// Named map/modify/update syntax over the current transactional evaluator.
 /// Both state roles use TxRef::update's borrowed snapshot and Result<(replacement,result),E>.
 pub(crate) fn transaction(input: Input) -> syn::Result<TokenStream> {
-    let mode = input.mode(&["map_error", "modify", "update"], "default")?;
+    let mode = input.mode(&["map_error", "modify", "update", "prepare_domain"], "default")?;
     let mut fields = input.fields;
     let path = crate::expand::effect_crate_path()?;
+    if mode == "prepare_domain" {
+        let memory = fields.take("memory")?;
+        let region = fields.take("region")?;
+        let capacity = fields.take("capacity")?;
+        return fields.finish(quote!(#path::transactional::TransactionDomain::prepare(#memory, #region, #capacity)));
+    }
     let output = if mode == "map_error" {
         let program = fields.take("program")?;
         let map = fields.role("map", 1, BodyCategory::Native)?;
@@ -82,12 +88,18 @@ pub(crate) fn atom(input: Input) -> syn::Result<TokenStream> {
 /// at its documented engine boundary, not an arbitrary durable coordination body.
 pub(crate) fn workflow(input: Input) -> syn::Result<TokenStream> {
     let mode = input.mode(
-        &["map_error", "for_each", "retry", "compensate", "result"],
+        &["map_error", "for_each", "retry", "compensate", "result", "prepare_engine"],
         "default",
     )?;
     let mut fields = input.fields;
     let path = crate::expand::effect_crate_path()?;
     let output = match mode.as_str() {
+        "prepare_engine" => {
+            let memory = fields.take("memory")?;
+            let region = fields.take("region")?;
+            let capacity = fields.take("capacity")?;
+            quote!(#path::workflow::MemoryWorkflowEngine::prepare(#memory, #region, #capacity))
+        }
         "result" => {
             let value = fields.take("value")?;
             quote!(#path::workflow::Durable::from_result_once(#value))

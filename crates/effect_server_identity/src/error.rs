@@ -43,6 +43,8 @@ pub enum CapabilityName {
 pub enum IdentityError {
     /// Inert definition or selected native policy was invalid.
     Configuration(&'static str),
+    /// Selected workflow admission refused before native work.
+    Admission(effect::PreparedAdmissionError),
     /// An explicitly optional capability was not installed.
     MissingCapability(CapabilityName),
     /// A native replacement point was deliberately left unselected.
@@ -79,6 +81,7 @@ impl std::fmt::Display for IdentityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Configuration(_) => "invalid identity configuration",
+            Self::Admission(_) => "identity workflow capacity unavailable",
             Self::MissingCapability(_) | Self::MissingPolicy(_) => {
                 "identity capability not selected"
             }

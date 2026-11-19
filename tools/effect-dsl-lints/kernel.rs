@@ -33,14 +33,14 @@ pub fn machine(
         && match caller_owner {
             "cache::Cache" => matches!(
                 caller,
-                "get_observed"
+                "make_with_index" | "get_observed"
             // Inspection and shared acquisition select entries with the private
             // cancellation Context and propagate all producer Exit variants.
-            | "try_get" | "get_shared"
+            | "try_get_key" | "get_key"
             // Retirement and replacement settle owned generations, join cleanup
             // failures, and finish the interpreter Step. Their ordinary input and
             // uninterruptible composition are separately checked and use the DSL.
-            | "invalidate_matching" | "set"
+            | "invalidate_selected" | "set"
             // Shutdown joins the native driver before finishing the interpreter.
             | "shutdown"
             ),
@@ -58,7 +58,7 @@ pub fn machine(
             "config::Config" => caller == "load",
             // Journal commit/retry uses the private cancellation Context and
             // maps cancellation to interruption before finishing the Step.
-            "transactional::transaction::Transaction" => caller == "atomically",
+            "transactional::transaction::Transaction" => caller == "atomically_with",
             // Close/transfer the native scope owner, settling abandonment and
             // forwarding protected full cleanup outcomes through Finish.
             "scope::Scope" => {
@@ -66,13 +66,33 @@ pub fn machine(
                     // Fiber admission registers native ownership before invoking
                     // R's provider, forwarding its private child Context/Finish.
                     || caller == "fork" && caller_path == "fiber::<impl scope::Scope<E>>::fork"
+                    || caller == "fork_unit_with_task_guard" && caller_path == "fiber::<impl scope::Scope<E>>::fork_unit_with_task_guard"
+                    || caller == "fork_recording_admission" && caller_path == "fiber::<impl scope::Scope<E>>::fork_recording_admission"
+            }
+            // Prepared scope owners use the SAME phase/close engine, retaining
+            // checked physical batches through protected cleanup. A generic DSL
+            // body here would install a second scope/ownership boundary.
+            "scope::prepared::PreparedScope" => matches!(caller, "close" | "admit_close"),
+            "scope::prepared::PreparedScopeOwner" => caller == "into_effect",
+            "scope::prepared::pool::PreparedScopePool" => caller == "try_scoped",
+            "scope::prepared::resource::PreparedResourceBinding" => {
+                matches!(caller, "acquire_scoped" | "admit_acquire_scoped")
+            }
+            "scope::prepared::resource::future::PreparedFutureResourceBinding" => {
+                matches!(caller, "acquire_scoped" | "admit_acquire_scoped")
+            }
+            "scope::prepared::PreparedCheckpoint" => caller == "release",
+            "scope::prepared::PreparedRelease" => {
+                matches!(caller, "register" | "admit_registration")
             }
             // The private buffer producer and shared pull reader use cancellation,
             // protected producer observation and complete terminal outcomes.
             "stream::internal::buffer::Buffered" => matches!(caller, "producer" | "reader"),
             // Acquisition joins late provider completion and registers the owned
             // lease with protected finalization before publishing success.
-            "pool::Pool" => matches!(caller, "acquire" | "ensure_size" | "shutdown"),
+            // Both constructor modes register the same native scope finalizer
+            // through the private Context and Finish in make_with_controls.
+            "pool::Pool" => matches!(caller, "make_with_controls" | "acquire" | "ensure_size" | "shutdown"),
             // Lease completion joins protected settlement using the original Context.
             "pool::PoolLease" => caller == "end_effect",
             // Native keyed admission forwards the selected semaphore's Context.
@@ -83,7 +103,7 @@ pub fn machine(
             "pub_sub::PubSub" => caller == "publish_candidate",
             "pub_sub::Subscription" => caller == "take",
             // Resolver settlement retains every full batch/request outcome.
-            "request_resolver::RequestResolver" => matches!(caller, "resolve" | "resolve_many"),
+            "request_resolver::RequestResolver" => matches!(caller, "make_configured" | "resolve" | "resolve_batch"),
             // Scoped acquisition registers raw ownership before cancellation.
             "resource::ResourceBinding" => caller == "acquire_scoped",
             // The pull recipe owns its initial snapshot and native cancellation
@@ -131,6 +151,11 @@ pub fn inherent_transition(
         && caller == "from_event"
         && target == Some(owner)
         && callee == "register")
+        // The prepared multi-borrow leaf moves both counted resource views into
+        // one concrete Ready capture; no Effect erasure or observer clone occurs.
+        || owner == "internal::runtime::prepared::graph::resource::ResourceValue"
+            && caller == "access2"
+            && callee_path == "internal::runtime::prepared::graph::ready"
         // Full-outcome adapters must retain defects, interruption and cleanup
         // channels. A success-only DSL bind cannot implement these transitions.
         || owner == "program::Effect"
@@ -142,7 +167,7 @@ pub fn inherent_transition(
         // Protected release leaves consume their future once under the native
         // cancellation Context and keep full cleanup outcome families.
         || owner == "resource::Release"
-            && matches!(caller, "try_future" | "from_exit_future")
+            && matches!(caller, "try_future" | "from_exit_future" | "from_prepared_exit_future")
             && callee_path == "internal::workflow::Workflow::new"
         // Native async binding/cleanup evaluates under this existing Context;
         // rebuilding it through effect! would replace its lexical scope owner.
@@ -150,13 +175,24 @@ pub fn inherent_transition(
             && matches!((caller, callee_path),
                 ("bind", "internal::macro_future::AsyncBindable::into_scoped_effect")
                 | ("release", "internal::macro_future::evaluate" | "internal::macro_future::release_work"))
+        // A pre-held prepared suffix must use the SAME protected finalizer
+        // workflow, not a second macro scope or a fresh allocating batch.
+        || owner == "scope::prepared::PreparedCheckpoint" && caller == "release"
+            && callee_path == "internal::macro_future::release_work"
+        // Preparation consumes the existing release plan's one concrete
+        // factory. Retain the exact typed handoff into its regional owner.
+        || owner == "scope::prepared::PreparedReleasePlan"
+            && caller == "prepare"
+            && target == Some("scope::prepared::PreparedRelease")
+            && callee == "prepare"
         // Journal leaves retain private retry/conflict/invalid decisions and
         // branch rollback. These exact native edges never admit helper calls.
         || owner == "transactional::transaction::Transaction"
             && matches!(caller, "fail_with" | "or_else" | "for_each")
             && callee_path == "transactional::transaction::Transaction::new"
-        || owner == "transactional::tx_ref::TxRef"
-            && matches!(caller, "read" | "write")
+        || matches!((owner, caller),
+            ("transactional::tx_ref::TxRef", "read" | "write")
+                | ("transactional::prepared_ref::PreparedTxRef", "read" | "write" | "update_step"))
             && callee_path == "transactional::transaction::Transaction::new"
         // Native read recipes install observations in the supplied context.
         || owner == "reactivity::atom_program::AtomProgram"
@@ -245,7 +281,7 @@ pub fn inherent_transition(
                 ("persistence::internal::cache_gate::CacheGate", "acquire")
                 | ("reactivity::atom::Atom", "refresh" | "dispose")
                 | ("reactivity::atom_cache::AtomCache", "refresh")
-                | ("reactivity::atom_ref::AtomRef", "set" | "dispose" | "export" | "import")
+                | ("reactivity::atom_ref::AtomRef", "set" | "dispose" | "hydrate_permit")
                 | ("reactivity::atom_ref::AtomReadContext", "read")
                 | ("reactivity::invalidation::InvalidationRegistry", "invalidate")
                 | ("rpc::client::RpcClient", "call")
@@ -274,7 +310,7 @@ pub fn inherent_transition(
             && callee_path == "reactivity::query::ReactiveQuery::new"
         // Close the cache index with its direct one-shot leaf after the owning
         // scope drains producers; do not add an Effect operation to cleanup.
-        || owner == "weak_cache::WeakCache" && caller == "make"
+        || matches!(owner, "weak_cache::WeakCache" | "request_resolver::RequestResolver") && caller == "make_configured"
             && callee_path == "resource::Release::sync"
         // Terminal execution tags the existing durable result without nesting
         // another durable async body/scope. Recovery keeps its direct no-op leaf
@@ -294,7 +330,11 @@ pub fn inherent_transition(
 pub fn transition(caller: &str, callee: &str) -> bool {
     matches!(
         (caller, callee),
-        ("internal::workflow::bind", "internal::workflow::Bindable::bind_workflow")
+        // Typed late-environment import is exactly one canonical Bind over an
+        // already described selector. This edge grants no ordinary Effect or
+        // caller construction permission; pending target storage is preflighted.
+        ("internal::runtime::prepared::graph::import::environment::import_with_environment", "internal::runtime::prepared::graph::bind")
+        | ("internal::workflow::bind", "internal::workflow::Bindable::bind_workflow")
         | ("internal::workflow::bind_effect", "internal::workflow::bind_operation")
         | ("internal::workflow::defer_callback2", "internal::workflow::defer_callback1")
         | ("internal::workflow::success", "internal::workflow::Workflow::from_exit")

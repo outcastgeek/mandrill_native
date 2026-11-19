@@ -23,7 +23,7 @@ impl Parse for EffectInput {
             && mode.parse::<Token![;]>().is_ok()
             && mode
                 .parse::<Ident>()
-                .is_ok_and(|name| name == "guard" || name == "body")
+                .is_ok_and(|name| name == "guard" || name == "body" || name == "on_capacity")
             && mode.peek(Token![:])
         {
             input.parse::<Ident>()?;

@@ -20,11 +20,8 @@
 //!   untrimmed beyond the request reader's trim.
 //! - Every definition lookup is observed at call time through the shared
 //!   collections of the definition model, so an in-place mutation the caller makes
-//!   through the registry is what this admission reads. The owner also copies
-//!   each declared filter's nested `Allowed`/`Options` slices into its local
-//!   collection; that copy is not observable here because admission reads only the
-//!   filter key, parameter, mode and default value, and those are copied with the
-//!   filter element by [`SharedList::to_vec`].
+//!   through the registry is what this admission reads. The filter declarations
+//!   are borrowed and the request query is decoded once.
 //!
 //! # Request-query reader
 //!
@@ -47,8 +44,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::commands::InputBytes;
-use effect::{Effect, effect_sync};
-use effect_server::Request;
+use effect::memory::{Bytes, MemoryError};
+use effect::{Effect, effect_sync, effect_try_sync};
+use effect_server::{Request, ServerError};
+use std::num::NonZeroUsize;
+
+use crate::forms::{PreparedMergedForm, PreparedMergedForms};
 
 use crate::definitions::{
     RESOURCE_FILTER_MODE_MULTI_ALL, RESOURCE_FILTER_MODE_SINGLE, RESOURCE_FILTER_SEARCH,
@@ -195,6 +196,19 @@ pub struct ListOptions {
     pub request_language: Option<RequestLanguageFunc>,
 }
 
+/// Selected limits for projected list-query data.
+#[derive(Clone, Copy)]
+pub struct PreparedListLimits {
+    /// Largest configured page size admitted to a consumer.
+    pub page_size: NonZeroUsize,
+    /// Maximum declared filters examined per list request.
+    pub filters: NonZeroUsize,
+    /// Maximum bytes in the request path and encoded query.
+    pub request: Bytes,
+    /// Maximum bytes of filter key and default metadata examined per request.
+    pub filter_metadata: Bytes,
+}
+
 /// Admits list queries against the registered definitions.
 #[derive(Clone)]
 pub struct ListService {
@@ -232,6 +246,113 @@ impl ListService {
         let kind = kind.clone();
         effect_sync! { body: move || admit_list_query(resources.as_ref(), &options, &request, &kind), }
     }
+
+    /// Decode and admit the query using an existing prepared form workspace.
+    /// Limits are checked before named-page parsing. The returned list data is
+    /// owned by the caller and bounded by the query and filter capacities.
+    pub fn list_query_prepared<R: Send + Sync + 'static>(
+        &self,
+        request: &Request,
+        kind: &ResourceKind,
+        storage: Arc<PreparedMergedForms>,
+        limits: PreparedListLimits,
+    ) -> Effect<ResourceListQuery, ServerError, R> {
+        let service = self.clone();
+        let request = request.clone();
+        let kind = kind.clone();
+        effect_try_sync! {
+            body: move || {
+                check_request_bytes(&request, limits.request)?;
+                let fields = storage.read_query(&request)?;
+                service.admit_prepared(&request, &kind, &fields, limits)
+            },
+        }
+    }
+
+    pub(super) fn admit_prepared(
+        &self,
+        request: &Request,
+        kind: &ResourceKind,
+        fields: &PreparedMergedForm,
+        limits: PreparedListLimits,
+    ) -> Result<ResourceListQuery, ServerError> {
+        check_request_bytes(request, limits.request)?;
+        check_count(
+            usize::try_from(page_size(&self.options))
+                .map_err(|_| MemoryError::ArithmeticOverflow)
+                .map_err(ServerError::Memory)?,
+            limits.page_size.get(),
+        )?;
+        let mut query = empty_query(&self.options);
+        let mut result = Ok(());
+        let _ = self.resources.visit_definition(kind, &mut |definition| {
+            result = (|| {
+                definition
+                    .filters
+                    .try_with(|filters| check_filters(filters, limits))
+                    .map_err(ServerError::Memory)??;
+                if let Some(parse) = &self.options.parse_named_page {
+                    query.page = parse(request, PAGE_QUERY_PARAM);
+                }
+                definition
+                    .filters
+                    .try_with(|filters| {
+                        check_filters(filters, limits)?;
+                        apply_list_values(&mut query, QueryValuesRef::Prepared(fields), filters);
+                        Ok(())
+                    })
+                    .map_err(ServerError::Memory)?
+            })();
+        });
+        result.map(|()| query)
+    }
+}
+
+pub(crate) fn check_request_bytes(request: &Request, maximum: Bytes) -> Result<(), ServerError> {
+    check_capacity(
+        request
+            .uri()
+            .path_and_query()
+            .map_or(0, |value| value.as_str().len()),
+        maximum.get(),
+    )
+}
+
+pub(super) fn check_capacity(requested: usize, capacity: usize) -> Result<(), ServerError> {
+    if requested > capacity {
+        return Err(ServerError::Memory(MemoryError::ValueTooLarge {
+            requested: Bytes::new(requested),
+            capacity: Bytes::new(capacity),
+        }));
+    }
+    Ok(())
+}
+
+fn check_count(requested: usize, capacity: usize) -> Result<(), ServerError> {
+    if requested > capacity {
+        return Err(ServerError::Memory(MemoryError::NoSlot));
+    }
+    Ok(())
+}
+
+fn check_filters(
+    filters: &[ResourceFilterDefinition],
+    limits: PreparedListLimits,
+) -> Result<(), ServerError> {
+    check_count(filters.len(), limits.filters.get())?;
+    let mut metadata = Bytes::new(0);
+    for filter in filters {
+        for value in [
+            filter.key.as_str(),
+            filter.param.as_str(),
+            filter.default_value.as_str(),
+        ] {
+            metadata = metadata
+                .checked_add(Bytes::new(value.len()))
+                .map_err(ServerError::Memory)?;
+        }
+    }
+    check_capacity(metadata.get(), limits.filter_metadata.get())
 }
 
 /// Construct the list-query admission service.
@@ -259,59 +380,94 @@ fn admit_list_query(
     request: &Request,
     kind: &ResourceKind,
 ) -> ResourceListQuery {
-    let Ok(definition) = resources.definition(kind) else {
-        return ResourceListQuery {
-            page: 1,
-            page_size: page_size(options),
-            search: InputBytes::default(),
-            sort: InputBytes::default(),
-            filters: BTreeMap::new(),
-            filter_values: BTreeMap::new(),
-        };
-    };
-    let page = match &options.parse_named_page {
-        Some(parse) => parse(request, PAGE_QUERY_PARAM),
-        None => 1,
-    };
-    let filters: Vec<ResourceFilterDefinition> = definition.filters.to_vec();
-    let mut query = ResourceListQuery {
-        page,
+    let mut query = empty_query(options);
+    let _ = resources.visit_definition(kind, &mut |definition| {
+        if let Some(parse) = &options.parse_named_page {
+            query.page = parse(request, PAGE_QUERY_PARAM);
+        }
+        let values = request_query_map(request);
+        definition.filters.with(|filters| {
+            apply_list_values(&mut query, QueryValuesRef::Ordinary(&values), filters);
+        });
+    });
+    query
+}
+
+fn empty_query(options: &ListOptions) -> ResourceListQuery {
+    ResourceListQuery {
+        page: 1,
         page_size: page_size(options),
-        search: request_query_value(request, SEARCH_QUERY_PARAM),
-        sort: request_query_value(request, SORT_QUERY_PARAM),
+        search: InputBytes::default(),
+        sort: InputBytes::default(),
         filters: BTreeMap::new(),
         filter_values: BTreeMap::new(),
-    };
-    for filter in &filters {
-        apply_list_filter(&mut query, request, filter);
     }
-    query
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum QueryValuesRef<'a> {
+    Ordinary(&'a QueryValues),
+    Prepared(&'a PreparedMergedForm),
+}
+
+impl QueryValuesRef<'_> {
+    pub(super) fn trimmed(self, key: &str) -> InputBytes {
+        let value = match self {
+            Self::Ordinary(values) => values
+                .get(key.as_bytes())
+                .and_then(|values| values.first())
+                .map(InputBytes::as_bytes),
+            Self::Prepared(values) => values.query_values(key.as_bytes()).next(),
+        };
+        value
+            .map(crate::validation::trim_unicode_whitespace)
+            .map(InputBytes::from)
+            .unwrap_or_default()
+    }
+}
+
+fn apply_list_values(
+    query: &mut ResourceListQuery,
+    values: QueryValuesRef<'_>,
+    filters: &[ResourceFilterDefinition],
+) {
+    query.search = values.trimmed(SEARCH_QUERY_PARAM);
+    query.sort = values.trimmed(SORT_QUERY_PARAM);
+    for filter in filters {
+        apply_list_filter(query, values, filter);
+    }
 }
 
 /// Apply one declared filter to the admitted query.
 fn apply_list_filter(
     query: &mut ResourceListQuery,
-    request: &Request,
+    request: QueryValuesRef<'_>,
     filter: &ResourceFilterDefinition,
 ) {
-    let param = filter_query_param(filter);
+    let param = borrowed_filter_query_param(filter);
     if filter.key.as_str() == RESOURCE_FILTER_SEARCH {
-        query.search = request_query_value_or_default(request, &param, &filter.default_value);
+        query.search = query_value_or_default(request, param, &filter.default_value);
         return;
     }
     if filter.key.as_str() == RESOURCE_FILTER_SORT {
-        query.sort = request_query_value_or_default(request, &param, &filter.default_value);
+        query.sort = query_value_or_default(request, param, &filter.default_value);
         return;
     }
-    if resource_filter_mode(filter).as_str() == RESOURCE_FILTER_MODE_MULTI_ALL {
+    if filter.mode.as_str() == RESOURCE_FILTER_MODE_MULTI_ALL {
         let options = FilterValueOptions {
             sort: true,
             lowercase: false,
             max_values: DEFAULT_MAX_FILTER_VALUES,
         };
-        let mut values = normalize_filter_values(&request_query_values(request, &param), &options);
+        let mut values = match request {
+            QueryValuesRef::Ordinary(request) => {
+                let requested = request.get(param.as_bytes()).map_or(&[][..], Vec::as_slice);
+                normalize_filter_values(requested, &options)
+            }
+            QueryValuesRef::Prepared(request) => prepared_filter_values(request, param),
+        };
         if values.is_empty() && !filter.default_value.as_str().trim().is_empty() {
-            values = normalize_filter_values(&[filter.default_value.as_str().to_owned()], &options);
+            values = normalize_filter_values(&[filter.default_value.as_str()], &options);
         }
         if let Some(first) = values.first() {
             query.filters.insert(filter.key.clone(), first.clone());
@@ -319,20 +475,55 @@ fn apply_list_filter(
         }
         return;
     }
-    let value = request_query_value_or_default(request, &param, &filter.default_value);
+    let value = query_value_or_default(request, param, &filter.default_value);
     if !value.is_empty() {
         query.filters.insert(filter.key.clone(), value.clone());
         query.filter_values.insert(filter.key.clone(), vec![value]);
     }
 }
 
+fn prepared_filter_values(request: &PreparedMergedForm, param: &str) -> Vec<InputBytes> {
+    const MAXIMUM: usize = DEFAULT_MAX_FILTER_VALUES as usize;
+    let mut smallest: [&[u8]; MAXIMUM] = [&[]; MAXIMUM];
+    let mut len = 0;
+    for value in request
+        .query_values(param.as_bytes())
+        .map(crate::validation::trim_unicode_whitespace)
+    {
+        if value.is_empty() {
+            continue;
+        }
+        let (active, _) = smallest.split_at(len);
+        let Err(index) = active.binary_search(&value) else {
+            continue;
+        };
+        if index == MAXIMUM {
+            continue;
+        }
+        if len < MAXIMUM {
+            len += 1;
+        }
+        let (active, _) = smallest.split_at_mut(len);
+        let (_, tail) = active.split_at_mut(index);
+        tail.rotate_right(1);
+        if let Some(first) = tail.first_mut() {
+            *first = value;
+        }
+    }
+    let (active, _) = smallest.split_at(len);
+    active
+        .iter()
+        .map(|value| InputBytes::from(*value))
+        .collect()
+}
+
 /// A trimmed request query value, or the declared default when the request has none.
-fn request_query_value_or_default(
-    request: &Request,
+fn query_value_or_default(
+    request: QueryValuesRef<'_>,
     param: &str,
     default: &ResourceFilterValue,
 ) -> InputBytes {
-    let value = request_query_value(request, param);
+    let value = request.trimmed(param);
     if value.is_empty() {
         default.as_str().into()
     } else {
@@ -343,11 +534,15 @@ fn request_query_value_or_default(
 /// Resolve the query parameter for a filter definition.
 #[must_use]
 pub fn filter_query_param(definition: &ResourceFilterDefinition) -> String {
+    borrowed_filter_query_param(definition).to_owned()
+}
+
+fn borrowed_filter_query_param(definition: &ResourceFilterDefinition) -> &str {
     let param = definition.param.trim();
     if param.is_empty() {
-        definition.key.as_str().to_owned()
+        definition.key.as_str()
     } else {
-        param.to_owned()
+        param
     }
 }
 
@@ -364,11 +559,7 @@ pub fn resource_filter_mode(definition: &ResourceFilterDefinition) -> ResourceFi
 /// Read one trimmed query value.
 #[must_use]
 pub fn request_query_value(request: &Request, key: &str) -> InputBytes {
-    parse_query(request.uri().query().unwrap_or_default())
-        .get(key.as_bytes())
-        .and_then(|values| values.first())
-        .map(|value| value.trim().to_owned())
-        .unwrap_or_default()
+    QueryValuesRef::Ordinary(&request_query_map(request)).trimmed(key)
 }
 
 /// Read the first untrimmed query value, or the empty string.
@@ -467,18 +658,18 @@ pub fn resource_url_with_query(base: &str, query: &QueryValues) -> String {
 /// Append encoded query values to a base URL.
 #[must_use]
 pub fn append_encoded_query(base: &str, query: &QueryValues) -> String {
-    if query.is_empty() {
-        return base.to_owned();
+    let mut url = base.to_owned();
+    let mut separator = if base.contains('?') { '&' } else { '?' };
+    for (key, entries) in query {
+        for value in entries {
+            url.push(separator);
+            append_component(key.as_bytes(), &mut url);
+            url.push('=');
+            append_component(value.as_bytes(), &mut url);
+            separator = '&';
+        }
     }
-    let encoded = encode_values(query);
-    if encoded.is_empty() {
-        return base.to_owned();
-    }
-    if base.contains('?') {
-        format!("{base}&{encoded}")
-    } else {
-        format!("{base}?{encoded}")
-    }
+    url
 }
 
 /// Copy a query value map.
@@ -537,37 +728,47 @@ fn encode_values(values: &QueryValues) -> String {
             if !encoded.is_empty() {
                 encoded.push('&');
             }
-            encoded.push_str(&encode_component(key.as_bytes()));
+            append_component(key.as_bytes(), &mut encoded);
             encoded.push('=');
-            encoded.push_str(&encode_component(value.as_bytes()));
+            append_component(value.as_bytes(), &mut encoded);
         }
     }
     encoded
 }
 
 /// Encode one query component.
-fn encode_component(value: &[u8]) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for &byte in value {
-        match byte {
-            b' ' => encoded.push('+'),
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(char::from(byte));
-            }
-            other => {
-                encoded.push('%');
-                encoded.push(hex_digit(other / 16));
-                encoded.push(hex_digit(other % 16));
-            }
-        }
+fn append_component(value: &[u8], encoded: &mut String) {
+    for byte in value.iter().copied() {
+        let (bytes, length) = encode_byte(byte);
+        let (bytes, _) = bytes.split_at(length);
+        encoded.extend(bytes.iter().copied().map(char::from));
     }
-    encoded
+}
+
+pub(crate) fn append_url_component_into(
+    value: &[u8],
+    encoded: &mut effect::memory::Buffer<'_>,
+) -> Result<(), MemoryError> {
+    for byte in value.iter().copied() {
+        let (bytes, length) = encode_byte(byte);
+        let (bytes, _) = bytes.split_at(length);
+        encoded.extend_from_slice(bytes)?;
+    }
+    Ok(())
+}
+
+fn encode_byte(byte: u8) -> ([u8; 3], usize) {
+    match byte {
+        b' ' => ([b'+', 0, 0], 1),
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => ([byte, 0, 0], 1),
+        other => ([b'%', hex_digit(other / 16), hex_digit(other % 16)], 3),
+    }
 }
 
 /// The uppercase hexadecimal digit for a nibble.
-fn hex_digit(nibble: u8) -> char {
+fn hex_digit(nibble: u8) -> u8 {
     match nibble {
-        0..=9 => char::from(b'0' + nibble),
-        _ => char::from(b'A' + nibble - 10),
+        0..=9 => b'0' + nibble,
+        _ => b'A' + nibble - 10,
     }
 }

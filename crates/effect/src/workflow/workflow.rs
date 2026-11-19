@@ -2,7 +2,7 @@
 
 use super::{
     Durable, HasWorkflowEngine, WorkflowCheckpoint, WorkflowCodecError, WorkflowDefinition,
-    WorkflowEngine, WorkflowHandle, WorkflowRunId, WorkflowSnapshot, WorkflowStatus,
+    WorkflowEngine, WorkflowHandle, WorkflowHead, WorkflowRunId, WorkflowStatus,
 };
 use crate::{Effect, PrimaryOutcomeRef, Release};
 use crate::{
@@ -268,7 +268,7 @@ impl<I: Send + 'static, A: Send + 'static, E: Send + 'static> WorkflowDefinition
                                         let expected_input = Arc::clone(&encoded_input);
                                         {
                                             let __dsl_program = {
-                                            let __dsl_program = effect_provide_some! { program: effect_map_error! { program: engine.start(handle.clone(), Arc::clone(&encoded_input)), map: WorkflowRunError::Engine, }, project: |_: &R| (), }; let engine=Arc::clone(&engine);
+                                            let __dsl_program = effect_provide_some! { program: effect_map_error! { program: engine.start_head(handle.clone(), Arc::clone(&encoded_input)), map: WorkflowRunError::Engine, }, project: |_: &R| (), }; let engine=Arc::clone(&engine);
             let pending=Arc::clone(&pending_reset);
             let expected_handle=handle_for_run.clone();
             let compatibility=Arc::clone(&definition.compatibility);
@@ -318,7 +318,7 @@ impl<I: Send + 'static, A: Send + 'static, E: Send + 'static> WorkflowDefinition
                                                     {
                                                         let __dsl_program = effect_provide_some! {
                                                         program: effect_map_error! {
-                                                        program: engine.transition(
+                                                        program: engine.transition_head(
                                                         run.clone(), snapshot.checkpoint(),
                                                         WorkflowStatus::Running,
                                                     ), map: WorkflowRunError::Engine, }, project: |_: &R| (), }; effect! {
@@ -362,7 +362,7 @@ impl<I: Send + 'static, A: Send + 'static, E: Send + 'static> WorkflowDefinition
                                                                             {
                                                                                 let __dsl_program = effect_provide_some! {
                                                                                 program: effect_map_error! {
-                                                                                program: engine_for_interruption.transition(
+                                                                                program: engine_for_interruption.transition_head(
                                                                                 interrupted_run.clone(),
                                                                                 interruption_checkpoint.clone(),
                                                                                 WorkflowStatus::Ready,
@@ -397,7 +397,7 @@ impl<I: Send + 'static, A: Send + 'static, E: Send + 'static> WorkflowDefinition
                                                                     {
                                                                         let __dsl_program = effect_provide_some! {
                                                                         program: effect_map_error! {
-                                                                        program: engine_for_failure.transition(
+                                                                        program: engine_for_failure.transition_head(
                                                                         failure_run.clone(),
                                                                         failure_checkpoint.clone(),
                                                                         WorkflowStatus::Ready,
@@ -434,7 +434,7 @@ impl<I: Send + 'static, A: Send + 'static, E: Send + 'static> WorkflowDefinition
                                                                     let __dsl_program = __dsl_program.clone(); let definition = definition.clone(); let engine_for_completion = engine_for_completion.clone(); let run_for_result = run_for_result.clone(); let step = __dsl_program.clone()?; match step {
                                                                     WorkflowStep::Suspended => {
                                                                         {
-                                                                            let __dsl_program = effect_provide_some! { program: effect_map_error! { program: engine_for_completion.inspect(run_for_result.clone()), map: WorkflowRunError::Engine, }, project: |_: &R| (), }; effect! {
+                                                                            let __dsl_program = effect_provide_some! { program: effect_map_error! { program: engine_for_completion.inspect_head(run_for_result.clone()), map: WorkflowRunError::Engine, }, project: |_: &R| (), }; effect! {
                                                                             let snapshot = __dsl_program.clone()?; match snapshot
                                                                                 .map(|value| value.status) {
                                                                                 Some(WorkflowStatus::Suspended) => {
@@ -463,7 +463,7 @@ impl<I: Send + 'static, A: Send + 'static, E: Send + 'static> WorkflowDefinition
                                                                     {
                                                                         let __dsl_program = effect_provide_some! {
                                                                         program: effect_map_error! {
-                                                                        program: engine_for_completion.complete(
+                                                                        program: engine_for_completion.complete_head(
                                                                         run_for_result.clone(), encoded,
                                                                     ), map: move |source| {
                                                                         WorkflowRunError::UncertainCompletion {
@@ -506,9 +506,9 @@ impl<I: Send + 'static, A: Send + 'static, E: Send + 'static> WorkflowDefinition
 /// Retry only the reset checkpoint retained by this run recipe; validate returned ownership before clearing it or acknowledging completion.
 fn recover_pending<R, BodyError>(
     engine: Arc<R::Engine>,
-    snapshot: WorkflowSnapshot,
+    snapshot: WorkflowHead,
     pending: Arc<Mutex<Option<WorkflowCheckpoint>>>,
-) -> Effect<WorkflowSnapshot, WorkflowRunError<EngineError<R>, BodyError>, R>
+) -> Effect<WorkflowHead, WorkflowRunError<EngineError<R>, BodyError>, R>
 where
     R: HasWorkflowEngine + Send + Sync + 'static,
     BodyError: Send + 'static,
@@ -530,7 +530,7 @@ where
             let __dsl_program = effect_provide_some! {
             program: effect_map_error! {
             program: engine
-            .transition(run, checkpoint, WorkflowStatus::Ready), map: move |source| WorkflowRunError::Recovery {
+            .transition_head(run, checkpoint, WorkflowStatus::Ready), map: move |source| WorkflowRunError::Recovery {
                 body: None,
                 source,
                 run: failed_run.clone(),

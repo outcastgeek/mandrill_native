@@ -468,7 +468,7 @@ fn schedule_exhaustion_delay_cancellation_and_timeout_cleanup_keep_full_outcomes
         Exit::FinalizationFailed(Finalization {
             primary: PrimaryOutcome::Failed(5),
             first: CleanupFailure::ReleaseFailure(7),
-            rest: Vec::new()
+            rest: effect::CleanupFailures::default()
         })
     );
     let retry: Effect<(), usize, Env> = effect_retry! { program: effect_try_sync! { body: { let __dsl_error = || 5; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }, schedule: Schedule::recurs(2).intersect(Schedule::spaced(Duration::from_secs(1))), };
@@ -478,17 +478,25 @@ fn schedule_exhaustion_delay_cancellation_and_timeout_cleanup_keep_full_outcomes
     assert_eq!(block_on(run), Exit::Interrupted);
     assert_eq!(env.clock.pending(), 0);
     let env = Arc::new(Env::default());
+    let entered = Arc::new(AtomicUsize::new(0));
+    let body_entered = Arc::clone(&entered);
     let pending: Effect<usize, usize, Env> = effect_resource! {
-    ensuring; program: effect_future! { body: |cancel| async move {
-            cancel.cancelled().await;
-            1usize
+    ensuring; program: effect_future! { body: move |cancel| {
+            let body_entered = Arc::clone(&body_entered);
+            async move {
+                body_entered.fetch_add(1, Ordering::SeqCst);
+                cancel.cancelled().await;
+                1usize
+            }
         }, }, release: { let __dsl_cleanup = effect_try_sync! { body: { let __dsl_error = || 7; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }; move |_| __dsl_cleanup.clone() },
     };
     let mut run = Box::pin(
         effect_timeout! { program: pending, duration: Duration::from_secs(1), on_timeout: || 99, }
             .run(Arc::clone(&env)),
     );
-    drive::until(run.as_mut(), || env.clock.pending() == 1);
+    drive::until(run.as_mut(), || {
+        env.clock.pending() == 1 && entered.load(Ordering::SeqCst) == 1
+    });
     let (outcome, advanced) = block_on(join(run, env.clock.advance(Duration::from_secs(1))));
     assert!(advanced.is_ok());
     assert_eq!(
@@ -496,7 +504,7 @@ fn schedule_exhaustion_delay_cancellation_and_timeout_cleanup_keep_full_outcomes
         Exit::FinalizationFailed(Finalization {
             primary: PrimaryOutcome::Failed(99),
             first: CleanupFailure::ReleaseFailure(7),
-            rest: Vec::new()
+            rest: effect::CleanupFailures::default()
         })
     );
     env.tasks.finish();

@@ -71,9 +71,16 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::io;
+use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::LazyLock;
 
+use crate::byte_text::BufferWriter;
+use effect::memory::{
+    Buffer, BufferView, Bytes, FixedVector, MemoryError, PreparedMemory, RegionId, SlotLease,
+    SlotPool,
+};
 use html5ever::serialize::{HtmlSerializer, SerializeOpts, Serializer, TraversalScope};
 use html5ever::tendril::StrTendril;
 use html5ever::tokenizer::states::RawKind;
@@ -288,13 +295,16 @@ impl SanitizePolicy {
 #[derive(Debug, Default)]
 struct CleanAttributes {
     /// The attribute name/value pairs.
-    entries: Vec<(String, String)>,
+    entries: Vec<(QualName, String)>,
 }
 
 impl CleanAttributes {
     /// Append one surviving attribute.
     fn push(&mut self, key: String, value: &str) {
-        self.entries.push((key, value.to_owned()));
+        self.entries.push((
+            QualName::new(None, ns!(), LocalName::from(key.as_str())),
+            value.to_owned(),
+        ));
     }
 
     /// Whether no attribute survived.
@@ -304,22 +314,22 @@ impl CleanAttributes {
 
     /// Whether an attribute with this name survived.
     fn contains(&self, key: &str) -> bool {
-        self.entries.iter().any(|(name, _)| name == key)
+        self.entries
+            .iter()
+            .any(|(name, _)| &*name.local == key)
     }
 
     /// Drop or rewrite the URL attributes of a linkable element.
     fn retain_valid_urls(&mut self, policy: &SanitizePolicy, element: &str) {
-        let mut validated: Vec<(String, String)> = Vec::with_capacity(self.entries.len());
-        for (key, value) in &self.entries {
-            if is_url_attribute(element, key) {
-                if let Some(url) = policy.sanitize_url(value) {
-                    validated.push((key.clone(), url));
-                }
-            } else {
-                validated.push((key.clone(), value.clone()));
+        self.entries.retain_mut(|(key, value)| {
+            if is_url_attribute(element, key.local.as_ref()) {
+                let Some(url) = policy.sanitize_url(value) else {
+                    return false;
+                };
+                *value = url;
             }
-        }
-        self.entries = validated;
+            true
+        });
     }
 
     /// Apply the `rel="nofollow"` rule for link elements with an `href`.
@@ -329,7 +339,7 @@ impl CleanAttributes {
         }
         let mut nofollow_found = false;
         for (key, value) in &mut self.entries {
-            if key == "rel" {
+            if &*key.local == "rel" {
                 if !value.contains("nofollow") {
                     value.push_str(" nofollow");
                 }
@@ -337,35 +347,191 @@ impl CleanAttributes {
             }
         }
         if !nofollow_found {
-            self.entries.push(("rel".to_owned(), "nofollow".to_owned()));
+            self.push("rel".to_owned(), "nofollow");
         }
     }
 }
 
 /// The sanitizer state for one document.
-struct SanitizeState<'policy> {
+struct SanitizeState<'policy, W: io::Write> {
     /// The policy being applied.
     policy: &'policy SanitizePolicy,
     /// The serializer that writes the surviving tokens.
     ///
     /// The surviving tokens are written by the HTML serializer for the
     /// processed-content boundary. No markup is assembled by this module.
-    serializer: HtmlSerializer<Vec<u8>>,
+    serializer: HtmlSerializer<W>,
     /// Whether an unclosed dropped start tag still has to swallow its end tag.
     skip_closing_tag: bool,
     /// The dropped start tags whose end tags are swallowed.
-    closing_tags_to_skip: Vec<String>,
+    closing_tags_to_skip: SkipTags,
     /// The most recently started element name, used for the raw-text guard.
     most_recently_started_token: String,
     /// Whether a dropped skip-content element is currently suppressing its content.
     skip_element_content: bool,
     /// How many dropped skip-content elements are currently open.
     skipping_elements_count: i64,
+    selected: Option<SelectedLimits>,
+    writer_failed: bool,
 }
 
-impl<'policy> SanitizeState<'policy> {
+enum SkipTags {
+    Ordinary(Vec<LocalName>),
+    Prepared(SlotLease<'static, FixedVector<'static, LocalName>>),
+}
+impl SkipTags {
+    fn push(&mut self, tag: LocalName) -> Result<(), MemoryError> {
+        match self {
+            Self::Ordinary(tags) => {
+                tags.push(tag);
+                Ok(())
+            }
+            Self::Prepared(tags) => tags.push(tag).map_err(|_| MemoryError::NoSlot),
+        }
+    }
+
+    fn last(&self) -> Option<&LocalName> {
+        match self {
+            Self::Ordinary(tags) => tags.last(),
+            Self::Prepared(tags) => tags.as_slice().last(),
+        }
+    }
+
+    fn pop(&mut self) {
+        match self {
+            Self::Ordinary(tags) => {
+                tags.pop();
+            }
+            Self::Prepared(tags) => {
+                tags.pop();
+            }
+        }
+    }
+}
+impl Drop for SkipTags {
+    fn drop(&mut self) {
+        if let Self::Prepared(tags) = self {
+            tags.clear();
+        }
+    }
+}
+
+/// Limits for the native tokenizer boundary and filtered HTML publication.
+#[derive(Clone, Copy)]
+#[must_use]
+pub struct HtmlSanitizeLimits {
+    /// Input bytes accepted before constructing the tokenizer.
+    pub input_bytes: NonZeroUsize,
+    /// Maximum tag tokens, bounding the native serializer stack as well.
+    pub tags: NonZeroUsize,
+    /// Maximum tokenizer-provided attributes on one tag.
+    pub attributes: NonZeroUsize,
+    /// Maximum UTF-8 bytes retained in the sanitized HTML lease.
+    pub output_bytes: NonZeroUsize,
+}
+
+struct SelectedLimits {
+    limits: HtmlSanitizeLimits,
+    tags: usize,
+    failure: Option<MemoryError>,
+}
+impl SelectedLimits {
+    fn check_tag(&mut self, attributes: usize) -> Result<(), MemoryError> {
+        self.tags = self
+            .tags
+            .checked_add(1)
+            .ok_or(MemoryError::ArithmeticOverflow)?;
+        if self.tags > self.limits.tags.get() || attributes > self.limits.attributes.get() {
+            return Err(MemoryError::NoSlot);
+        }
+        Ok(())
+    }
+}
+
+/// Startup-prepared output buffers and dropped-tag working tables.
+pub struct PreparedHtmlSanitizer {
+    output: SlotPool<'static, Buffer<'static>>,
+    skipped: SlotPool<'static, FixedVector<'static, LocalName>>,
+    limits: HtmlSanitizeLimits,
+}
+impl PreparedHtmlSanitizer {
+    /// Region payload sizing. Native tokenizer/tendril/serializer scratch is bounded
+    /// by the selected input and tag limits and is supplied by html5ever.
+    pub fn storage_bytes(
+        calls: NonZeroUsize,
+        limits: HtmlSanitizeLimits,
+    ) -> Result<Bytes, MemoryError> {
+        let tags = std::alloc::Layout::array::<LocalName>(limits.tags.get())
+            .map_err(|_| MemoryError::InvalidLayout)?;
+        SlotPool::<Buffer<'static>>::storage_bytes(calls.get())?
+            .checked_add(SlotPool::<FixedVector<'static, LocalName>>::storage_bytes(
+                calls.get(),
+            )?)?
+            .checked_add(
+                Bytes::new(tags.size())
+                    .checked_add(Bytes::new(limits.output_bytes.get()))?
+                    .checked_mul(calls.get())?,
+            )
+    }
+
+    /// Prepare complete reusable workspaces before content parsing starts.
+    pub fn prepare(
+        memory: &PreparedMemory<'static>,
+        region: RegionId,
+        calls: NonZeroUsize,
+        limits: HtmlSanitizeLimits,
+    ) -> Result<Self, MemoryError> {
+        Self::storage_bytes(calls, limits)?;
+        Ok(Self {
+            output: memory.buffers(region, calls.get(), Bytes::new(limits.output_bytes.get()))?,
+            skipped: memory.slots(region, calls.get(), |_| {
+                FixedVector::prepare(memory.allocator(region)?, limits.tags.get())
+            })?,
+            limits,
+        })
+    }
+
+    /// Apply the same policy and return the complete regional UTF-8 owner.
+    pub fn sanitize(&self, html: &str) -> Result<BufferView<'static>, MemoryError> {
+        if html.len() > self.limits.input_bytes.get() {
+            return Err(MemoryError::ValueTooLarge {
+                requested: Bytes::new(html.len()),
+                capacity: Bytes::new(self.limits.input_bytes.get()),
+            });
+        }
+        let mut output = self.output.try_checkout()?;
+        let skipped = SkipTags::Prepared(self.skipped.try_checkout()?);
+        output.clear();
+        if html.trim().is_empty() {
+            output.extend_from_slice(html.as_bytes())?;
+        } else {
+            let mut state = SanitizeState::new(
+                &CONTENT_SANITIZE_POLICY,
+                BufferWriter::new(&mut output),
+                skipped,
+            );
+            state.selected = Some(SelectedLimits {
+                limits: self.limits,
+                tags: 0,
+                failure: None,
+            });
+            let state = tokenize(html, state);
+            if let Some(error) = state
+                .selected
+                .as_ref()
+                .and_then(|limits| limits.failure)
+                .or_else(|| state.serializer.writer.memory_error())
+            {
+                return Err(error);
+            }
+        }
+        Ok(BufferView::new(output.share()))
+    }
+}
+
+impl<'policy, W: io::Write> SanitizeState<'policy, W> {
     /// A fresh state with no output.
-    fn new(policy: &'policy SanitizePolicy) -> Self {
+    fn new(policy: &'policy SanitizePolicy, writer: W, skipped: SkipTags) -> Self {
         let options = SerializeOpts {
             // The filtered token stream is not a tree: a stray end tag must be
             // written, not panic, and it must not shift a real element's parent.
@@ -375,22 +541,40 @@ impl<'policy> SanitizeState<'policy> {
         };
         Self {
             policy,
-            serializer: HtmlSerializer::new(Vec::new(), options),
+            serializer: HtmlSerializer::new(writer, options),
             skip_closing_tag: false,
-            closing_tags_to_skip: Vec::new(),
+            closing_tags_to_skip: skipped,
             most_recently_started_token: String::new(),
             skip_element_content: false,
             skipping_elements_count: 0,
+            selected: None,
+            writer_failed: false,
         }
     }
 
     /// Apply the policy to one token.
     fn process(&mut self, token: &Token) {
+        if self.writer_failed
+            || self
+                .selected
+                .as_ref()
+                .is_some_and(|limits| limits.failure.is_some())
+        {
+            return;
+        }
         match token {
             // Doctypes have no safe parsing mechanism and are dropped; comments are
             // dropped unless a policy allows them, and this policy does not.
             Token::DoctypeToken(_) | Token::CommentToken(_) => {}
-            Token::TagToken(tag) => self.process_tag(tag),
+            Token::TagToken(tag) => {
+                if let Some(limits) = &mut self.selected
+                    && let Err(error) = limits.check_tag(tag.attrs.len())
+                {
+                    limits.failure = Some(error);
+                    return;
+                }
+                self.process_tag(tag);
+            }
             Token::CharacterTokens(data) => self.write_text(data),
             Token::NullCharacterToken => self.write_text("\u{0}"),
             Token::EOFToken | Token::ParseError(_) => {}
@@ -403,7 +587,7 @@ impl<'policy> SanitizeState<'policy> {
         if self.skip_element_content || is_unsafe_element(&self.most_recently_started_token) {
             return;
         }
-        let _ = self.serializer.write_text(data);
+        self.writer_failed = self.serializer.write_text(data).is_err();
     }
 
     /// Write one surviving start tag through the serializer.
@@ -415,40 +599,25 @@ impl<'policy> SanitizeState<'policy> {
     /// ignores the slash and the token is emitted unchanged.
     fn write_start_tag(&mut self, name: &str, attributes: &CleanAttributes) {
         let element = qualified_element_name(name);
-        let attribute_values: Vec<(QualName, &str)> = attributes
-            .entries
-            .iter()
-            .map(|(key, value)| {
-                let name = QualName::new(None, ns!(), LocalName::from(key.as_str()));
-                (name, value.as_str())
-            })
-            .collect();
-        let _ = self.serializer.start_elem(
+        let started = self.serializer.start_elem(
             element.clone(),
-            attribute_values.iter().map(|(name, value)| (name, *value)),
+            attributes
+                .entries
+                .iter()
+                .map(|(name, value)| (name, value.as_str())),
         );
-        if is_void_element(name) {
-            let _ = self.serializer.end_elem(element);
+        self.writer_failed = started.is_err();
+        if !self.writer_failed && is_void_element(name) {
+            self.writer_failed = self.serializer.end_elem(element).is_err();
         }
     }
 
     /// Write one surviving end tag through the serializer.
     fn write_end_tag(&mut self, name: &str) {
-        let _ = self.serializer.end_elem(qualified_element_name(name));
-    }
-
-    /// Take the serializer's output as text.
-    fn take_output(&mut self) -> String {
-        let bytes = std::mem::take(&mut self.serializer.writer);
-        match String::from_utf8(bytes) {
-            Ok(output) => output,
-            // The serializer writes the UTF-8 text it is given plus ASCII markup, so
-            // this branch only guards the boundary against an invalid byte sequence.
-            Err(error) => {
-                let bytes = error.into_bytes();
-                String::from_utf8_lossy(&bytes).into_owned()
-            }
-        }
+        self.writer_failed = self
+            .serializer
+            .end_elem(qualified_element_name(name))
+            .is_err();
     }
 
     /// Apply the policy to one tag token.
@@ -477,7 +646,11 @@ impl<'policy> SanitizeState<'policy> {
         let attributes = self.policy.sanitize_attributes(name, &tag.attrs);
         if attributes.is_empty() && !self.policy.allows_element_without_attributes(name) {
             self.skip_closing_tag = true;
-            self.closing_tags_to_skip.push(name.to_owned());
+            if let Err(error) = self.closing_tags_to_skip.push(tag.name.clone())
+                && let Some(limits) = &mut self.selected
+            {
+                limits.failure = Some(error);
+            }
             return;
         }
         if self.skip_element_content {
@@ -517,10 +690,10 @@ impl<'policy> SanitizeState<'policy> {
             && self
                 .closing_tags_to_skip
                 .last()
-                .is_some_and(|pending| pending == name)
+                .is_some_and(|pending| &**pending == name)
         {
             self.closing_tags_to_skip.pop();
-            if self.closing_tags_to_skip.is_empty() {
+            if self.closing_tags_to_skip.last().is_none() {
                 self.skip_closing_tag = false;
             }
             return;
@@ -544,12 +717,12 @@ impl<'policy> SanitizeState<'policy> {
 }
 
 /// The token sink that applies the sanitizer state to every token.
-struct SanitizeSink<'policy> {
+struct SanitizeSink<'policy, W: io::Write> {
     /// The shared sanitizer state.
-    state: Rc<RefCell<SanitizeState<'policy>>>,
+    state: Rc<RefCell<Option<SanitizeState<'policy, W>>>>,
 }
 
-impl TokenSink for SanitizeSink<'_> {
+impl<W: io::Write> TokenSink for SanitizeSink<'_, W> {
     type Handle = ();
 
     fn process_token(&self, token: Token, _line_number: u64) -> TokenSinkResult<()> {
@@ -569,9 +742,9 @@ impl TokenSink for SanitizeSink<'_> {
             | Token::EOFToken
             | Token::ParseError(_) => None,
         };
-        let mut state = self.state.borrow_mut();
-        state.process(&token);
-        drop(state);
+        if let Some(state) = self.state.borrow_mut().as_mut() {
+            state.process(&token);
+        }
         transition.unwrap_or(TokenSinkResult::Continue)
     }
 }
@@ -604,8 +777,27 @@ pub(crate) fn sanitize_html(html: &str) -> String {
     if html.trim().is_empty() {
         return html.to_owned();
     }
-    let policy = &*CONTENT_SANITIZE_POLICY;
-    let state = Rc::new(RefCell::new(SanitizeState::new(policy)));
+    let state = SanitizeState::new(
+        &CONTENT_SANITIZE_POLICY,
+        Vec::new(),
+        SkipTags::Ordinary(Vec::new()),
+    );
+    let bytes = tokenize(html, state).serializer.writer;
+    match String::from_utf8(bytes) {
+        Ok(output) => output,
+        Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+    }
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "the tokenizer borrows the state and never removes its owner"
+)]
+fn tokenize<'policy, W: io::Write>(
+    html: &str,
+    state: SanitizeState<'policy, W>,
+) -> SanitizeState<'policy, W> {
+    let state = Rc::new(RefCell::new(Some(state)));
     let input = BufferQueue::default();
     input.push_back(StrTendril::from_slice(html));
     let tokenizer = Tokenizer::new(
@@ -616,7 +808,7 @@ pub(crate) fn sanitize_html(html: &str) -> String {
     );
     let _ = tokenizer.feed(&input);
     tokenizer.end();
-    state.borrow_mut().take_output()
+    state.borrow_mut().take().expect("sanitizer state")
 }
 
 /// Build the content policy plus its four additions.
@@ -1165,8 +1357,7 @@ fn encode_content_authority(authority: &str, scheme: Option<&str>) -> Option<Str
         .map_or((None, authority), |(u, h)| (Some(u), h));
     let mut result = String::new();
     if let Some(user) = user {
-        if !crate::url_text::valid_raw_userinfo(user)
-        {
+        if !crate::url_text::valid_raw_userinfo(user) {
             return None;
         }
         let (name, password) = user

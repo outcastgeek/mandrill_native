@@ -6,6 +6,12 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod prepared;
+pub use prepared::{
+    PreparedMetricCapacity, PreparedMetricDraft, PreparedMetricError, PreparedMetricRecorder,
+    PreparedMetricSeries, PreparedMetricSnapshot,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// A typed failure to define or record a metric under its declared constraints.
 pub enum MetricError {
@@ -251,12 +257,7 @@ impl MetricSample {
         labels: MetricLabels,
         value: MetricValue,
     ) -> Result<Self, MetricError> {
-        if descriptor.kind != value.kind() {
-            return Err(MetricError::WrongKind);
-        }
-        if matches!(value, MetricValue::Gauge(GaugeValue::Float(number)) if !number.is_finite()) {
-            return Err(MetricError::NonFiniteGauge);
-        }
+        validate_value(descriptor.kind, value)?;
         Ok(Self {
             descriptor,
             labels,
@@ -284,6 +285,16 @@ impl MetricSample {
     pub const fn value(&self) -> MetricValue {
         self.value
     }
+}
+
+fn validate_value(kind: MetricKind, value: MetricValue) -> Result<(), MetricError> {
+    if kind != value.kind() {
+        return Err(MetricError::WrongKind);
+    }
+    if matches!(value, MetricValue::Gauge(GaugeValue::Float(number)) if !number.is_finite()) {
+        return Err(MetricError::NonFiniteGauge);
+    }
+    Ok(())
 }
 
 /// Implementations either accept one measurement or return their typed error.

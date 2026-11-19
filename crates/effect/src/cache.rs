@@ -1,13 +1,20 @@
 //! Scoped in-memory cache lookup, ownership, and invalidation.
 
-use crate::execution::TaskEvent;
+use crate::cancellation::{LoaderCancellation, OwnedCancellationWait};
+use crate::execution::{PreparedTaskCompletion, TaskEvent};
 use crate::internal::notification::notify_all;
-use crate::internal::outcome;
-use crate::internal::runtime::{self, Context, Step};
+use crate::internal::runtime::{self, Context, Finish, Step};
+use crate::internal::runtime_storage::ReservedOnce;
+use crate::internal::work_list::WorkList as CacheList;
+use crate::memory::{
+    Bytes, FixedVector, FramePool, MemoryError, PreparedMemory, PreparedUnitFuture, RegionId,
+    SlotLease, SlotPool, WeakSlot, prepared_notification,
+};
 use crate::scope::Registered;
 use crate::{
-    Cancellation, Clock, Defect, Effect, Exit, HasClock, HasTaskSpawner, LibraryDefect,
-    ScheduledTask, Scope, TaskSpawner,
+    Cancellation, CleanupFailure, Clock, Defect, Effect, Exit, Finalization, HasClock,
+    HasTaskSpawner, LibraryDefect, PreparedCleanupAccumulator, PrimaryOutcome, ScheduledTask,
+    Scope, TaskSpawner,
 };
 use crate::{cache, effect, effect_sync, effect_uninterruptible};
 use event_listener::Event;
@@ -15,11 +22,17 @@ use futures_util::{
     FutureExt,
     future::{Either, select},
 };
-use std::collections::VecDeque;
+use std::alloc::Layout;
+use std::future::Future;
 use std::num::NonZeroUsize;
+use std::ops::Deref;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
+
+mod prepared;
+pub use prepared::{CacheKey, PreparedCacheCapacity, PreparedCacheStorage};
+use prepared::{Cell, CellLease, Cleanup, OutcomeStorage, Payloads};
 
 /// Shared ownership of a payload without requiring `T: Clone`.
 ///
@@ -27,7 +40,50 @@ use std::time::Duration;
 /// inspection; [`Self::try_into_owned`] transfers it only when this is the last
 /// owner. Debug output is opaque and does not inspect the application payload.
 pub struct SharedValue<T: Send + 'static> {
-    value: Arc<Mutex<T>>,
+    value: SharedStorage<T>,
+}
+enum SharedStorage<T: Send + 'static> {
+    Ordinary(Arc<Mutex<T>>),
+    Prepared(Cell<Mutex<T>>),
+}
+
+/// Startup-prepared cells for independently retained shared values.
+pub struct PreparedSharedValuePool<T: Send + 'static> {
+    cells: SlotPool<'static, Option<Mutex<T>>>,
+}
+
+/// One preadmitted shared value cell, empty until publication.
+pub struct PreparedSharedValueReservation<T: Send + 'static> {
+    cell: SlotLease<'static, Option<Mutex<T>>>,
+}
+
+impl<T: Send + 'static> PreparedSharedValuePool<T> {
+    /// Selected region bytes excluding allocator overhead.
+    pub fn storage_bytes(capacity: usize) -> Result<Bytes, MemoryError> {
+        SlotPool::<Option<Mutex<T>>>::storage_bytes(capacity)
+    }
+
+    /// Provision the actual cells before work that may retain a shared value.
+    pub fn prepare(
+        memory: &PreparedMemory<'static>,
+        region: RegionId,
+        capacity: usize,
+    ) -> Result<Self, MemoryError> {
+        Ok(Self { cells: memory.slots(region, capacity, |_| Ok(None))? })
+    }
+
+    /// Reserve one physical cell before constructing its value.
+    pub fn reserve(&self) -> Result<PreparedSharedValueReservation<T>, MemoryError> {
+        Ok(PreparedSharedValueReservation { cell: self.cells.try_checkout()? })
+    }
+}
+
+impl<T: Send + 'static> PreparedSharedValueReservation<T> {
+    /// Transfer the value into the cell retained by all shared readers.
+    #[must_use]
+    pub fn publish(self, value: T) -> SharedValue<T> {
+        SharedValue::from_reserved(self.cell, value)
+    }
 }
 impl<T: Send + 'static> std::fmt::Debug for SharedValue<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -42,7 +98,10 @@ impl<T: Send + 'static> Clone for SharedValue<T> {
     /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
-            value: Arc::clone(&self.value),
+            value: match &self.value {
+                SharedStorage::Ordinary(value) => SharedStorage::Ordinary(Arc::clone(value)),
+                SharedStorage::Prepared(value) => SharedStorage::Prepared(value.clone()),
+            },
         }
     }
 }
@@ -60,7 +119,29 @@ impl<T: Send + 'static> SharedValue<T> {
     /// Type: `Self`.
     pub fn new(value: T) -> Self {
         Self {
-            value: Arc::new(Mutex::new(value)),
+            value: SharedStorage::Ordinary(Arc::new(Mutex::new(value))),
+        }
+    }
+
+    /// Region bytes for one startup-provisioned value and its cell metadata.
+    pub fn prepared_storage_bytes() -> Result<Bytes, MemoryError> {
+        SlotPool::<Option<Mutex<T>>>::storage_bytes(1)
+    }
+
+    /// Provision one shared value in startup-owned memory. The last handle
+    /// keeps its cell checked out until the stored value is removed or dropped.
+    pub fn prepare_region(
+        memory: &PreparedMemory<'static>,
+        region: RegionId,
+        value: T,
+    ) -> Result<Self, MemoryError> {
+        let slots = memory.slots(region, 1, |_| Ok(None))?;
+        Ok(Self::from_reserved(slots.try_checkout()?, value))
+    }
+
+    pub(crate) fn from_reserved(slot: SlotLease<'static, Option<Mutex<T>>>, value: T) -> Self {
+        Self {
+            value: SharedStorage::Prepared(Cell::publish(slot, Mutex::new(value))),
         }
     }
     /// Borrow the contained value only for the duration of the supplied callback.
@@ -75,10 +156,12 @@ impl<T: Send + 'static> SharedValue<T> {
     /// # Returns
     /// Type: `Result<A, Defect>`.
     pub fn with<A>(&self, inspect: impl FnOnce(&T) -> A) -> Result<A, Defect> {
-        let value = self
-            .value
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let value = match &self.value {
+            SharedStorage::Ordinary(value) => &**value,
+            SharedStorage::Prepared(value) => &**value,
+        }
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
         catch_unwind(AssertUnwindSafe(|| inspect(&value))).map_err(Defect::from_panic)
     }
     /// Take the guarded value when no other shared views retain it.
@@ -89,12 +172,18 @@ impl<T: Send + 'static> SharedValue<T> {
     /// # Returns
     /// Type: `Result<T, Self>`.
     pub fn try_into_owned(self) -> Result<T, Self> {
-        match Arc::try_unwrap(self.value) {
-            Ok(value) => Ok(value
-                .into_inner()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)),
-            Err(value) => Err(Self { value }),
+        let value = match self.value {
+            SharedStorage::Ordinary(value) => {
+                Arc::try_unwrap(value).map_err(SharedStorage::Ordinary)
+            }
+            SharedStorage::Prepared(value) => {
+                value.try_into_inner().map_err(SharedStorage::Prepared)
+            }
         }
+        .map_err(|value| Self { value })?;
+        Ok(value
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 }
 #[derive(Clone, Copy)]
@@ -202,6 +291,14 @@ impl<E> Clone for CacheAdmission<E> {
         }
     }
 }
+impl<E> CacheAdmission<E> {
+    fn maximum(&self) -> Option<NonZeroUsize> {
+        match self {
+            Self::Unbounded => None,
+            Self::Bounded { maximum, .. } => Some(*maximum),
+        }
+    }
+}
 /// Outcome expiry and active admission settings used by [`Cache::make_with_options`].
 pub struct CacheOptions<A, E> {
     /// Retention lifetime selection; overrides the legacy fixed TTL in CacheConfig.
@@ -231,6 +328,170 @@ impl<E: Send + 'static> CacheSelectionError<E> {
 }
 
 type SharedOutcome<A, E> = Exit<SharedValue<A>, SharedValue<E>>;
+
+fn clone_observed<A: Send + 'static, E: Send + 'static>(
+    outcome: &SharedOutcome<A, E>,
+    invalidated: bool,
+    cleanup: &mut Option<Cleanup<E>>,
+) -> SharedOutcome<A, E> {
+    match outcome {
+        Exit::FinalizationFailed(details) => {
+            let mut rest = cleanup.take().unwrap_or_default();
+            rest.extend(details.rest.iter().cloned());
+            let primary = if invalidated {
+                PrimaryOutcome::WasInterrupted
+            } else {
+                details.primary.clone()
+            };
+            Exit::FinalizationFailed(Finalization {
+                primary,
+                first: details.first.clone(),
+                rest,
+            })
+        }
+        Exit::Success(_) | Exit::Fail(_) | Exit::Die(_) | Exit::Interrupted => {
+            if invalidated {
+                Exit::Interrupted
+            } else {
+                outcome.clone()
+            }
+        }
+    }
+}
+
+struct Retirement<E: Send + 'static> {
+    outcome: PreparedCleanupAccumulator<(), SharedValue<E>>,
+    notification: Option<prepared_notification::Registration>,
+}
+
+struct RetirementReservation<E: Send + 'static> {
+    cleanup: Cleanup<E>,
+    notification: prepared_notification::Registration,
+}
+
+impl<E: Send + 'static> RetirementReservation<E> {
+    fn reserve<K: Send + Sync + 'static, A: Send + 'static>(
+        payloads: &Payloads<K, A, E>,
+    ) -> Result<Self, MemoryError> {
+        Ok(Self {
+            cleanup: payloads.reserve_retirement()?,
+            notification: payloads.changed.listen()?,
+        })
+    }
+}
+
+impl<E: Send + 'static> Retirement<E> {
+    fn new(reservation: Option<RetirementReservation<E>>) -> Self {
+        Self::from_primary(reservation, Exit::Success(()))
+    }
+
+    fn from_primary(
+        reservation: Option<RetirementReservation<E>>,
+        primary: Exit<(), SharedValue<E>>,
+    ) -> Self {
+        let (cleanup, notification) = reservation.map_or_else(
+            || (Cleanup::default(), None),
+            |reservation| (reservation.cleanup, Some(reservation.notification)),
+        );
+        Self {
+            outcome: PreparedCleanupAccumulator::from_reserved(primary, cleanup),
+            notification,
+        }
+    }
+
+    fn with_primary<A: Send + 'static>(
+        reservation: Option<RetirementReservation<E>>,
+        outcome: &SharedOutcome<A, E>,
+    ) -> Self {
+        let primary = match outcome.primary() {
+            crate::PrimaryOutcomeRef::Succeeded => Exit::Success(()),
+            crate::PrimaryOutcomeRef::Failed(error) => Exit::Fail(error.clone()),
+            crate::PrimaryOutcomeRef::Defected(defect) => Exit::Die(defect.clone()),
+            crate::PrimaryOutcomeRef::WasInterrupted => Exit::Interrupted,
+        };
+        let mut retirement = Self::from_primary(reservation, primary);
+        retirement.append_exit(outcome);
+        retirement
+    }
+
+    fn append_exit<A: Send + 'static>(&mut self, outcome: &SharedOutcome<A, E>) {
+        if let Exit::FinalizationFailed(details) = outcome {
+            for failure in std::iter::once(&details.first).chain(details.rest.iter()) {
+                let failure = match failure {
+                    CleanupFailure::ReleaseFailure(error) => Exit::Fail(error.clone()),
+                    CleanupFailure::ReleaseDefect(defect) => Exit::Die(defect.clone()),
+                    CleanupFailure::ReleaseInterrupted => Exit::Interrupted,
+                };
+                self.outcome.append_cleanup(failure);
+            }
+        }
+    }
+
+    fn finish(self) -> Exit<(), SharedValue<E>> {
+        self.outcome.finish()
+    }
+}
+
+pub(crate) enum EntryKey<K: Send + Sync + 'static> {
+    Ordinary(Arc<K>),
+    Prepared(CacheKey<K>),
+}
+impl<K: Send + Sync + 'static> Deref for EntryKey<K> {
+    type Target = K;
+
+    fn deref(&self) -> &K {
+        match self {
+            Self::Ordinary(key) => key,
+            Self::Prepared(key) => key,
+        }
+    }
+}
+impl<K: Send + Sync + 'static> Clone for EntryKey<K> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Ordinary(key) => Self::Ordinary(Arc::clone(key)),
+            Self::Prepared(key) => Self::Prepared(key.clone()),
+        }
+    }
+}
+
+enum RecipeKey<K: Send + Sync + 'static> {
+    Pending(Option<K>),
+    Admitted(CacheKey<K>),
+}
+
+enum LookupKey<K: Send + Sync + 'static> {
+    Owned(EntryKey<K>),
+    Pending(Arc<Mutex<RecipeKey<K>>>, KeyPurpose),
+}
+#[derive(Clone, Copy)]
+enum KeyPurpose {
+    Lookup,
+    Maintenance,
+}
+impl<K: Send + Sync + 'static> Clone for LookupKey<K> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Owned(key) => Self::Owned(key.clone()),
+            Self::Pending(key, purpose) => Self::Pending(Arc::clone(key), *purpose),
+        }
+    }
+}
+
+type InvalidationPredicate<K, A> =
+    Arc<dyn Fn(&K, Option<SharedValue<A>>, bool) -> bool + Send + Sync>;
+enum Invalidation<K, A: Send + 'static, Q> {
+    Predicate(InvalidationPredicate<K, A>),
+    Key(Q),
+}
+impl<K, A: Send + 'static, Q: Clone> Clone for Invalidation<K, A, Q> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Predicate(predicate) => Self::Predicate(Arc::clone(predicate)),
+            Self::Key(key) => Self::Key(key.clone()),
+        }
+    }
+}
 /// Typed entry state used by cache.
 ///
 /// # Type parameters
@@ -242,6 +503,7 @@ struct EntryState<A: Send + 'static, E: Send + 'static> {
     invalidated: bool,
     retiring: bool,
     observed: bool,
+    diagnostic: Option<SlotLease<'static, ()>>,
 }
 /// Typed entry used by cache.
 ///
@@ -250,10 +512,326 @@ struct EntryState<A: Send + 'static, E: Send + 'static> {
 /// - `A`: Application value type. Bound or type: `Send + 'static`.
 /// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 pub(crate) struct Entry<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
-    pub(crate) key: Arc<K>,
+    pub(crate) key: EntryKey<K>,
     state: Mutex<EntryState<A, E>>,
-    changed: Event,
+    outcome_storage: Mutex<Option<OutcomeStorage<A, E>>>,
+    produced: Mutex<Option<Exit<A, E>>>,
+    submission: Mutex<Submission>,
+    changed: Option<Event>,
     cancellation: Cancellation,
+}
+
+pub(crate) enum IndexEntry<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
+    Ordinary(Arc<Entry<K, A, E>>),
+    Prepared(Cell<Entry<K, A, E>>),
+}
+type EntryLease<K, A, E> = CellLease<Entry<K, A, E>>;
+
+impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Clone for IndexEntry<K, A, E> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Ordinary(entry) => Self::Ordinary(Arc::clone(entry)),
+            Self::Prepared(entry) => Self::Prepared(entry.clone()),
+        }
+    }
+}
+
+impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Deref for IndexEntry<K, A, E> {
+    type Target = Entry<K, A, E>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Ordinary(entry) => entry,
+            Self::Prepared(entry) => entry,
+        }
+    }
+}
+
+impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> IndexEntry<K, A, E> {
+    fn publish(lease: Option<EntryLease<K, A, E>>, entry: Entry<K, A, E>) -> Self {
+        match lease {
+            Some(lease) => Self::Prepared(Cell::publish(lease, entry)),
+            None => Self::Ordinary(Arc::new(entry)),
+        }
+    }
+
+    pub(crate) fn same_entry(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Ordinary(left), Self::Ordinary(right)) => Arc::ptr_eq(left, right),
+            (Self::Prepared(left), Self::Prepared(right)) => left.same_cell(right),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn downgrade(&self) -> Result<WeakIndexEntry<K, A, E>, MemoryError> {
+        match self {
+            Self::Ordinary(entry) => Ok(WeakIndexEntry::Ordinary(Arc::downgrade(entry))),
+            Self::Prepared(entry) => entry.downgrade().map(WeakIndexEntry::Prepared),
+        }
+    }
+}
+
+pub(crate) enum WeakIndexEntry<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
+    Ordinary(Weak<Entry<K, A, E>>),
+    Prepared(WeakSlot<'static, Option<Entry<K, A, E>>>),
+}
+
+impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> WeakIndexEntry<K, A, E> {
+    pub(crate) fn matches_entry(&self, entry: &IndexEntry<K, A, E>) -> bool {
+        match (self, entry) {
+            (Self::Ordinary(weak), IndexEntry::Ordinary(entry)) => {
+                std::ptr::eq(weak.as_ptr(), Arc::as_ptr(entry))
+            }
+            (Self::Prepared(weak), IndexEntry::Prepared(entry)) => entry.matches_weak(weak),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn same_entry(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Ordinary(left), Self::Ordinary(right)) => left.ptr_eq(right),
+            (Self::Prepared(left), Self::Prepared(right)) => left.same_slot(right),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn upgrade(&self) -> Option<IndexEntry<K, A, E>> {
+        match self {
+            Self::Ordinary(entry) => entry.upgrade().map(IndexEntry::Ordinary),
+            Self::Prepared(entry) => entry
+                .upgrade()
+                .map(|entry| IndexEntry::Prepared(Cell::from_shared(entry))),
+        }
+    }
+
+    pub(crate) fn is_live(&self) -> bool {
+        match self {
+            Self::Ordinary(entry) => entry.strong_count() != 0,
+            Self::Prepared(entry) => entry.is_live(),
+        }
+    }
+}
+type IndexTable<K, A, E> = FixedVector<'static, IndexEntry<K, A, E>>;
+
+/// Finite retained-cache index and lookup snapshots with interchangeable backing.
+pub struct PreparedCacheIndex<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
+    slots: SlotPool<'static, IndexTable<K, A, E>>,
+    active: SlotPool<'static, IndexTable<K, A, E>>,
+    maintenance: SlotPool<'static, IndexTable<K, A, E>>,
+    shutdown: SlotPool<'static, IndexTable<K, A, E>>,
+    diagnostics: SlotPool<'static, FixedVector<'static, Diagnostic<K, A, E>>>,
+    diagnostic_permits: SlotPool<'static, ()>,
+    observers: SlotPool<'static, ()>,
+    width: usize,
+    maximum_active: NonZeroUsize,
+}
+impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> PreparedCacheIndex<K, A, E> {
+    /// Caller-region bytes for the indexes and lookup table metadata.
+    pub fn storage_bytes(
+        retention: CacheCapacity,
+        active: NonZeroUsize,
+        concurrent_lookups: NonZeroUsize,
+        diagnostics: NonZeroUsize,
+        observers: NonZeroUsize,
+    ) -> Result<Bytes, MemoryError> {
+        let width = prepared_index_width(retention, active)?;
+        let maintenance = width.checked_add(active.get())
+            .and_then(|width| width.checked_add(diagnostics.get()))
+            .ok_or(MemoryError::ArithmeticOverflow)?;
+        let tables = concurrent_lookups.get().checked_add(1).ok_or(MemoryError::ArithmeticOverflow)?;
+        let width = std::alloc::Layout::array::<IndexEntry<K, A, E>>(width)
+            .map_err(|_| MemoryError::InvalidLayout)?;
+        let active = std::alloc::Layout::array::<IndexEntry<K, A, E>>(active.get())
+            .map_err(|_| MemoryError::InvalidLayout)?;
+        let records = std::alloc::Layout::array::<Diagnostic<K, A, E>>(diagnostics.get())
+            .map_err(|_| MemoryError::InvalidLayout)?;
+        let maintenance = std::alloc::Layout::array::<IndexEntry<K, A, E>>(maintenance)
+            .map_err(|_| MemoryError::InvalidLayout)?;
+        SlotPool::<IndexTable<K, A, E>>::storage_bytes(tables)?
+            .checked_add(Bytes::new(width.size()).checked_mul(tables)?)?
+            .checked_add(SlotPool::<IndexTable<K, A, E>>::storage_bytes(1)?)?
+            .checked_add(Bytes::new(active.size()))?
+            .checked_add(SlotPool::<IndexTable<K, A, E>>::storage_bytes(1)?)?
+            .checked_add(Bytes::new(active.size()))?
+            .checked_add(SlotPool::<IndexTable<K, A, E>>::storage_bytes(1)?)?
+            .checked_add(Bytes::new(maintenance.size()))?
+            .checked_add(SlotPool::<FixedVector<'static, Diagnostic<K, A, E>>>::storage_bytes(2)?)?
+            .checked_add(Bytes::new(records.size()).checked_mul(2)?)?
+            .checked_add(SlotPool::<()>::storage_bytes(diagnostics.get())?)?
+            .checked_add(SlotPool::<()>::storage_bytes(observers.get())?)
+    }
+    /// Provision a live retained index and the selected concurrent lookup snapshots.
+    /// Pending producers count toward membership even when settled retention is disabled.
+    pub fn prepare(
+        memory: &PreparedMemory<'static>,
+        region: RegionId,
+        retention: CacheCapacity,
+        active: NonZeroUsize,
+        concurrent_lookups: NonZeroUsize,
+        diagnostics: NonZeroUsize,
+        observers: NonZeroUsize,
+    ) -> Result<Self, MemoryError> {
+        let _ = Self::storage_bytes(retention, active, concurrent_lookups, diagnostics, observers)?;
+        let width = prepared_index_width(retention, active)?;
+        let maintenance_width = width.checked_add(active.get())
+            .and_then(|width| width.checked_add(diagnostics.get()))
+            .ok_or(MemoryError::ArithmeticOverflow)?;
+        let tables = concurrent_lookups.get().checked_add(1).ok_or(MemoryError::ArithmeticOverflow)?;
+        let slots = memory.slots(region, tables, |_| FixedVector::prepare(memory.allocator(region)?, width))?;
+        let active_slots = memory.slots(region, 1, |_| FixedVector::prepare(memory.allocator(region)?, active.get()))?;
+        let shutdown = memory.slots(region, 1, |_| FixedVector::prepare(memory.allocator(region)?, active.get()))?;
+        let maintenance = memory.slots(region, 1, |_| FixedVector::prepare(memory.allocator(region)?, maintenance_width))?;
+        let diagnostic_slots = memory.slots(region, 2, |_| FixedVector::prepare(memory.allocator(region)?, diagnostics.get()))?;
+        let diagnostic_permits = memory.slots(region, diagnostics.get(), |_| Ok(()))?;
+        let observers = memory.slots(region, observers.get(), |_| Ok(()))?;
+        Ok(Self {
+            slots, active: active_slots, maintenance, shutdown, diagnostics: diagnostic_slots, diagnostic_permits,
+            observers, width, maximum_active: active,
+        })
+    }
+
+    fn reserve(&self) -> Result<CacheIndex<K, A, E>, MemoryError> {
+        CacheIndex::checkout(&self.slots)
+    }
+
+    fn reserve_active(&self) -> Result<CacheIndex<K, A, E>, MemoryError> {
+        CacheIndex::checkout(&self.active)
+    }
+
+    fn reserve_maintenance(&self) -> Result<CacheIndex<K, A, E>, MemoryError> {
+        CacheIndex::checkout(&self.maintenance)
+    }
+
+    fn reserve_shutdown(&self) -> Result<CacheIndex<K, A, E>, MemoryError> {
+        CacheIndex::checkout(&self.shutdown)
+    }
+
+    fn reserve_diagnostics(&self) -> Result<CacheList<Diagnostic<K, A, E>>, MemoryError> {
+        CacheList::checkout(&self.diagnostics)
+    }
+}
+
+fn prepared_index_width(retention: CacheCapacity, active: NonZeroUsize) -> Result<usize, MemoryError> {
+    let settled = match retention {
+        CacheCapacity::Bounded(capacity) => capacity.get(),
+        CacheCapacity::NoRetention => 0,
+        CacheCapacity::Unbounded => return Err(MemoryError::UnsupportedRunContract),
+    };
+    settled.checked_add(active.get()).ok_or(MemoryError::ArithmeticOverflow)
+}
+
+type CacheIndex<K, A, E> = CacheList<IndexEntry<K, A, E>>;
+
+struct CacheSnapshot<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
+    revision: CacheRevision,
+    entries: CacheIndex<K, A, E>,
+}
+struct ObservationReservation<E: Send + 'static> {
+    observer: Option<SlotLease<'static, ()>>,
+    cleanup: Option<Cleanup<E>>,
+    notification: Option<prepared_notification::Registration>,
+    cancelled: Option<OwnedCancellationWait>,
+}
+
+pub(crate) struct SelectedCacheEntry<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
+    pub(crate) entry: IndexEntry<K, A, E>,
+    observation: CacheObservation,
+    reservation: ObservationReservation<E>,
+    independent_task: Option<ScheduledTask>,
+}
+enum SnapshotKind {
+    Lookup,
+    Maintenance { allow_closed: bool },
+}
+
+fn retain_selected<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static>(
+    entries: &mut CacheIndex<K, A, E>,
+    mut choose: impl FnMut(&IndexEntry<K, A, E>) -> bool,
+) {
+    let mut index = 0;
+    while let Some(entry) = entries.get(index) {
+        if choose(entry) && !entries.iter().take(index).any(|earlier| earlier.same_entry(entry)) {
+            index += 1;
+        } else {
+            drop(entries.remove(index));
+        }
+    }
+}
+
+struct PreparedIndexSelection<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
+    index: PreparedCacheIndex<K, A, E>,
+    payloads: Option<Payloads<K, A, E>>,
+    on_error: Arc<dyn Fn(MemoryError) -> SharedValue<E> + Send + Sync>,
+    on_active: Option<Arc<dyn Fn() -> SharedValue<E> + Send + Sync>>,
+    active_limit: Option<NonZeroUsize>,
+    independent: bool,
+}
+impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static>
+    PreparedIndexSelection<K, A, E>
+{
+    fn maximum(&self, admission: &CacheAdmission<E>) -> Option<NonZeroUsize> {
+        self.active_limit.or_else(|| admission.maximum())
+    }
+}
+
+/// Prebuilt refusal callbacks for independent memory and active-load limits.
+/// A callback can clone a startup-provisioned shared value for its exact reason.
+pub struct PreparedCacheRefusals<E: Send + 'static> {
+    memory: Arc<dyn Fn(MemoryError) -> SharedValue<E> + Send + Sync>,
+    active: Arc<dyn Fn() -> SharedValue<E> + Send + Sync>,
+}
+
+impl<E: Send + 'static> Clone for PreparedCacheRefusals<E> {
+    fn clone(&self) -> Self {
+        Self {
+            memory: Arc::clone(&self.memory),
+            active: Arc::clone(&self.active),
+        }
+    }
+}
+
+impl<E: Send + 'static> PreparedCacheRefusals<E> {
+    /// Select already shared results for the distinct refusal channels.
+    #[must_use]
+    pub fn new(
+        memory: impl Fn(MemoryError) -> SharedValue<E> + Send + Sync + 'static,
+        active: impl Fn() -> SharedValue<E> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            memory: Arc::new(memory),
+            active: Arc::new(active),
+        }
+    }
+
+    /// Apply the caller's shared memory-refusal policy to the original reason.
+    #[must_use]
+    pub fn memory(&self, reason: MemoryError) -> SharedValue<E> {
+        (self.memory)(reason)
+    }
+}
+
+#[derive(Clone)]
+enum CacheRevision {
+    Ordinary(Arc<()>),
+    Prepared(u128),
+    Exhausted,
+}
+impl CacheRevision {
+    fn matches(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Ordinary(left), Self::Ordinary(right)) => Arc::ptr_eq(left, right),
+            (Self::Prepared(left), Self::Prepared(right)) => left == right,
+            _ => false,
+        }
+    }
+
+    fn next(&self) -> Self {
+        match self {
+            Self::Ordinary(_) => Self::Ordinary(Arc::new(())),
+            Self::Prepared(version) => version.checked_add(1).map_or(Self::Exhausted, Self::Prepared),
+            Self::Exhausted => Self::Exhausted,
+        }
+    }
 }
 /// Type alias for diagnostic in cache.
 ///
@@ -261,7 +839,26 @@ pub(crate) struct Entry<K: Send + Sync + 'static, A: Send + 'static, E: Send + '
 /// - `K`: Key type used for identity or lookup.
 /// - `A`: Application value type.
 /// - `E`: Domain-error type.
-type Diagnostic<K, A, E> = (Arc<Entry<K, A, E>>, SharedOutcome<A, E>);
+struct Diagnostic<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
+    entry: IndexEntry<K, A, E>,
+    _permit: Option<SlotLease<'static, ()>>,
+}
+fn take_diagnostics<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static>(
+    pending: &mut CacheList<Diagnostic<K, A, E>>,
+    selected: &CacheIndex<K, A, E>,
+    removed: &mut CacheList<Diagnostic<K, A, E>>,
+) {
+    let mut index = 0;
+    while let Some(diagnostic) = pending.get(index) {
+        if selected.iter().any(|entry| entry.same_entry(&diagnostic.entry))
+            && let Some(diagnostic) = pending.remove(index)
+        {
+            removed.push_reserved(diagnostic);
+        } else {
+            index += 1;
+        }
+    }
+}
 /// Variants of submission used by cache.
 enum Submission {
     Pending(Option<Defect>),
@@ -274,8 +871,158 @@ enum Submission {
 /// - `K`: Key type used for identity or lookup.
 /// - `A`: Application value type.
 /// - `E`: Domain-error type.
-type StartLoad<K, A, E> =
-    Arc<dyn Fn(Arc<Entry<K, A, E>>, Weak<Inner<K, A, E>>, Context) + Send + Sync>;
+type StartLoad<K, A, E> = Arc<
+    dyn Fn(IndexEntry<K, A, E>, Weak<Inner<K, A, E>>, Context, Option<ScheduledTask>) + Send + Sync,
+>;
+type LoadEffect<K, A, E> = Arc<dyn Fn(&EntryKey<K>, &Context, Finish<A, E>) -> Step + Send + Sync>;
+
+struct PreparedLoader<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
+    entry: IndexEntry<K, A, E>,
+    context: Context,
+    evaluate: runtime::PreparedNestedReservation<A, E>,
+    origin: runtime::ParallelContextReservation,
+    load: LoadEffect<K, A, E>,
+}
+
+impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> PreparedLoader<K, A, E> {
+    async fn run(self) {
+        let context = self
+            .context
+            .parallel_prepared(self.entry.cancellation.clone(), self.origin);
+        let outcome = AssertUnwindSafe(runtime::evaluate_context_reserved(
+            &context,
+            self.evaluate,
+            |finish| (self.load)(&self.entry.key, &context, finish),
+        ))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|panic| Exit::Die(Defect::from_panic(panic)));
+        *self
+            .entry
+            .produced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
+    }
+}
+
+struct LoaderNotice<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
+    entry: IndexEntry<K, A, E>,
+    owner: Weak<Inner<K, A, E>>,
+}
+
+struct LoaderInput<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
+    entry: IndexEntry<K, A, E>,
+    owner: Weak<Inner<K, A, E>>,
+    context: Context,
+}
+
+impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> LoaderNotice<K, A, E> {
+    fn complete(self, event: PreparedTaskCompletion) {
+        let outcome = self
+            .entry
+            .produced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        match event {
+            PreparedTaskCompletion::Ready => {
+                let outcome = outcome.unwrap_or_else(|| {
+                    Exit::Die(Defect::from(LibraryDefect::MissingInterpreterOutcome))
+                });
+                settle(&self.entry, &self.owner, outcome);
+            }
+            PreparedTaskCompletion::Lost(defect) => {
+                self.lost(defect);
+                drop(outcome);
+            }
+        }
+    }
+
+    fn lost(&self, defect: Defect) {
+        let publish = {
+            let mut admission = self
+                .entry
+                .submission
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &mut *admission {
+                Submission::Pending(pending) => {
+                    *pending = Some(defect);
+                    None
+                }
+                Submission::Accepted => {
+                    *admission = Submission::Finished;
+                    Some(defect)
+                }
+                Submission::Finished => None,
+            }
+        };
+        if let Some(defect) = publish {
+            settle(&self.entry, &self.owner, Exit::Die(defect));
+        }
+    }
+}
+
+fn loader_layout<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static>()
+-> Result<Layout, MemoryError> {
+    fn future_layout<I, F: Future<Output = ()>>(_: fn(I) -> F) -> Layout {
+        Layout::new::<F>()
+    }
+    let (result, finish) = runtime::PreparedNestedReservation::<A, E>::layouts();
+    let origin = runtime::ParallelContextReservation::layout();
+    let future = future_layout(PreparedLoader::<K, A, E>::run);
+    let notification =
+        ReservedOnce::<PreparedTaskCompletion, ()>::layout::<LoaderNotice<K, A, E>>();
+    let size = result
+        .size()
+        .max(finish.size())
+        .max(origin.size())
+        .max(future.size())
+        .max(notification.size());
+    let alignment = result
+        .align()
+        .max(finish.align())
+        .max(origin.align())
+        .max(future.align())
+        .max(notification.align());
+    Layout::from_size_align(size, alignment).map_err(|_| MemoryError::InvalidLayout)
+}
+
+fn admit_loader<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static>(
+    frames: &FramePool<'static>,
+    load: LoadEffect<K, A, E>,
+) -> Result<impl FnOnce(LoaderInput<K, A, E>) -> ScheduledTask + use<K, A, E>, MemoryError> {
+    fn reserve_future<I, F: Future<Output = ()> + Send + 'static>(
+        frames: &FramePool<'static>,
+        _: fn(I) -> F,
+    ) -> Result<crate::memory::FrameReservation<'static, F>, MemoryError> {
+        frames.reserve()
+    }
+    let future = reserve_future(frames, PreparedLoader::<K, A, E>::run)?;
+    let notice =
+        ReservedOnce::<PreparedTaskCompletion, ()>::reserve::<LoaderNotice<K, A, E>>(frames)?;
+    let evaluate = runtime::PreparedNestedReservation::reserve(frames)?;
+    let origin = runtime::ParallelContextReservation::reserve(frames)?;
+    Ok(
+        move |LoaderInput {
+                  entry,
+                  owner,
+                  context,
+              }| {
+            let runner = PreparedLoader {
+                entry: entry.clone(),
+                context,
+                evaluate,
+                origin,
+                load,
+            };
+            ScheduledTask::prepared(
+                PreparedUnitFuture::initialize(future, runner.run()),
+                notice.initialize(LoaderNotice { entry, owner }, LoaderNotice::complete),
+            )
+        },
+    )
+}
 /// Typed cache state used by cache.
 ///
 /// # Type parameters
@@ -284,12 +1031,22 @@ type StartLoad<K, A, E> =
 /// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct CacheState<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
     closed: bool,
-    revision: Arc<()>,
-    retained: VecDeque<Arc<Entry<K, A, E>>>,
-    active: Vec<Arc<Entry<K, A, E>>>,
-    diagnostics: Vec<Diagnostic<K, A, E>>,
+    revision: CacheRevision,
+    retained: CacheIndex<K, A, E>,
+    active: CacheIndex<K, A, E>,
+    diagnostics: CacheList<Diagnostic<K, A, E>>,
     shutdown: CacheShutdown<E>,
+    shutdown_index: CacheIndex<K, A, E>,
+    shutdown_retirement: Option<RetirementReservation<E>>,
     owner_loss: Option<Defect>,
+}
+impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> CacheState<K, A, E> {
+    fn advance_revision(&mut self) {
+        self.revision = self.revision.next();
+        if matches!(self.revision, CacheRevision::Exhausted) {
+            self.closed = true;
+        }
+    }
 }
 /// Variants of cache shutdown used by cache.
 ///
@@ -308,12 +1065,14 @@ enum CacheShutdown<E: Send + 'static> {
 /// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 struct Inner<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> {
     state: Mutex<CacheState<K, A, E>>,
-    changed: Event,
-    parent: Cancellation,
+    changed: Option<Event>,
+    parent: LoaderCancellation,
     config: CacheConfig<K, E>,
     options: CacheOptions<A, E>,
     now: Arc<dyn Fn() -> Duration + Send + Sync>,
     start: StartLoad<K, A, E>,
+    load_effect: LoadEffect<K, A, E>,
+    prepared_index: Option<Arc<PreparedIndexSelection<K, A, E>>>,
 }
 /// A scoped cache that shares in-flight loads and retains their outcomes under an explicit policy.
 ///
@@ -362,14 +1121,14 @@ fn share<A: Send + 'static, E: Send + 'static>(outcome: Exit<A, E>) -> SharedOut
 /// - `E`: Bounds: `Send + 'static`.
 ///
 /// # Parameters
-/// - `entry` (`&Arc<Entry<K, A, E>>`): Stored record or event selected for this transition.
+/// - `entry` (`&IndexEntry<K, A, E>`): Stored record or event selected for this transition.
 /// - `owner` (`&Weak<Inner<K, A, E>>`): Worker or scope identity used to fence stale operations.
 /// - `original` (`Exit<A, E>`): The original supplied to this operation.
 ///
 /// # Returns
 /// Type: `()`.
 fn settle<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static>(
-    entry: &Arc<Entry<K, A, E>>,
+    entry: &IndexEntry<K, A, E>,
     owner: &Weak<Inner<K, A, E>>,
     original: Exit<A, E>,
 ) {
@@ -398,112 +1157,91 @@ fn settle<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static>(
         };
         Ok::<_, Defect>((keep, expires))
     }));
-    let (outcome, keep, expires) = match result {
-        Ok(Ok((keep, expires))) => (share(original), keep, expires),
-        Ok(Err(defect)) => (
-            share(outcome::append_cleanup(original, Exit::Die(defect))),
-            false,
-            None,
-        ),
-        Err(panic) => (
-            share(outcome::append_cleanup(
-                original,
-                Exit::Die(Defect::from_panic(panic)),
-            )),
-            false,
-            None,
-        ),
+    let (ttl_failure, mut keep, expires) = match result {
+        Ok(Ok((keep, expires))) => (None, keep, expires),
+        Ok(Err(defect)) => (Some(defect), false, None),
+        Err(panic) => (Some(Defect::from_panic(panic)), false, None),
     };
-    let mut entry_state = entry
-        .state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if entry_state.outcome.is_some() {
-        return;
-    }
-    let diagnostic = matches!(outcome, Exit::FinalizationFailed(_)).then(|| outcome.clone());
-    entry_state.outcome = Some(outcome);
-    entry_state.expires = expires;
-    let invalidated = entry_state.invalidated;
-    let retiring = entry_state.retiring;
-    drop(entry_state);
+    let storage = entry.outcome_storage.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner).take();
+    let Some(storage) = storage else { return };
+    let outcome = catch_unwind(AssertUnwindSafe(|| storage.publish(original, ttl_failure)))
+        .unwrap_or_else(|panic| {
+            keep = false;
+            Exit::Die(Defect::from_panic(panic))
+        });
+    let independent = owner.upgrade().is_some_and(|owner| owner.prepared_index.as_ref().is_some_and(|selection| selection.independent));
+    let publish = || {
+        let mut state = entry.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.outcome.is_some() {
+            return Err(outcome);
+        }
+        let diagnostic = !independent && !state.retiring && !state.observed
+            && matches!(outcome, Exit::FinalizationFailed(_));
+        state.outcome = Some(outcome);
+        state.expires = expires;
+        Ok((state.invalidated, diagnostic, state.diagnostic.take()))
+    };
     if let Some(owner) = owner.upgrade() {
-        let discarded = {
-            let mut state = owner
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state
-                .active
-                .retain(|candidate| !Arc::ptr_eq(candidate, entry));
-            let mut discarded = Vec::new();
-            if (!keep
-                || invalidated
-                || state.closed
-                || matches!(owner.config.capacity, CacheCapacity::NoRetention))
-                && let Some(position) = state
-                    .retained
-                    .iter()
-                    .position(|candidate| Arc::ptr_eq(candidate, entry))
-                && let Some(entry) = state.retained.remove(position)
-            {
-                discarded.push(entry);
+        // Serialize publication against eviction. Each transition can add only one
+        // completed retained element, so at most one element must retire.
+        let mut state = owner.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (invalidated, diagnostic, mut permit) = match publish() {
+            Ok(publication) => publication,
+            Err(discarded) => {
+                drop(state);
+                drop(discarded);
+                return;
             }
-            if let Some(diagnostic) = diagnostic
-                && !retiring
-                && !entry
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .observed
-            {
-                state.diagnostics.push((Arc::clone(entry), diagnostic));
-            }
-            let capacity = match owner.config.capacity {
-                CacheCapacity::Unbounded => None,
-                CacheCapacity::Bounded(capacity) => Some(capacity.get()),
-                CacheCapacity::NoRetention => Some(usize::default()),
-            };
-            if let Some(capacity) = capacity {
-                let mut count = state
-                    .retained
-                    .iter()
-                    .filter(|entry| {
-                        entry
-                            .state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .outcome
-                            .is_some()
-                    })
-                    .count();
-                while count > capacity {
-                    let position = state.retained.iter().position(|entry| {
-                        entry
-                            .state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .outcome
-                            .is_some()
-                    });
-                    if let Some(position) = position {
-                        if let Some(entry) = state.retained.remove(position) {
-                            discarded.push(entry);
-                            count -= NonZeroUsize::MIN.get();
-                        }
-                    } else {
-                        break;
-                    }
-                }
-            }
-            state.revision = Arc::new(());
-            discarded
         };
+        state.active.retain(|candidate| !candidate.same_entry(entry));
+        if diagnostic {
+            state.diagnostics.push_reserved(Diagnostic {
+                entry: entry.clone(),
+                _permit: permit.take(),
+            });
+        }
+        let drop_current = !keep || invalidated || state.closed
+            || matches!(owner.config.capacity, CacheCapacity::NoRetention);
+        let discarded_position = if drop_current {
+            state.retained.iter().position(|candidate| candidate.same_entry(entry))
+        } else if let CacheCapacity::Bounded(capacity) = owner.config.capacity {
+            let mut completed = state.retained.iter().enumerate().filter_map(|(index, candidate)| {
+                candidate.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .outcome.is_some().then_some(index)
+            });
+            let oldest = completed.next();
+            if completed.count() >= capacity.get() { oldest } else { None }
+        } else {
+            None
+        };
+        let discarded = discarded_position.and_then(|position| state.retained.remove(position));
+        state.advance_revision();
+        drop(state);
+        let notify = std::mem::DropGuard::new((), |_| {
+            notify_entry(entry);
+            if let Some(payloads) = owner.prepared_index.as_ref().and_then(|selection| selection.payloads.as_ref()) {
+                payloads.changed.notify_all();
+            }
+            if let Some(changed) = &owner.changed {
+                notify_all(changed);
+            }
+        });
         drop(discarded);
-        notify_all(&owner.changed);
+        drop(permit);
+        drop(notify);
+    } else if publish().is_ok() {
+        notify_entry(entry);
     }
+}
+
+fn notify_entry<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static>(
+    entry: &IndexEntry<K, A, E>,
+) {
     entry.cancellation.unlink();
-    notify_all(&entry.changed);
+    if let Some(changed) = &entry.changed {
+        notify_all(changed);
+    }
 }
 impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A, E> {
     /// Lazily construct a scoped cache with legacy fixed TTL and unbounded active admission.
@@ -553,80 +1291,272 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
         options: CacheOptions<A, E>,
         load: impl Fn(Arc<K>) -> Effect<A, E, R> + Send + Sync + 'static,
     ) -> Effect<Self, SharedValue<E>, R> {
+        Self::make_with_index(scope, config, options, None, Self::ordinary_loader(load))
+    }
+
+    /// Select a physically prepared membership index and fixed lookup snapshots
+    /// with an Arc-key loader. [`Self::make_prepared`] also selects inline
+    /// key and outcome storage.
+    pub fn make_with_prepared_index<R: HasClock + HasTaskSpawner + Send + Sync + 'static>(
+        scope: Scope<SharedValue<E>>,
+        config: CacheConfig<K, E>,
+        options: CacheOptions<A, E>,
+        index: PreparedCacheIndex<K, A, E>,
+        on_error: impl Fn(MemoryError) -> E + Send + Sync + 'static,
+        load: impl Fn(Arc<K>) -> Effect<A, E, R> + Send + Sync + 'static,
+    ) -> Effect<Self, SharedValue<E>, R> {
+        Self::make_with_index(
+            scope,
+            config,
+            options,
+            Some(Arc::new(PreparedIndexSelection {
+                index,
+                payloads: None,
+                on_error: Arc::new(move |error| SharedValue::new(on_error(error))),
+                on_active: None,
+                active_limit: None,
+                independent: false,
+            })),
+            Self::ordinary_loader(load),
+        )
+    }
+
+    /// Create a cache with region-backed indexes and inline key and outcome storage.
+    /// The loader receives a shared key handle it may retain across asynchronous work.
+    pub fn make_prepared<R: HasClock + HasTaskSpawner + Send + Sync + 'static>(
+        scope: Scope<SharedValue<E>>,
+        config: CacheConfig<K, E>,
+        options: CacheOptions<A, E>,
+        storage: PreparedCacheStorage<K, A, E>,
+        on_capacity: impl Fn(MemoryError) -> E + Send + Sync + 'static,
+        load: impl Fn(CacheKey<K>) -> Effect<A, E, R> + Send + Sync + 'static,
+    ) -> Effect<Self, SharedValue<E>, R> {
+        Self::make_prepared_inner(
+            scope,
+            config,
+            options,
+            PreparedIndexSelection {
+                index: storage.index,
+                payloads: Some(storage.payloads),
+                on_error: Arc::new(move |error| SharedValue::new(on_capacity(error))),
+                on_active: None,
+                active_limit: None,
+                independent: false,
+            },
+            load,
+        )
+    }
+
+    /// Create a prepared cache with shared results for memory and active-limit refusals.
+    pub fn make_prepared_with_refusals<R: HasClock + HasTaskSpawner + Send + Sync + 'static>(
+        scope: Scope<SharedValue<E>>,
+        config: CacheConfig<K, E>,
+        options: CacheOptions<A, E>,
+        storage: PreparedCacheStorage<K, A, E>,
+        refusals: PreparedCacheRefusals<E>,
+        load: impl Fn(CacheKey<K>) -> Effect<A, E, R> + Send + Sync + 'static,
+    ) -> Effect<Self, SharedValue<E>, R> {
+        Self::make_prepared_inner(
+            scope,
+            config,
+            options,
+            PreparedIndexSelection {
+                index: storage.index,
+                payloads: Some(storage.payloads),
+                on_error: refusals.memory,
+                on_active: Some(refusals.active),
+                active_limit: None,
+                independent: false,
+            },
+            load,
+        )
+    }
+
+    /// Prepare independent calls with no retained membership. Closing drains
+    /// accepted loaders and caller cancellation still joins their owned cleanup.
+    pub fn make_prepared_independent<R: HasClock + HasTaskSpawner + Send + Sync + 'static>(
+        scope: Scope<SharedValue<E>>,
+        admission: CacheAdmission<E>,
+        storage: PreparedCacheStorage<K, A, E>,
+        refusals: PreparedCacheRefusals<E>,
+        load: impl Fn(CacheKey<K>) -> Effect<A, E, R> + Send + Sync + 'static,
+    ) -> Effect<Self, SharedValue<E>, R> {
+        Self::make_prepared_inner(
+            scope,
+            CacheConfig { equal: Arc::new(|_, _| false), ttl: None, capacity: CacheCapacity::NoRetention, cache_failure: Arc::new(|_| false) },
+            CacheOptions { ttl: CacheTtl::Fixed(None), admission },
+            PreparedIndexSelection {
+                index: storage.index, payloads: Some(storage.payloads), on_error: refusals.memory,
+                on_active: Some(refusals.active), active_limit: None, independent: true,
+            },
+            load,
+        )
+    }
+
+    pub(crate) fn make_prepared_with_active_refusals<
+        R: HasClock + HasTaskSpawner + Send + Sync + 'static,
+    >(
+        scope: Scope<SharedValue<E>>,
+        config: CacheConfig<K, E>,
+        ttl: CacheTtl<A, E>,
+        active: NonZeroUsize,
+        storage: PreparedCacheStorage<K, A, E>,
+        refusals: PreparedCacheRefusals<E>,
+        load: impl Fn(CacheKey<K>) -> Effect<A, E, R> + Send + Sync + 'static,
+    ) -> Effect<Self, SharedValue<E>, R> {
+        Self::make_prepared_inner(
+            scope,
+            config,
+            CacheOptions {
+                ttl,
+                admission: CacheAdmission::Unbounded,
+            },
+            PreparedIndexSelection {
+                index: storage.index,
+                payloads: Some(storage.payloads),
+                on_error: refusals.memory,
+                on_active: Some(refusals.active),
+                active_limit: Some(active),
+                independent: false,
+            },
+            load,
+        )
+    }
+
+    fn make_prepared_inner<R: HasClock + HasTaskSpawner + Send + Sync + 'static>(
+        scope: Scope<SharedValue<E>>,
+        config: CacheConfig<K, E>,
+        options: CacheOptions<A, E>,
+        selection: PreparedIndexSelection<K, A, E>,
+        load: impl Fn(CacheKey<K>) -> Effect<A, E, R> + Send + Sync + 'static,
+    ) -> Effect<Self, SharedValue<E>, R> {
+        Self::make_with_index(
+            scope,
+            config,
+            options,
+            Some(Arc::new(selection)),
+            move |key| match key {
+                EntryKey::Prepared(key) => load(key.clone()),
+                EntryKey::Ordinary(_) => {
+                    crate::effect_die! { defect: Defect::from(LibraryDefect::MissingInterpreterOutcome), }
+                }
+            },
+        )
+    }
+
+    fn ordinary_loader<R: Send + Sync + 'static>(
+        load: impl Fn(Arc<K>) -> Effect<A, E, R> + Send + Sync + 'static,
+    ) -> impl Fn(&EntryKey<K>) -> Effect<A, E, R> + Send + Sync + 'static {
+        move |key| match key {
+            EntryKey::Ordinary(key) => load(Arc::clone(key)),
+            EntryKey::Prepared(_) => {
+                crate::effect_die! { defect: Defect::from(LibraryDefect::MissingInterpreterOutcome), }
+            }
+        }
+    }
+
+    fn make_with_index<R: HasClock + HasTaskSpawner + Send + Sync + 'static>(
+        scope: Scope<SharedValue<E>>,
+        config: CacheConfig<K, E>,
+        options: CacheOptions<A, E>,
+        prepared_index: Option<Arc<PreparedIndexSelection<K, A, E>>>,
+        load: impl Fn(&EntryKey<K>) -> Effect<A, E, R> + Send + Sync + 'static,
+    ) -> Effect<Self, SharedValue<E>, R> {
         let load = Arc::new(load);
         Effect::new(move |env: Arc<R>, context, finish| {
+            let (retained, active, diagnostics, shutdown_index, shutdown_retirement, shutdown_wait) = match &prepared_index {
+                Some(selection) => {
+                    let required = match selection.maximum(&options.admission) {
+                        Some(maximum) if maximum <= selection.index.maximum_active => {
+                            prepared_index_width(config.capacity, maximum)
+                        }
+                        Some(_) => Err(MemoryError::NoSlot),
+                        None => Err(MemoryError::UnsupportedRunContract),
+                    };
+                    match required.and_then(|required| {
+                        if required > selection.index.width {
+                            return Err(MemoryError::NoSlot);
+                        }
+                        Ok((selection.index.reserve()?, selection.index.reserve_active()?,
+                            selection.index.reserve_diagnostics()?, selection.index.reserve_shutdown()?,
+                            selection.payloads.as_ref().map(RetirementReservation::reserve).transpose()?,
+                            selection.payloads.as_ref().map(|payloads| payloads.closed.listen()).transpose()?))
+                    }) {
+                        Ok(retained) => retained,
+                        Err(error) => return runtime::finish(finish, Exit::Fail((selection.on_error)(error))),
+                    }
+                }
+                None => Default::default(),
+            };
+            let changed = shutdown_wait.is_none().then(Event::new);
+            let parent = match &prepared_index {
+                Some(selection) if let Some(payloads) = &selection.payloads => match payloads.cancellation.bind(&context.cancellation) {
+                    Ok(parent) => parent,
+                    Err(error) => return runtime::finish(finish, Exit::Fail((selection.on_error)(error))),
+                },
+                Some(_) | None => LoaderCancellation::ordinary(&context.cancellation),
+            };
             let load_env = Arc::clone(&env);
+            let prepared_env = Arc::clone(&env);
             let now_env = env;
             let load = Arc::clone(&load);
+            let prepared_load = Arc::clone(&load);
             let cache = Self {
                 inner: Arc::new(Inner {
                     state: Mutex::new(CacheState {
                         closed: false,
-                        revision: Arc::new(()),
-                        retained: VecDeque::new(),
-                        active: Vec::new(),
-                        diagnostics: Vec::new(),
+                        revision: if prepared_index.is_some() { CacheRevision::Prepared(0) } else { CacheRevision::Ordinary(Arc::new(())) },
+                        retained,
+                        active,
+                        diagnostics,
                         shutdown: CacheShutdown::Open,
+                        shutdown_index,
+                        shutdown_retirement,
                         owner_loss: None,
                     }),
-                    changed: Event::new(),
-                    parent: context.cancellation.child(),
+                    changed,
+                    parent,
                     config: config.clone(),
                     options: options.clone(),
+                    prepared_index: prepared_index.clone(),
                     now: Arc::new(move || now_env.clock().now()),
-                    start: Arc::new(move |entry, owner, context| {
-                        let env = Arc::clone(&load_env);
-                        let load = Arc::clone(&load);
-                        let completed = Arc::clone(&entry);
-                        let completed_owner = owner.clone();
+                    load_effect: Arc::new(move |key, context, finish| {
+                        let program = prepared_load(key);
+                        program.execute(Arc::clone(&prepared_env), context.clone(), finish)
+                    }),
+                    start: Arc::new(move |entry, owner, context, prepared| {
                         let submission_owner = owner.clone();
-                        let lost = Arc::clone(&entry);
-                        let lost_owner = owner;
-                        let submission = Arc::new(Mutex::new(Submission::Pending(None)));
-                        let lost_submission = Arc::clone(&submission);
-                        let task = ScheduledTask::new(
-                            move |settlement| {
-                                Box::pin(async move {
-                                    let outcome = AssertUnwindSafe(async {
-                                        let program = load(Arc::clone(&completed.key));
-                                        runtime::evaluate_context(program, env, &context).await
+                        let task = prepared.unwrap_or_else(|| {
+                            let env = Arc::clone(&load_env);
+                            let load = Arc::clone(&load);
+                            let completed = entry.clone();
+                            let completed_owner = owner.clone();
+                            let lost = LoaderNotice { entry: entry.clone(), owner };
+                            ScheduledTask::new(
+                                move |settlement| {
+                                    Box::pin(async move {
+                                        let outcome = AssertUnwindSafe(async {
+                                            let program = load(&completed.key);
+                                            runtime::evaluate_context(program, env, &context).await
+                                        })
+                                        .catch_unwind()
+                                        .await
+                                        .unwrap_or_else(|panic| Exit::Die(Defect::from_panic(panic)));
+                                        settlement.release();
+                                        settle(&completed, &completed_owner, outcome);
                                     })
-                                    .catch_unwind()
-                                    .await
-                                    .unwrap_or_else(|panic| Exit::Die(Defect::from_panic(panic)));
-                                    settlement.release();
-                                    settle(&completed, &completed_owner, outcome);
-                                })
-                            },
-                            move |event| match event {
-                                TaskEvent::Started => {}
-                                TaskEvent::Lost(defect) => {
-                                    let publish = {
-                                        let mut admission = lost_submission
-                                            .lock()
-                                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                        match &mut *admission {
-                                            Submission::Pending(pending) => {
-                                                *pending = Some(defect);
-                                                None
-                                            }
-                                            Submission::Accepted => {
-                                                *admission = Submission::Finished;
-                                                Some(defect)
-                                            }
-                                            Submission::Finished => None,
-                                        }
-                                    };
-                                    if let Some(defect) = publish {
-                                        settle(&lost, &lost_owner, Exit::Die(defect));
+                                },
+                                move |event| {
+                                    if let TaskEvent::Lost(defect) = event {
+                                        lost.lost(defect);
                                     }
-                                }
-                            },
-                        );
+                                },
+                            )
+                        });
                         let submitted =
                             catch_unwind(AssertUnwindSafe(|| load_env.task_spawner().spawn(task)));
                         let failure = {
-                            let mut admission = submission
+                            let mut admission = entry.submission
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             match submitted {
@@ -657,8 +1587,8 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
             let abandoned = cache.clone();
             let finalizer = Registered::with_abandon(
                 move |finish| {
-                    Step::Suspended(Box::pin(async move {
-                        let cleanup = close.shutdown_owned(close_context).await;
+                    Step::suspended(Box::pin(async move {
+                        let cleanup = close.shutdown_owned(close_context, shutdown_wait).await;
                         runtime::finish(finish, cleanup)
                     }))
                 },
@@ -694,8 +1624,8 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.closed = true;
             state.owner_loss = Some(Defect::from(LibraryDefect::ScopeOwnerDropped));
-            state.revision = Arc::new(());
-            for entry in state.active.iter().chain(&state.retained) {
+            state.advance_revision();
+            for entry in state.active.iter().chain(state.retained.iter()) {
                 entry
                     .state
                     .lock()
@@ -704,7 +1634,7 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
             }
         }
         let _ = self.inner.parent.request();
-        notify_all(&self.inner.changed);
+        self.notify_shutdown();
     }
     /// # Type parameters
     /// - `A`: Success or application-value type.
@@ -712,197 +1642,548 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
     /// - `K`: Type supplied by the enclosing impl or trait.
     ///
     /// # Parameters
-    /// - `key` (`Arc<K>`): Stable key used to locate or identify the selected value.
+    /// - `key` (`EntryKey<K>`): Stable key used to locate or identify the selected value.
     /// - `context` (`&Context`): Execution context carrying cancellation, scope, and trace state.
     ///
     /// # Returns
-    /// Type: `Result<Option<Arc<Entry<K, A, E>>>, Defect>`.
+    /// Type: `Result<Option<SelectedCacheEntry<K, A, E>>, CacheSelectionError<E>>`.
     pub(crate) async fn select_entry(
         &self,
-        key: Arc<K>,
+        key: EntryKey<K>,
         context: &Context,
-    ) -> Result<Option<Arc<Entry<K, A, E>>>, CacheSelectionError<E>> {
-        self.select_observed_entry(key, context)
-            .await
-            .map(|entry| entry.map(|(entry, _)| entry))
+    ) -> Result<Option<SelectedCacheEntry<K, A, E>>, CacheSelectionError<E>> {
+        self.select_observed_entry(key, context).await
     }
+
+    fn payloads(&self) -> Option<&Payloads<K, A, E>> {
+        self.inner.prepared_index.as_ref()?.payloads.as_ref()
+    }
+
+    /// Admit a key into this cache's selected memory. A refusal returns the
+    /// original key. The returned handle may be reused with [`Self::get_prepared`].
+    pub fn prepare_key(&self, key: K) -> Result<CacheKey<K>, (MemoryError, K)> {
+        if self.is_closed() {
+            return Err((MemoryError::Closed, key));
+        }
+        match self
+            .payloads()
+            .ok_or(MemoryError::UnsupportedRunContract)
+            .and_then(|payloads| payloads.reserve_key().map(|lease| (payloads, lease)))
+        {
+            Ok((payloads, lease)) => Ok(payloads.publish_key(lease, key)),
+            Err(error) => Err((error, key)),
+        }
+    }
+
+    fn lookup_key(&self, key: K) -> LookupKey<K> {
+        self.lookup_key_for(key, KeyPurpose::Lookup)
+    }
+
+    fn lookup_key_for(&self, key: K, purpose: KeyPurpose) -> LookupKey<K> {
+        if self.payloads().is_some() {
+            LookupKey::Pending(Arc::new(Mutex::new(RecipeKey::Pending(Some(key)))), purpose)
+        } else {
+            LookupKey::Owned(EntryKey::Ordinary(Arc::new(key)))
+        }
+    }
+
+    fn admit_key(&self, key: LookupKey<K>) -> Result<EntryKey<K>, CacheSelectionError<E>> {
+        self.admit_lookup_key(key, false)
+    }
+
+    fn admit_lookup_key(&self, key: LookupKey<K>, allow_closed: bool) -> Result<EntryKey<K>, CacheSelectionError<E>> {
+        let key = match key {
+            LookupKey::Owned(key) => key,
+            LookupKey::Pending(key, purpose) => {
+                if !allow_closed && self.is_closed() {
+                    return Err(self.closed_error());
+                }
+                self.admit_recipe_key(&key, purpose).map_err(|error| self.index_error(error))?
+            }
+        };
+        self.validate_key(&key)?;
+        Ok(key)
+    }
+
+    fn admit_recipe_key(&self, key: &Mutex<RecipeKey<K>>, purpose: KeyPurpose) -> Result<EntryKey<K>, MemoryError> {
+        let payloads = self.payloads().ok_or(MemoryError::UnsupportedRunContract)?;
+        let mut recipe = key.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let RecipeKey::Pending(pending) = &mut *recipe {
+            let lease = match purpose {
+                KeyPurpose::Lookup => payloads.reserve_key()?,
+                KeyPurpose::Maintenance => payloads.reserve_maintenance_key()?,
+            };
+            let value = pending.take().ok_or(MemoryError::UnsupportedRunContract)?;
+            *recipe = RecipeKey::Admitted(payloads.publish_key(lease, value));
+        }
+        match &*recipe {
+            RecipeKey::Admitted(key) => Ok(EntryKey::Prepared(key.clone())),
+            RecipeKey::Pending(_) => Err(MemoryError::UnsupportedRunContract),
+        }
+    }
+
+    fn validate_key(&self, key: &EntryKey<K>) -> Result<(), CacheSelectionError<E>> {
+        match (key, self.payloads()) {
+            (EntryKey::Ordinary(_), None) => Ok(()),
+            (EntryKey::Prepared(key), Some(payloads)) if payloads.owns_key(key) => Ok(()),
+            _ => Err(self.index_error(MemoryError::UnsupportedRunContract)),
+        }
+    }
+
+    fn reserve_entry(&self) -> Result<Option<EntryLease<K, A, E>>, MemoryError> {
+        self.payloads().map(Payloads::reserve_entry).transpose()
+    }
+
+    fn reserve_outcome(&self) -> Result<OutcomeStorage<A, E>, MemoryError> {
+        self.payloads()
+            .map_or(Ok(OutcomeStorage::Ordinary), Payloads::reserve_outcome)
+    }
+
+    pub(crate) fn share_expected_error(&self, error: E) -> Result<SharedValue<E>, MemoryError> {
+        if let Some(payloads) = self.payloads() {
+            Ok(SharedValue::from_reserved(payloads.reserve_error()?, error))
+        } else {
+            Ok(SharedValue::new(error))
+        }
+    }
+
+    fn reserve_cleanup(&self) -> Result<Option<Cleanup<E>>, MemoryError> {
+        self.payloads().map(Payloads::reserve_cleanup).transpose()
+    }
+    fn try_observer(&self) -> Result<Option<SlotLease<'static, ()>>, MemoryError> {
+        self.inner
+            .prepared_index
+            .as_ref()
+            .map(|selection| selection.index.observers.try_checkout())
+            .transpose()
+    }
+
+    pub(crate) fn select_existing(
+        &self,
+        entry: IndexEntry<K, A, E>,
+        cancellation: &Cancellation,
+    ) -> Result<SelectedCacheEntry<K, A, E>, CacheSelectionError<E>> {
+        let (pending, compound) = {
+            let state = entry
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                state.outcome.is_none(),
+                matches!(state.outcome, Some(Exit::FinalizationFailed(_))),
+            )
+        };
+        let reservation = self
+            .reserve_observation(pending, compound, cancellation)
+            .map_err(|error| self.index_error(error))?;
+        let observation = if pending {
+            CacheObservation::Shared
+        } else {
+            CacheObservation::Retained
+        };
+        Ok(SelectedCacheEntry {
+            entry,
+            observation,
+            reservation,
+            independent_task: None,
+        })
+    }
+
+    fn reserve_observation(
+        &self,
+        pending: bool,
+        compound: bool,
+        cancellation: &Cancellation,
+    ) -> Result<ObservationReservation<E>, MemoryError> {
+        let observer = if pending { self.try_observer()? } else { None };
+        let cleanup = if pending || compound {
+            self.reserve_cleanup()?
+        } else {
+            None
+        };
+        let notification = if pending {
+            self.payloads()
+                .map(|payloads| payloads.changed.listen())
+                .transpose()?
+        } else {
+            None
+        };
+        let cancelled = if pending && self.payloads().is_some() {
+            Some(cancellation.reserve_wait_owned()?)
+        } else {
+            None
+        };
+        Ok(ObservationReservation {
+            observer,
+            cleanup,
+            notification,
+            cancelled,
+        })
+    }
+
+    fn independent(&self) -> bool {
+        self.inner.prepared_index.as_ref().is_some_and(|selection| selection.independent)
+    }
+
+    fn closed_error(&self) -> CacheSelectionError<E> {
+        if self.independent() {
+            self.index_error(MemoryError::Closed)
+        } else {
+            CacheSelectionError::Defect(Defect::from(LibraryDefect::CacheClosed))
+        }
+    }
+
+    fn active_limit(&self) -> Option<NonZeroUsize> {
+        let admission = &self.inner.options.admission;
+        self.inner.prepared_index.as_ref().map_or_else(
+            || admission.maximum(),
+            |selection| selection.maximum(admission),
+        )
+    }
+
+    fn active_refusal(&self) -> CacheSelectionError<E> {
+        if let Some(shared) = self
+            .inner
+            .prepared_index
+            .as_ref()
+            .and_then(|selection| selection.on_active.as_ref())
+        {
+            return CacheSelectionError::Capacity(shared());
+        }
+        match &self.inner.options.admission {
+            CacheAdmission::Bounded { capacity_error, .. } => {
+                CacheSelectionError::Capacity(SharedValue::new(capacity_error()))
+            }
+            CacheAdmission::Unbounded => {
+                CacheSelectionError::Defect(Defect::from(LibraryDefect::MissingInterpreterOutcome))
+            }
+        }
+    }
+
+    fn index_error(&self, error: MemoryError) -> CacheSelectionError<E> {
+        match &self.inner.prepared_index {
+            Some(selection) => CacheSelectionError::Capacity((selection.on_error)(error)),
+            None => CacheSelectionError::Defect(Defect::from(
+                LibraryDefect::PreparedConstructionUnbound,
+            )),
+        }
+    }
+
+    fn reserve_retired_diagnostics(&self) -> Result<CacheList<Diagnostic<K, A, E>>, CacheSelectionError<E>> {
+        match &self.inner.prepared_index {
+            Some(selection) => selection.index.reserve_diagnostics().map_err(|error| self.index_error(error)),
+            None => Ok(CacheList::default()),
+        }
+    }
+
+    fn snapshot_index(&self, kind: SnapshotKind) -> Result<CacheSnapshot<K, A, E>, CacheSelectionError<E>> {
+        let (maintenance, allow_closed) = match kind {
+            SnapshotKind::Lookup => (false, false),
+            SnapshotKind::Maintenance { allow_closed } => (true, allow_closed),
+        };
+        let mut fresh = match &self.inner.prepared_index {
+            Some(selection) => match if maintenance {
+                selection.index.reserve_maintenance()
+            } else {
+                selection.index.reserve()
+            } {
+                Ok(fresh) => fresh,
+                Err(_) if !allow_closed && self.is_closed() => {
+                    return Err(self.closed_error());
+                }
+                Err(error) => return Err(self.index_error(error)),
+            },
+            None => CacheIndex::default(),
+        };
+        let state = self.inner.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if (state.closed && !allow_closed) || matches!(state.revision, CacheRevision::Exhausted) {
+            drop(state);
+            return Err(self.closed_error());
+        }
+        let required = if maintenance {
+            state.retained.len().checked_add(state.active.len())
+                .and_then(|count| count.checked_add(state.diagnostics.len()))
+        } else {
+            Some(state.retained.len())
+        };
+        if required.is_none_or(|required| required > fresh.remaining()) {
+            drop(state);
+            drop(fresh);
+            return Err(self.index_error(MemoryError::NoSlot));
+        }
+        for entry in state.retained.iter() {
+            fresh.push_reserved(entry.clone());
+        }
+        if maintenance {
+            for entry in state.active.iter() {
+                fresh.push_reserved(entry.clone());
+            }
+            for diagnostic in state.diagnostics.iter() {
+                fresh.push_reserved(diagnostic.entry.clone());
+            }
+        }
+        Ok(CacheSnapshot { revision: state.revision.clone(), entries: fresh })
+    }
+
     async fn select_observed_entry(
         &self,
-        key: Arc<K>,
+        key: EntryKey<K>,
         context: &Context,
-    ) -> Result<Option<(Arc<Entry<K, A, E>>, CacheObservation)>, CacheSelectionError<E>> {
+    ) -> Result<Option<SelectedCacheEntry<K, A, E>>, CacheSelectionError<E>> {
+        self.validate_key(&key)?;
         loop {
             if context.cancelled() {
                 return Ok(None);
             }
-            let (revision, entries) = {
-                let state = self
-                    .inner
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if state.closed {
-                    return Err(CacheSelectionError::Defect(Defect::from(
-                        LibraryDefect::CacheClosed,
-                    )));
-                }
-                (
-                    Arc::clone(&state.revision),
-                    state.retained.iter().map(Arc::clone).collect::<Vec<_>>(),
-                )
-            };
+            let CacheSnapshot { revision, entries: mut fresh } = self.snapshot_index(SnapshotKind::Lookup)?;
             let now = (self.inner.now)();
-            let fresh = entries
-                .into_iter()
-                .filter(|entry| {
-                    let state = entry
-                        .state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    !state.invalidated && state.expires.is_none_or(|expires| now < expires)
-                })
-                .collect::<Vec<_>>();
-            let found = fresh
-                .iter()
+            fresh.retain(|entry| {
+                let state = entry.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                !state.invalidated && state.expires.is_none_or(|expires| now < expires)
+            });
+            let found = fresh.iter()
                 .find(|entry| (self.inner.config.equal)(&entry.key, &key))
-                .map(Arc::clone);
-            let admission_error = match &self.inner.options.admission {
-                CacheAdmission::Unbounded => None,
-                CacheAdmission::Bounded {
-                    maximum,
-                    capacity_error,
-                } => Some((*maximum, Arc::clone(capacity_error))),
-            };
-            let selection = {
-                let mut state = self
-                    .inner
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .cloned();
+            let (selection, stale) = {
+                let mut state = self.inner.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if state.closed {
-                    return Err(CacheSelectionError::Defect(Defect::from(
-                        LibraryDefect::CacheClosed,
-                    )));
+                    drop(state);
+                    return Err(self.closed_error());
                 }
-                if !Arc::ptr_eq(&state.revision, &revision) {
-                    None
+                if !state.revision.matches(&revision) {
+                    (None, Some(fresh))
                 } else {
-                    let old = std::mem::take(&mut state.retained);
-                    state.retained = fresh.into();
-                    let (entry, start) = match found {
-                        Some(entry) => {
-                            state
-                                .retained
-                                .retain(|candidate| !Arc::ptr_eq(candidate, &entry));
-                            state.retained.push_back(Arc::clone(&entry));
-                            (entry, false)
-                        }
-                        None if admission_error
-                            .as_ref()
-                            .is_some_and(|(maximum, _)| state.active.len() >= maximum.get()) =>
-                        {
-                            // Restore the snapshot; admission cannot evict entries.
-                            state.retained = old;
+                    if found.is_none() {
+                        if self.active_limit().is_some_and(|maximum| state.active.len() >= maximum.get()) {
                             drop(state);
-                            if let Some((_, error)) = &admission_error {
-                                return Err(CacheSelectionError::Capacity(SharedValue::new(
-                                    error(),
-                                )));
-                            }
-                            return Err(CacheSelectionError::Defect(Defect::from(
-                                LibraryDefect::CacheClosed,
-                            )));
+                            drop(fresh);
+                            return Err(self.active_refusal());
+                        }
+                        if fresh.remaining() == 0 || state.active.remaining() == 0 {
+                            drop(state);
+                            drop(fresh);
+                            return Err(self.index_error(MemoryError::NoSlot));
+                        }
+                    }
+                    let pending = found.as_ref().is_none_or(|entry| {
+                        entry.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).outcome.is_none()
+                    });
+                    let reservation = match self.reserve_observation(pending, false, &context.cancellation) {
+                        Ok(reservation) => reservation,
+                        Err(error) => {
+                            drop(state);
+                            drop(fresh);
+                            return Err(self.index_error(error));
+                        }
+                    };
+                    let (entry, start, prepared) = match found {
+                        Some(entry) => {
+                            fresh.retain(|candidate| !candidate.same_entry(&entry));
+                            (entry, false, None)
                         }
                         None => {
-                            let entry = Arc::new(Entry {
-                                key: Arc::clone(&key),
+                            let diagnostic = match &self.inner.prepared_index {
+                                Some(selection) if !selection.independent => match selection.index.diagnostic_permits.try_checkout() {
+                                    Ok(permit) => Some(permit),
+                                    Err(error) => {
+                                        drop(state);
+                                        drop(fresh);
+                                        drop(reservation);
+                                        return Err(self.index_error(error));
+                                    }
+                                },
+                                Some(_) | None => None,
+                            };
+                            let outcome_storage = match self.reserve_outcome() {
+                                Ok(storage) => storage,
+                                Err(error) => {
+                                    drop(state);
+                                    drop(fresh);
+                                    drop(reservation);
+                                    drop(diagnostic);
+                                    return Err(self.index_error(error));
+                                }
+                            };
+                            let lease = match self.reserve_entry() {
+                                Ok(lease) => lease,
+                                Err(error) => {
+                                    drop(state);
+                                    drop(fresh);
+                                    drop(reservation);
+                                    drop(diagnostic);
+                                    drop(outcome_storage);
+                                    return Err(self.index_error(error));
+                                }
+                            };
+                            let loader = match self.payloads().map(|payloads| {
+                                admit_loader(&payloads.loader, self.inner.load_effect.clone())
+                            }).transpose() {
+                                Ok(loader) => loader,
+                                Err(error) => {
+                                    drop(state);
+                                    drop(fresh);
+                                    drop(reservation);
+                                    drop(diagnostic);
+                                    drop(outcome_storage);
+                                    drop(lease);
+                                    return Err(self.index_error(error));
+                                }
+                            };
+                            let cancellation = match self.inner.parent.child() {
+                                Ok(cancellation) => cancellation,
+                                Err(error) => {
+                                    drop(state);
+                                    drop(fresh);
+                                    drop(reservation);
+                                    drop(diagnostic);
+                                    drop(outcome_storage);
+                                    drop(lease);
+                                    drop(loader);
+                                    return Err(self.index_error(error));
+                                }
+                            };
+                            let changed = lease.is_none().then(Event::new);
+                            let entry = IndexEntry::publish(lease, Entry {
+                                key: key.clone(),
+                                outcome_storage: Mutex::new(Some(outcome_storage)),
+                                produced: Mutex::new(None),
+                                submission: Mutex::new(Submission::Pending(None)),
                                 state: Mutex::new(EntryState {
                                     outcome: None,
                                     expires: None,
                                     invalidated: false,
                                     retiring: false,
                                     observed: false,
+                                    diagnostic,
                                 }),
-                                changed: Event::new(),
-                                cancellation: self.inner.parent.child(),
+                                changed,
+                                cancellation,
                             });
-                            state.active.push(Arc::clone(&entry));
-                            state.retained.push_back(Arc::clone(&entry));
-                            (entry, true)
+                            let prepared = loader.map(|loader| loader(LoaderInput {
+                                entry: entry.clone(), owner: Arc::downgrade(&self.inner), context: context.clone(),
+                            }));
+                            state.active.push_reserved(entry.clone());
+                            (entry, true, prepared)
                         }
                     };
-                    state.revision = Arc::new(());
+                    fresh.push_reserved(entry.clone());
+                    let old = std::mem::replace(&mut state.retained, fresh);
+                    state.advance_revision();
                     let observation = if start {
                         CacheObservation::Loaded
-                    } else if entry
-                        .state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .outcome
-                        .is_some()
-                    {
+                    } else if entry.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).outcome.is_some() {
                         CacheObservation::Retained
                     } else {
                         CacheObservation::Shared
                     };
-                    Some((entry, start, old, observation))
+                    (Some((SelectedCacheEntry { entry, observation, reservation, independent_task: None }, start, old, prepared)), None)
                 }
             };
-            if let Some((entry, start, old, observation)) = selection {
-                drop(old);
-                if start {
-                    (self.inner.start)(
-                        Arc::clone(&entry),
-                        Arc::downgrade(&self.inner),
-                        context.parallel(entry.cancellation.clone()),
-                    );
+            if let Some((mut selected, start, old, prepared)) = selection {
+                let old = if prepared.is_none() {
+                    drop(old);
+                    None
+                } else {
+                    Some(old)
+                };
+                if start && self.independent() {
+                    *selected.entry.submission.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Submission::Accepted;
+                    selected.independent_task = prepared;
+                } else if start {
+                    let dispatch = if prepared.is_some() {
+                        context.clone()
+                    } else {
+                        context.parallel(selected.entry.cancellation.clone())
+                    };
+                    (self.inner.start)(selected.entry.clone(), Arc::downgrade(&self.inner), dispatch, prepared);
                 }
-                return Ok(Some((entry, observation)));
+                drop(old);
+                return Ok(Some(selected));
             }
+            drop(stale);
             cooperative_retry().await;
         }
     }
+
     /// # Type parameters
     /// - `A`: Success or application-value type.
     /// - `E`: Domain-error type.
     /// - `K`: Type supplied by the enclosing impl or trait.
     ///
     /// # Parameters
-    /// - `entry` (`&Arc<Entry<K, A, E>>`): Stored record or event selected for this transition.
+    /// - `entry` (`&IndexEntry<K, A, E>`): Stored record or event selected for this transition.
     /// - `cancellation` (`Cancellation`): The cancellation token for this operation.
     ///
     /// # Returns
     /// Type: `SharedOutcome<A, E>`.
-    pub(crate) async fn observe(
-        entry: &Arc<Entry<K, A, E>>,
+    async fn observe_with_cleanup(
+        entry: &IndexEntry<K, A, E>,
         cancellation: Cancellation,
+        reservation: ObservationReservation<E>,
+        independent: bool,
     ) -> SharedOutcome<A, E> {
+        let ObservationReservation {
+            observer: _observer,
+            mut cleanup,
+            notification,
+            cancelled,
+        } = reservation;
+        let mut ready = || {
+            let state = entry
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !independent && cancellation.is_requested() {
+                return Some(Exit::Interrupted);
+            }
+            state
+                .outcome
+                .as_ref()
+                .map(|outcome| clone_observed(outcome, state.invalidated, &mut cleanup))
+        };
+        if let Some(result) = ready() {
+            return result;
+        }
+        let mut cancelled = std::pin::pin!(async {
+            if let Some(cancelled) = cancelled {
+                cancelled.wait().await;
+            } else {
+                cancellation.cancelled().await;
+            }
+        });
+        let mut cancellation_forwarded = false;
         loop {
-            let changed = entry.changed.listen();
-            let result = {
-                let state = entry
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if cancellation.is_requested() {
-                    return Exit::Interrupted;
-                }
-                state.outcome.as_ref().map(|outcome| {
-                    if state.invalidated {
-                        outcome::append_failures(
-                            Exit::Interrupted,
-                            outcome::failures(outcome.clone()),
-                        )
-                    } else {
-                        outcome.clone()
-                    }
-                })
+            if independent && !cancellation_forwarded && cancellation.is_requested() {
+                let _ = entry.cancellation.request();
+                cancellation_forwarded = true;
+            }
+            let ordinary = if let Some(notification) = &notification {
+                notification.reset();
+                None
+            } else {
+                entry.changed.as_ref().map(Event::listen)
             };
-            if let Some(result) = result {
+            if let Some(result) = ready() {
                 return result;
             }
-            match select(Box::pin(changed), Box::pin(cancellation.cancelled())).await {
+            let changed = async {
+                if let Some(notification) = &notification {
+                    std::future::poll_fn(|context| notification.poll(context)).await;
+                } else if let Some(ordinary) = ordinary {
+                    ordinary.await;
+                }
+            };
+            let changed = std::pin::pin!(changed);
+            if cancellation_forwarded {
+                changed.await;
+                continue;
+            }
+            match select(changed, cancelled.as_mut()).await {
                 Either::Left(((), _)) => {}
+                Either::Right(((), _)) if independent => {
+                    let _ = entry.cancellation.request();
+                    cancellation_forwarded = true;
+                }
                 Either::Right(((), _)) => return Exit::Interrupted,
             }
         }
@@ -913,17 +2194,45 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
     /// - `K`: Type supplied by the enclosing impl or trait.
     ///
     /// # Parameters
-    /// - `entry` (`&Arc<Entry<K, A, E>>`): Stored record or event selected for this transition.
+    /// - `entry` (`&IndexEntry<K, A, E>`): Stored record or event selected for this transition.
     /// - `cancellation` (`Cancellation`): The cancellation token for this operation.
     ///
     /// # Returns
     /// Type: `SharedOutcome<A, E>`.
-    pub(crate) async fn observe_value(
+    pub(crate) async fn observe_selected(
         &self,
-        entry: &Arc<Entry<K, A, E>>,
+        selected: SelectedCacheEntry<K, A, E>,
         cancellation: Cancellation,
     ) -> SharedOutcome<A, E> {
-        let result = Self::observe(entry, cancellation).await;
+        let SelectedCacheEntry { entry, reservation, independent_task, .. } = selected;
+        if independent_task.is_some() && cancellation.is_requested() {
+            let _ = entry.cancellation.request();
+        }
+        let observe = self.observe_value_with_cleanup(&entry, cancellation, reservation);
+        if let Some(task) = independent_task {
+            // Disabled Web loads stay in their caller. The cache tracks the
+            // settlement for drain, while this caller drives the prepared work.
+            let (outcome, ()) = futures_util::future::join(observe, task).await;
+            outcome
+        } else {
+            observe.await
+        }
+    }
+
+    async fn observe_value_with_cleanup(
+        &self,
+        entry: &IndexEntry<K, A, E>,
+        cancellation: Cancellation,
+        reservation: ObservationReservation<E>,
+    ) -> SharedOutcome<A, E> {
+        let independent = self.independent();
+        let cleanup = std::mem::DropGuard::new(entry, |entry| {
+            if independent {
+                let _ = entry.cancellation.request();
+            }
+        });
+        let result = Self::observe_with_cleanup(entry, cancellation, reservation, independent).await;
+        let _ = std::mem::DropGuard::dismiss(cleanup);
         if matches!(result, Exit::FinalizationFailed(_)) {
             entry
                 .state
@@ -936,17 +2245,13 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let mut discarded = Vec::new();
-                state.diagnostics.retain(|(candidate, outcome)| {
-                    if Arc::ptr_eq(candidate, entry) {
-                        discarded.push(outcome.clone());
-                        false
-                    } else {
-                        true
-                    }
-                });
-                if !discarded.is_empty() {
-                    state.revision = Arc::new(());
+                let position = state
+                    .diagnostics
+                    .iter()
+                    .position(|diagnostic| diagnostic.entry.same_entry(entry));
+                let discarded = position.and_then(|position| state.diagnostics.remove(position));
+                if discarded.is_some() {
+                    state.advance_revision();
                 }
                 discarded
             };
@@ -955,11 +2260,21 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
         result
     }
     /// Lazily get or load one key, sharing producer work and successful/error ownership for equivalent keys; use get_observed for acquisition classification.
+    /// A recipe for a prepared cache retains its admitted key for subsequent runs.
     pub fn get<R: Send + Sync + 'static>(
         &self,
         key: K,
     ) -> Effect<SharedValue<A>, SharedValue<E>, R> {
-        self.get_shared(Arc::new(key))
+        self.get_key(self.lookup_key(key))
+    }
+
+    /// Lazily get or load a key admitted by [`Self::prepare_key`]. Reusing this
+    /// handle consumes no additional key slot, including when the lookup hits.
+    pub fn get_prepared<R: Send + Sync + 'static>(
+        &self,
+        key: CacheKey<K>,
+    ) -> Effect<SharedValue<A>, SharedValue<E>, R> {
+        self.get_key(LookupKey::Owned(EntryKey::Prepared(key)))
     }
 
     /// Lazily acquire a key and report Retained, Shared or Loaded with its shared success.
@@ -972,26 +2287,31 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
         &self,
         key: K,
     ) -> Effect<CacheLookup<A>, SharedValue<E>, R> {
-        let key = Arc::new(key);
+        let key = self.lookup_key(key);
         let cache = self.clone();
         Effect::new(move |_, context, finish| {
             let cache = cache.clone();
-            let key = Arc::clone(&key);
-            Step::Suspended(Box::pin(async move {
+            let key = key.clone();
+            Step::suspended(Box::pin(async move {
                 let work = async {
+                    if context.cancelled() {
+                        return Exit::Interrupted;
+                    }
+                    let key = match cache.admit_key(key) {
+                        Ok(key) => key,
+                        Err(error) => return error.exit(),
+                    };
                     match cache.select_observed_entry(key, &context).await {
-                        Ok(Some((entry, observation))) => match cache
-                            .observe_value(&entry, context.cancellation.clone())
-                            .await
-                        {
-                            Exit::Success(value) => {
-                                Exit::Success(CacheLookup { value, observation })
+                        Ok(Some(selected)) => {
+                            let observation = selected.observation;
+                            match cache.observe_selected(selected, context.cancellation.clone()).await {
+                                Exit::Success(value) => Exit::Success(CacheLookup { value, observation }),
+                                Exit::Fail(error) => Exit::Fail(error),
+                                Exit::Die(defect) => Exit::Die(defect),
+                                Exit::Interrupted => Exit::Interrupted,
+                                Exit::FinalizationFailed(details) => Exit::FinalizationFailed(details),
                             }
-                            Exit::Fail(error) => Exit::Fail(error),
-                            Exit::Die(defect) => Exit::Die(defect),
-                            Exit::Interrupted => Exit::Interrupted,
-                            Exit::FinalizationFailed(details) => Exit::FinalizationFailed(details),
-                        },
+                        }
                         Ok(None) => Exit::Interrupted,
                         Err(error) => error.exit(),
                     }
@@ -1013,32 +2333,42 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
         &self,
         key: K,
     ) -> Effect<Option<SharedValue<A>>, SharedValue<E>, R> {
+        self.try_get_key(self.lookup_key(key))
+    }
+
+    /// Inspect a fresh retained success using an already admitted lookup key.
+    pub fn try_get_prepared<R: Send + Sync + 'static>(
+        &self,
+        key: CacheKey<K>,
+    ) -> Effect<Option<SharedValue<A>>, SharedValue<E>, R> {
+        self.try_get_key(LookupKey::Owned(EntryKey::Prepared(key)))
+    }
+
+    fn try_get_key<R: Send + Sync + 'static>(
+        &self,
+        key: LookupKey<K>,
+    ) -> Effect<Option<SharedValue<A>>, SharedValue<E>, R> {
         let cache = self.clone();
-        let key = Arc::new(key);
         Effect::new(move |_, context, finish| {
             let cache = cache.clone();
-            let key = Arc::clone(&key);
-            Step::Suspended(Box::pin(async move {
+            let key = key.clone();
+            Step::suspended(Box::pin(async move {
                 let work = async {
+                    if context.cancelled() {
+                        return Exit::Interrupted;
+                    }
+                    let key = match cache.admit_key(key) {
+                        Ok(key) => key,
+                        Err(error) => return error.exit(),
+                    };
                     loop {
                         if context.cancelled() {
                             return Exit::Interrupted;
                         }
-                        let (revision, entries, closed) = {
-                            let state = cache
-                                .inner
-                                .state
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            (
-                                Arc::clone(&state.revision),
-                                state.retained.iter().cloned().collect::<Vec<_>>(),
-                                state.closed,
-                            )
+                        let CacheSnapshot { revision, entries } = match cache.snapshot_index(SnapshotKind::Lookup) {
+                            Ok(snapshot) => snapshot,
+                            Err(error) => return error.exit(),
                         };
-                        if closed {
-                            return Exit::Die(Defect::from(LibraryDefect::CacheClosed));
-                        }
                         let now = (cache.inner.now)();
                         let found = entries
                             .iter()
@@ -1065,11 +2395,12 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
                                 .state
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            Arc::ptr_eq(&revision, &state.revision)
+                            state.revision.matches(&revision)
                         };
                         if current {
                             return Exit::Success(value);
                         }
+                        drop(entries);
                         cooperative_retry().await;
                     }
                 };
@@ -1086,18 +2417,25 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
         &self,
         key: Arc<K>,
     ) -> Effect<SharedValue<A>, SharedValue<E>, R> {
+        self.get_key(LookupKey::Owned(EntryKey::Ordinary(key)))
+    }
+
+    fn get_key<R: Send + Sync + 'static>(&self, key: LookupKey<K>) -> Effect<SharedValue<A>, SharedValue<E>, R> {
         let cache = self.clone();
         Effect::new(move |_, context, finish| {
             let cache = cache.clone();
-            let key = Arc::clone(&key);
-            Step::Suspended(Box::pin(async move {
+            let key = key.clone();
+            Step::suspended(Box::pin(async move {
                 let work = async {
-                    match cache.select_entry(key, &context).await {
-                        Ok(Some(entry)) => {
-                            cache
-                                .observe_value(&entry, context.cancellation.clone())
-                                .await
-                        }
+                    if context.cancelled() {
+                        return Exit::Interrupted;
+                    }
+                    let key = match cache.admit_key(key) {
+                        Ok(key) => key,
+                        Err(error) => return error.exit(),
+                    };
+                    match cache.select_observed_entry(key, &context).await {
+                        Ok(Some(selected)) => cache.observe_selected(selected, context.cancellation.clone()).await,
                         Ok(None) => Exit::Interrupted,
                         Err(error) => error.exit(),
                     }
@@ -1125,33 +2463,68 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
     /// Returns `Exit<(), SharedValue<E>>`.
     async fn retire(
         &self,
-        selected: Vec<Arc<Entry<K, A, E>>>,
-        earlier: Vec<SharedOutcome<A, E>>,
-    ) -> Exit<(), SharedValue<E>> {
-        for entry in &selected {
-            let _ = entry.cancellation.request();
+        mut selected: CacheIndex<K, A, E>,
+        earlier: impl Iterator<Item = Diagnostic<K, A, E>> + Send,
+        ignore_selected_diagnostics: bool,
+        cancel: bool,
+        mut cleanup: Retirement<E>,
+    ) -> Retirement<E> {
+        if cancel {
+            for entry in selected.iter() {
+                let _ = entry.cancellation.request();
+            }
         }
-        let mut cleanup = Exit::Success(());
-        for outcome in earlier {
-            cleanup = outcome::append_failures(cleanup, outcome::failures(outcome));
-        }
-        for entry in selected {
-            loop {
-                let changed = entry.changed.listen();
-                let outcome = entry
+        for diagnostic in earlier {
+            if !ignore_selected_diagnostics
+                || !selected
+                    .iter()
+                    .any(|entry| entry.same_entry(&diagnostic.entry))
+            {
+                let state = diagnostic
+                    .entry
                     .state
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .outcome
-                    .clone();
-                if let Some(outcome) = outcome {
-                    cleanup = outcome::append_failures(cleanup, outcome::failures(outcome));
-                    break;
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(outcome) = &state.outcome {
+                    cleanup.append_exit(outcome);
                 }
-                changed.await;
+            }
+        }
+        while let Some(entry) = selected.pop_front() {
+            loop {
+                let ordinary = if let Some(notification) = &cleanup.notification {
+                    notification.reset();
+                    None
+                } else {
+                    entry.changed.as_ref().map(Event::listen)
+                };
+                {
+                    let state = entry
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(outcome) = &state.outcome {
+                        if cancel {
+                            cleanup.append_exit(outcome);
+                        }
+                        break;
+                    }
+                }
+                if let Some(notification) = &cleanup.notification {
+                    std::future::poll_fn(|context| notification.poll(context)).await;
+                } else if let Some(ordinary) = ordinary {
+                    ordinary.await;
+                }
             }
         }
         cleanup
+    }
+
+    fn reserve_retirement(&self) -> Result<Option<RetirementReservation<E>>, CacheSelectionError<E>> {
+        self.payloads()
+            .map(RetirementReservation::reserve)
+            .transpose()
+            .map_err(|error| self.index_error(error))
     }
     /// Mark the selected cached or reactive state stale for its consumers.
     ///
@@ -1168,7 +2541,15 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
     /// Type: `Effect<(), SharedValue<E>, R>`.
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn invalidate<R: Send + Sync + 'static>(&self, key: K) -> Effect<(), SharedValue<E>, R> {
-        self.invalidate_shared(Arc::new(key))
+        self.invalidate_selected(Invalidation::Key(self.lookup_key_for(key, KeyPurpose::Maintenance)), || {})
+    }
+
+    /// Invalidate one key using its already admitted region handle.
+    pub fn invalidate_prepared<R: Send + Sync + 'static>(
+        &self,
+        key: CacheKey<K>,
+    ) -> Effect<(), SharedValue<E>, R> {
+        self.invalidate_selected(Invalidation::Key(LookupKey::Owned(EntryKey::Prepared(key))), || {})
     }
 
     /// # Type parameters
@@ -1195,68 +2576,83 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
         &self,
         predicate: impl Fn(&K, Option<SharedValue<A>>, bool) -> bool + Send + Sync + 'static,
     ) -> Effect<(), SharedValue<E>, R> {
-        let predicate = Arc::new(predicate);
+        self.invalidate_matching_committed(predicate, || {})
+    }
+
+    pub(crate) fn invalidate_matching_committed<R: Send + Sync + 'static>(
+        &self,
+        predicate: impl Fn(&K, Option<SharedValue<A>>, bool) -> bool + Send + Sync + 'static,
+        on_commit: impl Fn() + Send + Sync + 'static,
+    ) -> Effect<(), SharedValue<E>, R> {
+        self.invalidate_selected(Invalidation::Predicate(Arc::new(predicate)), on_commit)
+    }
+
+    fn invalidate_selected<R: Send + Sync + 'static>(
+        &self,
+        query: Invalidation<K, A, LookupKey<K>>,
+        on_commit: impl Fn() + Send + Sync + 'static,
+    ) -> Effect<(), SharedValue<E>, R> {
+        let on_commit = Arc::new(on_commit);
         let cache = self.clone();
         let program = Effect::new(move |_, _, finish| {
             let cache = cache.clone();
-            let predicate = Arc::clone(&predicate);
-            Step::Suspended(Box::pin(async move {
+            let query = query.clone();
+            let on_commit = Arc::clone(&on_commit);
+            Step::suspended(Box::pin(async move {
                 let work = async {
+                    let query = match query {
+                        Invalidation::Predicate(predicate) => Invalidation::Predicate(predicate),
+                        Invalidation::Key(key) => match cache.admit_lookup_key(key, true) {
+                            Ok(key) => Invalidation::Key(key),
+                            Err(error) => return error.exit(),
+                        },
+                    };
                     loop {
-                        let (revision, entries, diagnostics) = {
-                            let state = cache
-                                .inner
-                                .state
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            (
-                                Arc::clone(&state.revision),
-                                state
-                                    .retained
-                                    .iter()
-                                    .chain(&state.active)
-                                    .map(Arc::clone)
-                                    .collect::<Vec<_>>(),
-                                state
-                                    .diagnostics
-                                    .iter()
-                                    .map(|(entry, _)| Arc::clone(entry))
-                                    .collect::<Vec<_>>(),
-                            )
+                        let CacheSnapshot {
+                            revision,
+                            entries: mut selected,
+                        } = match cache
+                            .snapshot_index(SnapshotKind::Maintenance { allow_closed: true })
+                        {
+                            Ok(snapshot) => snapshot,
+                            Err(error) => return error.exit(),
                         };
-                        let mut selected = Vec::new();
-                        for entry in entries.into_iter().chain(diagnostics) {
-                            let (value, pending) = {
-                                let state = entry
-                                    .state
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                (
-                                    match &state.outcome {
+                        let mut discarded = match cache.reserve_retired_diagnostics() {
+                            Ok(discarded) => discarded,
+                            Err(error) => return error.exit(),
+                        };
+                        retain_selected(&mut selected, |entry| match &query {
+                            Invalidation::Key(key) => (cache.inner.config.equal)(&entry.key, key),
+                            Invalidation::Predicate(predicate) => {
+                                let (value, pending) = {
+                                    let state = entry.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    let value = match &state.outcome {
                                         Some(Exit::Success(value)) => Some(value.clone()),
                                         _ => None,
-                                    },
-                                    state.outcome.is_none(),
-                                )
-                            };
-                            if predicate(&entry.key, value, pending)
-                                && !selected
-                                    .iter()
-                                    .any(|candidate| Arc::ptr_eq(candidate, &entry))
-                            {
-                                selected.push(entry);
+                                    };
+                                    (value, state.outcome.is_none())
+                                };
+                                predicate(&entry.key, value, pending)
                             }
-                        }
-                        let earlier = {
+                        });
+                        let retirement = if selected.len() == 0 {
+                            Retirement::new(None)
+                        } else {
+                            match cache.reserve_retirement() {
+                                Ok(cleanup) => Retirement::new(cleanup),
+                                Err(error) => return error.exit(),
+                            }
+                        };
+                        let committed = {
                             let mut state = cache
                                 .inner
                                 .state
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            if !Arc::ptr_eq(&state.revision, &revision) {
-                                None
+                            if !state.revision.matches(&revision) {
+                                false
                             } else {
-                                for entry in &selected {
+                                for entry in selected.iter() {
                                     let mut entry_state = entry
                                         .state
                                         .lock()
@@ -1267,26 +2663,26 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
                                 state.retained.retain(|entry| {
                                     !selected
                                         .iter()
-                                        .any(|candidate| Arc::ptr_eq(candidate, entry))
+                                        .any(|candidate| candidate.same_entry(entry))
                                 });
-                                let diagnostics = std::mem::take(&mut state.diagnostics);
-                                let mut earlier = Vec::new();
-                                for (entry, outcome) in diagnostics {
-                                    if selected
-                                        .iter()
-                                        .any(|candidate| Arc::ptr_eq(candidate, &entry))
-                                    { /* selected canonical outcomes are joined below */
-                                    } else {
-                                        state.diagnostics.push((entry, outcome));
-                                    }
-                                }
-                                state.revision = Arc::new(());
-                                Some(std::mem::take(&mut earlier))
+                                take_diagnostics(&mut state.diagnostics, &selected, &mut discarded);
+                                state.advance_revision();
+                                true
                             }
                         };
-                        if let Some(earlier) = earlier {
-                            return cache.retire(selected, earlier).await;
+                        // The selected canonical outcomes are joined below.
+                        drop(discarded);
+                        if committed {
+                            let committed = catch_unwind(AssertUnwindSafe(|| on_commit()));
+                            let mut retirement = cache
+                                .retire(selected, std::iter::empty(), false, true, retirement)
+                                .await;
+                            if let Err(panic) = committed {
+                                retirement.outcome.append_cleanup(Exit::Die(Defect::from_panic(panic)));
+                            }
+                            return retirement.finish();
                         }
+                        drop(selected);
                         cooperative_retry().await;
                     }
                 };
@@ -1314,69 +2710,79 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
     /// still apply, and the stored input is consumed once without cloning.
     pub fn set<R: Send + Sync + 'static>(&self, key: K, value: A) -> Effect<(), SharedValue<E>, R> {
         let cache = self.clone();
-        let key = Arc::new(key);
-        let input = effect_sync! { once; body: move || value, };
+        let input = effect_sync! { once; body: move || (key, value), };
         effect! {
             let cache = cache.clone();
-            let key = Arc::clone(&key);
             let input = input.clone();
-            let value = input?;
-            let value = Arc::new(Mutex::new(Some(value)));
+            let input = input?;
+            let input = Arc::new(Mutex::new(Some(input)));
             let replacement = Effect::new(move |_, _, finish| {
                 let cache = cache.clone();
-                let key = Arc::clone(&key);
-                let value = Arc::clone(&value);
-                Step::Suspended(Box::pin(async move {
+                let input = Arc::clone(&input);
+                Step::suspended(Box::pin(async move {
                     let work = async {
-                        let value = value
+                        let input = input
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .take();
-                        let Some(value) = value else {
+                        let Some((key, value)) = input else {
                             return Exit::Die(Defect::from(LibraryDefect::CacheClosed));
                         };
+                        let key = if cache.payloads().is_some() {
+                            match cache.prepare_key(key) {
+                                Ok(key) => EntryKey::Prepared(key),
+                                Err((MemoryError::Closed, _key)) => return Exit::Die(Defect::from(LibraryDefect::CacheClosed)),
+                                Err((error, _key)) => return cache.index_error(error).exit(),
+                            }
+                        } else {
+                            EntryKey::Ordinary(Arc::new(key))
+                        };
+                        let mut entry_lease = match cache.reserve_entry() {
+                            Ok(lease) => lease,
+                            Err(error) => return cache.index_error(error).exit(),
+                        };
+                        let mut outcome_storage = match cache.payloads().map_or(Ok(OutcomeStorage::Ordinary), Payloads::reserve_success) {
+                            Ok(storage) => Some(storage),
+                            Err(error) => return cache.index_error(error).exit(),
+                        };
+                        let retirement_cleanup = match cache.reserve_retirement() {
+                            Ok(cleanup) => cleanup,
+                            Err(error) => return error.exit(),
+                        };
                         loop {
-                            let (revision, entries, closed) = {
-                                let state = cache
-                                    .inner
-                                    .state
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                (
-                                    Arc::clone(&state.revision),
-                                    state
-                                        .retained
-                                        .iter()
-                                        .chain(&state.active)
-                                        .chain(state.diagnostics.iter().map(|(entry, _)| entry))
-                                        .cloned()
-                                        .collect::<Vec<_>>(),
-                                    state.closed,
-                                )
+                            let CacheSnapshot { revision, entries: mut selected } = match
+                                cache.snapshot_index(SnapshotKind::Maintenance { allow_closed: false })
+                            {
+                                Ok(snapshot) => snapshot,
+                                Err(error) => return error.exit(),
                             };
-                            if closed {
-                                return Exit::Die(Defect::from(LibraryDefect::CacheClosed));
-                            }
-                            let mut selected = Vec::new();
-                            for entry in entries {
-                                if (cache.inner.config.equal)(&entry.key, &key)
-                                    && !selected
-                                        .iter()
-                                        .any(|candidate| Arc::ptr_eq(candidate, &entry))
-                                {
-                                    selected.push(entry);
-                                }
-                            }
+                            let mut diagnostics = match cache.reserve_retired_diagnostics() {
+                                Ok(diagnostics) => diagnostics,
+                                Err(error) => return error.exit(),
+                            };
+                            retain_selected(&mut selected, |entry| (cache.inner.config.equal)(&entry.key, &key));
+                            let cancellation = match cache.inner.parent.child() {
+                                Ok(cancellation) => cancellation,
+                                Err(error) => return cache.index_error(error).exit(),
+                            };
                             let installed = {
                                 let mut state = cache
                                     .inner
                                     .state
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                if !Arc::ptr_eq(&revision, &state.revision) {
+                                if !state.revision.matches(&revision) {
                                     None
                                 } else {
-                                    for entry in &selected {
+                                    if state.active.remaining() == 0 || (state.retained.remaining() == 0
+                                        && !state.retained.iter().any(|candidate| {
+                                            selected.iter().any(|entry| entry.same_entry(candidate))
+                                        }))
+                                    {
+                                        drop(state);
+                                        return cache.index_error(MemoryError::NoSlot).exit();
+                                    }
+                                    for entry in selected.iter() {
                                         let mut state = entry
                                             .state
                                             .lock()
@@ -1384,69 +2790,47 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
                                         state.invalidated = true;
                                         state.retiring = true;
                                     }
-                                    let mut diagnostics = Vec::new();
-                                    let mut index = 0;
-                                    while index < state.diagnostics.len() {
-                                        if selected.iter().any(|entry| {
-                                            state.diagnostics.get(index).is_some_and(
-                                                |(candidate, _)| Arc::ptr_eq(entry, candidate),
-                                            )
-                                        }) {
-                                            diagnostics.push(state.diagnostics.remove(index).1);
-                                        } else {
-                                            index += 1;
-                                        }
-                                    }
+                                    take_diagnostics(&mut state.diagnostics, &selected, &mut diagnostics);
                                     state.retained.retain(|entry| {
                                         !selected
                                             .iter()
-                                            .any(|candidate| Arc::ptr_eq(candidate, entry))
+                                            .any(|candidate| candidate.same_entry(entry))
                                     });
-                                    let entry = Arc::new(Entry {
-                                        key: Arc::clone(&key),
+                                    let changed = entry_lease.is_none().then(Event::new);
+                                    let entry = IndexEntry::publish(entry_lease.take(), Entry {
+                                        key: key.clone(),
+                                        outcome_storage: Mutex::new(outcome_storage.take()),
+                                        produced: Mutex::new(None),
+                                        submission: Mutex::new(Submission::Finished),
                                         state: Mutex::new(EntryState {
                                             outcome: None,
                                             expires: None,
                                             invalidated: false,
                                             retiring: false,
                                             observed: true,
+                                            diagnostic: None,
                                         }),
-                                        changed: Event::new(),
-                                        cancellation: cache.inner.parent.child(),
+                                        changed,
+                                        cancellation,
                                     });
-                                    state.retained.push_back(Arc::clone(&entry));
-                                    state.active.push(Arc::clone(&entry));
-                                    state.revision = Arc::new(());
-                                    Some((entry, diagnostics))
+                                    state.retained.push_reserved(entry.clone());
+                                    state.active.push_reserved(entry.clone());
+                                    state.advance_revision();
+                                    Some(entry)
                                 }
                             };
-                            if let Some((entry, diagnostics)) = installed {
+                            if let Some(entry) = installed {
                                 settle(&entry, &Arc::downgrade(&cache.inner), Exit::Success(value));
-                                let published = entry
-                                    .state
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .outcome
-                                    .clone()
-                                    .unwrap_or_else(|| {
-                                        Exit::Die(Defect::from(
-                                            LibraryDefect::MissingInterpreterOutcome,
-                                        ))
-                                    });
-                                let retired = cache.retire(selected, diagnostics).await;
-                                return outcome::append_cleanup(
-                                    match published {
-                                        Exit::Success(_) => Exit::Success(()),
-                                        Exit::Fail(error) => Exit::Fail(error),
-                                        Exit::Die(defect) => Exit::Die(defect),
-                                        Exit::Interrupted => Exit::Interrupted,
-                                        Exit::FinalizationFailed(details) => {
-                                            Exit::FinalizationFailed(details)
-                                        }
-                                    },
-                                    retired,
-                                );
+                                let retirement = {
+                                    let entry = entry.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    let missing = Exit::Die(Defect::from(LibraryDefect::MissingInterpreterOutcome));
+                                    Retirement::with_primary(retirement_cleanup, entry.outcome.as_ref().unwrap_or(&missing))
+                                };
+                                let earlier = std::iter::from_fn(move || diagnostics.pop_front());
+                                return cache.retire(selected, earlier, false, true, retirement).await.finish();
                             }
+                            drop(diagnostics);
+                            drop(selected);
                             cooperative_retry().await;
                         }
                     };
@@ -1461,7 +2845,8 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
         }
     }
 
-    async fn shutdown_start(&self) {
+    async fn shutdown_start(&self, notification: Option<prepared_notification::Registration>) {
+        let cancel = !self.independent();
         let selected = {
             let mut state = self
                 .inner
@@ -1472,61 +2857,75 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
                 CacheShutdown::Open => {
                     state.closed = true;
                     state.shutdown = CacheShutdown::Closing;
-                    state.revision = Arc::new(());
-                    let selected = state.active.iter().map(Arc::clone).collect::<Vec<_>>();
-                    for entry in &selected {
+                    state.advance_revision();
+                    let mut selected = std::mem::take(&mut state.shutdown_index);
+                    for entry in state.active.iter() {
+                        selected.push_reserved(entry.clone());
+                    }
+                    for entry in selected.iter() {
                         let mut entry_state = entry
                             .state
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        entry_state.invalidated = true;
+                        entry_state.invalidated = cancel;
                         entry_state.retiring = true;
                     }
-                    let earlier: Vec<_> = std::mem::take(&mut state.diagnostics)
-                        .into_iter()
-                        .filter(|(entry, _)| {
-                            !selected
-                                .iter()
-                                .any(|candidate| Arc::ptr_eq(candidate, entry))
-                        })
-                        .map(|(_, outcome)| outcome)
-                        .collect();
+                    let diagnostics = std::mem::take(&mut state.diagnostics);
                     let retained = std::mem::take(&mut state.retained);
-                    Some((selected, earlier, retained))
+                    Some((
+                        selected,
+                        diagnostics,
+                        retained,
+                        state.shutdown_retirement.take(),
+                    ))
                 }
                 CacheShutdown::Closing | CacheShutdown::Closed(_) => None,
             }
         };
-        if let Some((selected, earlier, retained)) = selected {
+        if let Some((selected, mut diagnostics, retained, cleanup)) = selected {
             let mut guard = CacheShutdownDriver {
                 cache: self.clone(),
                 settled: false,
             };
-            for entry in retained {
-                entry
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .invalidated = true;
+            if cancel {
+                for entry in retained.iter() {
+                    entry.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).invalidated = true;
+                }
             }
-            let _ = self.inner.parent.request();
-            let mut outcome = self.retire(selected, earlier).await;
+            let cancel_on_drop = std::mem::DropGuard::new(&self.inner.parent, |parent| {
+                if cancel {
+                    let _ = parent.request();
+                }
+            });
+            drop(retained);
+            drop(cancel_on_drop);
+            let earlier = std::iter::from_fn(move || diagnostics.pop_front());
+            let mut retirement = self
+                .retire(selected, earlier, true, cancel, Retirement::new(cleanup))
+                .await;
+            drop(retirement.notification.take());
             let mut state = self
                 .inner
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(defect) = state.owner_loss.take() {
-                outcome = outcome::append_cleanup(outcome, Exit::Die(defect));
+                retirement.outcome.append_cleanup(Exit::Die(defect));
             }
-            state.shutdown = CacheShutdown::Closed(Some(outcome));
+            state.shutdown = CacheShutdown::Closed(Some(retirement.finish()));
             drop(state);
             guard.settled = true;
+            let notify = std::mem::DropGuard::new(self, |cache| cache.notify_shutdown());
             self.inner.parent.unlink();
-            notify_all(&self.inner.changed);
+            drop(notify);
         } else {
             loop {
-                let changed = self.inner.changed.listen();
+                let ordinary = if let Some(notification) = &notification {
+                    notification.reset();
+                    None
+                } else {
+                    self.inner.changed.as_ref().map(Event::listen)
+                };
                 if matches!(
                     self.inner
                         .state
@@ -1537,19 +2936,50 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
                 ) {
                     break;
                 }
-                changed.await;
+                if let Some(notification) = &notification {
+                    std::future::poll_fn(|context| notification.poll(context)).await;
+                } else if let Some(ordinary) = ordinary {
+                    ordinary.await;
+                }
             }
         }
     }
-    ///
-    /// # Type parameters
-    /// - `E`: Domain-error type.
-    ///
-    /// # Returns
-    /// Type: `Exit<(), SharedValue<E>>`.
-    /// Returns `Exit<(), SharedValue<E>>`.
-    async fn shutdown_owned(&self, _: Context) -> Exit<(), SharedValue<E>> {
-        self.shutdown_start().await;
+
+    fn notify_shutdown(&self) {
+        if let Some(payloads) = self.payloads() {
+            payloads.closed.notify_all();
+        }
+        if let Some(changed) = &self.inner.changed {
+            notify_all(changed);
+        }
+    }
+
+    fn reserve_close_wait(
+        &self,
+    ) -> Result<Option<prepared_notification::Registration>, MemoryError> {
+        let Some(payloads) = self.payloads() else {
+            return Ok(None);
+        };
+        let closed = matches!(
+            self.inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .shutdown,
+            CacheShutdown::Closed(_)
+        );
+        if closed {
+            return Ok(None);
+        }
+        payloads.closed.listen().map(Some)
+    }
+
+    async fn shutdown_owned(
+        &self,
+        _: Context,
+        notification: Option<prepared_notification::Registration>,
+    ) -> Exit<(), SharedValue<E>> {
+        self.shutdown_start(notification).await;
         let mut state = self
             .inner
             .state
@@ -1579,8 +3009,12 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Cache<K, A,
         let cache = self.clone();
         effect_uninterruptible! { program: Effect::new(move |_, _, finish| {
             let cache = cache.clone();
-            Step::Suspended(Box::pin(async move {
-                cache.shutdown_start().await;
+            Step::suspended(Box::pin(async move {
+                let notification = match cache.reserve_close_wait() {
+                    Ok(notification) => notification,
+                    Err(error) => return runtime::finish(finish, cache.index_error(error).exit()),
+                };
+                cache.shutdown_start(notification).await;
                 let status = {
                     let state = cache
                         .inner
@@ -1631,7 +3065,7 @@ impl<K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> Drop
                 .shutdown = CacheShutdown::Closed(Some(Exit::Die(Defect::from(
                 LibraryDefect::CacheShutdownDriverDropped,
             ))));
-            notify_all(&self.cache.inner.changed);
+            self.cache.notify_shutdown();
         }
     }
 }

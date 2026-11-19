@@ -1,6 +1,6 @@
 //! Reserve two cups, cancel the order, and record the stock return once.
 //!
-//! Run: `cargo +1.99.0 run -p effect --example reserve_cancelled_order`.
+//! Run: `cargo +1.100.0 run -p effect --example reserve_cancelled_order`.
 //! Input: eight available cups and a two-cup reservation. Output: stock 6 after
 //! reservation, stock 8 after cancellation, and stock 8 after compensation replay.
 //! The stock and workflow history are local to this process.

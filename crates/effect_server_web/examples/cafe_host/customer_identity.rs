@@ -77,6 +77,10 @@ pub(super) struct CustomerServices {
 pub(super) async fn configure(
     sql: SqlClient,
     policy: CustomerPolicy,
+    (admission, invocations): (
+        Arc<PreparedProviderAdmission>,
+        Arc<PreparedIdentityInvocations>,
+    ),
 ) -> Result<CustomerServices, Box<dyn std::error::Error>> {
     let capacity = policy.capacity;
     let cookie = policy.cookie;
@@ -110,7 +114,8 @@ pub(super) async fn configure(
             challenge_capacity: capacity,
             utc_now: OffsetDateTime::now_utc,
         },
-    )?;
+    )?
+    .with_prepared_invocations(invocations);
     backend.initialize().await?;
     let role_name = NormalizedUserName::parse("CUSTOMER")?;
     if backend
@@ -131,7 +136,7 @@ pub(super) async fn configure(
     ));
     let normalizer = Retained::new(UpperInvariantLookupNormalizer::new());
     let authenticator = Retained::new(AuthenticatorTokenProvider::new());
-    let admission = Retained::new(CafeAdmission);
+    let sign_in_policy = Retained::new(CafeAdmission);
     let recent_window = time::Duration::seconds(policy.recent_seconds);
     let definition = identity! {
         storage: identity_store! { backend: backend }?,
@@ -151,18 +156,23 @@ pub(super) async fn configure(
             .map_err(IdentityError::Native)?;
             Ok(SignInManager::new(users)
                 .with_authenticator_token_provider(authenticator.clone())
-                .with_sign_in_policy(admission.clone())
+                .with_sign_in_policy(sign_in_policy.clone())
                 .with_authentication_scheme("Cafe.Customer"))
 
         },
         tickets: tickets, browser: browser, principal_factory: NativePrincipalPolicy::new(ClaimsIdentityOptions::default()),
         errors |error| { cafe_error(CafeProblem::Identity(Box::new(error))) }, clock: IdentityClock::new(OffsetDateTime::now_utc),
         grant_policy: GrantPolicy { self_lifetime: native_window, recent_lifetime: recent_window }, admission: capacity,
-    }?;
+    }?.with_prepared_admission(admission);
     let mut selected_security = security! {
         csp: csp! { directive(CspDirective::DefaultSrc, CspSources::self_origin()); directive(CspDirective::ScriptSrc, CspSources::nonce()); directive(CspDirective::StyleSrc, CspSources::nonce()); },
         nonce: || {
-        effect_try_sync! { body { ResponseNonce::new(uuid::Uuid::new_v4().simple().to_string()) }, on_error |error| { cafe_error(CafeProblem::Web(error)) }, }
+        effect_try_sync! {
+            body {
+            let mut nonce = [0; 32];
+            uuid::Uuid::new_v4().simple().encode_lower(&mut nonce);
+            ResponseNonce::from_hex_bytes(nonce)
+        }, on_error |error| { cafe_error(CafeProblem::Web(error)) }, }
         },
         authentication: definition.cookie_stage(),
         header(http::header::X_CONTENT_TYPE_OPTIONS, http::HeaderValue::from_static("nosniff"));

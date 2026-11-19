@@ -1,11 +1,13 @@
 //! Native setup for the café demonstration; business workflows stay in the SQL DSL.
 
+use effect::memory::MemoryPolicy;
 use effect_sql::sqlx::{
     SqlSafeStr, TursoConnectOptions, TursoPool, TursoPoolOptions,
     migrate::{Migration, MigrationType},
 };
 use effect_sql::{
     MigrationCatalog, MigrationStep, Rollback, SQLX_JOURNAL, SqlClient, SqlError, SqlMigrator,
+    SqlStartupError,
 };
 use std::{
     borrow::Cow,
@@ -31,24 +33,29 @@ pub struct CafeDatabase {
 }
 impl CafeDatabase {
     /// Acquire a fresh file-backed local database and apply the declared application migration.
-    pub async fn acquire() -> Result<Self, SqlError> {
+    #[expect(clippy::result_large_err, reason = "retains the complete SQL failure without boxing")]
+    pub async fn acquire(native_memory: Option<MemoryPolicy>) -> Result<Self, SqlStartupError> {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| SqlError::Configuration("demo clock precedes epoch".into()))?
             .as_nanos();
         let directory =
             std::env::temp_dir().join(format!("effect-sql-cafe-{}-{stamp}", std::process::id()));
-        std::fs::create_dir(&directory)
-            .map_err(|error| SqlError::Configuration(error.to_string()))?;
-        let options = TursoConnectOptions::new()
-            .filename(directory.join("cafe.db"))
-            .create_if_missing(true)
-            .busy_timeout(DEMO_WRITE_WAIT);
-        let pool = TursoPoolOptions::new()
-            .max_connections(DEMO_POOL_CONNECTIONS)
-            .connect_with(options)
-            .await?;
-        let client = SqlClient::new(pool.clone());
+        let client = SqlClient::open(native_memory, || async {
+            std::fs::create_dir(&directory)
+                .map_err(|error| SqlError::Configuration(error.to_string()))?;
+            let options = TursoConnectOptions::new()
+                .filename(directory.join("cafe.db"))
+                .create_if_missing(true)
+                .statement_cache_capacity(0)
+                .busy_timeout(DEMO_WRITE_WAIT);
+            Ok(TursoPoolOptions::new()
+                .max_connections(DEMO_POOL_CONNECTIONS)
+                .connect_with(options)
+                .await?)
+        })
+        .await?;
+        let pool = client.kernel().pool().clone();
         let database = Self {
             pool,
             client,
@@ -75,11 +82,12 @@ impl CafeDatabase {
             .await
         {
             database.pool.close().await;
-            return Err(error);
+            return Err(error.into());
         }
         Ok(database)
     }
     /// Join native pool shutdown before removing the temporary demonstration directory.
+    #[expect(clippy::result_large_err, reason = "retains the complete SQL failure without boxing")]
     pub async fn close(self) -> Result<(), SqlError> {
         self.pool.close().await;
         std::fs::remove_dir_all(&self.directory)

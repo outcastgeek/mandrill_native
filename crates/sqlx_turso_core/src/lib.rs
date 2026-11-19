@@ -23,6 +23,7 @@ mod macros;
 mod migrate;
 mod options;
 mod pool;
+mod prepared_rows;
 mod query_result;
 mod row;
 mod statement;
@@ -39,12 +40,18 @@ pub use column::TursoColumn;
 pub use connection::{TursoConnection, TursoNativeTransaction};
 pub use database::Turso;
 pub use error::{TursoAdapterError, TursoDatabaseError};
+pub use executor::PreparedTursoCursorError;
 pub use macros::{TursoDescribeExt, TursoTypeChecking};
 pub use options::{
     TursoConnectOptions, TursoDatabaseTarget, TursoEncryptionOptions, TursoExperimentalFeature,
     TursoExperimentalFeatures, TursoIo, TursoSyncOptions,
 };
 pub use pool::{TursoExecutor, TursoPool, TursoPoolOptions};
+pub use prepared_rows::{
+    PreparedTursoCursorReservation, PreparedTursoRowError, PreparedTursoRowMemoryError,
+    PreparedTursoRowReservation, PreparedTursoRowsCapacity, PreparedTursoRowsDemand,
+    PreparedTursoRowsPool,
+};
 pub use query_result::TursoQueryResult;
 pub use row::TursoRow;
 pub use statement::TursoStatement;

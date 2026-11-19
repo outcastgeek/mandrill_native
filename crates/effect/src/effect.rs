@@ -83,13 +83,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
     /// Tag this transition with its selected native context and restore that
     /// context before the caller continuation, without retaining thread guards.
     pub(crate) fn execute(self, env: Arc<R>, context: Context, finish: Finish<A, E>) -> Step {
-        let instrumentation_context = context.clone();
-        let finish = runtime::instrument_finish(finish, context.clone());
-        let step = runtime::more(move || {
-            context.begin_operation();
-            if context.cancelled() {
-                return runtime::finish(finish, Exit::Interrupted);
-            }
+        runtime::operation_entry(context, finish, move |context, finish| {
             match self.operation.as_ref() {
                 Some(operation) => operation(env, context, finish),
                 None => runtime::finish(
@@ -97,8 +91,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
                     Exit::Die(Defect::from(LibraryDefect::MissingEffectRecipe)),
                 ),
             }
-        });
-        runtime::instrument_step(step, instrumentation_context)
+        })
     }
 
     /// # Type parameters
@@ -309,9 +302,43 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
     pub fn from_future<F: Future<Output = A> + Send + 'static>(
         factory: impl Fn(Cancellation) -> F + Send + Sync + 'static,
     ) -> Self {
-        Self::future_exit(move |token| {
+        Self::ordinary_future_exit(move |token| {
             let pending = factory(token);
             async move { Exit::Success(pending.await) }
+        })
+    }
+
+    /// Construct a future using checked prepared frame storage selected by
+    /// run_with_frames. Both its pinned payload and completion transition are
+    /// physically reserved before invoking factory. Refusal is mapped explicitly
+    /// to E, never a hidden defect. The future itself never falls back to system
+    /// storage. Mapped refusal still uses ordinary continuation routing; other
+    /// interpreter/context/description allocations remain unchanged.
+    pub fn from_prepared_future<F: Future<Output = A> + Send + 'static>(
+        factory: impl Fn(Cancellation) -> F + Send + Sync + 'static,
+        on_capacity: impl Fn(crate::memory::MemoryError) -> E + Send + Sync + 'static,
+    ) -> Self {
+        Self::new(move |_, context, finish| {
+            let failed = |finish, error| {
+                let outcome = catch_unwind(AssertUnwindSafe(|| on_capacity(error)))
+                    .map(Exit::Fail)
+                    .unwrap_or_else(|panic| Exit::Die(Defect::from_panic(panic)));
+                runtime::finish(finish, outcome)
+            };
+            let Some(pool) = context.frames() else {
+                return failed(finish, crate::memory::MemoryError::MissingRuntimeStorage);
+            };
+            match crate::internal::runtime_storage::prepare_future(
+                pool,
+                || {
+                    let pending = factory(context.cancellation.clone());
+                    async move { Exit::Success(pending.await) }
+                },
+                finish,
+            ) {
+                Ok(step) => step,
+                Err((error, finish)) => failed(finish, error),
+            }
         })
     }
 
@@ -335,7 +362,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
         on_error: impl Fn(X) -> E + Send + Sync + 'static,
     ) -> Self {
         let on_error = Arc::new(on_error);
-        Self::future_exit(move |token| {
+        Self::ordinary_future_exit(move |token| {
             let pending = factory(token);
             let on_error = Arc::clone(&on_error);
             async move {
@@ -356,13 +383,19 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
     ///
     /// # Returns
     /// Type: `Self`.
-    fn future_exit<F: Future<Output = Exit<A, E>> + Send + 'static>(
+    pub(crate) fn future_exit(
+        factory: impl Fn(Arc<R>, Context, Finish<A, E>) -> Step + Send + Sync + 'static,
+    ) -> Self {
+        Self::new(factory)
+    }
+
+    fn ordinary_future_exit<F: Future<Output = Exit<A, E>> + Send + 'static>(
         factory: impl Fn(Cancellation) -> F + Send + Sync + 'static,
     ) -> Self {
-        Self::new(move |_, context, finish| {
+        Self::future_exit(move |_, context, finish| {
             match catch_unwind(AssertUnwindSafe(|| factory(context.cancellation.clone()))) {
                 Err(panic) => runtime::finish(finish, Exit::Die(Defect::from_panic(panic))),
-                Ok(pending) => Step::Suspended(Box::pin(async move {
+                Ok(pending) => Step::suspended(Box::pin(async move {
                     let outcome = AssertUnwindSafe(pending)
                         .catch_unwind()
                         .await
@@ -867,6 +900,18 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
         runtime::evaluate(self.clone(), env, Cancellation::new())
     }
 
+    /// Execute using explicit pre-provisioned work/cleanup frame pools. Prepared
+    /// future leaves use these pools; ordinary operations retain their existing
+    /// storage domains. This is not a complete PreparedRun descriptor or a
+    /// whole-execution allocation-free claim for an opaque existing Effect.
+    pub fn run_with_frames(
+        &self,
+        env: Arc<R>,
+        frames: crate::memory::RunFrames,
+    ) -> impl Future<Output = Exit<A, E>> + Send + 'static + use<A, E, R> {
+        runtime::evaluate_frames(self.clone(), env, Cancellation::new(), frames)
+    }
+
     /// Run with the external cancellation source supplied by `R`.
     ///
     /// The accessor and all work are lazy. Request cancellation through the
@@ -897,6 +942,27 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
                 Err(panic) => return Exit::Die(Defect::from_panic(panic)),
             };
             runtime::evaluate(program, env, cancellation).await
+        }
+    }
+
+    /// The external-cancellation counterpart of run_with_frames. The existing
+    /// accessor panic/cancellation publication rules are retained, with separate
+    /// prepared cleanup storage selected by protected contexts.
+    pub fn run_cancellable_with_frames(
+        &self,
+        env: Arc<R>,
+        frames: crate::memory::RunFrames,
+    ) -> impl Future<Output = Exit<A, E>> + Send + 'static + use<A, E, R>
+    where
+        R: HasCancellation,
+    {
+        let program = self.clone();
+        async move {
+            let cancellation = match catch_unwind(AssertUnwindSafe(|| env.cancellation().clone())) {
+                Ok(cancellation) => cancellation,
+                Err(panic) => return Exit::Die(Defect::from_panic(panic)),
+            };
+            runtime::evaluate_frames(program, env, cancellation, frames).await
         }
     }
 
@@ -1129,7 +1195,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
     /// Type: `Self`.
     pub fn sync_once(callback: impl FnOnce() -> A + Send + 'static) -> Self {
         Self::try_sync_once(
-            move || Ok::<A, std::convert::Infallible>(callback()),
+            move || Ok::<A, !>(callback()),
             |never| match never {},
         )
     }
@@ -1222,7 +1288,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
         Self::try_future_with_env(
             move |env, cancellation| {
                 let future = factory(env, cancellation);
-                async move { Ok::<A, std::convert::Infallible>(future.await) }
+                async move { Ok::<A, !>(future.await) }
             },
             |never| match never {},
         )
@@ -1254,7 +1320,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
         Self::new(move |env, context, finish| {
             let factory = Arc::clone(&factory);
             let on_error = Arc::clone(&on_error);
-            Step::Suspended(Box::pin(async move {
+            Step::suspended(Box::pin(async move {
                 let outcome = AssertUnwindSafe(async {
                     match factory(Arc::clone(&env), context.cancellation.clone()).await {
                         Ok(value) => Exit::Success(value),
@@ -1287,7 +1353,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
         Self::try_future_once(
             move |cancel| {
                 let future = factory(cancel);
-                async move { Ok::<A, std::convert::Infallible>(future.await) }
+                async move { Ok::<A, !>(future.await) }
             },
             |never| match never {},
         )
@@ -1318,7 +1384,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
             match candidate {
-                Some((factory, on_error)) => Step::Suspended(Box::pin(async move {
+                Some((factory, on_error)) => Step::suspended(Box::pin(async move {
                     let outcome = AssertUnwindSafe(async {
                         match factory(context.cancellation).await {
                             Ok(value) => Exit::Success(value),

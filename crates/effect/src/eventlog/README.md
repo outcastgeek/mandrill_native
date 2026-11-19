@@ -6,6 +6,17 @@ For memory compaction, obtain the journal's `retention_authority()`, register re
 
 `Projection::advance` reads the journal after its stored checkpoint, checks every event group, tag and version, folds outside the store lock, then atomically publishes the new state and checkpoint through `AtomicProjectionStore`. A fold failure writes neither state nor checkpoint. The projection store is a derived view; replaying the journal rebuilds it.
 
+`PreparedMemoryEventJournal` reserves its stream and event indexes, payload and
+outcome buffers, and leased read pages in the supplied region. An escaped page
+retains its bytes across compaction. Compaction still requires the journal's own
+retention permit and checks it against the current registered consumers.
+
+`PreparedEventLog` holds record buffers before encoding and running its handler.
+The journal makes the final cursor and deduplication decision after the handler
+returns. `PreparedProjection` folds a leased page into reserved byte snapshots
+and publishes the final buffer and its checkpoint together. Codec scratch and
+external handler work follow their separately selected owners.
+
 `EventObservation::reconcile` maps committed entries to reactive invalidation keys. It advances the returned cursor only after notification succeeds. On notification failure, `EventObservationError::Notification` carries `replay_after`, so a consumer can re-read from the prior cursor. A notification is never evidence of an append or a replacement for the journal.
 
 For an append → projection → invalidation example, including fold and

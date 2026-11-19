@@ -143,7 +143,7 @@ fn validate_tag_condition(request: &Request, name: http::HeaderName) -> Result<(
         let mut start = 0;
         for (index, byte) in value.bytes().enumerate() {
             if byte == b'"' {
-                quoted = !quoted;
+                quoted.toggle();
             } else if byte == b',' && !quoted {
                 tokens.push(value.get(start..index).unwrap_or("").trim().to_owned());
                 start = index.saturating_add(1);

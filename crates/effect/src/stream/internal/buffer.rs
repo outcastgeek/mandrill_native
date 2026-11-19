@@ -197,7 +197,7 @@ impl<A: Send + 'static> Buffered<A> {
         Effect::new(move |env, context, finish| {
             let buffer = buffer.clone();
             let reader = reader.clone();
-            Step::Suspended(Box::pin(async move {
+            Step::suspended(Box::pin(async move {
                 let work = async {
                     loop {
                         let pulled =
@@ -252,7 +252,7 @@ impl<A: Send + 'static> Buffered<A> {
         StreamReader::new(Effect::new(move |env, context, finish| {
             let buffer = buffer.clone();
             let active = Arc::clone(&active);
-            Step::Suspended(Box::pin(async move {
+            Step::suspended(Box::pin(async move {
                 let work = async {
                     // Cloned readers share one pull gate, so only one can
                     // transfer a producer's non-Clone terminal error.

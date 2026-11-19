@@ -65,7 +65,7 @@ mod search_tokens;
 mod service;
 
 pub use self::detail_query::{
-    DetailOptions, DetailService, ResourceDetailQuery, new_detail_service,
+    DetailOptions, DetailService, PreparedDetailLimits, ResourceDetailQuery, new_detail_service,
 };
 pub use self::filters::{
     FilterToggleURLOptions, ResourceFilterChipLabelFunc, ResourceFilterChipVM,
@@ -73,14 +73,14 @@ pub use self::filters::{
 };
 pub use self::list_query::{
     CanonicalRouteParams, DEFAULT_MAX_FILTER_VALUES, FilterValueOptions, ListOptions, ListService,
-    PAGE_QUERY_PARAM, ParseNamedPageFunc, QueryValues, RequestLanguageFunc, ResourceListQuery,
+    PAGE_QUERY_PARAM, ParseNamedPageFunc, PreparedListLimits, QueryValues, RequestLanguageFunc, ResourceListQuery,
     SEARCH_QUERY_PARAM, SORT_QUERY_PARAM, append_encoded_query, clone_query, filter_query_param,
     first_non_blank, new_list_service, normalize_filter_values, path_value, request_query_value,
     request_query_map, request_query_values, resource_filter_mode, resource_filter_url,
     resource_url_with_query,
 };
 pub use self::relation::{
-    RELATION_LOOKUP_CHOICES, RELATION_LOOKUP_INVERSE, RelationContractError, RelationKeyValue,
+    PreparedRelationLimits, PreparedRelationLookup, RELATION_LOOKUP_CHOICES, RELATION_LOOKUP_INVERSE, RelationContractError, RelationKeyValue,
     RelationLookupBinding, RelationLookupCause, RelationLookupEmpty, RelationLookupFailed,
     RelationLookupDecodeError, RelationLookupFound, RelationLookupFunc, RelationLookupInput, RelationLookupMode,
     RelationLookupObservation, RelationLookupOptions, RelationLookupOutcome, RelationLookupRecord,
@@ -95,6 +95,7 @@ pub use self::search_tokens::{
     DEFAULT_MAX_SEARCH_TOKENS, SearchTokenOptions, search_tokens, search_tokens_with_options,
 };
 pub use self::service::{Options, QueryService, new_query_service};
+pub(crate) use self::list_query::{append_url_component_into, check_request_bytes};
 
 /// Compile-time witness that the admission service keeps the owner's effect shape.
 ///

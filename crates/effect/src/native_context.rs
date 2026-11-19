@@ -18,12 +18,183 @@ pub struct NativeContext {
     pub(crate) context: Context,
 }
 
+/// Affine ownership of the future, output, entry and instrumentation frames
+/// for one contextual nested future. Dropping it unused returns the frames.
+#[must_use = "dropping the reservation returns its unused frames"]
+pub struct PreparedContextualFutureReservation<I, R, F, A, E>
+where
+    I: Send + 'static,
+    R: Send + Sync + 'static,
+    F: Future<Output = Exit<A, E>> + Send + 'static,
+    A: Send + 'static,
+    E: Send + 'static,
+{
+    origin: NativeContext,
+    frames: crate::internal::runtime_storage::FutureReservation<F, A, E>,
+    nested: runtime::PreparedNestedReservation<A, E>,
+    instrumentation: crate::internal::runtime_storage::InstrumentationReservation<A, E>,
+    entry: crate::memory::FrameReservation<'static, PreparedContextualEntry<I, R, F, A, E>>,
+}
+
+/// Exact physical frame layouts retained by a contextual future reservation.
+#[derive(Clone, Copy, Debug)]
+pub struct PreparedContextualFutureLayouts {
+    /// Pinned future frame.
+    pub pending: std::alloc::Layout,
+    /// Future completion transition frame.
+    pub completion: std::alloc::Layout,
+    /// Nested interpreter outcome frame.
+    pub output: std::alloc::Layout,
+    /// Nested interpreter terminal store frame.
+    pub store: std::alloc::Layout,
+    /// Typed operation entry frame.
+    pub entry: std::alloc::Layout,
+    /// Entry and restore instrumentation frame layouts.
+    pub instrumentation: crate::memory::PreparedContextualDemand,
+}
+
+struct PreparedContextualEntry<I, R, F, A: Send + 'static, E: Send + 'static>
+where
+    I: Send + 'static,
+    R: Send + Sync + 'static,
+    F: Future<Output = Exit<A, E>> + Send + 'static,
+{
+    input: I,
+    environment: Arc<R>,
+    context: Context,
+    finish: runtime::Finish<A, E>,
+    frames: crate::internal::runtime_storage::FutureReservation<F, A, E>,
+    factory: fn(I, Arc<R>, NativeContext) -> F,
+}
+
+impl<I, R, F, A, E> crate::internal::runtime_storage::Consume<(), runtime::Step>
+    for PreparedContextualEntry<I, R, F, A, E>
+where
+    I: Send + 'static,
+    R: Send + Sync + 'static,
+    F: Future<Output = Exit<A, E>> + Send + 'static,
+    A: Send + 'static,
+    E: Send + 'static,
+{
+    fn consume(self, (): ()) -> runtime::Step {
+        let Self {
+            input,
+            environment,
+            context,
+            finish,
+            frames,
+            factory,
+        } = self;
+        if !runtime::begin_operation(&context) {
+            return frames.complete(Exit::Interrupted, finish);
+        }
+        frames.start(
+            || factory(input, environment, NativeContext { context }),
+            finish,
+        )
+    }
+}
+
+impl<I, R, F, A, E> PreparedContextualFutureReservation<I, R, F, A, E>
+where
+    I: Send + 'static,
+    R: Send + Sync + 'static,
+    F: Future<Output = Exit<A, E>> + Send + 'static,
+    A: Send + 'static,
+    E: Send + 'static,
+{
+    /// Exact layouts of the reserved frames; transitive pointees and the
+    /// surrounding interpreter remain separate.
+    #[must_use]
+    pub fn layouts() -> PreparedContextualFutureLayouts {
+        let (pending, completion) =
+            crate::internal::runtime_storage::FutureReservation::<F, A, E>::layouts();
+        let (output, store) = runtime::PreparedNestedReservation::<A, E>::layouts();
+        PreparedContextualFutureLayouts {
+            pending,
+            completion,
+            output,
+            store,
+            entry: std::alloc::Layout::new::<PreparedContextualEntry<I, R, F, A, E>>(),
+            instrumentation:
+                crate::internal::runtime_storage::InstrumentationReservation::<A, E>::layouts(),
+        }
+    }
+
+    /// Consume the reservation on its original context using the existing
+    /// nested interpreter, preserving its full Exit and publication behavior.
+    pub async fn run(
+        self,
+        input: I,
+        env: Arc<R>,
+        factory: fn(I, Arc<R>, NativeContext) -> F,
+    ) -> Exit<A, E> {
+        let context = self.origin.context;
+        let entry_context = context.clone();
+        let frames = self.frames;
+        let instrumentation = self.instrumentation;
+        let entry = self.entry;
+        runtime::evaluate_context_reserved(&context, self.nested, move |finish| {
+            let (finish, tag) = instrumentation.finish(finish, entry_context.clone());
+            let step = runtime::Step::More(crate::internal::runtime_storage::Once::prepared(
+                entry,
+                PreparedContextualEntry {
+                    input,
+                    environment: env,
+                    context: entry_context.clone(),
+                    finish,
+                    frames,
+                    factory,
+                },
+            ));
+            runtime::instrument_step_reserved(step, entry_context, tag)
+        })
+        .await
+    }
+}
+
 impl NativeContext {
+    /// Claim the actual frames from this context before constructing the
+    /// future. Missing or insufficient selected storage returns its typed cause.
+    pub fn reserve_prepared_exit_future<I, R, F, A, E>(
+        &self,
+    ) -> Result<PreparedContextualFutureReservation<I, R, F, A, E>, crate::memory::MemoryError>
+    where
+        I: Send + 'static,
+        R: Send + Sync + 'static,
+        F: Future<Output = Exit<A, E>> + Send + 'static,
+        A: Send + 'static,
+        E: Send + 'static,
+    {
+        let pool = self
+            .context
+            .frames()
+            .ok_or(crate::memory::MemoryError::MissingRuntimeStorage)?;
+        let frames = crate::internal::runtime_storage::FutureReservation::reserve(pool)?;
+        let nested = runtime::PreparedNestedReservation::reserve(pool)?;
+        let instrumentation =
+            crate::internal::runtime_storage::InstrumentationReservation::reserve(pool)?;
+        let entry = pool.reserve()?;
+        Ok(PreparedContextualFutureReservation {
+            origin: self.clone(),
+            frames,
+            nested,
+            instrumentation,
+            entry,
+        })
+    }
     /// Borrow the cooperative cancellation token of this execution.
     /// Dropping a future does not acknowledge native rollback or resource release.
     #[must_use]
     pub fn cancellation(&self) -> &Cancellation {
         &self.context.cancellation
+    }
+
+    /// Reserve the checked cancellation registration before polling admitted native work.
+    pub fn try_cancelled(
+        &self,
+    ) -> Result<impl Future<Output = ()> + '_, crate::memory::MemoryError> {
+        self.context.cancellation.try_cancelled()
     }
 
     /// Borrow the current Effect trace, whose IDs are distinct from native OTel IDs.
@@ -97,6 +268,54 @@ where
     E: Send + 'static,
     R: Send + Sync + 'static,
 {
+    /// Return the actual pending and completion frame layouts for a contextual
+    /// prepared future factory, without invoking that factory. The layouts
+    /// cover these frames only, not captured pointees or interpreter storage.
+    #[must_use]
+    pub fn prepared_exit_future_with_context_layouts<F>(
+        _factory: &impl Fn(Arc<R>, NativeContext) -> F,
+    ) -> (std::alloc::Layout, std::alloc::Layout)
+    where
+        F: Future<Output = Exit<A, E>> + Send + 'static,
+    {
+        crate::internal::runtime_storage::FutureReservation::<F, A, E>::layouts()
+    }
+
+    /// Run a contextual, full-Exit future in the current run's selected work
+    /// or cleanup frames. Both frames are reserved before the factory runs;
+    /// missing or exhausted storage is mapped by `on_capacity` without fallback.
+    /// The surrounding Effect interpreter and native allocations remain separate.
+    pub fn from_prepared_exit_future_with_context<F>(
+        factory: impl Fn(Arc<R>, NativeContext) -> F + Send + Sync + 'static,
+        on_capacity: impl Fn(crate::memory::MemoryError) -> E + Send + Sync + 'static,
+    ) -> Self
+    where
+        F: Future<Output = Exit<A, E>> + Send + 'static,
+    {
+        Self::future_exit(move |env, context, finish| {
+            let failed = |finish, error| {
+                let outcome = catch_unwind(AssertUnwindSafe(|| on_capacity(error)))
+                    .map(Exit::Fail)
+                    .unwrap_or_else(|panic| Exit::Die(Defect::from_panic(panic)));
+                runtime::finish(finish, outcome)
+            };
+            let Some(pool) = context.frames() else {
+                return failed(finish, crate::memory::MemoryError::MissingRuntimeStorage);
+            };
+            let native_context = NativeContext {
+                context: context.clone(),
+            };
+            match crate::internal::runtime_storage::prepare_future(
+                pool,
+                || factory(env, native_context),
+                finish,
+            ) {
+                Ok(step) => step,
+                Err((error, finish)) => failed(finish, error),
+            }
+        })
+    }
+
     /// Run this program with an explicitly selected Effect trace context.
     ///
     /// Selection is scoped to this lazy program and its nested work; the caller's
@@ -132,7 +351,7 @@ where
         let factory = Arc::new(factory);
         Self::new(move |env, context, finish| {
             let factory = Arc::clone(&factory);
-            runtime::Step::Suspended(Box::pin(async move {
+            runtime::Step::suspended(Box::pin(async move {
                 let outcome =
                     AssertUnwindSafe(async move { factory(env, NativeContext { context }).await })
                         .catch_unwind()

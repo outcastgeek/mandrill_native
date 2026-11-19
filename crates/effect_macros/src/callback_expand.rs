@@ -114,6 +114,13 @@ pub(crate) fn body(fields: &mut Fields) -> syn::Result<TokenStream> {
 /// Native leaf lowering: `body` returns a value, Result, or one native Future.
 /// Reusable factories are the default; once forms move owned captures without cloning.
 pub(crate) fn leaf(name: &str, input: Input) -> syn::Result<TokenStream> {
+    if crate::prepared_future_expand::is_prepared_operation(&input) {
+        return crate::prepared_future_expand::operation(
+            name,
+            input,
+            &crate::expand::effect_crate_path()?,
+        );
+    }
     let mode = input.mode(
         &[
             "once",
@@ -121,6 +128,7 @@ pub(crate) fn leaf(name: &str, input: Input) -> syn::Result<TokenStream> {
             "with_context",
             "once_with_context",
             "exit_with_context",
+            "prepared",
         ],
         "reusable",
     )?;
@@ -130,6 +138,44 @@ pub(crate) fn leaf(name: &str, input: Input) -> syn::Result<TokenStream> {
     let kind = name
         .trim_start_matches("effect_")
         .trim_start_matches("try_");
+    if mode == "prepared" {
+        if kind != "future" || fallible {
+            return Err(syn::Error::new(
+                Span::call_site(),
+                "prepared mode currently selects effect_future; use explicit capacity mapping",
+            ));
+        }
+        let callback = fields.role("body", 1, BodyCategory::Native)?;
+        let mapper = fields.role("on_capacity", 1, BodyCategory::Native)?;
+        return fields.finish_inferred(
+            quote!(A, E, R, F, Pending, M),
+            &[("body", quote!(F)), ("on_capacity", quote!(M))],
+            quote!(#path::Effect<A, E, R>),
+            quote!(A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static,
+                Pending: ::core::future::Future<Output = A> + Send + 'static,
+                F: Fn(#path::Cancellation) -> Pending + Send + Sync + 'static,
+                M: Fn(#path::memory::MemoryError) -> E + Send + Sync + 'static),
+            quote!(#path::Effect::from_prepared_future(#callback, #mapper)),
+        );
+    }
+    if mode == "exit_with_context"
+        && kind == "future"
+        && !fallible
+        && fields.contains("on_capacity")
+    {
+        let callback = fields.role("body", 2, BodyCategory::Native)?;
+        let capacity = fields.role("on_capacity", 1, BodyCategory::Native)?;
+        return fields.finish_inferred(
+            quote!(A, E, R, F, Pending, M),
+            &[("body", quote!(F)), ("on_capacity", quote!(M))],
+            quote!(#path::Effect<A, E, R>),
+            quote!(A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static,
+                Pending: ::core::future::Future<Output = #path::Exit<A, E>> + Send + 'static,
+                F: Fn(::std::sync::Arc<R>, #path::NativeContext) -> Pending + Send + Sync + 'static,
+                M: Fn(#path::memory::MemoryError) -> E + Send + Sync + 'static),
+            quote!(#path::Effect::from_prepared_exit_future_with_context(#callback, #capacity)),
+        );
+    }
     let base = if kind == "future" {
         "from_future"
     } else {

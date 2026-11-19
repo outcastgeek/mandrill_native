@@ -2,7 +2,6 @@
 
 use super::runtime::{self, Context, Step};
 use super::workflow::Workflow;
-use crate::scope::Registered;
 use crate::{Defect, Effect, Exit, LibraryDefect, ResourceBinding, ResourceValue, Scope};
 use futures_util::FutureExt;
 use std::future::{Future, poll_fn};
@@ -212,21 +211,26 @@ impl<E: Send + 'static, R: Send + Sync + 'static> MacroContext<E, R> {
 /// - `R`: Bounds: `Send + Sync + 'static`.
 ///
 /// # Parameters
-/// - `releases` (`Vec<Registered<E>>`): The releases supplied to this operation.
+/// - `releases` (`FinalizerBatch<E>`): Owned ordinary or physically reserved cleanup batch.
 /// - `cleanup` (`Exit<(), E>`): The cleanup supplied to this operation.
 ///
 /// # Returns
 /// Type: `Workflow<(), E, R>`.
 /// Returns `Workflow<(), E, R>`.
-fn release_work<E: Send + 'static, R: Send + Sync + 'static>(
-    mut releases: Vec<Registered<E>>,
+pub(crate) fn release_work<E: Send + 'static, R: Send + Sync + 'static>(
+    mut releases: crate::scope::FinalizerBatch<E>,
     cleanup: Exit<(), E>,
 ) -> Workflow<(), E, R> {
     Workflow::new(move |env, context, finish| match releases.pop() {
-        Some(release) => release.execute(runtime::continuation(move |result| {
-            release_work(releases, super::outcome::append_cleanup(cleanup, result))
-                .execute(env, context, finish)
-        })),
+        Some(release) => release.execute_with(move |frame| {
+            runtime::continuation_retained(
+                move |result| {
+                    release_work(releases, super::outcome::append_cleanup(cleanup, result))
+                        .execute(env, context, finish)
+                },
+                frame,
+            )
+        }),
         None => runtime::finish(finish, cleanup),
     })
 }
@@ -296,7 +300,7 @@ where
             scope: scope.clone(),
         };
         let body = Workflow::new(move |_, _, finish| {
-            Step::Composed(Box::pin(async move {
+            Step::composed(Box::pin(async move {
                 let result = AssertUnwindSafe(async { factory(macro_context).await })
                     .catch_unwind()
                     .await

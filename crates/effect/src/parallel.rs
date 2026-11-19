@@ -1,5 +1,8 @@
 //! Bounded parallel traversal and race coordination.
 
+mod prepared;
+pub use prepared::PreparedUnitCohorts;
+
 use crate::effect_scope;
 use crate::fiber::JoinedOrigin;
 use crate::internal::notification::notify_all;
@@ -165,7 +168,7 @@ where
                                     child,
                                     runtime::continuation(move |right: Exit<Fiber<A, E>, E>| {
                                         match right.into_failure() {
-                                            Ok(right) => Step::Suspended(Box::pin(async move {
+                                            Ok(right) => Step::suspended(Box::pin(async move {
                                                 runtime::finish(
                                                     finish,
                                                     settle_race(left, right, selection, context)
@@ -763,7 +766,7 @@ where
                 cancellation: context.cancellation.child(),
                 state: Mutex::new(Collection {
                     reservations: std::iter::repeat_n((), count).enumerate(),
-                    values: std::iter::repeat_with(|| None).take(count).collect(),
+                    values: Vec::from_fn(count, |_| None),
                     terminal: None,
                     cleanup: Vec::new(),
                 }),
@@ -805,7 +808,7 @@ where
 {
     Effect::new(move |env, context, finish| {
         let batch = Arc::clone(&batch);
-        Step::Suspended(Box::pin(async move {
+        Step::suspended(Box::pin(async move {
             while let Some(index) = batch.reserve() {
                 let outcome = match catch_unwind(AssertUnwindSafe(|| batch.source.job(index))) {
                     Ok(Some(program)) => {
@@ -875,7 +878,7 @@ where
                 }),
             )
         }
-        None => Step::Suspended(Box::pin(async move {
+        None => Step::suspended(Box::pin(async move {
             let mut joined = FuturesUnordered::new();
             for fiber in fibers {
                 joined.push(async move { fiber.take_owned().await });

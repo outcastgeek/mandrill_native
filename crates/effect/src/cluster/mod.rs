@@ -8,6 +8,7 @@
 //! independent workflow engine, without becoming a second workflow journal.
 
 mod activation;
+mod activation_table;
 mod client;
 mod cluster_workflow_engine;
 mod entity;
@@ -15,6 +16,8 @@ mod entity_proxy;
 mod entity_resource;
 mod memory_store;
 mod message_store;
+mod prepared_client;
+mod prepared_runner;
 mod runner;
 mod schedule;
 mod singleton;
@@ -24,6 +27,7 @@ pub use activation::{
     ActivationLease, ActivationOutcome, ActivationPhase, ActivationStatus, ClusterActivationStore,
     HasClusterActivationStore, PassivationOutcome,
 };
+pub use activation_table::PreparedClusterActivationCapacity;
 pub use client::{ClusterClient, ClusterClientError, ClusterPoll};
 pub use cluster_workflow_engine::{ClusterWorkflowEngine, ClusterWorkflowError};
 pub use entity::{
@@ -32,7 +36,12 @@ pub use entity::{
 };
 pub use entity_proxy::EntityProxy;
 pub use entity_resource::{EntityResource, EntityResourceError};
-pub use memory_store::MemoryClusterMessageStore;
+pub use memory_store::{
+    MemoryClusterMessageStore, PreparedAcceptedRequest, PreparedClusterChunk, PreparedClusterClaim,
+    PreparedClusterClaims, PreparedClusterMessageState, PreparedClusterObservation,
+    PreparedClusterPayloadReservation, PreparedClusterReply, PreparedClusterSnapshot,
+    PreparedClusterSnapshots, PreparedClusterStoreCapacity, PreparedClusterStoreError,
+};
 pub use message_store::{
     AcceptancePolicy, AcceptedRequest, ClaimOptions, ClaimToken, ClusterMessageStore,
     ClusterStoreError, ClusterStoreOperation, CompletedReply, DurableClusterMessageStore,
@@ -40,6 +49,13 @@ pub use message_store::{
     MessageScan, MessageStoreCapacity, ObserverCursor, PayloadConflictPolicy, ReplyKind,
     SavedChunk, SavedMessage, SavedMessageState, SavedReply, StoreCompletion, StoreMutation,
     StoreObservation,
+};
+pub use prepared_client::{
+    PreparedClusterClient, PreparedClusterClientError, PreparedClusterSubmission,
+};
+pub use prepared_runner::{
+    PreparedClusterClaimToken, PreparedClusterDelivery, PreparedClusterExecutor,
+    PreparedClusterRunRequest, PreparedClusterRunnerError, PreparedClusterRunnerMemory,
 };
 pub use runner::{ClusterRunOutcome, ClusterRunner, ClusterRunnerError};
 pub use schedule::{

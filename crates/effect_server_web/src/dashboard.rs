@@ -8,8 +8,11 @@ use crate::{
     admission::SessionAdmission,
     diagnostics::{DiagnosticsError, RuntimeSampler, RuntimeSnapshot},
 };
-use crate::{effect_map_error, effect_try_sync};
-use effect::{Effect, Exit, effect, service};
+use crate::{effect_future, effect_map_error, effect_sync, effect_try_sync, effect_using};
+use effect::memory::{
+    Buffer, BufferLease, BufferView, Bytes, MemoryError, PreparedMemory, RegionId, SlotPool,
+};
+use effect::{Effect, Exit, PreparedAdmissionError, PreparedProviderAdmission, effect, service};
 use effect_server::{
     HasRequest, HtmlContent, HttpMethodSet, Reply, Request, Router, ServerError, SsePolicy,
     SseRecord,
@@ -69,7 +72,7 @@ pub struct DashboardPresentation<E: Send + 'static, R: Send + Sync + 'static> {
     /// Finite compatibility view selected by application policy.
     pub compatibility: Arc<dyn Fn(DashboardPage) -> Effect<HtmlContent, E, R> + Send + Sync>,
     /// Finite application Effect rendering a capacity rejection before commitment.
-    /// Web supplies the named HTTP 429/no-store protocol metadata.
+    /// Web supplies HTTP 503 Service Unavailable and `Cache-Control: no-store`.
     pub capacity: Arc<dyn Fn(effect::AdmissionError) -> Effect<HtmlContent, E, R> + Send + Sync>,
 }
 impl<E: Send + 'static, R: Send + Sync + 'static> Clone for DashboardPresentation<E, R> {
@@ -101,6 +104,56 @@ pub struct DashboardPolicy {
     /// Positive maximum concurrent live operator sessions.
     pub sessions: NonZeroUsize,
 }
+
+/// Dedicated finite HTML, SSE output and live session owners for protected operational routes.
+pub struct PreparedDashboardOutput {
+    pages: SlotPool<'static, Buffer<'static>>,
+    frames: SlotPool<'static, Buffer<'static>>,
+    sessions: Arc<PreparedProviderAdmission>,
+    capacity: NonZeroUsize,
+}
+impl PreparedDashboardOutput {
+    /// Region bytes for both buffers and live session admission, excluding allocator overhead.
+    pub fn storage_bytes(
+        pages: usize,
+        html_bytes: Bytes,
+        frames: usize,
+        frame_bytes: Bytes,
+    ) -> Result<Bytes, MemoryError> {
+        SlotPool::<Buffer<'static>>::storage_bytes(pages)?
+            .checked_add(html_bytes.checked_mul(pages)?)?
+            .checked_add(SlotPool::<Buffer<'static>>::storage_bytes(frames)?)?
+            .checked_add(frame_bytes.checked_mul(frames)?)?
+            .checked_add(PreparedProviderAdmission::storage_bytes(0)?)
+    }
+
+    /// Provision finite views, live frames and the selected session limit.
+    pub fn prepare(
+        memory: &PreparedMemory<'static>,
+        region: RegionId,
+        pages: usize,
+        html_bytes: Bytes,
+        frames: usize,
+        frame_bytes: Bytes,
+        sessions: NonZeroUsize,
+    ) -> Result<Self, MemoryError> {
+        Self::storage_bytes(pages, html_bytes, frames, frame_bytes)?;
+        Ok(Self {
+            pages: memory.buffers(region, pages, html_bytes)?,
+            frames: memory.buffers(region, frames, frame_bytes)?,
+            sessions: Arc::new(PreparedProviderAdmission::prepare(
+                memory, region, sessions, 0,
+            )?),
+            capacity: sessions,
+        })
+    }
+}
+
+#[derive(Clone)]
+enum DashboardSessions {
+    Ordinary(SessionAdmission),
+    Prepared(Arc<PreparedProviderAdmission>),
+}
 /// Prepared protected route set, distinct from public availability aliases.
 #[must_use]
 pub struct ProtectedDashboard<E: Send + 'static, R: Send + Sync + 'static> {
@@ -126,9 +179,56 @@ impl<E: Send + 'static, R: HasRequest + Send + Sync + 'static> ProtectedDashboar
         inject: impl Fn(DiagnosticsError<S>) -> E + Send + Sync + 'static,
         native_error: impl Fn(ServerError) -> E + Send + Sync + 'static,
     ) -> Result<Self, ServerError> {
+        Self::build(
+            policy,
+            access,
+            presentation,
+            sampler,
+            inject,
+            native_error,
+            None,
+        )
+    }
+
+    /// Build the protected routes with independent finite view and frame backing.
+    pub fn new_prepared<S: Send + 'static>(
+        policy: DashboardPolicy,
+        access: OperatorAccess<E, R>,
+        presentation: DashboardPresentation<E, R>,
+        sampler: RuntimeSampler<S>,
+        inject: impl Fn(DiagnosticsError<S>) -> E + Send + Sync + 'static,
+        native_error: impl Fn(ServerError) -> E + Send + Sync + 'static,
+        output: Arc<PreparedDashboardOutput>,
+    ) -> Result<Self, ServerError> {
+        Self::build(
+            policy,
+            access,
+            presentation,
+            sampler,
+            inject,
+            native_error,
+            Some(output),
+        )
+    }
+
+    fn build<S: Send + 'static>(
+        policy: DashboardPolicy,
+        access: OperatorAccess<E, R>,
+        presentation: DashboardPresentation<E, R>,
+        sampler: RuntimeSampler<S>,
+        inject: impl Fn(DiagnosticsError<S>) -> E + Send + Sync + 'static,
+        native_error: impl Fn(ServerError) -> E + Send + Sync + 'static,
+        output: Option<Arc<PreparedDashboardOutput>>,
+    ) -> Result<Self, ServerError> {
+        let admission = match &output {
+            Some(storage) if storage.capacity != policy.sessions => {
+                return Err(ServerError::Invalid("dashboard session capacity".into()));
+            }
+            Some(storage) => DashboardSessions::Prepared(storage.sessions.clone()),
+            None => DashboardSessions::Ordinary(SessionAdmission::new(policy.sessions)),
+        };
         let inject = Arc::new(inject);
         let native_error: Arc<dyn Fn(ServerError) -> E + Send + Sync> = Arc::new(native_error);
-        let admission = SessionAdmission::new(policy.sessions);
         let mut routes = router! {}?;
         let methods = HttpMethodSet::new(vec![http::Method::GET])?;
         for (path, render) in [
@@ -145,6 +245,7 @@ impl<E: Send + 'static, R: HasRequest + Send + Sync + 'static> ProtectedDashboar
             let path_for_view = path.clone();
             let bound = policy.html_bytes;
             let page_error = native_error.clone();
+            let page_output = output.clone();
             let reply = effect! {
                 let access = access.clone();
                 let sampler = sampler.clone();
@@ -152,6 +253,14 @@ impl<E: Send + 'static, R: HasRequest + Send + Sync + 'static> ProtectedDashboar
                 let render = render.clone();
                 let path = path_for_view.clone();
                 let page_error = page_error.clone();
+                let page_output = page_output.clone();
+                let reserve_error = page_error.clone();
+                let reserved = effect_try_sync! {
+                    body: move || page_output.as_ref()
+                        .map(|storage| storage.pages.try_checkout())
+                        .transpose(),
+                    on_error: move |error| reserve_error(ServerError::Memory(error)),
+                }?;
                 let request = service! { env |env: &R| { env.request().clone() }, }?;
                 (access.authorize)(request)?;
                 let status = effect_map_error! { program: sampler.status(), map: move |error| inject(error), }?;
@@ -161,7 +270,7 @@ impl<E: Send + 'static, R: HasRequest + Send + Sync + 'static> ProtectedDashboar
                     path,
                     interval: sampler.interval,
                 })?;
-                effect_try_sync! { once; body: { let __dsl_result = finite_html(html, bound, &page_error); move || __dsl_result }, on_error: ::core::convert::identity, }?
+                effect_try_sync! { once; body: { let __dsl_result = finite_html(html, bound, &page_error, reserved); move || __dsl_result }, on_error: ::core::convert::identity, }?
             };
             routes = router! {
                 source: routes,
@@ -176,6 +285,7 @@ impl<E: Send + 'static, R: HasRequest + Send + Sync + 'static> ProtectedDashboar
         let live_inject = inject.clone();
         let live_errors = native_error.clone();
         let live_presentation = presentation.clone();
+        let live_output = output;
         let live = endpoint! {
             body: move |context| {
             let policy = live_policy.clone();
@@ -185,6 +295,7 @@ impl<E: Send + 'static, R: HasRequest + Send + Sync + 'static> ProtectedDashboar
             let errors = live_errors.clone();
             let admission = admission.clone();
             let access = live_access.clone();
+            let output = live_output.clone();
             async move {
                 let request = context
                     .bind(service! { env: |env: &R| env.request().clone(), })
@@ -195,16 +306,33 @@ impl<E: Send + 'static, R: HasRequest + Send + Sync + 'static> ProtectedDashboar
                     move |error| errors(error)
                 });
                 context.bind(effect_try_sync! { once; body: { let __dsl_result = cursor; move || __dsl_result }, on_error: ::core::convert::identity, }).await?;
-                let reservation = context.bind(admission.reservation()).await?;
-                let admitted = reservation
-                    .with(|result| result.as_ref().map(|_| ()).map_err(|error| *error))
-                    .map_err(Exit::Die)?;
+                let admitted = match admission {
+                    DashboardSessions::Ordinary(admission) => {
+                        let reservation = context.bind(admission.reservation()).await?;
+                        reservation.with(|result| result.as_ref().map(|_| ()).map_err(|error| *error))
+                            .map_err(Exit::Die)?
+                    }
+                    DashboardSessions::Prepared(admission) => {
+                        let reservation = context.bind(effect_using! {
+                            binding;
+                            acquire: effect_sync! { body: move || admission.admit() },
+                        }).await?;
+                        reservation.with(|result| match result {
+                            Ok(_) => Ok(Ok(())),
+                            Err(PreparedAdmissionError::Admission(denial)) => Ok(Err(*denial)),
+                            Err(PreparedAdmissionError::Memory(error)) => Err(*error),
+                        }).map_err(Exit::Die)?
+                            .map_err(|error| Exit::Fail(errors(ServerError::Memory(error))))?
+                    }
+                };
                 if let Err(denial) = admitted {
+                    let reserved = output.as_ref().map(|storage| storage.pages.try_checkout()).transpose()
+                        .map_err(|error| Exit::Fail(errors(ServerError::Memory(error))))?;
                     let html = context.bind((presentation.capacity)(denial)).await?;
                     let reply =
-                        finite_html(html, policy.html_bytes, &errors).map_err(Exit::Fail)?;
+                        finite_html(html, policy.html_bytes, &errors, reserved).map_err(Exit::Fail)?;
                     let status =
-                        effect_server::BodyStatus::new(http::StatusCode::TOO_MANY_REQUESTS)
+                        effect_server::BodyStatus::new(http::StatusCode::SERVICE_UNAVAILABLE)
                             .map_err(|error| Exit::Fail(errors(error)))?;
                     return Ok(reply! { status(status); source(reply); });
                 }
@@ -219,42 +347,70 @@ impl<E: Send + 'static, R: HasRequest + Send + Sync + 'static> ProtectedDashboar
                 let program = stream! {
                     source: source,
                     write: move |status, writer| {
-                    let errors = native_error.clone();
-                    let policy = view_policy.clone();
-                    let writer = writer.clone();
-                    let rendered = fragment(DashboardPage {
-                        snapshot: status.sample.clone(),
-                        degraded: status.failure.is_some(),
-                        path: policy.page.clone(),
-                        interval,
-                    });
-                    effect! {
-                        let errors = errors.clone();
-                        let policy = policy.clone();
-                        let writer = writer.clone();
-                        let html = rendered.clone()?;
-                        let finite = effect_try_sync! {
-                            once; body: {
-                            let reply: Reply<E, R> = reply! { html(html) };
-                            let __dsl_result = reply.into_finite(policy.html_bytes)
-                                .map_err(|error| errors(error)); move || __dsl_result }, on_error: ::core::convert::identity, }?;
-                        // Datastar repeats its elements prefix within native bounded SSE framing.
-                        let data = std::str::from_utf8(&finite.bytes).map(|html| {
-                            html.lines()
-                                .map(|line| format!("elements {line}"))
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        }).map_err(|_| errors(ServerError::Invalid("diagnostic HTML UTF-8".into())));
-                        drop(finite);
-                        let data = effect_try_sync! { once; body: { let __dsl_result = data; move || __dsl_result }, on_error: ::core::convert::identity, }?;
-                        writer.sse(SseRecord {
-                            event: Some("datastar-patch-elements".into()),
-                            id: None,
-                            retry: None,
-                            data,
-                        }, policy.sse)?;
-                    }
+                        let errors = native_error.clone();
+                        let policy = view_policy.clone();
+                        let fragment = fragment.clone();
+                        let output = output.clone();
+                        effect_future! {
+                            exit_with_context; body: move |env: Arc<R>, context| {
+                                let errors = errors.clone();
+                                let policy = policy.clone();
+                                let fragment = fragment.clone();
+                                let output = output.clone();
+                                let writer = writer.clone();
+                                let status = status.clone();
+                                async move {
+                                    let reserved = match output.as_ref().map(|slots| slots.frames.try_checkout()).transpose() {
+                                        Ok(reserved) => reserved,
+                                        Err(error) => return Exit::Fail(errors(ServerError::Memory(error))),
+                                    };
+                                    let html = match crate::split_exit(context.run(fragment(DashboardPage {
+                                        snapshot: status.sample.clone(),
+                                        degraded: status.failure.is_some(),
+                                        path: policy.page.clone(),
+                                        interval,
+                                    }), env.clone()).await) {
+                                        Ok(html) => html,
+                                        Err(failure) => return failure,
+                                    };
+                                    let reply: Reply<E,R> = reply! { html(html) };
+                                    let finite = match reply.into_finite(policy.html_bytes) {
+                                        Ok(finite) => finite,
+                                        Err(error) => return Exit::Fail(errors(error)),
+                                    };
+                                    let html = match std::str::from_utf8(&finite.bytes) {
+                                        Ok(html) => html,
+                                        Err(_) => return Exit::Fail(errors(ServerError::Invalid("diagnostic HTML UTF-8".into()))),
+                                    };
+                                    if let Some(buffer) = reserved {
+                                        let view = match prepared_fragment(buffer, html, policy.sse) {
+                                            Ok(view) => view,
+                                            Err(error) => return Exit::Fail(errors(error)),
+                                        };
+                                        drop(finite);
+                                        context.run(writer.write_lease(view), env).await
+                                    } else {
+                                        let mut data = String::new();
+                                        for (index, line) in html.lines().enumerate() {
+                                            if index != 0 {
+                                                data.push('\n');
+                                            }
+                                            data.push_str("elements ");
+                                            data.push_str(line);
+                                        }
+                                        drop(finite);
+                                        context.run(writer.sse(SseRecord {
+                                            event: Some("datastar-patch-elements".into()),
+                                            id: None,
+                                            retry: None,
+                                            data,
+                                        }, policy.sse), env).await
+                                    }
+                                }
+                            },
+                        }
                     },
+
                 };
                 Ok(reply! {
                     header(
@@ -290,9 +446,19 @@ fn finite_html<E: Send + 'static, R: Send + Sync + 'static>(
     html: HtmlContent,
     bound: NonZeroUsize,
     errors: &Arc<dyn Fn(ServerError) -> E + Send + Sync>,
+    reserved: Option<BufferLease<'static>>,
 ) -> Result<Reply<E, R>, E> {
     let reply: Reply<E, R> = reply! { html(html) };
     let finite = reply.into_finite(bound).map_err(|error| errors(error))?;
+    let reply = if let Some(mut output) = reserved {
+        output.clear();
+        output
+            .extend_from_slice(&finite.bytes)
+            .map_err(|error| errors(ServerError::Memory(error)))?;
+        reply! { lease(BufferView::new(output.share()), http::HeaderValue::from_static("text/html; charset=utf-8")) }
+    } else {
+        reply! { finite(finite) }
+    };
     Ok(reply! {
         header(
             http::header::CACHE_CONTROL,
@@ -302,6 +468,41 @@ fn finite_html<E: Send + 'static, R: Send + Sync + 'static>(
             http::header::VARY,
             http::HeaderValue::from_static("Authorization, Cookie"),
         );
-        finite(finite);
+        source(reply);
     })
+}
+
+fn prepared_fragment(
+    mut buffer: BufferLease<'static>,
+    html: &str,
+    policy: SsePolicy,
+) -> Result<BufferView<'static>, ServerError> {
+    buffer.clear();
+    let mut push = |bytes: &[u8]| {
+        let end = buffer
+            .len()
+            .checked_add(bytes.len())
+            .ok_or(ServerError::Memory(MemoryError::ArithmeticOverflow))?;
+        if end > policy.frame_bytes.get() {
+            return Err(ServerError::Limit("SSE frame".into()));
+        }
+        buffer.extend_from_slice(bytes).map_err(ServerError::Memory)
+    };
+    push(b"event: datastar-patch-elements\n")?;
+    if html.is_empty() {
+        push(b"data: \n")?;
+    } else {
+        for html_line in html.lines() {
+            for (index, line) in html_line.split('\r').enumerate() {
+                push(b"data: ")?;
+                if index == 0 {
+                    push(b"elements ")?;
+                }
+                push(line.as_bytes())?;
+                push(b"\n")?;
+            }
+        }
+    }
+    push(b"\n")?;
+    Ok(BufferView::new(buffer.share()))
 }

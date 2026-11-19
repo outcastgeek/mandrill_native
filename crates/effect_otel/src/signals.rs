@@ -1,12 +1,17 @@
 //! Native span mapping, poll contexts and lazy typed telemetry operations.
 
+mod prepared;
+use prepared::PreparedSignals;
+pub use prepared::{PreparedAttributeWriter, PreparedOtelRedaction, PreparedOtelSignalCapacity};
+
 use crate::{BorrowedProviders, OtelContext, OtelMetricRecorder};
+use effect::memory::{MemoryError, PreparedMemory, RegionId};
 use effect::{
     Annotations, Defect, Diagnostics, Effect, HasClock, HasTracer, LogLevel, Logger,
-    PollInstrumentation, PollScope, SpanId, SpanOutcome, TraceContext, Tracer, effect,
-    effect_try_sync, service,
+    PollInstrumentation, PollScope, PreparedDiagnostics, PreparedPollHook, PreparedTraceContext,
+    SpanFinish, SpanId, SpanOutcome, TraceContext, Tracer, effect, effect_try_sync, service,
 };
-use effect_tracing::TracingBackend;
+use effect_tracing::{NativePollScope, TracingBackend};
 use opentelemetry::baggage::BaggageExt;
 use opentelemetry::trace::TraceContextExt;
 use opentelemetry::{KeyValue, Value};
@@ -149,6 +154,8 @@ pub struct OtelBackend {
     metrics: OtelMetricRecorder,
     /// Telemetry failures never replace the business exit for concise operations.
     diagnostics: Diagnostics,
+    prepared: Option<Arc<PreparedSignals>>,
+    prepared_diagnostics: Option<PreparedDiagnostics>,
 }
 
 impl OtelBackend {
@@ -172,7 +179,34 @@ impl OtelBackend {
             redaction,
             metrics,
             diagnostics,
+            prepared: None,
+            prepared_diagnostics: None,
         }
+    }
+
+    /// Select physical signal and span records before this backend is installed.
+    /// Provider processors, exporters and their retained native state remain
+    /// independently selected. Existing emitter APIs use these records.
+    pub fn with_prepared_signals(
+        mut self,
+        memory: &PreparedMemory<'static>,
+        region: RegionId,
+        capacity: PreparedOtelSignalCapacity,
+        redact: PreparedOtelRedaction,
+        diagnostics: PreparedDiagnostics,
+    ) -> Result<Self, MemoryError> {
+        let signals = PreparedSignals::prepare(memory, region, capacity, redact)?;
+        self.tracing = TracingBackend::prepare(
+            self.tracing.dispatch().clone(),
+            memory,
+            region,
+            capacity.tracing,
+            self.diagnostics.clone(),
+        )?
+        .with_prepared_diagnostics(diagnostics.clone());
+        self.prepared = Some(Arc::new(signals));
+        self.prepared_diagnostics = Some(diagnostics);
+        Ok(self)
     }
 
     /// Compose official trace and log layers with explicit event routing.
@@ -213,45 +247,65 @@ impl OtelBackend {
     /// Native SDK timestamps are used; core monotonic durations are never epoch times.
     #[must_use]
     pub fn tracer(&self) -> Tracer {
-        let redaction = self.redaction.clone();
         let start = self.clone();
-        let finish = self.clone();
-        self.tracing.tracer_with_hooks(
+        if let Some(records) = &self.prepared {
+            let annotations = records.redact.annotations.clone();
+            let records = records.clone();
+            let prepare = self.clone();
+            return self.tracing.tracer_with_prepared_retained_hooks(
+                move |source, output| annotations(source, output),
+                move |_| {
+                    let permit = prepare
+                        .providers
+                        .admit()
+                        .map_err(NativeError::into_defect)?;
+                    let options = pending_options();
+                    let (attributes, links) = option_attributes(options.as_deref());
+                    let record = records
+                        .stage("", attributes, links)
+                        .map_err(NativeError::into_defect)?;
+                    Ok((permit, (options, record)))
+                },
+                move |span, info, (options, record)| {
+                    if span.is_disabled() {
+                        return Ok(());
+                    }
+                    start.attach_span(span, info.name, info.parent, options.as_deref())?;
+                    for (key, value) in info.annotations() {
+                        span.set_attribute(key.to_owned(), value.to_owned());
+                    }
+                    let (_, mut groups) = record.parts().map_err(NativeError::into_defect)?;
+                    groups
+                        .next()
+                        .and_then(|attributes| {
+                            attributes.for_each(|value| span.set_attribute(value.key, value.value))
+                        })
+                        .map_err(NativeError::into_defect)?;
+                    if let Some(options) = options {
+                        for link in &options.links {
+                            let attributes = groups
+                                .next()
+                                .and_then(prepared::Attributes::native)
+                                .map_err(NativeError::into_defect)?;
+                            span.add_link_with_attributes(link.span_context.clone(), attributes);
+                        }
+                    }
+                    Ok(())
+                },
+                finish_span,
+            );
+        }
+        let redaction = self.redaction.clone();
+        let admit = self.providers.clone();
+        self.tracing.tracer_with_retained_hooks(
             move |a| (redaction.annotations)(a),
+            move || admit.admit().map_err(NativeError::into_defect),
             move |span, info| {
                 if span.is_disabled() {
                     return Ok(());
                 }
-                let _permit = start.providers.admit().map_err(NativeError::into_defect)?;
-                let current = opentelemetry::Context::current();
-                let options = current
-                    .get::<PendingOptions>()
-                    .map(|o| Arc::clone(&o.options));
-                let inherited = if current.get::<BridgeAttachment>().is_some() {
-                    OtelContext::from_native(&current)
-                } else {
-                    let trace = TraceContext {
-                        annotations: info.annotations.clone(),
-                        span: info.parent.clone(),
-                    };
-                    OtelContext::from_native(&start.native_context(&trace))
-                };
-                // Strip pending bridge metadata before SDK inheritance so nested
-                // ordinary spans cannot inherit another span's kind/attributes/links.
-                let parent = options
-                    .as_ref()
-                    .and_then(|o| o.parent.as_ref())
-                    .unwrap_or(&inherited)
-                    .native()
-                    .clone();
-                span.set_parent(parent)
-                    .map_err(|error| Defect::new(error.to_string()))?;
-                span.record("otel.name", info.name.as_ref());
-                let kind = options
-                    .as_ref()
-                    .map_or(opentelemetry::trace::SpanKind::Internal, |o| o.kind.clone());
-                span.record("otel.kind", kind_name(&kind));
-                // Core annotations have already passed the core redactor.
+                let options = pending_options();
+                start.attach_span(span, &info.name, info.parent.as_ref(), options.as_deref())?;
                 for (key, value) in info.annotations.iter() {
                     span.set_attribute(key.to_string(), value.to_string());
                 }
@@ -268,22 +322,37 @@ impl OtelBackend {
                 }
                 Ok(())
             },
-            move |span, info| {
-                // Outcome classification contains no typed business error/defect payload.
-                span.set_attribute("effect.outcome", outcome_name(info.outcome));
-                span.set_attribute("effect.cleanup_failed", info.cleanup_failed);
-                if info.cleanup_failed || !matches!(info.outcome, SpanOutcome::Succeeded) {
-                    span.set_status(opentelemetry::trace::Status::error(outcome_name(
-                        info.outcome,
-                    )));
-                }
-                // A user-set status is preserved on successful completion.
-                finish
-                    .providers
-                    .ensure_open()
-                    .map_err(NativeError::into_defect)
-            },
+            finish_span,
         )
+    }
+
+    fn attach_span(
+        &self,
+        span: &tracing::Span,
+        name: &str,
+        parent: Option<&SpanId>,
+        options: Option<&SpanOptions>,
+    ) -> Result<(), Defect> {
+        let current = opentelemetry::Context::current();
+        let inherited = if current.get::<BridgeAttachment>().is_some() {
+            OtelContext::from_native(&current)
+        } else {
+            OtelContext::from_native(&self.native_context_for(parent.map(SpanId::as_str)))
+        };
+        // Pending options are cleared by the existing detached-context projection.
+        let parent = options
+            .and_then(|options| options.parent.as_ref())
+            .unwrap_or(&inherited)
+            .native()
+            .clone();
+        span.set_parent(parent)
+            .map_err(|error| Defect::new(error.to_string()))?;
+        span.record("otel.name", name);
+        let kind = options.map_or(opentelemetry::trace::SpanKind::Internal, |options| {
+            options.kind.clone()
+        });
+        span.record("otel.kind", kind_name(&kind));
+        Ok(())
     }
 
     /// Build a redacting core logger whose events route to the official log bridge.
@@ -365,10 +434,15 @@ impl OtelBackend {
 
     /// Preserve current local identity when live, otherwise retain the explicit base.
     fn native_context(&self, trace: &TraceContext) -> opentelemetry::Context {
-        let native = trace
-            .span
-            .as_ref()
-            .and_then(|id| self.tracing.with_native(id, OpenTelemetrySpanExt::context))
+        self.native_context_for(trace.span.as_ref().map(SpanId::as_str))
+    }
+
+    fn native_context_for(&self, id: Option<&str>) -> opentelemetry::Context {
+        let native = id
+            .and_then(|id| {
+                self.tracing
+                    .with_native_text(id, OpenTelemetrySpanExt::context)
+            })
             .unwrap_or_else(|| self.context.native().clone());
         let inherited = native.baggage().iter().map(|(key, (value, metadata))| {
             opentelemetry::baggage::KeyValueMetadata::new(
@@ -399,13 +473,22 @@ impl OtelBackend {
         let selected = self.native_context(trace);
         let same = current.span().span_context() == selected.span().span_context();
         if current.get::<BridgeAttachment>().is_some() && (trace.span.is_none() || same) {
-            let tracing = self.tracing.enter(trace);
+            let tracing = PollInstrumentation::enter(&self.tracing, trace);
             Box::new(OtelPollScope {
                 _context: current.attach(),
                 _tracing: tracing,
             })
         } else {
-            self.enter(trace)
+            PollInstrumentation::enter(self, trace)
+        }
+    }
+
+    fn record_failure(&self, defect: Defect) {
+        match &self.prepared_diagnostics {
+            Some(diagnostics) => {
+                let _ = diagnostics.record_defect(&defect);
+            }
+            None => self.diagnostics.record(defect),
         }
     }
 
@@ -413,10 +496,35 @@ impl OtelBackend {
     fn diagnose(&self, action: impl FnOnce() -> Result<(), NativeError>) {
         match catch_unwind(AssertUnwindSafe(action)) {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => self.diagnostics.record(error.into_defect()),
-            Err(panic) => self.diagnostics.record(Defect::from_panic(panic)),
+            Ok(Err(error)) => self.record_failure(error.into_defect()),
+            Err(panic) => self.record_failure(Defect::from_panic(panic)),
         }
     }
+}
+
+fn finish_span(span: &tracing::Span, info: &SpanFinish) -> Result<(), Defect> {
+    // Outcome classification contains no typed business error/defect payload.
+    span.set_attribute("effect.outcome", outcome_name(info.outcome));
+    span.set_attribute("effect.cleanup_failed", info.cleanup_failed);
+    if info.cleanup_failed || !matches!(info.outcome, SpanOutcome::Succeeded) {
+        span.set_status(opentelemetry::trace::Status::error(outcome_name(
+            info.outcome,
+        )));
+    }
+    // Admitted spans finish while close waits on their retained permit.
+    Ok(())
+}
+
+fn pending_options() -> Option<Arc<SpanOptions>> {
+    opentelemetry::Context::current()
+        .get::<PendingOptions>()
+        .map(|options| options.options.clone())
+}
+
+fn option_attributes(
+    options: Option<&SpanOptions>,
+) -> (&[KeyValue], &[opentelemetry::trace::Link]) {
+    options.map_or((&[], &[]), |options| (&options.attributes, &options.links))
 }
 
 /// Guards restore OTel first, then native span/dispatch before a poll returns.
@@ -435,7 +543,7 @@ impl PollInstrumentation for OtelBackend {
     fn enter(&self, trace: &TraceContext) -> Box<dyn PollScope> {
         let result = catch_unwind(AssertUnwindSafe(|| {
             let native = self.native_context(trace).with_value(BridgeAttachment);
-            let tracing = self.tracing.enter(trace);
+            let tracing = PollInstrumentation::enter(&self.tracing, trace);
             Box::new(OtelPollScope {
                 _context: native.attach(),
                 _tracing: tracing,
@@ -446,6 +554,41 @@ impl PollInstrumentation for OtelBackend {
             Err(panic) => {
                 self.diagnostics.record(Defect::from_panic(panic));
                 Box::new(NoopPollScope)
+            }
+        }
+    }
+}
+
+/// A concrete stack guard for the prepared runtime's selected poll hook.
+#[doc(hidden)]
+pub struct PreparedOtelPollScope {
+    _context: Option<opentelemetry::ContextGuard>,
+    _tracing: Option<NativePollScope>,
+}
+
+impl PollScope for PreparedOtelPollScope {}
+impl PreparedPollHook for OtelBackend {
+    type Guard<'a> = PreparedOtelPollScope;
+
+    fn enter<'a>(&'a self, trace: Option<&'a PreparedTraceContext>) -> Self::Guard<'a> {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let native = self
+                .native_context_for(trace.and_then(PreparedTraceContext::span))
+                .with_value(BridgeAttachment);
+            let tracing = PreparedPollHook::enter(&self.tracing, trace);
+            PreparedOtelPollScope {
+                _context: Some(native.attach()),
+                _tracing: Some(tracing),
+            }
+        }));
+        match result {
+            Ok(guard) => guard,
+            Err(panic) => {
+                self.record_failure(Defect::from_panic(panic));
+                PreparedOtelPollScope {
+                    _context: None,
+                    _tracing: None,
+                }
             }
         }
     }
@@ -464,7 +607,7 @@ impl PollInstrumentation for SpanInstrumentation {
     /// Attach pending metadata only when the new span is being created.
     fn enter(&self, trace: &TraceContext) -> Box<dyn PollScope> {
         if trace.span != self.parent {
-            return self.backend.enter(trace);
+            return PollInstrumentation::enter(&self.backend, trace);
         }
         let result = catch_unwind(AssertUnwindSafe(|| {
             let native = self
@@ -474,7 +617,7 @@ impl PollInstrumentation for SpanInstrumentation {
                 .with_value(PendingOptions {
                     options: Arc::clone(&self.options),
                 });
-            let tracing = self.backend.tracing.enter(trace);
+            let tracing = PollInstrumentation::enter(&self.backend.tracing, trace);
             Box::new(OtelPollScope {
                 _context: native.attach(),
                 _tracing: tracing,
@@ -674,10 +817,19 @@ impl Otel {
         E: Send + 'static,
         R: HasOtel + Send + Sync + 'static,
     {
-        let values = Arc::new(vec![KeyValue::new(key, value)]);
+        let value = KeyValue::new(key, value);
         best_effort(move |backend, trace| {
+            let source = std::slice::from_ref(&value);
+            if let Some(prepared) = &backend.prepared {
+                let record = prepared.stage("", source, &[])?;
+                let (_, mut groups) = record.parts()?;
+                let attributes = groups.next()?;
+                return backend.with_native(trace, |span| {
+                    attributes.for_each(|value| span.set_attribute(value.key, value.value))
+                });
+            }
             backend.with_native(trace, |span| {
-                for value in (backend.redaction.attributes)(&values).map_err(NativeError::Native)? {
+                for value in (backend.redaction.attributes)(source).map_err(NativeError::Native)? {
                     span.set_attribute(value.key, value.value);
                 }
                 Ok(())
@@ -741,6 +893,15 @@ impl Otel {
         let name = name.into();
         let attributes = Arc::new(attributes);
         best_effort(move |backend, trace| {
+            if let Some(prepared) = &backend.prepared {
+                let record = prepared.stage(&name, &attributes, &[])?;
+                let (name, mut groups) = record.parts()?;
+                let attributes = groups.next()?;
+                return backend.with_native(trace, |span| {
+                    span.add_event(name.to_owned(), attributes.native()?);
+                    Ok(())
+                });
+            }
             backend.with_native(trace, |span| {
                 span.add_event(
                     name.to_string(),
@@ -783,6 +944,15 @@ impl Otel {
         R: HasOtel + Send + Sync + 'static,
     {
         best_effort(move |backend, trace| {
+            if let Some(prepared) = &backend.prepared {
+                let record = prepared.stage("", &link.attributes, &[])?;
+                let (_, mut groups) = record.parts()?;
+                let attributes = groups.next()?;
+                return backend.with_native(trace, |span| {
+                    span.add_link_with_attributes(link.span_context.clone(), attributes.native()?);
+                    Ok(())
+                });
+            }
             backend.with_native(trace, |span| {
                 span.add_link_with_attributes(
                     link.span_context.clone(),

@@ -1,14 +1,20 @@
 //! Validated culture identities and bounded JSON catalogue resources.
 
-use super::{LocalizationError, MessageContract, Template};
+use super::message::{visit_template, write_bounded};
+use super::{ArgumentList, LocalizationError, MessageContract, Template};
 use crate::{effect_future, effect_try_blocking};
 use bytes::Bytes;
+use effect::memory::{
+    Buffer, BufferView, Bytes as MemoryBytes, FixedVector, MemoryError, PreparedMemory, RegionId,
+    SlotLease, SlotPool,
+};
 use effect::{Effect, Exit};
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// Syntactically validated BCP 47 culture identity. Selection additionally checks
@@ -168,10 +174,17 @@ pub struct CultureSet {
     /// Selection allowlist, including configured parents and default.
     supported: Arc<[CultureId]>,
     /// Exact declared parent relation; cycles/missing parents are rejected.
-    parents: BTreeMap<CultureId, CultureId>,
+    metadata: Arc<BTreeMap<CultureId, CultureMetadata>>,
     /// Last lookup fallback selected by the application.
     fallback: CultureId,
 }
+
+#[derive(Clone)]
+pub(super) struct CultureMetadata {
+    pub(super) precedence: Arc<[CultureId]>,
+    pub(super) content_language: http::HeaderValue,
+}
+
 impl CultureSet {
     /// Prepare a nonempty culture set. The parent relation is explicit because
     /// locale inheritance can differ from blindly removing a hyphen segment.
@@ -197,19 +210,34 @@ impl CultureSet {
                 return Err(LocalizationError::Definition("culture parents".into()));
             }
         }
+        let mut metadata = BTreeMap::new();
         for culture in &supported {
             let mut seen = BTreeSet::new();
             let mut current = culture;
+            let mut chain = vec![culture.clone()];
             while let Some(parent) = relation.get(current) {
                 if !seen.insert(current) {
                     return Err(LocalizationError::Definition("culture parent cycle".into()));
                 }
+                chain.push(parent.clone());
                 current = parent;
             }
+            if !chain.contains(&fallback) {
+                chain.push(fallback.clone());
+            }
+            let content_language = http::HeaderValue::from_str(culture.as_str())
+                .map_err(|_| LocalizationError::Definition("content language".into()))?;
+            metadata.insert(
+                culture.clone(),
+                CultureMetadata {
+                    precedence: chain.into(),
+                    content_language,
+                },
+            );
         }
         Ok(Self {
             supported: supported.into(),
-            parents: relation,
+            metadata: Arc::new(metadata),
             fallback,
         })
     }
@@ -225,19 +253,17 @@ impl CultureSet {
     }
     /// Return exact/actual-parent/default precedence without duplicate fallback entries.
     pub fn precedence(&self, culture: &CultureId) -> Result<Vec<CultureId>, LocalizationError> {
-        if !self.contains(culture) {
-            return Err(LocalizationError::Definition("unsupported culture".into()));
-        }
-        let mut chain = vec![culture.clone()];
-        let mut current = culture;
-        while let Some(parent) = self.parents.get(current) {
-            chain.push(parent.clone());
-            current = parent;
-        }
-        if !chain.contains(&self.fallback) {
-            chain.push(self.fallback.clone());
-        }
-        Ok(chain)
+        Ok(self.metadata(culture)?.precedence.to_vec())
+    }
+
+    pub(super) fn metadata(
+        &self,
+        culture: &CultureId,
+    ) -> Result<CultureMetadata, LocalizationError> {
+        self.metadata
+            .get(culture)
+            .cloned()
+            .ok_or_else(|| LocalizationError::Definition("unsupported culture".into()))
     }
 }
 /// Explicit resource and formatted-output limits, with no hidden catalogue defaults.
@@ -316,6 +342,72 @@ impl<R: effect::HasBlockingExecutor + Send + Sync + 'static> CatalogResource<R> 
                     Ok(Bytes::from(bytes))
                 }, on_error: |error| error, }
             }),
+        }
+    }
+
+    pub(super) fn prepared_file(
+        identity: impl Into<Arc<str>>,
+        culture: CultureId,
+        path: std::path::PathBuf,
+        maximum: NonZeroUsize,
+        buffers: Arc<SlotPool<'static, Buffer<'static>>>,
+    ) -> Self {
+        let identity = identity.into();
+        let source_identity = identity.clone();
+        let path = Arc::new(path);
+        Self {
+            identity,
+            culture,
+            load: Arc::new(move || {
+                let path = path.clone();
+                let identity = source_identity.clone();
+                let buffers = buffers.clone();
+                effect_try_blocking! {
+                    body: move |_| read_prepared_file(&path, &identity, maximum, &buffers),
+                    on_error: |error| error,
+                }
+            }),
+        }
+    }
+}
+
+fn read_prepared_file(
+    path: &std::path::Path,
+    identity: &str,
+    maximum: NonZeroUsize,
+    buffers: &SlotPool<'static, Buffer<'static>>,
+) -> Result<Bytes, LocalizationError> {
+    use std::io::Read;
+    let mut output = buffers.try_checkout().map_err(LocalizationError::Memory)?;
+    let maximum = maximum.get();
+    let ceiling = maximum
+        .checked_add(1)
+        .ok_or_else(|| LocalizationError::Limit("file read bytes".into()))?;
+    let mut file =
+        std::fs::File::open(path).map_err(|_| LocalizationError::Load(identity.into()))?;
+    let mut scratch = [0u8; 4096];
+    output.clear();
+    loop {
+        let available = ceiling - output.len();
+        let count = available.min(scratch.len());
+        let window = scratch
+            .get_mut(..count)
+            .ok_or_else(|| LocalizationError::Limit("file read bytes".into()))?;
+        match file.read(window) {
+            Ok(0) => return Ok(Bytes::from_owner(BufferView::new(output.share()))),
+            Ok(read) => {
+                let chunk = window
+                    .get(..read)
+                    .ok_or_else(|| LocalizationError::Load(identity.into()))?;
+                if read > maximum - output.len() {
+                    return Err(LocalizationError::Limit("resource bytes".into()));
+                }
+                output
+                    .extend_from_slice(chunk)
+                    .map_err(LocalizationError::Memory)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
+            Err(_) => return Err(LocalizationError::Load(identity.into())),
         }
     }
 }
@@ -420,15 +512,33 @@ impl<C: Send + Sync + 'static, R: Send + Sync + 'static> CatalogDefinition<C, R>
         }
         Ok(())
     }
+
+    pub(super) fn resource_count(&self) -> usize {
+        self.resources.len()
+    }
     /// Read and validate every source before returning one replacement. No partial
     /// catalogue is published; ownership/cleanup failures remain Effect outcomes.
     pub fn load(&self) -> Effect<Catalog<C>, LocalizationError, R> {
+        self.load_with(None)
+    }
+
+    pub(super) fn load_with(
+        &self,
+        prepared: Option<Arc<effect::memory::SlotPool<'static, PreparedCatalogData>>>,
+    ) -> Effect<Catalog<C>, LocalizationError, R> {
         let definition = self.clone();
         effect_future! {
             exit_with_context; body: move |env: Arc<R>, context| {
             let definition = definition.clone();
+            let prepared = prepared.clone();
             async move {
-                let mut entries = BTreeMap::new();
+                let mut entries = match prepared {
+                    Some(pool) => match pool.try_checkout() {
+                        Ok(slot) => CatalogEntries::Prepared(PreparedCatalogLease(slot)),
+                        Err(error) => return Exit::Fail(LocalizationError::Memory(error)),
+                    },
+                    None => CatalogEntries::Ordinary(BTreeMap::new()),
+                };
                 for resource in definition.resources.iter() {
                     let bytes = match context.run((resource.load)(), env.clone()).await {
                         Exit::Success(bytes) => bytes,
@@ -439,18 +549,10 @@ impl<C: Send + Sync + 'static, R: Send + Sync + 'static> CatalogDefinition<C, R>
                             return Exit::FinalizationFailed(failure);
                         }
                     };
-                    let parsed =
-                        match parse_resource(&bytes, definition.limits, &definition.contracts) {
-                            Ok(parsed) => parsed,
-                            Err(error) => return Exit::Fail(error),
-                        };
-                    for (key, template) in parsed {
-                        if entries
-                            .insert((resource.culture.clone(), key.clone()), template)
-                            .is_some()
-                        {
-                            return Exit::Fail(LocalizationError::Key(key));
-                        }
+                    if let Err(error) = entries.parse(
+                        &resource.culture, &bytes, definition.limits, &definition.contracts,
+                    ) {
+                        return Exit::Fail(error);
                     }
                 }
                 Exit::Success(Catalog {
@@ -470,18 +572,236 @@ pub struct Catalog<C: Send + Sync + 'static> {
     /// Prepared family identity, retained in each generation.
     pub(crate) identity: Arc<str>,
     /// Checked exact culture/key templates.
-    pub(crate) entries: BTreeMap<(CultureId, String), Template>,
+    entries: CatalogEntries,
     /// Explicit formatted-output byte limit.
     pub(crate) limits: CatalogLimits,
     /// Compile-time catalogue family marker.
     marker: PhantomData<fn() -> C>,
 }
+
+struct PreparedCatalogEntry {
+    culture: CultureId,
+    key: &'static str,
+    fields: &'static [&'static str],
+    source: Range<usize>,
+}
+
+pub(super) struct PreparedCatalogData {
+    source: Buffer<'static>,
+    entries: FixedVector<'static, PreparedCatalogEntry>,
+}
+impl PreparedCatalogData {
+    pub(super) fn storage_bytes(
+        entries: usize,
+        bytes: MemoryBytes,
+    ) -> Result<MemoryBytes, MemoryError> {
+        let layout = std::alloc::Layout::array::<PreparedCatalogEntry>(entries)
+            .map_err(|_| MemoryError::InvalidLayout)?;
+        MemoryBytes::new(layout.size()).checked_add(bytes)
+    }
+
+    pub(super) fn prepare(
+        memory: &PreparedMemory<'static>,
+        region: RegionId,
+        entries: usize,
+        bytes: MemoryBytes,
+    ) -> Result<Self, MemoryError> {
+        Ok(Self {
+            source: memory.buffer(region, bytes)?,
+            entries: FixedVector::prepare(memory.allocator(region)?, entries)?,
+        })
+    }
+
+    #[allow(clippy::expect_used)] // Insertion stores only complete UTF-8 strings and their exact bounds.
+    fn source(&self, entry: &PreparedCatalogEntry) -> &str {
+        let source = self
+            .source
+            .as_slice()
+            .get(entry.source.clone())
+            .expect("prepared catalogue source range");
+        std::str::from_utf8(source).expect("prepared catalogue source UTF-8")
+    }
+
+    fn find(&self, culture: &CultureId, key: &'static str) -> Option<&PreparedCatalogEntry> {
+        let entries = self.entries.as_slice();
+        let index = entries
+            .binary_search_by(|entry| (&entry.culture, entry.key).cmp(&(culture, key)))
+            .ok()?;
+        entries.get(index)
+    }
+}
+
+struct PreparedCatalogLease(SlotLease<'static, PreparedCatalogData>);
+impl Drop for PreparedCatalogLease {
+    fn drop(&mut self) {
+        self.0.entries.clear();
+        self.0.source.clear();
+    }
+}
+
+enum CatalogEntries {
+    Ordinary(BTreeMap<(CultureId, &'static str), Template>),
+    Prepared(PreparedCatalogLease),
+}
+impl CatalogEntries {
+    fn parse(
+        &mut self,
+        culture: &CultureId,
+        bytes: &[u8],
+        limits: CatalogLimits,
+        contracts: &BTreeMap<&'static str, &'static [&'static str]>,
+    ) -> Result<(), LocalizationError> {
+        match self {
+            Self::Ordinary(entries) => {
+                let mut parsed = BTreeMap::new();
+                parse_resource(bytes, limits, contracts, |key, fields, source| {
+                    let template = Template::parse(source, fields)?;
+                    if parsed.insert(key, template).is_some() {
+                        return Err(LocalizationError::Key(key.into()));
+                    }
+                    Ok(())
+                })?;
+                for (key, template) in parsed {
+                    if entries.insert((culture.clone(), key), template).is_some() {
+                        return Err(LocalizationError::Key(key.into()));
+                    }
+                }
+            }
+            Self::Prepared(PreparedCatalogLease(data)) => {
+                let first = data.entries.as_slice().len();
+                parse_resource(bytes, limits, contracts, |key, fields, source| {
+                    visit_template(source, fields, |_, _| Ok(()))?;
+                    let current = data
+                        .entries
+                        .as_slice()
+                        .get(first..)
+                        .ok_or(LocalizationError::Admission)?;
+                    if current.iter().any(|entry| entry.key == key) {
+                        return Err(LocalizationError::Key(key.into()));
+                    }
+                    let start = data.source.len();
+                    data.source
+                        .extend_from_slice(source.as_bytes())
+                        .map_err(LocalizationError::Memory)?;
+                    let end = data.source.len();
+                    data.entries
+                        .push(PreparedCatalogEntry {
+                            culture: culture.clone(),
+                            key,
+                            fields,
+                            source: start..end,
+                        })
+                        .map_err(|_| LocalizationError::Memory(MemoryError::NoSlot))?;
+                    Ok(())
+                })?;
+                let entries = data.entries.as_mut_slice();
+                entries.sort_unstable_by(|left, right| {
+                    (&left.culture, left.key).cmp(&(&right.culture, right.key))
+                });
+                if let Some(duplicate) = entries.windows(2).find_map(|pair| match pair {
+                    [left, right] if left.culture == right.culture && left.key == right.key => {
+                        Some(left.key)
+                    }
+                    [_left, _right] => None,
+                    _ => None,
+                }) {
+                    return Err(LocalizationError::Key(duplicate.into()));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl<C: Send + Sync + 'static> Catalog<C> {
     /// Compare prepared content without cloning templates or argument payloads.
     pub(crate) fn same(&self, other: &Self) -> bool {
-        self.identity == other.identity && self.entries == other.entries
+        self.identity == other.identity
+            && match (&self.entries, &other.entries) {
+                (CatalogEntries::Ordinary(left), CatalogEntries::Ordinary(right)) => left == right,
+                (
+                    CatalogEntries::Prepared(PreparedCatalogLease(left)),
+                    CatalogEntries::Prepared(PreparedCatalogLease(right)),
+                ) => {
+                    let left_entries = left.entries.as_slice();
+                    let right_entries = right.entries.as_slice();
+                    left_entries.len() == right_entries.len()
+                        && left_entries
+                            .iter()
+                            .zip(right_entries)
+                            .all(|(entry, candidate)| {
+                                entry.culture == candidate.culture
+                                    && entry.key == candidate.key
+                                    && left.source(entry) == right.source(candidate)
+                            })
+                }
+                (CatalogEntries::Ordinary(_), CatalogEntries::Prepared(_))
+                | (CatalogEntries::Prepared(_), CatalogEntries::Ordinary(_)) => false,
+            }
+    }
+
+    pub(super) fn write(
+        &self,
+        culture: &CultureId,
+        key: &'static str,
+        arguments: &impl ArgumentList,
+        formatting: &CultureId,
+        emit: impl FnMut(&str) -> Result<(), LocalizationError>,
+    ) -> Result<bool, LocalizationError> {
+        let maximum = self.limits.message_bytes.get();
+        match &self.entries {
+            CatalogEntries::Ordinary(entries) => {
+                let Some(template) = entries.get(&(culture.clone(), key)) else {
+                    return Ok(false);
+                };
+                template.write(arguments, formatting, maximum, emit)?;
+            }
+            CatalogEntries::Prepared(PreparedCatalogLease(data)) => {
+                let Some(entry) = data.find(culture, key) else {
+                    return Ok(false);
+                };
+                write_bounded(maximum, emit, |append| {
+                    visit_template(data.source(entry), entry.fields, |field, value| {
+                        if field {
+                            arguments.write_value(value, formatting, append)
+                        } else {
+                            append(value)
+                        }
+                    })
+                })?;
+            }
+        }
+        Ok(true)
+    }
+
+    #[allow(clippy::expect_used)] // Prepared source entered the generation only after contract validation.
+    pub(super) fn enumerate(&self, culture: &CultureId, output: &mut BTreeMap<String, Template>) {
+        match &self.entries {
+            CatalogEntries::Ordinary(entries) => {
+                for ((entry_culture, key), template) in entries {
+                    if entry_culture == culture {
+                        output.insert((*key).into(), template.clone());
+                    }
+                }
+            }
+            CatalogEntries::Prepared(PreparedCatalogLease(data)) => {
+                for entry in data
+                    .entries
+                    .as_slice()
+                    .iter()
+                    .filter(|entry| entry.culture == *culture)
+                {
+                    let template = Template::parse(data.source(entry), entry.fields)
+                        .expect("validated template");
+                    output.insert(entry.key.into(), template);
+                }
+            }
+        }
     }
 }
+
+type StoreTemplate<'a> =
+    dyn FnMut(&'static str, &'static [&'static str], &str) -> Result<(), LocalizationError> + 'a;
 /// One bounded parse budget shared by recursive serde seeds.
 struct Budget<'a> {
     /// Explicit caller parser limits.
@@ -491,7 +811,7 @@ struct Budget<'a> {
     /// Complete contract map; unknown resource messages fail validation.
     contracts: &'a BTreeMap<&'static str, &'static [&'static str]>,
     /// Checked flattened output; all leaves must be string templates.
-    output: BTreeMap<String, Template>,
+    store: &'a mut StoreTemplate<'a>,
     /// Original safe domain category, retained instead of serde's parser text.
     failure: Option<LocalizationError>,
 }
@@ -544,25 +864,13 @@ impl<'de> Visitor<'de> for Node<'_, '_> {
                 Some(LocalizationError::Limit("catalogue key/value bytes".into()));
             return Err(E::custom("catalogue key/value bytes"));
         }
-        let Some(fields) = self.budget.contracts.get(self.path.as_str()) else {
+        let Some((&key, fields)) = self.budget.contracts.get_key_value(self.path.as_str()) else {
             self.budget.failure = Some(LocalizationError::Template(self.path.clone()));
             return Err(E::custom("unknown message contract"));
         };
-        let template = match Template::parse(value, fields) {
-            Ok(template) => template,
-            Err(error) => {
-                self.budget.failure = Some(error);
-                return Err(E::custom("message template"));
-            }
-        };
-        if self
-            .budget
-            .output
-            .insert(self.path.clone(), template)
-            .is_some()
-        {
-            self.budget.failure = Some(LocalizationError::Key(self.path));
-            return Err(E::custom("duplicate catalogue key"));
+        if let Err(error) = (self.budget.store)(key, fields, value) {
+            self.budget.failure = Some(error);
+            return Err(E::custom("message template"));
         }
         Ok(())
     }
@@ -643,7 +951,8 @@ fn parse_resource(
     bytes: &[u8],
     limits: CatalogLimits,
     contracts: &BTreeMap<&'static str, &'static [&'static str]>,
-) -> Result<BTreeMap<String, Template>, LocalizationError> {
+    mut store: impl FnMut(&'static str, &'static [&'static str], &str) -> Result<(), LocalizationError>,
+) -> Result<(), LocalizationError> {
     if bytes.len() > limits.bytes.get() {
         return Err(LocalizationError::Limit("resource bytes".into()));
     }
@@ -651,7 +960,7 @@ fn parse_resource(
         limits,
         keys: 0,
         contracts,
-        output: BTreeMap::new(),
+        store: &mut store,
         failure: None,
     };
     let mut parser = serde_json::Deserializer::from_slice(bytes);
@@ -671,6 +980,5 @@ fn parse_resource(
     }
     parser
         .end()
-        .map_err(|_| LocalizationError::Resource("trailing JSON".into()))?;
-    Ok(budget.output)
+        .map_err(|_| LocalizationError::Resource("trailing JSON".into()))
 }

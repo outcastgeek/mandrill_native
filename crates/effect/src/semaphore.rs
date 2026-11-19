@@ -294,7 +294,7 @@ impl Semaphore {
         let semaphore = self.clone();
         Effect::new(move |_, context, finish| {
             let semaphore = semaphore.clone();
-            Step::Suspended(Box::pin(async move {
+            Step::suspended(Box::pin(async move {
                 let outcome =
                     AssertUnwindSafe(semaphore.acquire_owned(count, context.cancellation))
                         .catch_unwind()

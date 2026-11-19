@@ -5,14 +5,42 @@ use sqlx_core::{
     row::Row,
 };
 
-use crate::{Turso, TursoColumn, TursoValue, TursoValueRef, column::collect_column_names};
+use crate::{
+    Turso, TursoColumn, TursoValue, TursoValueRef, column::collect_column_names,
+    prepared_rows::RowValues,
+};
+
+#[derive(Clone)]
+enum Values {
+    Native(Vec<TursoValue>),
+    Prepared(Arc<RowValues>),
+}
+impl std::fmt::Debug for Values {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
+    }
+}
+impl Default for Values {
+    fn default() -> Self {
+        Self::Native(Vec::new())
+    }
+}
+impl std::ops::Deref for Values {
+    type Target = [TursoValue];
+    fn deref(&self) -> &[TursoValue] {
+        match self {
+            Self::Native(v) => v,
+            Self::Prepared(v) => &v.values,
+        }
+    }
+}
 
 /// Row returned from a Turso query
 #[derive(Clone, Debug, Default)]
 pub struct TursoRow {
     columns: Arc<[TursoColumn]>,
     column_names: Arc<HashMap<UStr, usize>>,
-    values: Vec<TursoValue>,
+    values: Values,
 }
 
 impl TursoRow {
@@ -25,7 +53,7 @@ impl TursoRow {
         Self {
             columns,
             column_names,
-            values,
+            values: Values::Native(values),
         }
     }
 
@@ -37,7 +65,19 @@ impl TursoRow {
         Self {
             columns,
             column_names,
-            values,
+            values: Values::Native(values),
+        }
+    }
+
+    pub(crate) fn prepared(
+        columns: Arc<[TursoColumn]>,
+        column_names: Arc<HashMap<UStr, usize>>,
+        values: Arc<RowValues>,
+    ) -> Self {
+        Self {
+            columns,
+            column_names,
+            values: Values::Prepared(values),
         }
     }
 

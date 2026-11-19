@@ -1,6 +1,6 @@
 //! Sam inspects recorded pickup cups and files the scheduled closing checklist.
 //!
-//! Run: `cargo +1.99.0 run -p effect --example close_coffee_shop`.
+//! Run: `cargo +1.100.0 run -p effect --example close_coffee_shop`.
 //! An OrderPad is café state. Effect owns activation-scoped resources, addressed
 //! dispatch, leased closing responsibility, and calendar planning. The local store
 //! demonstrates ownership within this process; it is not a distributed deployment.

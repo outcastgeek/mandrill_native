@@ -21,14 +21,16 @@ pub struct PatternPolicy {
 }
 /// A prepared bounded PikeVM pattern; clones share immutable compiled state.
 ///
-/// Each search has a fresh matcher cache. In configured codecs, demand is also
-/// charged to the invocation's cumulative pattern budget. Search follows regex
-/// semantics: use anchors in the expression when a full-string match is required.
+/// Ordinary searches create a matcher cache; explicit prepared selection reuses
+/// exclusive startup-prepared cache owners. In configured codecs, demand is
+/// also charged to the invocation's cumulative pattern budget. Search follows
+/// regex semantics: use anchors when a full-string match is required.
 #[derive(Clone)]
 pub struct CheckedPattern {
     source: Arc<str>,
     vm: Arc<PikeVM>,
     policy: PatternPolicy,
+    prepared: Option<Arc<super::prepared_pattern_cache::PreparedPatternCaches>>,
 }
 impl CheckedPattern {
     /// Compile under the supplied syntax and size bounds; invalid or over-budget patterns return `InvalidDefinition`.
@@ -44,12 +46,37 @@ impl CheckedPattern {
             source,
             vm: Arc::new(vm),
             policy,
+            prepared: None,
         })
     }
     /// Borrow the original pattern source used for introspection.
     #[must_use]
     pub fn source(&self) -> &str {
         &self.source
+    }
+    /// Checked region and logical native-cache entry demand for this pattern.
+    pub fn prepared_cache_demand(
+        &self,
+        caches: usize,
+    ) -> Result<super::PreparedPatternCacheDemand, crate::memory::MemoryError> {
+        super::prepared_pattern_cache::demand(&self.vm, caches)
+    }
+    /// Prepare an explicit number of exclusive native matcher caches at startup.
+    /// Native cache allocations and their allocator overhead are separate from
+    /// region records; the original matcher remains the runtime search engine.
+    pub fn with_prepared_caches(
+        &self,
+        memory: &crate::memory::PreparedMemory<'static>,
+        region: crate::memory::RegionId,
+        caches: usize,
+    ) -> Result<Self, crate::memory::MemoryError> {
+        let prepared = super::prepared_pattern_cache::prepare(memory, region, &self.vm, caches)?;
+        Ok(Self {
+            source: Arc::clone(&self.source),
+            vm: Arc::clone(&self.vm),
+            policy: self.policy,
+            prepared: Some(Arc::new(prepared)),
+        })
     }
     /// Search `text` using this pattern's explicit per-search budget.
     ///
@@ -60,7 +87,7 @@ impl CheckedPattern {
         // The extra position is the end-of-input transition, not a policy default.
         self.matches_in(text, None)
     }
-    fn matches_in(
+    pub(super) fn matches_in(
         &self,
         text: &str,
         context: Option<&super::ParseContext>,
@@ -77,9 +104,18 @@ impl CheckedPattern {
                 demand.ok_or_else(|| SchemaIssue::new(SchemaIssueKind::PatternBudget))?,
             )?;
         }
-        let mut cache = self.vm.create_cache();
-        Ok(self.vm.is_match(&mut cache, text))
+        if let Some(prepared) = &self.prepared {
+            let mut cache = prepared
+                .pool
+                .checkout()
+                .map_err(|error| SchemaIssue::new(SchemaIssueKind::Memory(error)))?;
+            Ok(self.vm.is_match(&mut cache, text))
+        } else {
+            let mut cache = self.vm.create_cache();
+            Ok(self.vm.is_match(&mut cache, text))
+        }
     }
+    pub(super) fn has_prepared_cache(&self) -> bool { self.prepared.is_some() }
 }
 fn invalid() -> SchemaIssue {
     SchemaIssue::new(SchemaIssueKind::InvalidDefinition)
@@ -102,7 +138,15 @@ pub struct StringConstraints {
     /// Require RFC UUID text layout, version-4 nibble and RFC variant bits when true.
     pub uuid_v4: bool,
 }
-impl StringConstraints {
+#[derive(Clone)]
+struct PreparedStringConstraints {
+    constraints: StringConstraints,
+    length_name: Arc<str>,
+    length_operand: Arc<str>,
+    uuid_name: Arc<str>,
+    uuid_operand: Arc<str>,
+}
+impl PreparedStringConstraints {
     fn validate_in(
         &self,
         value: &str,
@@ -120,38 +164,36 @@ impl StringConstraints {
             }
         }
         let length = value.chars().count();
-        if length < self.minimum || length > self.maximum {
-            return Err(constraint(
-                "stringLength",
-                format!("{}..={}", self.minimum, self.maximum),
-            ));
+        if length < self.constraints.minimum || length > self.constraints.maximum {
+            return Err(SchemaIssue::new(SchemaIssueKind::Constraint {
+                name: Arc::clone(&self.length_name),
+                operand: Arc::clone(&self.length_operand),
+            }));
         }
-        if let Some(pattern) = &self.pattern
+        if let Some(pattern) = &self.constraints.pattern
             && !pattern.matches_in(value, context)?
         {
             return Err(SchemaIssue::new(SchemaIssueKind::PatternMismatch));
         }
-        if self.uuid_v4 {
+        if self.constraints.uuid_v4 {
             // RFC 9562 UUID textual layout, version 4 nibble and RFC variant.
-            let mut nibbles = Vec::new();
-            for (index, byte) in value.bytes().enumerate() {
-                if matches!(index, 8 | 13 | 18 | 23) {
-                    if byte != b'-' {
-                        return Err(constraint("uuid", "v4"));
+            let valid = value.len() == 36
+                && value.bytes().enumerate().all(|(index, byte)| {
+                    if matches!(index, 8 | 13 | 18 | 23) {
+                        byte == b'-'
+                    } else if index == 14 {
+                        byte == b'4'
+                    } else if index == 19 {
+                        matches!(byte, b'8'..=b'9' | b'a'..=b'b' | b'A'..=b'B')
+                    } else {
+                        byte.is_ascii_hexdigit()
                     }
-                } else if let Some(nibble) = char::from(byte).to_digit(16) {
-                    nibbles.push(nibble);
-                } else {
-                    return Err(constraint("uuid", "v4"));
-                }
-            }
-            if value.len() != 36
-                || nibbles.get(12) != Some(&4)
-                || !nibbles
-                    .get(16)
-                    .is_some_and(|nibble| matches!(nibble, 8..=11))
-            {
-                return Err(constraint("uuid", "v4"));
+                });
+            if !valid {
+                return Err(SchemaIssue::new(SchemaIssueKind::Constraint {
+                    name: Arc::clone(&self.uuid_name),
+                    operand: Arc::clone(&self.uuid_operand),
+                }));
             }
         }
         Ok(())
@@ -166,22 +208,8 @@ impl StringConstraints {
 pub fn json_string_constraints(
     constraints: StringConstraints,
 ) -> Result<PureCodec<String, JsonValue>, SchemaIssue> {
-    if constraints.minimum > constraints.maximum {
-        return Err(invalid());
-    }
+    let (ast, constraints) = prepare_string_constraints(constraints)?;
     let source = super::json_string();
-    let mut ast = SchemaAst::new(SchemaShape::StringLength {
-        source: source.ast().clone(),
-        minimum: constraints.minimum,
-        maximum: constraints.maximum,
-        unit: StringLengthUnit::UnicodeScalars,
-    });
-    if constraints.pattern.is_some() || constraints.uuid_v4 {
-        ast = ast.derive(SchemaShape::Checked {
-            source: ast.clone(),
-            name: "checked_string".into(),
-        });
-    }
     let decode = constraints.clone();
     let validate = constraints.clone();
     let writer_constraints = constraints.clone();
@@ -204,6 +232,77 @@ pub fn json_string_constraints(
         writer.string(value)
     })
     .with_equivalence(|left, right| left == right))
+}
+fn prepare_string_constraints(
+    constraints: StringConstraints,
+) -> Result<(SchemaAst, PreparedStringConstraints), SchemaIssue> {
+    if constraints.minimum > constraints.maximum {
+        return Err(invalid());
+    }
+    let mut ast = SchemaAst::new(SchemaShape::StringLength {
+        source: SchemaAst::primitive(super::PrimitiveShape::String),
+        minimum: constraints.minimum,
+        maximum: constraints.maximum,
+        unit: StringLengthUnit::UnicodeScalars,
+    });
+    if constraints.pattern.is_some() || constraints.uuid_v4 {
+        ast = ast.derive(SchemaShape::Checked {
+            source: ast.clone(),
+            name: "checked_string".into(),
+        });
+    }
+    let constraints = PreparedStringConstraints {
+        length_name: Arc::from("stringLength"),
+        length_operand: Arc::from(format!("{}..={}", constraints.minimum, constraints.maximum)),
+        uuid_name: Arc::from("uuid"),
+        uuid_operand: Arc::from("v4"),
+        constraints,
+    };
+    Ok((ast, constraints))
+}
+
+/// Constrained managed string retaining its original document owner. A selected
+/// pattern must have caller-prepared caches; no ordinary cache fallback occurs.
+pub fn json_prepared_string_constraints(
+    constraints: StringConstraints,
+) -> Result<PureCodec<super::PreparedJsonString, super::SharedPreparedJsonValue>, SchemaIssue> {
+    if constraints
+        .pattern
+        .as_ref()
+        .is_some_and(|pattern| pattern.prepared.is_none())
+    {
+        return Err(SchemaIssue::new(SchemaIssueKind::Memory(
+            crate::memory::MemoryError::UnsupportedRunContract,
+        )));
+    }
+    let (ast, constraints) = prepare_string_constraints(constraints)?;
+    let source = super::json_prepared_string();
+    let decode = constraints.clone();
+    let validate = constraints.clone();
+    let writer_constraints = constraints.clone();
+    Ok(PureCodec::with_context_ast(
+        ast,
+        move |value, context| {
+            let value =
+                source.decode_in_ref(value, super::parse_context::descend(context)?.as_ref())?;
+            decode.validate_in(value.as_str(), context)?;
+            Ok(value)
+        },
+        move |value: &super::PreparedJsonString, context| {
+            constraints.validate_in(value.as_str(), context)?;
+            value
+                .retain_value()
+                .map_err(|error| SchemaIssue::new(SchemaIssueKind::Memory(error)))
+        },
+    )
+    .with_context_type_validator(move |value: &super::PreparedJsonString, context| {
+        validate.validate_in(value.as_str(), context)
+    })
+    .with_writer(move |value, writer| {
+        writer_constraints.validate_in(value.as_str(), None)?;
+        writer.string(value.as_str())
+    })
+    .with_equivalence(|left, right| left.as_str() == right.as_str()))
 }
 /// Whether a scalar literal enum rejects or retains values outside its declared set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -356,10 +455,166 @@ pub fn json_literal_enum(
         writer.tree(enum_value(value, &writer_literals, unknown, &writer_kind)?)
     }))
 }
+/// A managed literal-enum result; unknown values retain their whole document.
+pub enum PreparedLiteralEnumValue {
+    /// Index into the startup literal list.
+    Known(usize),
+    /// A non-member scalar retained when Preserve is selected.
+    Unknown(super::SharedPreparedJsonValue),
+}
+impl PreparedLiteralEnumValue {
+    /// Fallibly retain a complete unknown document, or copy the known index.
+    pub fn try_clone(&self) -> Result<Self, crate::memory::MemoryError> {
+        match self {
+            Self::Known(index) => Ok(Self::Known(*index)),
+            Self::Unknown(value) => Ok(Self::Unknown(value.try_clone()?)),
+        }
+    }
+}
+fn managed_literal_kind(value: &super::SharedPreparedJsonValue) -> Result<ValueKind, SchemaIssue> {
+    if value.view().kind() == Some(super::PreparedJsonKind::Number) {
+        Ok(ValueKind::Number)
+    } else {
+        super::json_codec::prepared_view_kind(value.view())
+    }
+}
+fn managed_enum_equal(
+    value: &super::SharedPreparedJsonValue,
+    literal: &JsonValue,
+) -> Result<bool, SchemaIssue> {
+    if let (Some(token), Some(number)) = (value.view().number_token(), literal.as_number()) {
+        let left = super::managed_number::ManagedNumber::parse(token).ok_or_else(invalid)?;
+        let right =
+            super::managed_number::ManagedNumber::parse(number.as_str()).ok_or_else(invalid)?;
+        return left
+            .compare(right)
+            .map(|ordering| ordering == std::cmp::Ordering::Equal)
+            .map_err(|error| SchemaIssue::new(SchemaIssueKind::Memory(error)));
+    }
+    super::managed_literal::equals(value.view(), literal)
+}
+fn prepared_enum_value<'a>(
+    value: &'a PreparedLiteralEnumValue,
+    literals: &[JsonValue],
+    templates: &'a [super::SharedPreparedJsonValue],
+    unknown: UnknownLiteralPolicy,
+    kind: &ValueKind,
+) -> Result<&'a super::SharedPreparedJsonValue, SchemaIssue> {
+    match value {
+        PreparedLiteralEnumValue::Known(index) => templates.get(*index).ok_or_else(invalid),
+        PreparedLiteralEnumValue::Unknown(value) => {
+            if unknown != UnknownLiteralPolicy::Preserve || managed_literal_kind(value)? != *kind {
+                return Err(SchemaIssue::new(SchemaIssueKind::LiteralMismatch));
+            }
+            for literal in literals {
+                if managed_enum_equal(value, literal)? {
+                    return Err(SchemaIssue::new(SchemaIssueKind::LiteralMismatch));
+                }
+            }
+            Ok(value)
+        }
+    }
+}
+/// Prepare a scalar literal enum; each template retains a full managed document.
+pub fn json_prepared_literal_enum(
+    literals: Vec<JsonValue>,
+    unknown: UnknownLiteralPolicy,
+    output: &super::PreparedJsonParserPool,
+    policy: ParsePolicy,
+) -> Result<PureCodec<PreparedLiteralEnumValue, super::SharedPreparedJsonValue>, SchemaIssue> {
+    let first = literals.first().ok_or_else(invalid)?;
+    let kind = literal_kind(first);
+    if matches!(kind, ValueKind::Sequence | ValueKind::Record)
+        || literals.iter().any(|value| literal_kind(value) != kind)
+    {
+        return Err(invalid());
+    }
+    for (index, value) in literals.iter().enumerate() {
+        if literals
+            .iter()
+            .take(index)
+            .any(|previous| literal_equal(previous, value))
+        {
+            return Err(invalid());
+        }
+    }
+    let ast = if unknown == UnknownLiteralPolicy::Reject {
+        SchemaAst::new(SchemaShape::Union(
+            literals
+                .iter()
+                .map(|value| SchemaAst::new(SchemaShape::Literal(Arc::new(value.clone()))))
+                .collect(),
+        ))
+    } else {
+        SchemaAst::opaque()
+    };
+    let mut prepared = Vec::new();
+    prepared.try_reserve_exact(literals.len()).map_err(|_| {
+        SchemaIssue::new(SchemaIssueKind::Memory(
+            crate::memory::MemoryError::BackingAllocationFailed,
+        ))
+    })?;
+    for literal in &literals {
+        prepared.push(output.copy_native_template(literal, policy)?);
+    }
+    let literals: Arc<[JsonValue]> = literals.into();
+    let templates: Arc<[super::SharedPreparedJsonValue]> = prepared.into();
+    let dec_literals = Arc::clone(&literals);
+    let enc_literals = Arc::clone(&literals);
+    let val_literals = Arc::clone(&literals);
+    let write_literals = Arc::clone(&literals);
+    let enc_templates = Arc::clone(&templates);
+    let val_templates = Arc::clone(&templates);
+    let write_templates = Arc::clone(&templates);
+    let dec_kind = kind.clone();
+    let enc_kind = kind.clone();
+    let val_kind = kind.clone();
+    let write_kind = kind;
+    Ok(PureCodec::with_context_ast(
+        ast,
+        move |value: &super::SharedPreparedJsonValue, _| {
+            for (index, literal) in dec_literals.iter().enumerate() {
+                if managed_enum_equal(value, literal)? {
+                    return Ok(PreparedLiteralEnumValue::Known(index));
+                }
+            }
+            if unknown == UnknownLiteralPolicy::Preserve && managed_literal_kind(value)? == dec_kind
+            {
+                Ok(PreparedLiteralEnumValue::Unknown(
+                    value
+                        .try_clone()
+                        .map_err(|e| SchemaIssue::new(SchemaIssueKind::Memory(e)))?,
+                ))
+            } else {
+                Err(SchemaIssue::new(SchemaIssueKind::LiteralMismatch))
+            }
+        },
+        move |value: &PreparedLiteralEnumValue, _| {
+            prepared_enum_value(value, &enc_literals, &enc_templates, unknown, &enc_kind)?
+                .try_clone()
+                .map_err(|e| SchemaIssue::new(SchemaIssueKind::Memory(e)))
+        },
+    )
+    .with_type_validator(move |value| {
+        prepared_enum_value(value, &val_literals, &val_templates, unknown, &val_kind).map(|_| ())
+    })
+    .with_writer(move |value, writer| {
+        prepared_enum_value(
+            value,
+            &write_literals,
+            &write_templates,
+            unknown,
+            &write_kind,
+        )?
+        .view()
+        .write_to(writer)
+    }))
+}
 pub(crate) fn resource_failure(issue: &SchemaIssue) -> bool {
     matches!(
         issue.kind(),
         SchemaIssueKind::LimitExceeded { .. }
+            | SchemaIssueKind::Memory(_)
             | SchemaIssueKind::ResourceDemand { .. }
             | SchemaIssueKind::PatternBudget
     ) || issue.children().iter().any(resource_failure)
@@ -685,8 +940,7 @@ pub fn json_all_of<A: Send + 'static>(
                     budget.available()?;
                 }
                 let before = budget.used();
-                let child =
-                    super::parse_context::child(context, IssueSegment::Alternative(index))?;
+                let child = super::parse_context::child(context, IssueSegment::Alternative(index))?;
                 match codec.decode_in_ref(value, child.as_ref()) {
                     Ok(decoded) => {
                         if index == select_decode {
@@ -890,6 +1144,186 @@ pub fn json_array_constraints<A: Send + 'static>(
         result.with_writer(move |value, writer| {
             check_array_length(value.len(), constraints, policy)?;
             check_typed_unique(value, constraints, writer_equivalent.as_deref())?;
+            write.write_into(value, writer)
+        })
+    } else {
+        result
+    })
+}
+#[derive(Clone)]
+struct PreparedArrayDiagnostics {
+    length_name: Arc<str>,
+    length_operand: Arc<str>,
+    unique_name: Arc<str>,
+    unique_operand: Arc<str>,
+}
+impl PreparedArrayDiagnostics {
+    fn length(
+        &self,
+        length: usize,
+        constraints: ArrayConstraints,
+        policy: ParsePolicy,
+    ) -> Result<(), SchemaIssue> {
+        if length > policy.limits.collection.get() {
+            return Err(SchemaIssue::new(SchemaIssueKind::LimitExceeded {
+                resource: SchemaResource::Width,
+            }));
+        }
+        if length < constraints.minimum || length > constraints.maximum {
+            return Err(SchemaIssue::new(SchemaIssueKind::Constraint {
+                name: Arc::clone(&self.length_name),
+                operand: Arc::clone(&self.length_operand),
+            }));
+        }
+        Ok(())
+    }
+    fn duplicate(&self) -> SchemaIssue {
+        SchemaIssue::new(SchemaIssueKind::Constraint {
+            name: Arc::clone(&self.unique_name),
+            operand: Arc::clone(&self.unique_operand),
+        })
+    }
+    fn encoded_unique(
+        &self,
+        value: &super::SharedPreparedJsonValue,
+        prefix: impl Fn(SchemaIssue, usize) -> SchemaIssue,
+    ) -> Result<(), SchemaIssue> {
+        let mut current = value.view().first_child();
+        let mut index = 0usize;
+        while let Some(item) = current {
+            let mut previous = value.view().first_child();
+            for _ in 0..index {
+                let candidate = previous.ok_or_else(invalid)?;
+                if super::managed_literal::numeric_structural_equal(candidate, item)? {
+                    return Err(prefix(self.duplicate(), index));
+                }
+                previous = candidate.next_sibling();
+            }
+            current = item.next_sibling();
+            index = index.checked_add(1).ok_or_else(|| {
+                SchemaIssue::new(SchemaIssueKind::Memory(
+                    crate::memory::MemoryError::ArithmeticOverflow,
+                ))
+            })?;
+        }
+        Ok(())
+    }
+    fn typed_unique<A>(
+        &self,
+        values: &[A],
+        constraints: ArrayConstraints,
+        equivalent: Option<&SemanticEquality<A>>,
+        prefix: impl Fn(SchemaIssue, usize) -> SchemaIssue,
+    ) -> Result<(), SchemaIssue> {
+        if constraints.unique {
+            let equivalent =
+                equivalent.ok_or_else(|| SchemaIssue::new(SchemaIssueKind::MissingValidator))?;
+            for (index, value) in values.iter().enumerate() {
+                if values
+                    .iter()
+                    .take(index)
+                    .any(|previous| equivalent(previous, value))
+                {
+                    return Err(prefix(self.duplicate(), index));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+/// Apply array constraints to managed values with actual prepared backing.
+pub fn json_prepared_array_constraints<A: Send + 'static>(
+    element: PureCodec<A, super::SharedPreparedJsonValue>,
+    constraints: ArrayConstraints,
+    policy: ParsePolicy,
+    arrays: Arc<super::PreparedJsonArrayPool<A>>,
+    output: Arc<super::PreparedJsonParserPool>,
+    validation: Arc<super::PreparedJsonValidationPool>,
+) -> Result<PureCodec<super::PreparedJsonArray<A>, super::SharedPreparedJsonValue>, SchemaIssue> {
+    if constraints.minimum > constraints.maximum
+        || constraints.maximum > policy.limits.collection.get()
+    {
+        return Err(invalid());
+    }
+    let diagnostics = PreparedArrayDiagnostics {
+        length_name: Arc::from("arrayLength"),
+        length_operand: Arc::from(format!("{}..={}", constraints.minimum, constraints.maximum)),
+        unique_name: Arc::from("uniqueItems"),
+        unique_operand: Arc::from("true"),
+    };
+    let equivalent = element.equivalence();
+    let validator_eq = equivalent.as_ref().map(Arc::clone);
+    let writer_eq = equivalent.as_ref().map(Arc::clone);
+    let base = super::json_prepared_array(
+        element,
+        arrays,
+        output,
+        policy,
+        Some(policy.limits.collection),
+    );
+    let decode = base.clone();
+    let validate = base.clone();
+    let write = base.clone();
+    let has_validator = base.has_type_validator() && (!constraints.unique || equivalent.is_some());
+    let has_writer = base.has_writer() && (!constraints.unique || equivalent.is_some());
+    let decode_diag = diagnostics.clone();
+    let validate_diag = diagnostics.clone();
+    let writer_diag = diagnostics.clone();
+    let result = PureCodec::with_context_ast(
+        base.ast().derive(SchemaShape::Checked {
+            source: base.ast().clone(),
+            name: Arc::from("array_constraints"),
+        }),
+        move |value: &super::SharedPreparedJsonValue, context| {
+            let active = super::parse_context::policy(context, policy);
+            validation.check_parse_limits(value, &active.limits)?;
+            if value.view().kind() != Some(super::PreparedJsonKind::Array) {
+                return Err(invalid());
+            }
+            decode_diag.length(value.view().len(), constraints, active)?;
+            if constraints.unique {
+                decode_diag.encoded_unique(value, |issue, index| {
+                    super::prepared_issue_at(context, issue, IssueSegment::Index(index))
+                })?;
+            }
+            decode.decode_in_ref(value, context)
+        },
+        move |value: &super::PreparedJsonArray<A>, context| {
+            let active = super::parse_context::policy(context, policy);
+            diagnostics.length(value.as_slice().len(), constraints, active)?;
+            let encoded = base.encode_in_ref(value, context)?;
+            if constraints.unique {
+                if encoded.view().kind() != Some(super::PreparedJsonKind::Array) {
+                    return Err(invalid());
+                }
+                diagnostics.encoded_unique(&encoded, |issue, index| {
+                    super::prepared_issue_at(context, issue, IssueSegment::Index(index))
+                })?;
+            }
+            Ok(encoded)
+        },
+    );
+    let result = if has_validator {
+        result.with_context_type_validator(move |value: &super::PreparedJsonArray<A>, context| {
+            validate_diag.length(
+                value.as_slice().len(),
+                constraints,
+                super::parse_context::policy(context, policy),
+            )?;
+            validate_diag.typed_unique(value.as_slice(), constraints, validator_eq.as_deref(), |issue, index| {
+                super::prepared_issue_at(context, issue, IssueSegment::Index(index))
+            })?;
+            validate.validate_in_ref(value, context)
+        })
+    } else {
+        result
+    };
+    Ok(if has_writer {
+        result.with_writer(move |value, writer| {
+            writer_diag.length(value.as_slice().len(), constraints, policy)?;
+            writer_diag.typed_unique(value.as_slice(), constraints, writer_eq.as_deref(), |issue, index| {
+                writer.issue_at(issue, IssueSegment::Index(index))
+            })?;
             write.write_into(value, writer)
         })
     } else {

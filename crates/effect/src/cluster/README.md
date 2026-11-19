@@ -6,5 +6,23 @@ Cluster separates accepted messages, ownership/activation, execution and recorde
 
 `ClusterRunner` obtains its message store, scheduler and wall clock through `R`. It claims accepted messages, dispatches through the adapter and records replies. Expired claim leases permit reclaim; ownership generations fence stale settlement. Encoded requests pass through `EntityDispatcher` for frame and envelope decoding, address checks and typed reply encoding.
 
+`cluster! { memory: &memory, region: region, store_capacity: limits }` selects
+the prepared volatile store. It reserves the record and activation tables,
+payload slots, per-message history and observer records, and leased read pages.
+Inactive addresses retain their owner generations, so the activation bound
+counts remembered addresses. Stable identities retain their caller-owned bytes
+under the configured identity limits. Reply and history readers retain actual
+payload slots after record removal.
+
+`PreparedClusterClient` writes a typed request directly into a reserved store
+slot and decodes a leased observation. Acknowledgement remains separate.
+`ClusterRunner::run_next_prepared` acquires a regional pending slot, applies the
+per-entity bound, and reserves reply backing, a diagnostic token frame and
+native executor capacity before claiming. The executor receives the claim and
+backing together and returns them after work settles. A failure retains its
+original token frame until dropped. The completion timestamp and fenced store transition run
+without suspension once the reply returns. `run_next_prepared_in` can use the
+enclosing prepared context's cancellation registration.
+
 See the [provider-neutral example](../../tests/fixtures/shared/provider_program.rs),
 `entity_macro`, for an `entity!` handler and addressed framed calls.

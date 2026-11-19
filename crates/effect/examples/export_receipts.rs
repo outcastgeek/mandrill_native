@@ -1,6 +1,6 @@
 //! Export per-customer receipt totals from a caller-supplied receipt CSV.
 //!
-//! Run: `cargo +1.99.0 run -p effect --example export_receipts -- COUNTER.csv MOBILE.csv OUTPUT.csv`.
+//! Run: `cargo +1.100.0 run -p effect --example export_receipts -- COUNTER.csv MOBILE.csv OUTPUT.csv`.
 //! Each input file contains rows of `ticket,customer,cups,unit_cents`, with no header or quoted commas.
 //! For `104,Maya,2,475` and `105,Lee,1,325`, output is `Lee,325` then `Maya,950`.
 //! Two bounded workers read independent counter/mobile files and validate their rows.

@@ -234,7 +234,7 @@ fn nested_release_failures_preserve_primary_error_and_reverse_order() {
         Exit::FinalizationFailed(Finalization {
             primary: PrimaryOutcome::Failed(Error::Body),
             first: CleanupFailure::ReleaseFailure(Error::Release(2)),
-            rest: vec![CleanupFailure::ReleaseFailure(Error::Release(1))],
+            rest: vec![CleanupFailure::ReleaseFailure(Error::Release(1))].into(),
         })
     );
     assert_eq!(
@@ -278,7 +278,7 @@ fn cancellation_during_awaited_release_is_masked_and_published_after_settlement(
         Exit::FinalizationFailed(Finalization {
             primary: PrimaryOutcome::WasInterrupted,
             first: CleanupFailure::ReleaseFailure(Error::Release(42)),
-            rest: Vec::new(),
+            rest: effect::CleanupFailures::default(),
         })
     );
     assert_eq!(releases.load(Ordering::SeqCst), 1);
@@ -303,7 +303,7 @@ fn body_and_release_factory_panics_preserve_release_obligations_and_outcomes() {
         Exit::FinalizationFailed(Finalization {
             primary: PrimaryOutcome::Succeeded,
             first: CleanupFailure::ReleaseDefect(Defect::from_panic(Box::new("release factory"))),
-            rest: Vec::new(),
+            rest: effect::CleanupFailures::default(),
         })
     );
 }

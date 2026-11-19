@@ -123,54 +123,70 @@ pub fn collect_media_attachment_inputs(
     form: Option<&ByteFormData>,
     normalize_role: Option<RoleNormalizerRef<'_>>,
 ) -> Vec<MediaAttachmentInput> {
-    let asset_ids =
-        form_values_with_fallback(form, "attachment_ids[]", "media_attachment_asset_id");
-    let positions =
-        form_values_with_fallback(form, "attachment_positions[]", "media_attachment_position");
-    let roles = form_values_with_fallback(form, "attachment_roles[]", "media_attachment_role");
-    let title_overrides = form_values_with_fallback(
-        form,
-        "attachment_titles[]",
-        "media_attachment_title_override",
-    );
-    let captions =
-        form_values_with_fallback(form, "attachment_captions[]", "media_attachment_caption");
-    let alt_overrides =
-        form_values_with_fallback(form, "attachment_alts[]", "media_attachment_alt_override");
-
-    let count = [
-        asset_ids.len(),
-        positions.len(),
-        roles.len(),
-        title_overrides.len(),
-        captions.len(),
-        alt_overrides.len(),
-    ]
-    .into_iter()
-    .max()
-    .unwrap_or(0);
-
+    let columns = AttachmentColumns::new(form);
+    let count = columns.len();
     let mut collected: Vec<(i64, usize, MediaAttachmentInput)> = Vec::with_capacity(count);
     for index in 0..count {
         // The item is constructed completely — which invokes the caller's role
         // normalizer — before a blank asset identity is skipped.
         let item = MediaAttachmentInput {
-            asset_id: InputBytes::from(trim_unicode_whitespace(slice_string_value(asset_ids, index))),
-            role: normalize_role_with(slice_string_value(roles, index), normalize_role),
-            title_override: InputBytes::from(trim_unicode_whitespace(slice_string_value(title_overrides, index))),
-            caption: InputBytes::from(trim_unicode_whitespace(slice_string_value(captions, index))),
-            alt_override: InputBytes::from(trim_unicode_whitespace(slice_string_value(alt_overrides, index))),
+            asset_id: InputBytes::from(trim_unicode_whitespace(slice_string_value(columns.asset_ids, index))),
+            role: normalize_role_with(slice_string_value(columns.roles, index), normalize_role),
+            title_override: InputBytes::from(trim_unicode_whitespace(slice_string_value(columns.title_overrides, index))),
+            caption: InputBytes::from(trim_unicode_whitespace(slice_string_value(columns.captions, index))),
+            alt_override: InputBytes::from(trim_unicode_whitespace(slice_string_value(columns.alt_overrides, index))),
         };
         if item.asset_id.is_empty() {
             continue;
         }
         let position =
-            parse_attachment_position(slice_string_value(positions, index), index as i64);
+            parse_attachment_position(slice_string_value(columns.positions, index), index as i64);
         collected.push((position, index, item));
     }
     collected.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
     collected.into_iter().map(|(_, _, item)| item).collect()
 }
+
+pub(super) struct AttachmentColumns<'a> {
+    pub(super) asset_ids: &'a [Vec<u8>],
+    pub(super) positions: &'a [Vec<u8>],
+    pub(super) roles: &'a [Vec<u8>],
+    pub(super) title_overrides: &'a [Vec<u8>],
+    pub(super) captions: &'a [Vec<u8>],
+    pub(super) alt_overrides: &'a [Vec<u8>],
+}
+
+impl<'a> AttachmentColumns<'a> {
+    pub(super) fn new(form: Option<&'a ByteFormData>) -> Self {
+        let asset_ids =
+            form_values_with_fallback(form, "attachment_ids[]", "media_attachment_asset_id");
+        let positions =
+            form_values_with_fallback(form, "attachment_positions[]", "media_attachment_position");
+        let roles = form_values_with_fallback(form, "attachment_roles[]", "media_attachment_role");
+        let title_overrides = form_values_with_fallback(
+            form,
+            "attachment_titles[]",
+            "media_attachment_title_override",
+        );
+        let captions =
+            form_values_with_fallback(form, "attachment_captions[]", "media_attachment_caption");
+        let alt_overrides =
+            form_values_with_fallback(form, "attachment_alts[]", "media_attachment_alt_override");
+        Self { asset_ids, positions, roles, title_overrides, captions, alt_overrides }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        [
+            self.asset_ids.len(),
+            self.positions.len(),
+            self.roles.len(),
+            self.title_overrides.len(),
+            self.captions.len(),
+            self.alt_overrides.len(),
+        ].into_iter().max().unwrap_or(0)
+    }
+}
+
 
 /// Derive deduplicated attachment inputs from presented form items.
 ///
@@ -461,7 +477,7 @@ fn normalize_role_with(raw: &[u8], normalize_role: Option<RoleNormalizerRef<'_>>
 /// A trimmed signed integer is accepted; a malformed or negative value becomes the
 /// row's original index, so neither a negative position nor a rejected value
 /// reorders the row ahead of the parsed ones.
-fn parse_attachment_position(raw: &[u8], fallback: i64) -> i64 {
+pub(super) fn parse_attachment_position(raw: &[u8], fallback: i64) -> i64 {
     match std::str::from_utf8(trim_unicode_whitespace(raw)).ok().and_then(|value| value.parse::<i64>().ok()) {
         Some(value) if value >= 0 => value,
         _ => fallback,
@@ -469,7 +485,7 @@ fn parse_attachment_position(raw: &[u8], fallback: i64) -> i64 {
 }
 
 /// One column value at a position, or empty bytes when the column is shorter.
-fn slice_string_value(values: &[Vec<u8>], index: usize) -> &[u8] {
+pub(super) fn slice_string_value(values: &[Vec<u8>], index: usize) -> &[u8] {
     values.get(index).map_or(&[], Vec::as_slice)
 }
 

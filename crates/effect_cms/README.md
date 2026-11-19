@@ -23,6 +23,59 @@ API designs or product behavior.
 - **Sequencing.** No test writing or execution until 100% of implementation code
   is in place. The current implementation phase also defers routine builds, checks and lints.
 
+## Prepared CMS consumers
+
+The original service constructors and request helpers remain the ordinary path.
+For a prepared application, calculate the common CMS payload and slot-table demand
+with `PreparedCmsMemory::storage_bytes(CmsMemoryCapacity)`. Include that demand
+and allocator overhead in a region of the application's existing memory plan.
+Call `PreparedCmsMemory::prepare` with that region before sealing the plan.
+Definition records, command and access work, and optional
+`PreparedCmsContent` workspaces have separate sizes. Include the selected owners
+in the same application plan and attach content workspaces with `with_content`.
+
+Keep the resulting `Arc<PreparedCmsMemory>` in application services and implement
+`HasCmsMemory`. `effect_server::RequestEnv` forwards that capability while
+retaining the current request. `read_prepared_cms_form` uses both capabilities to
+read retained decoded fields. Query, command and validation services use their
+explicit prepared inputs. Build those inputs with `PreparedDefinitionServices`,
+then use `new_prepared_definition_service_set` or
+`new_prepared_definition_runtime_factory` with the selected
+`DefinitionRegistryStorage`. An explicitly supplied registry keeps its authority
+over declarations. These constructors preserve the application's validation,
+access, persistence and provider callbacks.
+
+Configure prepared body and reply buffers on Server endpoints that need them.
+`ResourcePageRenderer::reply_prepared` selects the existing Maud page renderer.
+`definition_reply_prepared` claims the output before its selected list, detail or
+dashboard query and page producer. `reply_prepared_with` accepts the application's
+own effectful page-model source and applies the same output lifetime.
+`render_prepared_maud_reply` invokes a consumer renderer after taking the
+response's output buffer. For direct encoding into a caller-owned buffer,
+`write_maud_markup` appends native markup and preserves the output prefix on
+refusal. These adapters account for the native Maud string and the full output
+slot while both are live. Renderers own any intermediate work before returning
+markup. `prepared_cms_search_stream` writes existing Maud components and
+prepared signal text into leased Datastar frames from the CMS capability.
+
+`LocalizedAuthoringService::with_prepared_memory` selects the shared decoded form
+owner for the existing authoring handler. Where a Gemini provider is selected,
+`PreparedCmsContent::gemini_translator` attaches the prepared provider workspace
+to the application's existing translator.
+
+Media runtimes expose `list_attachment_items_prepared`,
+`preview_attachment_items_from_request_prepared` and
+`replace_attachments_from_request_prepared` for applications that use selected
+attachment storage. Validation and compatible media readers share one admitted
+form snapshot, preserving repeated field values and the request's single body
+claim. An incompatible storage owner or form policy yields a typed conflict.
+
+Map memory and capacity refusals through the application's typed error callbacks.
+Keep form, validation, draft and output handles only as long as a consumer needs
+their backing. A published response body or event holds its lease through
+transport. Any native provider and consumer memory belongs to its existing
+owner.
+
 ## Baseline and preserved work
 
 - Local workspace: branch `main`, HEAD `8fb68c23b9b18acd3853f92b6b34f6b318e94abb`.

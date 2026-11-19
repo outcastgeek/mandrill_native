@@ -32,10 +32,26 @@ pub struct SyncObservation {
 }
 /// Execute the named native SQL readiness query through the supplied existing
 /// client. Backend/decode/cleanup failures retain their typed SQL outcome channels.
+#[expect(clippy::result_large_err, reason = "the statement factory retains the owned native SQL error")]
 pub fn readiness<R: Send + Sync + 'static>(client: &SqlClient) -> Effect<bool, SqlError, R> {
     effect_map! {
     program: client
     .scalar::<_, i64, R>(|| sql! { text: "SELECT 1", }), map: |value| value == 1, }
+}
+/// Execute the fixed readiness statement with the selected session and row backing.
+#[expect(clippy::result_large_err, reason = "prepared statement and row projection retain the owned SQL and row errors")]
+pub fn readiness_prepared<R: Send + Sync + 'static>(client: &SqlClient) -> Effect<bool, SqlError, R> {
+    let decoder = effect_sql::row! {
+        project: |row| effect_sql::native_column_ref::<i64>(row, "ready"),
+    };
+    effect! {
+        bind;
+        program: client.first_prepared_read(|| sql! { text: "SELECT 1 AS ready", }, decoder),
+        body: |row| match row {
+            Some(value) => effect::effect_sync! { body: move || value == 1, },
+            None => effect::effect_try_sync! { body: || Err(SqlError::RowAbsent), },
+        },
+    }
 }
 /// Borrow sync statistics under one existing SQL session and release its native
 /// lease before returning a safe finite projection. Non-sync configurations return

@@ -20,6 +20,31 @@ pub struct RayonCpu {
     diagnostics: Diagnostics,
 }
 impl RayonCpu {
+    /// Prepare the compatible bounded CPU backend. Rayon ThreadPool::spawn
+    /// cannot place HeapJobs into caller-provided storage, so this explicit
+    /// route uses fixed workers/queue instead and never falls back to Rayon or
+    /// its global pool. Rayon/dependency calls inside a callback require the
+    /// callback's separately budgeted working-set contract.
+    pub fn prepare<C, T, D>(
+        memory: &effect::memory::PreparedMemory<'static>,
+        region: effect::memory::RegionId,
+        capacity: usize,
+        native: effect::prepared_provider::ProviderNativeEnvelope,
+    ) -> Result<
+        effect::prepared_provider::PreparedProvider<
+            effect::prepared_provider::SynchronousJob<C>,
+            T,
+            D,
+        >,
+        effect::prepared_provider::ProviderStartupError,
+    >
+    where
+        C: FnOnce(effect::prepared_provider::PreparedCancellation) -> T + Send + 'static,
+        T: Send + 'static,
+        D: effect::prepared_provider::ProviderWorkingSet,
+    {
+        effect::prepared_provider::PreparedProvider::prepare(memory, region, capacity, native)
+    }
     #[must_use]
     /// Attach an existing pool to Effect with explicit job admission and diagnostics.
     /// # Parameters

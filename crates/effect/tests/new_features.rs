@@ -50,14 +50,13 @@ fn transaction_for_each_commits_all_steps_and_rolls_back_on_failure() -> Result<
     };
 
     let item_ref = reference.clone();
-    let successful = Transaction::<(), &'static str>::for_each(
-        || 0..3,
-        move |item| {
+    let successful: Transaction<(), &'static str> = transaction! {
+        for item in 0..3 {
             transaction! {
-            modify; reference: item_ref, modify: move |value| Ok((value + item + 1, ())),
-            }
-        },
-    );
+                modify; reference: item_ref, modify: move |value| Ok((value + item + 1, ())),
+            }?;
+        }
+    };
     assert!(matches!(
         run(&successful.atomically(policy), Arc::clone(&environment)),
         Exit::Success(())
@@ -67,20 +66,19 @@ fn transaction_for_each_commits_all_steps_and_rolls_back_on_failure() -> Result<
     );
 
     let item_ref = reference.clone();
-    let failing = Transaction::<(), &'static str>::for_each(
-        || 0..3,
-        move |item| {
+    let failing: Transaction<(), &'static str> = transaction! {
+        for item in 0..3 {
             transaction! {
-            modify; reference: item_ref, modify: move |value| {
-                            if item == 1 {
-                                Err("stop")
-                            } else {
-                                Ok((value + 1, ()))
-                            }
-                        },
-            }
-        },
-    );
+                modify; reference: item_ref, modify: move |value| {
+                    if item == 1 {
+                        Err("stop")
+                    } else {
+                        Ok((value + 1, ()))
+                    }
+                },
+            }?;
+        }
+    };
     assert!(matches!(
         run(&failing.atomically(policy), Arc::clone(&environment)),
         Exit::Fail(TransactionError::Domain("stop"))

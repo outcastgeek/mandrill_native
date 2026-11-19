@@ -1,5 +1,10 @@
 //! Bounded native instrument identities and exact portable metric adaptation.
 
+mod prepared;
+
+pub use prepared::PreparedOtelMetricCapacity;
+
+use effect::memory::{PreparedMemory, RegionId};
 use effect::{
     GaugeValue, MetricDescriptor, MetricLabels, MetricRecorder, MetricSample, MetricValue,
 };
@@ -183,6 +188,11 @@ struct Entry {
     series: BTreeSet<MetricLabels>,
 }
 
+enum Registry {
+    Ordinary(Mutex<BTreeMap<String, Entry>>),
+    Prepared(prepared::Registry),
+}
+
 /// Core recorder adaptation using the official SDK meter and immutable policies.
 #[derive(Clone)]
 pub struct OtelMetricRecorder {
@@ -193,7 +203,7 @@ pub struct OtelMetricRecorder {
     /// No library-selected cardinality, numeric conversion or units.
     policy: MetricPolicy,
     /// One registry serializes name compatibility and series admission together.
-    entries: Arc<Mutex<BTreeMap<String, Entry>>>,
+    entries: Arc<Registry>,
 }
 impl OtelMetricRecorder {
     /// Select a native meter scope without constructing a provider/exporter/runtime.
@@ -202,6 +212,35 @@ impl OtelMetricRecorder {
         providers: crate::BorrowedProviders,
         scope: opentelemetry::InstrumentationScope,
         policy: MetricPolicy,
+    ) -> Result<Self, OtelMetricError> {
+        Self::with_registry(
+            providers,
+            scope,
+            policy,
+            Registry::Ordinary(Mutex::new(BTreeMap::new())),
+        )
+    }
+
+    /// Prepare instrument identities and label series before calling the SDK meter.
+    /// Native SDK instrumentation and redactor-owned inputs retain their own allocation policy.
+    pub fn new_prepared(
+        providers: crate::BorrowedProviders,
+        scope: opentelemetry::InstrumentationScope,
+        policy: MetricPolicy,
+        memory: &PreparedMemory<'static>,
+        region: RegionId,
+        capacity: PreparedOtelMetricCapacity,
+    ) -> Result<Self, OtelMetricError> {
+        let entries = prepared::Registry::prepare(memory, region, &policy, capacity)
+            .map_err(prepared::capacity_error)?;
+        Self::with_registry(providers, scope, policy, Registry::Prepared(entries))
+    }
+
+    fn with_registry(
+        providers: crate::BorrowedProviders,
+        scope: opentelemetry::InstrumentationScope,
+        policy: MetricPolicy,
+        entries: Registry,
     ) -> Result<Self, OtelMetricError> {
         use opentelemetry::metrics::MeterProvider;
         let _permit = providers.admit().map_err(admission_error)?;
@@ -213,7 +252,7 @@ impl OtelMetricRecorder {
             meter,
             providers,
             policy,
-            entries: Arc::new(Mutex::new(BTreeMap::new())),
+            entries: Arc::new(entries),
         })
     }
 
@@ -228,10 +267,8 @@ impl OtelMetricRecorder {
         definition: MetricDefinition,
     ) -> Result<NativeInstrument, OtelMetricError> {
         let _permit = self.providers.admit().map_err(admission_error)?;
-        catch_unwind(AssertUnwindSafe(|| {
-            self.admit(name, None, definition, None)
-        }))
-        .map_err(|panic| OtelMetricError::Native(effect::Defect::from_panic(panic)))?
+        catch_unwind(AssertUnwindSafe(|| self.admit_native(name, definition)))
+            .map_err(|panic| OtelMetricError::Native(effect::Defect::from_panic(panic)))?
     }
 
     /// Use a registered native instrument while owned shutdown awaits this callback.
@@ -245,29 +282,39 @@ impl OtelMetricRecorder {
     ) -> Result<A, OtelMetricError> {
         let _permit = self.providers.admit().map_err(admission_error)?;
         catch_unwind(AssertUnwindSafe(|| {
-            let instrument = self.admit(name, None, definition, None)?;
+            let instrument = self.admit_native(name, definition)?;
             action(&instrument)
         }))
         .map_err(|panic| OtelMetricError::Native(effect::Defect::from_panic(panic)))?
     }
 
-    /// Check definition/name/series as one mutation before publishing an instrument.
-    fn admit(
+    fn admit_native(
         &self,
+        name: &str,
+        definition: MetricDefinition,
+    ) -> Result<NativeInstrument, OtelMetricError> {
+        validate_metric_definition(name, &definition)?;
+        match self.entries.as_ref() {
+            Registry::Ordinary(entries) => {
+                self.admit_ordinary(entries, name, None, definition, None)
+            }
+            Registry::Prepared(entries) => entries
+                .admit(name, None, &definition, None, || {
+                    self.build(name.to_owned(), &definition)
+                })
+                .map(|(native, _)| native),
+        }
+    }
+
+    fn admit_ordinary(
+        &self,
+        entries: &Mutex<BTreeMap<String, Entry>>,
         name: &str,
         descriptor: Option<&MetricDescriptor>,
         definition: MetricDefinition,
         labels: Option<&MetricLabels>,
     ) -> Result<NativeInstrument, OtelMetricError> {
-        validate_definition(name, &definition.unit)?;
-        if let Some(unit) = definition.latency_unit
-            && (definition.kind != NativeInstrumentKind::HistogramU64
-                || definition.unit.as_ref() != unit.unit())
-        {
-            return Err(OtelMetricError::InvalidDefinition);
-        }
-        let mut entries = self
-            .entries
+        let mut entries = entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(entry) = entries.get_mut(name) {
@@ -331,6 +378,20 @@ impl OtelMetricRecorder {
     }
 }
 
+fn validate_metric_definition(
+    name: &str,
+    definition: &MetricDefinition,
+) -> Result<(), OtelMetricError> {
+    validate_definition(name, &definition.unit)?;
+    if let Some(unit) = definition.latency_unit
+        && (definition.kind != NativeInstrumentKind::HistogramU64
+            || definition.unit.as_ref() != unit.unit())
+    {
+        return Err(OtelMetricError::InvalidDefinition);
+    }
+    Ok(())
+}
+
 /// Native SDK 0.32 instrument-name contract; these are protocol bounds, not quotas.
 const NATIVE_NAME_MAX_BYTES: usize = 255;
 /// Native SDK 0.32 instrument-unit contract, measured in ASCII bytes.
@@ -360,43 +421,74 @@ impl MetricRecorder for OtelMetricRecorder {
     fn record(&self, sample: &MetricSample) -> Result<(), Self::Error> {
         let _permit = self.providers.admit().map_err(admission_error)?;
         catch_unwind(AssertUnwindSafe(|| {
+            let draft = match self.entries.as_ref() {
+                Registry::Ordinary(_) => None,
+                Registry::Prepared(entries) => Some(entries.draft()?),
+            };
             let definition = (self.policy.define)(sample.descriptor())?;
             let labels = (self.policy.redact)(sample.labels())?;
-            // Validate representation before consuming registry/series capacity.
             let measurement = exact(sample.value(), &definition)?;
-            let native = self.admit(
-                sample.descriptor().name().as_str(),
-                Some(sample.descriptor()),
-                definition,
-                Some(&labels),
-            )?;
-            let attributes = labels
-                .as_map()
-                .iter()
-                .map(|(k, v)| KeyValue::new(k.to_string(), v.to_string()))
-                .collect::<Vec<_>>();
-            match (native, measurement) {
-                (NativeInstrument::CounterU64(native), Measurement::U64(value)) => {
-                    native.add(value, &attributes)
+            let name = sample.descriptor().name().as_str();
+            validate_metric_definition(name, &definition)?;
+            match self.entries.as_ref() {
+                Registry::Prepared(entries) => {
+                    let mut draft = draft.ok_or(OtelMetricError::CapacityReached)?;
+                    draft.stage(&labels)?;
+                    let (native, observation) = entries.admit(
+                        name,
+                        Some(sample.descriptor()),
+                        &definition,
+                        Some(draft),
+                        || self.build(name.to_owned(), &definition),
+                    )?;
+                    let observation = observation.ok_or(OtelMetricError::CapacityReached)?;
+                    measure(native, measurement, observation.attributes())
                 }
-                (NativeInstrument::GaugeI64(native), Measurement::I64(value)) => {
-                    native.record(value, &attributes)
+                Registry::Ordinary(entries) => {
+                    let native = self.admit_ordinary(
+                        entries,
+                        name,
+                        Some(sample.descriptor()),
+                        definition,
+                        Some(&labels),
+                    )?;
+                    let attributes = labels
+                        .as_map()
+                        .iter()
+                        .map(|(k, v)| KeyValue::new(k.to_string(), v.to_string()))
+                        .collect::<Vec<_>>();
+                    measure(native, measurement, &attributes)
                 }
-                (NativeInstrument::GaugeU64(native), Measurement::U64(value)) => {
-                    native.record(value, &attributes)
-                }
-                (NativeInstrument::GaugeF64(native), Measurement::F64(value)) => {
-                    native.record(value, &attributes)
-                }
-                (NativeInstrument::HistogramU64(native), Measurement::U64(value)) => {
-                    native.record(value, &attributes)
-                }
-                _ => return Err(OtelMetricError::WrongKind),
             }
-            Ok(())
         }))
         .map_err(|panic| OtelMetricError::Native(effect::Defect::from_panic(panic)))?
     }
+}
+
+fn measure(
+    native: NativeInstrument,
+    measurement: Measurement,
+    attributes: &[KeyValue],
+) -> Result<(), OtelMetricError> {
+    match (native, measurement) {
+        (NativeInstrument::CounterU64(native), Measurement::U64(value)) => {
+            native.add(value, attributes)
+        }
+        (NativeInstrument::GaugeI64(native), Measurement::I64(value)) => {
+            native.record(value, attributes)
+        }
+        (NativeInstrument::GaugeU64(native), Measurement::U64(value)) => {
+            native.record(value, attributes)
+        }
+        (NativeInstrument::GaugeF64(native), Measurement::F64(value)) => {
+            native.record(value, attributes)
+        }
+        (NativeInstrument::HistogramU64(native), Measurement::U64(value)) => {
+            native.record(value, attributes)
+        }
+        _ => return Err(OtelMetricError::WrongKind),
+    }
+    Ok(())
 }
 
 /// Numeric observations after checked conversion; no application payload is held.

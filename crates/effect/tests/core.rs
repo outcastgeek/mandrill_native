@@ -239,7 +239,7 @@ fn error_mapping_preserves_every_finalization_error() {
             CleanupFailure::ReleaseFailure(3),
             CleanupFailure::ReleaseDefect(Defect::new("release")),
             CleanupFailure::ReleaseInterrupted,
-        ],
+        ].into(),
     });
     assert_eq!(
         exit.map_error(|value| value.to_string()),
@@ -250,7 +250,7 @@ fn error_mapping_preserves_every_finalization_error() {
                 CleanupFailure::ReleaseFailure(String::from("3")),
                 CleanupFailure::ReleaseDefect(Defect::new("release")),
                 CleanupFailure::ReleaseInterrupted
-            ],
+            ].into(),
         })
     );
 }

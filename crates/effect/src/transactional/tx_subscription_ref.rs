@@ -37,7 +37,8 @@ fn map_error(error: JournalError) -> TxSubscriptionError {
         JournalError::Conflict
         | JournalError::MixedDomain
         | JournalError::MissingCell
-        | JournalError::VersionExhausted => TxSubscriptionError::MissingCell,
+        | JournalError::VersionExhausted
+        | JournalError::Memory(_) => TxSubscriptionError::MissingCell,
     }
 }
 

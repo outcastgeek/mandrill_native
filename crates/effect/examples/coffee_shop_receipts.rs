@@ -1,6 +1,6 @@
 //! Maya and Lee receive receipts; the café builds its receipt book and daily sales total.
 //!
-//! Run: `cargo +1.99.0 run -p effect --example coffee_shop_receipts`.
+//! Run: `cargo +1.100.0 run -p effect --example coffee_shop_receipts`.
 //! Add `-- --book` to print the detailed receipt book instead of the daily total.
 //! Input: Maya buys two 475-cent lattes; Lee buys one 325-cent americano.
 //! Expected daily total: two receipts, three drinks, 1275 cents ($12.75).

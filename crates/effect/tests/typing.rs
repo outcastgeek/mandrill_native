@@ -21,7 +21,7 @@ fn external_compiler_contracts() -> Result<(), Box<dyn std::error::Error>> {
     );
     std::fs::create_dir_all(directory.0.join("src"))?;
     let manifest = format!(
-        "[package]\nname = \"effect-typing-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\nrust-version = \"1.99\"\n[workspace]\n[profile.dev]\ndebug = 0\nincremental = false\n[dependencies]\nmandrill_effect = {{ package = \"effect\", path = {:?} }}\n",
+        "[package]\nname = \"effect-typing-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\nrust-version = \"1.100.0\"\n[workspace]\n[profile.dev]\ndebug = 0\nincremental = false\n[dependencies]\nmandrill_effect = {{ package = \"effect\", path = {:?} }}\n",
         env!("CARGO_MANIFEST_DIR")
     );
     std::fs::write(directory.0.join("Cargo.toml"), &manifest)?;
@@ -296,7 +296,7 @@ fn planned_feature_type_pairs() -> Result<(), Box<dyn std::error::Error>> {
     )));
     std::fs::create_dir_all(directory.0.join("src"))?;
     let manifest = format!(
-        "[package]\nname = \"effect-feature-typing-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\nrust-version = \"1.99\"\n[workspace]\n[profile.dev]\ndebug = 0\nincremental = false\n[dependencies]\nmandrill_effect = {{ package = \"effect\", path = {:?} }}\n",
+        "[package]\nname = \"effect-feature-typing-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\nrust-version = \"1.100.0\"\n[workspace]\n[profile.dev]\ndebug = 0\nincremental = false\n[dependencies]\nmandrill_effect = {{ package = \"effect\", path = {:?} }}\n",
         env!("CARGO_MANIFEST_DIR")
     );
     std::fs::write(directory.0.join("Cargo.toml"), &manifest)?;
@@ -1000,7 +1000,7 @@ fn extension_compiler_contracts() -> Result<(), Box<dyn std::error::Error>> {
     );
     std::fs::create_dir_all(directory.0.join("src"))?;
     let mut manifest = String::from(
-        "[package]\nname = \"extension-typing-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\nrust-version = \"1.99\"\n[workspace]\n[profile.dev]\ndebug = 0\nincremental = false\n[features]\ndefault = [\"sqlx-turso\"]\nsqlx-turso = []\n[dependencies]\n",
+        "[package]\nname = \"extension-typing-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\nrust-version = \"1.100.0\"\n[workspace]\n[profile.dev]\ndebug = 0\nincremental = false\n[features]\ndefault = [\"sqlx-turso\"]\nsqlx-turso = []\n[dependencies]\n",
     );
     for (alias, package, folder, features) in [
         ("mandrill_effect", "effect", "effect", ""),
@@ -1247,10 +1247,14 @@ fn main() {
             "requires exactly one",
         ),
     ] {
+        let (imports, expression) = source
+            .trim_start()
+            .split_once('\n')
+            .ok_or("a rejected extension fixture needs imports and an expression")?;
         std::fs::write(
             directory.0.join("src/main.rs"),
             format!(
-                "/// Exercise one rejected domain description at the ordinary consumer entry point.\nfn main() {{ let _ = {source}; }}"
+                "{imports}\n/// Exercise one rejected domain description at the ordinary consumer entry point.\nfn main() {{ let _ = {expression}; }}"
             ),
         )?;
         let output = extension_check(&directory.0, &root)?;
@@ -1305,6 +1309,8 @@ fn copy_renamed_consumer(
                 text = text.replace(original, renamed);
             }
             std::fs::write(target, text)?;
+        } else if path.ends_with("pickup/browser.js") {
+            std::fs::copy(path, target)?;
         }
     }
     Ok(())

@@ -47,7 +47,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> ScopedBody<
                 Effect::new(move |env, context, finish| {
                     let bridge = MacroContext::with_scope(env, context, scope.clone());
                     let factory = Arc::clone(&factory);
-                    Step::Composed(Box::pin(async move {
+                    Step::composed(Box::pin(async move {
                         let result = AssertUnwindSafe(async { factory(bridge).await })
                             .catch_unwind()
                             .await;

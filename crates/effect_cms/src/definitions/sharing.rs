@@ -185,6 +185,22 @@ impl<T> SharedList<T> {
         reader(&values[self.start..end])
     }
 
+    /// Inspect the view while avoiding nested waits on shared collection owners.
+    pub(crate) fn try_with<R>(
+        &self,
+        reader: impl FnOnce(&[T]) -> R,
+    ) -> Result<R, effect::memory::MemoryError> {
+        use effect::memory::MemoryError;
+        let values = match self.values.try_read() {
+            Ok(values) => values,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err(MemoryError::Busy),
+        };
+        let end = self.start.checked_add(self.length).ok_or(MemoryError::InvalidRange)?;
+        let view = values.get(self.start..end).ok_or(MemoryError::InvalidRange)?;
+        Ok(reader(view))
+    }
+
     /// Mutate one element of this handle in place.
     ///
     /// The mutation writes into the shared backing store, so it is observed through

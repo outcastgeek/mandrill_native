@@ -590,7 +590,7 @@ fn pool_invalid_idle_replacement_and_discard_keep_canonical_cleanup_errors() {
         Exit::FinalizationFailed(Finalization {
             primary: PrimaryOutcome::Succeeded,
             first: CleanupFailure::ReleaseFailure(7),
-            rest: Vec::new()
+            rest: fx::CleanupFailures::default()
         })
     );
     env.tasks.finish();

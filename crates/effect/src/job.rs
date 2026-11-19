@@ -405,7 +405,7 @@ where
         Ok(result) => result,
         Err(panic) => Err(Defect::from_panic(panic)),
     };
-    Step::Suspended(Box::pin(async move {
+    Step::suspended(Box::pin(async move {
         // Always await accepted work, including after a running callback receives
         // cancellation. Rejection/panic also waits for capture destruction.
         let completed = completion.wait().await;

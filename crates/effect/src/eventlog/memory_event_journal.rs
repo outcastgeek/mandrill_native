@@ -11,6 +11,14 @@ use std::collections::BTreeMap;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 
+mod prepared;
+pub use prepared::{
+    PreparedAppendDecision, PreparedEncodedEventOutcome, PreparedEventAppend,
+    PreparedEventHeader, PreparedEventInspection, PreparedJournalEntry, PreparedJournalError,
+    PreparedJournalRead, PreparedJournalReadOutcome, PreparedMemoryEventJournal,
+    PreparedMemoryJournalCapacity,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Explicit resource bounds for eventlog memory event journal.
 pub struct MemoryJournalCapacity {

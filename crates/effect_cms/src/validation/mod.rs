@@ -55,6 +55,7 @@ mod native_contracts;
 mod issues;
 mod localization;
 mod paths;
+mod prepared_result;
 mod relation;
 mod result;
 
@@ -62,8 +63,10 @@ pub(crate) use self::action_validation::trim_unicode_whitespace;
 pub use self::action_validation::{
     build_command_input_from_form, form_values_from_form, ActionValidationAccepted, ActionValidationCause, ActionValidationError,
     ActionValidationOutcome, ActionValidationRejected, ActionValidationService,
-    ActionValidationStopped, build_command_input, form_values,
+    ActionValidationStopped, PreparedActionValidationError, PreparedActionValidationOutcome,
+    build_command_input, form_values,
 };
+pub(crate) use self::action_validation::PreparedValidationInput;
 pub use self::bindings::{
     ActionValidator, Binder, Bindings, CommandInputValidator, Options, ValidationResultValidator,
     Validators, new_bindings, new_bindings_from,
@@ -96,6 +99,10 @@ pub use self::localization::{
     validation_issue_message_key, validation_summary_message, validation_summary_title,
 };
 pub use self::paths::{Binding, Catalog, LookupOptions};
+pub use self::prepared_result::{
+    PreparedValidationArgument, PreparedValidationIssue, PreparedValidationResult,
+    PreparedValidationResults, ValidationResultCapacity, ValidationResultReservation,
+};
 pub use self::relation::{
     RelationRowInput, RelationRowIssue, RelationRowsApplicationResult,
     RelationRowsApplicationValidateFunc, RelationRowsApplicationValidator, RelationRowsCheckFunc,
@@ -112,3 +119,4 @@ pub use self::result::{
 };
 
 pub use native_contracts::{validate_native_value, validate_native_command_input, NativeContractValidator, NativeContractHandle, NativeContractError, NativeContractDocument, route_native_contract, native_command_input_document, native_mutation_result_document, native_validation_result_document};
+pub use native_contracts::{PreparedNativeContractError, PreparedNativeContractRejection};

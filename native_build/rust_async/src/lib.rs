@@ -267,7 +267,42 @@ impl RuntimeController {
     }
 }
 
+/// Worker-local runtime context. This guard is never sent across threads.
+pub struct PreparedRuntimeGuard<'a> {
+    _guard: tokio::runtime::EnterGuard<'a>,
+}
+
+/// Count/drain ownership for a physically prepared compatible backend. This
+/// lease alone is NOT a physical task reservation and cannot submit to Tokio.
+/// The adapter must acquire its queue/capture/completion storage first and keep
+/// this lease until future/capture destruction and completion notification end.
+pub struct PreparedOperation {
+    _permit: Permit,
+    _parent: Option<Permit>,
+}
+
 impl RuntimeHandle {
+    /// Enter this runtime on the current compatible worker for reactor access.
+    /// No task is spawned and no shutdown authority is transferred.
+    #[must_use]
+    pub fn enter_prepared_worker(&self) -> PreparedRuntimeGuard<'_> {
+        PreparedRuntimeGuard {
+            _guard: self.runtime.enter(),
+        }
+    }
+
+    /// Couple existing native parent/service drain to a compatible backend's
+    /// actual physical reservation. This does not allocate a cancellation token
+    /// or create/spawn a Tokio task. Drop rolls back rejected preparation.
+    pub fn reserve_prepared(&self) -> Result<PreparedOperation, AdmissionError> {
+        let parent = self.parent.as_ref().map(Permit::acquire).transpose()?;
+        let permit = Permit::acquire(&self.admission)?;
+        Ok(PreparedOperation {
+            _permit: permit,
+            _parent: parent,
+        })
+    }
+
     #[must_use]
     pub fn worker_count(&self) -> usize {
         self.runtime.metrics().num_workers()

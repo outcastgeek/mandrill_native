@@ -81,6 +81,7 @@ pub use self::managed_routes::{
     ManagedRouteMounter, ManagedRouteRegistration, ManagedStartError, MetadataSync,
     MetadataSyncError, Options, PERMISSION_MODE_ALL, PERMISSION_MODE_ANY, PermissionByName,
     PermissionGuard, PermissionMiddleware, PermissionMode, PermissionRequirementBuilder,
+    PreparedManagedRouteCapacity, PreparedManagedRouteStorage,
     RegisteredRoutes, RouteByPathAndMethod, RouteCatalogue, RouteDraft, RouteHandler,
     RoutePermission, RoutePermissionLookup, RouteRecord, RouteRequirement, Service,
     normalize_permissions, register, route_category, route_display_name, route_method,
@@ -96,7 +97,7 @@ pub use self::paths::{
 };
 pub use self::redirects::{
     LegacyRoute, MutationResultRoutePathBuilder, build_resource_sse_url,
-    build_resource_sse_url_for_kind, mutation_result_param_pairs, mutation_result_path,
+    build_resource_sse_url_for_kind, build_resource_sse_url_into, mutation_result_param_pairs, mutation_result_path,
     new_legacy_management_redirect_route, new_query_preserving_route_redirect_handler,
     redirect_mutation_result,
 };

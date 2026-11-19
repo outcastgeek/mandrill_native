@@ -8,6 +8,12 @@ use crate::{
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
+mod prepared;
+pub use prepared::{
+    PreparedAtomEvaluation, PreparedAtomOwner, PreparedAtomRegistry, PreparedAtomRegistryCapacity,
+    PreparedAtomRegistryError,
+};
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 /// Stable identity used by reactivity atom registry operations.
 pub struct AtomId(InvalidationKey);

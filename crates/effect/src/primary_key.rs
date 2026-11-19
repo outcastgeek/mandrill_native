@@ -3,6 +3,9 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+mod prepared;
+pub use prepared::{PreparedKeyError, PreparedKeyPool, PreparedStableKey};
+
 /// A consumer-defined, stable domain tag. Renaming it changes the encoded key
 /// space and therefore requires an explicit migration policy.
 pub trait KeyDomain: 'static {
@@ -119,6 +122,27 @@ pub enum KeySegment {
     Binary(Arc<[u8]>),
     /// The encoded integer is nonnegative. Contains `u64`.
     Unsigned(u64),
+}
+
+/// A logical key component borrowed for immediate encoding.
+#[derive(Clone, Copy, Debug)]
+pub enum KeySegmentRef<'a> {
+    /// UTF-8 text.
+    Text(&'a str),
+    /// Uninterpreted bytes.
+    Binary(&'a [u8]),
+    /// An unsigned value encoded as one network-order word.
+    Unsigned(u64),
+}
+
+impl<'a> From<&'a KeySegment> for KeySegmentRef<'a> {
+    fn from(segment: &'a KeySegment) -> Self {
+        match segment {
+            KeySegment::Text(text) => Self::Text(text),
+            KeySegment::Binary(bytes) => Self::Binary(bytes),
+            KeySegment::Unsigned(value) => Self::Unsigned(*value),
+        }
+    }
 }
 
 /// Consumer-owned logical identity components. Domain-specific IDs implement
@@ -291,6 +315,28 @@ impl<D: KeyDomain> StableKey<D> {
         segments: impl IntoIterator<Item = KeySegment>,
     ) -> Result<Self, KeyError> {
         let segments: Vec<_> = segments.into_iter().collect();
+        let segment_refs = || segments.iter().map(KeySegmentRef::from);
+        let required = Self::encoded_size(namespace, segments.len(), segment_refs())?;
+
+        let mut encoded = Vec::new();
+        encoded
+            .try_reserve_exact(required)
+            .map_err(|_| KeyError::AllocationFailed)?;
+        Self::write_encoded(namespace, segments.len(), segment_refs(), |bytes| {
+            encoded.extend_from_slice(bytes);
+            Ok::<(), KeyError>(())
+        })?;
+        Ok(Self {
+            encoded: Arc::from(encoded),
+            domain: PhantomData,
+        })
+    }
+
+    fn encoded_size<'a>(
+        namespace: &KeyNamespace<D>,
+        count: usize,
+        segments: impl Iterator<Item = KeySegmentRef<'a>>,
+    ) -> Result<usize, KeyError> {
         let mut required = 1usize;
         for bytes in [D::TAG.as_bytes(), namespace.name.as_bytes()] {
             let _ = u64::try_from(bytes.len()).map_err(|_| KeyError::LengthOverflow)?;
@@ -299,15 +345,15 @@ impl<D: KeyDomain> StableKey<D> {
                 .and_then(|count| count.checked_add(bytes.len()))
                 .ok_or(KeyError::LengthOverflow)?;
         }
-        let _ = u64::try_from(segments.len()).map_err(|_| KeyError::LengthOverflow)?;
+        let _ = u64::try_from(count).map_err(|_| KeyError::LengthOverflow)?;
         required = required
             .checked_add(Self::WORD)
             .ok_or(KeyError::LengthOverflow)?;
-        for segment in &segments {
+        for segment in segments {
             let length = match segment {
-                KeySegment::Text(text) => text.len(),
-                KeySegment::Binary(bytes) => bytes.len(),
-                KeySegment::Unsigned(_) => Self::WORD,
+                KeySegmentRef::Text(text) => text.len(),
+                KeySegmentRef::Binary(bytes) => bytes.len(),
+                KeySegmentRef::Unsigned(_) => Self::WORD,
             };
             let _ = u64::try_from(length).map_err(|_| KeyError::LengthOverflow)?;
             required = required
@@ -316,34 +362,36 @@ impl<D: KeyDomain> StableKey<D> {
                 .ok_or(KeyError::LengthOverflow)?;
         }
 
-        let mut encoded = Vec::new();
-        encoded
-            .try_reserve_exact(required)
-            .map_err(|_| KeyError::AllocationFailed)?;
-        encoded.push(Self::VERSION);
-        Self::push_bytes(&mut encoded, D::TAG.as_bytes())?;
-        Self::push_bytes(&mut encoded, namespace.name.as_bytes())?;
-        Self::push_word(&mut encoded, segments.len())?;
+        Ok(required)
+    }
+
+    fn write_encoded<'a, E: From<KeyError>>(
+        namespace: &KeyNamespace<D>,
+        count: usize,
+        segments: impl Iterator<Item = KeySegmentRef<'a>>,
+        mut write: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        write(&[Self::VERSION])?;
+        Self::write_bytes(D::TAG.as_bytes(), &mut write)?;
+        Self::write_bytes(namespace.name.as_bytes(), &mut write)?;
+        Self::write_word(count, &mut write)?;
         for segment in segments {
             match segment {
-                KeySegment::Text(text) => {
-                    encoded.push(Self::TEXT);
-                    Self::push_bytes(&mut encoded, text.as_bytes())?;
+                KeySegmentRef::Text(text) => {
+                    write(&[Self::TEXT])?;
+                    Self::write_bytes(text.as_bytes(), &mut write)?;
                 }
-                KeySegment::Binary(bytes) => {
-                    encoded.push(Self::BINARY);
-                    Self::push_bytes(&mut encoded, &bytes)?;
+                KeySegmentRef::Binary(bytes) => {
+                    write(&[Self::BINARY])?;
+                    Self::write_bytes(bytes, &mut write)?;
                 }
-                KeySegment::Unsigned(value) => {
-                    encoded.push(Self::UNSIGNED);
-                    Self::push_bytes(&mut encoded, &value.to_be_bytes())?;
+                KeySegmentRef::Unsigned(value) => {
+                    write(&[Self::UNSIGNED])?;
+                    Self::write_bytes(&value.to_be_bytes(), &mut write)?;
                 }
             }
         }
-        Ok(Self {
-            encoded: Arc::from(encoded),
-            domain: PhantomData,
-        })
+        Ok(())
     }
 
     /// Reject noncanonical or cross-domain encoded identities before use.
@@ -357,30 +405,38 @@ impl<D: KeyDomain> StableKey<D> {
     /// # Returns
     /// Type: `Result<Self, KeyError>`.
     pub fn from_encoded(encoded: Arc<[u8]>) -> Result<Self, KeyError> {
+        Self::validate_encoded(&encoded)?;
+        Ok(Self {
+            encoded,
+            domain: PhantomData,
+        })
+    }
+
+    fn validate_encoded(encoded: &[u8]) -> Result<(), KeyError> {
         let mut cursor = 0;
-        match Self::read_exact(&encoded, &mut cursor, 1)?.first() {
+        match Self::read_exact(encoded, &mut cursor, 1)?.first() {
             Some(version) if *version == Self::VERSION => {}
             _ => return Err(KeyError::UnsupportedVersion),
         }
-        let domain = Self::read_bytes(&encoded, &mut cursor)?;
+        let domain = Self::read_bytes(encoded, &mut cursor)?;
         if domain != D::TAG.as_bytes() {
             return Err(KeyError::WrongDomain);
         }
         if domain.is_empty() {
             return Err(KeyError::EmptyDomain);
         }
-        let namespace = Self::read_bytes(&encoded, &mut cursor)?;
+        let namespace = Self::read_bytes(encoded, &mut cursor)?;
         if namespace.is_empty() {
             return Err(KeyError::EmptyNamespace);
         }
         std::str::from_utf8(namespace).map_err(|_| KeyError::InvalidUtf8)?;
-        let segments = Self::read_word(&encoded, &mut cursor)?;
+        let segments = Self::read_word(encoded, &mut cursor)?;
         for _ in 0..segments {
-            let kind = Self::read_exact(&encoded, &mut cursor, 1)?
+            let kind = Self::read_exact(encoded, &mut cursor, 1)?
                 .first()
                 .copied()
                 .ok_or(KeyError::Truncated)?;
-            let payload = Self::read_bytes(&encoded, &mut cursor)?;
+            let payload = Self::read_bytes(encoded, &mut cursor)?;
             match kind {
                 Self::TEXT => {
                     std::str::from_utf8(payload).map_err(|_| KeyError::InvalidUtf8)?;
@@ -393,10 +449,7 @@ impl<D: KeyDomain> StableKey<D> {
         if cursor != encoded.len() {
             return Err(KeyError::TrailingBytes);
         }
-        Ok(Self {
-            encoded,
-            domain: PhantomData,
-        })
+        Ok(())
     }
 
     #[must_use]
@@ -423,30 +476,20 @@ impl<D: KeyDomain> StableKey<D> {
         self.encoded
     }
 
-    ///
-    /// # Parameters
-    /// - `buffer` (`&mut Vec<u8>`): The buffer supplied to this operation.
-    /// - `value` (`usize`): Value read, transformed, encoded, or stored by this operation.
-    ///
-    /// # Returns
-    /// Type: `Result<(), KeyError>`.
-    fn push_word(buffer: &mut Vec<u8>, value: usize) -> Result<(), KeyError> {
+    fn write_word<E: From<KeyError>>(
+        value: usize,
+        write: &mut impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
         let value = u64::try_from(value).map_err(|_| KeyError::LengthOverflow)?;
-        buffer.extend_from_slice(&value.to_be_bytes());
-        Ok(())
+        write(&value.to_be_bytes())
     }
 
-    ///
-    /// # Parameters
-    /// - `buffer` (`&mut Vec<u8>`): The buffer supplied to this operation.
-    /// - `bytes` (`&[u8]`): Encoded bytes to validate, decode, write, or transfer.
-    ///
-    /// # Returns
-    /// Type: `Result<(), KeyError>`.
-    fn push_bytes(buffer: &mut Vec<u8>, bytes: &[u8]) -> Result<(), KeyError> {
-        Self::push_word(buffer, bytes.len())?;
-        buffer.extend_from_slice(bytes);
-        Ok(())
+    fn write_bytes<E: From<KeyError>>(
+        bytes: &[u8],
+        write: &mut impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        Self::write_word(bytes.len(), write)?;
+        write(bytes)
     }
 
     ///

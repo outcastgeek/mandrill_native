@@ -256,7 +256,7 @@ impl<E: Send + 'static, R: HasHttpTransport + Send + Sync + 'static> Effect<Http
                 Err(panic) => return runtime::finish(finish, Exit::Die(Defect::from_panic(panic))),
             };
             let on_error = Arc::clone(&on_error);
-            Step::Suspended(Box::pin(async move {
+            Step::suspended(Box::pin(async move {
                 let outcome = match AssertUnwindSafe(future).catch_unwind().await {
                     Ok(Ok(response)) => Exit::Success(response),
                     Ok(Err(defect)) => match catch_unwind(AssertUnwindSafe(|| {
@@ -344,7 +344,7 @@ pub fn text<E: Send + 'static, R: Send + Sync + 'static>(
             Err(defect) => return runtime::finish(finish, Exit::Die(defect)),
         };
         let on_error = Arc::clone(&on_error);
-        Step::Suspended(Box::pin(async move {
+        Step::suspended(Box::pin(async move {
             let work = async {
                 let result = AssertUnwindSafe(future).catch_unwind().await;
                 match result {

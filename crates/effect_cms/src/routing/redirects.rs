@@ -40,8 +40,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use effect::memory::{Buffer, Bytes, MemoryError};
 use effect::{effect, effect_sync};
-use effect_server::{BodyStatus, Reply, Request, native::axum::body::Body, reply};
+use effect_server::{BodyStatus, Reply, Request, ServerError, native::axum::body::Body, reply};
 use http::{HeaderName, HeaderValue, Method, StatusCode};
 
 use crate::access::{hex_escape_non_ascii, new_redirect_access_response, resolved_redirect_target};
@@ -50,7 +51,10 @@ use crate::definitions::{
     RESOURCE_AUX_ROUTE_SSE, Registry, ResourceAuxRoute, ResourceKind, ResourceRouteSet,
     find_resource_definition,
 };
-use crate::queries::{append_encoded_query, clone_query, request_query_map};
+use crate::forms::PreparedMergedForms;
+use crate::queries::{
+    append_encoded_query, append_url_component_into, check_request_bytes, request_query_map,
+};
 
 use super::managed_routes::{ManagedRoute, PermissionMode, RouteHandler};
 use super::paths::RoutePathBuilder;
@@ -230,7 +234,7 @@ pub fn build_resource_sse_url(
     page: i64,
     route_path: Option<&RoutePathBuilder>,
 ) -> String {
-    let mut query = clone_query(&request_query_map(request));
+    let mut query = request_query_map(request);
     query.insert("page".into(), vec![page.to_string().into()]);
     let declared = route_set
         .aux
@@ -241,6 +245,81 @@ pub fn build_resource_sse_url(
         None => declared,
     };
     append_encoded_query(base.as_str(), &query)
+}
+
+/// Append an SSE route URL into admitted output using prepared query-decoding storage.
+/// Existing pairs remain in sorted-key and repeated-value order and the page is
+/// replaced. A failure restores the supplied output prefix.
+pub fn build_resource_sse_url_into(
+    request: &Request,
+    route_set: &ResourceRouteSet,
+    page: i64,
+    route_path: Option<&RoutePathBuilder>,
+    storage: &PreparedMergedForms,
+    maximum_request: Bytes,
+    output: &mut Buffer<'_>,
+) -> Result<(), ServerError> {
+    check_request_bytes(request, maximum_request)?;
+    let fields = storage.read_query(request)?;
+    let declared = route_set
+        .aux
+        .get(&ResourceAuxRoute::new(RESOURCE_AUX_ROUTE_SSE))
+        .unwrap_or_default();
+    let base = match route_path {
+        Some(route_path) => route_path(request, &declared, &[]),
+        None => declared,
+    };
+    let start = output.len();
+    let mut output = std::mem::DropGuard::new(output, move |output| output.truncate(start));
+    output
+        .extend_from_slice(base.as_bytes())
+        .map_err(ServerError::Memory)?;
+    let mut separator = if base.contains('?') { b'&' } else { b'?' };
+    let mut page_bytes = [0; 20];
+    let page = encode_page(page, &mut page_bytes).map_err(ServerError::Memory)?;
+    let mut page = Some(page);
+    for (key, value) in fields.pairs() {
+        if key >= b"page".as_slice()
+            && let Some(page) = page.take()
+        {
+            append_query_pair(&mut output, &mut separator, b"page", page)
+                .map_err(ServerError::Memory)?;
+        }
+        if key != b"page" {
+            append_query_pair(&mut output, &mut separator, key, value)
+                .map_err(ServerError::Memory)?;
+        }
+    }
+    if let Some(page) = page {
+        append_query_pair(&mut output, &mut separator, b"page", page)
+            .map_err(ServerError::Memory)?;
+    }
+    let _ = std::mem::DropGuard::dismiss(output);
+    Ok(())
+}
+
+fn append_query_pair(
+    output: &mut Buffer<'_>,
+    separator: &mut u8,
+    key: &[u8],
+    value: &[u8],
+) -> Result<(), MemoryError> {
+    output.extend_from_slice(&[*separator])?;
+    append_url_component_into(key, output)?;
+    output.extend_from_slice(b"=")?;
+    append_url_component_into(value, output)?;
+    *separator = b'&';
+    Ok(())
+}
+
+fn encode_page(page: i64, output: &mut [u8; 20]) -> Result<&[u8], MemoryError> {
+    use std::io::Write as _;
+    let length = {
+        let mut cursor = std::io::Cursor::new(output.as_mut_slice());
+        write!(cursor, "{page}").map_err(|_| MemoryError::InvalidRange)?;
+        usize::try_from(cursor.position()).map_err(|_| MemoryError::ArithmeticOverflow)?
+    };
+    output.get(..length).ok_or(MemoryError::InvalidRange)
 }
 
 /// Build the server-sent-events URL for a registered kind.

@@ -229,7 +229,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Stream<A, E
                                     })
                             }));
                         }
-                        Step::Composed(Box::pin(async move {
+                        Step::composed(Box::pin(async move {
                             let result = poll_fn(|cx| {
                                 let Some(body) = owner.body.as_mut() else {
                                     return Poll::Ready(Exit::Die(Defect::from(

@@ -19,6 +19,7 @@ mod atom_registry;
 mod atom_rpc;
 mod hydration;
 mod invalidation;
+mod prepared_invalidation;
 mod query;
 mod source;
 
@@ -29,18 +30,28 @@ pub use atom_persistence::{
     PersistedAtom, PersistedAtomError, PersistedAtomLoad, PersistedAtomSave,
 };
 pub use atom_ref::{AtomDependencyError, AtomReadContext, AtomRef, AtomRefError};
-pub use atom_registry::{AtomId, AtomKind, AtomRegistry, AtomRegistryError};
+pub use atom_registry::{
+    AtomId, AtomKind, AtomRegistry, AtomRegistryError, PreparedAtomEvaluation, PreparedAtomOwner,
+    PreparedAtomRegistry, PreparedAtomRegistryCapacity, PreparedAtomRegistryError,
+};
 pub use atom_rpc::{
     RpcMiddlewareMutationAtom, RpcMiddlewareMutationError, RpcMiddlewareQueryAtom, RpcMutationAtom,
     RpcMutationError, RpcQueryAtom,
 };
 pub use hydration::{
     HydrationConflictPolicy, HydrationError, HydrationImportOutcome, HydrationRecordResult,
-    HydrationSchema, HydrationSet,
+    HydrationSchema, HydrationSet, PreparedHydrationBytes, PreparedHydrationCodec,
+    PreparedHydrationError, PreparedHydrationImportPage, PreparedHydrationInputPage,
+    PreparedHydrationPage, PreparedHydrationRecord, PreparedHydrationRecordResult,
+    PreparedHydrationSchema, PreparedHydrationSet, PreparedHydrationSetCapacity,
 };
 pub use invalidation::{
     InvalidationBatch, InvalidationError, InvalidationKey, InvalidationRegistry,
     InvalidationSubscription,
+};
+pub use prepared_invalidation::{
+    PreparedInvalidationBatch, PreparedInvalidationCapacity, PreparedInvalidationError,
+    PreparedInvalidationRegistry,
 };
 pub use query::{ReactiveQuery, ReactiveQueryError};
 pub use source::{EffectStreamSource, ReactiveStateSource};

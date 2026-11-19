@@ -13,6 +13,10 @@ mod definition;
 mod envelope;
 mod in_process;
 mod middleware;
+mod prepared_client;
+mod prepared_in_process;
+mod prepared_memory;
+mod prepared_wire;
 mod protocol;
 mod server;
 mod stream_protocol;
@@ -32,6 +36,20 @@ pub use in_process::InProcessRpcChannel;
 pub use middleware::{
     RpcClientMiddleware, RpcClientMiddlewareError, RpcServerMiddleware, RpcServerMiddlewareError,
     RpcStreamMiddleware, RpcStreamMiddlewareError,
+};
+pub use prepared_client::{
+    PreparedRpcChannel, PreparedRpcClient, PreparedRpcClientError, PreparedRpcOperation,
+    PreparedRpcPayloadCodec,
+};
+pub(crate) use prepared_client::check_frame_storage;
+pub use prepared_in_process::{
+    PreparedInProcessAdmission, PreparedInProcessRpcChannel, PreparedRpcHandler,
+    PreparedRpcServerError,
+};
+pub use prepared_memory::{PreparedRpcCapacity, PreparedRpcExchange, PreparedRpcMemory};
+pub use prepared_wire::{
+    PreparedRpcDecoder, PreparedRpcEncoder, PreparedRpcEnvelope, PreparedRpcHeader,
+    PreparedRpcWire, PreparedRpcWireError,
 };
 pub use protocol::{InProcessRpcProtocolChannel, RpcProtocol, RpcProtocolError};
 pub use server::{RpcServerError, RpcUnaryServer};

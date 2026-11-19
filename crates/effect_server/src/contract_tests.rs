@@ -116,6 +116,7 @@ async fn negotiation_and_preconditions_before_rendering() -> Result<(), Box<dyn 
                     chunk_bytes: NonZeroUsize::MIN.saturating_add(63),
                 },
                 Arc::new(|error| error),
+                None,
             )
         },
     };
@@ -175,6 +176,7 @@ async fn negotiation_and_preconditions_before_rendering() -> Result<(), Box<dyn 
                     chunk_bytes: NonZeroUsize::MIN.saturating_add(63),
                 },
                 Arc::new(|error| error),
+                None,
             )
         },
     };
@@ -188,13 +190,14 @@ async fn negotiation_and_preconditions_before_rendering() -> Result<(), Box<dyn 
 #[tokio::test]
 async fn first_byte_backpressure_and_disconnect() -> Result<(), Box<dyn std::error::Error>> {
     let request = request(http::Method::GET, "/", &[], Body::empty())?;
-    let (mut body, writer, completion) = crate::body::channel::<ServerError, ()>(
-        &request,
+    let completion = crate::BodyCompletion::new(request.cancellation().clone());
+    let (mut body, writer, _) = crate::body::channel::<ServerError, ()>(
         BodyPolicy {
             frames: NonZeroUsize::MIN,
             chunk_bytes: NonZeroUsize::MIN.saturating_add(15),
         },
         Arc::new(|error| error),
+        crate::body::BodySignal::Ordinary(completion.clone()),
     );
     completion.arm();
     let cleaned = Arc::new(AtomicUsize::new(0));

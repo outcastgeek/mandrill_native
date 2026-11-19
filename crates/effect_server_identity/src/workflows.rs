@@ -13,15 +13,15 @@ use crate::services::{
 use crate::{
     IdentityError,
     authority::{
-        EnrollmentGrant, PendingLoginGrant, PermissionDecision, PermissionGrant,
+        EnrollmentGrant, IdentityAuthority, PendingLoginGrant, PermissionDecision, PermissionGrant,
         PermissionOperation, PermissionTarget, RecentSelfGrant, RoleGrant, ScopeGrant, SelfGrant,
         VerifiedExternalGrant,
     },
     capabilities::StoreSelection,
     components::{BearerIssuance, BrowserComponents, PrincipalComponents, SessionIssuance},
     definition::{
-        IdentityComponents, IdentityDefinition, LoginInput, LoginOutcome, RegistrationInput,
-        complete_login,
+        IdentityComponents, IdentityDefinition, LoginInput, LoginOutcome,
+        PreparedIdentityInvocation, RegistrationInput, complete_login,
     },
     policies::{
         AuthenticatorSelection, BrowserSelection, EmailSelection, ExternalSelection,
@@ -29,7 +29,7 @@ use crate::{
     },
 };
 use crate::{effect_map, identity};
-use effect::Effect;
+use effect::{Effect, Exit, effect, effect_future};
 use identity_rs::identity::{
     IdentityResult,
     axum::browser::BrowserRequestSecurity,
@@ -302,6 +302,49 @@ impl<
         }
     }
 }
+enum CookieHeaderSource {
+    Owned(http::HeaderMap),
+    Request(effect_server::Request),
+}
+
+impl CookieHeaderSource {
+    fn headers(&self) -> &http::HeaderMap {
+        match self {
+            Self::Owned(headers) => headers,
+            Self::Request(request) => request.headers(),
+        }
+    }
+}
+
+fn check_auth_header(
+    request: &effect_server::Request,
+    header: &http::HeaderName,
+    maximum: NonZeroUsize,
+) -> Result<(), IdentityError> {
+    use effect::memory::{Bytes, MemoryError};
+    let values = request.headers().get_all(header);
+    if *header == http::header::AUTHORIZATION && values.iter().nth(1).is_some() {
+        return Err(IdentityError::Policy(http::StatusCode::BAD_REQUEST));
+    }
+    let limit = Bytes::new(maximum.get());
+    let mut total = Bytes::new(0);
+    for value in &values {
+        let add = Bytes::new(header.as_str().len()).checked_add(Bytes::new(value.as_bytes().len()));
+        total = add
+            .and_then(|add| total.checked_add(add))
+            .map_err(|error| IdentityError::Input(effect_server::ServerError::Memory(error)))?;
+        if total > limit {
+            return Err(IdentityError::Input(effect_server::ServerError::Memory(
+                MemoryError::ValueTooLarge {
+                    requested: total,
+                    capacity: limit,
+                },
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Trusted native cookie verification result; only accepted current state carries authority.
 pub enum CookieAuthentication {
     /// Selected cookie absent.
@@ -1872,55 +1915,79 @@ where
         P::Service: CookieSessionService,
         P::Principal: PrincipalComponents<Users<C::Native>>,
     {
-        identity! {
-        identity: self, invoke_once(headers), native: |native, headers, authority, policies| async move {
-                    use identity_rs::identity::principal::security_stamp::SecurityStampUserAccessor;
-                    use identity_rs::identity::ticket::CookieSessionResult;
-                    let principal = policies.principal_policy()?;
-                    let validator = CurrentTicketValidator {
-                        users: native.user_manager(),
-                        policy: principal,
-                        clock: authority.clock(),
-                    };
-                    match policies
-                        .ticket_service()?
-                        .authenticate_with_validator(&headers, &validator)
+        self.authenticate_cookie_from(CookieHeaderSource::Owned(headers), None)
+    }
+
+    fn authenticate_cookie_from<E, R>(
+        &self,
+        headers: CookieHeaderSource,
+        admission: Option<PreparedIdentityInvocation<S::Backend>>,
+    ) -> Effect<CookieAuthentication, E, R>
+    where
+        E: Send + 'static,
+        R: Send + Sync + 'static,
+        M: Fn(IdentityError) -> E,
+        C::Native: SignInService,
+        Users<C::Native>:
+            identity_rs::identity::principal::security_stamp::SecurityStampUserAccessor,
+        P: TicketSelection + PrincipalSelection,
+        P::Service: CookieSessionService,
+        P::Principal: PrincipalComponents<Users<C::Native>>,
+    {
+        let operation = |native: C::Native,
+                         headers: CookieHeaderSource,
+                         authority: IdentityAuthority<S::Backend>,
+                         policies: Arc<P>| async move {
+            use identity_rs::identity::principal::security_stamp::SecurityStampUserAccessor;
+            use identity_rs::identity::ticket::CookieSessionResult;
+            let principal = policies.principal_policy()?;
+            let validator = CurrentTicketValidator {
+                users: native.user_manager(),
+                policy: principal,
+                clock: authority.clock(),
+            };
+            match policies
+                .ticket_service()?
+                .authenticate_with_validator(headers.headers(), &validator)
+                .await
+                .map_err(IdentityError::Ticket)?
+            {
+                CookieSessionResult::Missing => Ok(CookieAuthentication::Missing),
+                CookieSessionResult::Rejected { removal } => {
+                    Ok(CookieAuthentication::Rejected { removal })
+                }
+                CookieSessionResult::Authenticated { ticket, renewal } => {
+                    let user = native
+                        .user_manager()
+                        .find_user_by_principal(ticket.principal(), principal.claims_options())
                         .await
-                        .map_err(IdentityError::Ticket)?
+                        .map_err(IdentityError::Native)?
+                        .ok_or(IdentityError::Unauthorized)?;
+                    if !native
+                        .user_manager()
+                        .validate_security_stamp(
+                            &user,
+                            ticket.principal().find_first_value(
+                                &principal.claims_options().security_stamp_claim_type,
+                            ),
+                        )
+                        .await
+                        .map_err(IdentityError::Native)?
                     {
-                        CookieSessionResult::Missing => Ok(CookieAuthentication::Missing),
-                        CookieSessionResult::Rejected { removal } => {
-                            Ok(CookieAuthentication::Rejected { removal })
-                        }
-                        CookieSessionResult::Authenticated { ticket, renewal } => {
-                            let user = native
-                                .user_manager()
-                                .find_user_by_principal(ticket.principal(), principal.claims_options())
-                                .await
-                                .map_err(IdentityError::Native)?
-                                .ok_or(IdentityError::Unauthorized)?;
-                            if !native
-                                .user_manager()
-                                .validate_security_stamp(
-                                    &user,
-                                    ticket.principal().find_first_value(
-                                        &principal.claims_options().security_stamp_claim_type,
-                                    ),
-                                )
-                                .await
-                                .map_err(IdentityError::Native)?
-                            {
-                                return Err(IdentityError::StaleGrant);
-                            }
-                            let actor = authority.verify_user_grant(&user).await?;
-                            Ok(CookieAuthentication::Authenticated {
-                                ticket: Arc::new(ticket),
-                                actor,
-                                renewal,
-                            })
-                        }
+                        return Err(IdentityError::StaleGrant);
                     }
-                },
+                    let actor = authority.verify_user_grant(&user).await?;
+                    Ok(CookieAuthentication::Authenticated {
+                        ticket: Arc::new(ticket),
+                        actor,
+                        renewal,
+                    })
+                }
+            }
+        };
+        match admission {
+            Some(admission) => self.invoke_prepared_once(admission, headers, operation),
+            None => identity! { identity: self, invoke_once(headers), native: operation },
         }
     }
     /// Issue bearer mode only from trusted completion and exact current user state.
@@ -2594,11 +2661,63 @@ where
         P::Service: CookieSessionService,
         P::Principal: PrincipalComponents<Users<C::Native>>,
     {
+        self.cookie_stage_with_limit(None)
+    }
+
+    /// Select prepared admission and a maximum aggregate Cookie header size
+    /// for the installed Web authentication hook, including each field name.
+    /// The original map is borrowed by the same native ticket validator.
+    pub fn prepared_cookie_stage<E, R>(
+        &self,
+        bytes: NonZeroUsize,
+    ) -> impl Fn(effect_server::Request) -> Effect<bool, E, R> + Send + Sync + 'static
+    where
+        E: Send + 'static,
+        R: Send + Sync + 'static,
+        M: Fn(IdentityError) -> E,
+        C::Native: SignInService,
+        Users<C::Native>:
+            identity_rs::identity::principal::security_stamp::SecurityStampUserAccessor,
+        P: TicketSelection + PrincipalSelection,
+        P::Service: CookieSessionService,
+        P::Principal: PrincipalComponents<Users<C::Native>>,
+    {
+        self.cookie_stage_with_limit(Some(bytes))
+    }
+
+    fn cookie_stage_with_limit<E, R>(
+        &self,
+        bytes: Option<NonZeroUsize>,
+    ) -> impl Fn(effect_server::Request) -> Effect<bool, E, R> + Send + Sync + 'static
+    where
+        E: Send + 'static,
+        R: Send + Sync + 'static,
+        M: Fn(IdentityError) -> E,
+        C::Native: SignInService,
+        Users<C::Native>:
+            identity_rs::identity::principal::security_stamp::SecurityStampUserAccessor,
+        P: TicketSelection + PrincipalSelection,
+        P::Service: CookieSessionService,
+        P::Principal: PrincipalComponents<Users<C::Native>>,
+    {
         let definition = self.clone();
         move |request: effect_server::Request| {
-            effect_map! {
-            program: definition
-            .authenticate_cookie(request.headers().clone()), map: move |outcome| {
+            let program = match bytes {
+                Some(bytes) => {
+                    let admit = definition.prepared_header_admission(
+                        request.clone(),
+                        http::header::COOKIE,
+                        bytes,
+                    );
+                    let definition = definition.clone();
+                    effect! { bind; program: admit, body: move |(request, admission)| {
+                        definition.authenticate_cookie_from(CookieHeaderSource::Request(request), Some(admission))
+                    }, }
+                }
+                None => definition
+                    .authenticate_cookie_from(CookieHeaderSource::Request(request.clone()), None),
+            };
+            effect_map! { program: program, map: move |outcome| {
                 let (authenticated, header) = match outcome {
                     CookieAuthentication::Missing => (false, None),
                     CookieAuthentication::Rejected { removal } => (false, Some(removal)),
@@ -2640,62 +2759,147 @@ where
         P::Provider: UserTokenProvider<IdentityUser>,
     {
         let definition = self.clone();
-        move |request: effect_server::Request| {
-            identity! {
-            identity: definition, invoke_once(request), native: |native, request, authority, policies| async move {
-                            let values = request.headers().get_all(http::header::AUTHORIZATION);
-                            if values.iter().count() > 1 {
-                                return Err(IdentityError::Policy(http::StatusCode::BAD_REQUEST));
-                            }
-                            let Some(header) = values.iter().next() else {
-                                return Ok(false);
-                            };
-                            let Ok(text) = header.to_str() else {
-                                return Ok(false);
-                            };
-                            let Some((scheme, token)) = text.split_once(' ') else {
-                                return Ok(false);
-                            };
-                            if !scheme.eq_ignore_ascii_case("Bearer") {
-                                return Ok(false);
-                            }
-                            let parsed = match identity_rs::identity::tokens::parse_bearer_token(token) {
-                                Ok(parsed) => parsed,
-                                Err(identity_rs::identity::tokens::BearerTokenError::InvalidToken) => {
-                                    return Ok(false);
-                                }
-                                Err(error) => return Err(IdentityError::Bearer(error)),
-                            };
-                            let Some(user) = native
-                                .user_manager()
-                                .find_by_id(&parsed.user_id())
-                                .await
-                                .map_err(IdentityError::Native)?
-                            else {
-                                return Ok(false);
-                            };
-                            match identity_rs::identity::tokens::validate_user_access_token(
-                                policies.token_provider()?,
-                                token,
-                                &user,
-                            )
-                            .await
-                            {
-                                Ok(true) => {
-                                    let actor = authority.verify_user_grant(&user).await?;
-                                    request.insert_extension(actor);
-                                    Ok(true)
-                                }
-                                Ok(false)
-                                | Err(identity_rs::identity::tokens::BearerTokenError::InvalidToken) => {
-                                    Ok(false)
-                                }
-                                Err(error) => Err(IdentityError::Bearer(error)),
-                            }
-                        },
-            }
+        move |request| definition.authenticate_selected_bearer(request, None)
+    }
+
+    /// Select prepared admission and a maximum Authorization header byte size
+    /// including its name, for Web's existing authentication hook.
+    pub fn prepared_bearer_stage<E, R>(
+        &self,
+        bytes: NonZeroUsize,
+    ) -> impl Fn(effect_server::Request) -> Effect<bool, E, R> + Send + Sync + 'static
+    where
+        E: Send + 'static,
+        R: Send + Sync + 'static,
+        M: Fn(IdentityError) -> E,
+        C::Native: SignInService,
+        Users<C::Native>: UserLifecycleManager,
+        P: TokenSelection,
+        P::Provider: UserTokenProvider<IdentityUser>,
+    {
+        let definition = self.clone();
+        move |request| {
+            let admit =
+                definition.prepared_header_admission(request, http::header::AUTHORIZATION, bytes);
+            let definition = definition.clone();
+            effect! { bind; program: admit, body: move |(request, admission)| {
+                definition.authenticate_selected_bearer(request, Some(admission))
+            }, }
         }
     }
+
+    fn authenticate_selected_bearer<E, R>(
+        &self,
+        request: effect_server::Request,
+        admission: Option<PreparedIdentityInvocation<S::Backend>>,
+    ) -> Effect<bool, E, R>
+    where
+        E: Send + 'static,
+        R: Send + Sync + 'static,
+        M: Fn(IdentityError) -> E,
+        C::Native: SignInService,
+        Users<C::Native>: UserLifecycleManager,
+        P: TokenSelection,
+        P::Provider: UserTokenProvider<IdentityUser>,
+    {
+        let operation = |native: C::Native,
+                         request: effect_server::Request,
+                         authority: IdentityAuthority<S::Backend>,
+                         policies: Arc<P>| async move {
+            let values = request.headers().get_all(http::header::AUTHORIZATION);
+            if values.iter().count() > 1 {
+                return Err(IdentityError::Policy(http::StatusCode::BAD_REQUEST));
+            }
+            let Some(header) = values.iter().next() else {
+                return Ok(false);
+            };
+            let Ok(text) = header.to_str() else {
+                return Ok(false);
+            };
+            let Some((scheme, token)) = text.split_once(' ') else {
+                return Ok(false);
+            };
+            if !scheme.eq_ignore_ascii_case("Bearer") {
+                return Ok(false);
+            }
+            let parsed = match identity_rs::identity::tokens::parse_bearer_token(token) {
+                Ok(parsed) => parsed,
+                Err(identity_rs::identity::tokens::BearerTokenError::InvalidToken) => {
+                    return Ok(false);
+                }
+                Err(error) => return Err(IdentityError::Bearer(error)),
+            };
+            let Some(user) = native
+                .user_manager()
+                .find_by_id(&parsed.user_id())
+                .await
+                .map_err(IdentityError::Native)?
+            else {
+                return Ok(false);
+            };
+            match identity_rs::identity::tokens::validate_user_access_token(
+                policies.token_provider()?,
+                token,
+                &user,
+            )
+            .await
+            {
+                Ok(true) => {
+                    let actor = authority.verify_user_grant(&user).await?;
+                    request.insert_extension(actor);
+                    Ok(true)
+                }
+                Ok(false) | Err(identity_rs::identity::tokens::BearerTokenError::InvalidToken) => {
+                    Ok(false)
+                }
+                Err(error) => Err(IdentityError::Bearer(error)),
+            }
+        };
+        match admission {
+            Some(admission) => self.invoke_prepared_once(admission, request, operation),
+            None => identity! { identity: self, invoke_once(request), native: operation },
+        }
+    }
+
+    fn prepared_header_admission<E, R>(
+        &self,
+        request: effect_server::Request,
+        header: http::HeaderName,
+        bytes: NonZeroUsize,
+    ) -> Effect<
+        (
+            effect_server::Request,
+            PreparedIdentityInvocation<S::Backend>,
+        ),
+        E,
+        R,
+    >
+    where
+        E: Send + 'static,
+        R: Send + Sync + 'static,
+        M: Fn(IdentityError) -> E,
+    {
+        let definition = self.clone();
+        effect_future! {
+            exit_with_context;
+            body: move |_: Arc<R>, _| {
+                let definition = definition.clone();
+                let request = request.clone();
+                let header = header.clone();
+                async move {
+                    let result = definition.reserve_prepared_invocation().and_then(|admission| {
+                        check_auth_header(&request, &header, bytes)?;
+                        Ok((request, admission))
+                    });
+                    match result {
+                        Ok(admission) => Exit::Success(admission),
+                        Err(error) => error.into_exit().map_error(|error| definition.map_error(error)),
+                    }
+                }
+            },
+        }
+    }
+
     /// Seal genuine native primary proof into the selected browser context. Storage
     /// acknowledgment consumes this owned receipt; copying grants cannot establish
     /// one-use. External metadata uses its native external HTTP group or the explicit

@@ -56,6 +56,7 @@
 //! owner's deliberate public surface.
 
 mod builders;
+mod demand;
 mod model;
 mod registry;
 mod relation_validation;
@@ -73,7 +74,7 @@ pub use self::model::{
     ResourceListSectionDefinition, ResourceRouteSet, ResourceSEODefinition,
     ResourceSitemapDefinition,
 };
-pub use self::registry::{DefinitionRegistry, UnknownResourceKind};
+pub use self::registry::{DefinitionRegistry, PreparedDefinitionCapacity, UnknownResourceKind};
 pub use self::relations::{
     RelationError, ResourceRelationDefinition, ResourceRelationDescriptor,
     ResourceRelationEditorDefinition, ResourceRelationKeyDefinition,
@@ -141,6 +142,38 @@ pub trait Registry {
     /// the last stored definition. The returned outer list is independent of the
     /// registry and of every other call.
     fn definitions(&self) -> Vec<ResourceDefinition>;
+
+    /// Visit a definition for read-only work. A consumer implementation may
+    /// serve this from its own snapshot by overriding the compatibility default.
+    fn visit_definition(
+        &self,
+        kind: &ResourceKind,
+        visit: &mut dyn FnMut(&ResourceDefinition),
+    ) -> Result<(), UnknownResourceKind> {
+        visit(&self.definition(kind)?);
+        Ok(())
+    }
+
+    /// Visit definitions in registration order, stopping when the visitor breaks.
+    fn visit_definitions(
+        &self,
+        visit: &mut dyn FnMut(&ResourceDefinition) -> std::ops::ControlFlow<()>,
+    ) -> std::ops::ControlFlow<()> {
+        for definition in self.definitions() {
+            visit(&definition)?;
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    /// Visit definitions directly from retained storage for a selected prepared
+    /// consumer. A registry that cannot borrow its definitions returns a typed
+    /// refusal before invoking the visitor.
+    fn visit_prepared_definitions(
+        &self,
+        _visit: &mut dyn FnMut(&ResourceDefinition) -> std::ops::ControlFlow<()>,
+    ) -> Result<std::ops::ControlFlow<()>, effect::memory::MemoryError> {
+        Err(effect::memory::MemoryError::UnsupportedRunContract)
+    }
 }
 
 /// Compile-time witness that the concrete registry supplies the owner's lookup

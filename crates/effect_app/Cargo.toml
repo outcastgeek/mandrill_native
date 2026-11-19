@@ -2,7 +2,8 @@
 name = "effect-app"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version.workspace = true
+
 [dependencies]
 effect = { path = "../../crates/effect" }
 effect-tokio = { path = "../../crates/effect_tokio" }
@@ -15,5 +16,6 @@ futures-util = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
+
 [lints]
 workspace = true

@@ -2,7 +2,7 @@
 name = "effect"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version.workspace = true
 
 [features]
 default = []
@@ -15,7 +15,7 @@ futures-util = { workspace = true, default-features = false, features = ["std", 
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["arbitrary_precision"] }
 num-bigint = { version = "0.4.8", default-features = false, features = ["std"] }
-regex-automata = { version = "0.4.18", default-features = false, features = ["std", "syntax", "nfa-thompson", "nfa-pikevm", "unicode"] }
+regex-automata = { version = "=0.4.18", default-features = false, features = ["std", "syntax", "nfa-thompson", "nfa-pikevm", "unicode"] }
 serde_stacker = { workspace = true }
 
 [dev-dependencies]

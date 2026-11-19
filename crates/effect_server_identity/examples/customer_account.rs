@@ -1,6 +1,6 @@
 //! Register Maya, verify her password with native Identity, then save her receipt preference.
 //!
-//! Run: `CAFE_DATABASE=target/receipt-accounts.db cargo +1.99.0 run -p effect-server-identity --features sqlx-turso --example customer_account`.
+//! Run: `CAFE_DATABASE=target/receipt-accounts.db cargo +1.100.0 run -p effect-server-identity --features sqlx-turso --example customer_account`.
 //! Expected: `Maya registered, logged in, and saved email_receipts=true.`
 //! The native manager enforces its account/password policy, OS-backed password salt,
 //! two concurrent password operations and 100,000 hash iterations. The local SQLx

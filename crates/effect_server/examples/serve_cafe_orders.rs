@@ -1,6 +1,6 @@
 //! Retrieve customer 7's saved order 42 as HTML and JSON over a finite HTTP/1 host.
 //! Run with
-//! `CAFE_CHUNK_BYTES=4096 CAFE_JSON_BYTES=1024 CAFE_TELEMETRY_CAPACITY=8 CAFE_DRAIN_MS=3000 cargo +1.99.0 run -p effect-server --example serve_cafe_orders`.
+//! `CAFE_CHUNK_BYTES=4096 CAFE_JSON_BYTES=1024 CAFE_TELEMETRY_CAPACITY=8 CAFE_DRAIN_MS=3000 cargo +1.100.0 run -p effect-server --example serve_cafe_orders`.
 //! The caller chooses the bounded frame size and graceful-drain deadline. The finite run
 //! applies the supplied telemetry count to spans, metric descriptors and series per descriptor.
 //! prints HTTP 200 HTML and JSON responses for order 42, then releases the host and providers.
@@ -17,13 +17,10 @@ use effect::{
 };
 #[path = "../../effect_otel/examples/cafe_telemetry/mod.rs"]
 pub mod cafe_telemetry;
-#[cfg(not(test))]
 use cafe_telemetry::TelemetryCapacity;
-#[cfg(not(test))]
 use effect::effect_try_future;
 use effect::schema;
 use effect::{Effect, JsonWriterPolicy, ParsePolicy};
-#[cfg(not(test))]
 use effect_otel::BorrowedProviders;
 use effect_otel::{Otel, otel};
 use effect_server::effect_from_option;
@@ -33,10 +30,8 @@ use effect_server::{
     ServerPolicy, endpoint, pipeline, registered, reply, representations, route, router, routes,
     server,
 };
-#[cfg(not(test))]
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-#[cfg(not(test))]
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -279,8 +274,11 @@ pub(crate) async fn exchange(
         .map_err(ServerError::Io)?;
     String::from_utf8(received).map_err(|_| ServerError::Invalid("response UTF-8".into()))
 }
+// Keep the entry point typechecked when the test harness supplies its own main.
+#[cfg(test)]
+const _: fn() -> Result<(), Box<dyn std::error::Error>> = main;
+
 /// Execute once at the outer host boundary, then drain providers and shut down caller-owned SDKs.
-#[cfg(not(test))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let link = order_route()?.path(&OrderId(42))?;
     let chunk_bytes = NonZeroUsize::new(std::env::var("CAFE_CHUNK_BYTES")?.parse()?)

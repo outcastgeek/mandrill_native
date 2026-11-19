@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{Effect, ResourceValue, Scope};
 use crate::{KeyDomain, StableKey};
-use crate::{effect_scope_acquire, transaction};
+use crate::transaction;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -199,12 +199,7 @@ impl TxReentrantLock {
     where
         R: HasTransactionDomain + Send + Sync + 'static,
     {
-        let lock = self.clone();
-        let release_owner = owner.clone();
-        effect_scope_acquire! {
-        scope: scope, acquire: self.acquire(owner).atomically(policy), release: move |()| {
-                    lock.release(release_owner.clone()).atomically(policy)
-                },
-        }
+        let release = self.release(owner.clone());
+        self.acquire(owner).acquire_scoped(scope, release, policy)
     }
 }

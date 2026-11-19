@@ -36,7 +36,7 @@ impl JsonExactNumber {
             .parse()
             .map_err(|_| SchemaIssue::new(SchemaIssueKind::OutOfRange))?;
         let text = number.to_string();
-        let unsigned = text.strip_prefix('-').unwrap_or(&text);
+        let unsigned = text.trim_prefix('-');
         let (mantissa, exponent) = unsigned.split_once(['e', 'E']).unwrap_or((unsigned, "0"));
         let exponent: BigInt = exponent
             .parse()

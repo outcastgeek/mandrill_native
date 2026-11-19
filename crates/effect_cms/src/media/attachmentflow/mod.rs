@@ -37,6 +37,7 @@
 //! owners, and no table, schema, migration, query, pool, connection or backend is
 //! declared or opened.
 
+mod prepared;
 mod state;
 mod workflow;
 
@@ -45,6 +46,14 @@ pub use self::state::{
     ContentVideoMutationMediaStateOptions, build_content_media_collection_mutation_state,
     build_content_video_mutation_media_state,
 };
+pub use self::prepared::{
+    PreparedAttachmentReplaceOptions, PreparedAttachmentRowBuilder, PreparedAttachmentRowPool,
+    PreparedAttachmentRowReplacer, PreparedAttachmentRows,
+    list_prepared_media_attachment_form_items,
+    preview_prepared_media_attachment_form_items_from_request,
+    replace_prepared_media_attachments_from_request,
+};
+pub(crate) use self::prepared::{list_prepared_admitted, reserve_attachment_list};
 pub use self::workflow::{
     AttachmentPreviewer, AttachmentReplacer, CurrentMediaAttachmentInputOptions,
     MediaAttachmentAssetLoader, MediaAttachmentItemBuilder, MediaAttachmentItemLoader,

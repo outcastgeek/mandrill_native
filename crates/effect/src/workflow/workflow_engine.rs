@@ -3,8 +3,8 @@
 use super::{
     EncodedWorkflowOutcome, RecordedActivity, RecordedChild, RecordedCompensation,
     RecordedDeadline, RecordedRace, RecordedSignal, WorkflowActivityId, WorkflowCompensationId,
-    WorkflowHandle, WorkflowRaceId, WorkflowRegistration, WorkflowRunId, WorkflowSignalId,
-    WorkflowSnapshot, WorkflowStatus, WorkflowVersion,
+    WorkflowHandle, WorkflowHead, WorkflowRaceId, WorkflowRegistration, WorkflowRunId,
+    WorkflowSignalId, WorkflowSnapshot, WorkflowStatus, WorkflowVersion,
 };
 use crate::{Effect, UtcMillis};
 use std::num::NonZeroU32;
@@ -133,6 +133,16 @@ pub trait WorkflowEngine: Send + Sync + 'static {
         handle: WorkflowHandle,
         encoded_input: Arc<[u8]>,
     ) -> Effect<WorkflowSnapshot, Self::Error>;
+
+    /// Start or recover the same run and return only its authoritative header.
+    /// Providers can project it in the same transaction without reading history.
+    fn start_head(
+        &self,
+        handle: WorkflowHandle,
+        encoded_input: Arc<[u8]>,
+    ) -> Effect<WorkflowHead, Self::Error> {
+        crate::effect_map! { program: self.start(handle, encoded_input), map: WorkflowSnapshot::into_head, }
+    }
     /// # Parameters
     /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
     ///
@@ -140,6 +150,13 @@ pub trait WorkflowEngine: Send + Sync + 'static {
     /// Type: `Effect<Option<WorkflowSnapshot>, Self::Error>`.
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     fn inspect(&self, run: WorkflowRunId) -> Effect<Option<WorkflowSnapshot>, Self::Error>;
+
+    /// Inspect run metadata without loading its replay histories when supported.
+    fn inspect_head(&self, run: WorkflowRunId) -> Effect<Option<WorkflowHead>, Self::Error> {
+        crate::effect_map! {
+            program: self.inspect(run), map: |snapshot| snapshot.map(WorkflowSnapshot::into_head),
+        }
+    }
     /// Lazily conditionally transition this run using the complete expected checkpoint.
     ///
     /// Providers must atomically compare status and execution ownership with `expected`
@@ -153,6 +170,16 @@ pub trait WorkflowEngine: Send + Sync + 'static {
         expected: super::WorkflowCheckpoint,
         next: WorkflowStatus,
     ) -> Effect<WorkflowSnapshot, Self::Error>;
+
+    /// Perform the same checkpoint comparison and transition, projecting its authoritative header.
+    fn transition_head(
+        &self,
+        run: WorkflowRunId,
+        expected: super::WorkflowCheckpoint,
+        next: WorkflowStatus,
+    ) -> Effect<WorkflowHead, Self::Error> {
+        crate::effect_map! { program: self.transition(run, expected, next), map: WorkflowSnapshot::into_head, }
+    }
     /// # Parameters
     /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
     /// - `activity` (`WorkflowActivityId`): The activity supplied to this operation.
@@ -389,6 +416,15 @@ pub trait WorkflowEngine: Send + Sync + 'static {
         run: WorkflowRunId,
         outcome: EncodedWorkflowOutcome,
     ) -> Effect<WorkflowSnapshot, Self::Error>;
+
+    /// Record the same terminal outcome and return its authoritative header.
+    fn complete_head(
+        &self,
+        run: WorkflowRunId,
+        outcome: EncodedWorkflowOutcome,
+    ) -> Effect<WorkflowHead, Self::Error> {
+        crate::effect_map! { program: self.complete(run, outcome), map: WorkflowSnapshot::into_head, }
+    }
     /// # Parameters
     /// - `run` (`WorkflowRunId`): Stable identity of the workflow run being inspected or changed.
     ///

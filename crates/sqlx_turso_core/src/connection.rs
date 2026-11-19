@@ -128,6 +128,59 @@ impl TursoConnection {
         self.fetch_many_sql(sql, true, arguments).await
     }
 
+    /// Open an owned cursor that yields each row before fetching the next.
+    /// Argument-free multiple commands execute sequentially as the stream is
+    /// consumed; a later error can follow earlier results. The caller retains
+    /// exclusive connection ownership until the stream is destroyed. Native
+    /// statement, row, value and parser allocations remain separate.
+    pub async fn owned_incremental_cursor(
+        &mut self,
+        sql: sqlx_core::sql_str::SqlStr,
+        arguments: Option<crate::TursoArguments>,
+    ) -> Result<OwnedCursorItems, Error> {
+        self.fetch_many_incremental(sql, arguments).await
+    }
+
+    /// Incremental cursor backed by prepared retained rows. Native SDK and VM allocations remain separate.
+    pub async fn owned_incremental_cursor_prepared(
+        &mut self,
+        sql: sqlx_core::sql_str::SqlStr,
+        arguments: Option<crate::TursoArguments>,
+        pool: std::sync::Arc<crate::PreparedTursoRowsPool>,
+    ) -> Result<
+        futures_core::stream::BoxStream<
+            'static,
+            Result<
+                either::Either<crate::TursoQueryResult, crate::TursoRow>,
+                crate::PreparedTursoCursorError,
+            >,
+        >,
+        Error,
+    > {
+        self.fetch_many_incremental_prepared(sql, arguments, pool)
+            .await
+    }
+
+    /// Incremental cursor with its first prepared row already reserved.
+    pub async fn owned_incremental_cursor_reserved(
+        &mut self,
+        sql: sqlx_core::sql_str::SqlStr,
+        arguments: Option<crate::TursoArguments>,
+        reservation: crate::PreparedTursoCursorReservation,
+    ) -> Result<
+        futures_core::stream::BoxStream<
+            'static,
+            Result<
+                either::Either<crate::TursoQueryResult, crate::TursoRow>,
+                crate::PreparedTursoCursorError,
+            >,
+        >,
+        Error,
+    > {
+        self.fetch_many_incremental_reserved(sql, arguments, reservation)
+            .await
+    }
+
     /// Resolve every transaction before disposing an exclusively transferred owner.
     ///
     /// This drains SQLx's pending rollback first, then awaits native rollback for

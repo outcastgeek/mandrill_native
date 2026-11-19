@@ -30,6 +30,7 @@ pub enum ColumnKey {
 }
 impl ColumnKey {
     /// Resolve native metadata while retaining the exact requested identity.
+    #[expect(clippy::result_large_err, reason = "retains the owned SQL error representation without an extra heap allocation")]
     fn index(&self, row: &TursoRow) -> Result<usize, RowError> {
         match self {
             Self::Name(name) => name.as_str().index(row),
@@ -198,6 +199,31 @@ where
         }),
     }
 }
+#[expect(clippy::result_large_err, reason = "retains the native SQL row error")]
+fn decode_native<T>(row: &TursoRow, index: usize, label: impl FnOnce() -> String) -> Result<T, RowError>
+where
+    T: Type<Turso>,
+    for<'a> T: Decode<'a, Turso>,
+{
+    match row.try_get_raw(index) {
+        Ok(value) if value.is_null() => return Err(RowError::NullColumn(label())),
+        Err(source) => return Err(RowError::Native { column: label(), source }),
+        Ok(_) => {}
+    }
+    row.try_get(index).map_err(|source| RowError::Native { column: label(), source })
+}
+
+/// Decode a required named cell directly from the admitted native row.
+#[expect(clippy::result_large_err, reason = "retains the native SQL row error")]
+pub fn native_column_ref<T>(row: &TursoRow, name: &str) -> Result<T, RowError>
+where
+    T: Type<Turso>,
+    for<'a> T: Decode<'a, Turso>,
+{
+    let index = name.index(row).map_err(|_| RowError::MissingColumn(name.to_owned()))?;
+    decode_native(row, index, || name.to_owned())
+}
+
 /// Decode a native Rust cell without a schema conversion; SQLx retains native type checks.
 pub fn native_column<T, R>(key: impl Into<ColumnKey>) -> RowRead<T, R>
 where
@@ -213,24 +239,9 @@ where
                     Ok(index) => index,
                     Err(error) => return Exit::Fail(error),
                 };
-                match row.try_get_raw(index) {
-                    Ok(value) if value.is_null() => {
-                        return Exit::Fail(RowError::NullColumn(key.label()));
-                    }
-                    Err(source) => {
-                        return Exit::Fail(RowError::Native {
-                            column: key.label(),
-                            source,
-                        });
-                    }
-                    Ok(_) => {}
-                }
-                match row.try_get::<T, _>(index) {
+                match decode_native(&row, index, || key.label()) {
                     Ok(value) => Exit::Success(value),
-                    Err(source) => Exit::Fail(RowError::Native {
-                        column: key.label(),
-                        source,
-                    }),
+                    Err(error) => Exit::Fail(error),
                 }
             })
         }),
@@ -322,17 +333,34 @@ pub(crate) fn failure_as<A, B, E>(exit: Exit<A, E>) -> Result<A, Exit<B, E>> {
     }
 }
 
-/// Reusable row decoder description. Each invocation moves one native row into its own program.
+type RowProjection<A> = dyn Fn(&TursoRow) -> Result<A, RowError> + Send + Sync;
+type EnvironmentProjection<A, R> = dyn Fn(&TursoRow, &R) -> Result<A, RowError> + Send + Sync;
+enum BorrowedProjection<A, R> {
+    Plain(Arc<RowProjection<A>>),
+    Environment(Arc<EnvironmentProjection<A, R>>),
+}
+impl<A, R> Clone for BorrowedProjection<A, R> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Plain(project) => Self::Plain(project.clone()),
+            Self::Environment(project) => Self::Environment(project.clone()),
+        }
+    }
+}
+
+/// Reusable row decoder description. Each owned invocation moves one native row into its program.
 #[must_use]
 pub struct RowDecoder<A: Send + 'static, R: Send + Sync + 'static = ()> {
     /// Lazy program factory; shared handles may be explicitly retained by the caller.
     run: Arc<RowProgram<A, R>>,
+    projection: Option<BorrowedProjection<A, R>>,
 }
 impl<A: Send + 'static, R: Send + Sync + 'static> Clone for RowDecoder<A, R> {
     /// Share decoder configuration without copying rows or output payloads.
     fn clone(&self) -> Self {
         Self {
             run: self.run.clone(),
+            projection: self.projection.clone(),
         }
     }
 }
@@ -353,17 +381,63 @@ impl<A: Send + 'static, R: Send + Sync + 'static> RowDecoder<A, R> {
                     }
                 })
             }),
+            projection: None,
         }
     }
     /// Adapt an extracted native projection returning typed row errors.
     pub fn pure(
         project: impl Fn(&TursoRow) -> Result<A, RowError> + Send + Sync + 'static,
     ) -> Self {
-        let project = Arc::new(project);
-        Self::from_program(move |context| {
-            let project = project.clone();
+        let project: Arc<RowProjection<A>> = Arc::new(project);
+        let run_project = project.clone();
+        let mut decoder = Self::from_program(move |context| {
+            let project = run_project.clone();
             async move { project(&context.row).map_err(|error| Box::new(Exit::Fail(error))) }
-        })
+        });
+        decoder.projection = Some(BorrowedProjection::Plain(project));
+        decoder
+    }
+    /// Adapt a genuine borrowed projection using the original selected environment.
+    pub fn pure_with_env(
+        project: impl Fn(&TursoRow, &R) -> Result<A, RowError> + Send + Sync + 'static,
+    ) -> Self {
+        let project: Arc<EnvironmentProjection<A, R>> = Arc::new(project);
+        let run_project = project.clone();
+        let mut decoder = Self::from_program(move |context| {
+            let project = run_project.clone();
+            async move { project(&context.row, &context.env).map_err(|error| Box::new(Exit::Fail(error))) }
+        });
+        decoder.projection = Some(BorrowedProjection::Environment(project));
+        decoder
+    }
+    /// Whether this decoder has an independent borrowed projection.
+    #[must_use]
+    pub fn has_borrowed_decoder(&self) -> bool {
+        matches!(&self.projection, Some(BorrowedProjection::Plain(_)))
+    }
+    /// Run the genuine synchronous projection once, without a row Arc or Effect.
+    /// The caller supplies panic and context boundaries. Native row storage and
+    /// any allocations owned by the returned value remain separate.
+    #[expect(clippy::result_large_err, reason = "retains the owned SQL row error representation without an extra heap allocation")]
+    pub fn decode_ref(&self, row: &TursoRow) -> Result<A, RowError> {
+        match &self.projection {
+            Some(BorrowedProjection::Plain(project)) => project(row),
+            Some(BorrowedProjection::Environment(_)) | None => Err(RowError::MissingBorrowedDecoder),
+        }
+    }
+    /// Whether either genuine borrowed projection can use the selected environment.
+    #[must_use]
+    pub fn has_borrowed_decoder_with_env(&self) -> bool {
+        self.projection.is_some()
+    }
+    /// Invoke the genuine borrowed projection with the original environment.
+    #[expect(clippy::result_large_err, reason = "retains the owned SQL row error representation without an extra heap allocation")]
+    pub fn decode_ref_with_env(&self, row: &TursoRow, env: &R) -> Result<A, RowError> {
+        match &self.projection {
+            Some(BorrowedProjection::Plain(project)) => project(row),
+            Some(BorrowedProjection::Environment(project)) => project(row, env),
+            None => Err(RowError::MissingBorrowedDecoder),
+        }
     }
     /// Decode under the outer native bridge, preserving row failures and application capabilities.
     pub async fn decode(

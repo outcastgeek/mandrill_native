@@ -141,8 +141,7 @@ pub fn resolve_media_provider(
         None => return InputBytes::default(),
     };
     let host = crate::byte_text::lowercase(trim_unicode_whitespace(&parsed.host));
-    let host = host.as_str();
-    let host = host.strip_prefix("www.").unwrap_or(host);
+    let host = host.trim_prefix("www.");
     if host == "youtu.be" || host.contains("youtube.com") {
         return "YouTube".to_owned().into();
     }

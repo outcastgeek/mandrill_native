@@ -161,7 +161,7 @@ fn same_event_intent(actual: &EventEnvelope, expected: &EventEnvelope) -> bool {
 /// # Returns
 /// Type: `EventRunError<JournalError, HandlerError>`.
 /// Returns `EventRunError<JournalError, HandlerError>`.
-fn recorded_outcome_error<JournalError, HandlerError>(
+pub(super) fn recorded_outcome_error<JournalError, HandlerError>(
     error: EventCodecError,
 ) -> EventRunError<JournalError, HandlerError> {
     match error {

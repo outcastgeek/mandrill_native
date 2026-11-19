@@ -2,7 +2,11 @@ use effect::{
     Defect, DiagnosticCapacity, DiagnosticOverflow, Diagnostics, Exit, LibraryDefect, LogLevel,
     Logger,
 };
-use effect_app::{AppConfig, AppError, Files, LiveApp, application, describe};
+use effect_app::{
+    AppConfig, AppError, AppMemoryLimits, AppMemoryMode, Files, InputLoadError, LiveApp,
+    ManagedAppError, ManagedLiveApp, ManagedStartupError, application, describe,
+    managed_application,
+};
 use std::{
     num::NonZeroUsize,
     path::PathBuf,
@@ -34,8 +38,8 @@ fn nz(value: usize) -> NonZeroUsize {
     assert!(value > 0, "fixture capacity must be positive");
     NonZeroUsize::MIN.saturating_add(value - 1)
 }
-fn app(directory: &Directory) -> Result<LiveApp, String> {
-    LiveApp::new(AppConfig {
+fn config(directory: &Directory) -> AppConfig {
+    AppConfig {
         files: Files {
             input: directory.0.join("input.json"),
             staging: directory.0.join("staging"),
@@ -54,8 +58,10 @@ fn app(directory: &Directory) -> Result<LiveApp, String> {
         retries: 2,
         retry_delay: Duration::ZERO,
         log_level: LogLevel::Error,
-    })
-    .map_err(|error| format!("fixture failed: {error:?}"))
+    }
+}
+fn app(directory: &Directory) -> Result<LiveApp, String> {
+    LiveApp::new(config(directory)).map_err(|error| format!("fixture failed: {error:?}"))
 }
 fn run(app: &LiveApp) -> Exit<effect_app::Report, effect::SharedValue<AppError>> {
     app.runtime.block_on(async {
@@ -63,6 +69,98 @@ fn run(app: &LiveApp) -> Exit<effect_app::Report, effect::SharedValue<AppError>>
         app.drain().await;
         outcome
     })
+}
+
+#[test]
+fn managed_modes_refuse_oversized_input_then_commit_using_the_same_backing()
+-> Result<(), Box<dyn std::error::Error>> {
+    use effect::memory::Bytes;
+
+    let exact = br#"{"samples":[10,20,-24]}"#;
+    let limits = AppMemoryLimits {
+        total_bytes: Bytes::new(256 * 1024),
+        input_bytes: nz(exact.len()),
+        output_bytes: nz(512),
+        samples: nz(3),
+        runs: nz(1),
+    };
+    for mode in [
+        AppMemoryMode::BoundedAllocation,
+        AppMemoryMode::PreparedReuse,
+    ] {
+        let directory = Directory::new()?;
+        let selected = ManagedLiveApp::new(config(&directory), mode, limits)
+            .map_err(|error| format!("managed startup failed: {error:?}"))?;
+        let files = &selected.app.env.files;
+        let initial = selected.memory_report();
+        assert_eq!(initial.reserved, limits.total_bytes);
+        std::fs::write(&files.output, b"previous\n")?;
+
+        for oversized in [
+            br#"{ "samples":[10,20,-24]}"#.as_slice(),
+            br#"{"samples":[1,1,1,1]}"#,
+        ] {
+            std::fs::write(&files.input, oversized)?;
+            let outcome = selected
+                .app
+                .runtime
+                .block_on(managed_application().run_cancellable(Arc::clone(&selected.env)));
+            let Exit::Fail(error) = outcome else {
+                return Err("oversized managed input did not fail".into());
+            };
+            assert!(
+                error
+                    .with(|error| matches!(
+                        error,
+                        ManagedAppError::Input(InputLoadError::Memory(_))
+                    ))
+                    .unwrap_or(false)
+            );
+            assert_eq!(std::fs::read(&files.output)?, b"previous\n");
+            assert!(!files.staging.exists());
+        }
+
+        for _ in 0..3 {
+            std::fs::write(&files.input, exact)?;
+            let outcome = selected
+                .app
+                .runtime
+                .block_on(managed_application().run_cancellable(Arc::clone(&selected.env)));
+            assert!(
+                matches!(outcome, Exit::Success(report) if report.sum == 6 && report.input_bytes == exact.len() as u64)
+            );
+            assert_eq!(std::fs::read(&files.output)?, b"6\n");
+            assert!(!files.staging.exists());
+            assert_eq!(selected.memory_report().committed, initial.committed);
+        }
+        selected.app.runtime.block_on(selected.app.drain());
+    }
+    Ok(())
+}
+
+#[test]
+fn managed_startup_refuses_an_arena_smaller_than_its_required_workspaces() -> Result<(), String> {
+    let directory = Directory::new()?;
+    let limits = AppMemoryLimits {
+        total_bytes: effect::memory::Bytes::new(1),
+        input_bytes: nz(64),
+        output_bytes: nz(64),
+        samples: nz(3),
+        runs: nz(1),
+    };
+    for mode in [
+        AppMemoryMode::BoundedAllocation,
+        AppMemoryMode::PreparedReuse,
+    ] {
+        assert!(matches!(
+            ManagedLiveApp::new(config(&directory), mode, limits),
+            Err(ManagedStartupError::Memory(
+                effect::memory::MemoryError::BudgetExceeded { .. }
+            ))
+        ));
+    }
+    assert!(!config(&directory).files.output.exists());
+    Ok(())
 }
 #[test]
 fn actual_file_application_commits_result_and_telemetry_failure_preserves_success()
@@ -153,7 +251,8 @@ fn provider_child_failure_is_reported_and_every_cleanup_detail_is_rendered() -> 
                 AppError::EmptySamples,
             )),
             effect::CleanupFailure::ReleaseInterrupted,
-        ],
+        ]
+        .into(),
     });
     let rendered = describe(outcome);
     assert!(

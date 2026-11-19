@@ -44,6 +44,7 @@ impl UserStore for SqlxIdentityStore {
     async fn create_user(&self, new_user: NewUser) -> Result<IdentityUser, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             new_user: NewUser,
         }
@@ -56,8 +57,8 @@ impl UserStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { new_user } = self;
-                let connection = StoreConnection::new(native);
+                let Self { new_user, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<IdentityUser, StoreError> = async move {
         let require_unique = new_user.require_unique_email();
@@ -67,7 +68,7 @@ impl UserStore for SqlxIdentityStore {
             .cloned()
             .ok_or(StoreError::CorruptStoredData)?;
         let normalized_email = user.normalized_email().map(ToString::to_string);
-        let payload = serialize_user(&user)?;
+        let payload = connection.encode_security(&user)?;
 
 
 
@@ -126,7 +127,7 @@ impl UserStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .transaction_operation(Operation { new_user })
+            .transaction_operation(Operation { security: self.security_scope()?, new_user })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -134,6 +135,7 @@ impl UserStore for SqlxIdentityStore {
     async fn update_user(&self, update: UserUpdate) -> Result<IdentityUser, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             update: UserUpdate,
         }
@@ -146,8 +148,8 @@ impl UserStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { update } = self;
-                let connection = StoreConnection::new(native);
+                let Self { update, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<IdentityUser, StoreError> = async move {
         let updated_user = update.user();
@@ -159,7 +161,7 @@ impl UserStore for SqlxIdentityStore {
         let normalized_name=updated_user.normalized_user_name().ok_or(StoreError::CorruptStoredData)?;
         validate_email_claim(&connection,updated_user,false).await?;
         let revision=ConcurrencyStamp::new();
-        let payload=serialize_refreshed_user(updated_user,&revision)?;
+        let payload=serialize_refreshed_user(&connection, updated_user,&revision)?;
         let changed=connection.execute("UPDATE effect_identity_users SET normalized_user_name=?1,normalized_email=?2,concurrency_stamp=?3,payload=?4 WHERE id=?5 AND concurrency_stamp=?6",
             (normalized_name.as_str(),updated_user.normalized_email().map(ToString::to_string),revision.to_string(),payload,id.to_string(),expected.to_string())).await.map_err(provider_category)?;
         ensure_rows_changed(changed,StoreError::TransactionConflict)?;
@@ -170,7 +172,7 @@ impl UserStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .transaction_operation(Operation { update })
+            .transaction_operation(Operation { security: self.security_scope()?, update })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -178,6 +180,7 @@ impl UserStore for SqlxIdentityStore {
     async fn delete_user(&self, id: &UserId) -> Result<(), StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
         }
@@ -190,8 +193,8 @@ impl UserStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<(), StoreError> = async move {
                     connection
@@ -209,7 +212,7 @@ impl UserStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .transaction_operation(Operation { id })
+            .transaction_operation(Operation { security: self.security_scope()?, id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -217,6 +220,7 @@ impl UserStore for SqlxIdentityStore {
     async fn find_user_by_id(&self, id: &UserId) -> Result<Option<IdentityUser>, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
         }
@@ -229,8 +233,8 @@ impl UserStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<Option<IdentityUser>, StoreError> =
                     async move { find_user_by_id(&connection, id).await }.await;
@@ -238,7 +242,7 @@ impl UserStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { id })
+            .connection_operation(Operation { security: self.security_scope()?, id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -249,6 +253,7 @@ impl UserStore for SqlxIdentityStore {
     ) -> Result<Option<IdentityUser>, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             normalized_name: &'input NormalizedUserName,
         }
@@ -261,8 +266,8 @@ impl UserStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { normalized_name } = self;
-                let connection = StoreConnection::new(native);
+                let Self { normalized_name, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<Option<IdentityUser>, StoreError> = async move {
                     let mut rows = connection
@@ -280,7 +285,7 @@ impl UserStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { normalized_name })
+            .connection_operation(Operation { security: self.security_scope()?, normalized_name })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -291,6 +296,7 @@ impl UserStore for SqlxIdentityStore {
     ) -> Result<Option<IdentityUser>, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             normalized_email: &'input NormalizedEmailAddress,
         }
@@ -303,8 +309,8 @@ impl UserStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { normalized_email } = self;
-                let connection = StoreConnection::new(native);
+                let Self { normalized_email, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<Option<IdentityUser>, StoreError> = async move {
                     let mut rows = connection
@@ -322,7 +328,7 @@ impl UserStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { normalized_email })
+            .connection_operation(Operation { security: self.security_scope()?, normalized_email })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -336,6 +342,7 @@ impl QueryableUserStore for SqlxIdentityStore {
     ) -> Result<UserPage, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             after: Option<UserId>,
             /// Native method input retained by borrow or moved exactly once.
@@ -350,8 +357,8 @@ impl QueryableUserStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { after, limit } = self;
-                let connection = StoreConnection::new(native);
+                let Self { after, limit, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<UserPage, StoreError> = async move {
                     if usize::from(limit.get()) > super::schema::NATIVE_COLLECTION_LIMIT {
@@ -382,7 +389,7 @@ impl QueryableUserStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { after, limit })
+            .connection_operation(Operation { security: self.security_scope()?, after, limit })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -392,6 +399,7 @@ impl UserEmailStore for SqlxIdentityStore {
     async fn get_email(&self, id: &UserId) -> Result<Option<EmailAddress>, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
         }
@@ -404,8 +412,8 @@ impl UserEmailStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<Option<EmailAddress>, StoreError> = async move {
                     let user = find_user_by_id(&connection, id)
@@ -419,7 +427,7 @@ impl UserEmailStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { id })
+            .connection_operation(Operation { security: self.security_scope()?, id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -439,6 +447,7 @@ impl UserEmailStore for SqlxIdentityStore {
     ) -> Result<Option<NormalizedEmailAddress>, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
         }
@@ -451,8 +460,8 @@ impl UserEmailStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<Option<NormalizedEmailAddress>, StoreError> = async move {
                     let user = find_user_by_id(&connection, id)
@@ -466,7 +475,7 @@ impl UserEmailStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { id })
+            .connection_operation(Operation { security: self.security_scope()?, id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -477,6 +486,7 @@ impl UserEmailStore for SqlxIdentityStore {
     ) -> Result<Option<IdentityUser>, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             normalized_email: &'input NormalizedEmailAddress,
         }
@@ -489,8 +499,8 @@ impl UserEmailStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { normalized_email } = self;
-                let connection = StoreConnection::new(native);
+                let Self { normalized_email, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<Option<IdentityUser>, StoreError> = async move {
                     let mut rows = connection
@@ -508,7 +518,7 @@ impl UserEmailStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { normalized_email })
+            .connection_operation(Operation { security: self.security_scope()?, normalized_email })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -528,6 +538,7 @@ impl UserEmailStore for SqlxIdentityStore {
     async fn get_email_confirmed(&self, id: &UserId) -> Result<bool, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
         }
@@ -540,8 +551,8 @@ impl UserEmailStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<bool, StoreError> = async move {
                     let user = find_user_by_id(&connection, id)
@@ -555,7 +566,7 @@ impl UserEmailStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { id })
+            .connection_operation(Operation { security: self.security_scope()?, id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -577,6 +588,7 @@ impl UserPhoneNumberStore for SqlxIdentityStore {
     async fn get_phone_number(&self, id: &UserId) -> Result<Option<PhoneNumber>, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
         }
@@ -589,8 +601,8 @@ impl UserPhoneNumberStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<Option<PhoneNumber>, StoreError> = async move {
                     let user = find_user_by_id(&connection, id)
@@ -604,7 +616,7 @@ impl UserPhoneNumberStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { id })
+            .connection_operation(Operation { security: self.security_scope()?, id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -621,6 +633,7 @@ impl UserPhoneNumberStore for SqlxIdentityStore {
     async fn get_phone_number_confirmed(&self, id: &UserId) -> Result<bool, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
         }
@@ -633,8 +646,8 @@ impl UserPhoneNumberStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<bool, StoreError> = async move {
                     let user = find_user_by_id(&connection, id)
@@ -648,7 +661,7 @@ impl UserPhoneNumberStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { id })
+            .connection_operation(Operation { security: self.security_scope()?, id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -674,6 +687,7 @@ impl UserRoleStore for SqlxIdentityStore {
     ) -> Result<(), StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
             /// Native method input retained by borrow or moved exactly once.
@@ -691,8 +705,9 @@ impl UserRoleStore for SqlxIdentityStore {
                 let Self {
                     id,
                     normalized_role_name,
+                    ..
                 } = self;
-                let connection = StoreConnection::new(native);
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<(), StoreError> = async move {
 
@@ -723,6 +738,7 @@ impl UserRoleStore for SqlxIdentityStore {
         }
         self.kernel
             .transaction_operation(Operation {
+                security: self.security_scope()?,
                 id,
                 normalized_role_name,
             })
@@ -737,6 +753,7 @@ impl UserRoleStore for SqlxIdentityStore {
     ) -> Result<(), StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
             /// Native method input retained by borrow or moved exactly once.
@@ -754,8 +771,9 @@ impl UserRoleStore for SqlxIdentityStore {
                 let Self {
                     id,
                     normalized_role_name,
+                    ..
                 } = self;
-                let connection = StoreConnection::new(native);
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<(), StoreError> = async move {
                     ensure_user_exists(&connection, id).await?;
@@ -785,6 +803,7 @@ impl UserRoleStore for SqlxIdentityStore {
         }
         self.kernel
             .transaction_operation(Operation {
+                security: self.security_scope()?,
                 id,
                 normalized_role_name,
             })
@@ -795,6 +814,7 @@ impl UserRoleStore for SqlxIdentityStore {
     async fn get_user_roles(&self, id: &UserId) -> Result<Vec<NormalizedUserName>, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
         }
@@ -807,8 +827,8 @@ impl UserRoleStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<Vec<NormalizedUserName>, StoreError> = async move {
                     ensure_user_exists(&connection, id).await?;
@@ -848,7 +868,7 @@ impl UserRoleStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { id })
+            .connection_operation(Operation { security: self.security_scope()?, id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -860,6 +880,7 @@ impl UserRoleStore for SqlxIdentityStore {
     ) -> Result<bool, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
             /// Native method input retained by borrow or moved exactly once.
@@ -877,8 +898,9 @@ impl UserRoleStore for SqlxIdentityStore {
                 let Self {
                     id,
                     normalized_role_name,
+                    ..
                 } = self;
-                let connection = StoreConnection::new(native);
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<bool, StoreError> = async move {
                     ensure_user_exists(&connection, id).await?;
@@ -909,6 +931,7 @@ impl UserRoleStore for SqlxIdentityStore {
         }
         self.kernel
             .connection_operation(Operation {
+                security: self.security_scope()?,
                 id,
                 normalized_role_name,
             })
@@ -924,6 +947,7 @@ impl UserRoleStore for SqlxIdentityStore {
     ) -> Result<identity_rs::identity::store::UserPage, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             normalized_role_name: &'input NormalizedUserName,
             /// Native method input retained by borrow or moved exactly once.
@@ -944,8 +968,9 @@ impl UserRoleStore for SqlxIdentityStore {
                     normalized_role_name,
                     after,
                     limit,
+                    ..
                 } = self;
-                let connection = StoreConnection::new(native);
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<identity_rs::identity::store::UserPage, StoreError> = async move {
         if usize::from(limit.get()) > super::schema::NATIVE_COLLECTION_LIMIT {
@@ -968,6 +993,7 @@ impl UserRoleStore for SqlxIdentityStore {
         }
         self.kernel
             .connection_operation(Operation {
+                security: self.security_scope()?,
                 normalized_role_name,
                 after,
                 limit,
@@ -981,6 +1007,7 @@ impl UserClaimStore for SqlxIdentityStore {
     async fn get_user_claims(&self, id: &UserId) -> Result<Vec<IdentityClaim>, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
         }
@@ -993,8 +1020,8 @@ impl UserClaimStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<Vec<IdentityClaim>, StoreError> = async move {
                     ensure_user_exists(&connection, id).await?;
@@ -1021,7 +1048,7 @@ impl UserClaimStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { id })
+            .connection_operation(Operation { security: self.security_scope()?, id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -1033,6 +1060,7 @@ impl UserClaimStore for SqlxIdentityStore {
     ) -> Result<(), StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
             /// Native method input retained by borrow or moved exactly once.
@@ -1047,8 +1075,8 @@ impl UserClaimStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id, claims } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, claims, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<(), StoreError> = async move {
                     if claims.len() > super::schema::NATIVE_COLLECTION_LIMIT {
@@ -1090,7 +1118,7 @@ impl UserClaimStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .transaction_operation(Operation { id, claims })
+            .transaction_operation(Operation { security: self.security_scope()?, id, claims })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -1103,6 +1131,7 @@ impl UserClaimStore for SqlxIdentityStore {
     ) -> Result<(), StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
             /// Native method input retained by borrow or moved exactly once.
@@ -1123,8 +1152,9 @@ impl UserClaimStore for SqlxIdentityStore {
                     id,
                     claim,
                     replacement,
+                    ..
                 } = self;
-                let connection = StoreConnection::new(native);
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<(), StoreError> = async move {
                     ensure_user_exists(&connection, id).await?;
@@ -1157,6 +1187,7 @@ impl UserClaimStore for SqlxIdentityStore {
         }
         self.kernel
             .transaction_operation(Operation {
+                security: self.security_scope()?,
                 id,
                 claim,
                 replacement,
@@ -1172,6 +1203,7 @@ impl UserClaimStore for SqlxIdentityStore {
     ) -> Result<(), StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
             /// Native method input retained by borrow or moved exactly once.
@@ -1186,8 +1218,8 @@ impl UserClaimStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id, claims } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, claims, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<(), StoreError> = async move {
                     if claims.len() > super::schema::NATIVE_COLLECTION_LIMIT {
@@ -1222,7 +1254,7 @@ impl UserClaimStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .transaction_operation(Operation { id, claims })
+            .transaction_operation(Operation { security: self.security_scope()?, id, claims })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -1235,6 +1267,7 @@ impl UserClaimStore for SqlxIdentityStore {
     ) -> Result<identity_rs::identity::store::UserPage, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             claim: &'input IdentityClaim,
             /// Native method input retained by borrow or moved exactly once.
@@ -1255,8 +1288,9 @@ impl UserClaimStore for SqlxIdentityStore {
                     claim,
                     after,
                     limit,
+                    ..
                 } = self;
-                let connection = StoreConnection::new(native);
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<identity_rs::identity::store::UserPage, StoreError> = async move {
         if usize::from(limit.get()) > super::schema::NATIVE_COLLECTION_LIMIT {
@@ -1279,6 +1313,7 @@ impl UserClaimStore for SqlxIdentityStore {
         }
         self.kernel
             .connection_operation(Operation {
+                security: self.security_scope()?,
                 claim,
                 after,
                 limit,
@@ -1292,6 +1327,7 @@ impl UserLoginStore for SqlxIdentityStore {
     async fn add_user_login(&self, id: &UserId, login: UserLoginInfo) -> Result<(), StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
             /// Native method input retained by borrow or moved exactly once.
@@ -1306,8 +1342,8 @@ impl UserLoginStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id, login } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, login, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<(), StoreError> = async move {
 
@@ -1342,7 +1378,7 @@ impl UserLoginStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .transaction_operation(Operation { id, login })
+            .transaction_operation(Operation { security: self.security_scope()?, id, login })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -1355,6 +1391,7 @@ impl UserLoginStore for SqlxIdentityStore {
     ) -> Result<(), StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
             /// Native method input retained by borrow or moved exactly once.
@@ -1375,8 +1412,9 @@ impl UserLoginStore for SqlxIdentityStore {
                     id,
                     login_provider,
                     provider_key,
+                    ..
                 } = self;
-                let connection = StoreConnection::new(native);
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<(), StoreError> = async move {
                     ensure_user_exists(&connection, id).await?;
@@ -1409,6 +1447,7 @@ impl UserLoginStore for SqlxIdentityStore {
         }
         self.kernel
             .transaction_operation(Operation {
+                security: self.security_scope()?,
                 id,
                 login_provider,
                 provider_key,
@@ -1420,6 +1459,7 @@ impl UserLoginStore for SqlxIdentityStore {
     async fn get_user_logins(&self, id: &UserId) -> Result<Vec<UserLoginInfo>, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
         }
@@ -1432,8 +1472,8 @@ impl UserLoginStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<Vec<UserLoginInfo>, StoreError> = async move {
                     ensure_user_exists(&connection, id).await?;
@@ -1460,7 +1500,7 @@ impl UserLoginStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { id })
+            .connection_operation(Operation { security: self.security_scope()?, id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -1472,6 +1512,7 @@ impl UserLoginStore for SqlxIdentityStore {
     ) -> Result<Option<IdentityUser>, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             login_provider: &'input LoginProvider,
             /// Native method input retained by borrow or moved exactly once.
@@ -1489,8 +1530,9 @@ impl UserLoginStore for SqlxIdentityStore {
                 let Self {
                     login_provider,
                     provider_key,
+                    ..
                 } = self;
-                let connection = StoreConnection::new(native);
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<Option<IdentityUser>, StoreError> = async move {
                     let mut rows = connection
@@ -1515,6 +1557,7 @@ impl UserLoginStore for SqlxIdentityStore {
         }
         self.kernel
             .connection_operation(Operation {
+                security: self.security_scope()?,
                 login_provider,
                 provider_key,
             })
@@ -1532,6 +1575,7 @@ impl UserAuthenticationTokenStore for SqlxIdentityStore {
     ) -> Result<Option<AuthTokenValue>, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
             /// Native method input retained by borrow or moved exactly once.
@@ -1552,8 +1596,9 @@ impl UserAuthenticationTokenStore for SqlxIdentityStore {
                     id,
                     login_provider,
                     name,
+                    ..
                 } = self;
-                let connection = StoreConnection::new(native);
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<Option<AuthTokenValue>, StoreError> = async move {
                     ensure_user_exists(&connection, id).await?;
@@ -1589,6 +1634,7 @@ impl UserAuthenticationTokenStore for SqlxIdentityStore {
         }
         self.kernel
             .connection_operation(Operation {
+                security: self.security_scope()?,
                 id,
                 login_provider,
                 name,
@@ -1606,6 +1652,7 @@ impl UserAuthenticationTokenStore for SqlxIdentityStore {
     ) -> Result<(), StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
             /// Native method input retained by borrow or moved exactly once.
@@ -1629,8 +1676,9 @@ impl UserAuthenticationTokenStore for SqlxIdentityStore {
                     login_provider,
                     name,
                     value,
+                    ..
                 } = self;
-                let connection = StoreConnection::new(native);
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<(), StoreError> = async move {
 
@@ -1669,6 +1717,7 @@ impl UserAuthenticationTokenStore for SqlxIdentityStore {
         }
         self.kernel
             .transaction_operation(Operation {
+                security: self.security_scope()?,
                 id,
                 login_provider,
                 name,
@@ -1688,6 +1737,7 @@ impl UserAuthenticationTokenStore for SqlxIdentityStore {
     ) -> Result<bool, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
             /// Native method input retained by borrow or moved exactly once.
@@ -1714,8 +1764,9 @@ impl UserAuthenticationTokenStore for SqlxIdentityStore {
                     name,
                     expected_value,
                     new_value,
+                    ..
                 } = self;
-                let connection = StoreConnection::new(native);
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<bool, StoreError> = async move {
                     ensure_user_exists(&connection, id).await?;
@@ -1748,6 +1799,7 @@ impl UserAuthenticationTokenStore for SqlxIdentityStore {
         }
         self.kernel
             .transaction_operation(Operation {
+                security: self.security_scope()?,
                 id,
                 login_provider,
                 name,
@@ -1766,6 +1818,7 @@ impl UserAuthenticationTokenStore for SqlxIdentityStore {
     ) -> Result<(), StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
             /// Native method input retained by borrow or moved exactly once.
@@ -1786,8 +1839,9 @@ impl UserAuthenticationTokenStore for SqlxIdentityStore {
                     id,
                     login_provider,
                     name,
+                    ..
                 } = self;
-                let connection = StoreConnection::new(native);
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<(), StoreError> = async move {
                     ensure_user_exists(&connection, id).await?;
@@ -1812,6 +1866,7 @@ impl UserAuthenticationTokenStore for SqlxIdentityStore {
         }
         self.kernel
             .transaction_operation(Operation {
+                security: self.security_scope()?,
                 id,
                 login_provider,
                 name,
@@ -1829,6 +1884,7 @@ impl UserPasskeyStore for SqlxIdentityStore {
     ) -> Result<(), StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
             /// Native method input retained by borrow or moved exactly once.
@@ -1843,8 +1899,8 @@ impl UserPasskeyStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id, passkey } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, passkey, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<(), StoreError> = async move {
         passkey.validate()?;
@@ -1871,9 +1927,9 @@ impl UserPasskeyStore for SqlxIdentityStore {
                 return Err(StoreError::ConstraintViolation);
             }
 
-            let expected_payload = serialize_user_passkey(&existing)?;
+            let expected_payload = connection.encode_security(&existing)?;
             let existing = existing.with_display_from_info(&passkey);
-            let payload = serialize_user_passkey(&existing)?;
+            let payload = connection.encode_security(&existing)?;
             let changed = connection
                 .execute(
                     "UPDATE effect_identity_user_passkeys SET payload = ?2 WHERE credential_id = ?1 AND payload = ?3",
@@ -1890,7 +1946,7 @@ impl UserPasskeyStore for SqlxIdentityStore {
         }
 
         let user_passkey = StoredPasskey::new(*id, passkey);
-        let payload = serialize_user_passkey(&user_passkey)?;
+        let payload = connection.encode_security(&user_passkey)?;
         let inserted = connection
             .execute(
                 collection_limit_sql!("
@@ -1916,7 +1972,7 @@ impl UserPasskeyStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .transaction_operation(Operation { id, passkey })
+            .transaction_operation(Operation { security: self.security_scope()?, id, passkey })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -1929,6 +1985,7 @@ impl UserPasskeyStore for SqlxIdentityStore {
     ) -> Result<bool, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
             /// Native method input retained by borrow or moved exactly once.
@@ -1949,8 +2006,9 @@ impl UserPasskeyStore for SqlxIdentityStore {
                     id,
                     expected,
                     updated,
+                    ..
                 } = self;
-                let connection = StoreConnection::new(native);
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<bool, StoreError> = async move {
         updated.validate()?;
@@ -1964,8 +2022,8 @@ impl UserPasskeyStore for SqlxIdentityStore {
             return Err(StoreError::ConstraintViolation);
         }
 
-        let old_payload = serialize_expected_passkey(*id, expected)?;
-        let new_payload = serialize_user_passkey(&StoredPasskey::new(*id, updated))?;
+        let old_payload = serialize_expected_passkey(&connection, *id, expected)?;
+        let new_payload = connection.encode_security(&StoredPasskey::new(*id, updated))?;
         let changed = connection.execute("UPDATE effect_identity_user_passkeys SET payload = ?1 WHERE user_id = ?2 AND credential_id = ?3 AND payload = ?4",
             (new_payload, id.to_string(), expected.credential_id().as_bytes(), old_payload)).await.map_err(provider_category)?;
         Ok(changed == 1)
@@ -1976,6 +2034,7 @@ impl UserPasskeyStore for SqlxIdentityStore {
         }
         self.kernel
             .transaction_operation(Operation {
+                security: self.security_scope()?,
                 id,
                 expected,
                 updated,
@@ -1991,6 +2050,7 @@ impl UserPasskeyStore for SqlxIdentityStore {
     ) -> Result<Option<UserPasskeyInfo>, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
             /// Native method input retained by borrow or moved exactly once.
@@ -2005,8 +2065,8 @@ impl UserPasskeyStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id, credential_id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, credential_id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<Option<UserPasskeyInfo>, StoreError> = async move {
                     ensure_user_exists(&connection, id).await?;
@@ -2032,7 +2092,7 @@ impl UserPasskeyStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { id, credential_id })
+            .connection_operation(Operation { security: self.security_scope()?, id, credential_id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -2040,6 +2100,7 @@ impl UserPasskeyStore for SqlxIdentityStore {
     async fn get_passkeys(&self, id: &UserId) -> Result<Vec<UserPasskeyInfo>, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
         }
@@ -2052,8 +2113,8 @@ impl UserPasskeyStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<Vec<UserPasskeyInfo>, StoreError> = async move {
                     ensure_user_exists(&connection, id).await?;
@@ -2080,7 +2141,7 @@ impl UserPasskeyStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { id })
+            .connection_operation(Operation { security: self.security_scope()?, id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -2091,6 +2152,7 @@ impl UserPasskeyStore for SqlxIdentityStore {
     ) -> Result<Option<IdentityUser>, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             credential_id: &'input PasskeyCredentialId,
         }
@@ -2103,8 +2165,8 @@ impl UserPasskeyStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { credential_id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { credential_id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<Option<IdentityUser>, StoreError> = async move {
                     let mut rows = connection
@@ -2127,7 +2189,7 @@ impl UserPasskeyStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { credential_id })
+            .connection_operation(Operation { security: self.security_scope()?, credential_id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -2139,6 +2201,7 @@ impl UserPasskeyStore for SqlxIdentityStore {
     ) -> Result<(), StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
             /// Native method input retained by borrow or moved exactly once.
@@ -2153,8 +2216,8 @@ impl UserPasskeyStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id, credential_id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, credential_id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<(), StoreError> = async move {
                     ensure_user_exists(&connection, id).await?;
@@ -2180,7 +2243,7 @@ impl UserPasskeyStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .transaction_operation(Operation { id, credential_id })
+            .transaction_operation(Operation { security: self.security_scope()?, id, credential_id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -2193,6 +2256,7 @@ impl PasskeyChallengeStore for SqlxIdentityStore {
     ) -> Result<(), StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             challenge_state: PasskeyChallengeState,
             /// Explicit installed capacity and UTC callable.
@@ -2210,8 +2274,9 @@ impl PasskeyChallengeStore for SqlxIdentityStore {
                 let Self {
                     challenge_state,
                     policy,
+                    ..
                 } = self;
-                let connection = StoreConnection::new(native);
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<(), StoreError> = async move {
                     challenge_state.validate()?;
@@ -2244,7 +2309,7 @@ impl PasskeyChallengeStore for SqlxIdentityStore {
                     {
                         return Err(StoreError::ConstraintViolation);
                     }
-                    let payload = serialize_passkey_challenge_state(&challenge_state)?;
+                    let payload = connection.encode_security(&challenge_state)?;
 
                     connection
                         .execute(
@@ -2274,6 +2339,7 @@ impl PasskeyChallengeStore for SqlxIdentityStore {
         }
         self.kernel
             .transaction_operation(Operation {
+                security: self.security_scope()?,
                 challenge_state,
                 policy: self.policy,
             })
@@ -2289,6 +2355,7 @@ impl PasskeyChallengeStore for SqlxIdentityStore {
     ) -> Result<Option<PasskeyChallengeState>, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             challenge: &'input PasskeyChallenge,
             /// Native method input retained by borrow or moved exactly once.
@@ -2309,8 +2376,9 @@ impl PasskeyChallengeStore for SqlxIdentityStore {
                     challenge,
                     purpose,
                     now,
+                    ..
                 } = self;
-                let connection = StoreConnection::new(native);
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<Option<PasskeyChallengeState>, StoreError> = async move {
                     let mut rows = connection
@@ -2358,6 +2426,7 @@ impl PasskeyChallengeStore for SqlxIdentityStore {
         }
         self.kernel
             .transaction_operation(Operation {
+                security: self.security_scope()?,
                 challenge,
                 purpose,
                 now,
@@ -2372,6 +2441,7 @@ impl PasskeyChallengeStore for SqlxIdentityStore {
     ) -> Result<(), StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             now: OffsetDateTime,
         }
@@ -2384,8 +2454,8 @@ impl PasskeyChallengeStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { now } = self;
-                let connection = StoreConnection::new(native);
+                let Self { now, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<(), StoreError> = async move {
                     connection
@@ -2406,7 +2476,7 @@ impl PasskeyChallengeStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .transaction_operation(Operation { now })
+            .transaction_operation(Operation { security: self.security_scope()?, now })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -2419,6 +2489,7 @@ impl UserLockoutStore for SqlxIdentityStore {
     ) -> Result<Option<OffsetDateTime>, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
         }
@@ -2431,8 +2502,8 @@ impl UserLockoutStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<Option<OffsetDateTime>, StoreError> = async move {
                     let user = find_user_by_id(&connection, id)
@@ -2446,7 +2517,7 @@ impl UserLockoutStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { id })
+            .connection_operation(Operation { security: self.security_scope()?, id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -2463,6 +2534,7 @@ impl UserLockoutStore for SqlxIdentityStore {
     async fn increment_access_failed_count(&self, id: &UserId) -> Result<u32, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
         }
@@ -2475,8 +2547,8 @@ impl UserLockoutStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<u32, StoreError> = async move {
                     let user = match find_user_by_id(&connection, id).await {
@@ -2502,7 +2574,7 @@ impl UserLockoutStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .transaction_operation(Operation { id })
+            .transaction_operation(Operation { security: self.security_scope()?, id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -2515,6 +2587,7 @@ impl UserLockoutStore for SqlxIdentityStore {
     async fn get_access_failed_count(&self, id: &UserId) -> Result<u32, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
         }
@@ -2527,8 +2600,8 @@ impl UserLockoutStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<u32, StoreError> = async move {
                     let user = find_user_by_id(&connection, id)
@@ -2542,7 +2615,7 @@ impl UserLockoutStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { id })
+            .connection_operation(Operation { security: self.security_scope()?, id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -2550,6 +2623,7 @@ impl UserLockoutStore for SqlxIdentityStore {
     async fn get_lockout_enabled(&self, id: &UserId) -> Result<bool, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
         }
@@ -2562,8 +2636,8 @@ impl UserLockoutStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<bool, StoreError> = async move {
                     let user = find_user_by_id(&connection, id)
@@ -2577,7 +2651,7 @@ impl UserLockoutStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { id })
+            .connection_operation(Operation { security: self.security_scope()?, id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -2596,6 +2670,7 @@ impl UserTwoFactorStore for SqlxIdentityStore {
     async fn get_two_factor_enabled(&self, id: &UserId) -> Result<bool, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
         }
@@ -2608,8 +2683,8 @@ impl UserTwoFactorStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<bool, StoreError> = async move {
                     let user = find_user_by_id(&connection, id)
@@ -2623,7 +2698,7 @@ impl UserTwoFactorStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { id })
+            .connection_operation(Operation { security: self.security_scope()?, id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -2666,6 +2741,7 @@ impl UserAuthenticatorKeyStore for SqlxIdentityStore {
     ) -> Result<(), StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
             /// Native method input retained by borrow or moved exactly once.
@@ -2680,8 +2756,8 @@ impl UserAuthenticatorKeyStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id, key } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, key, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<(), StoreError> = async move {
 
@@ -2708,7 +2784,7 @@ impl UserAuthenticatorKeyStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .transaction_operation(Operation { id, key })
+            .transaction_operation(Operation { security: self.security_scope()?, id, key })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -2716,6 +2792,7 @@ impl UserAuthenticatorKeyStore for SqlxIdentityStore {
     async fn reset_authenticator_key(&self, id: &UserId) -> Result<(), StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
         }
@@ -2728,8 +2805,8 @@ impl UserAuthenticatorKeyStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<(), StoreError> = async move {
 
@@ -2751,7 +2828,7 @@ impl UserAuthenticatorKeyStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .transaction_operation(Operation { id })
+            .transaction_operation(Operation { security: self.security_scope()?, id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -2765,6 +2842,7 @@ impl UserTwoFactorRecoveryCodeStore for SqlxIdentityStore {
     ) -> Result<(), StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
             /// Native method input retained by borrow or moved exactly once.
@@ -2782,8 +2860,9 @@ impl UserTwoFactorRecoveryCodeStore for SqlxIdentityStore {
                 let Self {
                     id,
                     recovery_code_hashes,
+                    ..
                 } = self;
-                let connection = StoreConnection::new(native);
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<(), StoreError> = async move {
                     if recovery_code_hashes.len() > super::schema::NATIVE_RECOVERY_LIMIT {
@@ -2791,7 +2870,7 @@ impl UserTwoFactorRecoveryCodeStore for SqlxIdentityStore {
                     }
                     let serialized_hashes = recovery_code_hashes
                         .iter()
-                        .map(serialize_recovery_code_hash)
+                        .map(|hash| connection.encode_security(hash))
                         .collect::<Result<Vec<_>, _>>()?;
 
                     ensure_user_exists(&connection, id).await?;
@@ -2828,6 +2907,7 @@ impl UserTwoFactorRecoveryCodeStore for SqlxIdentityStore {
         }
         self.kernel
             .transaction_operation(Operation {
+                security: self.security_scope()?,
                 id,
                 recovery_code_hashes,
             })
@@ -2842,6 +2922,7 @@ impl UserTwoFactorRecoveryCodeStore for SqlxIdentityStore {
     ) -> Result<bool, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
             /// Native method input retained by borrow or moved exactly once.
@@ -2856,13 +2937,13 @@ impl UserTwoFactorRecoveryCodeStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id, recovery_code } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, recovery_code, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<bool, StoreError> = async move {
                     ensure_user_exists(&connection, id).await?;
 
-                    let rows = match connection
+                    let mut rows = match connection
                         .query(
                             recovery_lookahead_sql!(
                                 "
@@ -2884,26 +2965,13 @@ impl UserTwoFactorRecoveryCodeStore for SqlxIdentityStore {
                         }
                     };
 
+                    if rows.remaining() > super::schema::NATIVE_RECOVERY_LIMIT {
+                        return Err(StoreError::CorruptStoredData);
+                    }
                     let mut matched_row_id = None;
-                    for row in recovery_code_rows(rows).await? {
-                        let row_id = match row_integer_at(&row, 0) {
-                            Ok(row_id) => row_id,
-                            Err(error) => {
-                                return Err(error);
-                            }
-                        };
-                        let hash_payload = match row_text_at(&row, 1) {
-                            Ok(hash_payload) => hash_payload,
-                            Err(error) => {
-                                return Err(error);
-                            }
-                        };
-                        let hash = match deserialize_recovery_code_hash(&hash_payload) {
-                            Ok(hash) => hash,
-                            Err(error) => {
-                                return Err(error);
-                            }
-                        };
+                    while let Some(row) = rows.next().await.map_err(provider_category)? {
+                        let row_id = row_integer_at(&row, 0)?;
+                        let hash: RecoveryCodeHash = rows.decode_security(&row, 1)?;
                         if hash.matches(recovery_code) {
                             matched_row_id = Some(row_id);
                         }
@@ -2938,7 +3006,7 @@ impl UserTwoFactorRecoveryCodeStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .transaction_operation(Operation { id, recovery_code })
+            .transaction_operation(Operation { security: self.security_scope()?, id, recovery_code })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -2946,6 +3014,7 @@ impl UserTwoFactorRecoveryCodeStore for SqlxIdentityStore {
     async fn count_recovery_codes(&self, id: &UserId) -> Result<usize, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
         }
@@ -2958,8 +3027,8 @@ impl UserTwoFactorRecoveryCodeStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<usize, StoreError> = async move {
                     ensure_user_exists(&connection, id).await?;
@@ -2991,7 +3060,7 @@ impl UserTwoFactorRecoveryCodeStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { id })
+            .connection_operation(Operation { security: self.security_scope()?, id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -3001,6 +3070,7 @@ impl RoleStore for SqlxIdentityStore {
     async fn create_role(&self, new_role: NewRole) -> Result<IdentityRole, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             new_role: NewRole,
         }
@@ -3013,8 +3083,8 @@ impl RoleStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { new_role } = self;
-                let connection = StoreConnection::new(native);
+                let Self { new_role, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<IdentityRole, StoreError> = async move {
                     let role = IdentityRole::from_new(new_role);
@@ -3022,7 +3092,7 @@ impl RoleStore for SqlxIdentityStore {
                         .normalized_name()
                         .cloned()
                         .ok_or(StoreError::CorruptStoredData)?;
-                    let payload = serialize_role(&role)?;
+                    let payload = connection.encode_security(&role)?;
 
                     connection
                         .execute(
@@ -3051,7 +3121,7 @@ impl RoleStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .transaction_operation(Operation { new_role })
+            .transaction_operation(Operation { security: self.security_scope()?, new_role })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -3059,6 +3129,7 @@ impl RoleStore for SqlxIdentityStore {
     async fn update_role(&self, update: RoleUpdate) -> Result<IdentityRole, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             update: RoleUpdate,
         }
@@ -3071,8 +3142,8 @@ impl RoleStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { update } = self;
-                let connection = StoreConnection::new(native);
+                let Self { update, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<IdentityRole, StoreError> = async move {
         let role=update.role();
@@ -3082,7 +3153,7 @@ impl RoleStore for SqlxIdentityStore {
         if existing.concurrency_stamp()!=expected{return Err(StoreError::TransactionConflict);}
         let normalized_name=role.normalized_name().ok_or(StoreError::CorruptStoredData)?;
         let revision=ConcurrencyStamp::new();
-        let payload=serialize_refreshed_role(role,&revision)?;
+        let payload=serialize_refreshed_role(&connection, role,&revision)?;
         let changed=connection.execute("UPDATE effect_identity_roles SET normalized_name=?1,concurrency_stamp=?2,payload=?3 WHERE id=?4 AND concurrency_stamp=?5",
             (normalized_name.as_str(),revision.to_string(),payload,id.to_string(),expected.to_string())).await.map_err(provider_category)?;
         ensure_rows_changed(changed,StoreError::TransactionConflict)?;
@@ -3093,7 +3164,7 @@ impl RoleStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .transaction_operation(Operation { update })
+            .transaction_operation(Operation { security: self.security_scope()?, update })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -3101,6 +3172,7 @@ impl RoleStore for SqlxIdentityStore {
     async fn delete_role(&self, id: &RoleId) -> Result<(), StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input RoleId,
         }
@@ -3113,8 +3185,8 @@ impl RoleStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<(), StoreError> = async move {
                     connection
@@ -3132,7 +3204,7 @@ impl RoleStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .transaction_operation(Operation { id })
+            .transaction_operation(Operation { security: self.security_scope()?, id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -3140,6 +3212,7 @@ impl RoleStore for SqlxIdentityStore {
     async fn find_role_by_id(&self, id: &RoleId) -> Result<Option<IdentityRole>, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input RoleId,
         }
@@ -3152,8 +3225,8 @@ impl RoleStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<Option<IdentityRole>, StoreError> =
                     async move { find_role_by_id(&connection, id).await }.await;
@@ -3161,7 +3234,7 @@ impl RoleStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { id })
+            .connection_operation(Operation { security: self.security_scope()?, id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -3172,6 +3245,7 @@ impl RoleStore for SqlxIdentityStore {
     ) -> Result<Option<IdentityRole>, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             normalized_name: &'input NormalizedUserName,
         }
@@ -3184,8 +3258,8 @@ impl RoleStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { normalized_name } = self;
-                let connection = StoreConnection::new(native);
+                let Self { normalized_name, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<Option<IdentityRole>, StoreError> = async move {
                     let mut rows = connection
@@ -3203,7 +3277,7 @@ impl RoleStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { normalized_name })
+            .connection_operation(Operation { security: self.security_scope()?, normalized_name })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -3217,6 +3291,7 @@ impl QueryableRoleStore for SqlxIdentityStore {
     ) -> Result<RolePage, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             after: Option<RoleId>,
             /// Native method input retained by borrow or moved exactly once.
@@ -3231,8 +3306,8 @@ impl QueryableRoleStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { after, limit } = self;
-                let connection = StoreConnection::new(native);
+                let Self { after, limit, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<RolePage, StoreError> = async move {
                     if usize::from(limit.get()) > super::schema::NATIVE_COLLECTION_LIMIT {
@@ -3263,7 +3338,7 @@ impl QueryableRoleStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { after, limit })
+            .connection_operation(Operation { security: self.security_scope()?, after, limit })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -3273,6 +3348,7 @@ impl RoleClaimStore for SqlxIdentityStore {
     async fn get_role_claims(&self, id: &RoleId) -> Result<Vec<IdentityClaim>, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input RoleId,
         }
@@ -3285,8 +3361,8 @@ impl RoleClaimStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<Vec<IdentityClaim>, StoreError> = async move {
                     ensure_role_exists(&connection, id).await?;
@@ -3313,7 +3389,7 @@ impl RoleClaimStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { id })
+            .connection_operation(Operation { security: self.security_scope()?, id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -3321,6 +3397,7 @@ impl RoleClaimStore for SqlxIdentityStore {
     async fn add_role_claim(&self, id: &RoleId, claim: IdentityClaim) -> Result<(), StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input RoleId,
             /// Native method input retained by borrow or moved exactly once.
@@ -3335,8 +3412,8 @@ impl RoleClaimStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id, claim } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, claim, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<(), StoreError> = async move {
 
@@ -3369,7 +3446,7 @@ impl RoleClaimStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .transaction_operation(Operation { id, claim })
+            .transaction_operation(Operation { security: self.security_scope()?, id, claim })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -3381,6 +3458,7 @@ impl RoleClaimStore for SqlxIdentityStore {
     ) -> Result<(), StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input RoleId,
             /// Native method input retained by borrow or moved exactly once.
@@ -3395,8 +3473,8 @@ impl RoleClaimStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id, claim } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, claim, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<(), StoreError> = async move {
                     ensure_role_exists(&connection, id).await?;
@@ -3424,7 +3502,7 @@ impl RoleClaimStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .transaction_operation(Operation { id, claim })
+            .transaction_operation(Operation { security: self.security_scope()?, id, claim })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -3437,6 +3515,7 @@ impl identity_rs::identity::protection::storage::EncryptedPersonalDataStore for 
     ) -> Result<identity_rs::identity::protection::storage::ProtectedUserRecord, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             record: identity_rs::identity::protection::storage::ProtectedUserRecord,
         }
@@ -3451,8 +3530,8 @@ impl identity_rs::identity::protection::storage::EncryptedPersonalDataStore for 
             where
                 Self: 'lease,
             {
-                let Self { record } = self;
-                let connection = StoreConnection::new(native);
+                let Self { record, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<identity_rs::identity::protection::storage::ProtectedUserRecord, StoreError> = async move {
         record.validate()?;
@@ -3466,9 +3545,9 @@ impl identity_rs::identity::protection::storage::EncryptedPersonalDataStore for 
         drop(rows);
         validate_protected_claims(&connection, &record).await?;
         connection.execute("INSERT INTO effect_identity_users(id, normalized_user_name, normalized_email, concurrency_stamp, payload) VALUES (?1, ?2, NULL, ?3, ?4)",
-            (record.id().to_string(), format!("protected:{}", record.id()), record.metadata().concurrency_stamp().to_string(), serialize_user(record.metadata())?)).await.map_err(provider_category)?;
+            (record.id().to_string(), format!("protected:{}", record.id()), record.metadata().concurrency_stamp().to_string(), connection.encode_security(record.metadata())?)).await.map_err(provider_category)?;
         connection.execute("INSERT INTO effect_identity_protected_users(user_id, require_unique, payload) VALUES (?1, ?2, ?3)",
-            (record.id().to_string(), i64::from(record.require_unique_email()), super::schema::encode_security(&record)?)).await.map_err(provider_category)?;
+            (record.id().to_string(), i64::from(record.require_unique_email()), connection.encode_security(&record)?)).await.map_err(provider_category)?;
         insert_protected_indexes(&connection, &record).await?;
 
         Ok(record)
@@ -3478,7 +3557,7 @@ impl identity_rs::identity::protection::storage::EncryptedPersonalDataStore for 
             }
         }
         self.kernel
-            .transaction_operation(Operation { record })
+            .transaction_operation(Operation { security: self.security_scope()?, record })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -3490,6 +3569,7 @@ impl identity_rs::identity::protection::storage::EncryptedPersonalDataStore for 
     ) -> Result<identity_rs::identity::protection::storage::ProtectedUserRecord, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             record: identity_rs::identity::protection::storage::ProtectedUserRecord,
             /// Native method input retained by borrow or moved exactly once.
@@ -3507,8 +3587,8 @@ impl identity_rs::identity::protection::storage::EncryptedPersonalDataStore for 
             where
                 Self: 'lease,
             {
-                let Self { record, expected } = self;
-                let connection = StoreConnection::new(native);
+                let Self { record, expected, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<identity_rs::identity::protection::storage::ProtectedUserRecord, StoreError> = async move {
         record.validate()?;
@@ -3525,13 +3605,13 @@ impl identity_rs::identity::protection::storage::EncryptedPersonalDataStore for 
         }
         validate_protected_claims(&connection, &record).await?;
         let changed = connection.execute("UPDATE effect_identity_users SET concurrency_stamp = ?1, payload = ?2 WHERE id = ?3 AND concurrency_stamp = ?4",
-            (record.metadata().concurrency_stamp().to_string(), serialize_user(record.metadata())?, record.id().to_string(), expected.to_string())).await.map_err(provider_category)?;
+            (record.metadata().concurrency_stamp().to_string(), connection.encode_security(record.metadata())?, record.id().to_string(), expected.to_string())).await.map_err(provider_category)?;
         ensure_rows_changed(changed, StoreError::TransactionConflict)?;
         connection
             .execute(
                 "UPDATE effect_identity_protected_users SET payload = ?1 WHERE user_id = ?2",
                 (
-                    super::schema::encode_security(&record)?,
+                    connection.encode_security(&record)?,
                     record.id().to_string(),
                 ),
             )
@@ -3553,7 +3633,7 @@ impl identity_rs::identity::protection::storage::EncryptedPersonalDataStore for 
             }
         }
         self.kernel
-            .transaction_operation(Operation { record, expected })
+            .transaction_operation(Operation { security: self.security_scope()?, record, expected })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -3565,6 +3645,7 @@ impl identity_rs::identity::protection::storage::EncryptedPersonalDataStore for 
     {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: &'input UserId,
         }
@@ -3583,8 +3664,8 @@ impl identity_rs::identity::protection::storage::EncryptedPersonalDataStore for 
             where
                 Self: 'lease,
             {
-                let Self { id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<
                     Option<identity_rs::identity::protection::storage::ProtectedUserRecord>,
@@ -3594,7 +3675,7 @@ impl identity_rs::identity::protection::storage::EncryptedPersonalDataStore for 
             }
         }
         self.kernel
-            .connection_operation(Operation { id })
+            .connection_operation(Operation { security: self.security_scope()?, id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -3606,6 +3687,7 @@ impl identity_rs::identity::protection::storage::EncryptedPersonalDataStore for 
     {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             indexes: &'input [identity_rs::identity::protection::storage::ProtectedLookupKey],
         }
@@ -3624,8 +3706,8 @@ impl identity_rs::identity::protection::storage::EncryptedPersonalDataStore for 
             where
                 Self: 'lease,
             {
-                let Self { indexes } = self;
-                let connection = StoreConnection::new(native);
+                let Self { indexes, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<Vec<identity_rs::identity::protection::storage::ProtectedUserRecord>, StoreError> = async move {
         if indexes.len() > super::schema::NATIVE_PROTECTED_INDEX_LIMIT {
@@ -3659,7 +3741,7 @@ impl identity_rs::identity::protection::storage::EncryptedPersonalDataStore for 
             }
         }
         self.kernel
-            .connection_operation(Operation { indexes })
+            .connection_operation(Operation { security: self.security_scope()?, indexes })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -3674,6 +3756,7 @@ impl BrowserContextStore for SqlxIdentityStore {
     ) -> Result<(), StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             context: BrowserContext,
             /// Native method input retained by borrow or moved exactly once.
@@ -3694,8 +3777,9 @@ impl BrowserContextStore for SqlxIdentityStore {
                     context,
                     now,
                     capacity,
+                    ..
                 } = self;
-                let connection = StoreConnection::new(native);
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<(), StoreError> = async move {
         context.validate()?;
@@ -3736,7 +3820,7 @@ impl BrowserContextStore for SqlxIdentityStore {
                     context.id().to_string(),
                     i64::try_from(context.expires_at().unix_timestamp_nanos())
                         .map_err(|_| StoreError::CorruptStoredData)?,
-                    super::schema::encode_security(&context)?,
+                    connection.encode_security(&context)?,
                 ),
             )
             .await
@@ -3749,6 +3833,7 @@ impl BrowserContextStore for SqlxIdentityStore {
         }
         self.kernel
             .transaction_operation(Operation {
+                security: self.security_scope()?,
                 context,
                 now,
                 capacity,
@@ -3764,6 +3849,7 @@ impl BrowserContextStore for SqlxIdentityStore {
     ) -> Result<Option<BrowserContext>, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: uuid::Uuid,
             /// Native method input retained by borrow or moved exactly once.
@@ -3778,8 +3864,8 @@ impl BrowserContextStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id, now } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, now, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<Option<BrowserContext>, StoreError> = async move {
                     let mut rows = connection
@@ -3792,7 +3878,7 @@ impl BrowserContextStore for SqlxIdentityStore {
                     let Some(row) = rows.next().await.map_err(provider_category)? else {
                         return Ok(None);
                     };
-                    let context: BrowserContext = super::schema::decode_security(&row_text(&row)?)?;
+                    let context: BrowserContext = rows.decode_security(&row, 0)?;
                     context.validate()?;
                     if context.id() != id {
                         return Err(StoreError::CorruptStoredData);
@@ -3805,7 +3891,7 @@ impl BrowserContextStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .connection_operation(Operation { id, now })
+            .connection_operation(Operation { security: self.security_scope()?, id, now })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -3820,6 +3906,7 @@ impl BrowserContextStore for SqlxIdentityStore {
     ) -> Result<bool, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation<'input> {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: uuid::Uuid,
             /// Native method input retained by borrow or moved exactly once.
@@ -3846,8 +3933,9 @@ impl BrowserContextStore for SqlxIdentityStore {
                     expected_pending,
                     value,
                     now,
+                    ..
                 } = self;
-                let connection = StoreConnection::new(native);
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<bool, StoreError> = async move {
         let Some(context) = find_browser_context(&connection, id, now).await? else {
@@ -3858,9 +3946,9 @@ impl BrowserContextStore for SqlxIdentityStore {
             return Ok(false);
         }
         let expected_payload =
-            super::schema::encode_security(&context)?;
+            connection.encode_security(&context)?;
         let updated = context.with_pending_authentication(value)?;
-        let payload = super::schema::encode_security(&updated)?;
+        let payload = connection.encode_security(&updated)?;
         let changed = connection.execute(
             "UPDATE effect_identity_browser_contexts SET payload=?1 WHERE id=?2 AND payload=?3 AND expires_at>?4",
             (payload, id.to_string(), expected_payload, i64::try_from(now.unix_timestamp_nanos()).map_err(|_| StoreError::CorruptStoredData)?),
@@ -3873,6 +3961,7 @@ impl BrowserContextStore for SqlxIdentityStore {
         }
         self.kernel
             .transaction_operation(Operation {
+                security: self.security_scope()?,
                 id,
                 expected_token,
                 expected_pending,
@@ -3886,6 +3975,7 @@ impl BrowserContextStore for SqlxIdentityStore {
     async fn remove_browser_context(&self, id: uuid::Uuid) -> Result<(), StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             id: uuid::Uuid,
         }
@@ -3898,8 +3988,8 @@ impl BrowserContextStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { id } = self;
-                let connection = StoreConnection::new(native);
+                let Self { id, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<(), StoreError> = async move {
                     connection
@@ -3916,7 +4006,7 @@ impl BrowserContextStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .transaction_operation(Operation { id })
+            .transaction_operation(Operation { security: self.security_scope()?, id })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -3927,6 +4017,7 @@ impl BrowserContextStore for SqlxIdentityStore {
     ) -> Result<usize, StoreError> {
         /// Borrowed/moved native invocation, separate from any reusable Effect recipe.
         struct Operation {
+            security: super::schema::SecurityScope,
             /// Native method input retained by borrow or moved exactly once.
             now: OffsetDateTime,
         }
@@ -3939,8 +4030,8 @@ impl BrowserContextStore for SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let Self { now } = self;
-                let connection = StoreConnection::new(native);
+                let Self { now, .. } = self;
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result: Result<usize, StoreError> = async move {
                     let now = i64::try_from(now.unix_timestamp_nanos())
@@ -3959,7 +4050,7 @@ impl BrowserContextStore for SqlxIdentityStore {
             }
         }
         self.kernel
-            .transaction_operation(Operation { now })
+            .transaction_operation(Operation { security: self.security_scope()?, now })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -4060,7 +4151,7 @@ async fn save_user(
         if rows.next().await.map_err(provider_category)?.is_none() {
             return Err(StoreError::CorruptStoredData);
         }
-        let changed=connection.execute("UPDATE effect_identity_users SET concurrency_stamp=?1,payload=?2 WHERE id=?3 AND concurrency_stamp=?4",(user.concurrency_stamp().to_string(),serialize_user(user)?,user.id().to_string(),expected.to_string())).await.map_err(provider_category)?;
+        let changed=connection.execute("UPDATE effect_identity_users SET concurrency_stamp=?1,payload=?2 WHERE id=?3 AND concurrency_stamp=?4",(user.concurrency_stamp().to_string(),connection.encode_security(user)?,user.id().to_string(),expected.to_string())).await.map_err(provider_category)?;
         return ensure_rows_changed(changed, StoreError::TransactionConflict);
     }
     let normalized_user_name = user
@@ -4068,7 +4159,7 @@ async fn save_user(
         .cloned()
         .ok_or(StoreError::CorruptStoredData)?;
     let normalized_email = user.normalized_email().map(ToString::to_string);
-    let payload = serialize_user(user)?;
+    let payload = connection.encode_security(user)?;
     let changed = connection
         .execute(
             "
@@ -4129,9 +4220,8 @@ async fn read_optional_user(rows: &mut StoreRows) -> Result<Option<IdentityUser>
         return Ok(None);
     };
 
-    let payload = row_text(&row)?;
     consume_rows(rows).await?;
-    deserialize_user(&payload).map(Some)
+    rows.decode_security(&row, 0).map(Some)
 }
 
 /// Validate native persisted state or bind its fields inside the caller's owned SQL operation.
@@ -4139,7 +4229,7 @@ async fn read_unique_user(rows: &mut StoreRows) -> Result<Option<IdentityUser>, 
     let Some(row) = rows.next().await.map_err(provider_category)? else {
         return Ok(None);
     };
-    let user = deserialize_user(&row_text(&row)?)?;
+    let user = rows.decode_security(&row, 0)?;
     if rows.next().await.map_err(provider_category)?.is_some() {
         consume_rows(rows).await?;
         return Err(StoreError::ConstraintViolation);
@@ -4179,7 +4269,7 @@ async fn read_users(rows: &mut StoreRows) -> Result<Vec<IdentityUser>, StoreErro
         if users.len() >= super::schema::NATIVE_COLLECTION_LOOKAHEAD {
             return Err(StoreError::CorruptStoredData);
         }
-        users.push(deserialize_user(&row_text(&row)?)?);
+        users.push(rows.decode_security(&row, 0)?);
     }
 
     Ok(users)
@@ -4191,9 +4281,8 @@ async fn read_optional_role(rows: &mut StoreRows) -> Result<Option<IdentityRole>
         return Ok(None);
     };
 
-    let payload = row_text(&row)?;
     consume_rows(rows).await?;
-    deserialize_role(&payload).map(Some)
+    rows.decode_security(&row, 0).map(Some)
 }
 
 /// Validate native persisted state or bind its fields inside the caller's owned SQL operation.
@@ -4203,7 +4292,7 @@ async fn read_roles(rows: &mut StoreRows) -> Result<Vec<IdentityRole>, StoreErro
         if roles.len() >= super::schema::NATIVE_COLLECTION_LOOKAHEAD {
             return Err(StoreError::CorruptStoredData);
         }
-        roles.push(deserialize_role(&row_text(&row)?)?);
+        roles.push(rows.decode_security(&row, 0)?);
     }
 
     Ok(roles)
@@ -4263,9 +4352,8 @@ async fn read_optional_user_passkey(
         return Ok(None);
     };
 
-    let payload = row_text(&row)?;
     consume_rows(rows).await?;
-    deserialize_user_passkey(&payload).map(Some)
+    read_passkey(rows, &row).map(Some)
 }
 
 /// Validate native persisted state or bind its fields inside the caller's owned SQL operation.
@@ -4276,9 +4364,8 @@ async fn read_optional_passkey_challenge_state(
         return Ok(None);
     };
 
-    let payload = row_text(&row)?;
     consume_rows(rows).await?;
-    deserialize_passkey_challenge_state(&payload).map(Some)
+    rows.decode_security(&row, 0).map(Some)
 }
 
 /// Validate native persisted state or bind its fields inside the caller's owned SQL operation.
@@ -4292,7 +4379,7 @@ pub(super) async fn read_user_passkeys(
         if passkeys.len() >= super::schema::NATIVE_COLLECTION_LIMIT {
             return Err(StoreError::CorruptStoredData);
         }
-        let user_passkey = deserialize_user_passkey(&row_text(&row)?)?;
+        let user_passkey = read_passkey(rows, &row)?;
         if user_passkey.user_id() != *owner {
             return Err(StoreError::CorruptStoredData);
         }
@@ -4338,47 +4425,10 @@ pub(super) fn ensure_rows_changed(changed: u64, error: StoreError) -> Result<(),
     Ok(())
 }
 /// Validate native persisted state or bind its fields inside the caller's owned SQL operation.
-pub(super) fn serialize_user(user: &IdentityUser) -> Result<String, StoreError> {
-    super::schema::encode_security(user)
-}
-
-/// Validate native persisted state or bind its fields inside the caller's owned SQL operation.
-pub(super) fn deserialize_user(payload: &str) -> Result<IdentityUser, StoreError> {
-    super::schema::decode_security(payload)
-}
-
-/// Validate native persisted state or bind its fields inside the caller's owned SQL operation.
-fn serialize_role(role: &IdentityRole) -> Result<String, StoreError> {
-    super::schema::encode_security(role)
-}
-
-/// Validate native persisted state or bind its fields inside the caller's owned SQL operation.
-fn deserialize_role(payload: &str) -> Result<IdentityRole, StoreError> {
-    super::schema::decode_security(payload)
-}
-
-/// Validate native persisted state or bind its fields inside the caller's owned SQL operation.
-pub(super) fn serialize_user_passkey(passkey: &StoredPasskey) -> Result<String, StoreError> {
-    super::schema::encode_security(passkey)
-}
-
-/// Validate native persisted state or bind its fields inside the caller's owned SQL operation.
-pub(super) fn deserialize_user_passkey(payload: &str) -> Result<StoredPasskey, StoreError> {
-    let record: StoredPasskey = super::schema::decode_security(payload)?;
+fn read_passkey(rows: &StoreRows, row: &sqlx::TursoRow) -> Result<StoredPasskey, StoreError> {
+    let record: StoredPasskey = rows.decode_security(row, 0)?;
     record.info.validate()?;
     Ok(record)
-}
-
-/// Validate native persisted state or bind its fields inside the caller's owned SQL operation.
-fn serialize_passkey_challenge_state(
-    challenge_state: &PasskeyChallengeState,
-) -> Result<String, StoreError> {
-    super::schema::encode_security(challenge_state)
-}
-
-/// Validate native persisted state or bind its fields inside the caller's owned SQL operation.
-fn deserialize_passkey_challenge_state(payload: &str) -> Result<PasskeyChallengeState, StoreError> {
-    super::schema::decode_security(payload)
 }
 
 /// Validate native persisted state or bind its fields inside the caller's owned SQL operation.
@@ -4389,28 +4439,6 @@ fn passkey_challenge_purpose_text(purpose: PasskeyChallengePurpose) -> &'static 
     }
 }
 
-/// Validate native persisted state or bind its fields inside the caller's owned SQL operation.
-pub(super) fn serialize_recovery_code_hash(hash: &RecoveryCodeHash) -> Result<String, StoreError> {
-    super::schema::encode_security(hash)
-}
-
-/// Validate native persisted state or bind its fields inside the caller's owned SQL operation.
-pub(super) fn deserialize_recovery_code_hash(
-    payload: &str,
-) -> Result<RecoveryCodeHash, StoreError> {
-    super::schema::decode_security(payload)
-}
-/// Validate native persisted state or bind its fields inside the caller's owned SQL operation.
-async fn recovery_code_rows(mut rows: StoreRows) -> Result<Vec<sqlx::TursoRow>, StoreError> {
-    let mut collected = Vec::new();
-    while let Some(row) = rows.next().await.map_err(provider_category)? {
-        if collected.len() >= super::schema::NATIVE_RECOVERY_LIMIT {
-            return Err(StoreError::CorruptStoredData);
-        }
-        collected.push(row);
-    }
-    Ok(collected)
-}
 /// Validate native persisted state or bind its fields inside the caller's owned SQL operation.
 pub(super) async fn read_protected_user(
     connection: &StoreConnection<'_>,
@@ -4431,7 +4459,7 @@ pub(super) async fn read_protected_user(
         .await
         .map_err(provider_category)?
         .ok_or(StoreError::CorruptStoredData)?;
-    let record: ProtectedPersistence = super::schema::decode_security(&row_text(&row)?)?;
+    let record: ProtectedPersistence = rows.decode_security(&row, 0)?;
     consume_rows(&mut rows).await?;
     record
         .metadata
@@ -4518,10 +4546,11 @@ struct ExpectedPasskey<'a> {
 }
 /// Serialize a native expected credential by borrow; no public crypto payload is cloned.
 pub(super) fn serialize_expected_passkey(
+    connection: &StoreConnection<'_>,
     id: UserId,
     expected: &UserPasskeyInfo,
-) -> Result<String, StoreError> {
-    super::schema::encode_security(&ExpectedPasskey {
+) -> Result<super::schema::SecurityText, StoreError> {
+    connection.encode_security(&ExpectedPasskey {
         user_id: id,
         info: expected,
     })
@@ -4557,7 +4586,7 @@ async fn find_browser_context(
     let Some(row) = rows.next().await.map_err(provider_category)? else {
         return Ok(None);
     };
-    let context: BrowserContext = super::schema::decode_security(&row_text(&row)?)?;
+    let context: BrowserContext = rows.decode_security(&row, 0)?;
     context.validate()?;
     if context.id() != id {
         return Err(StoreError::CorruptStoredData);
@@ -4578,6 +4607,7 @@ impl SqlxIdentityStore {
     {
         /// Scoped mutation captures the account identity by borrow and consumes its callback.
         struct Contact<'input, F> {
+            security: super::schema::SecurityScope,
             /// Stable user reference valid until this operation settles.
             id: &'input UserId,
             /// Native lifecycle mutation with no reusable/Clone payload requirement.
@@ -4594,7 +4624,7 @@ impl SqlxIdentityStore {
             where
                 Self: 'lease,
             {
-                let connection = StoreConnection::new(native);
+                let connection = StoreConnection::new(native, self.security);
                 let diagnostics = connection.diagnostics();
                 let result = async {
                         let user = find_user_by_id(&connection, self.id).await?.ok_or(StoreError::NotFound)?;
@@ -4604,7 +4634,7 @@ impl SqlxIdentityStore {
                         if updated.user_name().is_none() {
                             let mut rows = connection.query("SELECT user_id FROM effect_identity_protected_users WHERE user_id=?1", (self.id.to_string(),)).await.map_err(provider_category)?;
                             if rows.next().await.map_err(provider_category)?.is_none() { return Err(StoreError::CorruptStoredData); }
-                            let changed = connection.execute("UPDATE effect_identity_users SET concurrency_stamp=?2,payload=?3 WHERE id=?1 AND concurrency_stamp=?4", (self.id.to_string(), updated.concurrency_stamp().to_string(), serialize_user(&updated)?, expected.to_string())).await.map_err(provider_category)?;
+                            let changed = connection.execute("UPDATE effect_identity_users SET concurrency_stamp=?2,payload=?3 WHERE id=?1 AND concurrency_stamp=?4", (self.id.to_string(), updated.concurrency_stamp().to_string(), connection.encode_security(&updated)?, expected.to_string())).await.map_err(provider_category)?;
                             ensure_rows_changed(changed, StoreError::TransactionConflict)?;
                         } else {
                             validate_email_claim(&connection,&updated,false).await?;
@@ -4616,7 +4646,7 @@ impl SqlxIdentityStore {
             }
         }
         self.kernel
-            .transaction_operation(Contact { id, update })
+            .transaction_operation(Contact { security: self.security_scope()?, id, update })
             .await
             .map_err(|error| self.narrow(error))
     }
@@ -4643,7 +4673,7 @@ async fn rotate_security_stamp(
             (
                 id.to_string(),
                 user.concurrency_stamp().to_string(),
-                serialize_user(&user)?,
+                connection.encode_security(&user)?,
             ),
         )
         .await
@@ -4655,9 +4685,10 @@ async fn rotate_security_stamp(
 /// The explicit private DTO follows v1 security fields; no JSON DOM or credential
 /// clone is used to work around upstream's accessor-only update command.
 pub(super) fn serialize_refreshed_user(
+    connection: &StoreConnection<'_>,
     user: &IdentityUser,
     stamp: &ConcurrencyStamp,
-) -> Result<String, StoreError> {
+) -> Result<super::schema::SecurityText, StoreError> {
     #[derive(serde::Serialize)]
     /// Borrowed private v1 account persistence representation, separate from views.
     struct Persistence<'a> {
@@ -4692,7 +4723,7 @@ pub(super) fn serialize_refreshed_user(
         /// New revision minted only after checking the expected version.
         concurrency_stamp: &'a ConcurrencyStamp,
     }
-    super::schema::encode_security(&Persistence {
+    connection.encode_security(&Persistence {
         id: user.id(),
         user_name: user.user_name(),
         normalized_user_name: user.normalized_user_name(),
@@ -4713,9 +4744,10 @@ pub(super) fn serialize_refreshed_user(
 /// Serialize the borrowed role update using its stable ID and fresh persisted stamp.
 /// Native public Deserialize validates the owned acknowledged result on reload.
 fn serialize_refreshed_role(
+    connection: &StoreConnection<'_>,
     role: &IdentityRole,
     stamp: &ConcurrencyStamp,
-) -> Result<String, StoreError> {
+) -> Result<super::schema::SecurityText, StoreError> {
     #[derive(serde::Serialize)]
     /// Version-one role persistence fields, independent of HTTP account views.
     struct Persistence<'a> {
@@ -4728,7 +4760,7 @@ fn serialize_refreshed_role(
         /// Fresh committed revision following a successful expected-version check.
         concurrency_stamp: &'a ConcurrencyStamp,
     }
-    super::schema::encode_security(&Persistence {
+    connection.encode_security(&Persistence {
         id: role.id(),
         name: role.name(),
         normalized_name: role.normalized_name(),

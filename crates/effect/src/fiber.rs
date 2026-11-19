@@ -4,6 +4,7 @@ use crate::execution::TaskEvent;
 use crate::internal::notification::notify_all;
 use crate::internal::outcome;
 use crate::internal::runtime::{self, Context, Finish, Step};
+use crate::memory::{SharedSlot, prepared_notification};
 use crate::scope::Registered;
 use crate::{
     Cancellation, Defect, Effect, Exit, HasTaskSpawner, LibraryDefect, ScheduledTask, Scope,
@@ -11,9 +12,39 @@ use crate::{
 };
 use event_listener::Event;
 use futures_util::future::select;
+use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll};
+
+mod prepared;
+pub(crate) use prepared::{
+    PreparedForkDispatch, PreparedUnitFork, PreparedUnitForks, prepared_fork_task_layout,
+};
+
+// Field order keeps the owner through destruction of the future and all its
+// captures, including when destruction unwinds. Ready does not release it.
+struct OwnedTaskFuture<F, O> {
+    future: F,
+    _owner: O,
+}
+
+struct ForkSubmission<A: Send + 'static, E: Send + 'static, T> {
+    fiber: Fiber<A, E>,
+    finalizer: Registered<E>,
+    task: T,
+}
+impl<F: Future, O> Future for OwnedTaskFuture<F, O> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        // SAFETY: the future is structurally pinned and is never moved or
+        // replaced; the owner is not projected or taken while polling.
+        let this = unsafe { self.get_unchecked_mut() };
+        unsafe { Pin::new_unchecked(&mut this.future) }.poll(context)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Variants of admission used by fiber.
@@ -50,6 +81,7 @@ struct State<A: Send + 'static, E: Send + 'static> {
     observed: bool,
     protected: bool,
     origin: Option<JoinedOrigin>,
+    retirement: Option<crate::scope::UnitRetirement<E>>,
 }
 
 #[derive(Clone, Copy)]
@@ -80,6 +112,14 @@ struct Inner<A: Send + 'static, E: Send + 'static> {
     cancellation: Cancellation,
     state: Mutex<State<A, E>>,
     changed: Event,
+    prepared_observers: Option<prepared_notification::Event>,
+    cleanup_waker: futures_util::task::AtomicWaker,
+    produced: Mutex<Option<Produced<A, E>>>,
+}
+
+struct Produced<A, E> {
+    outcome: Exit<A, E>,
+    protected: bool,
 }
 
 /// Terminal classification. Observing it does not consume or recover errors.
@@ -231,7 +271,55 @@ impl<A: Send + 'static, E: Send + 'static> SharedExit<A, E> {
 /// - `A`: Application value type. Bound or type: `Send + 'static`.
 /// - `E`: Domain-error type. Bound or type: `Send + 'static`.
 pub struct Fiber<A: Send + 'static, E: Send + 'static> {
-    inner: Arc<Inner<A, E>>,
+    inner: FiberOwner<A, E>,
+}
+
+type FiberSlot<A, E> = SharedSlot<'static, Option<Inner<A, E>>>;
+
+enum FiberOwner<A: Send + 'static, E: Send + 'static> {
+    Ordinary(Arc<Inner<A, E>>),
+    Prepared(Option<FiberSlot<A, E>>),
+}
+
+impl<A: Send + 'static, E: Send + 'static> Clone for FiberOwner<A, E> {
+    #[allow(clippy::expect_used)] // Accepted fibers have a live owner. The reference limit is the Arc limit.
+    fn clone(&self) -> Self {
+        match self {
+            Self::Ordinary(inner) => Self::Ordinary(Arc::clone(inner)),
+            Self::Prepared(inner) => Self::Prepared(Some(
+                inner
+                    .as_ref()
+                    .expect("live fiber slot")
+                    .try_clone()
+                    .expect("fiber owner limit"),
+            )),
+        }
+    }
+}
+
+impl<A: Send + 'static, E: Send + 'static> std::ops::Deref for FiberOwner<A, E> {
+    type Target = Inner<A, E>;
+
+    #[allow(clippy::expect_used)] // A live slot is initialized before its owner is published.
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Ordinary(inner) => inner,
+            Self::Prepared(inner) => inner
+                .as_deref()
+                .and_then(Option::as_ref)
+                .expect("live fiber record"),
+        }
+    }
+}
+
+impl<A: Send + 'static, E: Send + 'static> Drop for FiberOwner<A, E> {
+    fn drop(&mut self) {
+        if let Self::Prepared(inner) = self
+            && let Some(mut slot) = inner.take().and_then(SharedSlot::into_last)
+        {
+            drop(slot.take());
+        }
+    }
 }
 
 impl<A: Send + 'static, E: Send + 'static> Clone for Fiber<A, E> {
@@ -240,7 +328,7 @@ impl<A: Send + 'static, E: Send + 'static> Clone for Fiber<A, E> {
     /// Type: `Self`.
     fn clone(&self) -> Self {
         Self {
-            inner: Arc::clone(&self.inner),
+            inner: self.inner.clone(),
         }
     }
 }
@@ -290,20 +378,35 @@ impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
     /// Type: `Self`.
     fn new(cancellation: Cancellation) -> Self {
         Self {
-            inner: Arc::new(Inner {
-                cancellation,
-                state: Mutex::new(State {
-                    admission: Admission::Submitting,
-                    started: false,
-                    completion: Completion::Pending,
-                    status: None,
-                    observed: false,
-                    protected: false,
-                    origin: None,
-                }),
-                changed: Event::new(),
-            }),
+            inner: FiberOwner::Ordinary(Arc::new(Self::initialize(cancellation, None))),
         }
+    }
+
+    fn initialize(
+        cancellation: Cancellation,
+        prepared_observers: Option<prepared_notification::Event>,
+    ) -> Inner<A, E> {
+        Inner {
+            cancellation,
+            state: Mutex::new(State {
+                admission: Admission::Submitting,
+                started: false,
+                completion: Completion::Pending,
+                status: None,
+                observed: false,
+                protected: false,
+                origin: None,
+                retirement: None,
+            }),
+            changed: Event::new(),
+            prepared_observers,
+            cleanup_waker: futures_util::task::AtomicWaker::new(),
+            produced: Mutex::new(None),
+        }
+    }
+
+    fn retirement_tag(&self) -> usize {
+        (&*self.inner as *const Inner<A, E>).addr()
     }
 
     ///
@@ -324,12 +427,22 @@ impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
     /// # Returns
     /// Type: `()`.
     fn admitted(&self, admission: Admission) {
-        self.inner
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .admission = admission;
+        // A provider may complete synchronously before spawn returns. Either
+        // this transition or publication takes the one weak retirement hook.
+        let retirement = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.admission = admission;
+            self.take_retirement(&mut state)
+        };
+        if let Some(retirement) = retirement {
+            retirement.retire();
+        }
         notify_all(&self.inner.changed);
+        self.inner.cleanup_waker.wake();
     }
 
     ///
@@ -344,7 +457,7 @@ impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
     /// # Returns
     /// Type: `()`.
     fn publish(&self, completion: Completion<A, E>, protected: bool) {
-        {
+        let retirement = {
             let mut state = self
                 .inner
                 .state
@@ -366,8 +479,32 @@ impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
                 Completion::Pending | Completion::Consumed => None,
             };
             state.completion = completion;
+            self.take_retirement(&mut state)
+        };
+        if let Some(retirement) = retirement {
+            retirement.retire();
         }
         notify_all(&self.inner.changed);
+        if let Some(observers) = &self.inner.prepared_observers {
+            observers.notify_all();
+        }
+        self.inner.cleanup_waker.wake();
+    }
+
+    fn take_retirement(&self, state: &mut State<A, E>) -> Option<crate::scope::UnitRetirement<E>> {
+        let status = state.status?;
+        let accepted = state.admission == Admission::Accepted;
+        let succeeded = accepted && status == FiberStatus::Succeeded;
+        let prepared_settled = self.inner.prepared_observers.is_some()
+            && (accepted && (state.observed || status == FiberStatus::Interrupted)
+                || matches!(state.admission, Admission::Rejected | Admission::Panicked)
+                    && !state.started
+                    && matches!(state.origin, Some(JoinedOrigin::DriverLost)));
+        if succeeded || prepared_settled {
+            state.retirement.take()
+        } else {
+            None
+        }
     }
 
     /// Await classification without marking an error observed.
@@ -381,17 +518,51 @@ impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
     pub async fn settled(&self) -> FiberStatus {
         loop {
             let changed = self.inner.changed.listen();
-            let status = self
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .status;
-            if let Some(status) = status {
+            if let Some(status) = self.settled_status() {
                 return status;
             }
             changed.await;
         }
+    }
+
+    pub(crate) fn settled_status(&self) -> Option<FiberStatus> {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .status
+    }
+
+    // The resolver uses this after its preadmitted observer sees readiness.
+    // Inspect only with internal structural access to the retained outcome.
+    pub(crate) fn observe_ready<T>(
+        &self,
+        inspect: impl FnOnce(&Exit<A, E>) -> T,
+    ) -> Result<Option<T>, Defect> {
+        let (observed, retirement) = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.admission == Admission::Submitting {
+                return Ok(None);
+            }
+            let observed = match &state.completion {
+                Completion::Pending => return Ok(None),
+                Completion::Ready(outcome) => Ok(inspect(outcome)),
+                Completion::Lost(defect) => Ok(inspect(&Exit::Die(defect.clone()))),
+                Completion::Shared(outcome) => outcome.with(inspect),
+                Completion::Consumed => Err(Defect::from(LibraryDefect::FiberOutcomeConsumed)),
+            };
+            state.observed |= observed.is_ok();
+            let retirement = self.take_retirement(&mut state);
+            (observed, retirement)
+        };
+        if let Some(retirement) = retirement {
+            retirement.retire();
+        }
+        observed.map(Some)
     }
 
     /// # Type parameters
@@ -475,7 +646,7 @@ impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
         let fiber = self.clone();
         Effect::new(move |_, context, finish| {
             let fiber = fiber.clone();
-            Step::Suspended(Box::pin(async move {
+            Step::suspended(Box::pin(async move {
                 let outcome = match fiber
                     .observe(
                         context.cancellation,
@@ -558,7 +729,7 @@ impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
         let fiber = self.clone();
         Effect::new(move |_, context, finish| {
             let fiber = fiber.clone();
-            Step::Suspended(Box::pin(async move {
+            Step::suspended(Box::pin(async move {
                 if matches!(mode, ObservationMode::Interrupt) {
                     let _ = fiber.inner.cancellation.request();
                 }
@@ -597,7 +768,7 @@ impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
         let fiber = self.clone();
         Effect::new(move |_, context, finish| {
             let fiber = fiber.clone();
-            Step::Suspended(Box::pin(async move {
+            Step::suspended(Box::pin(async move {
                 if matches!(mode, ObservationMode::Interrupt) {
                     let _ = fiber.inner.cancellation.request();
                 }
@@ -635,9 +806,9 @@ impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
         mode: ObservationMode,
         ownership: Ownership,
     ) -> Result<Option<Observed<A, E>>, Defect> {
+        let mut listener = None;
         loop {
-            let changed = self.inner.changed.listen();
-            let available = {
+            let (available, retirement) = {
                 let mut state = self
                     .inner
                     .state
@@ -654,7 +825,7 @@ impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
                 if state.admission == Admission::Submitting
                     || matches!(state.completion, Completion::Pending)
                 {
-                    None
+                    (None, None)
                 } else {
                     let completion = std::mem::replace(&mut state.completion, Completion::Consumed);
                     let result = match (completion, ownership) {
@@ -695,12 +866,20 @@ impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
                         }
                     };
                     state.observed |= result.is_ok();
-                    Some(result)
+                    let retirement = self.take_retirement(&mut state);
+                    (Some(result), retirement)
                 }
             };
+            if let Some(retirement) = retirement {
+                retirement.retire();
+            }
             if let Some(result) = available {
                 return result.map(Some);
             }
+            let Some(changed) = listener.take() else {
+                listener = Some(self.inner.changed.listen());
+                continue;
+            };
             match mode {
                 ObservationMode::Await => {
                     let cancelled = pin!(cancellation.cancelled());
@@ -722,61 +901,108 @@ impl<A: Send + 'static, E: Send + 'static> Fiber<A, E> {
         let _ = self.inner.cancellation.request();
         loop {
             let changed = self.inner.changed.listen();
-            let completed = {
-                let mut state = self
-                    .inner
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if state.admission == Admission::Submitting || state.status.is_none() {
-                    None
-                } else if state.observed {
-                    Some(Cleanup::Observed)
-                } else {
-                    match std::mem::replace(&mut state.completion, Completion::Consumed) {
-                        Completion::Ready(outcome) => Some(Cleanup::Outcome(outcome)),
-                        Completion::Lost(defect) => Some(Cleanup::Loss {
-                            defect,
-                            report: state.admission == Admission::Accepted || state.started,
-                        }),
-                        Completion::Consumed | Completion::Shared(_) => Some(Cleanup::Observed),
-                        Completion::Pending => {
-                            state.completion = Completion::Pending;
-                            None
-                        }
-                    }
-                }
-            };
-            if let Some(completed) = completed {
-                self.inner.cancellation.unlink();
-                return match completed {
-                    Cleanup::Observed => Exit::Success(()),
-                    Cleanup::Outcome(Exit::Success(value)) => {
-                        match catch_unwind(AssertUnwindSafe(|| drop(value))) {
-                            Ok(()) => Exit::Success(()),
-                            Err(panic) => Exit::Die(Defect::from_panic(panic)),
-                        }
-                    }
-                    Cleanup::Outcome(Exit::Interrupted) => Exit::Success(()),
-                    Cleanup::Outcome(failure) => match failure.into_failure() {
-                        Ok(_) => Exit::Success(()),
-                        Err(failure) => failure,
-                    },
-                    Cleanup::Loss { defect, report } => {
-                        if report {
-                            Exit::Die(defect)
-                        } else {
-                            Exit::Success(())
-                        }
-                    }
-                };
+            if let Some(outcome) = self.cleanup_ready() {
+                return outcome;
             }
             changed.await;
         }
     }
+
+    fn cleanup_ready(&self) -> Option<Exit<(), E>> {
+        let completed = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.admission == Admission::Submitting || state.status.is_none() {
+                None
+            } else if state.observed {
+                Some(Cleanup::Observed)
+            } else {
+                match std::mem::replace(&mut state.completion, Completion::Consumed) {
+                    Completion::Ready(outcome) => Some(Cleanup::Outcome(outcome)),
+                    Completion::Lost(defect) => Some(Cleanup::Loss {
+                        defect,
+                        report: state.admission == Admission::Accepted || state.started,
+                    }),
+                    Completion::Consumed | Completion::Shared(_) => Some(Cleanup::Observed),
+                    Completion::Pending => {
+                        state.completion = Completion::Pending;
+                        None
+                    }
+                }
+            }
+        };
+        let completed = completed?;
+        self.inner.cancellation.unlink();
+        Some(match completed {
+            Cleanup::Observed => Exit::Success(()),
+            Cleanup::Outcome(Exit::Success(value)) => {
+                match catch_unwind(AssertUnwindSafe(|| drop(value))) {
+                    Ok(()) => Exit::Success(()),
+                    Err(panic) => Exit::Die(Defect::from_panic(panic)),
+                }
+            }
+            Cleanup::Outcome(Exit::Interrupted) => Exit::Success(()),
+            Cleanup::Outcome(failure) => match failure.into_failure() {
+                Ok(_) => Exit::Success(()),
+                Err(failure) => failure,
+            },
+            Cleanup::Loss { defect, report } => {
+                if report {
+                    Exit::Die(defect)
+                } else {
+                    Exit::Success(())
+                }
+            }
+        })
+    }
 }
 
 impl<E: Send + 'static> Scope<E> {
+    pub(crate) fn start_prepared_fork<R, F>(
+        &self,
+        env: &Arc<R>,
+        parent: &Context,
+        dispatch: PreparedForkDispatch<E>,
+        work: impl FnOnce(Arc<R>, Context) -> F,
+    ) -> Exit<Fiber<(), E>, E>
+    where
+        R: HasTaskSpawner + Send + Sync + 'static,
+        F: Future<Output = Exit<(), E>> + Send + 'static,
+    {
+        let PreparedForkDispatch {
+            mut fork,
+            observers,
+            permits: (scope_owner, task_owner),
+        } = dispatch;
+        let Some(task) = fork.task.take() else {
+            return Exit::Die(Defect::from(LibraryDefect::PreparedConstructionUnbound));
+        };
+        // The preceding protected fork used an independent cancellation
+        // source. The reserved child has that same ancestry, plus a typed
+        // fiber origin carrying the caller's trace and instrumentation.
+        let (context, task) = task.prepare_start(parent);
+        let (fiber, finalizer) =
+            fork.initialize(self, context.cancellation.clone(), observers, scope_owner);
+        if let Err(finalizer) = self.try_register(finalizer) {
+            fiber.admitted(Admission::Rejected);
+            fiber.publish(Completion::Ready(Exit::Interrupted), false);
+            drop(finalizer);
+            let cleanup = fiber.cleanup_ready().unwrap_or(Exit::Die(Defect::from(
+                LibraryDefect::MissingInterpreterOutcome,
+            )));
+            return outcome::append_cleanup(
+                Exit::Die(Defect::from(LibraryDefect::ScopeRegistrationClosed)),
+                cleanup,
+            );
+        }
+        let future = work(Arc::clone(env), context.clone());
+        let scheduled = task.schedule(future, context, fiber.clone(), task_owner);
+        start_scheduled(fiber, env, scheduled)
+    }
+
     /// Register ownership before submitting through the current R. Closing
     /// rejects without accessing the provider. Cleanup cancels and joins every
     /// submitted task, including provider rejection/panic and cancellation races.
@@ -800,6 +1026,99 @@ impl<E: Send + 'static> Scope<E> {
         let scope = self.clone();
         Effect::new(move |env, context, finish| {
             scope.submit(program.clone(), &env, context.child(), finish)
+        })
+    }
+
+    // A prepared dispatch records native admission in the same transition as
+    // submission, before the trampoline can suspend its caller's continuation.
+    pub(crate) fn fork_recording_admission<R>(
+        &self,
+        program: Effect<(), E, R>,
+        settlement: prepared_notification::Event,
+        owners: (SharedSlot<'static, ()>, SharedSlot<'static, ()>),
+        prepared: PreparedUnitFork<E>,
+        record: impl FnOnce(&Exit<Fiber<(), E>, E>) + Send + 'static,
+    ) -> Effect<Fiber<(), E>, E, R>
+    where
+        R: HasTaskSpawner + Send + Sync + 'static,
+    {
+        let scope = self.clone();
+        let observation = Mutex::new(Some((settlement, owners, prepared, record)));
+        Effect::new(move |env, context, finish| {
+            let admission = observation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            let Some((settlement, (scope_owner, task_owner), prepared, record)) = admission else {
+                return runtime::finish(
+                    finish,
+                    Exit::Die(Defect::from(LibraryDefect::FutureFactoryConsumed)),
+                );
+            };
+            let child_context = context.child();
+            let (fiber, finalizer) = prepared.initialize(
+                &scope,
+                child_context.cancellation.clone(),
+                settlement,
+                scope_owner,
+            );
+            let program = program.clone();
+            let task = move |fiber, env| {
+                ordinary_task(program, env, child_context, fiber, Some(task_owner))
+            };
+            let submission = ForkSubmission {
+                fiber,
+                finalizer,
+                task,
+            };
+            scope.submit_registered(submission, &env, finish, record)
+        })
+    }
+
+    /// Fork a unit task whose successful, accepted registration may retire early.
+    /// The supplied owner remains in the scope cleanup until it settles or the
+    /// accepted task succeeds. Other outcomes retain normal scope reporting.
+    /// Ordinary scope checkpoints keep their registration boundary when
+    /// a successful child retires.
+    pub fn fork_unit_with_owner<R, O>(
+        &self,
+        program: Effect<(), E, R>,
+        owner: O,
+    ) -> Effect<Fiber<(), E>, E, R>
+    where
+        R: HasTaskSpawner + Send + Sync + 'static,
+        O: Clone + Send + Sync + 'static,
+    {
+        self.fork_unit_with_task_guard(program, owner, ())
+    }
+
+    /// Retain an additional guard in the scheduled future. The finalizer
+    /// retains the diagnostic owner independently of that guard.
+    #[doc(hidden)]
+    pub fn fork_unit_with_task_guard<R, O, G>(
+        &self,
+        program: Effect<(), E, R>,
+        owner: O,
+        guard: G,
+    ) -> Effect<Fiber<(), E>, E, R>
+    where
+        R: HasTaskSpawner + Send + Sync + 'static,
+        O: Clone + Send + Sync + 'static,
+        G: Clone + Send + Sync + 'static,
+    {
+        let scope = self.clone();
+        Effect::new(move |env, context, finish| {
+            let program = program.clone();
+            let child = context.child();
+            let finalizer_owner = owner.clone();
+            let task_owner = (finalizer_owner.clone(), guard.clone());
+            scope.submit_with_owner(
+                program,
+                &env,
+                child,
+                finish,
+                Some((finalizer_owner, task_owner)),
+            )
         })
     }
 
@@ -859,64 +1178,144 @@ impl<E: Send + 'static> Scope<E> {
         A: Send + 'static,
         R: HasTaskSpawner + Send + Sync + 'static,
     {
+        self.submit_with_owner(program, env, child_context, finish, None::<((), ())>)
+    }
+
+    fn submit_with_owner<A, R, O, T>(
+        &self,
+        program: Effect<A, E, R>,
+        env: &Arc<R>,
+        child_context: Context,
+        finish: Finish<Fiber<A, E>, E>,
+        owners: Option<(O, T)>,
+    ) -> Step
+    where
+        A: Send + 'static,
+        R: HasTaskSpawner + Send + Sync + 'static,
+        O: Send + 'static,
+        T: Send + 'static,
+    {
         let fiber = Fiber::new(child_context.cancellation.clone());
+        let (owner, task_owner) = owners.unzip();
         let cleanup = fiber.clone();
         let abandon = fiber.clone();
-        let finalizer = Registered::with_abandon(
+        let tag = owner.as_ref().map(|_| fiber.retirement_tag());
+        if let Some(tag) = tag {
+            fiber
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retirement = Some(self.unit_retirement(tag));
+        }
+        let mut finalizer = Registered::with_abandon(
             move |finish| {
-                Step::Suspended(Box::pin(async move {
-                    runtime::finish(finish, cleanup.cleanup().await)
+                Step::suspended(Box::pin(async move {
+                    let outcome = cleanup.cleanup().await;
+                    drop(owner);
+                    runtime::finish(finish, outcome)
                 }))
             },
             move || {
                 let _ = abandon.inner.cancellation.request();
             },
         );
+        if let Some(tag) = tag {
+            finalizer.set_retirement_tag(tag);
+        }
+        let task = move |fiber, env| ordinary_task(program, env, child_context, fiber, task_owner);
+        let submission = ForkSubmission {
+            fiber,
+            finalizer,
+            task,
+        };
+        self.submit_registered(submission, env, finish, |_| {})
+    }
+
+    fn submit_registered<A, R, T>(
+        &self,
+        submission: ForkSubmission<A, E, T>,
+        env: &Arc<R>,
+        finish: Finish<Fiber<A, E>, E>,
+        record: impl FnOnce(&Exit<Fiber<A, E>, E>) + Send + 'static,
+    ) -> Step
+    where
+        A: Send + 'static,
+        R: HasTaskSpawner + Send + Sync + 'static,
+        T: FnOnce(Fiber<A, E>, Arc<R>) -> ScheduledTask,
+    {
+        let ForkSubmission {
+            fiber,
+            finalizer,
+            task,
+        } = submission;
         if let Err(finalizer) = self.try_register(finalizer) {
             fiber.admitted(Admission::Rejected);
             fiber.publish(Completion::Ready(Exit::Interrupted), false);
             return finalizer.execute(runtime::continuation(move |cleanup| {
-                runtime::finish(
-                    finish,
-                    outcome::append_cleanup(
-                        Exit::Die(Defect::from(LibraryDefect::ScopeRegistrationClosed)),
-                        cleanup,
-                    ),
-                )
+                let outcome = outcome::append_cleanup(
+                    Exit::Die(Defect::from(LibraryDefect::ScopeRegistrationClosed)),
+                    cleanup,
+                );
+                record(&outcome);
+                runtime::finish(finish, outcome)
             }));
         }
-        let completed = fiber.clone();
-        // One notification capture handles startup and loss, rather than
-        // separately boxing each callback and retaining two Fiber handles.
-        let notification = fiber.clone();
-        let child_env = Arc::clone(env);
-        let task = ScheduledTask::new(
-            move |settlement| {
-                Box::pin(async move {
-                    let outcome =
-                        runtime::evaluate_context(program, child_env, &child_context).await;
-                    settlement.release();
-                    completed.publish(Completion::Ready(outcome), child_context.was_protected());
-                })
-            },
-            move |event| match event {
-                TaskEvent::Started => notification.started(),
-                TaskEvent::Lost(defect) => notification.publish(Completion::Lost(defect), false),
-            },
-        );
-        match catch_unwind(AssertUnwindSafe(|| env.task_spawner().spawn(task))) {
-            Ok(Ok(())) => {
-                fiber.admitted(Admission::Accepted);
-                runtime::finish(finish, Exit::Success(fiber))
-            }
-            Ok(Err(defect)) => {
-                fiber.admitted(Admission::Rejected);
-                runtime::finish(finish, Exit::Die(defect))
-            }
-            Err(panic) => {
-                fiber.admitted(Admission::Panicked);
-                runtime::finish(finish, Exit::Die(Defect::from_panic(panic)))
-            }
+        let task = task(fiber.clone(), Arc::clone(env));
+        let outcome = start_scheduled(fiber, env, task);
+        record(&outcome);
+        runtime::finish(finish, outcome)
+    }
+}
+
+fn start_scheduled<A: Send + 'static, E: Send + 'static, R: HasTaskSpawner>(
+    fiber: Fiber<A, E>,
+    env: &Arc<R>,
+    task: ScheduledTask,
+) -> Exit<Fiber<A, E>, E> {
+    match catch_unwind(AssertUnwindSafe(|| env.task_spawner().spawn(task))) {
+        Ok(Ok(())) => {
+            fiber.admitted(Admission::Accepted);
+            Exit::Success(fiber)
+        }
+        Ok(Err(defect)) => {
+            fiber.admitted(Admission::Rejected);
+            Exit::Die(defect)
+        }
+        Err(panic) => {
+            fiber.admitted(Admission::Panicked);
+            Exit::Die(Defect::from_panic(panic))
         }
     }
+}
+
+fn ordinary_task<
+    A: Send + 'static,
+    E: Send + 'static,
+    R: Send + Sync + 'static,
+    O: Send + 'static,
+>(
+    program: Effect<A, E, R>,
+    env: Arc<R>,
+    child_context: Context,
+    completed: Fiber<A, E>,
+    task_owner: Option<O>,
+) -> ScheduledTask {
+    let notification = completed.clone();
+    ScheduledTask::new(
+        move |settlement| {
+            Box::pin(OwnedTaskFuture {
+                future: async move {
+                    let outcome = runtime::evaluate_context(program, env, &child_context).await;
+                    settlement.release();
+                    completed.publish(Completion::Ready(outcome), child_context.was_protected());
+                },
+                _owner: task_owner,
+            })
+        },
+        move |event| match event {
+            TaskEvent::Started => notification.started(),
+            TaskEvent::Lost(defect) => notification.publish(Completion::Lost(defect), false),
+        },
+    )
 }

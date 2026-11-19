@@ -1,8 +1,10 @@
 //! Versioned transactional references.
 
 use super::TxValue;
-use super::internal::journal::{Cell, DomainInner, JournalError, TxJournal};
+use super::internal::journal::{DomainInner, JournalError, TxJournal};
+use super::internal::value::ErasedValue;
 use super::{Transaction, TransactionError, TxStep};
+use crate::memory::{Bytes, MemoryError, PreparedMemory, RegionId};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
@@ -13,6 +15,24 @@ pub enum TransactionDomainError {
     Capacity,
     /// No further identity can be allocated without exceeding its range.
     IdentityExhausted,
+    /// The selected prepared storage could not admit the operation.
+    Memory(MemoryError),
+}
+
+/// Physical limits for a prepared STM domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparedTransactionCapacity {
+    /// Live transactional cells.
+    pub cells: NonZeroUsize,
+    /// Distinct read observations per journal, including retry branch unions.
+    pub reads: NonZeroUsize,
+    /// Distinct staged writes per journal.
+    pub writes: NonZeroUsize,
+    /// Simultaneous journal pairs, including nested branches and preadmitted
+    /// scoped releases.
+    pub journals: NonZeroUsize,
+    /// Concurrent retry observations and their committed-change registrations.
+    pub retry_waiters: NonZeroUsize,
 }
 
 /// Process-local synchronization domain. There is no database, async runtime
@@ -23,6 +43,26 @@ pub struct TransactionDomain {
 }
 
 impl TransactionDomain {
+    /// Regional record and listener storage, excluding region headers/alignment
+    /// overhead and caller-owned cell values.
+    pub fn storage_bytes(capacity: PreparedTransactionCapacity) -> Result<Bytes, MemoryError> {
+        DomainInner::storage_bytes(capacity)
+    }
+
+    /// Provision the index, journal tables and retry controls at startup. A
+    /// transaction executed through this domain uses the same atomic commit
+    /// path and reports a typed memory refusal before publishing any write.
+    pub fn prepare(
+        memory: &PreparedMemory<'static>,
+        region: RegionId,
+        capacity: PreparedTransactionCapacity,
+    ) -> Result<Self, MemoryError> {
+        Ok(Self {
+            inner: Arc::new(DomainInner::prepare(memory, region, capacity)?),
+            capacity: capacity.cells,
+        })
+    }
+
     #[must_use]
     /// Construct a `TransactionDomain` from its required inputs and explicit policies.
     ///
@@ -49,34 +89,33 @@ impl TransactionDomain {
     /// # Returns
     /// Type: `Result<TxRef<T>, TransactionDomainError>`.
     pub fn reference<T: TxValue>(&self, initial: T) -> Result<TxRef<T>, TransactionDomainError> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.cells.len() >= self.capacity.get() {
-            return Err(TransactionDomainError::Capacity);
-        }
-        let raw = state
-            .next_id
-            .checked_add(1)
-            .ok_or(TransactionDomainError::IdentityExhausted)?;
-        let id = NonZeroU64::new(raw).ok_or(TransactionDomainError::IdentityExhausted)?;
-        state.next_id = raw;
-        state.cells.insert(
-            id,
-            Cell {
-                version: 0,
-                value: Arc::new(initial),
-            },
-        );
         Ok(TxRef {
-            handle: Arc::new(ReferenceHandle {
-                domain: Arc::clone(&self.inner),
-                id,
-            }),
+            handle: self.create_handle(ErasedValue::ordinary(Arc::new(initial)))?,
             marker: std::marker::PhantomData,
         })
+    }
+
+    fn create_handle(
+        &self,
+        value: ErasedValue,
+    ) -> Result<Arc<ReferenceHandle>, TransactionDomainError> {
+        let id = self.inner.create_cell(self.capacity.get(), value)?;
+        Ok(Arc::new(ReferenceHandle {
+            domain: Arc::clone(&self.inner),
+            id,
+        }))
+    }
+
+    pub(super) fn create_prepared_handle(
+        &self,
+        value: ErasedValue,
+    ) -> Result<Arc<ReferenceHandle>, TransactionDomainError> {
+        if !self.inner.is_prepared() {
+            return Err(TransactionDomainError::Memory(
+                MemoryError::UnsupportedRunContract,
+            ));
+        }
+        self.create_handle(value)
     }
 }
 
@@ -108,15 +147,7 @@ impl Drop for ReferenceHandle {
     /// # Returns
     /// Type: `()`.
     fn drop(&mut self) {
-        let removed = self
-            .domain
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cells
-            .remove(&self.id);
-        // A value's destructor can reenter the domain; run it outside the gate.
-        drop(removed);
+        self.domain.remove_cell(self.id);
     }
 }
 
@@ -151,19 +182,7 @@ impl<T: TxValue> TxRef<T> {
     /// # Returns
     /// Type: `Result<(u64, Arc<T>), JournalError>`.
     pub(crate) fn inspect_committed(&self) -> Result<(u64, Arc<T>), JournalError> {
-        let state = self
-            .handle
-            .domain
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let cell = state
-            .cells
-            .get(&self.handle.id)
-            .ok_or(JournalError::MissingCell)?;
-        let value = Arc::downcast::<T>(Arc::clone(&cell.value))
-            .map_err(|_| JournalError::WrongValueType)?;
-        Ok((cell.version, value))
+        self.handle.domain.inspect(self.handle.id)
     }
 
     /// # Type parameters
@@ -237,7 +256,7 @@ impl<T: TxValue> TxRef<T> {
     ) -> Transaction<B, E> {
         let reference = self.clone();
         Transaction::new(move |journal: &mut TxJournal| {
-            let current = match journal.read::<T>(&reference.handle) {
+            let current = match journal.read_for_write::<T>(&reference.handle) {
                 Ok(value) => value,
                 Err(JournalError::Conflict) => return TxStep::Conflict,
                 Err(error) => return TxStep::Invalid(TransactionError::from_journal(error)),

@@ -40,6 +40,10 @@ pub trait NativeBackend:
     fn configuration(&self) -> StorageConfiguration;
     /// Establish an owned native diagnostic scope without acquiring a provider or runtime.
     fn scoped(&self) -> Self;
+    /// Reserve the selected provider's invocation diagnostic storage when available.
+    fn try_scoped(&self) -> Result<Self, IdentityError> {
+        Ok(self.scoped())
+    }
     /// Restore a completed native result after its narrower store calls have settled.
     fn capture_outcome<A>(&self, result: Result<A, IdentityError>) -> Result<A, IdentityError>;
     /// Report a provider-retained fn-pointer UTC clock where its native store API
@@ -58,6 +62,14 @@ impl NativeBackend for crate::SqlxIdentityStore {
     fn scoped(&self) -> Self {
         self.invocation().store()
     }
+    fn try_scoped(&self) -> Result<Self, IdentityError> {
+        self.try_invocation()
+            .map(|invocation| invocation.store())
+            .map_err(|error| {
+                IdentityError::Admission(effect::PreparedAdmissionError::Memory(error))
+            })
+    }
+
     /// Preserve native defects/interruption/ordered SQL cleanup before narrowing returns.
     fn capture_outcome<A>(&self, result: Result<A, IdentityError>) -> Result<A, IdentityError> {
         match &self.invocation {

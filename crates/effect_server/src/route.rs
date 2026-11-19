@@ -354,9 +354,16 @@ pub(crate) struct RouteEntry<E: Send + 'static, R: Send + Sync + 'static> {
     pub(crate) patterns: Vec<String>,
     /// Typed captures become a completed endpoint before request execution.
     pub(crate) endpoint: Arc<EndpointSelector<E, R>>,
+    pub(crate) prepared: Option<Arc<dyn crate::prepared_endpoint::SharedEndpointAdmitter<E, R>>>,
+    pub(crate) prepared_input: Option<Arc<PreparedInputAdmission<E, R>>>,
+    pub(crate) on_capacity: Option<crate::StaticOverloadReply>,
+    pub(crate) byte_pools: Option<Arc<crate::PreparedEndpointBytePools>>,
     /// Registration metadata is installed before environment resolution.
     pub(crate) metadata: Registration,
 }
+type PreparedInputAdmission<E, R> = dyn Fn() -> Result<crate::prepared_endpoint::CaptureOnce<E, R>, effect::memory::MemoryError>
+    + Send
+    + Sync;
 /// Ordered router description. Native axum routing owns 404/405/HEAD behavior.
 pub struct Router<E: Send + 'static, R: Send + Sync + 'static> {
     /// Ordered typed/native registrations.
@@ -403,7 +410,83 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Router<E, R> {
         self.entries.push(RouteEntry {
             methods,
             patterns,
-            endpoint: Arc::new(move |captures| route.decode(&captures).map(&handler)),
+            endpoint: Arc::new(move |captures| route.decode(captures).map(&handler)),
+            prepared: None,
+            prepared_input: None,
+            on_capacity: None,
+            byte_pools: None,
+            metadata,
+        });
+        self
+    }
+    /// Register a startup-prepared endpoint on a unit route. Its exact graph is
+    /// admitted before request environment resolution and business execution.
+    /// Run it through [`crate::PreparedServer`]; an ordinary host refuses the route.
+    /// Use [`Router::prepared_input_methods`] for typed captures.
+    pub fn prepared_methods<F, D>(
+        mut self,
+        methods: HttpMethodSet,
+        route: Route<()>,
+        endpoint: crate::PreparedEndpoint<F, D>,
+    ) -> Self
+    where
+        D: effect::__private::prepared_graph::Description<
+                Value = crate::Reply<E, R>,
+                Error = E,
+                Env = R,
+            >,
+        F: Fn() -> D + Send + Sync + 'static,
+        crate::PreparedEndpoint<F, D>: Send + Sync + 'static,
+    {
+        let patterns = route.patterns.clone();
+        let metadata = route.metadata.clone();
+        let placeholder = crate::endpoint! { effect: crate::effect_die! { defect: effect::Defect::new("prepared endpoint placeholder must not execute"), }, };
+        self.entries.push(RouteEntry {
+            methods,
+            patterns,
+            endpoint: Arc::new(move |captures| {
+                route.decode(captures).map(|()| placeholder.clone())
+            }),
+            on_capacity: endpoint.on_capacity,
+            byte_pools: endpoint.byte_pools.clone(),
+            prepared: Some(Arc::new(endpoint)),
+            prepared_input: None,
+            metadata,
+        });
+        self
+    }
+    /// Register a prepared graph that consumes the decoded typed route input once.
+    pub fn prepared_input_methods<A, F, D>(
+        mut self,
+        methods: HttpMethodSet,
+        route: Route<A>,
+        endpoint: crate::PreparedInputEndpoint<F, A, D>,
+    ) -> Self
+    where
+        A: Send + 'static,
+        D: effect::__private::prepared_graph::Description<
+                Value = crate::Reply<E, R>,
+                Error = E,
+                Env = R,
+            >,
+        F: Fn(A) -> D + Send + Sync + 'static,
+        crate::PreparedInputEndpoint<F, A, D>: Send + Sync + 'static,
+    {
+        let patterns = route.patterns.clone();
+        let metadata = route.metadata.clone();
+        let placeholder = crate::endpoint! { effect: crate::effect_die! { defect: effect::Defect::new("prepared endpoint placeholder must not execute"), }, };
+        let decoder = route.decode.clone();
+        let on_capacity = endpoint.on_capacity;
+        let byte_pools = endpoint.byte_pools.clone();
+        let admit = move || endpoint.admit_input(decoder.clone());
+        self.entries.push(RouteEntry {
+            methods,
+            patterns,
+            endpoint: Arc::new(move |_| Ok(placeholder.clone())),
+            prepared: None,
+            prepared_input: Some(Arc::new(admit)),
+            on_capacity,
+            byte_pools,
             metadata,
         });
         self
@@ -421,6 +504,10 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Router<E, R> {
             methods,
             patterns: vec![path.to_owned()],
             endpoint: Arc::new(move |_| Ok(endpoint.clone())),
+            prepared: None,
+            prepared_input: None,
+            on_capacity: None,
+            byte_pools: None,
             metadata: registration.metadata,
         });
         Ok(self)
@@ -517,6 +604,10 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Clone for RouteEntry<E, R> {
             methods: self.methods.clone(),
             patterns: self.patterns.clone(),
             endpoint: self.endpoint.clone(),
+            prepared: self.prepared.clone(),
+            prepared_input: self.prepared_input.clone(),
+            on_capacity: self.on_capacity,
+            byte_pools: self.byte_pools.clone(),
             metadata: self.metadata.clone(),
         }
     }
@@ -806,7 +897,7 @@ type LinkEncoder<A> = dyn Fn(&A) -> Result<String, ServerError> + Send + Sync;
 type CaptureConstraint = dyn Fn(&str) -> bool + Send + Sync;
 
 /// Endpoint selection from owned native captures.
-type EndpointSelector<E, R> = dyn Fn(Captures) -> Result<Endpoint<E, R>, ServerError> + Send + Sync;
+type EndpointSelector<E, R> = dyn Fn(&Captures) -> Result<Endpoint<E, R>, ServerError> + Send + Sync;
 
 /// Native router configuration during description assembly.
 type RouterConfigurator = dyn Fn(axum::Router) -> Result<axum::Router, ServerError> + Send + Sync;

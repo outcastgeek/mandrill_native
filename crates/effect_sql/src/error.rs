@@ -7,6 +7,10 @@ use std::fmt;
 pub enum RowError {
     /// A decoder/choice description is empty or structurally invalid.
     InvalidDecoder,
+    /// The decoder has no independent synchronous borrowed projection.
+    MissingBorrowedDecoder,
+    /// A selected row projection could not acquire its prepared storage.
+    Memory(effect::memory::MemoryError),
     /// A requested name or ordinal is absent.
     MissingColumn(String),
     /// A required cell is SQL NULL; this is distinct from no row.
@@ -34,6 +38,8 @@ impl fmt::Display for RowError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::InvalidDecoder => "invalid SQL row decoder",
+            Self::MissingBorrowedDecoder => "SQL row decoder has no borrowed projection",
+            Self::Memory(_) => "SQL row projection memory admission failed",
             Self::MissingColumn(_) => "SQL column is absent",
             Self::NullColumn(_) => "required SQL cell is NULL",
             Self::Native { .. } => "SQL cell representation is invalid",
@@ -47,7 +53,9 @@ impl std::error::Error for RowError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Native { source, .. } => Some(source),
+            Self::Memory(source) => Some(source),
             Self::InvalidDecoder
+            | Self::MissingBorrowedDecoder
             | Self::MissingColumn(_)
             | Self::NullColumn(_)
             | Self::Schema { .. }
@@ -92,6 +100,14 @@ pub enum SqlError {
     RowAbsent,
     /// A present native row failed typed decoding.
     Decode(RowError),
+    /// An actual prepared SQL resource could not be acquired.
+    Memory(effect::memory::MemoryError),
+    /// Prepared native row backing refused an actual request.
+    PreparedRow(sqlx::PreparedTursoRowMemoryError),
+    /// The selected output's physical row or batch-item limit was exceeded.
+    RowLimit { limit: usize },
+    /// Prepared SQL description validation failed without dynamic diagnostics.
+    PreparedStatement(crate::PreparedSqlStatementError),
     /// A scoped handle was released, outside its frame, or reentered while its cursor owns native access.
     InactiveSession,
     /// Native commit was attempted but its durable result is unknown. Never retry blindly.
@@ -124,6 +140,43 @@ pub enum SqlError {
     /// An owned one-shot payload has already been consumed.
     Consumed,
 }
+
+/// Failure to validate or acquire the selected SQL provider at startup.
+#[derive(Debug)]
+pub enum SqlStartupError {
+    /// The SQLx/Turso backend has no verified native memory envelope for this policy.
+    MissingNativeMemoryEnvelope(effect::memory::MemoryPolicy),
+    /// Original SQL failure from provider or startup work.
+    Sql(SqlError),
+}
+
+impl From<SqlError> for SqlStartupError {
+    fn from(error: SqlError) -> Self {
+        Self::Sql(error)
+    }
+}
+
+impl fmt::Display for SqlStartupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingNativeMemoryEnvelope(policy) => write!(
+                f,
+                "effect-sql/SQLx/Turso needs a native VM byte envelope for {policy:?}"
+            ),
+            Self::Sql(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for SqlStartupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MissingNativeMemoryEnvelope(_) => None,
+            Self::Sql(error) => Some(error),
+        }
+    }
+}
+
 impl fmt::Display for SqlError {
     /// Produce safe category text without SQL, bindings or connection strings.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -134,6 +187,10 @@ impl fmt::Display for SqlError {
             Self::Provider(_) => "SQL provider failed",
             Self::RowAbsent => "required SQL row is absent",
             Self::Decode(_) => "SQL row decoding failed",
+            Self::Memory(_) => "SQL memory admission failed",
+            Self::PreparedRow(_) => "SQL prepared row backing failed",
+            Self::RowLimit { .. } => "SQL row limit exceeded",
+            Self::PreparedStatement(_) => "invalid prepared SQL statement",
             Self::InactiveSession => "SQL session is inactive",
             Self::CommitOutcomeUnknown(_) => "SQL commit outcome is unknown",
             Self::Cleanup { .. } => "SQL cleanup failed",
@@ -154,9 +211,13 @@ impl std::error::Error for SqlError {
             Self::Migration { source, .. } => Some(source.as_ref()),
             Self::Cleanup { cleanup, .. } => Some(cleanup.as_ref()),
             Self::Decode(source) => Some(source),
+            Self::Memory(source) => Some(source),
+            Self::PreparedRow(source) => Some(source),
+            Self::PreparedStatement(source) => Some(source),
             Self::Configuration(_)
             | Self::Identifier(_)
             | Self::RowAbsent
+            | Self::RowLimit { .. }
             | Self::InactiveSession
             | Self::MaintenanceRequired
             | Self::ReplicaNotAuthoritative
@@ -229,6 +290,10 @@ impl SqlError {
             | Self::Provider(_)
             | Self::RowAbsent
             | Self::Decode(_)
+            | Self::Memory(_)
+            | Self::PreparedRow(_)
+            | Self::RowLimit { .. }
+            | Self::PreparedStatement(_)
             | Self::InactiveSession
             | Self::CommitOutcomeUnknown(_)
             | Self::MaintenanceRequired
@@ -245,7 +310,7 @@ impl SqlError {
             Self::Migration { uncertain, source, .. } => *uncertain || source.outcome_uncertain(),
             Self::Cleanup { primary, cleanup } => primary.as_ref().is_some_and(|primary| primary.outcome_uncertain()) || cleanup.outcome_uncertain(),
             Self::NativeInvocation(outcome) => match outcome.as_ref() { effect::Exit::Fail(error) => error.outcome_uncertain(), effect::Exit::FinalizationFailed(details) => matches!(&details.primary, effect::PrimaryOutcome::Failed(error) if error.outcome_uncertain()) || std::iter::once(&details.first).chain(details.rest.iter()).any(|failure| matches!(failure, effect::CleanupFailure::ReleaseFailure(error) if error.outcome_uncertain())), effect::Exit::Success(()) | effect::Exit::Die(_) | effect::Exit::Interrupted => false },
-            Self::Configuration(_) | Self::Identifier(_) | Self::Binding(_) | Self::Provider(_) | Self::RowAbsent | Self::Decode(_) | Self::InactiveSession | Self::MaintenanceRequired | Self::ReplicaNotAuthoritative | Self::Consumed => false,
+            Self::Configuration(_) | Self::Identifier(_) | Self::Binding(_) | Self::Provider(_) | Self::RowAbsent | Self::Decode(_) | Self::Memory(_) | Self::PreparedRow(_) | Self::RowLimit { .. } | Self::PreparedStatement(_) | Self::InactiveSession | Self::MaintenanceRequired | Self::ReplicaNotAuthoritative | Self::Consumed => false,
         }
     }
 }

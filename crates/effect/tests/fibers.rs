@@ -281,7 +281,7 @@ fn parent_cancellation_joins_protected_child_and_retains_unobserved_error() {
         Exit::FinalizationFailed(Finalization {
             primary: PrimaryOutcome::WasInterrupted,
             first: CleanupFailure::ReleaseFailure(Payload(Cell::new(Marker::Error))),
-            rest: Vec::new(),
+            rest: effect::CleanupFailures::default(),
         })
     );
     env.tasks.finish();
@@ -331,7 +331,7 @@ fn accepted_driver_loss_remains_an_unobserved_cleanup_defect() -> Result<(), Str
         Exit::FinalizationFailed(Finalization {
             primary: PrimaryOutcome::Succeeded,
             first: CleanupFailure::ReleaseDefect(Defect::from(LibraryDefect::ScheduledTaskDropped)),
-            rest: Vec::new(),
+            rest: effect::CleanupFailures::default(),
         })
     );
     Ok(())
@@ -510,7 +510,7 @@ fn cancelled_external_waiter_leaves_protected_failure_for_the_scope_owner() {
         Exit::FinalizationFailed(Finalization {
             primary: PrimaryOutcome::Succeeded,
             first: CleanupFailure::ReleaseFailure(Payload(Cell::new(Marker::Error))),
-            rest: Vec::new(),
+            rest: effect::CleanupFailures::default(),
         })
     );
     env.tasks.finish();

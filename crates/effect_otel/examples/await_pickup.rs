@@ -1,6 +1,6 @@
 //! Wait for ticket 104 to become ready at either of two real outlet status files.
 //!
-//! Run: `cargo +1.99.0 run -p effect-otel --features server --example await_pickup -- NORTH.status SOUTH.status 2000 20`.
+//! Run: `cargo +1.100.0 run -p effect-otel --features server --example await_pickup -- NORTH.status SOUTH.status 2000 20`.
 //! Each caller-owned UTF-8 file contains exactly `104,pending` or `104,ready`.
 //! The last arguments are positive wait-window and polling milliseconds.
 //! Output first shows both outlet snapshots, then names the first ready outlet.

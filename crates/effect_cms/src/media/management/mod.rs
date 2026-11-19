@@ -16,7 +16,8 @@ mod routes;
 pub use self::bindings::{
     MediaAssetCommandBindingOptions, MediaAssetValidationBindingOptions, MediaInvalidRequest,
     MediaURLRequiredMessage, MediaValidationInvalidRequest, bind_media_asset_resource_commands,
-    bind_media_asset_resource_validation, media_asset_create_executor,
+    bind_media_asset_resource_validation, bind_prepared_media_asset_resource_commands,
+    bind_prepared_media_asset_resource_validation, media_asset_create_executor,
     media_asset_create_validator, media_asset_delete_executor, media_asset_update_executor,
     media_asset_update_validator,
 };

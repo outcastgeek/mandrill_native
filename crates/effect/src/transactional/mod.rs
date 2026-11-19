@@ -8,6 +8,8 @@
 //! a persistent database or a substitute for a workflow engine.
 
 mod internal;
+mod prepared_queue;
+mod prepared_ref;
 mod transaction;
 mod tx_chunk;
 mod tx_deferred;
@@ -23,6 +25,8 @@ mod tx_subscription_ref;
 mod tx_value;
 
 pub(crate) use transaction::TxStep;
+pub use prepared_queue::{PreparedTxQueue, PreparedTxQueueCapacity, PreparedTxQueueStorage};
+pub use prepared_ref::{PreparedTxRef, PreparedTxValue, PreparedTxValuePool};
 pub use transaction::{Transaction, TransactionError, TransactionPolicy};
 pub use tx_chunk::TxChunk;
 pub use tx_deferred::TxDeferred;
@@ -34,7 +38,10 @@ pub use tx_pub_sub::{
 };
 pub use tx_queue::TxQueue;
 pub use tx_reentrant_lock::{TxExecutionId, TxLockError, TxReentrantLock};
-pub use tx_ref::{HasTransactionDomain, TransactionDomain, TransactionDomainError, TxRef};
+pub use tx_ref::{
+    HasTransactionDomain, PreparedTransactionCapacity, TransactionDomain, TransactionDomainError,
+    TxRef,
+};
 pub use tx_semaphore::{TxSemaphore, TxSemaphoreError};
 pub use tx_subscription_ref::{TxSubscription, TxSubscriptionError, TxSubscriptionRef};
 pub use tx_value::TxValue;

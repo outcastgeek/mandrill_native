@@ -1,6 +1,6 @@
 //! Consume three order-status messages over a checked, scope-owned phone socket.
 //!
-//! Run: `cargo +1.99.0 run -p effect --example phone_order_status`.
+//! Run: `cargo +1.100.0 run -p effect --example phone_order_status`.
 //! Use `-- --accepted` to consume the same customer feed on an already accepted socket.
 //! Each run follows only one connection: accepted, preparing, ready, then one
 //! graceful close and native disposal. The in-process transport supplies the feed;

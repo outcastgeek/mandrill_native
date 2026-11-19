@@ -6,17 +6,22 @@
 //! acquire a finite witness through this constructor.
 
 use crate::WebError;
-use crate::{effect_die, effect_map, effect_map_error, effect_try_sync};
+use crate::{effect_die, effect_map, effect_map_error, effect_sync, effect_try_sync};
 use effect::cache;
+use effect::memory::{
+    Buffer, BufferLease, BufferView, Bytes, MemoryError, PreparedMemory, RegionId, SlotLease,
+    SlotPool,
+};
 use effect::{
-    Cache, CacheAdmission, CacheCapacity, CacheConfig, CacheOptions, CacheTtl, Effect, HasClock,
-    HasTaskSpawner, Scope, SharedValue, effect, service,
+    AdmissionCapacity, Cache, CacheAdmission, CacheCapacity, CacheConfig, CacheKey, CacheOptions,
+    CacheTtl, Effect, HasClock, HasTaskSpawner, PreparedCacheCapacity, PreparedCacheRefusals,
+    PreparedCacheStorage, ProviderAdmission, Scope, SharedValue, effect, service,
 };
 use effect_server::reply;
 use effect_server::{FiniteReply, HasRequest, Reply, Request, ResourceValidators};
 use http::{HeaderName, HeaderValue, Method};
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Trusted application partition selection borrowing the environment and request without credentials.
@@ -35,7 +40,7 @@ pub struct FiniteOutputPolicy {
     pub key_bytes: NonZeroUsize,
     /// Maximum retained finite responses.
     pub entries: NonZeroUsize,
-    /// Maximum independent finite renderers admitted by the core cache.
+    /// Maximum concurrent finite renderers across cache misses and bypasses.
     pub maximum_active: NonZeroUsize,
     /// Positive elapsed retention; output responses always have finite retention.
     pub retain: Duration,
@@ -102,6 +107,14 @@ struct AuthorizedKey {
     /// Conservative eligibility after selected authentication and native cookies.
     cacheable: bool,
 }
+
+enum AuthorizedOutput {
+    Ordinary(AuthorizedKey),
+    Prepared {
+        input: PreparedOutputInput,
+        identity: Option<BufferView<'static>>,
+    },
+}
 /// Finite-only source. The callback returns already encoded bounded bytes, not a
 /// Reply stream collected by Web. R provides the startup-selected render capabilities.
 #[must_use]
@@ -112,6 +125,161 @@ pub struct FiniteSource<E: Send + 'static, R: Send + Sync + 'static> {
     cacheable: bool,
     /// Checked fixed response variation used to validate the policy key dimensions.
     vary: Arc<[HeaderName]>,
+}
+
+type OutputErrors<E> = Arc<dyn Fn(WebError) -> E + Send + Sync>;
+type PreparedRender<E, R> = dyn Fn(PreparedOutputInput, RenderReservation, usize, OutputErrors<E>) -> Effect<FiniteReply, E, R>
+    + Send
+    + Sync;
+
+struct RenderReservation {
+    output: BufferLease<'static>,
+    _renderer: SlotLease<'static, ()>,
+}
+
+/// A finite renderer whose fixed output slot is acquired before model loading or writing.
+#[must_use]
+pub struct PreparedFiniteSource<E: Send + 'static, R: Send + Sync + 'static> {
+    render: Arc<PreparedRender<E, R>>,
+    vary: Arc<[HeaderName]>,
+}
+
+impl<E: Send + 'static, R: Send + Sync + 'static> Clone for PreparedFiniteSource<E, R> {
+    fn clone(&self) -> Self {
+        Self {
+            render: self.render.clone(),
+            vary: self.vary.clone(),
+        }
+    }
+}
+
+/// Checked destination retaining the actual preadmitted HTTP output backing.
+pub struct PreparedOutputWriter<'a> {
+    output: &'a mut Buffer<'static>,
+    maximum: usize,
+    failure: Option<WebError>,
+}
+
+impl PreparedOutputWriter<'_> {
+    /// Append encoded bytes. The first refused append prevents publication.
+    pub fn write(&mut self, bytes: &[u8]) -> Result<(), WebError> {
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        let result = self
+            .output
+            .len()
+            .checked_add(bytes.len())
+            .ok_or(WebError::Memory(MemoryError::ArithmeticOverflow))
+            .and_then(|observed| {
+                if observed > self.maximum {
+                    return Err(WebError::ResponseLimit {
+                        maximum: self.maximum,
+                        observed,
+                    });
+                }
+                self.output
+                    .extend_from_slice(bytes)
+                    .map_err(WebError::Memory)
+            });
+        if let Err(error) = &result {
+            self.failure = Some(error.clone());
+        }
+        result
+    }
+}
+
+/// Owned authorized input for a prepared finite renderer. Only the request
+/// dimensions represented by the admitted cache identity are accessible.
+pub struct PreparedOutputInput {
+    policy: Arc<str>,
+    partition: OutputPartition,
+    vary: Arc<[HeaderName]>,
+    request: Request,
+}
+
+impl PreparedOutputInput {
+    /// Validated policy namespace.
+    #[must_use]
+    pub fn policy(&self) -> &str {
+        &self.policy
+    }
+
+    /// Explicit authorized tenant/representation/culture dimensions.
+    #[must_use]
+    pub fn partition(&self) -> &OutputPartition {
+        &self.partition
+    }
+
+    /// Exact request target path.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        self.request.uri().path()
+    }
+
+    /// Exact query, distinguishing an absent query from an empty one.
+    #[must_use]
+    pub fn query(&self) -> Option<&str> {
+        self.request.uri().query()
+    }
+
+    /// Ordered values of a header declared by this cache's variation policy.
+    pub fn header_values(
+        &self,
+        name: &HeaderName,
+    ) -> Option<http::header::GetAll<'_, HeaderValue>> {
+        self.vary
+            .contains(name)
+            .then(|| self.request.headers().get_all(name))
+    }
+}
+
+struct PreparedOutputKey {
+    identity: BufferView<'static>,
+    input: Mutex<Option<PreparedOutputInput>>,
+}
+
+/// Cache metadata and typed key/reply cells prepared in the application's shared region.
+pub struct PreparedOutputCacheStorage<E: Send + 'static> {
+    cache: PreparedCacheStorage<PreparedOutputKey, FiniteReply, E>,
+    capacity: PreparedCacheCapacity,
+    keys: SlotPool<'static, Buffer<'static>>,
+    renderers: SlotPool<'static, ()>,
+}
+
+impl<E: Send + 'static> PreparedOutputCacheStorage<E> {
+    /// Calculate storage for the selected core cache records. The request's
+    /// output bytes are supplied by the host pool and retain that pool owner.
+    pub fn storage_bytes(
+        capacity: PreparedCacheCapacity,
+        key_backing_bytes: NonZeroUsize,
+    ) -> Result<Bytes, MemoryError> {
+        PreparedCacheStorage::<PreparedOutputKey, FiniteReply, E>::storage_bytes(capacity)?
+            .checked_add(SlotPool::<Buffer<'static>>::storage_bytes(
+                capacity.keys.get(),
+            )?)?
+            .checked_add(Bytes::new(key_backing_bytes.get()).checked_mul(capacity.keys.get())?)?
+            .checked_add(SlotPool::<()>::storage_bytes(capacity.active.get())?)
+    }
+
+    /// Provision the cache records before traffic begins.
+    pub fn prepare(
+        memory: &PreparedMemory<'static>,
+        region: RegionId,
+        capacity: PreparedCacheCapacity,
+        key_backing_bytes: NonZeroUsize,
+    ) -> Result<Self, MemoryError> {
+        Ok(Self {
+            cache: PreparedCacheStorage::prepare(memory, region, capacity)?,
+            capacity,
+            keys: memory.buffers(
+                region,
+                capacity.keys.get(),
+                Bytes::new(key_backing_bytes.get()),
+            )?,
+            renderers: memory.slots(region, capacity.active.get(), |_| Ok(()))?,
+        })
+    }
 }
 impl<E: Send + 'static, R: Send + Sync + 'static> Clone for FiniteSource<E, R> {
     /// Share only the inert callback; response bytes retain native shared ownership.
@@ -124,6 +292,42 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Clone for FiniteSource<E, R> {
     }
 }
 impl<E: Send + 'static, R: Send + Sync + 'static> FiniteSource<E, R> {
+    fn render_admitted(
+        &self,
+        key: Arc<OutputKey>,
+        renderers: ProviderAdmission,
+        maximum: usize,
+        errors: OutputErrors<E>,
+    ) -> Effect<FiniteReply, E, R> {
+        let render = self.render.clone();
+        let on_capacity = errors.clone();
+        crate::admission::independent(
+            renderers,
+            move || {
+                let errors = errors.clone();
+                effect! {
+                    bind;
+                    program: render(key.clone()),
+                    body: move |reply| {
+                        let errors = errors.clone();
+                        effect_try_sync! {
+                            once;
+                            body: move || {
+                                let observed = reply.bytes.len();
+                                if observed > maximum {
+                                    return Err(errors(WebError::ResponseLimit { maximum, observed }));
+                                }
+                                Ok(reply)
+                            },
+                            on_error: ::core::convert::identity,
+                        }
+                    },
+                }
+            },
+            move |_| renderer_capacity_error(&on_capacity),
+        )
+    }
+
     /// Select a renderer whose terminal result is the Server finite witness. An
     /// opaque/native/stream Reply must not be converted via body collection here.
     pub fn new(
@@ -227,16 +431,182 @@ impl<E: Send + 'static, R: Send + Sync + 'static> FiniteSource<E, R> {
             vary: vary.into(),
         })
     }
+
+    /// Select fixed response metadata and a checked writer over the output
+    /// buffer already admitted for the request producing this response.
+    pub fn prepared_encoded<A: Send + 'static>(
+        media: HeaderValue,
+        mut headers: http::HeaderMap,
+        prepare_model: impl Fn(PreparedOutputInput) -> Effect<A, E, R> + Send + Sync + 'static,
+        write: impl Fn(A, &mut PreparedOutputWriter<'_>) -> Result<(), E> + Send + Sync + 'static,
+    ) -> Result<PreparedFiniteSource<E, R>, WebError> {
+        headers.insert(http::header::CONTENT_TYPE, media);
+        let witness = FiniteReply {
+            status: http::StatusCode::OK,
+            headers,
+            bytes: bytes::Bytes::new(),
+        };
+        if !response_cacheable(&witness) {
+            return Err(WebError::Configuration(
+                "finite encoded cache metadata".into(),
+            ));
+        }
+        let vary = fixed_vary(&witness.headers, "finite encoded Vary")?;
+        let headers = Arc::new(witness.headers);
+        let prepare_model = Arc::new(prepare_model);
+        let write = Arc::new(write);
+        Ok(PreparedFiniteSource {
+            vary,
+            render: Arc::new(move |key, output, maximum, errors| {
+                let key = effect_sync! { once; body { key }, };
+                let output = effect_sync! { once; body { output }, };
+                let prepare_model = prepare_model.clone();
+                let write = write.clone();
+                let headers = headers.clone();
+                effect! {
+                    let output = output.clone();
+                    let key = key.clone();
+                    let prepare_model = prepare_model.clone();
+                    let write = write.clone();
+                    let headers = headers.clone();
+                    let errors = errors.clone();
+                    let output = output?;
+                    let key = key?;
+                    let model = prepare_model(key)?;
+                    effect_try_sync! {
+                        once;
+                        body: move || {
+                            let mut output = output;
+                            let maximum = maximum.min(output.output.capacity().get());
+                            let mut writer = PreparedOutputWriter { output: &mut output.output, maximum, failure: None };
+                            write(model, &mut writer)?;
+                            if let Some(error) = writer.failure {
+                                return Err(errors(error));
+                            }
+                            let view = BufferView::new(output.output.share());
+                            Ok(FiniteReply {
+                                status: http::StatusCode::OK,
+                                headers: headers.as_ref().clone(),
+                                bytes: bytes::Bytes::from_owner(view),
+                            })
+                        },
+                        on_error: ::core::convert::identity,
+                    }?
+                }
+            }),
+        })
+    }
+}
+
+fn renderer_capacity_error<E>(errors: &OutputErrors<E>) -> E {
+    errors(WebError::Configuration(
+        "output renderer active capacity".into(),
+    ))
+}
+
+fn fixed_vary(
+    headers: &http::HeaderMap,
+    error: &'static str,
+) -> Result<Arc<[HeaderName]>, WebError> {
+    let mut vary = Vec::new();
+    for value in headers.get_all(http::header::VARY) {
+        let value = value
+            .to_str()
+            .map_err(|_| WebError::Configuration(error.into()))?;
+        for name in value.split(',') {
+            vary.push(
+                HeaderName::from_bytes(name.trim().as_bytes())
+                    .map_err(|_| WebError::Configuration(error.into()))?,
+            );
+        }
+    }
+    Ok(vary.into())
+}
+
+impl<E: Send + 'static, R: Send + Sync + 'static> PreparedFiniteSource<E, R> {
+    fn render_for(
+        &self,
+        input: PreparedOutputInput,
+        renderers: &SlotPool<'static, ()>,
+        maximum: usize,
+        errors: OutputErrors<E>,
+    ) -> Result<Effect<FiniteReply, E, R>, WebError> {
+        let renderer = renderers.try_checkout().map_err(WebError::Memory)?;
+        let output = input
+            .request
+            .take_prepared_output_buffer()
+            .map_err(crate::application::web_server_error)?;
+        Ok((self.render)(
+            input,
+            RenderReservation {
+                output,
+                _renderer: renderer,
+            },
+            maximum,
+            errors,
+        ))
+    }
+}
+
+enum CacheBackend<E: Send + 'static, R: Send + Sync + 'static> {
+    Ordinary {
+        cache: Cache<OutputKey, FiniteReply, E>,
+        source: FiniteSource<E, R>,
+        renderers: ProviderAdmission,
+    },
+    Prepared {
+        cache: Cache<PreparedOutputKey, FiniteReply, E>,
+        source: PreparedFiniteSource<E, R>,
+        keys: Arc<SlotPool<'static, Buffer<'static>>>,
+        renderers: Arc<SlotPool<'static, ()>>,
+        refusals: PreparedCacheRefusals<E>,
+    },
+}
+
+impl<E: Send + 'static, R: Send + Sync + 'static> Clone for CacheBackend<E, R> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Ordinary {
+                cache,
+                source,
+                renderers,
+            } => Self::Ordinary {
+                cache: cache.clone(),
+                source: source.clone(),
+                renderers: renderers.clone(),
+            },
+            Self::Prepared {
+                cache,
+                source,
+                keys,
+                renderers,
+                refusals,
+            } => Self::Prepared {
+                cache: cache.clone(),
+                source: source.clone(),
+                keys: keys.clone(),
+                renderers: renderers.clone(),
+                refusals: refusals.clone(),
+            },
+        }
+    }
+}
+
+impl<E: Send + 'static, R: Send + Sync + 'static> CacheBackend<E, R> {
+    fn cacheable(&self) -> bool {
+        match self {
+            Self::Ordinary { source, .. } => source.cacheable,
+            Self::Prepared { .. } => true,
+        }
+    }
 }
 /// Shared finite output owner over core Cache; no second HTTP cache map exists.
 #[must_use]
 pub struct OutputCache<E: Send + 'static, R: Send + Sync + 'static> {
     /// Core retained/shared finite producer owner.
-    cache: Cache<OutputKey, FiniteReply, E>,
+    cache: CacheBackend<E, R>,
     /// Explicit policy retained for checked keys/responses.
     policy: FiniteOutputPolicy,
-    /// Independent bypass still invokes the same finite source.
-    source: FiniteSource<E, R>,
     /// Application-owned mandatory auth/precondition gate before lookup.
     gate: Arc<dyn Fn(Request) -> Effect<(), E, R> + Send + Sync>,
     /// Selected authentication state supplied by a trusted application capability.
@@ -252,7 +622,6 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Clone for OutputCache<E, R> {
         Self {
             cache: self.cache.clone(),
             policy: self.policy.clone(),
-            source: self.source.clone(),
             gate: self.gate.clone(),
             authenticated: self.authenticated.clone(),
             partition: self.partition.clone(),
@@ -274,7 +643,7 @@ impl<E: Send + 'static, R: HasClock + HasTaskSpawner + HasRequest + Send + Sync 
         partition: impl Fn(&R, &Request) -> Result<OutputPartition, WebError> + Send + Sync + 'static,
         errors: impl Fn(WebError) -> E + Send + Sync + 'static,
     ) -> Effect<Self, SharedValue<E>, R> {
-        let errors = Arc::new(errors);
+        let errors: OutputErrors<E> = Arc::new(errors);
         let valid = policy.validate().map_err({
             let errors = errors.clone();
             move |error| SharedValue::new(errors(error))
@@ -298,11 +667,13 @@ impl<E: Send + 'static, R: HasClock + HasTaskSpawner + HasRequest + Send + Sync 
                            WebError::Configuration("output Vary missing key dimension".into()),
                        ))); move || __dsl_result }, on_error: ::core::convert::identity, };
                    }
-                   let render = source.render.clone();
+                   let load_source = source.clone();
                    let maximum = policy.response_bytes.get();
                    let check_error = errors.clone();
                    let admission_error = errors.clone();
                    let maximum_active = policy.maximum_active;
+                   let renderers = ProviderAdmission::new(AdmissionCapacity::Bounded(maximum_active));
+                   let load_renderers = renderers.clone();
                    effect_map! {
                        program: cache! {
                        scope: scope.clone(),
@@ -316,31 +687,11 @@ impl<E: Send + 'static, R: HasClock + HasTaskSpawner + HasRequest + Send + Sync 
                            ttl: CacheTtl::Fixed(Some(policy.retain)),
                            admission: CacheAdmission::Bounded {
                                maximum: maximum_active,
-                               capacity_error: Arc::new(move || {
-                                   admission_error(WebError::Configuration(
-                                       "output renderer active capacity".into(),
-                                   ))
-                               }),
+                               capacity_error: Arc::new(move || renderer_capacity_error(&admission_error)),
                            },
                        },
                        load_shared: move |key| {
-                           let errors = check_error.clone();
-                           effect! {
-        bind;
-        program: render(key),
-        body: move |reply| {
-                               if reply.bytes.len() > maximum {
-                                   effect_try_sync! {
-                                       once; body: {
-                                       let __dsl_result = Err(errors(WebError::ResponseLimit {
-                                       maximum,
-                                       observed: reply.bytes.len(),
-                                   })); move || __dsl_result }, on_error: ::core::convert::identity, }
-                               } else {
-                                   effect_try_sync! { once; body: { let __dsl_result = Ok(reply); move || __dsl_result }, on_error: ::core::convert::identity, }
-                               }
-                           },
-        }
+                           load_source.render_admitted(key, load_renderers.clone(), maximum, check_error.clone())
                        },
                    }, map: {
                        let source = source.clone();
@@ -349,9 +700,10 @@ impl<E: Send + 'static, R: HasClock + HasTaskSpawner + HasRequest + Send + Sync 
                        let partition = partition.clone();
                        let errors = errors.clone();
                        move |cache| Self {
-                           cache,
+                           cache: CacheBackend::Ordinary {
+                               cache, source: source.as_ref().clone(), renderers: renderers.clone(),
+                           },
                            policy: policy.clone(),
-                           source: source.as_ref().clone(),
                            gate: gate.clone(),
                            authenticated: authenticated.clone(),
                            partition: partition.clone(),
@@ -359,6 +711,88 @@ impl<E: Send + 'static, R: HasClock + HasTaskSpawner + HasRequest + Send + Sync 
                        }
                    }, }
                },
+        }
+    }
+
+    /// Acquire a finite cache whose key backing and combined miss/bypass
+    /// render slots come from the selected region. Responses retain the host's
+    /// admitted output slot through cache hits and HTTP delivery.
+    #[allow(clippy::too_many_arguments)] // The scoped gate and authentication/partition roles are independent.
+    pub fn scoped_prepared(
+        scope: Scope<SharedValue<E>>,
+        policy: FiniteOutputPolicy,
+        source: PreparedFiniteSource<E, R>,
+        (storage, refusals): (PreparedOutputCacheStorage<E>, PreparedCacheRefusals<E>),
+        gate: impl Fn(Request) -> Effect<(), E, R> + Send + Sync + 'static,
+        authenticated: impl Fn(&R) -> bool + Send + Sync + 'static,
+        partition: impl Fn(&R, &Request) -> Result<OutputPartition, WebError> + Send + Sync + 'static,
+        errors: impl Fn(WebError) -> E + Send + Sync + 'static,
+    ) -> Effect<Self, SharedValue<E>, R> {
+        let errors: OutputErrors<E> = Arc::new(errors);
+        let policy = policy.validate().and_then(|policy| {
+            if source.vary.iter().any(|name| !policy.vary_headers.contains(name)) {
+                return Err(WebError::Configuration("output Vary missing key dimension".into()));
+            }
+            if !matches!(storage.capacity.retention, CacheCapacity::Bounded(entries) if entries == policy.entries)
+                || storage.capacity.active != policy.maximum_active
+            {
+                return Err(WebError::Configuration("output cache capacity differs from policy".into()));
+            }
+            Ok(policy)
+        });
+        let policy = match policy {
+            Ok(policy) => policy,
+            Err(error) => {
+                return effect_try_sync! { body: move || Err(SharedValue::new(errors(error.clone()))), };
+            }
+        };
+        let keys = Arc::new(storage.keys);
+        let renderers = Arc::new(storage.renderers);
+        let renderers_for_load = renderers.clone();
+        let source_for_load = source.clone();
+        let errors_for_load = errors.clone();
+        let admission_error = errors.clone();
+        let refusal_for_cache = refusals.clone();
+        let maximum = policy.response_bytes.get();
+        let cache = cache! {
+            scope: scope,
+            config: CacheConfig {
+                equal: Arc::new(|left: &PreparedOutputKey, right: &PreparedOutputKey| left.identity.as_ref() == right.identity.as_ref()),
+                ttl: Some(policy.retain), capacity: CacheCapacity::Bounded(policy.entries),
+                cache_failure: Arc::new(|_| false),
+            },
+            options: CacheOptions {
+                ttl: CacheTtl::Fixed(Some(policy.retain)),
+                admission: CacheAdmission::Bounded {
+                    maximum: policy.maximum_active,
+                    capacity_error: Arc::new(move || admission_error(WebError::Memory(MemoryError::NoSlot))),
+                },
+            },
+            memory: storage.cache,
+            refusals: refusal_for_cache,
+            load_shared: move |key: CacheKey<PreparedOutputKey>| {
+                let input = key.input.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+                let errors = errors_for_load.clone();
+                match input.ok_or(WebError::Memory(MemoryError::MissingRuntimeStorage))
+                    .and_then(|input| source_for_load.render_for(input, &renderers_for_load, maximum, errors.clone()))
+                {
+                    Ok(render) => render,
+                    Err(error) => effect_try_sync! { body: move || Err(errors(error.clone())), },
+                }
+            },
+        };
+        let gate = Arc::new(gate);
+        let authenticated = Arc::new(authenticated);
+        let partition = Arc::new(partition);
+        effect_map! {
+            program: cache,
+            map: move |cache| Self {
+                cache: CacheBackend::Prepared {
+                    cache, source: source.clone(), keys: keys.clone(), renderers: renderers.clone(), refusals: refusals.clone(),
+                },
+                policy: policy.clone(),
+                gate: gate.clone(), authenticated: authenticated.clone(), partition: partition.clone(), errors: errors.clone(),
+            },
         }
     }
     /// Authorize/evaluate mutation preconditions on every invocation, then consult
@@ -374,33 +808,76 @@ impl<E: Send + 'static, R: HasClock + HasTaskSpawner + HasRequest + Send + Sync 
             let selected = service! {
                 env |env: &R| { key_owner.key(env, &request_for_key) },
             }?;
-            let errors = owner.errors.clone();
-            let selected = effect_map_error! { program: effect_try_sync! { once; body: { let __dsl_result = selected; move || __dsl_result }, on_error: ::core::convert::identity, }, map: move |error| SharedValue::new(errors(error)), }?;
-            match selected {
-                AuthorizedKey { key, cacheable: true } => {
-                    let value = owner.cache.get(key)?;
+            let failure_owner = owner.clone();
+            let selected = effect_try_sync! { once; body: { let __dsl_result = selected; move || __dsl_result }, on_error: move |error| failure_owner.selection_error(error), }?;
+            let finite = match (owner.cache.clone(), selected) {
+                (CacheBackend::Ordinary { cache, .. }, AuthorizedOutput::Ordinary(AuthorizedKey { key, cacheable: true })) => {
+                    let value = cache.get(key)?;
                     match value.with(Clone::clone) {
-                        Ok(reply) => reply! { finite(reply) },
+                        Ok(reply) => reply,
                         Err(defect) => effect_die! { defect: defect, }?,
                     }
                 }
-                AuthorizedKey { key, cacheable: false } => {
-                    let reply = effect_map_error! { program: (owner.source.render)(Arc::new(key)), map: SharedValue::new, }?;
-                    let reply = effect_try_sync! {
-                        once; body: {
-                        let __dsl_result = if reply.bytes.len() > owner.policy.response_bytes.get() {
-                        Err(SharedValue::new((owner.errors)(WebError::ResponseLimit {
-                            maximum: owner.policy.response_bytes.get(), observed: reply.bytes.len(),
-                        })))
-                    } else { Ok(reply) }; move || __dsl_result }, on_error: ::core::convert::identity, }?;
-                    reply! { finite(reply) }
+                (CacheBackend::Ordinary { source, renderers, .. }, AuthorizedOutput::Ordinary(AuthorizedKey { key, cacheable: false })) => {
+                    let render = source.render_admitted(
+                        Arc::new(key), renderers, owner.policy.response_bytes.get(), owner.errors.clone(),
+                    );
+                    effect_map_error! { program: render, map: SharedValue::new, }?
                 }
-            }
+                (CacheBackend::Prepared { cache, refusals, .. }, AuthorizedOutput::Prepared { input, identity: Some(identity) }) => {
+                    let key = effect_try_sync! {
+                        once;
+                        body: {
+                            let cache = cache.clone();
+                            move || {
+                                cache.prepare_key(PreparedOutputKey { identity, input: Mutex::new(Some(input)) })
+                                    .map_err(|(error, abandoned)| {
+                                        drop(abandoned);
+                                        refusals.memory(error)
+                                    })
+                            }
+                        },
+                        on_error: ::core::convert::identity,
+                    }?;
+                    let value = cache.get_prepared(key)?;
+                    match value.with(Clone::clone) {
+                        Ok(reply) => reply,
+                        Err(defect) => effect_die! { defect: defect, }?,
+                    }
+                }
+                (CacheBackend::Prepared { source, renderers, .. }, AuthorizedOutput::Prepared { input, identity: None }) => {
+                    let reserved = source.render_for(input, &renderers, owner.policy.response_bytes.get(), owner.errors.clone());
+                    let render = effect_try_sync! {
+                        once;
+                        body: move || reserved,
+                        on_error: move |error| owner.selection_error(error),
+                    }?;
+                    effect_map_error! {
+                        program: render,
+                        map: SharedValue::new,
+                    }?
+                }
+                _ => effect_die! { defect: effect::Defect::from(effect::LibraryDefect::PreparedConstructionUnbound), }?,
+            };
+            reply! { finite(finite) }
         }
     }
-    /// Produce a bounded exact key only after gate success; native authorization/
-    /// cookie metadata and selected principal state impose conservative bypass.
-    fn key(&self, env: &R, request: &Request) -> Result<AuthorizedKey, WebError> {
+
+    fn selection_error(&self, error: WebError) -> SharedValue<E> {
+        if let CacheBackend::Prepared { refusals, .. } = &self.cache
+            && let WebError::Memory(
+                reason @ (MemoryError::NoSlot
+                | MemoryError::Busy
+                | MemoryError::CapacityExceeded { .. }),
+            ) = &error
+        {
+            return refusals.memory(*reason);
+        }
+        SharedValue::new((self.errors)(error))
+    }
+
+    /// Produce the authorized identity before lookup or renderer construction.
+    fn key(&self, env: &R, request: &Request) -> Result<AuthorizedOutput, WebError> {
         let declared = request
             .with_extensions(|extensions| extensions.get::<RootOutputCache>().cloned())
             .ok_or_else(|| WebError::Configuration("output cache root selection".into()))?;
@@ -413,62 +890,67 @@ impl<E: Send + 'static, R: HasClock + HasTaskSpawner + HasRequest + Send + Sync 
         if partition.namespace.is_empty() {
             return Err(WebError::Configuration("output partition namespace".into()));
         }
-        // Bypassed renderers still receive the complete bounded target; omitting query
-        // variation disables retention rather than skipping the key byte bound.
-        let query = request.uri().query().map(Arc::from);
-        let query_cacheable = self.policy.vary_query || query.is_none();
-        let headers = self
-            .policy
-            .vary_headers
-            .iter()
-            .map(|name| {
-                (
-                    name.clone(),
-                    request
-                        .headers()
-                        .get_all(name)
-                        .iter()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .into(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let key = OutputKey {
-            policy: self.policy.name.clone(),
-            partition,
-            path: Arc::from(request.uri().path()),
-            query,
-            headers: headers.into(),
-        };
-        let bytes = key
-            .policy
-            .len()
-            .checked_add(key.path.len())
-            .and_then(|n| n.checked_add(key.query.as_ref().map_or(0, |q| q.len())))
-            .and_then(|n| n.checked_add(key.partition.namespace.len()))
-            .and_then(|mut n| {
-                for dimension in key.partition.dimensions.iter() {
-                    n = n.checked_add(dimension.len())?;
-                }
-                for (name, values) in key.headers.iter() {
-                    n = n.checked_add(name.as_str().len())?;
-                    for value in values.iter() {
-                        n = n.checked_add(value.as_bytes().len())?;
-                    }
-                }
-                Some(n)
-            });
+        let bytes = key_payload_bytes(&self.policy, &partition, request);
         if bytes.is_none_or(|bytes| bytes > self.policy.key_bytes.get()) {
             return Err(WebError::Configuration("output key byte bound".into()));
         }
-        let cacheable = query_cacheable
-            && self.source.cacheable
+        let cacheable = (self.policy.vary_query || request.uri().query().is_none())
+            && self.cache.cacheable()
             && matches!(*request.method(), Method::GET | Method::HEAD)
             && !(self.authenticated)(env)
             && !request.headers().contains_key(http::header::AUTHORIZATION)
             && !request.headers().contains_key(http::header::COOKIE);
-        Ok(AuthorizedKey { key, cacheable })
+        match &self.cache {
+            CacheBackend::Ordinary { .. } => {
+                let headers = self
+                    .policy
+                    .vary_headers
+                    .iter()
+                    .map(|name| {
+                        (
+                            name.clone(),
+                            request
+                                .headers()
+                                .get_all(name)
+                                .iter()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .into(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                Ok(AuthorizedOutput::Ordinary(AuthorizedKey {
+                    key: OutputKey {
+                        policy: self.policy.name.clone(),
+                        partition,
+                        path: Arc::from(request.uri().path()),
+                        query: request.uri().query().map(Arc::from),
+                        headers: headers.into(),
+                    },
+                    cacheable,
+                }))
+            }
+            CacheBackend::Prepared { keys, .. } => {
+                let identity = if cacheable {
+                    let mut identity = keys.try_checkout().map_err(WebError::Memory)?;
+                    identity.clear();
+                    write_identity(&mut identity, &self.policy, &partition, request)
+                        .map_err(WebError::Memory)?;
+                    Some(BufferView::new(identity.share()))
+                } else {
+                    None
+                };
+                Ok(AuthorizedOutput::Prepared {
+                    input: PreparedOutputInput {
+                        policy: self.policy.name.clone(),
+                        partition,
+                        vary: self.policy.vary_headers.clone(),
+                        request: request.clone(),
+                    },
+                    identity,
+                })
+            }
+        }
     }
     /// Reuse Server's protocol-order validator handling on a finite reply. Callers
     /// must keep mutation preconditions in `gate` so hits cannot bypass them.
@@ -482,6 +964,78 @@ impl<E: Send + 'static, R: HasClock + HasTaskSpawner + HasRequest + Send + Sync 
         }
     }
 }
+impl<E: Send + 'static, R: Send + Sync + 'static> OutputCache<E, R> {
+    /// Evict finite responses and join fenced renderers after a source change.
+    pub fn clear(&self) -> Effect<(), SharedValue<E>, R> {
+        match &self.cache {
+            CacheBackend::Ordinary { cache, .. } => cache.clear(),
+            CacheBackend::Prepared { cache, .. } => cache.clear(),
+        }
+    }
+}
+
+fn key_payload_bytes(
+    policy: &FiniteOutputPolicy,
+    partition: &OutputPartition,
+    request: &Request,
+) -> Option<usize> {
+    let mut bytes = policy
+        .name
+        .len()
+        .checked_add(request.uri().path().len())?
+        .checked_add(request.uri().query().map_or(0, str::len))?
+        .checked_add(partition.namespace.len())?;
+    for value in partition.dimensions.iter() {
+        bytes = bytes.checked_add(value.len())?;
+    }
+    for name in policy.vary_headers.iter() {
+        bytes = bytes.checked_add(name.as_str().len())?;
+        for value in request.headers().get_all(name) {
+            bytes = bytes.checked_add(value.as_bytes().len())?;
+        }
+    }
+    Some(bytes)
+}
+
+fn write_identity(
+    output: &mut Buffer<'static>,
+    policy: &FiniteOutputPolicy,
+    partition: &OutputPartition,
+    request: &Request,
+) -> Result<(), MemoryError> {
+    fn length(output: &mut Buffer<'static>, count: usize) -> Result<(), MemoryError> {
+        let count = u64::try_from(count).map_err(|_| MemoryError::ArithmeticOverflow)?;
+        output.extend_from_slice(&count.to_be_bytes())
+    }
+    fn field(output: &mut Buffer<'static>, value: &[u8]) -> Result<(), MemoryError> {
+        length(output, value.len())?;
+        output.extend_from_slice(value)
+    }
+    field(output, policy.name.as_bytes())?;
+    field(output, partition.namespace.as_bytes())?;
+    length(output, partition.dimensions.len())?;
+    for dimension in partition.dimensions.iter() {
+        field(output, dimension.as_bytes())?;
+    }
+    field(output, request.uri().path().as_bytes())?;
+    if let Some(query) = request.uri().query() {
+        output.extend_from_slice(&[1])?;
+        field(output, query.as_bytes())?;
+    } else {
+        output.extend_from_slice(&[0])?;
+    }
+    length(output, policy.vary_headers.len())?;
+    for name in policy.vary_headers.iter() {
+        field(output, name.as_str().as_bytes())?;
+        let values = request.headers().get_all(name);
+        length(output, values.iter().count())?;
+        for value in values {
+            field(output, value.as_bytes())?;
+        }
+    }
+    Ok(())
+}
+
 /// Native conservative fixed-metadata eligibility. Dynamic native metadata uses
 /// the advanced bypass source and never enters shared/retained cache ownership.
 fn response_cacheable(reply: &FiniteReply) -> bool {

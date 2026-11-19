@@ -1,12 +1,106 @@
 //! Required definition services built in source dependency order.
 use std::{error::Error,sync::Arc};
-use effect_server::{Request,ByteFormPolicy};
+use effect::{Effect,effect_map_error};
+use effect::memory::{MemoryError, PreparedMemory, RegionId};
+use effect_server::{Request,ByteFormPolicy,ServerError};
 use crate::{commands,definitions,queries,validation,forms,rendering,dashboards,seo,routing,localization::TranslateKeyFunc};
 use super::{CMSRequestContext,ValidationMessageTranslator};
+use crate::PreparedCmsMemory;
 pub type ResourceRegistry=Arc<dyn definitions::Registry+Send+Sync>;
 pub type FormService<E,R>=forms::Service<CMSRequestContext,E,R>;
 pub type ValidationService<E,R>=validation::ActionValidationService<E,R>;
 pub type RenderingService<E>=rendering::FullService<E>;
+
+/// Storage for moving configured definitions into the startup registry.
+#[derive(Clone, Copy)]
+pub struct DefinitionRegistryStorage<'a> {
+    /// The application's prepared memory.
+    pub memory: &'a PreparedMemory<'static>,
+    /// The region for resource and registration-order records.
+    pub region: RegionId,
+    /// Registration and cumulative declaration metadata bounds.
+    pub capacity: definitions::PreparedDefinitionCapacity,
+}
+
+/// Bounds for projecting list and detail data from the prepared form workspace.
+#[derive(Clone, Copy)]
+pub struct PreparedDefinitionInputLimits {
+    /// Selected list page and projection limits.
+    pub list: queries::PreparedListLimits,
+    /// Selected detail query metadata limits.
+    pub detail: queries::PreparedDetailLimits,
+}
+
+/// Prepared owners applied before constructing the definition service graph.
+pub struct PreparedDefinitionServices<E> {
+    memory: Arc<PreparedCmsMemory>,
+    input: Arc<validation::PreparedValidationInput<E>>,
+    command: Arc<commands::PreparedCommandWork>,
+}
+
+impl<E: Send + 'static> PreparedDefinitionServices<E> {
+    /// Bind the shared CMS storage and the consumer's typed capacity mapper.
+    pub fn new(
+        memory: Arc<PreparedCmsMemory>,
+        input: PreparedDefinitionInputLimits,
+        command: Arc<commands::PreparedCommandWork>,
+        on_capacity: impl Fn(ServerError) -> E + Send + Sync + 'static,
+    ) -> Self {
+        let input = Arc::new(validation::PreparedValidationInput {
+            storage: memory.forms().clone(),
+            list: input.list,
+            detail: input.detail,
+            on_capacity: Arc::new(on_capacity),
+        });
+        Self { memory, input, command }
+    }
+
+    /// The shared memory capability used by this graph.
+    #[must_use]
+    pub fn memory(&self) -> &Arc<PreparedCmsMemory> { &self.memory }
+
+    /// Admit a list query with prepared byte decoding and typed refusal.
+    pub fn list_query<R: Send + Sync + 'static>(
+        &self,
+        service: &queries::QueryService,
+        request: &Request,
+        kind: &definitions::ResourceKind,
+    ) -> Effect<queries::ResourceListQuery, E, R> {
+        let on_capacity = self.input.on_capacity.clone();
+        effect_map_error! {
+            program: service.list_query_prepared(request, kind, self.memory.forms().clone(), self.input.list),
+            map: move |error| on_capacity(error),
+        }
+    }
+
+    /// Admit a detail query with prepared byte decoding and typed refusal.
+    pub fn detail_query<R: Send + Sync + 'static>(
+        &self,
+        service: &queries::QueryService,
+        request: &Request,
+    ) -> Effect<queries::ResourceDetailQuery, E, R> {
+        let on_capacity = self.input.on_capacity.clone();
+        effect_map_error! {
+            program: service.detail_query_prepared(request, self.memory.forms().clone(), self.input.detail),
+            map: move |error| on_capacity(error),
+        }
+    }
+
+    /// Validate an action with admitted input and retained validation output.
+    pub fn validate_action<R: Send + Sync + 'static>(
+        &self,
+        service: &ValidationService<E, R>,
+        request: Option<&Request>,
+        kind: &definitions::ResourceKind,
+        action: &definitions::ResourceAction,
+    ) -> Effect<validation::PreparedActionValidationOutcome<E>, validation::PreparedActionValidationError<E>, R>
+    where
+        E: Error,
+    {
+        service.clone().with_prepared_input(self.input.clone())
+            .validate_action_input_prepared(request, kind, action, self.memory.validation_results().clone())
+    }
+}
 pub struct DefinitionServiceValidators<E>{
     pub command_input:Option<commands::CommandInputValidator<E>>,pub validation:Option<validation::ValidationResultValidator<E>>,
     pub mutation:Option<commands::MutationResultValidator<E>>,pub form_page:Option<forms::FormPageValidator<E>>,
@@ -29,6 +123,23 @@ pub struct DefinitionServiceSetOptions<E:Send+'static,R:Send+Sync+'static>{
 }
 impl<E:Send+'static,R:Send+Sync+'static> DefinitionServiceSetOptions<E,R>{
     pub fn new(form_policy:ByteFormPolicy)->Self{Self{resources:None,definitions:Vec::new(),default_page_size:0,parse_named_page:None,request_language:None,validation_bindings:Default::default(),command_bindings:Default::default(),action_label:None,translate_key:None,is_management:None,route_path:None,route_set_for_request:None,route_set_for_mode:None,canonical_route_path:None,canonical_params:Default::default(),validation_paths:Default::default(),validators:Default::default(),form_policy,validation_translate:None}}
+
+    /// Prepare the supplied resource declarations before composing the services.
+    /// An explicitly selected consumer registry remains authoritative.
+    pub fn prepare_definitions(
+        mut self,
+        memory: &effect::memory::PreparedMemory<'static>,
+        region: effect::memory::RegionId,
+        capacity: definitions::PreparedDefinitionCapacity,
+    ) -> Result<Self, effect::memory::MemoryError> {
+        if self.resources.is_none() {
+            let definitions = std::mem::take(&mut self.definitions);
+            self.resources = Some(Arc::new(definitions::DefinitionRegistry::prepare(
+                memory, region, capacity, definitions,
+            )?));
+        }
+        Ok(self)
+    }
 }
 impl<E:Send+'static,R:Send+Sync+'static> Clone for DefinitionServiceSetOptions<E,R>{fn clone(&self)->Self{Self{resources:self.resources.clone(),definitions:self.definitions.clone(),default_page_size:self.default_page_size.clone(),parse_named_page:self.parse_named_page.clone(),request_language:self.request_language.clone(),validation_bindings:self.validation_bindings.clone(),command_bindings:self.command_bindings.clone(),action_label:self.action_label.clone(),translate_key:self.translate_key.clone(),is_management:self.is_management.clone(),route_path:self.route_path.clone(),route_set_for_request:self.route_set_for_request.clone(),route_set_for_mode:self.route_set_for_mode.clone(),canonical_route_path:self.canonical_route_path.clone(),canonical_params:self.canonical_params.clone(),validation_paths:self.validation_paths.clone(),validators:self.validators.clone(),form_policy:self.form_policy.clone(),validation_translate:self.validation_translate.clone()}}}
 /// Every field is an actual constructed owner capability, including dashboard rendering.
@@ -39,13 +150,37 @@ pub struct DefinitionServiceSet<E:Send+'static,R:Send+Sync+'static>{
 }
 impl<E:Send+'static,R:Send+Sync+'static> Clone for DefinitionServiceSet<E,R>{fn clone(&self)->Self{Self{resources:self.resources.clone(),queries:self.queries.clone(),validation:self.validation.clone(),commands:self.commands.clone(),seo:self.seo.clone(),forms:self.forms.clone(),rendering:self.rendering.clone(),dashboards:self.dashboards.clone(),validation_translate:self.validation_translate.clone()}}}
 pub fn new_definition_service_set<E:Error+Send+'static,R:Send+Sync+'static>(options:DefinitionServiceSetOptions<E,R>)->DefinitionServiceSet<E,R>{
+    build_definition_service_set(options, None)
+}
+
+/// Build the ordinary service shapes with selected prepared validation input and
+/// command working lifetimes. Existing consumer capabilities stay in their ports.
+pub fn new_prepared_definition_service_set<E: Error + Send + 'static, R: Send + Sync + 'static>(
+    options: DefinitionServiceSetOptions<E, R>,
+    registry: DefinitionRegistryStorage<'_>,
+    prepared: &PreparedDefinitionServices<E>,
+) -> Result<DefinitionServiceSet<E, R>, MemoryError> {
+    let options = options.prepare_definitions(registry.memory, registry.region, registry.capacity)?;
+    Ok(build_definition_service_set(options, Some(prepared)))
+}
+
+pub(super) fn build_definition_service_set<E: Error + Send + 'static, R: Send + Sync + 'static>(
+    options: DefinitionServiceSetOptions<E, R>,
+    prepared: Option<&PreparedDefinitionServices<E>>,
+) -> DefinitionServiceSet<E, R> {
     let resources=options.resources.unwrap_or_else(||Arc::new(definitions::new_definition_registry(options.definitions)));
     let queries=queries::new_query_service(resources.clone(),queries::Options{default_page_size:options.default_page_size,parse_named_page:options.parse_named_page,request_language:options.request_language,detail_params:options.canonical_params.clone()});
-    let validation=ValidationService::new(resources.clone(),Some(queries.clone()),options.form_policy,validation::Options{bindings:options.validation_bindings,validators:validation::Validators{command_input:options.validators.command_input.clone(),validation_result:options.validators.validation},path_catalog:Default::default()});
-    let commands=commands::CommandService::new(resources.clone(),commands::Options{resolve_action_label:options.action_label,validate_command_input:options.validators.command_input,validate_mutation_result:options.validators.mutation,executors:options.command_bindings});
-    let canonical=options.canonical_route_path.or_else(||{let path=options.route_path.clone();let params=options.canonical_params.clone();Some(Arc::new(move |request:&Request,definition:&definitions::ResourceDefinition,mode:&definitions::ResourceViewMode|{
+    let mut validation=ValidationService::new(resources.clone(),Some(queries.clone()),options.form_policy,validation::Options{bindings:options.validation_bindings,validators:validation::Validators{command_input:options.validators.command_input.clone(),validation_result:options.validators.validation},path_catalog:Default::default()});
+    let mut commands=commands::CommandService::new(resources.clone(),commands::Options{resolve_action_label:options.action_label,validate_command_input:options.validators.command_input,validate_mutation_result:options.validators.mutation,executors:options.command_bindings});
+    if let Some(prepared) = prepared {
+        validation = validation.with_prepared_input(prepared.input.clone());
+        let on_capacity = prepared.input.on_capacity.clone();
+        commands = commands.with_prepared_work(prepared.command.clone(), move |error| on_capacity(ServerError::Memory(error)));
+    }
+    let canonical=options.canonical_route_path.or_else(||{let path=options.route_path.clone();let params=options.canonical_params.clone();
         let query:routing::RequestValueFunc=Arc::new(|request,key|crate::byte_text::encoding_text(queries::request_query_value(request,key).as_bytes()));
         let captured:routing::RequestValueFunc=Arc::new(queries::path_value);
+        Some(Arc::new(move |request:&Request,definition:&definitions::ResourceDefinition,mode:&definitions::ResourceViewMode|{
         routing::canonical_route_path(request,definition,mode,path.as_ref(),Some(&query),Some(&captured),&params)
     }) as routing::CanonicalRoutePathBuilder)});
     let seo=seo::Service::new(resources.clone(),seo::Options{translate_key:options.translate_key.clone(),canonical_route_path:canonical,validate_seo:options.validators.seo,validate_sitemap_document:options.validators.sitemap_document,validate_sitemap_index:options.validators.sitemap_index});

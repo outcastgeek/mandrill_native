@@ -1,14 +1,16 @@
 //! Typed transactional composition, retry, and commit.
 
-use super::HasTransactionDomain;
-use super::internal::journal::{JournalError, TxJournal};
+use super::internal::journal::{JournalError, ReleaseJournal, TxJournal};
+use super::{HasTransactionDomain, TransactionDomain};
 use crate::internal::runtime::{self, Step};
-use crate::transaction;
-use crate::{Defect, Effect, Exit};
+use crate::memory::MemoryError;
+use crate::{Defect, Effect, Exit, ResourceValue, Scope};
+use crate::{effect, effect_scope_acquire, service, transaction};
 use futures_util::FutureExt;
 use futures_util::future::{poll_fn, select};
 use std::num::NonZeroUsize;
 use std::panic::AssertUnwindSafe;
+use std::pin::pin;
 use std::sync::Arc;
 use std::task::Poll;
 
@@ -18,6 +20,15 @@ use std::task::Poll;
 /// - `A`: Application value type.
 /// - `E`: Domain-error type.
 type TransactionStep<A, E> = dyn Fn(&mut TxJournal) -> TxStep<A, E> + Send + Sync;
+
+enum AtomicDomain {
+    Environment,
+    Selected(Arc<TransactionDomain>),
+    Release {
+        domain: Arc<TransactionDomain>,
+        journal: ReleaseJournal,
+    },
+}
 
 ///
 /// # Returns
@@ -64,6 +75,8 @@ pub enum TransactionError<E> {
     RetryWithoutReads,
     /// Execution was cancelled.
     Cancelled,
+    /// The prepared domain could not reserve journal or retry working storage.
+    Memory(MemoryError),
 }
 
 impl<E> TransactionError<E> {
@@ -82,6 +95,7 @@ impl<E> TransactionError<E> {
             JournalError::WrongValueType => Self::WrongValueType,
             JournalError::VersionExhausted => Self::VersionExhausted,
             JournalError::Conflict => Self::ConflictLimit,
+            JournalError::Memory(error) => Self::Memory(error),
         }
     }
 }
@@ -259,6 +273,7 @@ impl<A: Send + 'static, E: Send + 'static> Transaction<A, E> {
                 TransactionError::ConflictLimit => TransactionError::ConflictLimit,
                 TransactionError::RetryWithoutReads => TransactionError::RetryWithoutReads,
                 TransactionError::Cancelled => TransactionError::Cancelled,
+                TransactionError::Memory(error) => TransactionError::Memory(error),
             }),
         })
     }
@@ -304,14 +319,18 @@ impl<A: Send + 'static, E: Send + 'static> Transaction<A, E> {
     /// Type: `Self`.
     pub fn or_else(self, other: Self) -> Self {
         Self::new(move |journal| {
-            let before = journal.branch();
+            let before = match journal.branch() {
+                Ok(branch) => branch,
+                Err(error) => return TxStep::Invalid(TransactionError::Memory(error)),
+            };
             match (self.evaluate)(journal) {
                 TxStep::Retry => {
-                    let first_reads = journal.observed();
-                    journal.rollback(before);
+                    let first_reads = journal.rollback(before);
                     let second = (other.evaluate)(journal);
-                    if matches!(&second, TxStep::Retry) {
-                        journal.merge_observed(first_reads);
+                    if matches!(&second, TxStep::Retry)
+                        && let Err(error) = journal.merge_observed(first_reads)
+                    {
+                        return TxStep::Invalid(TransactionError::Memory(error));
                     }
                     second
                 }
@@ -334,19 +353,41 @@ impl<A: Send + 'static, E: Send + 'static> Transaction<A, E> {
     where
         R: HasTransactionDomain + Send + Sync + 'static,
     {
+        self.atomically_with(policy, AtomicDomain::Environment)
+    }
+
+    fn atomically_with<R>(
+        &self,
+        policy: TransactionPolicy,
+        authority: AtomicDomain,
+    ) -> Effect<A, TransactionError<E>, R>
+    where
+        R: HasTransactionDomain + Send + Sync + 'static,
+    {
         let transaction = self.clone();
         Effect::new(move |env: Arc<R>, context, finish| {
             let cancellation = context.cancellation.clone();
             let transaction = transaction.clone();
-            Step::Suspended(Box::pin(async move {
+            let (selected, reserved) = match &authority {
+                AtomicDomain::Environment => (None, Ok(None)),
+                AtomicDomain::Selected(domain) => (Some(Arc::clone(domain)), Ok(None)),
+                AtomicDomain::Release { domain, journal } => {
+                    (Some(Arc::clone(domain)), journal.take().map(Some))
+                }
+            };
+            Step::suspended(Box::pin(async move {
                 let result = AssertUnwindSafe(async move {
-                    let domain = env.transaction_domain();
+                    let mut reserved = reserved.map_err(TransactionError::Memory)?;
+                    let domain = selected.unwrap_or_else(|| env.transaction_domain());
+                    let is_release = reserved.is_some();
                     let mut conflicts = 0usize;
                     loop {
                         if cancellation.is_requested() {
                             return Err(TransactionError::Cancelled);
                         }
-                        let mut journal = TxJournal::new(Arc::clone(&domain.inner));
+                        let mut journal =
+                            TxJournal::new(Arc::clone(&domain.inner), reserved.take())
+                                .map_err(TransactionError::Memory)?;
                         journal.cancellation = Some(cancellation.clone());
                         match (transaction.evaluate)(&mut journal) {
                             TxStep::Success(value) => {
@@ -367,28 +408,33 @@ impl<A: Send + 'static, E: Send + 'static> Transaction<A, E> {
                             TxStep::Invalid(error) => return Err(error),
                             TxStep::Conflict => {}
                             TxStep::Retry => {
-                                let observed = journal.observed();
-                                if observed.is_empty() {
+                                if !journal.has_reads() {
                                     return Err(TransactionError::RetryWithoutReads);
                                 }
-                                let listener = domain.inner.changed.listen();
-                                let stale = {
-                                    let state = domain
-                                        .inner
-                                        .state
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                    observed.iter().any(|(id, record)| {
-                                        state.cells.get(id).map(|cell| cell.version)
-                                            != Some(record.version)
-                                    })
-                                };
-                                if stale {
+                                let observed = journal
+                                    .reserve_observed()
+                                    .map_err(TransactionError::Memory)?;
+                                if is_release {
+                                    reserved = Some(journal.recycle());
+                                } else {
+                                    drop(journal);
+                                }
+                                let listener = domain
+                                    .inner
+                                    .reserve_retry()
+                                    .map_err(TransactionError::Memory)?;
+                                if observed.is_stale(&domain.inner) {
                                     continue;
                                 }
-                                let _ =
-                                    select(Box::pin(listener), Box::pin(cancellation.cancelled()))
+                                if domain.inner.is_prepared() {
+                                    let cancelled = cancellation
+                                        .reserve_wait_owned()
+                                        .map_err(TransactionError::Memory)?;
+                                    let _ = select(pin!(listener), pin!(cancelled.wait())).await;
+                                } else {
+                                    let _ = select(pin!(listener), pin!(cancellation.cancelled()))
                                         .await;
+                                }
                                 if cancellation.is_requested() {
                                     return Err(TransactionError::Cancelled);
                                 }
@@ -400,6 +446,11 @@ impl<A: Send + 'static, E: Send + 'static> Transaction<A, E> {
                             .ok_or(TransactionError::ConflictLimit)?;
                         if conflicts > policy.max_conflicts.get() {
                             return Err(TransactionError::ConflictLimit);
+                        }
+                        if is_release {
+                            reserved = Some(journal.recycle());
+                        } else {
+                            drop(journal);
                         }
                         yield_after_conflict().await;
                     }
@@ -419,6 +470,41 @@ impl<A: Send + 'static, E: Send + 'static> Transaction<A, E> {
 }
 
 impl<E: Send + 'static> Transaction<(), E> {
+    pub(crate) fn acquire_scoped<R>(
+        &self,
+        scope: &Scope<TransactionError<E>>,
+        release: Self,
+        policy: TransactionPolicy,
+    ) -> Effect<ResourceValue<()>, TransactionError<E>, R>
+    where
+        R: HasTransactionDomain + Send + Sync + 'static,
+    {
+        let acquire = self.clone();
+        let scope = scope.clone();
+        effect! {
+            let acquire = acquire.clone();
+            let release = release.clone();
+            let scope = scope.clone();
+            let domain = service! { env: |env: &R| env.transaction_domain(), }?;
+            let (domain, reserved) = crate::effect_try_sync! {
+                once; body: move || {
+                    let journal = domain.inner.reserve_cleanup().map_err(TransactionError::Memory)?;
+                    Ok((domain, journal))
+                },
+            }?;
+            let release_domain = match reserved {
+                Some(journal) => AtomicDomain::Release { domain: Arc::clone(&domain), journal },
+                None => AtomicDomain::Environment,
+            };
+            let release = release.atomically_with(policy, release_domain);
+            effect_scope_acquire! {
+                scope: scope,
+                acquire: acquire.atomically_with(policy, AtomicDomain::Selected(domain)),
+                release: move |()| release.clone(),
+            }?
+        }
+    }
+
     /// Rebuild the input iterable for each transaction evaluation and consume its items in order.
     ///
     /// Owned items need no Clone bound. The first failure or retry request stops that

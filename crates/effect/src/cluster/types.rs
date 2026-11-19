@@ -1,5 +1,6 @@
 //! Stable Cluster identities and delivery policies.
 
+use crate::memory::{Bytes, MemoryError};
 use crate::{KeyDomain, StableKey};
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -90,6 +91,14 @@ pub struct ClusterAddress {
     pub entity: ClusterEntityId,
     /// Shard identity used to locate ownership for this entity. Type: `ClusterShardId`.
     pub shard: ClusterShardId,
+}
+
+impl ClusterAddress {
+    pub(super) fn identity_bytes(&self) -> Result<Bytes, MemoryError> {
+        Bytes::new(self.entity_type.as_str().len())
+            .checked_add(Bytes::new(self.entity.as_bytes().len()))?
+            .checked_add(Bytes::new(self.shard.as_bytes().len()))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

@@ -17,6 +17,14 @@ pub struct TursoArguments {
 }
 
 impl TursoArguments {
+    /// Fallibly reserve space for additional argument values.
+    pub fn try_reserve_exact(
+        &mut self,
+        additional: usize,
+    ) -> Result<(), std::collections::TryReserveError> {
+        self.values.try_reserve_exact(additional)
+    }
+
     /// Move another ordered binding buffer into this one without copying payloads.
     /// Anonymous placeholders must be used when composing independently built fragments.
     pub fn append(&mut self, mut other: Self) {
@@ -34,6 +42,17 @@ impl TursoArguments {
             .into_iter()
             .map(TursoValue::into_turso)
             .collect()
+    }
+
+    pub(crate) fn try_into_turso_values(
+        self,
+    ) -> Result<Vec<turso::Value>, std::collections::TryReserveError> {
+        let mut values = Vec::new();
+        values.try_reserve_exact(self.values.len())?;
+        for value in self.values {
+            values.push(value.try_into_turso()?);
+        }
+        Ok(values)
     }
 }
 

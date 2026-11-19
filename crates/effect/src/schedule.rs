@@ -1,5 +1,8 @@
 //! Composable retry and repeat scheduling decisions.
 
+mod prepared;
+pub use prepared::{PreparedSchedule, PreparedScheduleAttempt, PreparedScheduleTransition};
+
 use crate::internal::destruction::FlatDrop;
 use crate::internal::outcome;
 use crate::internal::runtime::{self, Context, Finish, Step};

@@ -41,6 +41,39 @@ fn drink_row() -> RowDecoder<Drink, SqlClient> {
     row! { let text = native_column::<String, SqlClient>("drink")?; Drink(text) }
 }
 
+#[cfg(feature = "fts")]
+#[tokio::test]
+async fn native_full_text_search_matches_bound_query() -> Result<(), SqlError> {
+    use effect_sql::sqlx::{TursoConnectOptions, TursoExperimentalFeature, TursoPoolOptions};
+
+    let options = TursoConnectOptions::new()
+        .experimental_feature(TursoExperimentalFeature::IndexMethod, true);
+    let pool = TursoPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+    let client = Arc::new(SqlClient::new(pool.clone()));
+    for text in [
+        "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+        "CREATE INDEX docs_fts ON docs USING fts(body)",
+        "INSERT INTO docs (id, body) VALUES (1, 'oat latte'), (2, 'black coffee')",
+    ] {
+        success(client.execute(move || sql! { text: text, }).run(client.clone()).await)?;
+    }
+
+    let search = client.query(
+        || sql! {
+            text("SELECT id FROM docs WHERE fts_match(body, ");
+            param("latte");
+            text(")");
+        },
+        row! { native_column::<i64, SqlClient>("id")? },
+    );
+    assert_eq!(success(search.run(client).await)?, vec![1]);
+    pool.close().await;
+    Ok(())
+}
+
 /// Binding order, quoting, SQL NULL/native mismatch, optional absence, scalar/fold and batch results.
 #[tokio::test]
 async fn statements_rows_and_result_modes() -> Result<(), SqlError> {
@@ -302,7 +335,7 @@ async fn cancellation_and_native_cleanup_channels() -> Result<(), SqlError> {
         first: CleanupFailure::ReleaseFailure(SqlError::CommitOutcomeUnknown(
             effect_sql::sqlx::Error::Protocol("acknowledgment unavailable".into()),
         )),
-        rest: vec![CleanupFailure::ReleaseInterrupted],
+        rest: vec![CleanupFailure::ReleaseInterrupted].into(),
     })));
     assert!(carrier.outcome_uncertain());
     assert!(matches!(

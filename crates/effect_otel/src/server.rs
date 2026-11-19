@@ -134,10 +134,7 @@ where
 {
     effect_try_sync! {
     body: move || {
-        let context = propagation.extract(
-            &OtelContext::default(),
-            &HeaderExtractor::new(request.headers()),
-        )?;
+        let context = propagation.extract_headers(&OtelContext::default(), request.headers())?;
         request.insert_extension(IncomingContext { context });
         Ok(())
     }, on_error: on_error, }

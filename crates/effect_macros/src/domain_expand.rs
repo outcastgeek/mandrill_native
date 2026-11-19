@@ -210,6 +210,20 @@ impl Fields {
         bounds: TokenStream,
         output: TokenStream,
     ) -> syn::Result<TokenStream> {
+        self.finish_inferred_selected(generics, types, returns, bounds, output, &[])
+    }
+    /// Syntax-only provider selections are passed as typed zero-sized markers
+    /// OUTSIDE the helper item. Outer type/const parameters remain in scope;
+    /// callbacks keep their inferred argument boundary and written field order.
+    pub(crate) fn finish_inferred_selected(
+        self,
+        generics: TokenStream,
+        types: &[(&str, TokenStream)],
+        returns: TokenStream,
+        bounds: TokenStream,
+        output: TokenStream,
+        selected: &[(TokenStream, TokenStream)],
+    ) -> syn::Result<TokenStream> {
         if let Some(field) = self.fields.iter().find(|field| !field.taken) {
             return Err(syn::Error::new(
                 field.name.span(),
@@ -230,6 +244,11 @@ impl Fields {
                 parameters.push(quote!(#local: #ty));
                 arguments.push(value);
             }
+        }
+        for (index, (parameter, actual)) in selected.iter().enumerate() {
+            let marker = Ident::new(&format!("__effect_selection_{index}"), Span::mixed_site());
+            parameters.push(quote!(#marker: ::core::marker::PhantomData<#parameter>));
+            arguments.push(quote!(::core::marker::PhantomData::<#actual>));
         }
         let apply = Ident::new("__effect_operator", Span::mixed_site());
         Ok(quote!({
@@ -528,6 +547,63 @@ pub(crate) fn cache(mut fields: Fields) -> syn::Result<TokenStream> {
         .iter()
         .any(|field| field.name == role && field.inline);
     let load = fields.callback(role, 1)?;
+    if fields.contains("memory") {
+        let memory = fields.take("memory")?;
+        let independent = fields.contains("independent").then(|| fields.take("independent")).transpose()?;
+        let (refusal, refusal_field, generic, refusal_bound, method) = if fields.contains("refusals") {
+            (
+                fields.take("refusals")?,
+                ("refusals", quote!(#path::PreparedCacheRefusals<E>)),
+                quote!(K, A, E, R, F),
+                quote!(),
+                quote!(make_prepared_with_refusals),
+            )
+        } else {
+            (
+                fields.take("on_capacity")?,
+                ("on_capacity", quote!(M)),
+                quote!(K, A, E, R, F, M),
+                quote!(M: Fn(#path::memory::MemoryError) -> E + Send + Sync + 'static),
+                quote!(make_prepared),
+            )
+        };
+        let (key, load_prepared) = if inline || role == "load_shared" {
+            (quote!(#path::CacheKey<K>), quote!(#load))
+        } else {
+            (quote!(&K), quote!(move |key: #path::CacheKey<K>| #load(&key)))
+        };
+        let construct = if let Some(independent) = independent {
+            if refusal_field.0 != "refusals" {
+                return Err(syn::Error::new(Span::call_site(), "independent prepared cache requires refusals"));
+            }
+            quote!(if #independent {
+                #path::Cache::make_prepared_independent(#scope, #options.admission, #memory, #refusal, #load_prepared)
+            } else {
+                #path::Cache::#method(#scope,#config,#options,#memory,#refusal,#load_prepared)
+            })
+        } else {
+            quote!(#path::Cache::#method(#scope,#config,#options,#memory,#refusal,#load_prepared))
+        };
+        return fields.finish_inferred(
+            generic,
+            &[
+                ("scope", quote!(#path::Scope<#path::SharedValue<E>>)),
+                ("config", quote!(#path::CacheConfig<K, E>)),
+                ("options", quote!(#path::CacheOptions<A, E>)),
+                ("load", quote!(F)),
+                ("load_shared", quote!(F)),
+                ("memory", quote!(#path::PreparedCacheStorage<K, A, E>)),
+                ("independent", quote!(bool)),
+                refusal_field,
+            ],
+            quote!(#path::Effect<#path::Cache<K, A, E>, #path::SharedValue<E>, R>),
+            quote!(K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static,
+                R: #path::HasClock + #path::HasTaskSpawner + Send + Sync + 'static,
+                F: Fn(#key) -> #path::Effect<A, E, R> + Send + Sync + 'static,
+                #refusal_bound),
+            construct,
+        );
+    }
     let method = if inline || role == "load_shared" {
         quote!(make_with_shared_key)
     } else {
@@ -538,6 +614,33 @@ pub(crate) fn cache(mut fields: Fields) -> syn::Result<TokenStream> {
     } else {
         quote!(&K)
     };
+    if fields.contains("prepared_index") {
+        let index = fields.take("prepared_index")?;
+        let on_capacity = fields.take("on_capacity")?;
+        let load_shared = if inline || role == "load_shared" {
+            quote!(#load)
+        } else {
+            quote!(move |key: ::std::sync::Arc<K>| #load(&key))
+        };
+        return fields.finish_inferred(
+            quote!(K, A, E, R, F, M),
+            &[
+                ("scope", quote!(#path::Scope<#path::SharedValue<E>>)),
+                ("config", quote!(#path::CacheConfig<K, E>)),
+                ("options", quote!(#path::CacheOptions<A, E>)),
+                ("load", quote!(F)),
+                ("load_shared", quote!(F)),
+                ("prepared_index", quote!(#path::PreparedCacheIndex<K, A, E>)),
+                ("on_capacity", quote!(M)),
+            ],
+            quote!(#path::Effect<#path::Cache<K, A, E>, #path::SharedValue<E>, R>),
+            quote!(K: Send + Sync + 'static, A: Send + 'static, E: Send + 'static,
+                R: #path::HasClock + #path::HasTaskSpawner + Send + Sync + 'static,
+                F: Fn(#key) -> #path::Effect<A, E, R> + Send + Sync + 'static,
+                M: Fn(#path::memory::MemoryError) -> E + Send + Sync + 'static),
+            quote!(#path::Cache::make_with_prepared_index(#scope,#config,#options,#index,#on_capacity,#load_shared)),
+        );
+    }
     fields.finish_inferred(
         quote!(K, A, E, R, F),
         &[
@@ -559,6 +662,52 @@ pub(crate) fn dependency_cache(mut fields: Fields) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
     let scope = fields.take("scope")?;
     let policy = fields.take("policy")?;
+    if fields.contains("dependency_pool") {
+        let (storage_field, storage_type, key_type, method) = if fields.contains("memory") {
+            (
+                "memory",
+                quote!(#path::PreparedDependencyStorage<K, D, A, E>),
+                quote!(#path::CacheKey<K>),
+                quote!(make_prepared),
+            )
+        } else {
+            (
+                "prepared_index",
+                quote!(#path::PreparedDependencyPayloadIndex<K, D, A, E>),
+                quote!(::std::sync::Arc<K>),
+                quote!(make),
+            )
+        };
+        let storage = fields.take(storage_field)?;
+        let pool = fields.take("dependency_pool")?;
+        let load = fields.callback("load", 2)?;
+        let mut inputs = vec![
+            ("scope", quote!(#path::Scope<#path::SharedValue<#path::DependencyCacheError<E>>>)),
+            ("policy", quote!(#path::PreparedDependencyPolicy<K, D, A, E>)),
+            (storage_field, storage_type),
+            ("dependency_pool", quote!(::std::sync::Arc<#path::PreparedDependencyPool<D>>)),
+            ("load", quote!(F)),
+        ];
+        let build = if storage_field == "memory" && fields.contains("refusals") {
+            let refusals = fields.take("refusals")?;
+            inputs.push(("refusals", quote!(#path::PreparedCacheRefusals<#path::DependencyCacheError<E>>)));
+            quote!(#path::PreparedDependencyCache::make_prepared_with_refusals(#scope,#policy,#storage,#pool,#refusals,#load))
+        } else {
+            quote!(#path::PreparedDependencyCache::#method(#scope,#policy,#storage,#pool,#load))
+        };
+        return fields.finish_inferred(
+            quote!(K, D, A, E, R, F),
+            &inputs,
+            quote!(#path::Effect<#path::PreparedDependencyCache<K, D, A, E>, #path::SharedValue<#path::DependencyCacheError<E>>, R>),
+            quote!(K: Send + Sync + 'static, D: Send + Sync + 'static,
+                A: Send + 'static, E: Send + 'static,
+                R: #path::HasClock + #path::HasTaskSpawner + Send + Sync + 'static,
+                F: Fn(#key_type, #path::PreparedDependencyWriter<D>)
+                    -> #path::Effect<(A, #path::PreparedDependencyWriter<D>), E, R>
+                    + Send + Sync + 'static),
+            build,
+        );
+    }
     let inline = fields
         .fields
         .iter()
@@ -574,6 +723,27 @@ pub(crate) fn dependency_cache(mut fields: Fields) -> syn::Result<TokenStream> {
     } else {
         quote!(&K)
     };
+    if fields.contains("prepared_index") {
+        let index = fields.take("prepared_index")?;
+        let load_shared = if inline {
+            quote!(#load)
+        } else {
+            quote!(move |key: ::std::sync::Arc<K>| #load(&key))
+        };
+        return fields.finish_inferred(
+            quote!(K, D, A, E, R, F),
+            &[("scope", quote!(#path::Scope<#path::SharedValue<#path::DependencyCacheError<E>>>)),
+                ("policy", quote!(#path::DependencyCachePolicy<K, D, A, E>)),
+                ("prepared_index", quote!(#path::PreparedDependencyCacheIndex<K, D, A, E>)),
+                ("load", quote!(F))],
+            quote!(#path::Effect<#path::DependencyCache<K, D, A, E>, #path::SharedValue<#path::DependencyCacheError<E>>, R>),
+            quote!(K: Send + Sync + 'static, D: Send + Sync + 'static,
+                A: Send + 'static, E: Send + 'static,
+                R: #path::HasClock + #path::HasTaskSpawner + Send + Sync + 'static,
+                F: Fn(#key) -> #path::Effect<(A, ::std::vec::Vec<D>), E, R> + Send + Sync + 'static),
+            quote!(#path::DependencyCache::make_with_prepared_index(#scope,#policy,#index,#load_shared)),
+        );
+    }
     fields.finish_inferred(
         quote!(K, D, A, E, R, F),
         &[("scope", quote!(#path::Scope<#path::SharedValue<#path::DependencyCacheError<E>>>)),
@@ -661,6 +831,16 @@ pub(crate) fn durable_queue(mut fields: Fields) -> syn::Result<TokenStream> {
 /// Declare a unary operation, optionally pairing it with an inline or reusable typed handler.
 pub(crate) fn rpc_operation(mut fields: Fields) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
+    if fields.contains("prepared_codec") {
+        let id = fields.take("id")?;
+        let version = fields.take("version")?;
+        let limits = fields.take("limits")?;
+        let codec = fields.take("prepared_codec")?;
+        return fields.finish(quote!(#path::rpc::PreparedRpcOperation::new(
+            #path::rpc::RpcOperationSpec { id: #id, version: #version, kind: #path::rpc::RpcOperationKind::Unary },
+            #limits, #codec,
+        )));
+    }
     if fields.contains("operation") {
         let operation = fields.take("operation")?;
         let handler = fields.role("handler", 1, BodyCategory::EffectFactory)?;
@@ -1099,6 +1279,14 @@ pub(crate) fn entity(mut fields: Fields) -> syn::Result<TokenStream> {
 /// Aggregate typed resource-aware definitions without acquiring state.
 pub(crate) fn cluster(mut fields: Fields) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
+    if fields.contains("store_capacity") {
+        let memory = fields.take("memory")?;
+        let region = fields.take("region")?;
+        let capacity = fields.take("store_capacity")?;
+        return fields.finish(quote!(#path::cluster::MemoryClusterMessageStore::prepare(
+            #memory, #region, #capacity,
+        )));
+    }
     let policy = fields.take("policy")?;
     let (entities, locals) = handler_bindings(&mut fields, "entities")?;
     fields.finish(
@@ -1152,7 +1340,13 @@ pub(crate) fn inline_role(name: &str) -> bool {
     matches!(
         name,
         "body"
+            | "input"
+            | "try_body"
+            | "reserve"
+            | "init"
+            | "cleanup"
             | "run"
+            | "run_prepared"
             | "load"
             | "acquire"
             | "handler"
@@ -1166,6 +1360,7 @@ pub(crate) fn inline_role(name: &str) -> bool {
             | "missing"
             | "value"
             | "on_error"
+            | "on_capacity"
             | "on_timeout"
             | "recover"
             | "finalizer"
@@ -1199,6 +1394,10 @@ pub(crate) fn inline_role(name: &str) -> bool {
             | "future"
             | "operation"
             | "select"
+            | "queue"
+            | "channel"
+            | "subscription"
+            | "reference"
             | "fold"
             | "evaluate"
             | "connect"

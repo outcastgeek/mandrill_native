@@ -480,7 +480,7 @@ impl WebSocketConnection {
         let connection = self.clone();
         Effect::new(move |env: Arc<R>, context, finish| {
             let connection = connection.clone();
-            Step::Suspended(Box::pin(async move {
+            Step::suspended(Box::pin(async move {
                 let work = async {
                     let _admission = match connection.inner.operations.admit() {
                         Ok(permit) => permit,
@@ -571,7 +571,7 @@ where
     let make = Arc::new(make);
     Effect::new(move |env: Arc<R>, context, finish| {
         let make = Arc::clone(&make);
-        Step::Suspended(Box::pin(async move {
+        Step::suspended(Box::pin(async move {
             let outcome = AssertUnwindSafe(async { make(context.cancellation.clone()).await })
                 .catch_unwind()
                 .await

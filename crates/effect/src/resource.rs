@@ -109,7 +109,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Release<E, R> {
             workflow: Workflow::new(move |_, context, finish| {
                 match catch_unwind(AssertUnwindSafe(|| factory(context.cancellation.clone()))) {
                     Err(panic) => runtime::finish(finish, Exit::Die(Defect::from_panic(panic))),
-                    Ok(pending) => Step::Suspended(Box::pin(async move {
+                    Ok(pending) => Step::suspended(Box::pin(async move {
                         let result = AssertUnwindSafe(pending).catch_unwind().await;
                         runtime::finish(
                             finish,
@@ -551,12 +551,44 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Release<E, R> {
     ///
     /// # Returns
     /// Type: `Self`.
+    /// Owned prepared cleanup leaf. Pending and completion frames are acquired
+    /// from protected run storage before invoking the FnOnce factory; capacity
+    /// remains explicit and there is no system-future fallback. Description and
+    /// mapped-refusal routing still use their disclosed legacy domains.
+    pub fn from_prepared_exit_future<F: Future<Output = Exit<(), E>> + Send + 'static>(
+        factory: impl FnOnce(Cancellation) -> F + Send + 'static,
+        on_capacity: impl FnOnce(crate::memory::MemoryError) -> E + Send + 'static,
+    ) -> Self {
+        Self {
+            workflow: Workflow::new(move |_, context, finish| {
+                let failed = move |finish, error| {
+                    let outcome = catch_unwind(AssertUnwindSafe(|| on_capacity(error)))
+                        .map(Exit::Fail)
+                        .unwrap_or_else(|panic| Exit::Die(Defect::from_panic(panic)));
+                    runtime::finish(finish, outcome)
+                };
+                let Some(pool) = context.frames() else {
+                    return failed(finish, crate::memory::MemoryError::MissingRuntimeStorage);
+                };
+                match crate::internal::runtime_storage::prepare_future(
+                    pool,
+                    || factory(context.cancellation.clone()),
+                    finish,
+                ) {
+                    Ok(step) => step,
+                    Err((error, finish)) => failed(finish, error),
+                }
+            }),
+        }
+    }
+    /// Existing system-stored owned cleanup future, preserving all Exit families.
+    /// Unlike the explicitly prepared companion, this leaf uses its normal domain.
     pub fn from_exit_future<F: Future<Output = Exit<(), E>> + Send + 'static>(
         factory: impl FnOnce(Cancellation) -> F + Send + 'static,
     ) -> Self {
         Self {
             workflow: Workflow::new(move |_, context, finish| {
-                Step::Suspended(Box::pin(async move {
+                Step::suspended(Box::pin(async move {
                     let result = AssertUnwindSafe(async { factory(context.cancellation).await })
                         .catch_unwind()
                         .await

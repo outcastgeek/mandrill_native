@@ -89,7 +89,7 @@ impl Fold for Lower {
             }
             parse_quote!(return Ok(()))
         } else if let Expr::Break(mut step) = expr {
-            step.expr = step.expr.map(|value| Box::new(self.fold_expr(*value)));
+            step.expr = step.expr.map(|value| Box::map(value, |value| self.fold_expr(value)));
             if let Some(checkpoint) = self.target(&step.label, false) {
                 let context = &self.context;
                 let label = &step.label;
@@ -109,7 +109,7 @@ impl Fold for Lower {
                 Expr::Continue(step)
             }
         } else if let Expr::While(mut step) = expr {
-            step.cond = Box::new(self.fold_expr(*step.cond));
+            step.cond = Box::map(step.cond, |condition| self.fold_expr(condition));
             let checkpoint = self.checkpoint();
             self.targets.push((
                 step.label.as_ref().map(|label| label.name.clone()),
@@ -124,7 +124,7 @@ impl Fold for Lower {
                 .insert(0, parse_quote!(#context.cooperate().await?;));
             Expr::While(step)
         } else if let Expr::ForLoop(mut step) = expr {
-            step.expr = Box::new(self.fold_expr(*step.expr));
+            step.expr = Box::map(step.expr, |iterable| self.fold_expr(iterable));
             let checkpoint = self.checkpoint();
             self.targets.push((
                 step.label.as_ref().map(|label| label.name.clone()),

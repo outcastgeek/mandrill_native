@@ -228,7 +228,7 @@ impl From<AdmissionError> for crate::Defect {
 }
 
 /// Typed capacity permit used by admission.
-struct CapacityPermit(Option<Arc<Inner>>);
+pub(crate) struct CapacityPermit(Option<Arc<Inner>>);
 /// Typed driver permit used by admission.
 struct DriverPermit(Option<Arc<Inner>>);
 impl Drop for CapacityPermit {
@@ -301,7 +301,7 @@ impl AdmissionPermit {
     pub fn task(self, task: crate::ScheduledTask) -> AdmittedTask {
         let (capacity, driver) = self.split();
         AdmittedTask {
-            task: Some(task.on_settled(move || drop(capacity))),
+            task: Some(task.with_permit(capacity)),
             driver,
         }
     }

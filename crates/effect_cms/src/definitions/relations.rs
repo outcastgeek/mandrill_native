@@ -141,6 +141,10 @@ impl ResourceRelationDescriptor {
             .map(|value| clone_relation_definition(&value.definition))
     }
 
+    pub(crate) fn definition_ref(&self) -> Option<&ResourceRelationDefinition> {
+        self.value.as_ref().map(|value| &value.definition)
+    }
+
     /// Whether the declaration explicitly allows `operation`.
     ///
     /// The comparison is exact: the value is not trimmed or otherwise

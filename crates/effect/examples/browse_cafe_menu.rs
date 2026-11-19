@@ -1,20 +1,22 @@
 //! Maya reads the menu and compares dairy-free choices with their actual prices.
 //!
-//! Run: `cargo +1.99.0 run -p effect --example browse_cafe_menu`.
+//! Run: `cargo +1.100.0 run -p effect --example browse_cafe_menu`.
 //! Input: an open board with americano 325, oat latte 475, cappuccino 450 cents.
 //! Output: all three priced choices, with cappuccino identified as unsuitable for Maya.
 //! A lazy stream supplies choices; the selected price board supplies each price.
+//! The visit admits cache keys and prices into a region prepared at startup.
 
-use effect::{effect_die, effect_map_error};
+use effect::{effect_die, effect_map_error, effect_sync, memory};
 pub mod cafe_support;
 use cafe_support::Cafe;
 use std::num::NonZeroUsize;
 /// Menu choices and price-board data used by the browsing and update recipes.
 pub mod menu;
+use effect::memory::{Bytes, RegionId};
 use effect::{
-    CacheAdmission, CacheCapacity, CacheConfig, CacheOptions, CacheTtl, Effect, Exit, Scope,
-    SharedValue, Stream, cache, effect_for_each, effect_scope, effect_try_sync, service, span,
-    stream,
+    CacheAdmission, CacheCapacity, CacheConfig, CacheKey, CacheOptions, CacheTtl, Effect, Exit,
+    PreparedCacheCapacity, PreparedCacheRefusals, PreparedCacheStorage, Scope, SharedValue, Stream,
+    cache, effect_for_each, effect_scope, effect_try_sync, service, span, stream,
 };
 use menu::{Drink, MenuBoard, MenuProblem};
 use std::{
@@ -23,9 +25,16 @@ use std::{
 };
 
 /// Pull the menu once and print the dietary information beside each selected price.
-fn browse_menu() -> Effect<(), SharedValue<MenuProblem>, CoffeeShop> {
+fn browse_menu(
+    storage: PreparedCacheStorage<Drink, i64, MenuProblem>,
+    refusals: PreparedCacheRefusals<MenuProblem>,
+) -> Effect<(), SharedValue<MenuProblem>, CoffeeShop> {
+    let storage = effect_sync! { once; body: move || storage, };
     effect_scope! {
         body |scope: Scope<SharedValue<MenuProblem>>| {
+        let storage = storage.clone();
+        let refusals = refusals.clone();
+        let storage = storage?;
         let prices = cache! {
             scope: scope, config: CacheConfig {
                 equal: Arc::new(|a: &Drink, b| a == b), ttl: None,
@@ -33,7 +42,8 @@ fn browse_menu() -> Effect<(), SharedValue<MenuProblem>, CoffeeShop> {
             options: CacheOptions {
                 ttl: CacheTtl::Fixed(None), admission: CacheAdmission::Bounded {
                 maximum: NonZeroUsize::MIN.saturating_add(3), capacity_error: Arc::new(|| MenuProblem::Busy) } },
-            load |drink: Arc<Drink>| { menu_price((*drink).clone())? },
+            memory: storage, refusals: refusals,
+            load |drink: CacheKey<Drink>| { menu_price((*drink).clone())? },
         }?;
         let drinks = effect_map_error! { program: menu_choices().run_collect(Some(3)), map: SharedValue::new, }?;
         let browse_prices = prices.clone();
@@ -52,9 +62,14 @@ fn browse_menu() -> Effect<(), SharedValue<MenuProblem>, CoffeeShop> {
                 if contains_dairy { { use std::io::Write; let written = writeln!(std::io::stdout().lock(), "    Maya skips dairy today."); match written { Ok(()) => (), Err(error) => effect_die! { defect: effect::Defect::from_io(error), }?, } }; }
             },
         }?;
-        let selected = prices.get(Drink::OatLatte)?;
+        let retained = prices.try_get(Drink::OatLatte)?;
+        let selected = match retained {
+            Some(value) => value,
+            None => prices.get(Drink::OatLatte)?,
+        };
         let selected_cents = match selected.with(|cents| *cents) { Ok(value) => value, Err(error) => effect_die! { defect: effect::Defect::new(format!("retained menu price: {error:?}")), }?, };
         { use std::io::Write; let written = writeln!(std::io::stdout().lock(), "Maya confirms her oat-latte choice at {} cents from the same visit menu.", selected_cents); match written { Ok(()) => (), Err(error) => effect_die! { defect: effect::Defect::from_io(error), }?, } };
+        prices.invalidate(Drink::OatLatte)?;
         },
     }
 }
@@ -83,6 +98,38 @@ fn menu_choices() -> Stream<Drink, MenuProblem, CoffeeShop> {
 }
 /// Select local providers and execute the customer's menu visit.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let capacity = PreparedCacheCapacity {
+        retention: CacheCapacity::Bounded(NonZeroUsize::MIN.saturating_add(2)),
+        active: NonZeroUsize::MIN.saturating_add(3),
+        lookups: NonZeroUsize::MIN.saturating_add(3),
+        diagnostics: NonZeroUsize::MIN.saturating_add(3),
+        observers: NonZeroUsize::MIN.saturating_add(3),
+        keys: NonZeroUsize::MIN.saturating_add(7),
+        entries: NonZeroUsize::MIN.saturating_add(7),
+        values: NonZeroUsize::MIN.saturating_add(7),
+        errors: NonZeroUsize::MIN.saturating_add(19),
+        cleanup_outcomes: NonZeroUsize::MIN.saturating_add(11),
+        maintenance_outcomes: NonZeroUsize::MIN.saturating_add(1),
+        cleanup_entries: 2,
+    };
+    let prices = PreparedCacheStorage::<Drink, i64, MenuProblem>::storage_bytes(capacity)?
+        .checked_add(SharedValue::<MenuProblem>::prepared_storage_bytes()?)?
+        .checked_add(Bytes::new(16 * 1024))?;
+    let total = prices.checked_add(Bytes::new(64 * 1024))?;
+    let memory = memory! {
+        total: total,
+        mode: prepared,
+        metadata: metadata,
+        partition metadata: 32 KiB,
+        partition prices: prices,
+    }?
+    .prepare()?;
+    let cache = PreparedCacheStorage::prepare(&memory, RegionId::named("prices"), capacity)?;
+    let busy = SharedValue::prepare_region(&memory, RegionId::named("prices"), MenuProblem::Busy)?;
+    let active_busy = busy.clone();
+    let refusals =
+        PreparedCacheRefusals::new(move |_reason| busy.clone(), move || active_busy.clone());
+    let _memory = memory.seal();
     let cafe = Cafe::open(
         MenuBoard {
             open: true,
@@ -91,7 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         NonZeroUsize::MIN.saturating_add(15),
         NonZeroUsize::MIN.saturating_add(3),
     );
-    let result = futures_executor::block_on(browse_menu().run(cafe.clone()));
+    let result = futures_executor::block_on(browse_menu(cache, refusals).run(cafe.clone()));
     cafe.base
         .finish()
         .map_err(|error| error.message().to_owned())?;

@@ -101,6 +101,609 @@ pub fn json_string() -> PureCodec<String, JsonValue> {
     .with_equivalence(|left, right| left == right)
 }
 
+/// A decoded string retaining the complete prepared document that owns its bytes.
+pub struct PreparedJsonString {
+    owner: super::SharedPreparedJsonValue,
+}
+impl PreparedJsonString {
+    /// Copy a name into an admitted managed string document without JSON text roundtripping.
+    pub fn copy_from(text: &str, parser: &super::PreparedJsonParserPool, policy: super::ParsePolicy) -> Result<Self, SchemaIssue> {
+        parser.prepare_name(text, policy)
+    }
+    pub(super) fn new(owner: super::SharedPreparedJsonValue) -> Result<Self, SchemaIssue> {
+        if owner.view().as_str().is_none() {
+            return Err(SchemaIssue::new(SchemaIssueKind::InvalidDefinition));
+        }
+        Ok(Self { owner })
+    }
+    /// Borrow the retained decoded UTF-8 string.
+    #[must_use]
+    #[allow(clippy::expect_used)] // The private constructor proves this immutable subtree is a string.
+    pub fn as_str(&self) -> &str {
+        self.owner
+            .view()
+            .as_str()
+            .expect("prepared string invariant")
+    }
+    /// Retain another owner of the complete backing document.
+    pub fn try_clone(&self) -> Result<Self, crate::memory::MemoryError> {
+        Ok(Self {
+            owner: self.owner.try_clone()?,
+        })
+    }
+    pub(super) fn retain_value(
+        &self,
+    ) -> Result<super::SharedPreparedJsonValue, crate::memory::MemoryError> {
+        self.owner.try_clone()
+    }
+}
+impl std::ops::Deref for PreparedJsonString {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+pub(super) fn prepared_value_kind(
+    value: &super::SharedPreparedJsonValue,
+) -> Result<ValueKind, SchemaIssue> {
+    prepared_view_kind(value.view())
+}
+#[doc(hidden)]
+pub fn prepared_view_kind(value: super::PreparedJsonValue<'_>) -> Result<ValueKind, SchemaIssue> {
+    use super::PreparedJsonKind;
+    Ok(
+        match value
+            .kind()
+            .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?
+        {
+            PreparedJsonKind::Null => ValueKind::Null,
+            PreparedJsonKind::Bool(_) => ValueKind::Boolean,
+            PreparedJsonKind::Number => {
+                let token = value
+                    .number_token()
+                    .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?;
+                let number = super::managed_number::ManagedNumber::parse(token)
+                    .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?;
+                if number.as_i64().is_some() || number.as_u64().is_some() {
+                    ValueKind::Integer
+                } else {
+                    ValueKind::Number
+                }
+            }
+            PreparedJsonKind::String => ValueKind::String,
+            PreparedJsonKind::Array => ValueKind::Sequence,
+            PreparedJsonKind::Object => ValueKind::Record,
+        },
+    )
+}
+/// Decode and encode an owned string view without copying its document backing.
+#[must_use]
+pub fn json_prepared_string() -> PureCodec<PreparedJsonString, super::SharedPreparedJsonValue> {
+    PureCodec::with_context_ast(
+        SchemaAst::primitive(PrimitiveShape::String),
+        |value: &super::SharedPreparedJsonValue, context| {
+            let Some(text) = value.view().as_str() else {
+                return Err(SchemaIssue::new(SchemaIssueKind::TypeMismatch {
+                    expected: ValueKind::String,
+                    actual: prepared_value_kind(value)?,
+                }));
+            };
+            check_string_budget(text, context)?;
+            let owner = value
+                .try_clone()
+                .map_err(|error| SchemaIssue::new(SchemaIssueKind::Memory(error)))?;
+            PreparedJsonString::new(owner)
+        },
+        |value: &PreparedJsonString, context| {
+            check_string_budget(value.as_str(), context)?;
+            value
+                .owner
+                .try_clone()
+                .map_err(|error| SchemaIssue::new(SchemaIssueKind::Memory(error)))
+        },
+    )
+    .with_context_type_validator(|value: &PreparedJsonString, context| {
+        check_string_budget(value.as_str(), context)
+    })
+    .with_writer(|value, writer| writer.string(value.as_str()))
+    .with_equivalence(|left, right| left.as_str() == right.as_str())
+}
+
+fn prepared_mismatch(expected: ValueKind, value: &super::SharedPreparedJsonValue) -> SchemaIssue {
+    match prepared_value_kind(value) {
+        Ok(actual) => SchemaIssue::new(SchemaIssueKind::TypeMismatch { expected, actual }),
+        Err(issue) => issue,
+    }
+}
+fn prepared_number(
+    value: &super::SharedPreparedJsonValue,
+) -> Result<Option<super::managed_number::ManagedNumber<'_>>, SchemaIssue> {
+    let Some(token) = value.view().number_token() else {
+        return Ok(None);
+    };
+    super::managed_number::ManagedNumber::parse(token)
+        .map(Some)
+        .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))
+}
+fn check_prepared_number_digits(
+    number: &super::managed_number::ManagedNumber<'_>,
+    context: Option<&super::ParseContext>,
+) -> Result<(), SchemaIssue> {
+    let Some(context) = context else {
+        return Ok(());
+    };
+    let digits = number.digits();
+    let limit = context.policy().integer_digits.get();
+    if digits > limit {
+        Err(SchemaIssue::new(SchemaIssueKind::ResourceDemand {
+            resource: super::SchemaResource::IntegerDigits,
+            limit,
+            observed: digits,
+        }))
+    } else {
+        Ok(())
+    }
+}
+/// Managed null codec with explicit document and parser policy owners for encoding.
+#[must_use]
+pub fn json_prepared_null(
+    pool: Arc<super::PreparedJsonParserPool>,
+    policy: super::ParsePolicy,
+) -> PureCodec<(), super::SharedPreparedJsonValue> {
+    let writer = json_null();
+    let ast = writer.ast().clone();
+    PureCodec::with_context_ast(
+        ast,
+        |value: &super::SharedPreparedJsonValue, _| {
+            if value.view().kind() == Some(super::PreparedJsonKind::Null) {
+                Ok(())
+            } else {
+                Err(prepared_mismatch(ValueKind::Null, value))
+            }
+        },
+        move |value: &(), context| {
+            pool.encode_with(
+                &writer,
+                value,
+                super::parse_context::policy(context, policy),
+            )
+        },
+    )
+    .with_type_validator(|_| Ok(()))
+    .with_writer(|_, writer| writer.null())
+}
+/// Managed boolean codec with explicit document and parser policy owners for encoding.
+#[must_use]
+pub fn json_prepared_bool(
+    pool: Arc<super::PreparedJsonParserPool>,
+    policy: super::ParsePolicy,
+) -> PureCodec<bool, super::SharedPreparedJsonValue> {
+    let writer = json_bool();
+    let ast = writer.ast().clone();
+    PureCodec::with_context_ast(
+        ast,
+        |value: &super::SharedPreparedJsonValue, _| match value.view().kind() {
+            Some(super::PreparedJsonKind::Bool(value)) => Ok(value),
+            _ => Err(prepared_mismatch(ValueKind::Boolean, value)),
+        },
+        move |value: &bool, context| {
+            pool.encode_with(
+                &writer,
+                value,
+                super::parse_context::policy(context, policy),
+            )
+        },
+    )
+    .with_type_validator(|_| Ok(()))
+    .with_writer(|value, writer| writer.boolean(*value))
+    .with_equivalence(|left, right| left == right)
+}
+/// Managed signed integer codec with explicit document and parser policy owners.
+#[must_use]
+pub fn json_prepared_i64(
+    pool: Arc<super::PreparedJsonParserPool>,
+    policy: super::ParsePolicy,
+) -> PureCodec<i64, super::SharedPreparedJsonValue> {
+    let writer = json_i64();
+    let ast = writer.ast().clone();
+    PureCodec::with_context_ast(
+        ast,
+        |value: &super::SharedPreparedJsonValue, context| {
+            let number = prepared_number(value)?
+                .ok_or_else(|| prepared_mismatch(ValueKind::Integer, value))?;
+            check_prepared_number_digits(&number, context)?;
+            number
+                .as_i64()
+                .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::OutOfRange))
+        },
+        move |value: &i64, context| {
+            let mut buffer = std::fmt::NumBuffer::new();
+            check_digit_budget(value.format_into(&mut buffer), context)?;
+            pool.encode_with(
+                &writer,
+                value,
+                super::parse_context::policy(context, policy),
+            )
+        },
+    )
+    .with_context_type_validator(|value: &i64, context| {
+        let mut buffer = std::fmt::NumBuffer::new();
+        check_digit_budget(value.format_into(&mut buffer), context)
+    })
+    .with_writer(|value, writer| writer.i64(*value))
+    .with_equivalence(|left, right| left == right)
+}
+/// Managed unsigned integer codec with explicit document and parser policy owners.
+#[must_use]
+pub fn json_prepared_u64(
+    pool: Arc<super::PreparedJsonParserPool>,
+    policy: super::ParsePolicy,
+) -> PureCodec<u64, super::SharedPreparedJsonValue> {
+    let writer = json_u64();
+    let ast = writer.ast().clone();
+    PureCodec::with_context_ast(
+        ast,
+        |value: &super::SharedPreparedJsonValue, context| {
+            let number = prepared_number(value)?
+                .ok_or_else(|| prepared_mismatch(ValueKind::Integer, value))?;
+            check_prepared_number_digits(&number, context)?;
+            number
+                .as_u64()
+                .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::OutOfRange))
+        },
+        move |value: &u64, context| {
+            let mut buffer = std::fmt::NumBuffer::new();
+            check_digit_budget(value.format_into(&mut buffer), context)?;
+            pool.encode_with(
+                &writer,
+                value,
+                super::parse_context::policy(context, policy),
+            )
+        },
+    )
+    .with_context_type_validator(|value: &u64, context| {
+        let mut buffer = std::fmt::NumBuffer::new();
+        check_digit_budget(value.format_into(&mut buffer), context)
+    })
+    .with_writer(|value, writer| writer.u64(*value))
+    .with_equivalence(|left, right| left == right)
+}
+/// Managed finite floating-point codec with explicit document and parser policy owners.
+#[must_use]
+pub fn json_prepared_f64(
+    pool: Arc<super::PreparedJsonParserPool>,
+    policy: super::ParsePolicy,
+) -> PureCodec<f64, super::SharedPreparedJsonValue> {
+    let writer = json_f64();
+    let ast = writer.ast().clone();
+    PureCodec::with_context_ast(
+        ast,
+        |value: &super::SharedPreparedJsonValue, _| {
+            let number = prepared_number(value)?
+                .ok_or_else(|| prepared_mismatch(ValueKind::Number, value))?;
+            number
+                .as_f64()
+                .filter(|number| number.is_finite())
+                .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::OutOfRange))
+        },
+        move |value: &f64, context| {
+            if !value.is_finite() {
+                return Err(SchemaIssue::new(SchemaIssueKind::NonFinite));
+            }
+            pool.encode_with(
+                &writer,
+                value,
+                super::parse_context::policy(context, policy),
+            )
+        },
+    )
+    .with_type_validator(|value: &f64| {
+        if value.is_finite() {
+            Ok(())
+        } else {
+            Err(SchemaIssue::new(SchemaIssueKind::NonFinite))
+        }
+    })
+    .with_writer(|value, writer| writer.finite_f64(*value))
+}
+
+/// Nullable managed values, retaining the same nested witness rules as `json_nullable`.
+#[must_use]
+pub fn json_prepared_nullable<A: Send + 'static>(
+    value: PureCodec<A, super::SharedPreparedJsonValue>,
+    pool: Arc<super::PreparedJsonParserPool>,
+    policy: super::ParsePolicy,
+) -> PureCodec<Option<A>, super::SharedPreparedJsonValue> {
+    let ast = SchemaAst::new(SchemaShape::Union(vec![
+        SchemaAst::primitive(PrimitiveShape::Null),
+        value.ast().clone(),
+    ]));
+    let decode = value.clone();
+    let validate = value.clone();
+    let write = value.clone();
+    let has_validator = value.has_type_validator();
+    let has_writer = value.has_writer();
+    let null_writer = json_null();
+    let codec = PureCodec::with_context_ast(
+        ast,
+        move |encoded: &super::SharedPreparedJsonValue, context| {
+            if encoded.view().kind() == Some(super::PreparedJsonKind::Null) {
+                Ok(None)
+            } else {
+                decode
+                    .decode_in_ref(encoded, super::parse_context::descend(context)?.as_ref())
+                    .map(Some)
+            }
+        },
+        move |decoded: &Option<A>, context| match decoded {
+            None => pool.encode_with(
+                &null_writer,
+                &(),
+                super::parse_context::policy(context, policy),
+            ),
+            Some(item) => {
+                value.encode_in_ref(item, super::parse_context::descend(context)?.as_ref())
+            }
+        },
+    );
+    let codec = if has_validator {
+        codec.with_context_type_validator(move |value: &Option<A>, context| match value {
+            None => Ok(()),
+            Some(value) => {
+                validate.validate_in_ref(value, super::parse_context::descend(context)?.as_ref())
+            }
+        })
+    } else {
+        codec
+    };
+    if has_writer {
+        codec.with_writer(move |value, writer| match value {
+            None => writer.null(),
+            Some(value) => write.write_into(value, writer),
+        })
+    } else {
+        codec
+    }
+}
+
+/// Managed homogeneous arrays with explicit typed-element and output-document backing.
+#[must_use]
+pub fn json_prepared_array<A: Send + 'static>(
+    element: PureCodec<A, super::SharedPreparedJsonValue>,
+    arrays: Arc<super::PreparedJsonArrayPool<A>>,
+    output: Arc<super::PreparedJsonParserPool>,
+    policy: super::ParsePolicy,
+    maximum: Option<std::num::NonZeroUsize>,
+) -> PureCodec<super::PreparedJsonArray<A>, super::SharedPreparedJsonValue> {
+    let ast = SchemaAst::new(SchemaShape::Sequence {
+        element: element.ast().clone(),
+        maximum,
+    });
+    let decode = element.clone();
+    let validate = element.clone();
+    let write = element.clone();
+    let has_validator = element.has_type_validator();
+    let has_writer = element.has_writer();
+    let codec = PureCodec::with_context_ast(
+        ast,
+        move |encoded: &super::SharedPreparedJsonValue, context| {
+            if encoded.view().kind() != Some(super::PreparedJsonKind::Array) {
+                return Err(prepared_mismatch(ValueKind::Sequence, encoded));
+            }
+            let len = encoded.view().len();
+            if context.is_some_and(|ctx| len > ctx.policy().parse.limits.collection.get())
+                || maximum.is_some_and(|limit| len > limit.get())
+            {
+                return Err(SchemaIssue::new(SchemaIssueKind::LimitExceeded {
+                    resource: super::SchemaResource::Width,
+                }));
+            }
+            let mut result = arrays
+                .reserve()
+                .map_err(|error| SchemaIssue::new(SchemaIssueKind::Memory(error)))?;
+            if len > result.capacity() {
+                return Err(SchemaIssue::new(SchemaIssueKind::Memory(
+                    crate::memory::MemoryError::NoSlot,
+                )));
+            }
+            for index in 0..len {
+                let child_context =
+                    super::parse_context::child(context, IssueSegment::Index(index))?;
+                let child = encoded
+                    .try_get_index(index)
+                    .map_err(|error| {
+                        super::prepared_issue_at(context, SchemaIssue::new(SchemaIssueKind::Memory(error)), IssueSegment::Index(index))
+                    })?
+                    .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?;
+                let item = decode
+                    .decode_in_ref(&child, child_context.as_ref())
+                    .map_err(|issue| super::prepared_issue_at(context, issue, IssueSegment::Index(index)))?;
+                if let Err(item) = result.push(item) {
+                    drop(item);
+                    return Err(SchemaIssue::new(SchemaIssueKind::Memory(
+                        crate::memory::MemoryError::NoSlot,
+                    )));
+                }
+            }
+            Ok(result)
+        },
+        move |decoded: &super::PreparedJsonArray<A>, context| {
+            let values = decoded.as_slice();
+            if context.is_some_and(|ctx| values.len() > ctx.policy().parse.limits.collection.get())
+                || maximum.is_some_and(|limit| values.len() > limit.get())
+            {
+                return Err(SchemaIssue::new(SchemaIssueKind::LimitExceeded {
+                    resource: super::SchemaResource::Width,
+                }));
+            }
+            output.assemble_array(
+                values.len(),
+                super::parse_context::policy(context, policy),
+                |index| {
+                    let item = values
+                        .get(index)
+                        .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?;
+                    let child_context =
+                        super::parse_context::child(context, IssueSegment::Index(index))?;
+                    element
+                        .encode_in_ref(item, child_context.as_ref())
+                        .map_err(|issue| super::prepared_issue_at(context, issue, IssueSegment::Index(index)))
+                },
+            )
+        },
+    );
+    let codec = if has_validator {
+        codec.with_context_type_validator(move |values: &super::PreparedJsonArray<A>, context| {
+            if context.is_some_and(|ctx| {
+                values.as_slice().len() > ctx.policy().parse.limits.collection.get()
+            }) || maximum.is_some_and(|limit| values.as_slice().len() > limit.get())
+            {
+                return Err(SchemaIssue::new(SchemaIssueKind::LimitExceeded {
+                    resource: super::SchemaResource::Width,
+                }));
+            }
+            for (index, value) in values.iter().enumerate() {
+                validate
+                    .validate_in_ref(
+                        value,
+                        super::parse_context::child(context, IssueSegment::Index(index))?.as_ref(),
+                    )
+                    .map_err(|issue| super::prepared_issue_at(context, issue, IssueSegment::Index(index)))?;
+            }
+            Ok(())
+        })
+    } else {
+        codec
+    };
+    if has_writer {
+        codec.with_writer(move |values, writer| {
+            if maximum.is_some_and(|limit| values.as_slice().len() > limit.get()) {
+                return Err(SchemaIssue::new(SchemaIssueKind::LimitExceeded {
+                    resource: super::SchemaResource::Width,
+                }));
+            }
+            writer.begin_array()?;
+            for (index, value) in values.iter().enumerate() {
+                write
+                    .write_into(value, writer)
+                    .map_err(|issue| writer.issue_at(issue, IssueSegment::Index(index)))?;
+            }
+            writer.end_array()
+        })
+    } else {
+        codec
+    }
+}
+
+/// A pair over managed JSON, retaining the ordinary tuple witness rules.
+#[must_use]
+pub fn json_prepared_tuple2<A: Send + 'static, B: Send + 'static>(
+    first: PureCodec<A, super::SharedPreparedJsonValue>,
+    second: PureCodec<B, super::SharedPreparedJsonValue>,
+    output: Arc<super::PreparedJsonParserPool>,
+    policy: super::ParsePolicy,
+) -> PureCodec<(A, B), super::SharedPreparedJsonValue> {
+    let ast = SchemaAst::new(SchemaShape::Tuple(vec![
+        first.ast().clone(),
+        second.ast().clone(),
+    ]));
+    let decode_first = first.clone();
+    let decode_second = second.clone();
+    let validation_first = first.clone();
+    let validation_second = second.clone();
+    let write_first = first.clone();
+    let write_second = second.clone();
+    let has_validator = first.has_type_validator() && second.has_type_validator();
+    let has_writer = first.has_writer() && second.has_writer();
+    let codec = PureCodec::with_context_ast(
+        ast,
+        move |encoded: &super::SharedPreparedJsonValue, context| {
+            if encoded.view().kind() != Some(super::PreparedJsonKind::Array) {
+                return Err(prepared_mismatch(ValueKind::Sequence, encoded));
+            }
+            let len = encoded.view().len();
+            if len != 2 {
+                return Err(SchemaIssue::new(SchemaIssueKind::LengthMismatch {
+                    expected: 2,
+                    actual: len,
+                }));
+            }
+            let left_context = super::parse_context::child(context, IssueSegment::Index(0))?;
+            let left = encoded
+                .try_get_index(0)
+                .map_err(|error| {
+                    super::prepared_issue_at(context, SchemaIssue::new(SchemaIssueKind::Memory(error)), IssueSegment::Index(0))
+                })?
+                .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?;
+            let left = decode_first
+                .decode_in_ref(&left, left_context.as_ref())
+                .map_err(|issue| super::prepared_issue_at(context, issue, IssueSegment::Index(0)))?;
+            let right_context = super::parse_context::child(context, IssueSegment::Index(1))?;
+            let right = encoded
+                .try_get_index(1)
+                .map_err(|error| {
+                    super::prepared_issue_at(context, SchemaIssue::new(SchemaIssueKind::Memory(error)), IssueSegment::Index(1))
+                })?
+                .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))?;
+            let right = decode_second
+                .decode_in_ref(&right, right_context.as_ref())
+                .map_err(|issue| super::prepared_issue_at(context, issue, IssueSegment::Index(1)))?;
+            Ok((left, right))
+        },
+        move |(left, right): &(A, B), context| {
+            output.assemble_array(2, super::parse_context::policy(context, policy), |index| {
+                match index {
+                    0 => first
+                        .encode_in_ref(
+                            left,
+                            super::parse_context::child(context, IssueSegment::Index(0))?.as_ref(),
+                        )
+                        .map_err(|issue| super::prepared_issue_at(context, issue, IssueSegment::Index(0))),
+                    1 => second
+                        .encode_in_ref(
+                            right,
+                            super::parse_context::child(context, IssueSegment::Index(1))?.as_ref(),
+                        )
+                        .map_err(|issue| super::prepared_issue_at(context, issue, IssueSegment::Index(1))),
+                    _ => Err(SchemaIssue::new(SchemaIssueKind::InvalidDefinition)),
+                }
+            })
+        },
+    );
+    let codec = if has_validator {
+        codec.with_context_type_validator(move |(first, second): &(A, B), context| {
+            validation_first
+                .validate_in_ref(
+                    first,
+                    super::parse_context::child(context, IssueSegment::Index(0))?.as_ref(),
+                )
+                .map_err(|issue| super::prepared_issue_at(context, issue, IssueSegment::Index(0)))?;
+            validation_second
+                .validate_in_ref(
+                    second,
+                    super::parse_context::child(context, IssueSegment::Index(1))?.as_ref(),
+                )
+                .map_err(|issue| super::prepared_issue_at(context, issue, IssueSegment::Index(1)))
+        })
+    } else {
+        codec
+    };
+    if has_writer {
+        codec.with_writer(move |(first, second), writer| {
+            writer.begin_array()?;
+            write_first
+                .write_into(first, writer)
+                .map_err(|issue| writer.issue_at(issue, IssueSegment::Index(0)))?;
+            write_second
+                .write_into(second, writer)
+                .map_err(|issue| writer.issue_at(issue, IssueSegment::Index(1)))?;
+            writer.end_array()
+        })
+    } else {
+        codec
+    }
+}
+
 /// Constrain JSON strings with the existing prepared StringPattern expression.
 ///
 /// Configured traversal is forwarded through the source string codec. This legacy
@@ -261,11 +864,7 @@ pub fn json_f64() -> PureCodec<f64, JsonValue> {
         }
     });
     if has_writer {
-        codec.with_writer(|value: &f64, writer| {
-            let number = serde_json::Number::from_f64(*value)
-                .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::NonFinite))?;
-            writer.number(&number.to_string())
-        })
+        codec.with_writer(|value: &f64, writer| writer.finite_f64(*value))
     } else {
         codec
     }
@@ -618,6 +1217,103 @@ pub fn json_tuple2<A: Send + 'static, B: Send + 'static>(
 /// validation and direct writing preserve the representation without cloning the
 /// payload or invoking an ordinary element encoder.
 #[must_use]
+pub fn json_prepared_bytes(
+    arrays: Arc<super::PreparedJsonArrayPool<u8>>,
+    output: Arc<super::PreparedJsonParserPool>,
+    policy: super::ParsePolicy,
+    maximum: Option<std::num::NonZeroUsize>,
+) -> PureCodec<super::PreparedJsonArray<u8>, super::SharedPreparedJsonValue> {
+    let ast = SchemaAst::new(SchemaShape::Sequence {
+        element: SchemaAst::new(SchemaShape::IntegerRange {
+            source: SchemaAst::primitive(PrimitiveShape::Integer),
+            minimum: i64::from(u8::MIN),
+            maximum: i64::from(u8::MAX),
+        }),
+        maximum,
+    });
+    PureCodec::with_context_ast(
+        ast,
+        move |encoded: &super::SharedPreparedJsonValue, context| {
+            if encoded.view().kind() != Some(super::PreparedJsonKind::Array) {
+                return Err(prepared_mismatch(ValueKind::Sequence, encoded));
+            }
+            let len = encoded.view().len();
+            check_collection_budget(len, context)?;
+            if maximum.is_some_and(|limit| len > limit.get()) {
+                return Err(SchemaIssue::new(SchemaIssueKind::LimitExceeded {
+                    resource: super::SchemaResource::Width,
+                }));
+            }
+            let mut bytes = arrays
+                .reserve()
+                .map_err(|error| SchemaIssue::new(SchemaIssueKind::Memory(error)))?;
+            if len > bytes.capacity() {
+                return Err(SchemaIssue::new(SchemaIssueKind::Memory(
+                    crate::memory::MemoryError::NoSlot,
+                )));
+            }
+            let mut child = encoded.view().first_child();
+            let mut index = 0usize;
+            while let Some(value) = child {
+                let item = if let Some(token) = value.number_token() {
+                    super::managed_number::ManagedNumber::parse(token)
+                        .and_then(|n| n.as_u64())
+                        .and_then(|n| u8::try_from(n).ok())
+                        .ok_or_else(|| SchemaIssue::new(SchemaIssueKind::OutOfRange))
+                } else {
+                    Err(SchemaIssue::new(SchemaIssueKind::TypeMismatch {
+                        expected: ValueKind::Integer,
+                        actual: prepared_view_kind(value)?,
+                    }))
+                }
+                .map_err(|issue| super::prepared_issue_at(context, issue, IssueSegment::Index(index)))?;
+                bytes.push(item).map_err(|_| {
+                    SchemaIssue::new(SchemaIssueKind::Memory(crate::memory::MemoryError::NoSlot))
+                })?;
+                child = value.next_sibling();
+                index += 1;
+            }
+            Ok(bytes)
+        },
+        move |bytes: &super::PreparedJsonArray<u8>, context| {
+            check_collection_budget(bytes.as_slice().len(), context)?;
+            if maximum.is_some_and(|limit| bytes.as_slice().len() > limit.get()) {
+                return Err(SchemaIssue::new(SchemaIssueKind::LimitExceeded {
+                    resource: super::SchemaResource::Width,
+                }));
+            }
+            output.assemble_bytes(
+                bytes.as_slice(),
+                super::parse_context::policy(context, policy),
+            )
+        },
+    )
+    .with_context_type_validator(move |bytes: &super::PreparedJsonArray<u8>, context| {
+        check_collection_budget(bytes.as_slice().len(), context)?;
+        if maximum.is_some_and(|limit| bytes.as_slice().len() > limit.get()) {
+            Err(SchemaIssue::new(SchemaIssueKind::LimitExceeded {
+                resource: super::SchemaResource::Width,
+            }))
+        } else {
+            Ok(())
+        }
+    })
+    .with_writer(move |bytes: &super::PreparedJsonArray<u8>, writer| {
+        if maximum.is_some_and(|limit| bytes.as_slice().len() > limit.get()) {
+            return Err(SchemaIssue::new(SchemaIssueKind::LimitExceeded {
+                resource: super::SchemaResource::Width,
+            }));
+        }
+        writer.begin_array()?;
+        for byte in bytes.as_slice() {
+            writer.u64(u64::from(*byte))?;
+        }
+        writer.end_array()
+    })
+}
+
+/// Represent ordinary owned bytes as a JSON array of integers in the u8 range.
+#[must_use]
 pub fn json_bytes(maximum: Option<std::num::NonZeroUsize>) -> PureCodec<Vec<u8>, JsonValue> {
     let ast = SchemaAst::new(SchemaShape::Sequence {
         element: SchemaAst::new(SchemaShape::IntegerRange {
@@ -706,6 +1402,37 @@ pub fn json_bytes(maximum: Option<std::num::NonZeroUsize>) -> PureCodec<Vec<u8>,
 /// Encoding and the direct writer reproduce the retained literal; the typed unit
 /// validator is independent of decoding. Equality follows the existing literal
 /// codec's representation comparison.
+pub fn json_prepared_literal(
+    value: Arc<JsonValue>,
+    output: &super::PreparedJsonParserPool,
+    policy: super::ParsePolicy,
+) -> Result<PureCodec<(), super::SharedPreparedJsonValue>, SchemaIssue> {
+    let template = output.copy_native_template(&value, policy)?;
+    let writer = template
+        .try_clone()
+        .map_err(|error| SchemaIssue::new(SchemaIssueKind::Memory(error)))?;
+    let ast = SchemaAst::new(SchemaShape::Literal(Arc::clone(&value)));
+    let codec = PureCodec::with_context_ast(
+        ast,
+        move |input: &super::SharedPreparedJsonValue, _| {
+            if super::managed_literal::equals(input.view(), &value)? {
+                Ok(())
+            } else {
+                Err(SchemaIssue::new(SchemaIssueKind::LiteralMismatch))
+            }
+        },
+        move |_: &(), _| {
+            template
+                .try_clone()
+                .map_err(|error| SchemaIssue::new(SchemaIssueKind::Memory(error)))
+        },
+    );
+    Ok(codec
+        .with_type_validator(|_| Ok(()))
+        .with_writer(move |_, output| writer.view().write_to(output)))
+}
+
+/// Accept one application-supplied ordinary JSON literal and decode it as unit.
 #[must_use]
 pub fn json_literal(value: Arc<JsonValue>) -> PureCodec<(), JsonValue> {
     let ast = SchemaAst::new(SchemaShape::Literal(Arc::clone(&value)));

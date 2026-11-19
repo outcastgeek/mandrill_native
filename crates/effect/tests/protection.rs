@@ -35,7 +35,7 @@ fn ensuring_runs_for_each_started_outcome_and_borrows_non_clone_primary_error() 
         Exit::FinalizationFailed(Finalization {
             primary: PrimaryOutcome::Failed(Error("body")),
             first: CleanupFailure::ReleaseFailure(Error("cleanup")),
-            rest: Vec::new(),
+            rest: effect::CleanupFailures::default(),
         })
     );
     assert_eq!(cleanups.load(Ordering::SeqCst), 1);
@@ -185,7 +185,7 @@ fn nested_cleanup_failures_retain_interruption_and_release_order_without_clone()
         Exit::FinalizationFailed(Finalization {
             primary: PrimaryOutcome::WasInterrupted,
             first: CleanupFailure::ReleaseFailure(Error("inner")),
-            rest: vec![CleanupFailure::ReleaseFailure(Error("outer"))],
+            rest: vec![CleanupFailure::ReleaseFailure(Error("outer"))].into(),
         })
     );
 }
@@ -207,7 +207,7 @@ fn finalizer_panic_is_retained_as_a_release_defect() {
         Exit::FinalizationFailed(Finalization {
             primary: PrimaryOutcome::WasInterrupted,
             first: CleanupFailure::ReleaseDefect(Defect::from_panic(Box::new("cleanup"))),
-            rest: Vec::new(),
+            rest: effect::CleanupFailures::default(),
         })
     );
 }

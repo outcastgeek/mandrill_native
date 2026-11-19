@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 // These field names and tags define the interoperable RPC envelope format.
 // They are protocol vocabulary, not application-configured policies.
-mod wire {
+pub(super) mod wire {
     pub const OPERATION: &str = "operation";
     pub const REVISION: &str = "revision";
     pub const CALL: &str = "call";
@@ -50,13 +50,18 @@ impl RpcCallId {
     /// Type: `Result<Self, RpcCallIdError>`.
     pub fn new(value: impl Into<Arc<str>>) -> Result<Self, RpcCallIdError> {
         let value = value.into();
+        Self::validate(&value)?;
+        Ok(Self(value))
+    }
+
+    pub(super) fn validate(value: &str) -> Result<(), RpcCallIdError> {
         if value.trim().is_empty() {
             return Err(RpcCallIdError::Empty);
         }
         if value.chars().any(|character| character.is_control()) {
             return Err(RpcCallIdError::InvalidCharacter);
         }
-        Ok(Self(value))
+        Ok(())
     }
 
     #[must_use]
@@ -92,7 +97,7 @@ impl RpcEnvelopeKind {
     ///
     /// # Returns
     /// Type: `&'static str`.
-    const fn as_wire(self) -> &'static str {
+    pub(super) const fn as_wire(self) -> &'static str {
         match self {
             Self::Request => wire::REQUEST,
             Self::Success => wire::SUCCESS,
@@ -111,7 +116,7 @@ impl RpcEnvelopeKind {
     /// # Returns
     /// Type: `Option<Self>`.
     /// Returns the value when present, or `None`.
-    fn from_wire(value: &str) -> Option<Self> {
+    pub(super) fn from_wire(value: &str) -> Option<Self> {
         match value {
             wire::REQUEST => Some(Self::Request),
             wire::SUCCESS => Some(Self::Success),
@@ -337,7 +342,7 @@ impl RpcEnvelope {
 ///
 /// # Returns
 /// Type: `Result<(), RpcWireError>`.
-fn validate_sequence(
+pub(super) fn validate_sequence(
     kind: RpcEnvelopeKind,
     sequence: Option<NonZeroU64>,
 ) -> Result<(), RpcWireError> {
@@ -385,6 +390,8 @@ impl RpcEnvelopeDecoder {
     ///
     /// # Returns
     /// Type: `Result<Vec<RpcEnvelope>, RpcWireFailure>`.
+    // SchemaIssue retains prepared child storage; boxing the error would allocate.
+    #[allow(clippy::result_large_err)]
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<RpcEnvelope>, RpcWireFailure> {
         if self.poisoned {
             return Err(RpcWireFailure {

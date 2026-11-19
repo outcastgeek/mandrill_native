@@ -7,25 +7,28 @@ use serde::Serialize;
 use std::io::{self, Write};
 use std::sync::Arc;
 
-enum Container {
+const JSON_SYNTAX_AT_BYTE: &str = "invalid JSON at byte ";
+
+enum Container<A, O, K> {
     Array {
-        values: Vec<JsonValue>,
+        values: A,
         need_value: bool,
         may_end: bool,
     },
     Object {
-        fields: serde_json::Map<String, JsonValue>,
-        key: Option<String>,
+        fields: O,
+        key: Option<K>,
         need_key: bool,
         may_end: bool,
         count: usize,
     },
 }
-struct Tokens<'a> {
+struct Tokens<'a, 'b> {
     text: &'a str,
     offset: usize,
+    mode: PathMode<'b>,
 }
-impl Tokens<'_> {
+impl<'a> Tokens<'a, '_> {
     fn whitespace(&mut self) {
         while self
             .text
@@ -41,23 +44,30 @@ impl Tokens<'_> {
         self.text.as_bytes().get(self.offset).copied()
     }
     fn syntax(&self) -> SchemaIssue {
-        SchemaIssue::new(SchemaIssueKind::JsonSyntax {
-            detail: Arc::from(format!("invalid JSON at byte {}", self.offset)),
-        })
+        match self.mode {
+            PathMode::Ordinary => SchemaIssue::new(SchemaIssueKind::JsonSyntax {
+                detail: Arc::from(format!("{JSON_SYNTAX_AT_BYTE}{}", self.offset)),
+            }),
+            PathMode::Prepared(memory) => match super::super::schema_issue::format_diagnostic_text(
+                memory,
+                format_args!("{JSON_SYNTAX_AT_BYTE}{}", self.offset),
+            ) {
+                Ok(detail) => SchemaIssue::new(SchemaIssueKind::PreparedJsonSyntax { detail }),
+                Err(issue) => issue,
+            },
+        }
     }
-    fn string(&mut self) -> Result<String, SchemaIssue> {
+    fn string_token(&mut self) -> Result<&'a str, SchemaIssue> {
         let start = self.offset;
         self.offset += 1;
         let mut escaped = false;
         while let Some(byte) = self.text.as_bytes().get(self.offset).copied() {
             self.offset += 1;
             if !escaped && byte == b'"' {
-                return serde_json::from_str(
-                    self.text
-                        .get(start..self.offset)
-                        .ok_or_else(|| self.syntax())?,
-                )
-                .map_err(|_| self.syntax());
+                return self
+                    .text
+                    .get(start..self.offset)
+                    .ok_or_else(|| self.syntax());
             }
             if escaped {
                 escaped = false;
@@ -67,9 +77,17 @@ impl Tokens<'_> {
         }
         Err(self.syntax())
     }
-    fn scalar(&mut self) -> Result<JsonValue, SchemaIssue> {
+    fn string<B: Backend>(&mut self, backend: &mut B) -> Result<B::Key, SchemaIssue> {
+        let token = self.string_token()?;
+        backend.string(token).map_err(|error| match error {
+            StringDecodeError::Syntax => self.syntax(),
+            StringDecodeError::Sink(issue) => issue,
+        })
+    }
+    fn scalar<B: Backend>(&mut self, backend: &mut B) -> Result<B::Value, SchemaIssue> {
         if self.byte() == Some(b'"') {
-            return self.string().map(JsonValue::String);
+            let value = self.string(backend)?;
+            return backend.string_value(value);
         }
         let start = self.offset;
         while self
@@ -84,6 +102,167 @@ impl Tokens<'_> {
             .text
             .get(start..self.offset)
             .ok_or_else(|| self.syntax())?;
+        backend
+            .scalar(token)
+            .map_err(|error| error.unwrap_or_else(|| self.syntax()))
+    }
+}
+
+enum StringDecodeError {
+    Syntax,
+    Sink(SchemaIssue),
+}
+// Both ordinary and prepared backends use this decoder after the same complete
+// token scan, so syntax errors keep the scanner's end-of-token offset.
+fn decode_quoted(
+    token: &str,
+    mut emit: impl FnMut(&str) -> Result<(), SchemaIssue>,
+) -> Result<(), StringDecodeError> {
+    fn hex(chars: &mut std::str::Chars<'_>) -> Result<u16, StringDecodeError> {
+        let mut value = 0u16;
+        for _ in 0..4 {
+            let digit = match chars.next() {
+                Some(c @ '0'..='9') => u32::from(c) - u32::from('0'),
+                Some(c @ 'a'..='f') => u32::from(c) - u32::from('a') + 10,
+                Some(c @ 'A'..='F') => u32::from(c) - u32::from('A') + 10,
+                _ => return Err(StringDecodeError::Syntax),
+            };
+            let digit = u16::try_from(digit).map_err(|_| StringDecodeError::Syntax)?;
+            value = (value << 4) | digit;
+        }
+        Ok(value)
+    }
+    let inner = token
+        .get(1..token.len().saturating_sub(1))
+        .ok_or(StringDecodeError::Syntax)?;
+    let mut chars = inner.chars();
+    while let Some(character) = chars.next() {
+        let decoded = match character {
+            '\\' => match chars.next() {
+                Some('"') => '"',
+                Some('\\') => '\\',
+                Some('/') => '/',
+                Some('b') => '\u{0008}',
+                Some('f') => '\u{000c}',
+                Some('n') => '\n',
+                Some('r') => '\r',
+                Some('t') => '\t',
+                Some('u') => {
+                    let first = hex(&mut chars)?;
+                    let code = if (0xd800..=0xdbff).contains(&first) {
+                        if chars.next() != Some('\\') || chars.next() != Some('u') {
+                            return Err(StringDecodeError::Syntax);
+                        }
+                        let second = hex(&mut chars)?;
+                        if !(0xdc00..=0xdfff).contains(&second) {
+                            return Err(StringDecodeError::Syntax);
+                        }
+                        0x10000 + ((u32::from(first) - 0xd800) << 10) + (u32::from(second) - 0xdc00)
+                    } else {
+                        u32::from(first)
+                    };
+                    char::from_u32(code).ok_or(StringDecodeError::Syntax)?
+                }
+                _ => return Err(StringDecodeError::Syntax),
+            },
+            value if value <= '\u{001f}' => return Err(StringDecodeError::Syntax),
+            value => value,
+        };
+        let mut bytes = [0u8; 4];
+        emit(decoded.encode_utf8(&mut bytes)).map_err(StringDecodeError::Sink)?;
+    }
+    Ok(())
+}
+trait ParseStack<T> {
+    fn push(&mut self, value: T) -> Result<(), SchemaIssue>;
+    fn pop(&mut self) -> Option<T>;
+    fn last_mut(&mut self) -> Option<&mut T>;
+    fn len(&self) -> usize;
+    fn as_slice(&self) -> &[T];
+}
+impl<T> ParseStack<T> for Vec<T> {
+    fn push(&mut self, value: T) -> Result<(), SchemaIssue> {
+        Vec::push(self, value);
+        Ok(())
+    }
+    fn pop(&mut self) -> Option<T> {
+        Vec::pop(self)
+    }
+    fn last_mut(&mut self) -> Option<&mut T> {
+        self.as_mut_slice().last_mut()
+    }
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+    fn as_slice(&self) -> &[T] {
+        Vec::as_slice(self)
+    }
+}
+impl<T> ParseStack<T> for &mut crate::memory::FixedVector<'static, T> {
+    fn push(&mut self, value: T) -> Result<(), SchemaIssue> {
+        crate::memory::FixedVector::push(self, value).map_err(|_| {
+            SchemaIssue::new(SchemaIssueKind::Memory(crate::memory::MemoryError::NoSlot))
+        })
+    }
+    fn pop(&mut self) -> Option<T> {
+        crate::memory::FixedVector::pop(self)
+    }
+    fn last_mut(&mut self) -> Option<&mut T> {
+        self.as_mut_slice().last_mut()
+    }
+    fn len(&self) -> usize {
+        crate::memory::FixedVector::len(self)
+    }
+    fn as_slice(&self) -> &[T] {
+        crate::memory::FixedVector::as_slice(self)
+    }
+}
+trait Backend {
+    type Value;
+    type Key;
+    type Array;
+    type Object;
+    fn string(&mut self, token: &str) -> Result<Self::Key, StringDecodeError>;
+    fn string_value(&mut self, value: Self::Key) -> Result<Self::Value, SchemaIssue>;
+    fn scalar(&mut self, token: &str) -> Result<Self::Value, Option<SchemaIssue>>;
+    fn array(&mut self) -> Result<Self::Array, SchemaIssue>;
+    fn object(&mut self) -> Result<Self::Object, SchemaIssue>;
+    fn array_len(&self, array: &Self::Array) -> Result<usize, SchemaIssue>;
+    fn array_push(
+        &mut self,
+        array: &mut Self::Array,
+        value: Self::Value,
+    ) -> Result<(), SchemaIssue>;
+    fn object_insert(
+        &mut self,
+        object: &mut Self::Object,
+        key: Self::Key,
+        value: Self::Value,
+        policy: DuplicateFields,
+        mode: PathMode<'_>,
+    ) -> Result<(), SchemaIssue>;
+    fn array_value(&mut self, array: Self::Array) -> Result<Self::Value, SchemaIssue>;
+    fn object_value(&mut self, object: Self::Object) -> Result<Self::Value, SchemaIssue>;
+    fn key_text<'a>(&'a self, key: &'a Self::Key) -> Result<&'a str, SchemaIssue>;
+}
+struct Ordinary;
+impl Backend for Ordinary {
+    type Value = JsonValue;
+    type Key = String;
+    type Array = Vec<JsonValue>;
+    type Object = serde_json::Map<String, JsonValue>;
+    fn string(&mut self, token: &str) -> Result<String, StringDecodeError> {
+        let mut output = String::new();
+        decode_quoted(token, |text| {
+            output.push_str(text);
+            Ok(())
+        })?;
+        Ok(output)
+    }
+    fn string_value(&mut self, value: String) -> Result<JsonValue, SchemaIssue> {
+        Ok(JsonValue::String(value))
+    }
+    fn scalar(&mut self, token: &str) -> Result<JsonValue, Option<SchemaIssue>> {
         match token {
             "null" => Ok(JsonValue::Null),
             "true" => Ok(JsonValue::Bool(true)),
@@ -91,30 +270,141 @@ impl Tokens<'_> {
             _ => token
                 .parse::<serde_json::Number>()
                 .map(JsonValue::Number)
-                .map_err(|_| self.syntax()),
+                .map_err(|_| None),
+        }
+    }
+    fn array(&mut self) -> Result<Self::Array, SchemaIssue> {
+        Ok(Vec::new())
+    }
+    fn object(&mut self) -> Result<Self::Object, SchemaIssue> {
+        Ok(serde_json::Map::new())
+    }
+    fn array_len(&self, array: &Self::Array) -> Result<usize, SchemaIssue> {
+        Ok(array.len())
+    }
+    fn array_push(&mut self, array: &mut Self::Array, value: JsonValue) -> Result<(), SchemaIssue> {
+        array.push(value);
+        Ok(())
+    }
+    fn object_insert(
+        &mut self,
+        object: &mut Self::Object,
+        key: String,
+        value: JsonValue,
+        policy: DuplicateFields,
+        _mode: PathMode<'_>,
+    ) -> Result<(), SchemaIssue> {
+        let duplicate = object.contains_key(&key);
+        if duplicate && policy == DuplicateFields::Reject {
+            return Err(SchemaIssue::new(SchemaIssueKind::DuplicateField(
+                key.into(),
+            )));
+        }
+        if !duplicate || policy == DuplicateFields::KeepLast {
+            object.insert(key, value);
+        }
+        Ok(())
+    }
+    fn array_value(&mut self, array: Self::Array) -> Result<JsonValue, SchemaIssue> {
+        Ok(JsonValue::Array(array))
+    }
+    fn object_value(&mut self, object: Self::Object) -> Result<JsonValue, SchemaIssue> {
+        Ok(JsonValue::Object(object))
+    }
+    fn key_text<'a>(&'a self, key: &'a String) -> Result<&'a str, SchemaIssue> {
+        Ok(key)
+    }
+}
+pub(crate) fn parse_json(text: &str, policy: ParsePolicy) -> Result<JsonValue, SchemaIssue> {
+    let value = parse_machine(text, policy, &mut Ordinary, Vec::new(), PathMode::Ordinary)?;
+    check_limits(&value, &policy.limits)?;
+    Ok(value)
+}
+#[derive(Clone, Copy)]
+enum PathMode<'a> {
+    Ordinary,
+    Prepared(Option<&'a super::super::PreparedIssueMemory>),
+}
+impl PathMode<'_> {
+    fn field(self, name: &str) -> Result<super::super::IssueSegment, SchemaIssue> {
+        match self {
+            Self::Ordinary => Ok(super::super::IssueSegment::Field(name.into())),
+            Self::Prepared(memory) => {
+                super::super::schema_issue::format_diagnostic_text(memory, format_args!("{name}"))
+                    .map(super::super::IssueSegment::PreparedField)
+            }
         }
     }
 }
-fn locate(issue: SchemaIssue, stack: &[Container]) -> SchemaIssue {
-    stack
-        .iter()
-        .rev()
-        .fold(issue, |issue, container| match container {
-            Container::Array { values, .. } => {
-                issue.at(super::super::IssueSegment::Index(values.len()))
-            }
+fn locate<B: Backend>(
+    mut issue: SchemaIssue,
+    stack: &[Container<B::Array, B::Object, B::Key>],
+    backend: &B,
+    mode: PathMode<'_>,
+) -> SchemaIssue {
+    for container in stack.iter().rev() {
+        let segment = match container {
+            Container::Array { values, .. } => match backend.array_len(values) {
+                Ok(len) => Some(super::super::IssueSegment::Index(len)),
+                Err(error) => {
+                    issue = error;
+                    continue;
+                }
+            },
             Container::Object {
                 key: Some(name), ..
-            } => issue.at(super::super::IssueSegment::Field(name.as_str().into())),
-            Container::Object { key: None, .. } => issue,
-        })
+            } => match backend.key_text(name) {
+                Ok(name) => match mode.field(name) {
+                    Ok(segment) => Some(segment),
+                    Err(error) => {
+                        return if super::super::prepared_json_validation::physical_cause(&issue)
+                            .is_some()
+                        {
+                            issue
+                        } else {
+                            error
+                        };
+                    }
+                },
+                Err(error) => {
+                    issue = error;
+                    continue;
+                }
+            },
+            Container::Object { key: None, .. } => None,
+        };
+        if let Some(segment) = segment {
+            match mode {
+                PathMode::Ordinary => issue = issue.at(segment),
+                PathMode::Prepared(memory) => {
+                    let (next, refused) = super::super::parse_context::selected_issue_at_control(
+                        memory, issue, segment,
+                    );
+                    issue = next;
+                    if refused {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    issue
 }
-pub(crate) fn parse_json(text: &str, policy: ParsePolicy) -> Result<JsonValue, SchemaIssue> {
+fn parse_machine<B: Backend, S: ParseStack<Container<B::Array, B::Object, B::Key>>>(
+    text: &str,
+    policy: ParsePolicy,
+    backend: &mut B,
+    mut stack: S,
+    mode: PathMode<'_>,
+) -> Result<B::Value, SchemaIssue> {
     if text.len() > policy.limits.bytes.get() {
         return Err(exceeded(SchemaResource::Bytes));
     }
-    let mut tokens = Tokens { text, offset: 0 };
-    let mut stack: Vec<Container> = Vec::new();
+    let mut tokens = Tokens {
+        text,
+        offset: 0,
+        mode,
+    };
     let mut nodes = 0usize;
     let mut completed = None;
     loop {
@@ -128,10 +418,10 @@ pub(crate) fn parse_json(text: &str, policy: ParsePolicy) -> Result<JsonValue, S
                     if !*need_value {
                         return Err(tokens.syntax());
                     }
-                    if values.len() == policy.limits.collection.get() {
+                    if backend.array_len(values)? == policy.limits.collection.get() {
                         return Err(exceeded(SchemaResource::Width));
                     }
-                    values.push(value);
+                    backend.array_push(values, value)?;
                     *need_value = false;
                     *may_end = true;
                 }
@@ -149,15 +439,7 @@ pub(crate) fn parse_json(text: &str, policy: ParsePolicy) -> Result<JsonValue, S
                     if *count > policy.limits.collection.get() {
                         return Err(exceeded(SchemaResource::Width));
                     }
-                    let duplicate = fields.contains_key(&name);
-                    if duplicate && policy.duplicate_fields == DuplicateFields::Reject {
-                        return Err(SchemaIssue::new(SchemaIssueKind::DuplicateField(
-                            name.into(),
-                        )));
-                    }
-                    if !duplicate || policy.duplicate_fields == DuplicateFields::KeepLast {
-                        fields.insert(name, value);
-                    }
+                    backend.object_insert(fields, name, value, policy.duplicate_fields, mode)?;
                     *need_key = false;
                     *may_end = true;
                 }
@@ -165,7 +447,6 @@ pub(crate) fn parse_json(text: &str, policy: ParsePolicy) -> Result<JsonValue, S
                     if tokens.byte().is_some() {
                         return Err(tokens.syntax());
                     }
-                    check_limits(&value, &policy.limits)?;
                     return Ok(value);
                 }
             }
@@ -178,7 +459,7 @@ pub(crate) fn parse_json(text: &str, policy: ParsePolicy) -> Result<JsonValue, S
                 if byte == b']' {
                     tokens.offset += 1;
                     if let Some(Container::Array { values, .. }) = stack.pop() {
-                        completed = Some(JsonValue::Array(values));
+                        completed = Some(backend.array_value(values)?);
                     }
                     continue;
                 }
@@ -204,7 +485,7 @@ pub(crate) fn parse_json(text: &str, policy: ParsePolicy) -> Result<JsonValue, S
             }) if byte == b']' => {
                 tokens.offset += 1;
                 if let Some(Container::Array { values, .. }) = stack.pop() {
-                    completed = Some(JsonValue::Array(values));
+                    completed = Some(backend.array_value(values)?);
                 }
                 continue;
             }
@@ -216,7 +497,7 @@ pub(crate) fn parse_json(text: &str, policy: ParsePolicy) -> Result<JsonValue, S
                 if byte == b'}' {
                     tokens.offset += 1;
                     if let Some(Container::Object { fields, .. }) = stack.pop() {
-                        completed = Some(JsonValue::Object(fields));
+                        completed = Some(backend.object_value(fields)?);
                     }
                     continue;
                 }
@@ -241,7 +522,7 @@ pub(crate) fn parse_json(text: &str, policy: ParsePolicy) -> Result<JsonValue, S
             }) if byte == b'}' => {
                 tokens.offset += 1;
                 if let Some(Container::Object { fields, .. }) = stack.pop() {
-                    completed = Some(JsonValue::Object(fields));
+                    completed = Some(backend.object_value(fields)?);
                 }
                 continue;
             }
@@ -253,7 +534,7 @@ pub(crate) fn parse_json(text: &str, policy: ParsePolicy) -> Result<JsonValue, S
                 if byte != b'"' {
                     return Err(tokens.syntax());
                 }
-                let name = tokens.string()?;
+                let name = tokens.string(backend)?;
                 if tokens.byte() != Some(b':') {
                     return Err(tokens.syntax());
                 }
@@ -270,34 +551,46 @@ pub(crate) fn parse_json(text: &str, policy: ParsePolicy) -> Result<JsonValue, S
             .checked_add(1)
             .ok_or_else(|| exceeded(SchemaResource::Depth))?;
         if depth > policy.limits.depth.get() {
-            return Err(locate(exceeded(SchemaResource::Depth), &stack));
+            return Err(locate(
+                exceeded(SchemaResource::Depth),
+                stack.as_slice(),
+                backend,
+                mode,
+            ));
         }
         nodes = nodes
             .checked_add(1)
             .ok_or_else(|| exceeded(SchemaResource::Steps))?;
         if nodes > policy.limits.nodes.get() {
-            return Err(locate(exceeded(SchemaResource::Steps), &stack));
+            return Err(locate(
+                exceeded(SchemaResource::Steps),
+                stack.as_slice(),
+                backend,
+                mode,
+            ));
         }
         match byte {
             b'[' => {
                 tokens.offset += 1;
+                let values = backend.array()?;
                 stack.push(Container::Array {
-                    values: Vec::new(),
+                    values,
                     need_value: true,
                     may_end: true,
-                });
+                })?;
             }
             b'{' => {
                 tokens.offset += 1;
+                let fields = backend.object()?;
                 stack.push(Container::Object {
-                    fields: serde_json::Map::new(),
+                    fields,
                     key: None,
                     need_key: true,
                     may_end: true,
                     count: 0,
-                });
+                })?;
             }
-            _ => completed = Some(tokens.scalar()?),
+            _ => completed = Some(tokens.scalar(backend)?),
         }
     }
 }
@@ -468,3 +761,11 @@ pub(crate) fn encode_json_bytes(
         })?;
     Ok(bytes)
 }
+
+mod prepared;
+pub use prepared::PreparedObjectAssembly;
+pub(crate) use prepared::{AssemblyKind, PreparedArrayAssembly, PreparedDocumentAssembly, PreparedJsonParseReservation, PreparedWriteStageError};
+pub use prepared::{
+    PreparedJsonDocument, PreparedJsonKind, PreparedJsonParserCapacity, PreparedJsonParserDemand,
+    PreparedJsonParserPool, PreparedJsonValue, SharedPreparedJsonValue,
+};

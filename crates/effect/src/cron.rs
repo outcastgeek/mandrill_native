@@ -1,6 +1,8 @@
 //! Pure recurring-calendar evaluation and occurrence policies.
 
 use crate::UtcMillis;
+use crate::memory::MemoryError;
+use crate::stream::{PreparedChunkPool, PreparedChunkValues};
 use chrono::{
     DateTime, Datelike, FixedOffset, LocalResult, NaiveDate, NaiveDateTime, TimeDelta, TimeZone,
     Timelike, Utc,
@@ -581,15 +583,29 @@ impl Cron {
     /// # Returns
     /// Type: `Result<Self, CronParseError>`.
     pub fn parse(expression: &str, day_match: DayMatch) -> Result<Self, CronParseError> {
-        let fields: Vec<_> = expression.split_whitespace().collect();
-        let (seconds, [minute, hour, day, month, weekday]) = match fields.as_slice() {
-            [minute, hour, day, month, weekday] => (
-                FieldSet::single(0),
-                [*minute, *hour, *day, *month, *weekday],
-            ),
-            [second, minute, hour, day, month, weekday] => (
+        let mut fields = expression.split_whitespace();
+        let fields: [_; 7] = std::array::from_fn(|_| fields.next());
+        let (seconds, [minute, hour, day, month, weekday]) = match fields {
+            [
+                Some(minute),
+                Some(hour),
+                Some(day),
+                Some(month),
+                Some(weekday),
+                None,
+                None,
+            ] => (FieldSet::single(0), [minute, hour, day, month, weekday]),
+            [
+                Some(second),
+                Some(minute),
+                Some(hour),
+                Some(day),
+                Some(month),
+                Some(weekday),
+                None,
+            ] => (
                 FieldSet::parse(second, CronFieldKind::Second, 0, MAX_SECOND)?,
-                [*minute, *hour, *day, *month, *weekday],
+                [minute, hour, day, month, weekday],
             ),
             _ => {
                 return Err(CronParseError {
@@ -659,11 +675,54 @@ impl Cron {
         transitions: CalendarTransitionPolicy,
         budget: CronSearchBudget,
     ) -> Result<Vec<CalendarOccurrence>, CronEvalError<Zone::Error>> {
+        let mut occurrences = Vec::new();
+        self.scan_occurrences(after, through, zone, transitions, budget, |occurrence| {
+            occurrences.push(occurrence);
+            Ok::<_, CronEvalError<Zone::Error>>(())
+        })?;
+        sort_occurrences(&mut occurrences)?;
+        Ok(occurrences)
+    }
+
+    /// Resolve the same UTC-ordered occurrences directly into one regional page.
+    /// The page is reserved before consulting the zone provider and remains
+    /// checked out while the caller owns it. Exhaustion returns no partial page.
+    pub fn occurrences_between_prepared<Zone: CalendarZone>(
+        &self,
+        after: UtcMillis,
+        through: UtcMillis,
+        zone: &Zone,
+        transitions: CalendarTransitionPolicy,
+        budget: CronSearchBudget,
+        output: &PreparedChunkPool<CalendarOccurrence>,
+    ) -> Result<PreparedChunkValues<CalendarOccurrence>, PreparedCronError<Zone::Error>> {
         if after > through {
-            return Err(CronEvalError::ReversedWindow);
+            return Err(CronEvalError::ReversedWindow.into());
+        }
+        let mut occurrences = output.try_checkout().map_err(PreparedCronError::Memory)?;
+        self.scan_occurrences(after, through, zone, transitions, budget, |occurrence| {
+            occurrences
+                .try_push(occurrence)
+                .map_err(|_| PreparedCronError::Memory(MemoryError::CollectionReservationFailed))
+        })?;
+        sort_occurrences(occurrences.as_mut_slice())?;
+        Ok(occurrences)
+    }
+
+    fn scan_occurrences<Zone: CalendarZone, Error: From<CronEvalError<Zone::Error>>>(
+        &self,
+        after: UtcMillis,
+        through: UtcMillis,
+        zone: &Zone,
+        transitions: CalendarTransitionPolicy,
+        budget: CronSearchBudget,
+        mut emit: impl FnMut(CalendarOccurrence) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if after > through {
+            return Err(CronEvalError::ReversedWindow.into());
         }
         if after == through {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let lower = DateTime::<Utc>::from_timestamp_millis(after.value())
             .and_then(|instant| {
@@ -683,13 +742,12 @@ impl Cron {
         let last_date = upper.date();
         let mut days = 0_usize;
         let mut candidates = 0_usize;
-        let mut occurrences = Vec::new();
         loop {
             days = days
                 .checked_add(1)
                 .ok_or(CronEvalError::BudgetExceeded(CronBudgetKind::Days))?;
             if days > budget.days.get() {
-                return Err(CronEvalError::BudgetExceeded(CronBudgetKind::Days));
+                return Err(CronEvalError::BudgetExceeded(CronBudgetKind::Days).into());
             }
             if self.matches_date(date) {
                 for hour in 0..=MAX_HOUR {
@@ -716,11 +774,12 @@ impl Cron {
                             if candidates > budget.candidates.get() {
                                 return Err(CronEvalError::BudgetExceeded(
                                     CronBudgetKind::Candidates,
-                                ));
+                                )
+                                .into());
                             }
                             let civil = CivilDateTime::from_naive(local);
                             collect_resolution(
-                                &mut occurrences,
+                                &mut emit,
                                 local,
                                 zone.resolve(civil).map_err(CronEvalError::Zone)?,
                                 after,
@@ -736,14 +795,7 @@ impl Cron {
             }
             date = date.succ_opt().ok_or(CronEvalError::TimeOutOfRange)?;
         }
-        occurrences.sort_unstable_by_key(|occurrence| occurrence.instant);
-        if occurrences.windows(2).any(|pair| match pair {
-            [first, second] => first.instant == second.instant,
-            _ => false,
-        }) {
-            return Err(CronEvalError::InvalidZoneResolution);
-        }
-        Ok(occurrences)
+        Ok(())
     }
 
     /// Select the explicit missed-run policy after a completed occurrence.
@@ -783,6 +835,76 @@ impl Cron {
             MissedOccurrencePolicy::All => Ok(due),
         }
     }
+
+    /// Select missed occurrences from the same prepared page used for duplicate
+    /// resolution checks and ordering. The page must fit the complete search
+    /// result even when the selected policy returns only its latest occurrence.
+    pub fn due_prepared<Zone: CalendarZone>(
+        &self,
+        window: std::ops::RangeInclusive<UtcMillis>,
+        zone: &Zone,
+        transitions: CalendarTransitionPolicy,
+        missed: MissedOccurrencePolicy,
+        budget: CronSearchBudget,
+        output: &PreparedChunkPool<CalendarOccurrence>,
+    ) -> Result<PreparedChunkValues<CalendarOccurrence>, PreparedCronError<Zone::Error>> {
+        let (after, now) = window.into_inner();
+        let mut due =
+            self.occurrences_between_prepared(after, now, zone, transitions, budget, output)?;
+        match missed {
+            MissedOccurrencePolicy::Skip | MissedOccurrencePolicy::Latest => {
+                let latest =
+                    due.as_slice().last().copied().filter(|last| {
+                        missed == MissedOccurrencePolicy::Latest || last.instant == now
+                    });
+                drop(due.take_items());
+                if let Some(latest) = latest {
+                    due.push_reserved(latest);
+                }
+            }
+            MissedOccurrencePolicy::All => {}
+        }
+        Ok(due)
+    }
+}
+
+/// Failure of the prepared occurrence search or its selected storage.
+#[derive(Debug)]
+pub enum PreparedCronError<ZoneError> {
+    /// Existing calendar validation or provider failure.
+    Calendar(CronEvalError<ZoneError>),
+    /// The caller-selected regional page could not hold the search result.
+    Memory(MemoryError),
+}
+
+impl<ZoneError> From<CronEvalError<ZoneError>> for PreparedCronError<ZoneError> {
+    fn from(error: CronEvalError<ZoneError>) -> Self {
+        Self::Calendar(error)
+    }
+}
+
+impl<ZoneError> std::fmt::Display for PreparedCronError<ZoneError> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Calendar(error) => error.fmt(formatter),
+            Self::Memory(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl<ZoneError: std::fmt::Debug> std::error::Error for PreparedCronError<ZoneError> {}
+
+fn sort_occurrences<ZoneError>(
+    occurrences: &mut [CalendarOccurrence],
+) -> Result<(), CronEvalError<ZoneError>> {
+    occurrences.sort_unstable_by_key(|occurrence| occurrence.instant);
+    if occurrences.windows(2).any(|pair| match pair {
+        [first, second] => first.instant == second.instant,
+        _ => false,
+    }) {
+        return Err(CronEvalError::InvalidZoneResolution);
+    }
+    Ok(())
 }
 
 ///
@@ -827,7 +949,7 @@ fn validate_resolution<ZoneError>(
 /// - `ZoneError`: Error returned by the calendar-zone provider.
 ///
 /// # Parameters
-/// - `occurrences` (`&mut Vec<CalendarOccurrence>`): The occurrences supplied to this operation.
+/// - `emit`: Destination for occurrences that fall in the requested window.
 /// - `local` (`NaiveDateTime`): Local civil-time representation to resolve.
 /// - `resolution` (`LocalResolution`): The resolution supplied to this operation.
 /// - `after` (`UtcMillis`): Cursor or instant after which results are selected.
@@ -835,20 +957,20 @@ fn validate_resolution<ZoneError>(
 /// - `transitions` (`CalendarTransitionPolicy`): The transitions supplied to this operation.
 ///
 /// # Returns
-/// Type: `Result<(), CronEvalError<ZoneError>>`.
-fn collect_resolution<ZoneError>(
-    occurrences: &mut Vec<CalendarOccurrence>,
+/// Type: `Result<(), Error>`.
+fn collect_resolution<ZoneError, Error: From<CronEvalError<ZoneError>>>(
+    emit: &mut impl FnMut(CalendarOccurrence) -> Result<(), Error>,
     local: NaiveDateTime,
     resolution: LocalResolution,
     after: UtcMillis,
     through: UtcMillis,
     transitions: CalendarTransitionPolicy,
-) -> Result<(), CronEvalError<ZoneError>> {
+) -> Result<(), Error> {
     let civil = CivilDateTime::from_naive(local);
     let selected = match resolution {
         LocalResolution::Gap => {
             return if transitions.gap == GapPolicy::Reject {
-                Err(CronEvalError::Gap(civil))
+                Err(CronEvalError::Gap(civil).into())
             } else {
                 Ok(())
             };
@@ -859,7 +981,7 @@ fn collect_resolution<ZoneError>(
         }
         LocalResolution::Overlap { earlier, later } => {
             if earlier >= later {
-                return Err(CronEvalError::InvalidZoneResolution);
+                return Err(CronEvalError::InvalidZoneResolution.into());
             }
             validate_resolution(local, earlier)?;
             validate_resolution(local, later)?;
@@ -873,7 +995,7 @@ fn collect_resolution<ZoneError>(
                 OverlapPolicy::Reject => {
                     return if in_window(earlier, after, through) || in_window(later, after, through)
                     {
-                        Err(CronEvalError::Overlap(civil))
+                        Err(CronEvalError::Overlap(civil).into())
                     } else {
                         Ok(())
                     };
@@ -882,35 +1004,13 @@ fn collect_resolution<ZoneError>(
         }
     };
     for (instant, phase) in selected.into_iter().flatten() {
-        push_occurrence(occurrences, after, through, instant, civil, phase);
+        if in_window(instant, after, through) {
+            emit(CalendarOccurrence {
+                instant,
+                local: civil,
+                phase,
+            })?;
+        }
     }
     Ok(())
-}
-
-///
-/// # Parameters
-/// - `occurrences` (`&mut Vec<CalendarOccurrence>`): The occurrences supplied to this operation.
-/// - `after` (`UtcMillis`): Cursor or instant after which results are selected.
-/// - `through` (`UtcMillis`): Last cursor or sequence included in this bounded operation.
-/// - `instant` (`UtcMillis`): The instant supplied to this operation.
-/// - `local` (`CivilDateTime`): Local civil-time representation to resolve.
-/// - `phase` (`OccurrencePhase`): The phase supplied to this operation.
-///
-/// # Returns
-/// Type: `()`.
-fn push_occurrence(
-    occurrences: &mut Vec<CalendarOccurrence>,
-    after: UtcMillis,
-    through: UtcMillis,
-    instant: UtcMillis,
-    local: CivilDateTime,
-    phase: OccurrencePhase,
-) {
-    if in_window(instant, after, through) {
-        occurrences.push(CalendarOccurrence {
-            instant,
-            local,
-            phase,
-        });
-    }
 }
