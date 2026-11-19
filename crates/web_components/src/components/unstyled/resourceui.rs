@@ -724,7 +724,7 @@ macro_rules! resource_element {
     ($tag:ident, $props:expr, $children:expr) => {{
         let props = $props;
         let attrs = props.build_attributes();
-        html! {
+        crate::html! {
             $tag
                 class=(props.build_classes())
                 ..(&attrs)
@@ -796,7 +796,7 @@ pub fn FilterChip(props: &FilterChipProps) -> Markup {
         resource_element!(span, props, contents)
     } else {
         let attrs = props.build_attributes();
-        html! {
+        crate::html! {
             a href=(&props.href) class=(props.build_classes())
                 ..(&attrs)
             { (contents) }

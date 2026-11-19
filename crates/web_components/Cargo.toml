@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 chrono = { workspace = true, default-features = false, features = ["clock", "std"] }
 maud = { workspace = true, features = ["axum"] }
+web_components_macros = { path = "../web_components_macros" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 

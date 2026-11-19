@@ -275,7 +275,7 @@ pub fn Button(props: &ButtonProps, children: Markup) -> Markup {
     let aria_disabled = disabled_or_loading.then_some("true");
 
     match props.as_element {
-        shared::ELEMENT_A => html! {
+        shared::ELEMENT_A => crate::html! {
             a
                 href=(props.href)
                 class=(classes)
@@ -285,7 +285,7 @@ pub fn Button(props: &ButtonProps, children: Markup) -> Markup {
                 (render_children(props, children))
             }
         },
-        shared::ELEMENT_SPAN => html! {
+        shared::ELEMENT_SPAN => crate::html! {
             span
                 class=(classes)
                 aria-disabled=[aria_disabled]
@@ -294,7 +294,7 @@ pub fn Button(props: &ButtonProps, children: Markup) -> Markup {
                 (render_children(props, children))
             }
         },
-        shared::ELEMENT_DIV => html! {
+        shared::ELEMENT_DIV => crate::html! {
             div
                 class=(classes)
                 role="button"
@@ -305,7 +305,7 @@ pub fn Button(props: &ButtonProps, children: Markup) -> Markup {
                 (render_children(props, children))
             }
         },
-        _ => html! {
+        _ => crate::html! {
             button
                 type=(props.button_type)
                 class=(classes)

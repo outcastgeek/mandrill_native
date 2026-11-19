@@ -1421,10 +1421,11 @@ Optional page overrides, shell callbacks, CSRF values, section-container IDs and
 layout fallback behavior remain explicit. List/detail layout props retain the shared
 `SEOView` produced by the existing SEO integration.
 
-The user approved the narrow Maud attribute-spread extension. The unchanged Maud
-runtime uses the local `vendor/maud_macros` patch, whose only upstream source changes
-are attribute AST parsing and generation for `..(&attributes)`. Standard Maud escaping
-handles names and values; invalid attribute names are rejected. Shared input, textarea,
+Ordinary templates import `maud::html` from stock Maud. Templates that use
+`..(&attributes)` import `web_components::html` or call `web_components::html!`
+directly. Shared controls use the same macro through `crate::html!`. Both use
+the stock Maud runtime. Attribute spreads use Maud escaping for names and
+values and reject invalid attribute names. Shared input, textarea,
 select/options, form, button, fieldset and resource layout controls now retain complete
 attribute maps, including caller-defined option synchronization data. Generic resource
 layouts, command-search input, icon-button compositions and date/time locale preference

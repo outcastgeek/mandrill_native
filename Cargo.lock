@@ -3075,6 +3075,8 @@ dependencies = [
 [[package]]
 name = "maud_macros"
 version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7261b00f3952f617899bc012e3dbd56e4f0110a038175929fa5d18e5a19913ca"
 dependencies = [
  "proc-macro2",
  "proc-macro2-diagnostics",
@@ -6274,6 +6276,17 @@ dependencies = [
  "maud",
  "serde",
  "serde_json",
+ "web_components_macros",
+]
+
+[[package]]
+name = "web_components_macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
 ]
 
 [[package]]

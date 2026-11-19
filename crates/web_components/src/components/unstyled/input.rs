@@ -425,7 +425,7 @@ fn attrs_described_by<'a>(
 pub fn Input(props: &InputProps) -> Markup {
     let mut attrs = props.build_attributes();
     if let Some(value)=attrs_described_by(props,&attrs){attrs.insert("aria-describedby".into(),value);}
-    html! {
+    crate::html! {
         div class=(props.build_wrapper_classes()) {
             input
                 type=(props.input_type)
@@ -668,7 +668,7 @@ pub fn FloatingPasswordInput(
 pub fn TextArea(props: &InputProps, rows: i32) -> Markup {
     let mut attrs = props.build_attributes();
     if let Some(value)=attrs_described_by(props,&attrs){attrs.insert("aria-describedby".into(),value);}
-    html! {
+    crate::html! {
         div class=(props.build_wrapper_classes()) {
             textarea
                 name=[optional(&props.name)]
@@ -1140,7 +1140,7 @@ pub fn CommaSeparatedInputWithLabel(
     let shell_attrs = CommaSeparatedShellAttributes(props);
     let list_attrs = CommaSeparatedListAttributes(props);
     let entry_attrs = CommaSeparatedEntryAttributes(props);
-    html! {
+    crate::html! {
         div class="space-y-1.5" {
             @if !label.is_empty() {
                 label for=(CommaSeparatedEntryID(props)) class=(label_classes(props)) {
@@ -1651,7 +1651,7 @@ pub fn CommandSearchInput(p:&CommandSearchInputProps)->Markup{
     let attrs=CommandSearchInputAttributes(p);
     let size=if matches!(p.size,shared::SIZE_LG|shared::SIZE_XL){"h-12 text-sm"}else{"h-10 text-sm"};
     let classes=shared::build_classes(&[size,"w-full min-w-0 rounded-xl border border-[var(--control-border,var(--input))] bg-card pl-10 pr-10 font-mono text-foreground caret-primary shadow-sm transition-[border-color,box-shadow,background-color] duration-150 placeholder:text-muted-foreground hover:border-ring focus:border-ring focus:outline-none focus:ring-0 focus:shadow-[0_0_0_2px_var(--ring)] focus-visible:border-ring focus-visible:outline-none focus-visible:ring-0 focus-visible:shadow-[0_0_0_2px_var(--ring)] disabled:cursor-not-allowed disabled:opacity-50 sm:pr-28",&p.input_class]);
-    html!{div class=(shared::build_classes(&["group relative min-w-0",if p.full_width{"w-full"}else{"max-w-xl"},&p.class])) ..(&p.attributes) {
+    crate::html!{div class=(shared::build_classes(&["group relative min-w-0",if p.full_width{"w-full"}else{"max-w-xl"},&p.class])) ..(&p.attributes) {
         span aria-hidden="true" class="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 select-none font-mono text-lg font-bold leading-none text-primary" {(if p.prefix.trim().is_empty(){">"}else{p.prefix.trim()})}
         input type="search" name=[optional(&p.name)] id=(CommandSearchInputID(p)) value=[optional(&p.value)] placeholder=[optional(&p.placeholder)] class=(classes) autocomplete="off" aria-label=(if p.aria_label.is_empty(){"Search"}else{&p.aria_label}) ..(&attrs);
         div class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 flex items-center gap-1" {

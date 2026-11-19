@@ -232,7 +232,7 @@ impl SelectProps {
 pub fn Select(props: &SelectProps) -> Markup {
     let mut attrs = props.build_attributes();
     attrs.remove("disabled");attrs.remove("required");
-    html! {
+    crate::html! {
         div class=(props.build_wrapper_classes()) {
             select
                 class=(props.build_classes())

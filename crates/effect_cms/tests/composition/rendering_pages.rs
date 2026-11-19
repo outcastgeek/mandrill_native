@@ -53,8 +53,8 @@ fn resource_form_renderer_preserves_domain_attributes_and_editor_requirement()->
 #[test]
 fn approved_maud_attribute_spread_escapes_values_and_rejects_invalid_names(){
     let attrs=BTreeMap::from([("data-on:click".to_owned(),"a < b && c == \"yes\"".to_owned()),("data-plugin".into(),"custom".into())]);
-    let html=html!{button class="fixed" ..(&attrs) {"Run"}}.into_string();assert!(html.contains("data-on:click=\"a &lt; b &amp;&amp; c == &quot;yes&quot;\""));assert!(html.contains("class=\"fixed\""));
-    for name in ["", "two names", "bad=key", "bad>key", "bad/key", "bad\"key"]{let bad=BTreeMap::from([(name,"value")]);let caught=std::panic::catch_unwind(||html!{div ..(&bad) {}});assert!(caught.is_err(),"accepted invalid attribute name {name:?}");}
+    let html=web_components::html!{button class="fixed" ..(&attrs) {"Run"}}.into_string();assert!(html.contains("data-on:click=\"a &lt; b &amp;&amp; c == &quot;yes&quot;\""));assert!(html.contains("class=\"fixed\""));
+    for name in ["", "two names", "bad=key", "bad>key", "bad/key", "bad\"key"]{let bad=BTreeMap::from([(name,"value")]);let caught=std::panic::catch_unwind(||web_components::html!{div ..(&bad) {}});assert!(caught.is_err(),"accepted invalid attribute name {name:?}");}
 }
 
 #[test]

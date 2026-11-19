@@ -223,7 +223,7 @@ pub fn buildDatastarAction(method: &str, url: &str, target: &str) -> String {
 
 fn render_form(props: &FormProps, csrf: Option<(&str, &str)>, children: Markup) -> Markup {
     let attrs = props.build_attributes();
-    html! {
+    crate::html! {
         form
             action=[if props.action.is_empty() { None } else { Some(props.action.as_str()) }]
             method=(&props.method)
@@ -493,5 +493,5 @@ mod tests {
 #[derive(Clone,Debug,Default)]
 pub struct FieldsetProps{pub disabled:bool,pub aria_invalid:String,pub attributes:BTreeMap<String,String>}
 pub fn Fieldset(props:&FieldsetProps,children:Markup)->Markup{
-    html!{fieldset disabled[props.disabled] aria-invalid=[shared::optional_attr(&props.aria_invalid)] ..(&props.attributes) {(children)}}
+    crate::html!{fieldset disabled[props.disabled] aria-invalid=[shared::optional_attr(&props.aria_invalid)] ..(&props.attributes) {(children)}}
 }
