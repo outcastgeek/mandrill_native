@@ -776,14 +776,14 @@ impl<
                 .and_then(|cell| cell.get().map(|body| (body.decode)(value, context)))
             {
                 Some(effect) => effect,
-                None => Effect::fail_with(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition)),
+                None => crate::effect_fail! { error: SchemaIssue::new(SchemaIssueKind::InvalidDefinition), },
             },
             move |value, context| match encode
                 .upgrade()
                 .and_then(|cell| cell.get().map(|body| (body.encode)(value, context)))
             {
                 Some(effect) => effect,
-                None => Effect::fail_with(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition)),
+                None => crate::effect_fail! { error: SchemaIssue::new(SchemaIssueKind::InvalidDefinition), },
             },
         );
         reference.validate = Some(Arc::new(move |value, context| {
@@ -793,7 +793,7 @@ impl<
                     .map(|validate| validate(value, context))
             }) {
                 Some(effect) => effect,
-                None => Effect::fail_with(|| SchemaIssue::new(SchemaIssueKind::MissingValidator)),
+                None => crate::effect_fail! { error: SchemaIssue::new(SchemaIssueKind::MissingValidator), },
             }
         }));
         reference.writer = Some(Arc::new(move |value, output| {
@@ -803,11 +803,11 @@ impl<
                     .map(|write| write(value, output))
             }) {
                 Some(effect) => effect,
-                None => Effect::fail_with(|| {
-                    SchemaIssue::new(SchemaIssueKind::UnsupportedRepresentation {
+                None => crate::effect_fail! {
+                    error: SchemaIssue::new(SchemaIssueKind::UnsupportedRepresentation {
                         kind: "direct_json_writer".into(),
-                    })
-                }),
+                    }),
+                },
             }
         }));
         let body = build(reference)?;
@@ -824,11 +824,11 @@ impl<
             ast,
             move |value, context| match decode.get() {
                 Some(body) => (body.decode)(value, context),
-                None => Effect::fail_with(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition)),
+                None => crate::effect_fail! { error: SchemaIssue::new(SchemaIssueKind::InvalidDefinition), },
             },
             move |value, context| match encode.get() {
                 Some(body) => (body.encode)(value, context),
-                None => Effect::fail_with(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition)),
+                None => crate::effect_fail! { error: SchemaIssue::new(SchemaIssueKind::InvalidDefinition), },
             },
         );
         if has_validator {
@@ -836,7 +836,7 @@ impl<
                 match validate.get().and_then(|body| body.validate.as_ref()) {
                     Some(validate) => validate(value, context),
                     None => {
-                        Effect::fail_with(|| SchemaIssue::new(SchemaIssueKind::MissingValidator))
+                        crate::effect_fail! { error: SchemaIssue::new(SchemaIssueKind::MissingValidator), }
                     }
                 }
             }));
@@ -846,7 +846,7 @@ impl<
                 match writer.get().and_then(|body| body.writer.as_ref()) {
                     Some(write) => write(value, output),
                     None => {
-                        Effect::fail_with(|| SchemaIssue::new(SchemaIssueKind::InvalidDefinition))
+                        crate::effect_fail! { error: SchemaIssue::new(SchemaIssueKind::InvalidDefinition), }
                     }
                 }
             }));
@@ -892,7 +892,7 @@ impl<
                 let boundary = match writer.boundary() {
                     Ok(boundary) => Arc::new(boundary),
                     Err(issue) => {
-                        return effect_try_sync! { once; body: { let __dsl_result = Err(issue); move || __dsl_result }, on_error: ::core::convert::identity, };
+                        return crate::effect_from_result! { once; result: Err(issue), };
                     }
                 };
                 let input = effect_try_sync! {
@@ -913,11 +913,11 @@ impl<
                     }?
                 }
             }
-            None => effect_try_sync! { body: { let __dsl_error = || {
-                SchemaIssue::new(SchemaIssueKind::UnsupportedRepresentation {
+            None => crate::effect_fail! {
+                error: SchemaIssue::new(SchemaIssueKind::UnsupportedRepresentation {
                     kind: "direct_json_writer".into(),
-                })
-            }; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, },
+                }),
+            },
         }
     }
     /// Lazily write a complete document in `EncodeEnv` using the supplied output bounds.
@@ -1030,9 +1030,8 @@ impl<
             let (value, context) = input.clone()?;
             match validate {
                 Some(validate) => validate(value, context)?,
-                None => effect_try_sync! {
-                    body: || Err(SchemaIssue::new(SchemaIssueKind::MissingValidator)),
-                    on_error: std::convert::identity,
+                None => crate::effect_fail! {
+                    error: SchemaIssue::new(SchemaIssueKind::MissingValidator),
                 }?,
             }
         }
@@ -1333,7 +1332,7 @@ impl<A: Send + 'static, DecodeEnv: Send + Sync + 'static> EffectSchema<A, Decode
             {
                 Some(value) => decode(value, None),
                 None => {
-                    effect_try_sync! { body: { let __dsl_error = || SchemaIssue::new(SchemaIssueKind::InputConsumed); move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }
+                    crate::effect_fail! { error: SchemaIssue::new(SchemaIssueKind::InputConsumed), }
                 }
             };
             effect! { __dsl_factory()? }

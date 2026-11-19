@@ -6,7 +6,7 @@ use crate::rpc::{
     RpcClientMiddlewareError,
 };
 use crate::{Effect, Stream};
-use crate::{effect, effect_map_error, effect_try_sync, reactive_query};
+use crate::{effect, effect_map_error, reactive_query};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -393,7 +393,7 @@ where
                                        .lock()
                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                                        .take();
-                                   effect_try_sync! { once; body: { let __dsl_result = value.ok_or(RpcMutationError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, }
+                                   crate::effect_from_result! { once; result: value.ok_or(RpcMutationError::InputConsumed), }
                                },
             }
                        }? }
@@ -543,11 +543,9 @@ where
                                        .take();
                                    match response {
                                        Some(response) => effect_map_error! { program: client.apply_after(response), map: RpcMiddlewareMutationError::CommittedWithMiddlewareFailure, },
-                                       None => effect_try_sync! {
-                                           once; body: {
-                                           let __dsl_result = Err(
+                                       None => crate::effect_from_result! { once; result: Err(
                                            RpcMiddlewareMutationError::InputConsumed,
-                                       ); move || __dsl_result }, on_error: ::core::convert::identity, },
+                                       ), },
                                    }
                                },
             }

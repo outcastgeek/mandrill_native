@@ -7,7 +7,7 @@ use crate::rpc::{
     RpcWireError,
 };
 use crate::{Effect, SchemaIssue};
-use crate::{effect, effect_try_sync};
+use crate::effect;
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
@@ -270,38 +270,40 @@ impl<R: Send + Sync + 'static> EntityDispatcher<R> {
                 if envelope.operation != operation.spec().id
                     || envelope.version != operation.spec().version
                 {
-                    return Effect::from_result_once(Err(EntityDispatchError::WrongOperation));
+                    return crate::effect_from_result! { once; result: Err(EntityDispatchError::WrongOperation), };
                 }
                 if envelope.kind != RpcEnvelopeKind::Request {
-                    return Effect::from_result_once(Err(EntityDispatchError::UnexpectedKind(
+                    return crate::effect_from_result! { once; result: Err(EntityDispatchError::UnexpectedKind(
                         envelope.kind,
-                    )));
+                    )), };
                 }
                 if let Err(issue) = crate::schema::internal::parser::check_limits(
                     &envelope.payload,
                     &operation.limits(),
                 ) {
-                    return Effect::from_result_once(Err(EntityDispatchError::RequestSchema(
+                    return crate::effect_from_result! { once; result: Err(EntityDispatchError::RequestSchema(
                         issue,
-                    )));
+                    )), };
                 }
                 let request = match operation.request_codec().decode_ref(&envelope.payload) {
                     Ok(request) => request,
                     Err(issue) => {
-                        return Effect::from_result_once(Err(EntityDispatchError::RequestSchema(
+                        return crate::effect_from_result! { once; result: Err(EntityDispatchError::RequestSchema(
                             issue,
-                        )));
+                        )), };
                     }
                 };
                 if !accepts(&address, &request) {
-                    return Effect::from_result_once(Err(EntityDispatchError::AddressMismatch));
+                    return crate::effect_from_result! { once; result: Err(EntityDispatchError::AddressMismatch), };
                 }
                 let envelope = Mutex::new(Some(envelope));
-                handler
-                    .call(request)
-                    .either()
-                    .map_error(|_| EntityDispatchError::UnexpectedExpectedError)
-                    .flat_map(move |result| {
+                effect! {
+                    bind;
+                    program: crate::effect_map_error! {
+                        program: effect! { either; program: handler.call(request), },
+                        map: |_| EntityDispatchError::UnexpectedExpectedError,
+                    },
+                    body: move |result| {
                         let encoded = match &result {
                             Ok(value) => operation.success_codec().encode_ref(value),
                             Err(error) => operation.error_codec().encode_ref(error),
@@ -309,24 +311,24 @@ impl<R: Send + Sync + 'static> EntityDispatcher<R> {
                         .map_err(EntityDispatchError::ReplySchema);
                         let payload = match encoded {
                             Ok(payload) => payload,
-                            Err(error) => return Effect::from_result_once(Err(error)),
+                            Err(error) => return crate::effect_from_result! { once; result: Err(error), },
                         };
                         if let Err(issue) = crate::schema::internal::parser::check_limits(
                             &payload,
                             &operation.limits(),
                         ) {
-                            return Effect::from_result_once(Err(
+                            return crate::effect_from_result! { once; result: Err(
                                 EntityDispatchError::ReplySchema(issue),
-                            ));
+                            ), };
                         }
                         let envelope = envelope
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .take();
                         let Some(mut envelope) = envelope else {
-                            return Effect::from_result_once(Err(
+                            return crate::effect_from_result! { once; result: Err(
                                 EntityDispatchError::InputConsumed,
-                            ));
+                            ), };
                         };
                         let kind = if result.is_ok() {
                             envelope.kind = RpcEnvelopeKind::Success;
@@ -349,8 +351,9 @@ impl<R: Send + Sync + 'static> EntityDispatcher<R> {
                                 kind,
                                 payload: Arc::from(bytes),
                             });
-                        Effect::from_result_once(encoded)
-                    })
+                        crate::effect_from_result! { once; result: encoded, }
+                    },
+                }
             }),
         );
         Ok(())
@@ -400,27 +403,29 @@ impl<R: Send + Sync + 'static> EntityDispatcher<R> {
         let frames = match decoder.push(&encoded_request) {
             Ok(frames) => frames,
             Err(FrameDecodeFailure { error, .. }) => {
-                return effect_try_sync! { once; body: { let __dsl_result = Err(EntityDispatchError::Wire(
-                    RpcWireError::Frame(error),
-                )); move || __dsl_result }, on_error: ::core::convert::identity, };
+                return crate::effect_from_result! {
+                    once;
+                    result: Err(EntityDispatchError::Wire(RpcWireError::Frame(error))),
+                };
             }
         };
         if let Err(error) = decoder.finish() {
-            return effect_try_sync! { once; body: { let __dsl_result = Err(EntityDispatchError::Wire(RpcWireError::Frame(
-                error,
-            ))); move || __dsl_result }, on_error: ::core::convert::identity, };
+            return crate::effect_from_result! {
+                once;
+                result: Err(EntityDispatchError::Wire(RpcWireError::Frame(error))),
+            };
         }
         let mut frames = frames.into_iter();
         let Some(first) = frames.next() else {
-            return effect_try_sync! { once; body: { let __dsl_result = Err(EntityDispatchError::MissingFrame); move || __dsl_result }, on_error: ::core::convert::identity, };
+            return crate::effect_from_result! { once; result: Err(EntityDispatchError::MissingFrame), };
         };
         if frames.next().is_some() {
-            return effect_try_sync! { once; body: { let __dsl_result = Err(EntityDispatchError::ExtraFrames); move || __dsl_result }, on_error: ::core::convert::identity, };
+            return crate::effect_from_result! { once; result: Err(EntityDispatchError::ExtraFrames), };
         }
         let envelope = match RpcEnvelope::decode(&first, self.policy) {
             Ok(envelope) => envelope,
             Err(error) => {
-                return effect_try_sync! { once; body: { let __dsl_result = Err(EntityDispatchError::Wire(error)); move || __dsl_result }, on_error: ::core::convert::identity, };
+                return crate::effect_from_result! { once; result: Err(EntityDispatchError::Wire(error)), };
             }
         };
         let key = (
@@ -431,11 +436,14 @@ impl<R: Send + Sync + 'static> EntityDispatcher<R> {
         match self.handlers.get(&key) {
             Some(handler) => handler(address, envelope),
             None => {
-                effect_try_sync! { once; body: { let __dsl_result = Err(EntityDispatchError::UnknownOperation {
-                    entity_type: key.0,
-                    operation: key.1,
-                    version: key.2,
-                }); move || __dsl_result }, on_error: ::core::convert::identity, }
+                crate::effect_from_result! {
+                    once;
+                    result: Err(EntityDispatchError::UnknownOperation {
+                        entity_type: key.0,
+                        operation: key.1,
+                        version: key.2,
+                    }),
+                }
             }
         }
     }

@@ -65,7 +65,7 @@ pub fn handle_media_picker_search<E:Send+'static,R:Send+Sync+'static>(request:&R
             let request=request.clone();let form=form.clone();let options=options.clone();
             match (options.build_page,options.render_picker,options.io.write_patch) {
                 (Some(build),Some(render),Some(write))=>{
-                    let page=build(&request,media_query_from_request(&request,Some(&form),options.page_size),String::new(),form).either()?;
+                    let page=effect! { either; program: build(&request,media_query_from_request(&request,Some(&form),options.page_size),String::new(),form), }?;
                     match page {
                         Ok(page)=>write(&request,page.root_id.clone().into(),"inner".into(),render(page))?,
                         Err(_)=>render_media_flow_error(&request,500,&options.internal_error_message,options.io.write_error.as_ref())?,
@@ -87,20 +87,20 @@ pub fn handle_media_picker_attach<E:Send+'static,R:Send+Sync+'static>(request:&R
                 options.build_manager,options.render_manager,options.io.write_patch,options.io.write_patches) {
                 (Some(build),Some(render_picker),Some(current),Some(preview),Some(manager),Some(render),Some(write),Some(writes))=>{
                     let surface=with_default_role(&request,resolve_media_flow_surface(&request,&form,options.surface.as_ref()),options.default_role.as_ref());
-                    let requested=current(&request,surface.clone(),form.clone()).either()?;
+                    let requested=effect! { either; program: current(&request,surface.clone(),form.clone()), }?;
                     match requested {
                         Err(_)=>render_media_flow_error(&request,500,&options.internal_error_message,options.io.write_error.as_ref())?,
                         Ok(inputs)=>{
                             let selected=media_selected_asset_ids(Some(&form));
                             if selected.is_empty() {
-                                let page=build(&request,media_query_from_request(&request,Some(&form),options.page_size),options.no_selection_message,form).either()?;
+                                let page=effect! { either; program: build(&request,media_query_from_request(&request,Some(&form),options.page_size),options.no_selection_message,form), }?;
                                 match page { Ok(page)=>write(&request,page.root_id.clone().into(),"inner".into(),render_picker(page))?,
                                     Err(_)=>render_media_flow_error(&request,500,&options.internal_error_message,options.io.write_error.as_ref())? }
                             } else {
                                 let mut roles=options.role_options;
                                 if roles.normalize_role.is_none(){roles.normalize_role=options.normalize_role.clone();}
                                 let next=attach_asset_ids_to_attachment_inputs(&inputs,&selected,role(&surface.role,options.normalize_role.as_ref()),&roles);
-                                let items=preview(&request,next).either()?;
+                                let items=effect! { either; program: preview(&request,next), }?;
                                 match items {
                                     Err(_)=>render_media_flow_error(&request,500,&options.internal_error_message,options.io.write_error.as_ref())?,
                                     Ok(items)=>match manager(&request,&form,surface.clone(),items) {
@@ -132,7 +132,7 @@ pub fn handle_media_attachment_mutation<E:Send+'static,R:Send+Sync+'static>(requ
             match (options.current_inputs,options.preview_items,options.build_manager,options.render_manager,options.io.write_patch) {
                 (Some(current),Some(preview),Some(manager),Some(render),Some(write))=>{
                     let surface=resolve_media_flow_surface(&request,&form,options.surface.as_ref());
-                    let requested=current(&request,surface.clone(),form.clone()).either()?;
+                    let requested=effect! { either; program: current(&request,surface.clone(),form.clone()), }?;
                     match requested {
                         Err(_)=>render_media_flow_error(&request,500,&options.internal_error_message,options.io.write_error.as_ref())?,
                         Ok(inputs)=>{
@@ -144,7 +144,7 @@ pub fn handle_media_attachment_mutation<E:Send+'static,R:Send+Sync+'static>(requ
                                 b"remove"=>remove_attachment_input(&inputs,&id,options.normalize_role.as_deref()),
                                 _=>inputs,
                             };
-                            let items=preview(&request,next).either()?;
+                            let items=effect! { either; program: preview(&request,next), }?;
                             match items {
                                 Err(_)=>render_media_flow_error(&request,500,&options.internal_error_message,options.io.write_error.as_ref())?,
                                 Ok(items)=>match manager(&request,&form,surface,items) {
@@ -184,11 +184,11 @@ fn run_inline_create<I:Clone+Send+'static,E:Send+'static,R:Send+Sync+'static>(re
     effect! {
         let request=request.clone();let form=form.clone();let options=options.clone();
         let surface=resolve_media_flow_surface(&request,&form,options.surface.as_ref());
-        let current=options.current_inputs.as_ref().expect("admitted current inputs")(&request,surface.clone(),form.clone()).either()?;
+        let current=effect! { either; program: options.current_inputs.as_ref().expect("admitted current inputs")(&request,surface.clone(),form.clone()), }?;
         match current {
             Err(_)=>render_media_flow_error(&request,500,&options.internal_error_message,options.io.write_error.as_ref())?,
             Ok(inputs)=>{
-                let preview=options.preview_items.as_ref().expect("admitted preview")(&request,inputs.clone()).either()?;
+                let preview=effect! { either; program: options.preview_items.as_ref().expect("admitted preview")(&request,inputs.clone()), }?;
                 match preview {
                     Err(_)=>render_media_flow_error(&request,500,&options.internal_error_message,options.io.write_error.as_ref())?,
                     Ok(current_items)=>{
@@ -198,7 +198,7 @@ fn run_inline_create<I:Clone+Send+'static,E:Send+'static,R:Send+Sync+'static>(re
                             let rendered=options.render_create.as_ref().expect("admitted renderer")(&request,&form,input,message,current_items);
                             write_inline_render(&request,422,rendered,&options.io)?
                         } else {
-                            let created=options.create_asset.as_ref().expect("admitted creator")(&request,input.clone()).either()?;
+                            let created=effect! { either; program: options.create_asset.as_ref().expect("admitted creator")(&request,input.clone()), }?;
                             match created {
                                 Err(_)=>{
                                     let rendered=options.render_create.as_ref().expect("admitted renderer")(&request,&form,input,options.internal_error_message.clone(),current_items);
@@ -208,7 +208,7 @@ fn run_inline_create<I:Clone+Send+'static,E:Send+'static,R:Send+Sync+'static>(re
                                     let surface=with_default_role(&request,surface,options.default_role.as_ref());
                                     let mut roles=options.role_options.clone();if roles.normalize_role.is_none(){roles.normalize_role=options.normalize_role.clone();}
                                     let next=attach_asset_ids_to_attachment_inputs(&inputs,&[id.trim()],role(&surface.role,options.normalize_role.as_ref()),&roles);
-                                    let preview=options.preview_items.as_ref().expect("admitted preview")(&request,next).either()?;
+                                    let preview=effect! { either; program: options.preview_items.as_ref().expect("admitted preview")(&request,next), }?;
                                     match preview {
                                         Err(_)=>render_media_flow_error(&request,500,&options.internal_error_message,options.io.write_error.as_ref())?,
                                         Ok(items)=>match options.build_manager.as_ref().expect("admitted manager")(&request,&form,surface.clone(),items) {
@@ -269,7 +269,7 @@ pub fn handle_media_shortcode_modal<E:Send+'static,R:Send+Sync+'static>(request:
                 (Some(load),Some(render),Some(write))=>{
                     let surface=resolve_media_flow_surface(&request,&form,options.surface.as_ref());
                     let query=media_query_from_request(&request,Some(&form),options.page_size);
-                    let result=load(&request,query.clone()).either()?;
+                    let result=effect! { either; program: load(&request,query.clone()), }?;
                     match result {
                         Err(_)=>render_media_flow_error(&request,500,&options.internal_error_message,options.io.write_error.as_ref())?,
                         Ok((items,total))=>{

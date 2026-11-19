@@ -86,8 +86,9 @@ extern crate self as effect_sql;
 
 /// Typed callback blocks using this facade's existing Effect dependency.
 pub use effect::{
-    codec, effect_all, effect_all_concurrent, effect_blocking, effect_cpu, effect_die,
-    effect_finalizer, effect_for_each, effect_for_each_concurrent, effect_from_option,
+    EffectEnvironment,
+    codec, effect_all, effect_all_concurrent, effect_blocking, effect_cpu, effect_die, effect_fail,
+    effect_finalizer, effect_for_each, effect_for_each_concurrent, effect_from_option, effect_from_result,
     effect_future, effect_map, effect_map_error, effect_on_interrupt, effect_permit,
     effect_provide_some, effect_provided, effect_race, effect_recover, effect_ref, effect_repeat,
     effect_resource, effect_retry, effect_sandbox, effect_schema_parse, effect_scope,
@@ -178,7 +179,7 @@ pub use sqlx;
 /// Construct a reusable native row program with scoped column reads and Effect validation.
 /// `row! { project: callback }` adapts an extracted borrowed native row projection.
 #[cfg(feature = "turso")]
-pub use effect_macros::row;
+pub use effect_macros::{EffectSqlRow, row};
 /// Build an inert statement with text/identifier/fragment/where/param operations.
 /// Returns Result; literals are trusted syntax and values always use native bindings.
 #[cfg(feature = "turso")]
@@ -199,6 +200,8 @@ pub mod __private {
     #[cfg(feature = "turso")]
     /// Row operations are scoped to the row-program carrier constructed by D05.
     pub use crate::{choice_text, column, native_column, optional_column, refine, validate};
+    #[cfg(feature = "turso")]
+    pub use sqlx::TursoConnection;
     /// Existing interpreter and macro lowering; never a separate SQL runtime.
     pub use effect;
 }

@@ -1448,9 +1448,10 @@ where
     {
         let decide = Arc::new(decide);
         let allow = Arc::new(allow);
-        self.invoke_once(
-            (scope, after, limit),
-            move |native, (scope, after, limit), authority, _| {
+        identity! {
+            identity: self,
+            invoke_once((scope, after, limit)),
+            native: move |native, (scope, after, limit), authority, _| {
                 let decide = decide.clone();
                 let allow = allow.clone();
                 async move {
@@ -1484,7 +1485,7 @@ where
                     Ok(AccountViewPage { accounts, next })
                 }
             },
-        )
+        }
     }
     /// Revalidate exact action/resource/revision permission before a selected
     /// administrative account callback. The callback receives current target state;
@@ -1518,9 +1519,10 @@ where
         } = action;
         let decide = Arc::new(decide);
         let operation = Arc::new(operation);
-        self.invoke_once(
-            (grant, operation_kind, action, resource, target, input),
-            move |native,
+        identity! {
+            identity: self,
+            invoke_once((grant, operation_kind, action, resource, target, input)),
+            native: move |native,
                   (grant, operation_kind, action, resource, target, input),
                   authority,
                   _| {
@@ -1549,7 +1551,7 @@ where
                     operation(native, user, input).await
                 }
             },
-        )
+        }
     }
     /// Revalidate approved role permission and current native role revision before
     /// a selected role-manager callback; role services are actual configured components.
@@ -1574,9 +1576,10 @@ where
     {
         let decide = Arc::new(decide);
         let operation = Arc::new(operation);
-        self.invoke_once(
-            (grant, operation_kind, input),
-            move |native, (grant, operation_kind, input), authority, _| {
+        identity! {
+            identity: self,
+            invoke_once((grant, operation_kind, input)),
+            native: move |native, (grant, operation_kind, input), authority, _| {
                 let decide = decide.clone();
                 let operation = operation.clone();
                 async move {
@@ -1588,7 +1591,7 @@ where
                     operation(native, role, input).await
                 }
             },
-        )
+        }
     }
     /// Create a role through selected native validation/normalization only after
     /// exact application action/resource/revision permission revalidation.
@@ -1609,9 +1612,10 @@ where
         DFut: Future<Output = Result<PermissionDecision, IdentityError>> + Send + 'static,
     {
         let decide = Arc::new(decide);
-        self.invoke_once(
-            (grant, action, resource, name),
-            move |native, (grant, action, resource, name), authority, _| {
+        identity! {
+            identity: self,
+            invoke_once((grant, action, resource, name)),
+            native: move |native, (grant, action, resource, name), authority, _| {
                 let decide = decide.clone();
                 async move {
                     if grant.target() != &PermissionTarget::Roles
@@ -1631,7 +1635,7 @@ where
                     Ok(RoleView::from_role(&role))
                 }
             },
-        )
+        }
     }
     /// Rename the current revision-bound role and preserve its stable ID.
     pub fn rename_role<E, R, D, DFut>(
@@ -1648,12 +1652,11 @@ where
         D: Fn(UserId, Arc<str>, Arc<str>) -> DFut + Send + Sync + 'static,
         DFut: Future<Output = Result<PermissionDecision, IdentityError>> + Send + 'static,
     {
-        self.administer_role(
-            grant,
-            PermissionOperation::RoleRename,
-            name,
-            decide,
-            |native, role, name| async move {
+        identity! {
+            identity: self,
+            administer_role(grant, PermissionOperation::RoleRename, name),
+            decide: decide,
+            operation |native, role, name| {
                 // Native RoleLifecycleManager::update recomputes equality through its
                 // selected normalizer; this owned accessor conversion retains a valid
                 // temporary aggregate without manufacturing a new role identity.
@@ -1669,7 +1672,7 @@ where
                     .map_err(IdentityError::Native)?;
                 Ok(RoleView::from_role(&role))
             },
-        )
+        }
     }
     /// Delete only the freshly authorized stable role; native deletion owns its
     /// actual membership/claims acknowledgment boundary.
@@ -1682,13 +1685,12 @@ where
         D: Fn(UserId, Arc<str>, Arc<str>) -> DFut + Send + Sync + 'static,
         DFut: Future<Output = Result<PermissionDecision, IdentityError>> + Send + 'static,
     {
-        self.administer_role(
-            grant,
-            PermissionOperation::RoleDelete,
-            (),
-            decide,
-            |native, role, ()| async move { acknowledged(native.delete(&role).await) },
-        )
+        identity! {
+            identity: self,
+            administer_role(grant, PermissionOperation::RoleDelete, ()),
+            decide: decide,
+            operation |native, role, ()| { acknowledged(native.delete(&role).await) },
+        }
     }
     /// Persist one native role claim only after current role/permission checks.
     pub fn add_role_claim<E, R, D, DFut>(
@@ -1705,13 +1707,12 @@ where
         D: Fn(UserId, Arc<str>, Arc<str>) -> DFut + Send + Sync + 'static,
         DFut: Future<Output = Result<PermissionDecision, IdentityError>> + Send + 'static,
     {
-        self.administer_role(
-            grant,
-            PermissionOperation::RoleClaimAdd,
-            claim,
-            decide,
-            |native, role, claim| async move { acknowledged(native.add_claim(&role, claim).await) },
-        )
+        identity! {
+            identity: self,
+            administer_role(grant, PermissionOperation::RoleClaimAdd, claim),
+            decide: decide,
+            operation |native, role, claim| { acknowledged(native.add_claim(&role, claim).await) },
+        }
     }
     /// Remove exactly the requested native claim from the current authorized role.
     pub fn remove_role_claim<E, R, D, DFut>(
@@ -1728,7 +1729,12 @@ where
         D: Fn(UserId, Arc<str>, Arc<str>) -> DFut + Send + Sync + 'static,
         DFut: Future<Output = Result<PermissionDecision, IdentityError>> + Send + 'static,
     {
-        self.administer_role(grant,PermissionOperation::RoleClaimRemove,claim,decide,|native,role,claim|async move{acknowledged(native.remove_claim(&role,&claim).await)})
+        identity! {
+            identity: self,
+            administer_role(grant, PermissionOperation::RoleClaimRemove, claim),
+            decide: decide,
+            operation |native, role, claim| { acknowledged(native.remove_claim(&role, &claim).await) },
+        }
     }
     /// Enumerate one finite native role page and revalidate application scope and
     /// per-role visibility before each safe view. No client lifetime owns SQL.
@@ -1752,9 +1758,10 @@ where
     {
         let decide = Arc::new(decide);
         let allow = Arc::new(allow);
-        self.invoke_once(
-            (scope, after, limit),
-            move |native, (scope, after, limit), authority, _| {
+        identity! {
+            identity: self,
+            invoke_once((scope, after, limit)),
+            native: move |native, (scope, after, limit), authority, _| {
                 let decide = decide.clone();
                 let allow = allow.clone();
                 async move {
@@ -1787,7 +1794,7 @@ where
                     Ok(RoleViewPage { roles, next })
                 }
             },
-        )
+        }
     }
     /// Apply membership to a current target only after exact administrative
     /// permission checks. Native role lookup resolves stable ownership/normalization.
@@ -1809,20 +1816,19 @@ where
         D: Fn(UserId, Arc<str>, Arc<str>) -> DFut + Send + Sync + 'static,
         DFut: Future<Output = Result<PermissionDecision, IdentityError>> + Send + 'static,
     {
-        self.administer_account(
-            grant,
-            AccountAction {
-                operation: PermissionOperation::MembershipAdd,
-                action,
-                resource,
-            },
-            target,
-            name,
-            decide,
-            |native, user, name| async move {
+        identity! {
+            identity: self,
+            administer_account(
+                grant,
+                AccountAction { operation: PermissionOperation::MembershipAdd, action, resource },
+                target,
+                name,
+            ),
+            decide: decide,
+            operation |native, user, name| {
                 acknowledged(native.user_manager().add_to_role(&user, &name).await)
             },
-        )
+        }
     }
     /// Remove current target membership under exact administrative permission.
     pub fn remove_account_from_role<E, R, D, DFut>(
@@ -1843,20 +1849,19 @@ where
         D: Fn(UserId, Arc<str>, Arc<str>) -> DFut + Send + Sync + 'static,
         DFut: Future<Output = Result<PermissionDecision, IdentityError>> + Send + 'static,
     {
-        self.administer_account(
-            grant,
-            AccountAction {
-                operation: PermissionOperation::MembershipRemove,
-                action,
-                resource,
-            },
-            target,
-            name,
-            decide,
-            |native, user, name| async move {
+        identity! {
+            identity: self,
+            administer_account(
+                grant,
+                AccountAction { operation: PermissionOperation::MembershipRemove, action, resource },
+                target,
+                name,
+            ),
+            decide: decide,
+            operation |native, user, name| {
                 acknowledged(native.user_manager().remove_from_role(&user, &name).await)
             },
-        )
+        }
     }
     /// Issue the configured native cookie only from a current completed result.
     /// The original native session/ticket is retained and no arbitrary ticket is accepted.
@@ -1986,7 +1991,9 @@ where
             }
         };
         match admission {
-            Some(admission) => self.invoke_prepared_once(admission, headers, operation),
+            Some(admission) => identity! {
+                identity: self, invoke_prepared_once(admission, headers), native: operation,
+            },
             None => identity! { identity: self, invoke_once(headers), native: operation },
         }
     }
@@ -2379,9 +2386,10 @@ where
             + 'static,
     {
         let transform = Arc::new(transform);
-        self.invoke_capability_once(
-            (grant, input),
-            move |storage, native, (grant, input), authority, _| {
+        identity! {
+            identity: self,
+            invoke_capability_once((grant, input)),
+            native: move |storage, native, (grant, input), authority, _| {
                 let transform = transform.clone();
                 async move {
                     let user = authority.revalidate_recent(&grant).await?;
@@ -2407,7 +2415,7 @@ where
                         .await
                 }
             },
-        )
+        }
     }
     /// Delete the selected complete self aggregate only at its exact current
     /// revision after recent proof; this is one acknowledged aggregate transaction.
@@ -2458,9 +2466,10 @@ where
         Fut: Future<Output = Result<A, IdentityError>> + Send + 'static,
     {
         let transport = Arc::new(transport);
-        self.invoke_capability_once(
-            (grant, id, expires_at, request),
-            move |storage, _, (grant, id, expires_at, request), authority, _| {
+        identity! {
+            identity: self,
+            invoke_capability_once((grant, id, expires_at, request)),
+            native: move |storage, _, (grant, id, expires_at, request), authority, _| {
                 let transport = transport.clone();
                 async move {
                     let user = authority.revalidate(&grant).await?;
@@ -2474,7 +2483,7 @@ where
                     transport(accepted).await
                 }
             },
-        )
+        }
     }
     /// Acknowledge selected notification acceptance before the actual configured
     /// application callback receives its original moved payload.
@@ -2499,9 +2508,10 @@ where
         Fut: Future<Output = Result<A, IdentityError>> + Send + 'static,
     {
         let dispatch = Arc::new(dispatch);
-        self.invoke_capability_once(
-            (grant, id, expires_at, request),
-            move |storage, _, (grant, id, expires_at, request), authority, _| {
+        identity! {
+            identity: self,
+            invoke_capability_once((grant, id, expires_at, request)),
+            native: move |storage, _, (grant, id, expires_at, request), authority, _| {
                 let dispatch = dispatch.clone();
                 async move {
                     let user = authority.revalidate(&grant).await?;
@@ -2515,7 +2525,7 @@ where
                     dispatch(accepted).await
                 }
             },
-        )
+        }
     }
     /// Persist an export/delete request after recent self proof and pass its
     /// receipt to an application-owned acceptance hook. No inventory or worker
@@ -2541,9 +2551,10 @@ where
         Fut: Future<Output = Result<A, IdentityError>> + Send + 'static,
     {
         let accept = Arc::new(accept);
-        self.invoke_capability_once(
-            (grant, id, expires_at, request),
-            move |storage, _, (grant, id, expires_at, request), authority, _| {
+        identity! {
+            identity: self,
+            invoke_capability_once((grant, id, expires_at, request)),
+            native: move |storage, _, (grant, id, expires_at, request), authority, _| {
                 let accept = accept.clone();
                 async move {
                     let user = authority.revalidate_recent(&grant).await?;
@@ -2557,7 +2568,7 @@ where
                     accept(accepted).await
                 }
             },
-        )
+        }
     }
     /// Inspect this owner's durable job request/status under current self authority.
     /// Corruption/availability remain failures, distinct from absent status.
@@ -2609,40 +2620,44 @@ where
         let policy = Arc::new(policy);
         move |request| {
             let policy = policy.clone();
-            definition.invoke_once(request, move |native, request, authority, policies| {
-                let policy = policy.clone();
-                async move {
-                    use identity_rs::identity::axum::AuthorizationDecision;
-                    let actor = request
-                        .with_extensions(|extensions| extensions.get::<SelfGrant>().cloned());
-                    let principal = if let Some(actor) = &actor {
-                        let verified = authority.revalidate(actor).await?;
-                        let user = current_user(native.user_manager(), verified).await?;
-                        Some(
-                            policies
-                                .principal_policy()?
-                                .create(native.user_manager(), &user)
-                                .await
-                                .map_err(IdentityError::Native)?,
-                        )
-                    } else {
-                        None
-                    };
-                    let decision = policy.authorize(principal.as_ref()).await;
-                    if let Some(actor) = &actor {
-                        authority.revalidate(actor).await?;
-                    }
-                    match decision {
-                        AuthorizationDecision::Allowed => Ok(()),
-                        AuthorizationDecision::Challenged => {
-                            Err(IdentityError::Policy(http::StatusCode::UNAUTHORIZED))
+            identity! {
+                identity: definition,
+                invoke_once(request),
+                native: move |native, request, authority, policies| {
+                    let policy = policy.clone();
+                    async move {
+                        use identity_rs::identity::axum::AuthorizationDecision;
+                        let actor = request
+                            .with_extensions(|extensions| extensions.get::<SelfGrant>().cloned());
+                        let principal = if let Some(actor) = &actor {
+                            let verified = authority.revalidate(actor).await?;
+                            let user = current_user(native.user_manager(), verified).await?;
+                            Some(
+                                policies
+                                    .principal_policy()?
+                                    .create(native.user_manager(), &user)
+                                    .await
+                                    .map_err(IdentityError::Native)?,
+                            )
+                        } else {
+                            None
+                        };
+                        let decision = policy.authorize(principal.as_ref()).await;
+                        if let Some(actor) = &actor {
+                            authority.revalidate(actor).await?;
                         }
-                        AuthorizationDecision::Forbidden => {
-                            Err(IdentityError::Policy(http::StatusCode::FORBIDDEN))
+                        match decision {
+                            AuthorizationDecision::Allowed => Ok(()),
+                            AuthorizationDecision::Challenged => {
+                                Err(IdentityError::Policy(http::StatusCode::UNAUTHORIZED))
+                            }
+                            AuthorizationDecision::Forbidden => {
+                                Err(IdentityError::Policy(http::StatusCode::FORBIDDEN))
+                            }
                         }
                     }
-                }
-            })
+                },
+            }
         }
     }
     /// Trusted cookie authentication stage for Web/Server policy composition.
@@ -2856,7 +2871,9 @@ where
             }
         };
         match admission {
-            Some(admission) => self.invoke_prepared_once(admission, request, operation),
+            Some(admission) => identity! {
+                identity: self, invoke_prepared_once(admission, request), native: operation,
+            },
             None => identity! { identity: self, invoke_once(request), native: operation },
         }
     }
@@ -2887,7 +2904,8 @@ where
                 let request = request.clone();
                 let header = header.clone();
                 async move {
-                    let result = definition.reserve_prepared_invocation().and_then(|admission| {
+                    let reserved = identity! { identity: &definition, reserve_prepared_invocation(), };
+                    let result = reserved.and_then(|admission| {
                         check_auth_header(&request, &header, bytes)?;
                         Ok((request, admission))
                     });

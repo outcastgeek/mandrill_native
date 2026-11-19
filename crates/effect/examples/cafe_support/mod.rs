@@ -9,23 +9,20 @@ pub mod tickets;
 /// Finite RPC/socket transport plumbing, independent of the application DSL recipe.
 pub mod transport;
 
-use effect::cluster::{HasClusterActivationStore, MemoryClusterMessageStore, MessageStoreCapacity};
+use effect::cluster::{MemoryClusterMessageStore, MessageStoreCapacity};
 use effect::encoding::{BinaryIdentity, BinaryLimits, FramePolicy};
 use effect::eventlog::{
-    HasAtomicProjectionStore, HasEventJournal, MemoryEventJournal, MemoryJournalCapacity,
-    MemoryProjectionStore,
+    MemoryEventJournal, MemoryJournalCapacity, MemoryProjectionStore,
 };
 use effect::persistence::{
-    HasKeyValueStore, HasPersistedQueueStore, MemoryKeyValueStore, MemoryPersistedQueueStore,
-    QueueStoreCapacity, StoreCapacity,
+    MemoryKeyValueStore, MemoryPersistedQueueStore, QueueStoreCapacity, StoreCapacity,
 };
 use effect::rpc::RpcEnvelopePolicy;
-use effect::transactional::{HasTransactionDomain, TransactionDomain};
-use effect::workflow::{HasWorkflowEngine, MemoryWorkflowEngine};
+use effect::transactional::TransactionDomain;
+use effect::workflow::MemoryWorkflowEngine;
 use effect::{
     BlockingExecutor, Cancellation, CpuExecutor, Defect, DiagnosticCapacity, DiagnosticOverflow,
-    Diagnostics, DuplicateFields, HasBlockingExecutor, HasCancellation, HasClock, HasCpuExecutor,
-    HasRequestScope, HasTaskSpawner, HasTracer, HasWallClock, KeyDomain, KeyNamespace, KeySegment,
+    Diagnostics, DuplicateFields, EffectEnvironment, KeyDomain, KeyNamespace, KeySegment,
     ParseLimits, ParsePolicy, RequestScope, ScheduledJob, ScheduledTask, SchemaErrorMode, SpanId,
     StableKey, TaskSpawner, TestClock, TestWallClock, Tracer, UnknownFields, UtcMillis,
 };
@@ -97,6 +94,33 @@ pub fn binary(name: &str) -> Result<BinaryIdentity, Defect> {
         .map_err(|error| Defect::new(format!("example binary identity: {error:?}")))
 }
 /// Café environment: application services beside Effect provider capabilities.
+#[derive(EffectEnvironment)]
+#[effect_environment(
+    task_spawner(provider = Providers, get = base),
+    cpu_executor(provider = CoffeeCpu, get = cpu),
+    blocking_executor(provider = CoffeeBlocking, get = blocking),
+    clock(provider = TestClock, get = &self.base.clock),
+    wall_clock(provider = TestWallClock, get = wall),
+    tracer = tracer,
+    cancellation = cancellation,
+    request_scope = requests,
+    transaction_domain = Arc::clone(&self.transactions),
+    cluster_activation_store(provider = MemoryClusterMessageStore, get = Arc::clone(&self.activation)),
+    event_journal(provider = MemoryEventJournal, get = Arc::clone(&self.journal)),
+    atomic_projection_store(
+        state = Sales,
+        provider = MemoryProjectionStore<Sales>,
+        get = Arc::clone(&self.projection),
+    ),
+    persisted_queue_store(provider = MemoryPersistedQueueStore, get = Arc::clone(&self.queues)),
+    workflow_engine(provider = MemoryWorkflowEngine, get = Arc::clone(&self.workflow)),
+    key_value_store(provider = MemoryKeyValueStore, get = Arc::clone(&self.records)),
+    websocket_transport(
+        provider = Services,
+        get = services,
+        requires(Services: effect::websocket::WebSocketTransport),
+    ),
+)]
 pub struct Cafe<Services: Send + Sync + 'static = (), Sales: Send + Sync + 'static = ()> {
     /// Application-defined café services, named in each customer or staff story.
     pub services: Arc<Services>,
@@ -128,138 +152,6 @@ pub struct Cafe<Services: Send + Sync + 'static = (), Sales: Send + Sync + 'stat
     pub workflow: Arc<MemoryWorkflowEngine>,
     /// Bounded logical record store used by saved coffee drafts.
     pub records: Arc<MemoryKeyValueStore>,
-}
-impl<Services: Send + Sync + 'static, Sales: Send + Sync + 'static> HasTaskSpawner
-    for Cafe<Services, Sales>
-{
-    /// Reuse the consumer's independent task provider.
-    type Tasks = Providers;
-    /// Delegate without installing another runtime.
-    fn task_spawner(&self) -> &Self::Tasks {
-        &self.base
-    }
-}
-impl<Services: Send + Sync + 'static, Sales: Send + Sync + 'static> HasCpuExecutor
-    for Cafe<Services, Sales>
-{
-    /// Reuse the consumer's CPU provider in the same environment.
-    type Executor = CoffeeCpu;
-    /// Delegate the application-selected CPU capability.
-    fn cpu_executor(&self) -> &Self::Executor {
-        &self.cpu
-    }
-}
-impl<Services: Send + Sync + 'static, Sales: Send + Sync + 'static> HasBlockingExecutor
-    for Cafe<Services, Sales>
-{
-    /// Reuse the consumer's blocking provider.
-    type Executor = CoffeeBlocking;
-    /// Delegate to the independently selected blocking capability.
-    fn blocking_executor(&self) -> &Self::Executor {
-        &self.blocking
-    }
-}
-impl<Services: Send + Sync + 'static, Sales: Send + Sync + 'static> HasClock
-    for Cafe<Services, Sales>
-{
-    /// Monotonic timing stays with the consumer's clock provider.
-    type Clock = TestClock;
-    /// Delegate the existing timing capability.
-    fn clock(&self) -> &Self::Clock {
-        &self.base.clock
-    }
-}
-impl<Services: Send + Sync + 'static, Sales: Send + Sync + 'static> HasWallClock
-    for Cafe<Services, Sales>
-{
-    /// Explicit test wall clock supports reproducible lease checks.
-    type Clock = TestWallClock;
-    /// Borrow the same authority for all activation operations.
-    fn wall_clock(&self) -> &Self::Clock {
-        &self.wall
-    }
-}
-impl<Services: Send + Sync + 'static, Sales: Send + Sync + 'static> HasTracer
-    for Cafe<Services, Sales>
-{
-    /// Return the example tracer used by every nested domain body.
-    fn tracer(&self) -> &Tracer {
-        &self.tracer
-    }
-}
-impl<Services: Send + Sync + 'static, Sales: Send + Sync + 'static> HasCancellation
-    for Cafe<Services, Sales>
-{
-    /// Borrow the explicit example cancellation authority.
-    fn cancellation(&self) -> &Cancellation {
-        &self.cancellation
-    }
-}
-impl<Services: Send + Sync + 'static, Sales: Send + Sync + 'static> HasRequestScope
-    for Cafe<Services, Sales>
-{
-    /// Resolver sharing uses the consumer-selected session identity, not a global key.
-    fn request_scope(&self) -> &RequestScope {
-        &self.requests
-    }
-}
-impl<Services: Send + Sync + 'static, Sales: Send + Sync + 'static> HasTransactionDomain
-    for Cafe<Services, Sales>
-{
-    /// Share the same journal domain across macro-created transaction attempts.
-    fn transaction_domain(&self) -> Arc<TransactionDomain> {
-        Arc::clone(&self.transactions)
-    }
-}
-impl<Services: Send + Sync + 'static, Sales: Send + Sync + 'static> HasClusterActivationStore
-    for Cafe<Services, Sales>
-{
-    /// Keep provider failures in the existing concrete activation error channel.
-    type Store = MemoryClusterMessageStore;
-    /// Share only the existing store handle.
-    fn cluster_activation_store(&self) -> Arc<Self::Store> {
-        Arc::clone(&self.activation)
-    }
-}
-impl<Services: Send + Sync + 'static, Sales: Send + Sync + 'static> HasEventJournal
-    for Cafe<Services, Sales>
-{
-    /// Use the existing bounded in-memory event journal.
-    type Journal = MemoryEventJournal;
-    /// Retain one authoritative journal instance.
-    fn event_journal(&self) -> Arc<Self::Journal> {
-        Arc::clone(&self.journal)
-    }
-}
-impl<Services: Send + Sync + 'static, Sales: Send + Sync + 'static> HasAtomicProjectionStore<Sales>
-    for Cafe<Services, Sales>
-{
-    /// Keep state and cursor atomic under the existing store contract.
-    type Store = MemoryProjectionStore<Sales>;
-    /// Retain the shared projection authority.
-    fn atomic_projection_store(&self) -> Arc<Self::Store> {
-        Arc::clone(&self.projection)
-    }
-}
-impl<Services: Send + Sync + 'static, Sales: Send + Sync + 'static> HasPersistedQueueStore
-    for Cafe<Services, Sales>
-{
-    /// Existing queue provider keeps its original typed settlement errors.
-    type Store = MemoryPersistedQueueStore;
-    /// Return the configured bounded queue store.
-    fn persisted_queue_store(&self) -> Arc<Self::Store> {
-        Arc::clone(&self.queues)
-    }
-}
-impl<Services: Send + Sync + 'static, Sales: Send + Sync + 'static> HasWorkflowEngine
-    for Cafe<Services, Sales>
-{
-    /// The workflow engine remains the existing logical recording/replay authority.
-    type Engine = MemoryWorkflowEngine;
-    /// Return the shared engine selected through this environment.
-    fn workflow_engine(&self) -> Arc<Self::Engine> {
-        Arc::clone(&self.workflow)
-    }
 }
 /// Application-selected worker provider for these finite demonstrations.
 pub struct Providers {
@@ -416,16 +308,5 @@ impl<Services: Send + Sync + 'static, Sales: Send + Sync + 'static> Cafe<Service
             workflow: Arc::new(MemoryWorkflowEngine::new()),
             records: Arc::new(MemoryKeyValueStore::new(StoreCapacity::Bounded(capacity))),
         })
-    }
-}
-
-impl<Services: Send + Sync + 'static, Sales: Send + Sync + 'static> HasKeyValueStore
-    for Cafe<Services, Sales>
-{
-    /// Logical store, without a physical durability warranty.
-    type Store = MemoryKeyValueStore;
-    /// Return the consumer-selected record provider.
-    fn key_value_store(&self) -> Arc<Self::Store> {
-        self.records.clone()
     }
 }

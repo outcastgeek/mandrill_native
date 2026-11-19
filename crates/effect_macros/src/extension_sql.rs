@@ -6,7 +6,7 @@ use syn::fold::Fold;
 use syn::{
     Expr, Ident, Stmt, Token,
     ext::IdentExt,
-    parse::{Parse, ParseStream},
+    parse::{Parse, ParseStream, Parser},
     punctuated::Punctuated,
 };
 use syn::{parenthesized, parse_quote};
@@ -216,12 +216,16 @@ fn client(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> {
         let lanes = fields.take("row_lanes")?;
         client = quote!(#client.with_row_lanes(#lanes));
     }
-    let output = if fields.contains("pending_checkout_admission") {
+    let mut output = if fields.contains("pending_checkout_admission") {
         let admission = fields.take("pending_checkout_admission")?;
         quote!(#client.with_pending_checkout_admission(#admission))
     } else {
         quote!(::core::result::Result::<_, #path::__private::effect::memory::MemoryError>::Ok(#client))
     };
+    if fields.contains("session_pool") {
+        let sessions = fields.take("session_pool")?;
+        output = quote!((#output).map(|client| client.with_session_pool(#sessions)));
+    }
     fields.finish(output)
 }
 
@@ -893,10 +897,7 @@ fn with_sql(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> 
         // Its captures move once through the existing core callback lowering.
         let selection: Stmt = parse_quote!(let #arg = #path::__private::effect::Effect::service(|client: &#path::SqlClient| client.clone())?;);
         let statements = std::iter::once(selection).chain(statements).collect();
-        let program = crate::async_expand::expand_once(
-            statements,
-            &quote!(#path::__private::effect::__private),
-        );
+        let program = crate::extension_support::effect_body_once(statements, path);
         quote!(#path::sql_with(#select, #program))
     };
     let result = match errors {
@@ -904,6 +905,183 @@ fn with_sql(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> 
         None => result,
     };
     Ok(quote!({ #(#body)* #result }))
+}
+
+const NATIVE_OPERATIONS: &[&str] = &[
+    "connection_operation", "transaction_operation", "reserve_transaction_operation",
+    "run_transaction_operation", "kernel_connection", "kernel_transaction", "session_native",
+    "open", "migrator", "migrate_initialize", "migrate_up",
+];
+
+/// Read a native role in receiver/argument order. Its expression stays within
+/// the caller's Rust temporary scope because the returned future borrows it.
+fn native_field(input: ParseStream<'_>, name: &str) -> syn::Result<Expr> {
+    let field: Ident = input.parse()?;
+    if field != name {
+        return Err(syn::Error::new(field.span(), format!("expected {name}:")));
+    }
+    input.parse::<Token![:]>()?;
+    let expression = input.parse()?;
+    if !input.is_empty() {
+        input.parse::<Token![,]>()?;
+    }
+    Ok(expression)
+}
+
+/// Select native SQL ownership without lifting the returned Result future.
+fn native_operation(input: ParseStream<'_>, path: &TokenStream) -> syn::Result<TokenStream> {
+    let mode: Ident = input.parse()?;
+    input.parse::<Token![;]>()?;
+    let (owner, method, argument) = match mode.to_string().as_str() {
+        "open" => {
+            let memory = native_field(input, "memory")?;
+            let pool = native_field(input, "pool")?;
+            return Ok(quote!(#path::SqlClient::open(#memory, #pool)));
+        }
+        "migrator" => {
+            let kernel = native_field(input, "kernel")?;
+            let catalog = native_field(input, "catalog")?;
+            return Ok(quote!(#path::SqlMigrator::new(#kernel, #catalog)));
+        }
+        "migrate_initialize" => ("migrator", "initialize", None),
+        "migrate_up" => ("migrator", "up", None),
+        "connection_operation" => ("kernel", "connection_operation", Some("operation")),
+        "transaction_operation" => ("kernel", "transaction_operation", Some("operation")),
+        "reserve_transaction_operation" => ("kernel", "reserve_transaction_operation", None),
+        "run_transaction_operation" => ("reservation", "run", Some("operation")),
+        "kernel_connection" => ("kernel", "with_connection", Some("body")),
+        "kernel_transaction" => ("kernel", "transaction", Some("body")),
+        "session_native" => ("session", "with_native", Some("body")),
+        _ => return Err(syn::Error::new(mode.span(), "unsupported native SQL operation")),
+    };
+    let receiver = native_field(input, owner)?;
+    let argument = argument.map(|name| native_field(input, name)).transpose()?;
+    let method = Ident::new(method, Span::mixed_site());
+    Ok(quote!((#receiver).#method(#argument)))
+}
+
+/// Select an existing typed SQL operation while retaining its receiver, ownership and effect context.
+fn operation(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> {
+    use crate::domain_expand::BodyCategory;
+    let input: crate::callback_expand::Input = syn::parse2(input)?;
+    let mode = input.mode(
+        &[
+            "execute", "query", "first", "first_prepared", "scalar", "session", "native",
+            "transaction", "transaction_once", "savepoint", "savepoint_once", "fold",
+            "fold_effect", "batch",
+        ],
+        "",
+    )?;
+    let mut fields = input.fields;
+    let receiver = if matches!(mode.as_str(), "execute" | "query" | "first" | "scalar")
+        && !fields.contains("client")
+    {
+        quote!(#path::Sql::)
+    } else {
+        let client = fields.transform("client", |expr, _| Ok(quote!(&(#expr))))?;
+        quote!(#client.)
+    };
+    let method = match mode.as_str() {
+        "first_prepared" => quote!(first_prepared_read),
+        "session" => quote!(with_session),
+        "fold" => quote!(fold_rows),
+        "fold_effect" => quote!(fold_rows_effect),
+        _ => {
+            let method = Ident::new(&mode, Span::mixed_site());
+            quote!(#method)
+        }
+    };
+    let output = match mode.as_str() {
+        "execute" | "scalar" => {
+            let statement = fields.take("statement")?;
+            quote!(#receiver #method(#statement))
+        }
+        "batch" => {
+            let statements = fields.take("statements")?;
+            quote!(#receiver #method(#statements))
+        }
+        "query" | "first" | "first_prepared" => {
+            let statement = fields.take("statement")?;
+            let decoder = fields.take("decoder")?;
+            quote!(#receiver #method(#statement, #decoder))
+        }
+        "fold" | "fold_effect" => {
+            let statement = fields.take("statement")?;
+            let decoder = fields.take("decoder")?;
+            let initial = fields.role("initial", 0, BodyCategory::Native)?;
+            let step = fields.role(
+                "step",
+                2,
+                if mode == "fold_effect" { BodyCategory::Effect } else { BodyCategory::Native },
+            )?;
+            quote!(#receiver #method(#statement, #decoder, #initial, #step))
+        }
+        "native" => {
+            let body = fields.transform("body", |expr, inline| {
+                let callback = if inline {
+                    crate::domain_expand::role(expr, 1, BodyCategory::Native)?
+                } else {
+                    quote!(#expr)
+                };
+                Ok(quote!({
+                    fn __sql_native_callback<A, F>(callback: F) -> F
+                    where
+                        F: for<'a> Fn(&'a mut #path::__private::TursoConnection) -> #path::NativeFuture<'a, A>,
+                    {
+                        callback
+                    }
+                    __sql_native_callback(#callback)
+                }))
+            })?;
+            quote!(#receiver native(#body))
+        }
+        _ => {
+            let owner = if mode == "session" {
+                quote!(#path::SqlSession)
+            } else {
+                quote!(#path::SqlTransaction)
+            };
+            let factory = if mode.ends_with("_once") { quote!(FnOnce) } else { quote!(Fn) };
+            let body = fields.transform("body", |expr, inline| {
+                let callback = if inline {
+                    sql_scope_body(expr, path)?
+                } else {
+                    quote!(#expr)
+                };
+                Ok(quote!({
+                    fn __sql_scope_callback<A, R, F>(callback: F) -> F
+                    where
+                        A: ::core::marker::Send + 'static,
+                        R: ::core::marker::Send + ::core::marker::Sync + 'static,
+                        F: #factory(#owner) -> #path::__private::effect::Effect<A, #path::SqlError, R>,
+                    {
+                        callback
+                    }
+                    __sql_scope_callback(#callback)
+                }))
+            })?;
+            quote!(#receiver #method(#body))
+        }
+    };
+    fields.finish(output)
+}
+
+/// Keep owned input and captures in each invocation's typed Effect body.
+fn sql_scope_body(expr: Expr, path: &TokenStream) -> syn::Result<TokenStream> {
+    let Expr::Closure(closure) = expr else {
+        return Err(syn::Error::new_spanned(expr, "SQL body requires one closure parameter"));
+    };
+    if closure.inputs.len() != 1 || closure.asyncness.is_some()
+        || !matches!(closure.output, syn::ReturnType::Default)
+    {
+        return Err(syn::Error::new_spanned(closure, "SQL body requires one parameter and a braced Effect body"));
+    }
+    let Expr::Block(block) = *closure.body else {
+        return Err(syn::Error::new_spanned(closure.body, "SQL Effect body must be braced"));
+    };
+    let inputs = closure.inputs;
+    let body = crate::extension_support::effect_body_once(block.block.stmts, path);
+    Ok(quote!(move |#inputs| #body))
 }
 
 /// Dispatch only the five approved SQL entry points through the existing shared proc-macro registry.
@@ -945,6 +1123,18 @@ pub(crate) fn expand(name: &str, input: TokenStream) -> syn::Result<TokenStream>
         }
         "sql" if matches!(input.clone().into_iter().next(), Some(proc_macro2::TokenTree::Ident(mode)) if mode == "prepared_statement") => {
             prepared_statement(input, &path)
+        }
+        "sql" if matches!(input.clone().into_iter().next(), Some(proc_macro2::TokenTree::Ident(mode))
+            if NATIVE_OPERATIONS.contains(&mode.to_string().as_str())) =>
+        {
+            (|stream: ParseStream<'_>| native_operation(stream, &path)).parse2(input)
+        }
+        "sql" if matches!(input.clone().into_iter().next(), Some(proc_macro2::TokenTree::Ident(mode))
+            if matches!(mode.to_string().as_str(), "execute" | "query" | "first" | "first_prepared"
+                | "scalar" | "session" | "native" | "transaction" | "transaction_once"
+                | "savepoint" | "savepoint_once" | "fold" | "fold_effect" | "batch")) =>
+        {
+            operation(input, &path)
         }
         "sql" => statement(input, &path),
         "sql_insert" => mutation(input, &path, false),

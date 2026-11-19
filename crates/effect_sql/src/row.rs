@@ -6,7 +6,8 @@
 
 use crate::RowError;
 use crate::{
-    codec, effect_future, effect_provide_some, effect_scope, effect_sync, effect_try_sync,
+    codec, effect_from_result, effect_future, effect_provide_some, effect_scope, effect_sync,
+    effect_try_sync,
 };
 use effect::{Codec, Effect, Exit, NativeContext, PureCodec};
 use sqlx::{ColumnIndex, Decode, Row, Turso, TursoRow, Type, ValueRef};
@@ -132,8 +133,7 @@ where
                     Ok(_) => {}
                 }
                 match row.try_get::<T, _>(index) {
-                    Ok(value) => context
-                        .run(codec.codec.decode_once(value), env)
+                    Ok(value) => effect::effect! { run_in_context; context: context, program: codec.codec.decode_once(value), environment: env, }
                         .await
                         .map_error(|issue| RowError::Schema {
                             column: key.label(),
@@ -178,15 +178,13 @@ where
                     Ok(_) => {}
                 }
                 match row.try_get::<T, _>(index) {
-                    Ok(value) => match failure_as(
-                        context
-                            .run(codec.codec.decode_once(value), env)
+                    Ok(value) => match effect::effect! { run_in_context; context: context, program: codec.codec.decode_once(value), environment: env, }
                             .await
                             .map_error(|issue| RowError::Schema {
                                 column: key.label(),
                                 issue,
-                            }),
-                    ) {
+                            })
+                            .into_failure() {
                         Ok(value) => Exit::Success(Some(value)),
                         Err(exit) => exit,
                     },
@@ -283,7 +281,7 @@ impl<A: Send + 'static, R: Send + Sync + 'static> RowStep<R> for Effect<A, RowEr
     type Output = A;
     /// Reuse the existing Effect interpreter for effectful validation.
     fn evaluate(self, context: &RowContext<R>) -> RowFuture<'_, A> {
-        Box::pin(context.context.run(self, context.env.clone()))
+        Box::pin(effect::effect! { run_in_context; context: context.context, program: self, environment: context.env.clone(), })
     }
 }
 impl<T: Send + Sync + 'static, R: Send + Sync + 'static> RowStep<R>
@@ -294,10 +292,11 @@ impl<T: Send + Sync + 'static, R: Send + Sync + 'static> RowStep<R>
     /// Acquire through the existing sealed core binder and await finalizers when row decoding settles.
     fn evaluate(self, context: &RowContext<R>) -> RowFuture<'_, Self::Output> {
         use effect::__private::AsyncBindable;
-        Box::pin(context.context.run(
-            self.into_scoped_effect(context.scope.clone()),
-            context.env.clone(),
-        ))
+        Box::pin(effect::effect! {
+            run_in_context; context: context.context,
+            program: self.into_scoped_effect(context.scope.clone()),
+            environment: context.env.clone(),
+        })
     }
 }
 impl<R: Send + Sync + 'static> RowContext<R> {
@@ -310,7 +309,7 @@ impl<R: Send + Sync + 'static> RowContext<R> {
         if self.context.cancellation().is_requested() {
             return Err(Box::new(Exit::Interrupted));
         }
-        failure_as(step.evaluate(self).await).map_err(Box::new)
+        step.evaluate(self).await.into_failure().map_err(Box::new)
     }
     /// Observe cooperative cancellation between row-program loop iterations.
     /// Only interruption allocates a boxed exit; successful checkpoints allocate nothing.
@@ -322,17 +321,6 @@ impl<R: Send + Sync + 'static> RowContext<R> {
         }
     }
 }
-/// Convert only success to a value; defects/interruption/finalization remain typed exits.
-pub(crate) fn failure_as<A, B, E>(exit: Exit<A, E>) -> Result<A, Exit<B, E>> {
-    match exit {
-        Exit::Success(value) => Ok(value),
-        Exit::Fail(error) => Err(Exit::Fail(error)),
-        Exit::Die(defect) => Err(Exit::Die(defect)),
-        Exit::Interrupted => Err(Exit::Interrupted),
-        Exit::FinalizationFailed(details) => Err(Exit::FinalizationFailed(details)),
-    }
-}
-
 type RowProjection<A> = dyn Fn(&TursoRow) -> Result<A, RowError> + Send + Sync;
 type EnvironmentProjection<A, R> = dyn Fn(&TursoRow, &R) -> Result<A, RowError> + Send + Sync;
 enum BorrowedProjection<A, R> {
@@ -463,7 +451,7 @@ impl<A: Send + 'static, R: Send + Sync + 'static> RowDecoder<A, R> {
                     }, }
                 },
         };
-        context.run(program, env).await
+        effect::effect! { run_in_context; context: context, program: program, environment: env, }.await
     }
 }
 
@@ -499,40 +487,39 @@ impl<R: Send + Sync + 'static> CellCodec<bool, i64, R> {
     /// This stricter domain codec coexists with SQLx's native permissive bool interoperability.
     pub fn boolean() -> Self {
         Self::new(codec! {
-        decode: |value| {
-            effect_try_sync! {
-                once; body: {
-                let __dsl_result = match value {
-                0 => Ok(false),
-                1 => Ok(true),
-                _ => Err(effect::SchemaIssue::new(
-                    effect::SchemaIssueKind::OutOfRange,
-                )),
-            }; move || __dsl_result }, on_error: ::core::convert::identity, }
-        }, encode: |value| effect_sync! { once; body: move || i64::from(value), }, })
+            decode: |value| effect_from_result! {
+                once;
+                result: match value {
+                    0 => Ok(false),
+                    1 => Ok(true),
+                    _ => Err(effect::SchemaIssue::new(effect::SchemaIssueKind::OutOfRange)),
+                },
+            },
+            encode: |value| effect_sync! { once; body: move || i64::from(value), },
+        })
     }
 }
 impl<R: Send + Sync + 'static> CellCodec<f64, f64, R> {
     /// Reject non-finite native reals in both directions without accepting a string/JSON detour.
     pub fn finite_real() -> Self {
         Self::new(codec! {
-        decode: |value: f64| {
-            effect_try_sync! {
-                once; body: {
-                let __dsl_result = if value.is_finite() {
-                Ok(value)
-            } else {
-                Err(effect::SchemaIssue::new(effect::SchemaIssueKind::NonFinite))
-            }; move || __dsl_result }, on_error: ::core::convert::identity, }
-        }, encode: |value: f64| {
-            effect_try_sync! {
-                once; body: {
-                let __dsl_result = if value.is_finite() {
-                Ok(value)
-            } else {
-                Err(effect::SchemaIssue::new(effect::SchemaIssueKind::NonFinite))
-            }; move || __dsl_result }, on_error: ::core::convert::identity, }
-        }, })
+            decode: |value: f64| effect_from_result! {
+                once;
+                result: if value.is_finite() {
+                    Ok(value)
+                } else {
+                    Err(effect::SchemaIssue::new(effect::SchemaIssueKind::NonFinite))
+                },
+            },
+            encode: |value: f64| effect_from_result! {
+                once;
+                result: if value.is_finite() {
+                    Ok(value)
+                } else {
+                    Err(effect::SchemaIssue::new(effect::SchemaIssueKind::NonFinite))
+                },
+            },
+        })
     }
 }
 impl<R: Send + Sync + 'static> CellCodec<effect::Decimal, String, R> {

@@ -468,6 +468,8 @@ struct MemoryMetrics {
 /// In-memory semantic implementation. Its capacity is explicit; full
 /// cardinality returns an error instead of dropping measurements silently.
 #[derive(Clone)]
+#[derive(crate::EffectEnvironment)]
+#[effect_environment(metric_recorder(provider = Self, get = self))]
 pub struct MemoryMetricRecorder {
     state: Arc<Mutex<MemoryMetrics>>,
     capacity: MetricCapacity,
@@ -558,17 +560,5 @@ impl MetricRecorder for MemoryMetricRecorder {
             .insert(sample.labels.clone(), MetricAggregate::first(sample.value));
         state.count = next_count;
         Ok(())
-    }
-}
-
-impl HasMetricRecorder for MemoryMetricRecorder {
-    /// Type alias for recorder in metric.
-    type Recorder = Self;
-
-    ///
-    /// # Returns
-    /// Type: `&Self::Recorder`.
-    fn metric_recorder(&self) -> &Self::Recorder {
-        self
     }
 }

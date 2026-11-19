@@ -411,6 +411,22 @@ fn read_through(
     path: &TokenStream,
     dependent: bool,
 ) -> syn::Result<TokenStream> {
+    if crate::restricted_expand::has_mode(&input, &["get", "invalidate_dependency"]) {
+        let input: crate::callback_expand::Input = syn::parse2(input)?;
+        let mode = input.mode(&["get", "invalidate_dependency"], "get")?;
+        let mut fields = input.fields;
+        let cache = fields.transform("cache", |value, _| Ok(quote!(&(#value))))?;
+        let output = if mode == "get" {
+            let key = fields.take("key")?;
+            quote!((#cache).get(#key))
+        } else if dependent {
+            let dependency = fields.take("dependency")?;
+            quote!((#cache).invalidate_dependency(#dependency))
+        } else {
+            return Err(syn::Error::new(Span::call_site(), "invalidation requires a dependency cache"));
+        };
+        return fields.finish(output);
+    }
     let mut fields = Fields::parse(input)?;
     let scope = fields.expression("scope")?;
     let retain = fields.expression("retain")?;
@@ -517,6 +533,12 @@ fn message_arguments(input: TokenStream, path: &TokenStream) -> syn::Result<Toke
 }
 /// D27 complete catalogue/culture/selection/missing policy with explicit optional reload.
 fn localization(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> {
+    if crate::restricted_expand::has_mode(&input, &["reload"]) {
+        let input: crate::callback_expand::Input = syn::parse2(input)?;
+        let mut fields = input.fields;
+        let catalog = fields.transform("catalog", |value, _| Ok(quote!(&(#value))))?;
+        return fields.finish(quote!((#catalog).reload()));
+    }
     let mut fields = Fields::parse(input)?;
     let catalogue = fields.expression("catalogue")?;
     let cultures = fields.expression("cultures")?;
@@ -531,10 +553,16 @@ fn localization(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStre
         }
         None => quote!(None),
     };
+    let constructor = match fields.optional("generations") {
+        Some((generations, false)) => {
+            let generations = fields.bind("generations", quote!(#generations))?;
+            quote!(#path::localization::Localization::new_prepared(#catalogue, #cultures, #select, #missing, #reload, #generations))
+        }
+        Some((generations, true)) => return Err(syn::Error::new_spanned(generations, "generations requires a prepared owner expression")),
+        None => quote!(#path::localization::Localization::new(#catalogue, #cultures, #select, #missing, #reload)),
+    };
     let bindings = fields.finish()?;
-    Ok(
-        quote!({ #(#bindings)* #path::localization::Localization::new(#catalogue, #cultures, #select, #missing, #reload) }),
-    )
+    Ok(quote!({ #(#bindings)* #constructor }))
 }
 /// D25 typed required/optional probe construction; readiness must be declared.
 fn availability(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> {
@@ -550,6 +578,7 @@ fn availability(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStre
     let errors = fields.bind("errors", quote!(#errors))?;
     let deadline = fields.expression("deadline")?;
     let parallelism = fields.expression("parallelism")?;
+    let workspace = fields.optional("workspace").map(|(value, _)| fields.bind("workspace", quote!(#value))).transpose()?;
     let traffic = match fields.optional("traffic_ready") {
         Some((value, _)) => {
             let value = fields.bind("traffic_ready", quote!(#value))?;
@@ -627,6 +656,10 @@ fn availability(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStre
     };
     let result = match prepared_output {
         Some(output) => quote!((#result).map(|availability| availability.with_prepared_output(#output))),
+        None => result,
+    };
+    let result = match workspace {
+        Some(workspace) => quote!((#result).map(|availability| availability.with_prepared_workspace(#workspace))),
         None => result,
     };
     Ok(quote!((|| { #(#bindings)* #result })()))
@@ -725,11 +758,91 @@ fn web(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> {
         quote!({ #(#bindings)* let #builder = #path::application::Web::new(#policy, #errors, #startup, #environment, #listen, #protocols, #routes); #(#methods)* #builder }),
     )
 }
+/// Compose an existing Web definition with its original scoped host owner.
+fn web_operation(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> {
+    let input: crate::callback_expand::Input = syn::parse2(input)?;
+    let mode = input.mode(&["prepare", "with_host", "run", "clear_output_cache", "output_reply", "prepared_output_cache", "admit", "traffic_ready"], "")?;
+    let mut fields = input.fields;
+    if mode == "prepared_output_cache" {
+        use crate::domain_expand::BodyCategory;
+        let core = quote!(#path::__private::effect);
+        let cache = quote!(#path::output_cache);
+        let request = quote!(#path::__private::Request);
+        let scope = fields.take("scope")?;
+        let policy = fields.take("policy")?;
+        let source = fields.take("source")?;
+        let storage = fields.take("storage")?;
+        let refusals = fields.take("refusals")?;
+        let gate = fields.role("gate", 1, BodyCategory::Effect)?;
+        let authenticated = fields.role("authenticated", 1, BodyCategory::Native)?;
+        let partition = fields.role("partition", 2, BodyCategory::Native)?;
+        let on_error = fields.role("on_error", 1, BodyCategory::Native)?;
+        return fields.finish_inferred(
+            quote!(E, R, G, A, P, M),
+            &[("scope", quote!(#core::Scope<#core::SharedValue<E>>)),
+              ("policy", quote!(#cache::FiniteOutputPolicy)),
+              ("source", quote!(#cache::PreparedFiniteSource<E, R>)),
+              ("storage", quote!(#cache::PreparedOutputCacheStorage<E>)),
+              ("refusals", quote!(#core::PreparedCacheRefusals<E>)),
+              ("gate", quote!(G)), ("authenticated", quote!(A)),
+              ("partition", quote!(P)), ("on_error", quote!(M))],
+            quote!(#core::Effect<#cache::OutputCache<E, R>, #core::SharedValue<E>, R>),
+            quote!(E: Send + 'static,
+                R: #core::HasClock + #core::HasTaskSpawner + #path::__private::HasRequest + Send + Sync + 'static,
+                G: Fn(#request) -> #core::Effect<(), E, R> + Send + Sync + 'static,
+                A: Fn(&R) -> bool + Send + Sync + 'static,
+                P: Fn(&R, &#request) -> ::core::result::Result<#cache::OutputPartition, #path::WebError> + Send + Sync + 'static,
+                M: Fn(#path::WebError) -> E + Send + Sync + 'static),
+            quote!(#cache::OutputCache::scoped_prepared(#scope, #policy, #source, (#storage, #refusals), #gate, #authenticated, #partition, #on_error)),
+        );
+    }
+    let source = fields.transform("source", |value, _| Ok(quote!(&(#value))))?;
+    let output = match mode.as_str() {
+        "prepare" => {
+            let scope = fields.take("scope")?;
+            quote!(#source.prepare(#scope))
+        }
+        "with_host" => {
+            let body = fields.transform("body", |expression, inline| {
+                let body = callback(expression, inline, path, true)?;
+                Ok(quote!({
+                    fn __web_host<A, E, R, F>(body: F) -> F
+                    where A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static,
+                        F: Fn(#path::__private::ServerHost)
+                            -> #path::__private::effect::Effect<A, E, R>,
+                    {
+                        body
+                    }
+                    __web_host(#body)
+                }))
+            })?;
+            quote!(#source.with_host(#body))
+        }
+        "run" => quote!(#source.run()),
+        "clear_output_cache" => quote!(#source.clear()),
+        "output_reply" => quote!(#source.reply()),
+        "traffic_ready" => quote!(#source.traffic_ready()),
+        "admit" => {
+            let class = fields.take("class")?;
+            let body = fields.role("body", 0, crate::domain_expand::BodyCategory::Native)?;
+            let on_refusal = fields.take("on_refusal")?;
+            quote!(#source.admit(#class, #body, #on_refusal))
+        }
+        _ => return Err(syn::Error::new(Span::call_site(), "missing Web operation")),
+    };
+    fields.finish(output)
+}
+
 /// Existing shared dispatcher; runtime owners are always resolved through the
 /// consumer's actual renamed effect-server-web package dependency.
 pub(crate) fn expand(name: &str, input: TokenStream) -> syn::Result<TokenStream> {
     let path = crate::extension_support::crate_path("effect-server-web")?;
     match name {
+        "web" if matches!(input.clone().into_iter().next(), Some(proc_macro2::TokenTree::Ident(mode))
+            if matches!(mode.to_string().as_str(), "prepare" | "with_host" | "run" | "clear_output_cache" | "output_reply" | "prepared_output_cache" | "admit" | "traffic_ready")) =>
+        {
+            web_operation(input, &path)
+        }
         "web" => web(input, &path),
         "security" => security(input, &path),
         "csp" => csp(input, &path),

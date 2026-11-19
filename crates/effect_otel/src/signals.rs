@@ -4,7 +4,7 @@ mod prepared;
 use prepared::PreparedSignals;
 pub use prepared::{PreparedAttributeWriter, PreparedOtelRedaction, PreparedOtelSignalCapacity};
 
-use crate::{BorrowedProviders, OtelContext, OtelMetricRecorder};
+use crate::{BorrowedProviders, OtelContext, OtelMetricRecorder, otel};
 use effect::memory::{MemoryError, PreparedMemory, RegionId};
 use effect::{
     Annotations, Defect, Diagnostics, Effect, HasClock, HasTracer, LogLevel, Logger,
@@ -473,7 +473,7 @@ impl OtelBackend {
         let selected = self.native_context(trace);
         let same = current.span().span_context() == selected.span().span_context();
         if current.get::<BridgeAttachment>().is_some() && (trace.span.is_none() || same) {
-            let tracing = PollInstrumentation::enter(&self.tracing, trace);
+            let tracing = self.tracing.enter_poll_scope(trace);
             Box::new(OtelPollScope {
                 _context: current.attach(),
                 _tracing: tracing,
@@ -532,7 +532,7 @@ struct OtelPollScope {
     /// The native context guard is thread-bound and never retained in a future.
     _context: opentelemetry::ContextGuard,
     /// Existing tracing adapter's span and dispatcher guards.
-    _tracing: Box<dyn PollScope>,
+    _tracing: NativePollScope,
 }
 impl PollScope for OtelPollScope {}
 /// Empty guard returned after a diagnostic-only native instrumentation failure.
@@ -543,7 +543,7 @@ impl PollInstrumentation for OtelBackend {
     fn enter(&self, trace: &TraceContext) -> Box<dyn PollScope> {
         let result = catch_unwind(AssertUnwindSafe(|| {
             let native = self.native_context(trace).with_value(BridgeAttachment);
-            let tracing = PollInstrumentation::enter(&self.tracing, trace);
+            let tracing = self.tracing.enter_poll_scope(trace);
             Box::new(OtelPollScope {
                 _context: native.attach(),
                 _tracing: tracing,
@@ -617,7 +617,7 @@ impl PollInstrumentation for SpanInstrumentation {
                 .with_value(PendingOptions {
                     options: Arc::clone(&self.options),
                 });
-            let tracing = PollInstrumentation::enter(&self.backend.tracing, trace);
+            let tracing = self.backend.tracing.enter_poll_scope(trace);
             Box::new(OtelPollScope {
                 _context: native.attach(),
                 _tracing: tracing,
@@ -651,7 +651,11 @@ impl Otel {
         E: Send + 'static,
         R: HasOtel + Send + Sync + 'static,
     {
-        program.with_poll_instrumentation(|env| Arc::new(selected_backend(env)))
+        effect! {
+            poll_instrumentation;
+            program: program,
+            select: |env| Arc::new(selected_backend(env)),
+        }
     }
 
     /// Lower the convenience DSL to the exact `Effect::with_span` lifetime path.
@@ -668,20 +672,26 @@ impl Otel {
     {
         let name = name.into();
         let options = Arc::new(options);
-        Effect::<TraceContext, E, R>::trace_context().flat_map(move |trace| {
-            let parent = trace.span;
-            let options = Arc::clone(&options);
-            program
-                .clone()
-                .with_span(Arc::clone(&name))
-                .with_poll_instrumentation(move |env| {
-                    Arc::new(SpanInstrumentation {
-                        backend: selected_backend(env),
-                        parent: parent.clone(),
-                        options: Arc::clone(&options),
-                    })
-                })
-        })
+        effect! {
+            bind;
+            program: effect! { trace_context; },
+            body: move |trace: TraceContext| {
+                let parent = trace.span;
+                let options = Arc::clone(&options);
+                otel! {
+                    instrumented_span;
+                    name: Arc::clone(&name),
+                    program: program.clone(),
+                    select: move |env| {
+                        Arc::new(SpanInstrumentation {
+                            backend: selected_backend(env),
+                            parent: parent.clone(),
+                            options: Arc::clone(&options),
+                        })
+                    },
+                }
+            },
+        }
     }
 
     /// Capture detached flags/tracestate/baggage from the current poll attachment.
@@ -693,7 +703,7 @@ impl Otel {
         R: HasOtel + Send + Sync + 'static,
     {
         effect! {
-            let trace = Effect::<TraceContext, E, R>::trace_context()?;
+            let trace = effect! { trace_context; }?;
             service! {
                 env |env: &R| {
                     let backend = env.otel();
@@ -727,17 +737,20 @@ impl Otel {
     {
         effect! {
         bind;
-        program: Effect::<TraceContext, E, R>::trace_context(),
-        body: move |mut trace| {
-                   trace.span = None;
-                   let context = context.clone();
-                   program
-                       .clone()
-                       .with_poll_instrumentation(move |env| {
-                           Arc::new(env.otel().with_context(context.clone()))
-                       })
-                       .with_trace_context(trace)
-               },
+        program: effect! { trace_context; },
+        body: move |mut trace: TraceContext| {
+            trace.span = None;
+            let context = context.clone();
+            effect! {
+                with_trace_context;
+                program: effect! {
+                    poll_instrumentation;
+                    program: program.clone(),
+                    select: move |env: &R| Arc::new(env.otel().with_context(context.clone())),
+                },
+                context: trace,
+            }
+        },
         }
     }
 
@@ -756,12 +769,14 @@ impl Otel {
         let entries = Arc::new(entries);
         effect! {
         bind;
-        program: Self::current_context(),
+        program: otel! { current_context; },
         body: move |context| {
                    let next = context.with_baggage(entries.iter().cloned());
-                   program.clone().with_poll_instrumentation(move |env| {
-                       Arc::new(env.otel().with_context(next.clone()))
-                   })
+                   effect! {
+                       poll_instrumentation;
+                       program: program.clone(),
+                       select: move |env: &R| Arc::new(env.otel().with_context(next.clone())),
+                   }
                },
         }
     }
@@ -777,7 +792,7 @@ impl Otel {
         let action = Arc::new(action);
         effect! {
             let action = Arc::clone(&action);
-            let trace = Effect::<TraceContext, NativeError, R>::trace_context()?;
+            let trace = effect! { trace_context; }?;
             let backend = service! { env |env: &R| { env.otel().clone() }, }?;
             effect_try_sync! {
                 body { backend.with_native(&trace, |span| action(span)) },
@@ -846,7 +861,7 @@ impl Otel {
         E: Send + 'static,
         R: HasOtel + Send + Sync + 'static,
     {
-        Self::attribute(key, value.into())
+        otel! { attribute; key: key, value: value.into(), }
     }
     /// Emit a native boolean without string conversion.
     pub fn tag_bool<E, R>(key: impl Into<opentelemetry::Key>, value: bool) -> Effect<(), E, R>
@@ -854,7 +869,7 @@ impl Otel {
         E: Send + 'static,
         R: HasOtel + Send + Sync + 'static,
     {
-        Self::attribute(key, value)
+        otel! { attribute; key: key, value: value, }
     }
     /// Emit the SDK's exact signed 64-bit integer representation.
     pub fn tag_int<E, R>(key: impl Into<opentelemetry::Key>, value: i64) -> Effect<(), E, R>
@@ -862,7 +877,7 @@ impl Otel {
         E: Send + 'static,
         R: HasOtel + Send + Sync + 'static,
     {
-        Self::attribute(key, value)
+        otel! { attribute; key: key, value: value, }
     }
     /// Emit a native floating point attribute, preserving numeric kind.
     pub fn tag_number<E, R>(key: impl Into<opentelemetry::Key>, value: f64) -> Effect<(), E, R>
@@ -870,7 +885,7 @@ impl Otel {
         E: Send + 'static,
         R: HasOtel + Send + Sync + 'static,
     {
-        Self::attribute(key, value)
+        otel! { attribute; key: key, value: value, }
     }
 
     /// Emit a trace event only, without also creating an equivalent log record.
@@ -879,7 +894,7 @@ impl Otel {
         E: Send + 'static,
         R: HasOtel + Send + Sync + 'static,
     {
-        Self::event_with(name, Vec::new())
+        otel! { event; name: name, attributes: Vec::new(), }
     }
     /// Emit typed redacted event attributes with SDK time, never core epoch guesses.
     pub fn event_with<E, R>(
@@ -1054,7 +1069,7 @@ where
     let action = Arc::new(action);
     effect! {
         let action = Arc::clone(&action);
-        let trace = Effect::<TraceContext, E, R>::trace_context()?;
+        let trace = effect! { trace_context; }?;
         service! {
             env |env: &R| {
                 let backend = env.otel();

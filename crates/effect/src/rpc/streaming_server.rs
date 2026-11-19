@@ -8,9 +8,8 @@ use crate::encoding::{FrameDecodeFailure, FrameDecoder};
 use crate::{Effect, JsonValue, SchemaIssue};
 use crate::{
     effect, effect_map_error, effect_provide_some, effect_scope, effect_scope_acquire, effect_sync,
-    effect_try_sync,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -106,6 +105,32 @@ where
         Self {
             pull: Arc::new(pull),
         }
+    }
+
+    /// Publish owned chunks followed by the terminal value through one shared pull cursor.
+    #[must_use]
+    pub fn finite(chunks: Vec<C>, terminal: T, exhausted: crate::Defect) -> Self {
+        let values = chunks.into_iter().map(RpcProduced::Chunk)
+            .chain(std::iter::once(RpcProduced::Terminal(terminal)))
+            .collect::<VecDeque<_>>();
+        let values = Arc::new(Mutex::new(values));
+        Self::new(move || {
+            let values = Arc::clone(&values);
+            let exhausted = exhausted.clone();
+            effect! {
+                let values = Arc::clone(&values);
+                let exhausted = exhausted.clone();
+                let next = effect_sync! { once; body: move || {
+                    values.lock().map(|mut values| values.pop_front())
+                        .map_err(|error| crate::Defect::new(error.to_string()))
+                }, }?;
+                match next {
+                    Ok(Some(value)) => value,
+                    Ok(None) => crate::effect_die! { defect: exhausted, }?,
+                    Err(error) => crate::effect_die! { defect: error, }?,
+                }
+            }
+        })
     }
 
     /// Request the next stream chunk within the reader’s scope.
@@ -236,15 +261,17 @@ where
         RpcStreamHandler::new(self.operation, move |request, context| {
             let for_open = Arc::clone(&project);
             let for_pull = Arc::clone(&project);
-            (self.invoke)(request, context)
-                .map(move |producer| {
+            let opened = crate::effect_map! {
+                program: (self.invoke)(request, context),
+                map: move |producer| {
                     let project = Arc::clone(&for_pull);
                     RpcStreamProducer::new(move || {
                         let project = Arc::clone(&project);
-                        producer.pull().provide_some(move |outer| project(outer))
+                        crate::effect_provide_some! { program: producer.pull(), project: move |outer| project(outer), }
                     })
-                })
-                .provide_some(move |outer| for_open(outer))
+                },
+            };
+            crate::effect_provide_some! { program: opened, project: move |outer| for_open(outer), }
         })
     }
 
@@ -501,11 +528,9 @@ where
                                         .take()
                                     {
                                         Some(bytes) => effect_sync! { once; body: move || Some(bytes), },
-                                        None => effect_try_sync! {
-                                            once; body: {
-                                            let __dsl_result = Err(
+                                        None => crate::effect_from_result! { once; result: Err(
                                             RpcStreamServerError::InputConsumed,
-                                        ); move || __dsl_result }, on_error: ::core::convert::identity, },
+                                        ), },
                                     },
                                     None => effect_provide_some! {
                                         program: effect_map_error! {
@@ -516,11 +541,9 @@ where
                                     let __dsl_program = receive; effect! {
                                     let __dsl_program = __dsl_program.clone(); let server = server.clone(); let session = session.clone(); let bytes = __dsl_program.clone()?; (move || {
                                     let Some(bytes) = bytes else {
-                                        return effect_try_sync! {
-                                            once; body: {
-                                            let __dsl_result = Err(
+                                        return crate::effect_from_result! { once; result: Err(
                                             RpcStreamServerError::Disconnected,
-                                        ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                        ), };
                                     };
                                     let request =
                                         decode_request(server.handler.operation(), &bytes, server.policy);
@@ -532,10 +555,7 @@ where
                                             let policy = server.policy;
                                             {
                                                 let __dsl_program = effect_map_error! {
-                                                program: server
-                                                .handler
-                                                .call(request, context)
-                                                .either(), map: RpcStreamServerError::Handler, }; effect! {
+                                                program: crate::effect! { either; program: server.handler.call(request, context), }, map: RpcStreamServerError::Handler, }; effect! {
                                                     let __dsl_program = __dsl_program.clone(); let call = call.clone(); let operation = operation.clone(); let session = session.clone(); let result = __dsl_program?; match result {
                                                     Ok(producer) => serve_pulls(
                                                         Arc::clone(&session),
@@ -554,7 +574,7 @@ where
                                                     ),
                                                 }? } }
                                         }
-                                        Err(error) => effect_try_sync! { once; body: { let __dsl_result = Err(error); move || __dsl_result }, on_error: ::core::convert::identity, },
+                                        Err(error) => crate::effect_from_result! { once; result: Err(error), },
                                     }
                                 })()? } }
                             }? } }
@@ -683,12 +703,12 @@ where
     let payload = match operation.error_codec().encode_ref(&error) {
         Ok(payload) => payload,
         Err(issue) => {
-            return effect_try_sync! { once; body: { let __dsl_result = Err(RpcStreamServerError::ErrorSchema(issue)); move || __dsl_result }, on_error: ::core::convert::identity, };
+            return crate::effect_from_result! { once; result: Err(RpcStreamServerError::ErrorSchema(issue)), };
         }
     };
     if let Err(issue) = crate::schema::internal::parser::check_limits(&payload, &operation.limits())
     {
-        return effect_try_sync! { once; body: { let __dsl_result = Err(RpcStreamServerError::ErrorSchema(issue)); move || __dsl_result }, on_error: ::core::convert::identity, };
+        return crate::effect_from_result! { once; result: Err(RpcStreamServerError::ErrorSchema(issue)), };
     }
     send_envelope(
         session,
@@ -732,7 +752,7 @@ where
     let frame = match envelope.encode(policy) {
         Ok(frame) => frame,
         Err(error) => {
-            return effect_try_sync! { once; body: { let __dsl_result = Err(RpcStreamServerError::Wire(error)); move || __dsl_result }, on_error: ::core::convert::identity, };
+            return crate::effect_from_result! { once; result: Err(RpcStreamServerError::Wire(error)), };
         }
     };
     effect_provide_some! {
@@ -785,9 +805,7 @@ where
             let call = call.clone();
             {
                 let __dsl_program = effect_map_error! {
-                program: producer
-                .pull()
-                .either(), map: RpcStreamServerError::Handler, };
+                program: crate::effect! { either; program: producer.pull(), }, map: RpcStreamServerError::Handler, };
                 effect! {
                     let __dsl_program = __dsl_program.clone(); let call = call.clone(); let operation = operation.clone(); let producer = producer.clone(); let session = session.clone(); let result = __dsl_program?; (move || match result {
                     Err(error) => send_error(
@@ -801,21 +819,17 @@ where
                         let payload = match operation.terminal_codec().encode_ref(&value) {
                             Ok(payload) => payload,
                             Err(issue) => {
-                                return effect_try_sync! {
-                                    once; body: {
-                                    let __dsl_result = Err(
+                                return crate::effect_from_result! { once; result: Err(
                                     RpcStreamServerError::TerminalSchema(issue),
-                                ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                ), };
                             }
                         };
                         if let Err(issue) =
                             crate::schema::internal::parser::check_limits(&payload, &operation.limits())
                         {
-                            return effect_try_sync! {
-                                once; body: {
-                                let __dsl_result = Err(
+                            return crate::effect_from_result! { once; result: Err(
                                 RpcStreamServerError::TerminalSchema(issue),
-                            ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                            ), };
                         }
                         send_envelope(
                             Arc::clone(&session),
@@ -833,30 +847,24 @@ where
                     }
                     Ok(RpcProduced::Chunk(value)) => {
                         let Some(sequence) = sequence else {
-                            return effect_try_sync! {
-                                once; body: {
-                                let __dsl_result = Err(
+                            return crate::effect_from_result! { once; result: Err(
                                 RpcStreamServerError::SequenceExhausted,
-                            ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                            ), };
                         };
                         let payload = match operation.chunk_codec().encode_ref(&value) {
                             Ok(payload) => payload,
                             Err(issue) => {
-                                return effect_try_sync! {
-                                    once; body: {
-                                    let __dsl_result = Err(
+                                return crate::effect_from_result! { once; result: Err(
                                     RpcStreamServerError::ChunkSchema(issue),
-                                ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                ), };
                             }
                         };
                         if let Err(issue) =
                             crate::schema::internal::parser::check_limits(&payload, &operation.limits())
                         {
-                            return effect_try_sync! {
-                                once; body: {
-                                let __dsl_result = Err(RpcStreamServerError::ChunkSchema(
+                            return crate::effect_from_result! { once; result: Err(RpcStreamServerError::ChunkSchema(
                                 issue,
-                            )); move || __dsl_result }, on_error: ::core::convert::identity, };
+                            )), };
                         }
                         let frame = RpcEnvelope {
                             operation: operation.spec().id.clone(),
@@ -885,11 +893,9 @@ where
                                 .receive_frame(), map: RpcStreamServerError::Transport, }, project: |_: &R| (), }; effect! {
                                     let __dsl_program = __dsl_program.clone(); let call = call.clone(); let operation = operation.clone(); let producer = producer.clone(); let session = session.clone(); let bytes = __dsl_program?; (move || {
                                     let Some(bytes) = bytes else {
-                                        return effect_try_sync! {
-                                            once; body: {
-                                            let __dsl_result = Err(
+                                        return crate::effect_from_result! { once; result: Err(
                                             RpcStreamServerError::Disconnected,
-                                        ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                        ), };
                                     };
                                     match decode_ack(&operation, &call, sequence, &bytes, policy) {
                                         Ok(()) => {
@@ -904,7 +910,7 @@ where
                                                 policy,
                                             )
                                         }
-                                        Err(error) => effect_try_sync! { once; body: { let __dsl_result = Err(error); move || __dsl_result }, on_error: ::core::convert::identity, },
+                                        Err(error) => crate::effect_from_result! { once; result: Err(error), },
                                     }
                                 })()? } }
                         }? } }

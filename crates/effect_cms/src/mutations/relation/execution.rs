@@ -255,7 +255,7 @@ where
         let readiness = Arc::clone(&readiness);
         let binding = Arc::clone(&binding);
         let draft = draft.clone();
-        let attempted = before.before(draft.clone()).either()?;
+        let attempted = effect! { either; program: before.before(draft.clone()), }?;
         match attempted {
             Ok(observation) => {
                 if cancellation_requested(&draft) {
@@ -345,7 +345,7 @@ where
     effect! {
         let request = request.clone();
         let draft = draft.clone();
-        let attempted = execute(request.clone()).either()?;
+        let attempted = effect! { either; program: execute(request.clone()), }?;
         match attempted {
             Ok(observation) => finish_execution(observation, request, draft),
             Err(error) => {

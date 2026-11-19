@@ -407,7 +407,7 @@ where
 {
     {
         let __dsl_program =
-            effect_map_error! { program: Effect::wall_now(), map: PersistedCacheError::Clock, };
+            effect_map_error! { program: crate::effect! { wall_now; }, map: PersistedCacheError::Clock, };
         effect! {
         let application = application.clone(); let definition = definition.clone(); let key = key.clone(); let now = __dsl_program.clone()?; {
             let key_for_read = Arc::clone(&key);
@@ -435,7 +435,7 @@ where
                         StoreRead::Found(entry) => match definition.decode(&entry.value.bytes) {
                             Ok(StoredOutcome::Success(value)) => effect_sync! { once; body: move || value, },
                             Ok(StoredOutcome::Failure(error)) => {
-                                effect_try_sync! { once; body: { let __dsl_result = Err(PersistedCacheError::Domain(error)); move || __dsl_result }, on_error: ::core::convert::identity, }
+                                crate::effect_from_result! { once; result: Err(PersistedCacheError::Domain(error)), }
                             }
                             Ok(
                                 StoredOutcome::Defect(_)
@@ -509,7 +509,7 @@ where
 {
     match policy.corrupt_record {
         CorruptCacheRecord::Reject => {
-            effect_try_sync! { once; body: { let __dsl_result = Err(error); move || __dsl_result }, on_error: ::core::convert::identity, }
+            crate::effect_from_result! { once; result: Err(error), }
         }
         CorruptCacheRecord::EvictAndReload => {
             let __dsl_program = service! { env: |env: &R| env.key_value_store(), };
@@ -579,26 +579,25 @@ where
 {
     {
         let __dsl_program = effect_map_error! {
-        program: application
-        .either(), map: PersistedCacheError::Domain, };
+        program: crate::effect! { either; program: application, }, map: PersistedCacheError::Domain, };
         effect! {
                    let __dsl_program = __dsl_program.clone(); let definition = definition.clone(); let key = key.clone(); let outcome = __dsl_program.clone()?; (move || {
                    if outcome.is_err() && !policy.persist_failures {
-                       return effect_try_sync! { once; body: { let __dsl_result = outcome.map_err(PersistedCacheError::Domain); move || __dsl_result }, on_error: ::core::convert::identity, };
+                       return crate::effect_from_result! { once; result: outcome.map_err(PersistedCacheError::Domain), };
                    }
                    let key = Arc::clone(&key);
                    let definition = definition.clone();
                    let pending = std::sync::Mutex::new(Some(outcome));
                    effect! {
         bind;
-        program: effect_map_error! { program: Effect::wall_now(), map: PersistedCacheError::Clock, },
+        program: effect_map_error! { program: crate::effect! { wall_now; }, map: PersistedCacheError::Clock, },
         body: move |now| {
                            let outcome = pending
                                .lock()
                                .unwrap_or_else(std::sync::PoisonError::into_inner)
                                .take();
                            let Some(outcome) = outcome else {
-                               return effect_try_sync! { once; body: { let __dsl_result = Err(PersistedCacheError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, };
+                               return crate::effect_from_result! { once; result: Err(PersistedCacheError::InputConsumed), };
                            };
                            let stored = match outcome {
                                Ok(value) => StoredOutcome::Success(value),
@@ -607,11 +606,9 @@ where
                            let encoded = match definition.encode(&stored) {
                                Ok(bytes) => bytes,
                                Err(issue) => {
-                                   return effect_try_sync! {
-                                       once; body: {
-                                       let __dsl_result = Err(PersistedCacheError::Encode(
+                                   return crate::effect_from_result! { once; result: Err(PersistedCacheError::Encode(
                                        issue,
-                                   )); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                   )), };
                                }
                            };
                            let outcome = match stored {
@@ -620,11 +617,9 @@ where
                                StoredOutcome::Defect(_)
                                | StoredOutcome::Interrupted
                                | StoredOutcome::FinalizationFailed(_) => {
-                                   return effect_try_sync! {
-                                       once; body: {
-                                       let __dsl_result = Err(
+                                   return crate::effect_from_result! { once; result: Err(
                                        PersistedCacheError::UnsupportedStoredOutcome,
-                                   ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                   ), };
                                }
                            };
                            let expires_at = match policy
@@ -634,7 +629,7 @@ where
                            {
                                Ok(value) => value,
                                Err(error) => {
-                                   return effect_try_sync! { once; body: { let __dsl_result = Err(PersistedCacheError::Time(error)); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                   return crate::effect_from_result! { once; result: Err(PersistedCacheError::Time(error)), };
                                }
                            };
                            let outcome = std::sync::Mutex::new(Some(outcome));
@@ -671,18 +666,16 @@ where
                                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                                                    .take();
                                                match result {
-                                                   Some(result) => effect_try_sync! { once; body: { let __dsl_result = result.map_err(PersistedCacheError::Domain); move || __dsl_result }, on_error: ::core::convert::identity, },
-                                                   None => effect_try_sync! {
-                                                       once; body: {
-                                                       let __dsl_result = Err(
+                                                   Some(result) => crate::effect_from_result! { once; result: result.map_err(PersistedCacheError::Domain), },
+                                                   None => crate::effect_from_result! { once; result: Err(
                                                        PersistedCacheError::InputConsumed,
-                                                   ); move || __dsl_result }, on_error: ::core::convert::identity, },
+                                                   ), },
                                                }
                                            },
         }
                                    }
                                    None => {
-                                       effect_try_sync! { once; body: { let __dsl_result = Err(PersistedCacheError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, }
+                                       crate::effect_from_result! { once; result: Err(PersistedCacheError::InputConsumed), }
                                    }
                                }
                            },

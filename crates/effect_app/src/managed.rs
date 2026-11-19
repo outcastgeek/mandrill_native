@@ -6,12 +6,11 @@ use crate::{
     AppConfig, AppEnv, AppError, LiveApp, LoadedSamples, Report, StagedOutput, application_stages,
 };
 use effect::memory::{
-    Bytes, HasMemory, Memory, MemoryError, MemoryPlan, MemoryPolicy, MemoryReport, Partition,
-    RegionId,
+    Bytes, HasMemory, Memory, MemoryError, MemoryPolicy, MemoryReport, Partition, RegionId,
 };
 use effect::{
-    Cancellation, Defect, Effect, Exit, HasCancellation, SharedValue, effect, effect_provide_some,
-    effect_provided, effect_retry, effect_try_blocking, effect_try_sync, schedule, service,
+    Cancellation, Defect, Effect, EffectEnvironment, Exit, SharedValue, effect, effect_provide_some,
+    effect_retry, effect_try_blocking, effect_try_sync, memory, schedule, service,
 };
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -115,10 +114,9 @@ impl Workspace {
             id: DATA,
             capacity: limits.total_bytes,
         }];
-        let memory = MemoryPlan::new(limits.total_bytes, &partitions)?
-            .metadata(DATA)?
-            .policy(policy)
-            .prepare()?;
+        let memory = memory! {
+            plan; total: limits.total_bytes, partitions: &partitions, metadata: DATA, policy: policy,
+        }?.prepare()?;
         let input = InputMemory::prepare(&memory, DATA, limits)?;
         let output = OutputMemory::prepare(&memory, DATA, limits)?;
         Ok(Self {
@@ -130,21 +128,14 @@ impl Workspace {
 }
 
 /// Selected data capabilities alongside the existing provider environment.
+#[derive(EffectEnvironment)]
+#[effect_environment(
+    memory(get = &self.workspace.memory, lifetime = 'static),
+    cancellation = &self.app.cancellation,
+)]
 pub struct ManagedAppEnv {
     app: Arc<AppEnv>,
     workspace: Arc<Workspace>,
-}
-
-impl HasMemory<'static> for ManagedAppEnv {
-    fn memory(&self) -> &Memory<'static> {
-        &self.workspace.memory
-    }
-}
-
-impl HasCancellation for ManagedAppEnv {
-    fn cancellation(&self) -> &Cancellation {
-        self.app.cancellation()
-    }
 }
 
 /// Existing live providers and the explicitly selected managed data environment.
@@ -205,10 +196,9 @@ impl ManagedLiveApp {
 fn load_samples(workspace: Arc<Workspace>) -> Effect<LoadedSamples, ManagedError, AppEnv> {
     effect! {
         let workspace = Arc::clone(&workspace);
-        let policy = service! { env |env: &AppEnv| {
+        let (files, retries, delay) = service! { env |env: &AppEnv| {
             (Arc::clone(&env.files), env.retries, env.retry_delay)
         }, }?;
-        let (files, retries, delay) = policy;
         let input = effect_try_blocking! {
             body |cancel: Cancellation| {
                 workspace.input.load(&workspace.memory, &files.input, || cancel.is_requested())
@@ -233,10 +223,9 @@ fn load_samples(workspace: Arc<Workspace>) -> Effect<LoadedSamples, ManagedError
 /// Run the ordinary business stages with explicitly bounded input, samples and output.
 pub fn managed_application() -> Effect<Report, ManagedError, ManagedAppEnv> {
     effect! {
-        let selected = service! { env |env: &ManagedAppEnv| {
-            (Arc::clone(&env.app), Arc::clone(&env.workspace))
+        let workspace = service! { env |env: &ManagedAppEnv| {
+            Arc::clone(&env.workspace)
         }, }?;
-        let (app, workspace) = selected;
         let program = application_stages(load_samples(Arc::clone(&workspace)), move |sum| {
             let workspace = Arc::clone(&workspace);
             effect_try_sync! {
@@ -247,7 +236,8 @@ pub fn managed_application() -> Effect<Report, ManagedError, ManagedAppEnv> {
                 on_error: |error| SharedValue::new(ManagedAppError::Output(error)),
             }
         });
-        let program = effect_provided! { program: program, environment: app, };
-        effect_provide_some! { program: program, project: |_: &ManagedAppEnv| (), }?
+        effect_provide_some! {
+            shared; program: program, project: |env: &ManagedAppEnv| Arc::clone(&env.app),
+        }?
     }
 }

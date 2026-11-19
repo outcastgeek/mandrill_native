@@ -6,7 +6,7 @@ use super::{
 use crate::rpc::RpcEnvelopePolicy;
 use crate::{Effect, Scope};
 use crate::{
-    effect, effect_map, effect_map_error, effect_provide_some, effect_sync, effect_try_sync,
+    effect, effect_map, effect_map_error, effect_provide_some, effect_sync,
     service,
 };
 use std::collections::BTreeMap;
@@ -62,7 +62,7 @@ impl<S: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
         policy: RpcEnvelopePolicy,
     ) -> Effect<EntityDispatcher<R>, EntityDefinitionError<E>, R> {
         if owner.address.entity_type != self.entity_type {
-            return effect_try_sync! { body: { let __dsl_error = || EntityDefinitionError::AddressMismatch; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
+            return crate::effect_fail! { error: EntityDefinitionError::AddressMismatch, };
         }
         let register = Arc::clone(&self.register);
         {
@@ -71,7 +71,7 @@ impl<S: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
             .acquire(scope, owner), map: EntityDefinitionError::Resource, };
             effect! {
                 let register = register.clone(); let state = __dsl_program.clone()?; {
-                effect_try_sync! { once; body: { let __dsl_result = register(Arc::new(state), policy).map_err(EntityDefinitionError::Registration); move || __dsl_result }, on_error: ::core::convert::identity, }
+                crate::effect_from_result! { once; result: register(Arc::new(state), policy).map_err(EntityDefinitionError::Registration), }
             }? }
         }
     }
@@ -150,7 +150,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> ClusterDefinition<E, R> {
             identity.clone(),
             Arc::new(move |_, owner, _| {
                 if owner.address.entity_type != identity {
-                    return effect_try_sync! { body: { let __dsl_error = || EntityDefinitionError::AddressMismatch; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
+                    return crate::effect_fail! { error: EntityDefinitionError::AddressMismatch, };
                 }
                 let dispatcher = dispatcher.clone();
                 effect_sync! { body: move || dispatcher.clone(), }
@@ -175,7 +175,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> ClusterDefinition<E, R> {
         match self.entities.get(&owner.address.entity_type) {
             Some(activate) => activate(scope, owner, self.policy),
             None => {
-                effect_try_sync! { body: { let __dsl_error = || EntityDefinitionError::UnknownEntity; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }
+                crate::effect_fail! { error: EntityDefinitionError::UnknownEntity, }
             }
         }
     }
@@ -274,7 +274,7 @@ where
         use super::ClusterActivationStore;
         let owner = self.owner.clone();
         {
-            let __dsl_program = effect_map_error! { program: Effect::wall_now(), map: EntityActivationError::Clock, };
+            let __dsl_program = effect_map_error! { program: crate::effect! { wall_now; }, map: EntityActivationError::Clock, };
             effect! {
             let owner = owner.clone(); let now = __dsl_program.clone()?; {
                 let owner = owner.clone();
@@ -289,9 +289,7 @@ where
                             .inspect_activation(inspect_owner.address.clone()), project: |_: &R| (), }
                     }? } }, map: EntityActivationError::Store, }; let owner = owner.clone(); effect! {
                         let __dsl_program = __dsl_program.clone(); let owner = owner.clone(); let status = __dsl_program?; {
-                            effect_try_sync! {
-                                once; body: {
-                                let __dsl_result = if status.is_some_and(|status| {
+                            crate::effect_from_result! { once; result: if status.is_some_and(|status| {
                                     status.phase == super::ActivationPhase::Active
                                         && status.lease.owner == owner
                                         && now < status.lease.lease_until
@@ -299,7 +297,7 @@ where
                                     Ok(())
                                 } else {
                                     Err(EntityActivationError::StaleOwnership)
-                                }; move || __dsl_result }, on_error: ::core::convert::identity, }
+                                }, }
                         }? } }
             }? }
         }
@@ -312,7 +310,7 @@ where
     ) -> EntityActivationEffect<super::SavedReply, std::convert::Infallible, R> {
         use super::ClusterExecutor;
         if address != self.owner.address {
-            return effect_try_sync! { body: { let __dsl_error = || EntityActivationError::AddressMismatch; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
+            return crate::effect_fail! { error: EntityActivationError::AddressMismatch, };
         }
         let dispatcher = self.dispatcher.clone();
         {

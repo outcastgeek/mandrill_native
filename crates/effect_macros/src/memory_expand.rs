@@ -94,6 +94,7 @@ impl Parse for Configuration {
             && matches!(
                 mode.to_string().as_str(),
                 "schema"
+                    | "plan"
                     | "schema_array"
                     | "schema_array_operations"
                     | "schema_map_operations"
@@ -316,6 +317,19 @@ pub(crate) fn configuration(input: Configuration) -> syn::Result<TokenStream> {
     Ok(match input {
         Configuration::Helper { mode, mut fields } => {
             let output = match mode.to_string().as_str() {
+                "plan" => {
+                    let total = fields.take("total")?;
+                    let partitions = fields.take("partitions")?;
+                    let metadata = fields.take("metadata")?;
+                    let policy = fields.take("policy")?;
+                    quote!((|| {
+                        ::core::result::Result::<_, #path::memory::MemoryError>::Ok(
+                            #path::memory::MemoryPlan::new(#total, #partitions)?
+                                .metadata(#metadata)?
+                                .policy(#policy),
+                        )
+                    })())
+                }
                 "numeric" => {
                     let memory = fields.transform("memory", |value, _| Ok(quote!(&(#value))))?;
                     let region = fields.take("region")?;

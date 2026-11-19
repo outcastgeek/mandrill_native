@@ -239,12 +239,3 @@ pub trait HasCancellation {
     /// Type: `&Cancellation`.
     fn cancellation(&self) -> &Cancellation;
 }
-
-impl HasCancellation for Cancellation {
-    ///
-    /// # Returns
-    /// Type: `&Cancellation`.
-    fn cancellation(&self) -> &Cancellation {
-        self
-    }
-}

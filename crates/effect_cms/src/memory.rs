@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use effect::memory::{Buffer, Bytes, MemoryError, PreparedMemory, RegionId, SlotPool};
 use effect::{Effect, effect, service};
-use effect_server::{HasRequest, RequestEnv, ServerError};
+use effect_server::{HasRequest, ServerError};
 
 use crate::content::PreparedCmsContent;
 use crate::forms::{
@@ -135,15 +135,10 @@ impl PreparedCmsMemory {
 }
 
 /// An application environment that explicitly selects prepared CMS storage.
+#[effect::__private::derive_cms_request_environment]
 pub trait HasCmsMemory {
     /// Borrow the startup capability with its region owners.
     fn cms_memory(&self) -> &Arc<PreparedCmsMemory>;
-}
-
-impl<R: HasCmsMemory> HasCmsMemory for RequestEnv<R> {
-    fn cms_memory(&self) -> &Arc<PreparedCmsMemory> {
-        self.services.cms_memory()
-    }
 }
 
 /// Read this effect's request into the application's prepared CMS form workspace.

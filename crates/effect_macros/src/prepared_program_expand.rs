@@ -121,6 +121,43 @@ pub(crate) fn program(expression: Expr, path: &TokenStream) -> syn::Result<Token
                     let graph = quote!(#path::__private::prepared_graph);
                     Ok(quote!(#graph::defer(move||{#body})))
                 }
+                crate::parse::EffectInput::Interpret(mode, _) => Err(syn::Error::new(
+                    mode.span(),
+                    "run the prepared description at its selected interpreter boundary",
+                )),
+                crate::parse::EffectInput::Sleep(_) => Err(syn::Error::new_spanned(
+                    expression,
+                    "prepared sleep requires an explicitly reserved timer descriptor",
+                )),
+                crate::parse::EffectInput::Either(mut fields) => {
+                    let source = fields.transform("program", |expr, _| program(expr, path))?;
+                    let graph = quote!(#path::__private::prepared_graph);
+                    fields.finish(quote!(#graph::either(#source)))
+                }
+                crate::parse::EffectInput::Log(_) => Err(syn::Error::new_spanned(
+                    expression,
+                    "prepared logging requires a selected telemetry descriptor",
+                )),
+                crate::parse::EffectInput::ConsoleWrite(_) => Err(syn::Error::new_spanned(
+                    expression,
+                    "prepared console writes require a selected provider descriptor",
+                )),
+                crate::parse::EffectInput::NativePrimitive(mode, _) => Err(syn::Error::new(
+                    mode.span(),
+                    "this operation requires an explicitly selected prepared descriptor",
+                )),
+                crate::parse::EffectInput::Defer(mut fields) => {
+                    let body = fields.transform("body", |expression, inline| {
+                        let expression = if inline {
+                            syn::parse2(crate::domain_expand::role(expression, 0, BodyCategory::Native)?)?
+                        } else {
+                            expression
+                        };
+                        loop_factory(expression, path)
+                    })?;
+                    let graph = quote!(#path::__private::prepared_graph);
+                    fields.finish(quote!(#graph::defer(#body)))
+                }
                 crate::parse::EffectInput::WhileLoop(mut fields) => {
                     let guard = fields.role("guard", 0, BodyCategory::Native)?;
                     let on_capacity = fields.role("on_capacity", 1, BodyCategory::Native)?;

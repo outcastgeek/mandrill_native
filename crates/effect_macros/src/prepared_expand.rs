@@ -20,10 +20,15 @@ pub(crate) fn expand(input: Input) -> syn::Result<TokenStream> {
             "scheduled",
             "fork",
             "race",
+            "run",
         ],
         "plan",
     )?;
     let mut fields = input.fields;
+    if mode == "run" {
+        let invocation = fields.take("invocation")?;
+        return fields.finish(quote!((#invocation).run()));
+    }
     let path = crate::expand::effect_crate_path()?;
     if mode == "description" {
         let description = fields.transform("program", |expression, _| {

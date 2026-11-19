@@ -85,8 +85,18 @@ async fn send_patch<E: Send + 'static, R: Send + Sync + 'static>(
     context: &NativeContext,
     environment: Arc<R>,
 ) -> Exit<(), E> {
-    match context.run(writer.write_lease(frame), environment.clone()).await {
-        Exit::Success(()) => context.run(writer.flush(), environment).await,
+    match effect::effect! {
+        run_in_context;
+        context: context,
+        program: effect_server::stream! { write_lease; writer: writer, view: frame, },
+        environment: environment.clone(),
+    }.await {
+        Exit::Success(()) => effect::effect! {
+            run_in_context;
+            context: context,
+            program: effect_server::stream! { flush; writer: writer, },
+            environment: environment,
+        }.await,
         failure @ (Exit::Fail(_) | Exit::Die(_) | Exit::Interrupted | Exit::FinalizationFailed(_)) => failure,
     }
 }
@@ -105,7 +115,12 @@ fn prepared_patch_body<E: Send + 'static, R: Send + Sync + 'static>(
             let writer = writer.clone();
             let errors = errors.clone();
             async move {
-                let mut initial = match context.run(first, environment.clone()).await {
+                let mut initial = match effect::effect! {
+                    run_in_context;
+                    context: context,
+                    program: first,
+                    environment: environment.clone(),
+                }.await {
                     Exit::Success(frame) => Some(frame),
                     Exit::Fail(error) => return Exit::Fail(error),
                     Exit::Die(defect) => return Exit::Die(defect),
@@ -206,7 +221,7 @@ pub(crate) fn event_reply<E:Send+'static,R:Send+Sync+'static>(event:String)->Rep
 pub(crate) fn event_stream_reply<E:Send+'static,R:Send+Sync+'static>(events:Vec<String>)->Reply<E,R>{
     let body=effect_server::stream! {body |writer| {
         let events=events.clone();let writer=writer.clone();
-        for event in events {if !event.is_empty(){writer.write(event.into())?;writer.flush()?;}}
+        for event in events {if !event.is_empty(){effect_server::stream! { write; writer: writer, bytes: event.into(), }?;effect_server::stream! { flush; writer: writer, }?;}}
     }};
     reply! {header(header::CACHE_CONTROL,HeaderValue::from_static("no-cache"));
         header(header::CONNECTION,HeaderValue::from_static("keep-alive"));

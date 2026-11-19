@@ -199,7 +199,7 @@ impl<E:std::error::Error+Send+'static,R:Send+Sync+'static> MediaAssetServiceBind
     pub fn register_routes<X>(&self,owner:&effect::Scope<X>,router:Option<effect_server::Router<E,R>>,mounter:Option<&crate::routing::ManagedRouteMounter<E,R>>)
         ->Effect<(crate::routing::RegisteredRoutes<E,R>,Option<effect::Fiber<(),X>>),X,R>
     where X:From<crate::routing::ManagedStartError<E>>+Send+Sync+'static,R:effect::HasClock+effect::HasConsole+effect::HasTaskSpawner {
-        self.routes.register_and_start_routes(owner,router,mounter)
+        crate::cms! { register_routes; service: self.routes, scope: owner, router: router, mounter: mounter, }
     }
     pub fn bind_resource_commands(&self,bindings:&crate::commands::ResourceCommandBindings<E,R>){bind_media_asset_resource_commands(bindings,self.commands.clone());}
     pub fn bind_resource_validation(&self,bindings:&crate::validation::Bindings<crate::commands::CommandInput,E,R>){bind_media_asset_resource_validation(bindings,self.validation.clone());}

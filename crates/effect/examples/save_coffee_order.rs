@@ -55,7 +55,7 @@ fn save_mayas_order() -> Effect<(), DraftProblem, CoffeeShop> {
         let feedback_codec = match problem_schema() { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, };
         let draft_version = match RecordVersion::new("coffee-order-v1") { Ok(value) => value, Err(error) => effect_die! { defect: effect::Defect::new(format!("draft version: {error:?}")), }?, };
         let drafts: Persistable<String, Arc<CoffeeOrder>, OrderProblem, CafeKeys> = persistable! {
-            namespace: draft_namespace, request: String, key: draft_identity::<String>,
+            namespace: draft_namespace, request: String, key: String::as_str,
             success: draft_codec, error: feedback_codec, version: RecordPolicy::new(draft_version, limits())
         };
         effect_map_error! { program: write(drafts.clone(), || "maya-morning-draft".to_owned(), move || StoredOutcome::Success(order.clone()), None), map: DraftProblem::Storage, }?;
@@ -197,7 +197,6 @@ fn order_form() -> Result<Codec<CoffeeOrder, JsonValue, CoffeeShop, CoffeeShop>,
             drink: drink.into_effect::<CoffeeShop, CoffeeShop>(),
             #[schema(default_with = || service! {
                 select: |cafe: &CoffeeShop| cafe.services.clone(),
-                on_error: |problem: SchemaIssue| problem,
                 run |defaults: &Arc<CounterDefaults>| { defaults.size.clone() }
             })]
             size: size.into_effect::<CoffeeShop, CoffeeShop>(),
@@ -213,10 +212,6 @@ fn problem_schema() -> Result<PureCodec<OrderProblem, JsonValue>, effect::Defect
         enum OrderProblem { MissingName => "missing-name", InvalidQuantity { maximum: json_i64() } => "quantity" }
         tag_field: "problem", content_field: "details", policy: parse_policy()
     }.map_err(|error| effect::Defect::new(format!("order feedback schema: {error:?}")))
-}
-/// Keep stable draft identity separate from the order's mutable contents.
-fn draft_identity<T: AsRef<str> + ?Sized>(identity: &T) -> &str {
-    identity.as_ref()
 }
 /// Café validation belongs to the application, after schema shape validation.
 fn accept_order(order: CoffeeOrder) -> Effect<CoffeeOrder, OrderProblem, CoffeeShop> {
@@ -242,7 +237,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         NonZeroUsize::MIN.saturating_add(15),
         NonZeroUsize::MIN.saturating_add(3),
     );
-    match futures_executor::block_on(save_mayas_order().run(cafe.clone())) {
+    match futures_executor::block_on(effect! {
+        run;
+        program: save_mayas_order(),
+        environment: cafe.clone(),
+    }) {
         Exit::Success(()) => (),
         exit @ (Exit::Fail(_) | Exit::Die(_) | Exit::Interrupted | Exit::FinalizationFailed(_)) => {
             return Err(format!("Maya's draft failed: {exit:?}").into());

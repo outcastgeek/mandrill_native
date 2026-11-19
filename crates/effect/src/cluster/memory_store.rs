@@ -5,7 +5,7 @@ use super::{
     AcceptedRequest, ActivationId, ActivationLease, ActivationOutcome, ActivationPhase,
     ActivationStatus, ClaimOptions, ClaimToken, ClusterActivationStore, ClusterAddress,
     ClusterMessageStore, ClusterObserverId, ClusterOwner, ClusterRequestId, ClusterStoreError,
-    CompletedReply, HasClusterActivationStore, HasClusterMessageStore, MessageAcceptance,
+    CompletedReply, MessageAcceptance,
     MessageClaim, MessageDisposition, MessageInspection, MessageScan, MessageStoreCapacity,
     ObserverCursor, OwnershipGeneration, PassivationOutcome, SavedChunk, SavedMessage,
     SavedMessageState, StoreCompletion, StoreMutation, StoreObservation,
@@ -738,18 +738,6 @@ impl ClusterMessageStore for MemoryClusterMessageStore {
     }
 }
 
-impl HasClusterMessageStore for Arc<MemoryClusterMessageStore> {
-    /// Type alias for store in cluster memory store.
-    type Store = MemoryClusterMessageStore;
-    ///
-    /// # Returns
-    /// Type: `Arc<Self::Store>`.
-    /// Returns `Arc<Self::Store>`.
-    fn cluster_message_store(&self) -> Arc<Self::Store> {
-        Arc::clone(self)
-    }
-}
-
 impl ClusterActivationStore for MemoryClusterMessageStore {
     /// Type alias for error in cluster memory store.
     type Error = ClusterStoreError;
@@ -951,17 +939,5 @@ impl ClusterActivationStore for MemoryClusterMessageStore {
         self.transact(address, |state, address| {
             Ok(state.current_owner.get(&address).cloned())
         })
-    }
-}
-
-impl HasClusterActivationStore for Arc<MemoryClusterMessageStore> {
-    /// Type alias for store in cluster memory store.
-    type Store = MemoryClusterMessageStore;
-    ///
-    /// # Returns
-    /// Type: `Arc<Self::Store>`.
-    /// Returns `Arc<Self::Store>`.
-    fn cluster_activation_store(&self) -> Arc<Self::Store> {
-        Arc::clone(self)
     }
 }

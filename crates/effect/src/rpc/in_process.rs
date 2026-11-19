@@ -3,7 +3,7 @@
 use super::{RpcChannel, RpcServerError, RpcUnaryServer, RpcWireError};
 use crate::Effect;
 use crate::encoding::FrameParts;
-use crate::{effect, effect_provided, effect_try_sync};
+use crate::{effect, effect_provided};
 use std::sync::Arc;
 
 /// Uses the actual encoded client/server machinery without opening a socket.
@@ -77,18 +77,18 @@ where
         let bytes = match request.into_bytes() {
             Ok(bytes) => bytes,
             Err(error) => {
-                return effect_try_sync! { once; body: { let __dsl_result = Err(RpcServerError::Wire(RpcWireError::Frame(
+                return crate::effect_from_result! { once; result: Err(RpcServerError::Wire(RpcWireError::Frame(
                     error,
-                ))); move || __dsl_result }, on_error: ::core::convert::identity, };
+                ))), };
             }
         };
         {
             let __dsl_program = effect_provided! { program: self.server
             .handle(bytes), environment: Arc::clone(&self.environment), };
             effect! { let response = __dsl_program.clone()?; {
-                effect_try_sync! { once; body: { let __dsl_result = response
+                crate::effect_from_result! { once; result: response
                         .into_bytes()
-                        .map_err(|error| RpcServerError::Wire(RpcWireError::Frame(error))); move || __dsl_result }, on_error: ::core::convert::identity, }
+                        .map_err(|error| RpcServerError::Wire(RpcWireError::Frame(error))), }
             }? }
         }
     }

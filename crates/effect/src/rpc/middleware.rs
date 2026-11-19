@@ -271,16 +271,20 @@ impl RpcServerMiddleware {
         RpcHandler::new(operation, move |request| {
             let handler = Arc::clone(&handler);
             let after = Arc::clone(&after);
-            before(request)
-                .map_error(RpcServerMiddlewareError::Before)
-                .flat_map(move |request| {
-                    handler
-                        .call(request)
-                        .map_error(RpcServerMiddlewareError::Domain)
-                })
-                .flat_map(move |response| {
-                    after(response).map_error(RpcServerMiddlewareError::After)
-                })
+            let handled = crate::effect! {
+                bind;
+                program: crate::effect_map_error! { program: before(request), map: RpcServerMiddlewareError::Before, },
+                body: move |request| crate::effect_map_error! {
+                    program: handler.call(request), map: RpcServerMiddlewareError::Domain,
+                },
+            };
+            crate::effect! {
+                bind;
+                program: handled,
+                body: move |response| crate::effect_map_error! {
+                    program: after(response), map: RpcServerMiddlewareError::After,
+                },
+            }
         })
     }
 }
@@ -350,32 +354,40 @@ impl RpcStreamMiddleware {
             let handler = Arc::clone(&handler);
             let chunk = Arc::clone(&chunk);
             let terminal = Arc::clone(&terminal);
-            before(request)
-                .map_error(RpcStreamMiddlewareError::Before)
-                .flat_map(move |request| {
-                    handler
-                        .call(request, context.clone())
-                        .map_error(RpcStreamMiddlewareError::Domain)
-                })
-                .map(move |producer| {
+            let opened = crate::effect! {
+                bind;
+                program: crate::effect_map_error! { program: before(request), map: RpcStreamMiddlewareError::Before, },
+                body: move |request| crate::effect_map_error! {
+                    program: handler.call(request, context.clone()), map: RpcStreamMiddlewareError::Domain,
+                },
+            };
+            crate::effect_map! {
+                program: opened,
+                map: move |producer| {
                     let chunk = Arc::clone(&chunk);
                     let terminal = Arc::clone(&terminal);
                     RpcStreamProducer::new(move || {
                         let chunk = Arc::clone(&chunk);
                         let terminal = Arc::clone(&terminal);
-                        producer
-                            .pull()
-                            .map_error(RpcStreamMiddlewareError::Domain)
-                            .flat_map(move |produced| match produced {
-                                RpcProduced::Chunk(value) => chunk(value)
-                                    .map(RpcProduced::Chunk)
-                                    .map_error(RpcStreamMiddlewareError::Chunk),
-                                RpcProduced::Terminal(value) => terminal(value)
-                                    .map(RpcProduced::Terminal)
-                                    .map_error(RpcStreamMiddlewareError::Terminal),
-                            })
+                        crate::effect! {
+                            bind;
+                            program: crate::effect_map_error! {
+                                program: producer.pull(), map: RpcStreamMiddlewareError::Domain,
+                            },
+                            body: move |produced| match produced {
+                                RpcProduced::Chunk(value) => crate::effect_map_error! {
+                                    program: crate::effect_map! { program: chunk(value), map: RpcProduced::Chunk, },
+                                    map: RpcStreamMiddlewareError::Chunk,
+                                },
+                                RpcProduced::Terminal(value) => crate::effect_map_error! {
+                                    program: crate::effect_map! { program: terminal(value), map: RpcProduced::Terminal, },
+                                    map: RpcStreamMiddlewareError::Terminal,
+                                },
+                            },
+                        }
                     })
-                })
+                },
+            }
         })
     }
 }

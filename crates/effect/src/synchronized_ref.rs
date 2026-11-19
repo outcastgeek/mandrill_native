@@ -128,11 +128,10 @@ impl<A: Send + Sync + 'static> SynchronizedRef<A> {
         let reference = self.clone();
         let on_admission_error = Arc::new(on_admission_error);
         let release_error = Arc::clone(&on_admission_error);
-        let acquisition = self
-            .inner
-            .admission
-            .acquire(NonZeroUsize::MIN)
-            .map_error(move |error| on_admission_error(error));
+        let acquisition = crate::effect_map_error! {
+            program: self.inner.admission.acquire(NonZeroUsize::MIN),
+            map: move |error| on_admission_error(error),
+        };
         ResourceBinding::new(acquisition, move |mut permit, _| {
             let release_error = Arc::clone(&release_error);
             Release::try_sync(move || {

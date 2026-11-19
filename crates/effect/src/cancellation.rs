@@ -259,6 +259,8 @@ impl Drop for State {
 
 /// Executor-independent, persistent cancellation request with broadcast notification.
 #[derive(Clone)]
+#[derive(crate::EffectEnvironment)]
+#[effect_environment(cancellation = self)]
 pub struct Cancellation {
     state: Node,
 }

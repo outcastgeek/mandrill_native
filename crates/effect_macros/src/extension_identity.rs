@@ -109,6 +109,12 @@ impl Entry {
 /// Resolve renamed extension dependencies and dispatch the exact required DSL.
 pub(crate) fn expand(name: &str, input: TokenStream) -> syn::Result<TokenStream> {
     let path = crate::extension_support::crate_path("effect-server-identity")?;
+    if matches!(input.clone().into_iter().next(), Some(proc_macro2::TokenTree::Ident(mode))
+        if matches!(mode.to_string().as_str(), "sqlx" | "sqlx_kernel" | "initialize"
+            | "prepare_invocations" | "invocation_pool" | "atomic_accounts" | "record_adapter" | "configure"))
+    {
+        return configured(name, syn::parse2(input)?, &path);
+    }
     let entries: Entries = syn::parse2(input)?;
     match name {
         "identity_store" => stores(entries, &path),
@@ -120,6 +126,68 @@ pub(crate) fn expand(name: &str, input: TokenStream) -> syn::Result<TokenStream>
         _ => Err(syn::Error::new(Span::call_site(), "unknown Identity macro")),
     }
 }
+/// Apply selections to the original native store or typed definition owner.
+fn configured(
+    name: &str,
+    input: crate::callback_expand::Input,
+    path: &TokenStream,
+) -> syn::Result<TokenStream> {
+    let allowed: &[&str] = match name {
+        "identity" => &["configure"],
+        "identity_store" => &["sqlx", "sqlx_kernel", "initialize", "prepare_invocations", "invocation_pool", "atomic_accounts", "record_adapter"],
+        _ => return Err(syn::Error::new(Span::call_site(), "unsupported Identity configuration mode")),
+    };
+    let mode = input.mode(allowed, "")?;
+    let mut fields = input.fields;
+    let output = match mode.as_str() {
+        "sqlx" => {
+            let pool = fields.take("pool")?;
+            let policy = fields.take("policy")?;
+            quote!(#path::SqlxIdentityStore::new(#pool, #policy))
+        }
+        "sqlx_kernel" => {
+            let kernel = fields.take("kernel")?;
+            let policy = fields.take("policy")?;
+            quote!(#path::SqlxIdentityStore::from_kernel(#kernel, #policy))
+        }
+        "initialize" => {
+            let backend = fields.raw("backend")?;
+            fields.finish(TokenStream::new())?;
+            return Ok(quote!((#backend).initialize()));
+        }
+        "prepare_invocations" => {
+            let store = fields.take("source")?;
+            let invocations = fields.take("invocations")?;
+            quote!(#store.with_prepared_invocations(#invocations))
+        }
+        "invocation_pool" => {
+            let memory = fields.take("memory")?;
+            let region = fields.take("region")?;
+            let capacity = fields.take("capacity")?;
+            quote!(#path::store::invocation::PreparedIdentityInvocations::prepare(#memory, #region, #capacity))
+        }
+        "atomic_accounts" => {
+            let backend = fields.take("backend")?;
+            let capacity = fields.take("token_capacity")?;
+            quote!(#path::store::accounts::AtomicAccounts::new(#backend, #capacity))
+        }
+        "record_adapter" => {
+            let backend = fields.take("backend")?;
+            let category = fields.take("category")?;
+            let policy = fields.take("policy")?;
+            let codec = fields.take("codec")?;
+            quote!(#path::store::records::SqlRecordAdapter::new(#backend, #category, #policy, #codec))
+        }
+        "configure" => {
+            let definition = fields.take("source")?;
+            let admission = fields.take("prepared_admission")?;
+            quote!(#definition.with_prepared_admission(#admission))
+        }
+        _ => return Err(syn::Error::new(Span::call_site(), "missing Identity configuration mode")),
+    };
+    fields.finish(output)
+}
+
 /// Reject unknown fields/operations instead of dynamically dispatching method names.
 fn unknown(entry: &Entry) -> syn::Error {
     syn::Error::new(
@@ -324,12 +392,72 @@ type CallbackOperation = (&'static str, usize, CallbackRoles);
 /// Ordinary Effect-returning workflows compose directly in Effect bodies; these forms
 /// remove native async callback boilerplate without inventing another runtime or grant.
 fn action(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStream> {
+    let workflows: &[(&str, usize)] = &[
+        ("register", 1),
+        ("login", 1),
+        ("account", 1),
+        ("change_password", 1),
+        ("remove_password", 1),
+        ("password_recovery_token", 1),
+        ("recover_password", 1),
+        ("complete_authenticator", 1),
+        ("complete_recovery_code", 1),
+        ("complete_external_authenticator", 1),
+        ("complete_external_recovery_code", 1),
+        ("complete_registry_factor", 1),
+        ("complete_external_registry_factor", 1),
+        ("pending_factor_providers", 1),
+        ("pending_factor_token", 2),
+        ("reset_authenticator", 1),
+        ("disable_two_factor", 1),
+        ("enable_authenticator", 2),
+        ("regenerate_recovery_codes", 2),
+        ("begin_passkey_enrollment", 2),
+        ("enroll_passkey", 1),
+        ("passkey_login_options", 1),
+        ("passkey_login", 1),
+        ("remove_passkey", 2),
+        ("verify_external", 1),
+        ("external_login", 2),
+        ("link_external", 2),
+        ("unlink_external", 3),
+        ("email_confirmation_token", 1),
+        ("confirm_email", 2),
+        ("set_email", 2),
+        ("set_phone_number", 2),
+        ("sign_in_cookie", 1),
+        ("authenticate_cookie", 1),
+        ("sign_in_bearer", 1),
+        ("refresh_bearer", 1),
+        ("logout_bearer", 1),
+        ("store_session", 2),
+        ("authenticate_stored_session", 2),
+        ("revoke_session", 3),
+        ("preferences", 2),
+        ("update_preferences", 5),
+        ("account_snapshot", 1),
+        ("delete_account", 1),
+        ("personal_data_job", 2),
+        ("cookie_stage", 0),
+        ("prepared_cookie_stage", 1),
+        ("selected_bearer_stage", 0),
+        ("prepared_bearer_stage", 1),
+        ("retain_pending_browser", 2),
+        ("resume_pending_browser", 1),
+        ("issue_antiforgery", 1),
+        ("selected_antiforgery_stage", 0),
+        ("logout_cookie", 2),
+        ("reserve_prepared_invocation", 0),
+        ("bearer_stage", 1),
+        ("antiforgery_stage", 1),
+    ];
     let operations: &[CallbackOperation] = &[
         ("authorize_once", 1, &[("authorize", 3)]),
         ("authorization_stage", 1, &[]),
         ("authorization_guard", 1, &[("guard", 2)]),
         ("invoke", 0, &[("native", 4)]),
         ("invoke_once", 1, &[("native", 4)]),
+        ("invoke_prepared_once", 2, &[("native", 4)]),
         ("invoke_capability_once", 1, &[("native", 5)]),
         ("native_http", 1, &[("native", 4)]),
         ("accounts_page", 3, &[("decide", 3), ("allow", 2)]),
@@ -348,6 +476,15 @@ fn action(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStr
         ("notify", 4, &[("dispatch", 1)]),
         ("request_personal_data_job", 4, &[("accept", 1)]),
     ];
+    if let [definition, call] = entries.as_slice()
+        && definition.name == "identity"
+        && let Some((name, count)) = workflows.iter().find(|(name, _)| call.name == *name)
+    {
+        let definition = definition.value()?;
+        let arguments = call.arguments(*count)?;
+        let method = Ident::new(name, Span::mixed_site());
+        return Ok(quote!((#definition).#method(#(#arguments),*)));
+    }
     let selected = entries
         .iter()
         .filter_map(|entry| operations.iter().find(|(name, _, _)| entry.name == *name))
@@ -359,7 +496,7 @@ fn action(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStr
         ));
     };
     let (name, count, roles) = **selected;
-    if matches!(name, "invoke_once" | "invoke_capability_once") {
+    if matches!(name, "invoke_once" | "invoke_prepared_once" | "invoke_capability_once") {
         return invoke_action(entries, path, name);
     }
     let mut evaluate = Vec::new();
@@ -376,7 +513,7 @@ fn action(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStr
                 ));
             }
             let value = entry.value()?;
-            evaluate.push(quote!(let #local = #value;));
+            evaluate.push(quote!(let #local = &(#value);));
             identity = Some(local);
         } else if entry.name == name {
             for (position, value) in entry.arguments(count)?.iter().enumerate() {
@@ -455,6 +592,8 @@ fn invoke_action(
     path: &TokenStream,
     method: &str,
 ) -> syn::Result<TokenStream> {
+    let prepared = method == "invoke_prepared_once";
+    let count = usize::from(prepared) + 1;
     // Canonical field order already reaches the native typed callback argument.
     // Keep the ordered helper below for callbacks written before their definition.
     if let [definition, input, callback] = entries.as_slice()
@@ -463,10 +602,7 @@ fn invoke_action(
         && callback.name == "native"
     {
         let definition_value = definition.value()?;
-        let input_values = input.arguments(1)?;
-        let input_value = input_values.first().ok_or_else(|| {
-            syn::Error::new(input.name.span(), "missing Identity invocation input")
-        })?;
+        let input_values = input.arguments(count)?;
         let callback = future_role(
             callback,
             if method == "invoke_capability_once" {
@@ -476,12 +612,10 @@ fn invoke_action(
             },
         )?;
         let definition = Ident::new("__identity_definition", Span::mixed_site());
-        let input = Ident::new("__identity_input", Span::mixed_site());
         let method = Ident::new(method, Span::mixed_site());
         return Ok(quote!({
             let #definition = &(#definition_value);
-            let #input = #input_value;
-            #definition.#method(#input, #callback)
+            #definition.#method(#(#input_values,)* #callback)
         }));
     }
     let mut parameters = Vec::new();
@@ -500,11 +634,27 @@ fn invoke_action(
                 quote!(&(#value)),
             )
         } else if entry.name == method {
-            let arguments = entry.arguments(1)?;
-            let value = arguments.first().ok_or_else(|| {
-                syn::Error::new(entry.name.span(), "missing Identity invocation input")
-            })?;
-            (&mut input, quote!(I), quote!(#value))
+            if input.is_some() {
+                return Err(syn::Error::new(entry.name.span(), "duplicate Identity invocation field"));
+            }
+            let arguments = entry.arguments(count)?;
+            let mut inputs = Vec::with_capacity(count);
+            for (position, value) in arguments.iter().enumerate() {
+                let argument = Ident::new(
+                    &format!("__identity_input_{position}"),
+                    Span::mixed_site(),
+                );
+                let ty = if prepared && position == 0 {
+                    quote!(#path::PreparedIdentityInvocation<S::Backend>)
+                } else {
+                    quote!(I)
+                };
+                parameters.push(quote!(#argument: #ty));
+                values.push(quote!(#value));
+                inputs.push(argument);
+            }
+            input = Some(inputs);
+            continue;
         } else if entry.name == "native" {
             let value = future_role(&entry, if capability { 5 } else { 4 })?;
             (&mut native, quote!(F), value)
@@ -539,7 +689,7 @@ fn invoke_action(
             I: Send + 'static, A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static,
             F: Fn(#storage C::Native, I, #path::authority::IdentityAuthority<S::Backend>, ::std::sync::Arc<P>) -> Pending + Send + Sync + 'static,
             Pending: ::core::future::Future<Output = ::core::result::Result<A, #path::IdentityError>> + Send + 'static {
-            #identity.#method(#input, #native)
+            #identity.#method(#(#input,)* #native)
         }
         __identity_invoke(#(#values),*)
     }))

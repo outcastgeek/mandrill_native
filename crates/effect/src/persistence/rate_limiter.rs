@@ -2,7 +2,7 @@
 
 use super::UtcMillis;
 use crate::{Effect, KeyDomain, StableKey};
-use crate::{effect, effect_map_error, effect_provide_some, effect_try_sync, service};
+use crate::{effect, effect_map_error, effect_provide_some, service};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -296,6 +296,7 @@ pub trait RateLimitStore: Send + Sync + 'static {
 }
 
 /// Selects the atomic rate-limit store in an application environment.
+#[crate::__private::derive_arc_capability(concrete = crate::persistence::MemoryRateLimitStore)]
 pub trait HasRateLimitStore {
     /// Store selected by this environment; its trait bound defines the required guarantees.
     type Store: RateLimitStore;
@@ -428,7 +429,7 @@ impl<D: KeyDomain> RateLimiter<D> {
         R: HasRateLimitStore + Send + Sync + 'static,
     {
         let RateLimitPolicy::AdaptiveWindow(policy) = self.policy else {
-            return effect_try_sync! { body: { let __dsl_error = || RateLimitError::UnsupportedFeedback; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
+            return crate::effect_fail! { error: RateLimitError::UnsupportedFeedback, };
         };
         {
             let __dsl_program = service! { env: |env: &R| env.rate_limit_store(), };

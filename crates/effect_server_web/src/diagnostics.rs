@@ -328,14 +328,17 @@ impl<E: Send + 'static> RuntimeSampler<E> {
         source: impl Fn() -> Effect<RuntimeSnapshot, E, R> + Send + Sync + 'static,
     ) -> Effect<Self, DiagnosticsError<E>, R> {
         if interval.is_zero() {
-            return effect_try_sync! { body: { let __dsl_error = || DiagnosticsError::Definition; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
+            return effect::effect_fail! { error: DiagnosticsError::Definition, };
         }
         let source = Arc::new(source);
         effect! {
                     let source = source.clone();
                     let scope = scope.clone();
                     let initial_source = source.clone();
-                    let sample = effect_map_error! { program: { let __dsl_factory = move || initial_source(); effect! { __dsl_factory()? } }, map: DiagnosticsError::Source, }?;
+                    let sample = effect_map_error! {
+                        program: effect! { defer; body: move || initial_source(), },
+                        map: DiagnosticsError::Source,
+                    }?;
                     let state = SubscriptionRef::new(
                         RuntimeStatus {
                             sample: Arc::new(sample),
@@ -353,24 +356,34 @@ impl<E: Send + 'static> RuntimeSampler<E> {
                         let source = worker_source.clone();
                         async move {
                             loop {
-                                let sleep = context
-                                    .run(
-                                        Effect::<(), DiagnosticsError<E>, R>::sleep(interval),
-                                        env.clone(),
-                                    )
+                                let sleep = effect::effect! {
+                                    run_in_context;
+                                    context: context,
+                                    program: effect! { sleep; duration: interval, },
+                                    environment: env.clone(),
+                                }
                                     .await;
                                 if !matches!(sleep, Exit::Success(())) {
                                     return sleep;
                                 }
-                                let sampled = context.run(source(), env.clone()).await;
+                                let sampled = effect::effect! {
+                                    run_in_context;
+                                    context: context,
+                                    program: source(),
+                                    environment: env.clone(),
+                                }.await;
                                 let status = match sampled {
                                     Exit::Success(sample) => RuntimeStatus {
                                         sample: Arc::new(sample),
                                         failure: None,
                                     },
                                     Exit::Fail(error) => {
-                                        let old = match context
-                                            .run(state.read(), env.clone())
+                                        let old = match effect::effect! {
+                                            run_in_context;
+                                            context: context,
+                                            program: effect! { watch_read; source: state, },
+                                            environment: env.clone(),
+                                        }
                                             .await
                                         {
                                             Exit::Success(old) => old,
@@ -396,12 +409,13 @@ impl<E: Send + 'static> RuntimeSampler<E> {
                                         );
                                     }
                                 };
-                                let published = context
-                                    .run(
-                                        effect_map_error! {
-                                            program: state.set(status), map: DiagnosticsError::Subscription, },
-                                        env.clone(),
-                                    )
+                                let published = effect::effect! {
+                                    run_in_context;
+                                    context: context,
+                                    program: effect_map_error! {
+                                            program: effect! { watch_set; source: state, value: status, }, map: DiagnosticsError::Subscription, },
+                                    environment: env.clone(),
+                                }
                                     .await;
                                 if !matches!(published, Exit::Success(_)) {
                                     return discard_value(published);
@@ -410,9 +424,9 @@ impl<E: Send + 'static> RuntimeSampler<E> {
                         }
                     }, };
                     effect_finalizer! {
-        scope: scope, body: effect_map! { program: effect_map_error! { program: state.shutdown(effect::PubSubShutdown::Discard), map: DiagnosticsError::Subscription, }, map: |_| (), },
+        scope: scope, body: effect_map! { program: effect_map_error! { program: effect! { watch_shutdown; source: state, mode: effect::PubSubShutdown::Discard, }, map: DiagnosticsError::Subscription, }, map: |_| (), },
         }?;
-                    scope.fork(worker)?;
+                    effect::effect_scope! { fork; scope: scope, program: worker, }?;
                     sampler
                 }
     }
@@ -441,7 +455,12 @@ impl<E: Send + 'static> RuntimeSampler<E> {
                         Ok(publication) => publication,
                         Err(error) => return Exit::Fail(DiagnosticsError::Memory(error)),
                     };
-                    let sample = match crate::split_exit(context.run(source(), env.clone()).await) {
+                    let sample = match effect::effect! {
+                        run_in_context;
+                        context: context,
+                        program: source(),
+                        environment: env.clone(),
+                    }.await.into_failure() {
                         Ok(sample) => sample,
                         Err(failure) => return failure.map_error(DiagnosticsError::Source),
                     };
@@ -456,7 +475,12 @@ impl<E: Send + 'static> RuntimeSampler<E> {
                             let mut sample = sample.clone();
                             async move {
                                 loop {
-                                    let sleep = context.run(Effect::<(), DiagnosticsError<E>, R>::sleep(interval), env.clone()).await;
+                                    let sleep = effect::effect! {
+                                        run_in_context;
+                                        context: context,
+                                        program: effect! { sleep; duration: interval, },
+                                        environment: env.clone(),
+                                    }.await;
                                     if !matches!(sleep, Exit::Success(())) {
                                         return sleep;
                                     }
@@ -468,7 +492,12 @@ impl<E: Send + 'static> RuntimeSampler<E> {
                                         Ok(shared_error) => shared_error,
                                         Err(error) => return Exit::Fail(DiagnosticsError::Memory(error)),
                                     };
-                                    let failure = match context.run(source(), env.clone()).await {
+                                    let failure = match effect::effect! {
+                                        run_in_context;
+                                        context: context,
+                                        program: source(),
+                                        environment: env.clone(),
+                                    }.await {
                                         Exit::Success(next) => { sample = next; None },
                                         Exit::Fail(error) => Some(shared_error.publish(error)),
                                         failure @ (Exit::Die(_) | Exit::Interrupted | Exit::FinalizationFailed(_)) => {
@@ -480,7 +509,12 @@ impl<E: Send + 'static> RuntimeSampler<E> {
                             }
                         },
                     };
-                    match crate::split_exit(context.run(scope.fork(worker), env).await) {
+                    match effect::effect! {
+                        run_in_context;
+                        context: context,
+                        program: effect::effect_scope! { fork; scope: scope, program: worker, },
+                        environment: env,
+                    }.await.into_failure() {
                         Ok(_) => Exit::Success(Self { state: RuntimeSource::Prepared { receiver: Arc::new(Mutex::new(receiver)), storage }, interval }),
                         Err(failure) => failure,
                     }
@@ -495,7 +529,7 @@ impl<E: Send + 'static> RuntimeSampler<E> {
     ) -> Effect<Arc<RuntimeStatus<E>>, DiagnosticsError<E>, R> {
         match &self.state {
             RuntimeSource::Ordinary(state) => {
-                effect_map_error! { program: state.read(), map: DiagnosticsError::Subscription, }
+                effect_map_error! { program: effect! { watch_read; source: state, }, map: DiagnosticsError::Subscription, }
             }
             RuntimeSource::Prepared { receiver, .. } => {
                 let state = receiver.clone();
@@ -536,7 +570,7 @@ impl<E: Send + 'static> RuntimeSampler<E> {
         stream! {
             pull: effect_map! {
                 program: effect_map_error! {
-                program: state.subscribe(), map: move |error| acquire_inject(DiagnosticsError::Subscription(error)), }, map: |snapshot| Cursor {
+                program: effect! { watch_subscribe; source: state, }, map: move |error| acquire_inject(DiagnosticsError::Subscription(error)), }, map: |snapshot| Cursor {
                     initial: std::sync::Mutex::new(Some(snapshot.value)),
                     subscription: snapshot.subscription,
                 }, },
@@ -550,12 +584,10 @@ impl<E: Send + 'static> RuntimeSampler<E> {
                         .take()
                     {
                         Some(initial) => {
-                            effect_try_sync! { once; body: { let __dsl_result = Ok(effect::Chunk::Values(vec![initial])); move || __dsl_result }, on_error: ::core::convert::identity, }
+                            effect::effect_from_result! { once; result: Ok(effect::Chunk::Values(vec![initial])), }
                         }
                         None => effect_map_error! {
-                            program: cursor
-                            .subscription
-                            .pull_chunk(), map: move |error| inject(DiagnosticsError::Subscription(error)), },
+                            program: effect! { subscription_pull_chunk; source: cursor.subscription, }, map: move |error| inject(DiagnosticsError::Subscription(error)), },
                     }
                 }) {
                     Ok(pull) => pull,
@@ -566,9 +598,7 @@ impl<E: Send + 'static> RuntimeSampler<E> {
                 let inject = release_inject.clone();
                 effect_map! {
                     program: effect_map_error! {
-                    program: cursor
-                        .subscription
-                        .unsubscribe(), map: move |error| inject(DiagnosticsError::Subscription(error)), }, map: |_| (), }
+                    program: effect! { subscription_unsubscribe; source: cursor.subscription, }, map: move |error| inject(DiagnosticsError::Subscription(error)), }, map: |_| (), }
             },
         }
     }

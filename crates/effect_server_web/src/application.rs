@@ -11,13 +11,16 @@ use crate::{
     localization::{IntoLocalization, PinnedCatalog},
     security::Security,
 };
-use crate::{effect_die, effect_future, effect_map, effect_map_error, effect_sync, effect_try_sync};
+use crate::{
+    effect_die, effect_fail, effect_from_result, effect_future, effect_map, effect_map_error,
+    effect_sync, effect_try_sync,
+};
 use effect::effect;
 use effect::memory::Admission;
 use effect::{Effect, Exit, HasCancellation, HasClock, HasTaskSpawner, Scope, effect_scope};
 use effect_server::{
     HasRequest, HasTokio, HttpProtocols, Pipeline, PreparedEndpointBytePools, PreparedHostResult,
-    PreparedServer, Request, RequestBinding, RequestCompletion, RequestHook, Router, Server,
+    PreparedServer, Request, RequestCompletion, RequestHook, Router, Server,
     ServerError, ServerHost, ServerPolicy, StaticOverloadReply,
 };
 use effect_server::{pipeline, router, server};
@@ -146,7 +149,7 @@ impl<C: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Prep
                 let byte_pools = byte_pools.clone();
                 let use_host = use_host.clone();
                 let errors = definition.errors.clone();
-                let server = definition.prepare(scope)?;
+                let server = crate::web! { prepare; source: definition, scope: scope, }?;
                 let host = effect_try_sync! {
                     once;
                     body: move || {
@@ -160,13 +163,20 @@ impl<C: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Prep
                         }
                         if let Some(admission) = admission {
                             let admission = admission.try_clone().map_err(WebError::Memory)?;
-                            prepared = prepared.with_request_control_admission(admission)
-                                .map_err(WebError::Memory)?;
+                            prepared = server! {
+                                prepared_configure;
+                                source: prepared,
+                                request_control_admission(admission),
+                            }.map_err(WebError::Memory)?;
                         }
                         if let Some(pools) = byte_pools {
-                            prepared = prepared.with_request_byte_pools(pools).map_err(WebError::Memory)?;
+                            prepared = server! {
+                                prepared_configure;
+                                source: prepared,
+                                request_byte_pools(pools),
+                            }.map_err(WebError::Memory)?;
                         }
-                        prepared.with_host(move |host| use_host(host))
+                        server! { with_host; source: prepared, body: move |host| use_host(host), }
                             .map_err(WebError::Memory)
                     },
                     on_error: move |error| errors(error),
@@ -181,7 +191,7 @@ impl<C: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Prep
     where
         R: HasRequest + HasClock + HasTaskSpawner + HasCancellation + HasTokio,
     {
-        self.with_host(wait_for_cancellation)
+        crate::web! { with_host; source: self, body: wait_for_cancellation, }
     }
 }
 
@@ -392,25 +402,27 @@ impl<C: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Web<
             }
         };
         let errors = self.errors.clone();
+        let localization_error = move |error| errors(WebError::Localization(error));
         self.features.push(Arc::new(move |_, scope| {
-            let errors = errors.clone();
-            let selection_errors = errors.clone();
-            definition
-                .scoped(scope, move |error| errors(WebError::Localization(error)))
-                .map(move |runtime| {
-                    let errors = selection_errors.clone();
+            let selected_error = localization_error.clone();
+            effect_map! {
+                program: definition.scoped(scope, localization_error.clone()),
+                map: move |runtime| {
+                    let errors = selected_error.clone();
                     let hook: RequestHook<E, R> = Arc::new(move |request| {
-                        let errors = errors.clone();
-                        let stage_errors = errors.clone();
-                        let request_after_selection = request.clone();
-                        runtime
-                            .for_request(request)
-                            .map_error(move |error| stage_errors(WebError::Localization(error)))
-                            .flat_map(move |catalog| {
-                                let request = request_after_selection.clone();
-                                let errors = errors.clone();
-                                Effect::try_sync_once(
-                                    move || {
+                        let response_request = request.clone();
+                        let select_error = errors.clone();
+                        let headers_error = errors.clone();
+                        effect! {
+                            bind;
+                            program: effect_map_error! {
+                                program: runtime.for_request(request), map: select_error,
+                            },
+                            body: move |catalog| {
+                                let request = response_request.clone();
+                                effect_try_sync! {
+                                    once;
+                                    body {
                                         request.with_extensions(|extensions| {
                                             if let Some(headers) =
                                                 extensions.get::<effect_server::ResponseHeaders>()
@@ -426,12 +438,14 @@ impl<C: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Web<
                                         request.insert_extension::<PinnedCatalog<L>>(catalog);
                                         Ok(())
                                     },
-                                    move |error| errors(WebError::Localization(error)),
-                                )
-                            })
+                                    on_error: headers_error.clone(),
+                                }
+                            },
+                        }
                     });
                     vec![hook]
-                })
+                },
+            }
         }));
         self
     }
@@ -458,7 +472,7 @@ impl<C: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Web<
         let startup_scope = scope.clone();
         effect! {
         bind;
-        program: { let __dsl_factory = move || startup(startup_scope.clone()); effect! { __dsl_factory()? } },
+        program: effect! { defer; body: move || startup(startup_scope.clone()), },
         body: move |capabilities| {
                    let capabilities = Arc::new(capabilities);
                    let definition = definition.clone();
@@ -475,9 +489,11 @@ impl<C: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Web<
                            let mut policy = definition.policy.clone();
                            if let Some(observe) = &definition.observer {
                                let observe = observe.clone();
-                               policy = policy.on_exit(move |env, request, completion| {
-                                   observe(env, request, completion)
-                               });
+                               policy = server! {
+                                   policy;
+                                   source: policy,
+                                   on_exit(move |env, request, completion| observe(env, request, completion)),
+                               };
                            }
                            let mut routes = (definition.routes)(capabilities.clone());
                            if let Some(availability) = &definition.availability {
@@ -501,9 +517,10 @@ impl<C: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Web<
                            let request_capabilities = capabilities.clone();
                            let mut server = match server! {
                                policy: policy,
-                               environment: RequestBinding::new(move |request| {
-                                   resolve(request_capabilities.clone(), request)
-                               }),
+                               environment: server! {
+                                   request_binding;
+                                   body: move |request| resolve(request_capabilities.clone(), request),
+                               },
                                listen: definition.listen,
                                protocols: definition.protocols,
                                routes: routes,
@@ -524,17 +541,17 @@ impl<C: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Web<
                                };
                            }
                            for feature in &definition.features {
-                               let hooks = match context
-                                   .run(feature(capabilities.clone(), scope.clone()), env.clone())
+                               let hooks = match effect::effect! {
+                                   run_in_context;
+                                   context: context,
+                                   program: feature(capabilities.clone(), scope.clone()),
+                                   environment: env.clone(),
+                               }
                                    .await
+                                   .into_failure()
                                {
-                                   Exit::Success(hooks) => hooks,
-                                   Exit::Fail(error) => return Exit::Fail(error),
-                                   Exit::Die(defect) => return Exit::Die(defect),
-                                   Exit::Interrupted => return Exit::Interrupted,
-                                   Exit::FinalizationFailed(failure) => {
-                                       return Exit::FinalizationFailed(failure);
-                                   }
+                                   Ok(hooks) => hooks,
+                                   Err(exit) => return exit,
                                };
                                for hook in hooks {
                                    server = server! {
@@ -605,8 +622,8 @@ impl<C: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Web<
             body |scope: Scope<E>| {
                 let definition = definition.clone();
                 let use_host = use_host.clone();
-                let server = definition.prepare(scope)?;
-                server.with_host(move |host| use_host(host))?
+                let server = crate::web! { prepare; source: definition, scope: scope, }?;
+                server! { with_host; source: server, body: move |host| use_host(host), }?
             },
         }
     }
@@ -616,7 +633,7 @@ impl<C: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static> Web<
     where
         R: HasRequest + HasClock + HasTaskSpawner + HasCancellation + HasTokio,
     {
-        self.with_host(wait_for_cancellation)
+        crate::web! { with_host; source: self, body: wait_for_cancellation, }
     }
 }
 fn wait_for_cancellation<E: Send + 'static, R: HasCancellation + Send + Sync + 'static>(
@@ -699,7 +716,12 @@ fn install_security<E: Send + 'static, R: HasRequest + Send + Sync + 'static>(
                     request.insert_extension(transport);
                 }
                 if let Some(nonce) = &security.nonce {
-                    let nonce = match context.run(nonce(), env).await {
+                    let nonce = match effect::effect! {
+                        run_in_context;
+                        context: context,
+                        program: nonce(),
+                        environment: env,
+                    }.await {
                         Exit::Success(nonce) => nonce,
                         Exit::Fail(error) => return Exit::Fail(error),
                         Exit::Die(defect) => return Exit::Die(defect),
@@ -751,10 +773,10 @@ fn install_security<E: Send + 'static, R: HasRequest + Send + Sync + 'static>(
            let present = request
                .with_extensions(|extensions| extensions.get::<crate::csp::ResponseNonce>().cloned());
            let nonce = match present {
-               Some(nonce) => effect_try_sync! { once; body: { let __dsl_result = Ok(Some(nonce)); move || __dsl_result }, on_error: ::core::convert::identity, },
+               Some(nonce) => effect_from_result! { once; result: Ok(Some(nonce)), },
                None => match &security.nonce {
                    Some(generate) => effect_map! { program: generate(), map: Some, },
-                   None => effect_sync! { body: { let __dsl_value = None; move || __dsl_value.clone() }, },
+                   None => effect_sync! { body { None }, },
                },
            };
            let response = std::sync::Mutex::new(Some(response));
@@ -786,9 +808,9 @@ fn install_security<E: Send + 'static, R: HasRequest + Send + Sync + 'static>(
                        None => csp.header(nonce.as_ref()),
                    }
                }, || Ok(static_headers.1.clone()));
-               match headers {
-                   Ok(()) => effect_try_sync! { once; body: { let __dsl_result = Ok(response); move || __dsl_result }, on_error: ::core::convert::identity, },
-                   Err(error) => effect_try_sync! { once; body: { let __dsl_result = Err(errors(error)); move || __dsl_result }, on_error: ::core::convert::identity, },
+               effect_from_result! {
+                   once;
+                   result: headers.map(|()| response).map_err(|error| errors(error)),
                }
            },
     }
@@ -813,21 +835,15 @@ fn install_security<E: Send + 'static, R: HasRequest + Send + Sync + 'static>(
                                if accepted {
                                    effect_sync! { body { () }, }
                                } else {
-                                   effect_try_sync! {
-                                       body: {
-                                       let __dsl_error = {
-                                       let errors = errors.clone();
-                                       move || errors(WebError::Rejected("authentication"))
-                                   }; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }
+                                   let errors = errors.clone();
+                                   effect_fail! { error: errors(WebError::Rejected("authentication")), }
                                }
                            },
         }
                        }
-                       None => effect_try_sync! {
-                           body: {
-                           let __dsl_error = move || {
-                           errors(WebError::Metadata("native route classification".into()))
-                       }; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, },
+                       None => effect_fail! {
+                           error: errors(WebError::Metadata("native route classification".into())),
+                       },
                    }
                    }),
                };

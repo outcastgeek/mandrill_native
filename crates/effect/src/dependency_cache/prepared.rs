@@ -409,11 +409,7 @@ impl<K: Send + Sync + 'static, D: Send + Sync + 'static, A: Send + 'static, E: S
                 } else {
                     Err(DependencyCacheError::Memory(MemoryError::UnsupportedRunContract))
                 };
-                effect_try_sync! {
-                    once;
-                    body: move || result,
-                    on_error: ::core::convert::identity,
-                }?
+                crate::effect_from_result! { once; result: result, }?
             }
         }
     }

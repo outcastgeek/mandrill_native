@@ -1,7 +1,7 @@
 //! Fixed metric series and independently retained snapshots.
 
 use super::{
-    HasMetricRecorder, MetricAggregate, MetricDomain, MetricError, MetricKind, MetricRecorder,
+    MetricAggregate, MetricDomain, MetricError, MetricKind, MetricRecorder,
     MetricSample, MetricValue, validate_value,
 };
 use crate::memory::{
@@ -285,6 +285,8 @@ impl PreparedMetricSnapshot {
 }
 
 /// A process-local recorder selected with finite, physically prepared storage.
+#[derive(crate::EffectEnvironment)]
+#[effect_environment(metric_recorder(provider = Self, get = self))]
 pub struct PreparedMetricRecorder {
     entries: Mutex<FixedVector<'static, Entry>>,
     identities: SlotPool<'static, Identity>,
@@ -436,13 +438,5 @@ impl MetricRecorder for PreparedMetricRecorder {
             labels,
             sample.value(),
         )
-    }
-}
-
-impl HasMetricRecorder for PreparedMetricRecorder {
-    type Recorder = Self;
-
-    fn metric_recorder(&self) -> &Self::Recorder {
-        self
     }
 }

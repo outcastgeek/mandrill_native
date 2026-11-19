@@ -9,8 +9,9 @@ extern crate self as effect_server_web;
 
 /// Typed callback blocks using this facade's existing Effect dependency.
 pub use effect::{
-    codec, effect_all, effect_all_concurrent, effect_blocking, effect_cpu, effect_die,
-    effect_finalizer, effect_for_each, effect_for_each_concurrent, effect_from_option,
+    EffectEnvironment, EffectErrorLabel,
+    codec, effect_all, effect_all_concurrent, effect_blocking, effect_cpu, effect_die, effect_fail,
+    effect_finalizer, effect_for_each, effect_for_each_concurrent, effect_from_option, effect_from_result,
     effect_future, effect_map, effect_map_error, effect_on_interrupt, effect_permit,
     effect_provide_some, effect_provided, effect_race, effect_recover, effect_ref, effect_repeat,
     effect_resource, effect_retry, effect_sandbox, effect_schema_parse, effect_scope,
@@ -103,6 +104,7 @@ pub use effect_macros::web;
 pub mod __private {
     /// The existing interpreter and lowering support, re-exported hygienically.
     pub use effect;
+    pub use effect_server::{HasRequest, Request, ServerHost};
 }
 
 /// Configuration/policy failures before native response commitment. Application
@@ -170,14 +172,4 @@ pub(crate) fn restore_exit<A: Send + 'static, E: Send + 'static, R: Send + Sync 
             }
         }
     }, }
-}
-
-pub(crate) fn split_exit<A, B, E>(exit: effect::Exit<A, E>) -> Result<A, effect::Exit<B, E>> {
-    match exit {
-        effect::Exit::Success(value) => Ok(value),
-        effect::Exit::Fail(error) => Err(effect::Exit::Fail(error)),
-        effect::Exit::Die(defect) => Err(effect::Exit::Die(defect)),
-        effect::Exit::Interrupted => Err(effect::Exit::Interrupted),
-        effect::Exit::FinalizationFailed(failure) => Err(effect::Exit::FinalizationFailed(failure)),
-    }
 }

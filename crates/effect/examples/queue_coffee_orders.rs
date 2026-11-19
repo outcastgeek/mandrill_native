@@ -4,7 +4,7 @@
 //! Input: ticket 106 for one cup. Output: one set of pickup instructions, its recorded
 //! result, and an empty claim after acknowledgement. Stores are process-local.
 
-use effect::{effect_die, effect_map_error, effect_provide_some, effect_try_sync};
+use effect::{effect_die, effect_from_result, effect_map_error, effect_provide_some};
 pub mod cafe_support;
 use cafe_support::tickets::{Pickup, Ticket, TicketError, error_codec, pickup_codec, ticket_codec};
 use cafe_support::{Cafe, CafeKeys, binary, binary_limits, key, limits};
@@ -14,11 +14,12 @@ use effect::persistence::{
 };
 use effect::workflow::{
     DurableDeferred, DurableQueueError, DurableQueueWorkerError, DurableSignalError,
-    DurableSignalWait, WorkflowCodecError, WorkflowDefinitionId, WorkflowEngine,
-    WorkflowEngineError, WorkflowHandle, WorkflowRunId, WorkflowSignalId, WorkflowVersion,
+    DurableSignalWait, WorkflowCodecError, WorkflowDefinitionId, WorkflowEngineError,
+    WorkflowHandle, WorkflowRunId, WorkflowSignalId, WorkflowVersion,
 };
 use effect::{
-    Effect, Exit, UtcMillis, durable_queue, effect, persisted_queue, service, workflow_definition,
+    Effect, Exit, UtcMillis, durable_queue, effect, persisted_queue, service, workflow,
+    workflow_definition,
 };
 use std::num::NonZeroUsize;
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
@@ -39,13 +40,19 @@ fn serve_queued_ticket() -> Effect<(), DeliveryError, Cafe> {
         let ticket = Ticket { number: "106".into(), customer: "Nora".into(), cups: 1 };
         let run = WorkflowRunId::from_stable(match key("delivery-106") { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, });
         let engine = service! { env |env: &Cafe| { env.workflow.clone() }, }?;
-        effect_map_error! { program: effect_provide_some! { program: engine.register(definition.registration()), project: |_: &Cafe| (), }, map: DeliveryError::Workflow, }?;
-        let input = effect_map_error! { program: effect_try_sync! { once; body: { let __dsl_result = definition.encode_input_bytes(&ticket); move || __dsl_result }, on_error: ::core::convert::identity, }, map: DeliveryError::Codec, }?;
+        effect_map_error! { program: effect_provide_some! { program: workflow! { register; engine: engine, registration: definition.registration(), }, project: |_: &Cafe| (), }, map: DeliveryError::Workflow, }?;
+        let input = effect_from_result! {
+            once;
+            result: definition.encode_input_bytes(&ticket),
+            on_error: DeliveryError::Codec,
+        }?;
         effect_map_error! { 
             program: effect_provide_some! { 
-            program: engine.start(WorkflowHandle {
-            run: run.clone(), definition: definition.id,
-            version: definition.version }, input), project: |_: &Cafe| (), }, map: DeliveryError::Workflow, }?;
+            program: workflow! {
+                start; engine: engine,
+                handle: WorkflowHandle { run: run.clone(), definition: definition.id, version: definition.version },
+                input: input,
+            }, project: |_: &Cafe| (), }, map: DeliveryError::Workflow, }?;
         let pickup = DurableDeferred {
             run, signal: WorkflowSignalId::from_stable(match key("pickup-106") { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, }),
             version: definition.version, codec: match pickup_codec() { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, }, limits: limits() };
@@ -62,13 +69,19 @@ fn serve_queued_ticket() -> Effect<(), DeliveryError, Cafe> {
         let queue = Arc::new(durable_queue! { queue: queue });
         let delivery_key = match key("delivery-106") { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, };
         effect_map_error! { 
-            program: queue.enqueue(delivery_key, move || ticket.clone(), &pickup,
-            UtcMillis::new(0), UtcMillis::new(0)), map: DeliveryError::Queue, }?;
+            program: durable_queue! {
+                enqueue; queue: queue, key: delivery_key, payload: move || ticket.clone(),
+                deferred: &pickup, occurred_at: UtcMillis::new(0), available_at: UtcMillis::new(0),
+            }, map: DeliveryError::Queue, }?;
         let owner = match QueueOwner::new("barista") { Ok(owner) => owner, Err(error) => effect_die! { defect: effect::Defect::new(format!("queue owner: {error:?}")), }?, };
         let claim = match QueueClaimOptions::new(owner, UtcMillis::new(0), UtcMillis::new(100), NonZeroUsize::MIN) { Ok(claim) => claim, Err(error) => effect_die! { defect: effect::Defect::new(format!("claim policy: {error:?}")), }?, };
-        let mut claims = effect_map_error! { program: queue.claim(claim.clone()), map: DeliveryError::Queue, }?;
+        let mut claims = effect_map_error! { program: durable_queue! { claim; queue: queue, options: claim.clone(), }, map: DeliveryError::Queue, }?;
         let claimed = match claims.pop() { Some(claimed) => claimed, None => effect_die! { defect: effect::Defect::new("queued ticket"), }?, };
-        let delivery = effect_map_error! { program: effect_try_sync! { once; body: { let __dsl_result = queue.decode_claim(claimed); move || __dsl_result }, on_error: ::core::convert::identity, }, map: DeliveryError::Decode, }?;
+        let delivery = effect_from_result! {
+            once;
+            result: durable_queue! { decode_claim; queue: queue, claim: claimed, },
+            on_error: DeliveryError::Decode,
+        }?;
         effect_map_error! { 
             program: durable_queue! {
             queue: queue.clone(), delivery: delivery, deferred: pickup.clone(),
@@ -83,13 +96,13 @@ fn serve_queued_ticket() -> Effect<(), DeliveryError, Cafe> {
                 Pickup { number: ticket.number, customer: ticket.customer, cups: ticket.cups }
             },
         }, map: DeliveryError::Worker, }?;
-        match effect_map_error! { program: pickup.wait(), map: DeliveryError::Pickup, }? {
+        match effect_map_error! { program: workflow! { wait_deferred; deferred: pickup, }, map: DeliveryError::Pickup, }? {
             DurableSignalWait::Ready(pickup) => {
                 use std::io::Write; let written = writeln!(std::io::stdout().lock(), "Recorded pickup: {} cup for {}, ticket {}.",
                 pickup.cups, pickup.customer, pickup.number); match written { Ok(()) => (), Err(error) => effect_die! { defect: effect::Defect::from_io(error), }?, } },
             DurableSignalWait::Waiting => effect_die! { defect: effect::Defect::new("worker returned before recording pickup"), }?,
         }
-        let remaining = effect_map_error! { program: queue.claim(claim), map: DeliveryError::Queue, }?;
+        let remaining = effect_map_error! { program: durable_queue! { claim; queue: queue, options: claim, }, map: DeliveryError::Queue, }?;
         assert!(remaining.is_empty());
         { use std::io::Write; let written = writeln!(std::io::stdout().lock(), "Acknowledged; no ticket remains to claim."); match written { Ok(()) => (), Err(error) => effect_die! { defect: effect::Defect::from_io(error), }?, } };
     }
@@ -117,7 +130,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         NonZeroUsize::MIN.saturating_add(15),
         NonZeroUsize::MIN.saturating_add(3),
     );
-    let result = futures_executor::block_on(serve_queued_ticket().run(env.clone()));
+    let result = futures_executor::block_on(effect! {
+        run;
+        program: serve_queued_ticket(),
+        environment: env.clone(),
+    });
     env.base
         .finish()
         .map_err(|error| error.message().to_owned())?;

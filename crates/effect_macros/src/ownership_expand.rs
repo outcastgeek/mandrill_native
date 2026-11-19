@@ -3,7 +3,7 @@
 //! cleanup remain in the existing runtime. No new resource or subscription engine.
 use crate::callback_expand::{Input, body, program};
 use crate::domain_expand::{BodyCategory, Fields};
-use proc_macro2::{Span, TokenStream};
+use proc_macro2::{Ident, Span, TokenStream};
 use quote::quote;
 
 /// Resource-only release bodies use Effect binds. Primary-aware release factories
@@ -52,6 +52,7 @@ pub(crate) fn ownership(name: &str, input: Input) -> syn::Result<TokenStream> {
             "prepared_pool",
             "admitted_pool",
             "admitted_close",
+            "close_owned",
             "admitted",
             "prepared_close",
             "reserve_closed",
@@ -59,6 +60,10 @@ pub(crate) fn ownership(name: &str, input: Input) -> syn::Result<TokenStream> {
             "reserve_close",
             "prepared_checkpoint",
             "prepared_release",
+            "fork",
+            "join",
+            "interrupt",
+            "fork_unit_with_task_guard",
             "merge",
             "provide",
             "release",
@@ -76,11 +81,44 @@ pub(crate) fn ownership(name: &str, input: Input) -> syn::Result<TokenStream> {
             "binding_native",
             "use",
             "ensuring_release",
+            "access",
         ],
         "default",
     )?;
     let mut fields = input.fields;
     let path = crate::expand::effect_crate_path()?;
+    if name == "effect_scope" && mode == "close_owned" {
+        let scope = fields.take("scope")?;
+        return fields.finish(quote!(#path::__private::close_scope_owned(#scope)));
+    }
+    if name == "effect_using" && mode == "access" {
+        let resource = fields.transform("resource", |value, _| Ok(quote!(&(#value))))?;
+        let access = fields.role("access", 1, BodyCategory::Native)?;
+        return fields.finish_inferred(
+            quote!(T, A, E, R, F),
+            &[("resource", quote!(&#path::ResourceValue<T>)), ("access", quote!(F))],
+            quote!(#path::Effect<A, E, R>),
+            quote!(T: Send + Sync + 'static, A: Send + 'static,
+                E: Send + 'static, R: Send + Sync + 'static,
+                F: Fn(&T) -> A + Send + Sync + 'static),
+            quote!((#resource).access(#access)),
+        );
+    }
+    if name == "effect_scope" && (mode == "fork" || mode == "fork_unit_with_task_guard") {
+        let scope = fields.transform("scope", |value, _| Ok(quote!(&(#value))))?;
+        let program = fields.take("program")?;
+        if mode == "fork_unit_with_task_guard" {
+            let owner = fields.take("owner")?;
+            let guard = fields.take("guard")?;
+            return fields.finish(quote!(#scope.fork_unit_with_task_guard(#program, #owner, #guard)));
+        }
+        return fields.finish(quote!(#scope.fork(#program)));
+    }
+    if name == "effect_scope" && (mode == "join" || mode == "interrupt") {
+        let fiber = fields.transform("fiber", |value, _| Ok(quote!(&(#value))))?;
+        let method = Ident::new(&mode, Span::mixed_site());
+        return fields.finish(quote!(#fiber.#method()));
+    }
     if name == "effect_resource" && mode == "plan_future" {
         let acquire = fields.take("acquire")?;
         let release = fields.role("release", 4, BodyCategory::Native)?;
@@ -708,14 +746,34 @@ pub(crate) fn state(name: &str, input: Input) -> syn::Result<TokenStream> {
             "modify",
             "update",
             "in_place",
+            "inspect",
+            "get",
             "synchronized",
             "synchronized_pure",
+            "synchronized_read",
             "exists_idle",
+            "retries",
+            "release",
+            "acquire",
+            "ensure_size",
         ],
         "default",
     )?;
     let mut fields = input.fields;
     let path = crate::expand::effect_crate_path()?;
+    if name == "pool" && mode == "release" {
+        let lease = fields.transform("lease", |value, _| Ok(quote!(&(#value))))?;
+        return fields.finish(quote!((#lease).release()));
+    }
+    if name == "pool" && (mode == "acquire" || mode == "ensure_size") {
+        let pool = fields.transform("pool", |value, _| Ok(quote!(&(#value))))?;
+        if mode == "acquire" {
+            let scope = fields.take("scope")?;
+            return fields.finish(quote!((#pool).acquire(#scope)));
+        }
+        let target = fields.take("target")?;
+        return fields.finish(quote!((#pool).ensure_size(#target)));
+    }
     let prepared_inspection = name == "pool" && mode == "exists_idle" && fields.contains("memory");
     if name == "weak_cache" && mode == "default" && fields.contains("memory") {
         let scope = fields.take("scope")?;
@@ -752,6 +810,11 @@ pub(crate) fn state(name: &str, input: Input) -> syn::Result<TokenStream> {
     }
     let prepared_storage = name == "pool" && mode == "default" && fields.contains("memory");
     let output = match name {
+        "schedule" if mode == "retries" => {
+            let count = fields.take("count")?;
+            let delay = fields.take("delay")?;
+            return fields.finish(quote!(#path::Schedule::recurs(#count).intersect(#path::Schedule::spaced(#delay))));
+        }
         "schedule" => {
             let state = fields.take("state")?;
             let step = fields.role("step", 4, BodyCategory::Native)?;
@@ -761,6 +824,19 @@ pub(crate) fn state(name: &str, input: Input) -> syn::Result<TokenStream> {
             let reference =
                 fields.transform("reference", |reference, _| Ok(quote!(&(#reference))))?;
             match mode.as_str() {
+                "get" => return fields.finish(quote!((#reference).get())),
+                "synchronized_read" => return fields.finish(quote!((#reference).read())),
+                "inspect" => {
+                    let inspect = fields.role("inspect", 1, BodyCategory::Native)?;
+                    return fields.finish_inferred(
+                        quote!(State, B, E, R, F),
+                        &[("reference", quote!(&#path::AtomicRef<State>)), ("inspect", quote!(F))],
+                        quote!(#path::Effect<B, E, R>),
+                        quote!(State: Send + 'static, B: Send + 'static, E: Send + 'static,
+                            R: Send + Sync + 'static, F: Fn(&State) -> B + Send + Sync + 'static),
+                        quote!((#reference).with(#inspect)),
+                    );
+                }
                 "modify" | "update" | "in_place" => {
                     let role = if mode == "update" { "update" } else { "modify" };
                     let callback = fields.role(role, 1, BodyCategory::Native)?;
@@ -1086,12 +1162,28 @@ pub(crate) fn demand(name: &str, input: Input) -> syn::Result<TokenStream> {
             "rechunk",
             "collect_prepared",
             "fold_prepared",
+            "open_in",
+            "collect",
         ],
         "default",
     )?;
     let mut fields = input.fields;
     let native_pull = name == "stream" && fields.contains("pull") && !fields.inline("read");
     let path = crate::expand::effect_crate_path()?;
+    if name == "stream" && mode == "open_in" {
+        let stream = fields.transform("stream", |value, _| Ok(quote!(&(#value))))?;
+        let scope = fields.take("scope")?;
+        return fields.finish(quote!((#stream).open(#scope)));
+    }
+    if name == "stream" && mode == "collect" {
+        let stream = fields.transform("stream", |value, _| Ok(quote!(&(#value))))?;
+        let limit = fields.take("limit")?;
+        return fields.finish(quote!((#stream).run_collect(#limit)));
+    }
+    if name == "stream" && mode == "pull" && fields.contains("reader") {
+        let reader = fields.transform("reader", |value, _| Ok(quote!(&(#value))))?;
+        return fields.finish(quote!((#reader).pull()));
+    }
     if matches!(name, "stream")
         && matches!(mode.as_str(), "iterable_prepared" | "pull_prepared" | "map_prepared" | "rechunk")
     {

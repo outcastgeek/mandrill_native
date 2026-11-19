@@ -1,7 +1,7 @@
 //! Atomic in-memory queue claims and settlement.
 
 use super::super::persisted_queue::{
-    HasPersistedQueueStore, MemoryQueueStoreError, PersistedQueueName, PersistedQueueStore,
+    MemoryQueueStoreError, PersistedQueueName, PersistedQueueStore,
     QueueClaim, QueueClaimOptions, QueueClaimToken, QueueDeadLetterReason, QueueMessageId,
     QueueOffer, QueueOfferOutcome, QueueRecord, QueueRecordState, QueueRequeue,
     QueueRequeueAttempts, QueueRequeueOutcome, QueueScan, QueueSettlement, QueueSettlementAction,
@@ -38,19 +38,6 @@ impl Clone for MemoryPersistedQueueStore {
         Self {
             state: Arc::clone(&self.state),
         }
-    }
-}
-
-impl HasPersistedQueueStore for Arc<MemoryPersistedQueueStore> {
-    /// Type alias for store in persistence internal queue delivery.
-    type Store = MemoryPersistedQueueStore;
-
-    ///
-    /// # Returns
-    /// Type: `Arc<Self::Store>`.
-    /// Returns `Arc<Self::Store>`.
-    fn persisted_queue_store(&self) -> Arc<Self::Store> {
-        Arc::clone(self)
     }
 }
 

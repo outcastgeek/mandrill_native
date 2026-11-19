@@ -271,13 +271,11 @@ impl ProtectedReplicaTransfer {
                             program: protection
                             .seal(session.clone(), Arc::clone(&bytes)), map: ReplicaTransferError::Protection, }, project: |_: &R| (), }; effect! {
                                 let expected = expected.clone(); let payload = __dsl_program.clone()?; {
-                                effect_try_sync! {
-                                    once; body: {
-                                    let __dsl_result = if payload.session == expected {
+                                crate::effect_from_result! { once; result: if payload.session == expected {
                                     Ok(payload)
                                 } else {
                                     Err(ReplicaTransferError::SessionMismatch)
-                                }; move || __dsl_result }, on_error: ::core::convert::identity, }
+                                }, }
                             }? } }
                     }? } }
             }? }
@@ -305,7 +303,7 @@ impl ProtectedReplicaTransfer {
         R: HasReplicaProtection + Send + Sync + 'static,
     {
         if payload.session != expected {
-            return effect_try_sync! { body: { let __dsl_error = || ReplicaTransferError::SessionMismatch; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
+            return crate::effect_fail! { error: ReplicaTransferError::SessionMismatch, };
         }
         let payload = Mutex::new(Some(payload));
         let codec = self.codec.clone();
@@ -324,7 +322,7 @@ impl ProtectedReplicaTransfer {
                                    program: effect_map_error! {
                                    program: protection
                                    .open(payload), map: ReplicaTransferError::Protection, }, project: |_: &R| (), },
-                               None => effect_try_sync! { once; body: { let __dsl_result = Err(ReplicaTransferError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, },
+                               None => crate::effect_from_result! { once; result: Err(ReplicaTransferError::InputConsumed), },
                            }
                        },
             };

@@ -356,6 +356,8 @@ impl<A: Send + 'static> Config<A> {
 /// Volatile source for composition and deterministic applications. Returned
 /// encoded values are shared; reads never clone an entire configuration tree.
 #[derive(Clone, Default)]
+#[derive(crate::EffectEnvironment)]
+#[effect_environment(config_source(provider = Self, get = self))]
 pub struct MemoryConfigSource {
     values: Arc<RwLock<BTreeMap<ConfigPath, Arc<JsonValue>>>>,
 }
@@ -425,17 +427,6 @@ impl ConfigSource for MemoryConfigSource {
     }
 }
 
-impl HasConfigSource for MemoryConfigSource {
-    /// Type alias for source in config.
-    type Source = Self;
-
-    ///
-    /// # Returns
-    /// Type: `&Self::Source`.
-    fn config_source(&self) -> &Self::Source {
-        self
-    }
-}
 
 type ConfigDefault<A, D> = Arc<dyn Fn() -> Effect<A, SchemaIssue, D> + Send + Sync>;
 

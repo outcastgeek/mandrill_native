@@ -93,7 +93,7 @@ fn lower(statements: &[Stmt], path: &TokenStream) -> TokenStream {
         Stmt::Expr(Expr::Try(expr), semi) => {
             let program = &expr.expr;
             if semi.is_none() && remaining.is_empty() {
-                quote_spanned!(statement.span().resolved_at(proc_macro2::Span::mixed_site())=> #path::bind(#program, move |value| #path::success(value)))
+                binding_result(expr, path)
             } else {
                 quote_spanned!(statement.span().resolved_at(proc_macro2::Span::mixed_site())=> #path::bind(#program, move |_| { #rest }))
             }
@@ -172,20 +172,35 @@ fn expression(expr: &Expr, path: &TokenStream) -> TokenStream {
         return quote_spanned!(expr.span().resolved_at(proc_macro2::Span::mixed_site())=> #(#attrs)* #path::defer(move || { #body }));
     }
     if let Expr::Try(expr) = expr {
-        let program = &expr.expr;
-        return quote_spanned!(expr.span().resolved_at(proc_macro2::Span::mixed_site())=> #path::bind(#program, move |value| #path::success(value)));
+        return binding_result(expr, path);
     }
     quote_spanned!(expr.span().resolved_at(proc_macro2::Span::mixed_site())=> #path::success(#expr))
+}
+
+/// A tail bind uses the same typed kernel in branches and at the top level.
+fn binding_result(step: &syn::ExprTry, path: &TokenStream) -> TokenStream {
+    let program = &step.expr;
+    quote_spanned!(step.question_token.span.resolved_at(Span::mixed_site())=>
+        #path::bind(#program, move |value| #path::success(value))
+    )
 }
 
 /// Lower a callback's owned inputs through a one-shot body rather than cloning captures.
 /// The callback itself remains reusable; each invocation returns a fresh execution description.
 pub(crate) fn expand_once(statements: Vec<Stmt>) -> syn::Result<TokenStream> {
-    let path = effect_crate_path()?;
+    Ok(expand_once_with_path(statements, effect_crate_path()?, false))
+}
+
+/// Lower an owned callback through the supplied hygienic Effect path.
+pub(crate) fn expand_once_with_path(
+    statements: Vec<Stmt>,
+    path: TokenStream,
+    native_async: bool,
+) -> TokenStream {
     let private = quote!(#path::__private);
-    if crate::parse::validate(&statements).is_err() || crate::parse::has_loops(&statements) {
-        return Ok(crate::async_expand::expand_once(statements, &private));
+    if native_async || crate::parse::validate(&statements).is_err() || crate::parse::has_loops(&statements) {
+        return crate::async_expand::expand_once(statements, &private);
     }
     let body = lower(&statements, &private);
-    Ok(quote!(#private::once(move || { #body })))
+    quote!(#private::once(move || { #body }))
 }

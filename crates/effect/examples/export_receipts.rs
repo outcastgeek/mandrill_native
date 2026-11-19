@@ -7,7 +7,7 @@
 //! CPU workers aggregate customer
 //! totals; owned batches move between steps. The output must not already exist.
 
-use effect::effect_try_sync;
+use effect::effect_from_result;
 pub mod cafe_support;
 use cafe_support::Cafe;
 use effect::{
@@ -29,7 +29,7 @@ fn export(inputs: Arc<[Arc<PathBuf>]>, output: PathBuf) -> Effect<usize, ExportE
                     once;
                     body |_cancel| { std::fs::read_to_string(input.as_ref()) },
                 }?;
-                let csv = effect_try_sync! { once; body: { let __dsl_result = native.map_err(ExportError::Io); move || __dsl_result }, on_error: ::core::convert::identity, }?;
+                let csv = effect_from_result! { once; result: native.map_err(ExportError::Io), }?;
                 Arc::new(csv)
             },
         }?;
@@ -128,7 +128,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         NonZeroUsize::MIN.saturating_add(15),
         NonZeroUsize::MIN.saturating_add(3),
     );
-    let result = futures_executor::block_on(export(inputs, output.clone()).run(env.clone()));
+    let result = futures_executor::block_on(effect! {
+        run;
+        program: export(inputs, output.clone()),
+        environment: env.clone(),
+    });
     env.base
         .finish()
         .map_err(|error| error.message().to_owned())?;

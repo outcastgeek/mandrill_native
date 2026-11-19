@@ -145,7 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pricing = effect_prepare! { prepare; plan: pricing, memory: prepared, region: metadata, capacity: 1, frames: price_frames, }?;
     let run = effect_prepare! { prepare; plan: plan, memory: prepared, region: metadata, capacity: capacity, frames: frames, }?;
     let priced = effect_prepare! { admit; run: &pricing, environment: Arc::new(()), }?;
-    let price = futures_executor::block_on(priced.run())
+    let price = futures_executor::block_on(effect_prepare! { run; invocation: priced, })
         .map(|outcome: &Exit<PriceValue, !>| match outcome {
             Exit::Success(Ok(cents)) => Ok(*cents),
             Exit::Success(Err(_)) => Err(ReceiptError::Outcome),
@@ -164,7 +164,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // including consumer Future destruction and Ready-output inspection.
     let _pricing_delivery_owner = Arc::clone(&environment);
     let invocation = effect_prepare! { admit; run: &run, environment: environment, }?;
-    let output = futures_executor::block_on(invocation.run());
+    let output = futures_executor::block_on(effect_prepare! { run; invocation: invocation, });
     // SAFETY: the original receipt/error moves only into this Future. It is
     // neither sent nor stored elsewhere; write/flush settle synchronously and
     // the captured outcome is destroyed before the consumer's origin lease.

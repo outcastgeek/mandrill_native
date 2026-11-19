@@ -135,6 +135,7 @@ pub trait ClusterActivationStore: Send + Sync + 'static {
 }
 
 /// Selects the activation-ownership store used by an application.
+#[crate::__private::derive_arc_capability(concrete = crate::cluster::MemoryClusterMessageStore)]
 pub trait HasClusterActivationStore {
     /// Store selected by this environment; its trait bound defines the required guarantees.
     type Store: ClusterActivationStore;

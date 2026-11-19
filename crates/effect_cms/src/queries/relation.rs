@@ -1923,7 +1923,7 @@ where
     effect! {
         let admission = admission.clone();
         let check = check.clone();
-        let attempted = admit(&callback_query).either()?;
+        let attempted = effect! { either; program: admit(&callback_query), }?;
         match attempted {
             Ok(()) => {
                 if check.cancellation().is_requested() {
@@ -1964,7 +1964,7 @@ where
     effect! {
         let admission = admission.clone();
         let request = request.clone();
-        let attempted = lookup(&callback_query).either()?;
+        let attempted = effect! { either; program: lookup(&callback_query), }?;
         match attempted {
             Ok(observation) => {
                 if request.cancellation().is_requested() {

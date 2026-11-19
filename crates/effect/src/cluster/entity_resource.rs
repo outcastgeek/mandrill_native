@@ -4,7 +4,7 @@ use super::ClusterOwner;
 use crate::{Effect, ResourceValue, Scope};
 use crate::{
     effect, effect_finalizer, effect_map, effect_map_error, effect_provide_some,
-    effect_scope_acquire, effect_sync, effect_try_sync, service,
+    effect_scope_acquire, effect_sync, service,
 };
 use std::sync::Arc;
 
@@ -112,14 +112,14 @@ impl<T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
                 let owner = check_owner.clone();
                 let check_owner = check_owner.clone();
                 let now = Arc::clone(&now);
-                { let __dsl_program = { let __dsl_left_program = effect_map_error! { program: { let __dsl_factory = move || now(); effect! { __dsl_factory()? } }, map: EntityResourceError::Resource, }; let __dsl_right_program = effect_try_sync! { once; body: { let __dsl_result = Ok(value); move || __dsl_result }, on_error: ::core::convert::identity, }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }; effect! { let check_owner = check_owner.clone(); let owner = owner.clone(); let (now , value) = __dsl_program.clone()?; {
+                { let __dsl_program = { let __dsl_left_program = effect_map_error! { program: { let __dsl_factory = move || now(); effect! { __dsl_factory()? } }, map: EntityResourceError::Resource, }; let __dsl_right_program = crate::effect_from_result! { once; result: Ok(value), }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }; effect! { let check_owner = check_owner.clone(); let owner = owner.clone(); let (now , value) = __dsl_program.clone()?; {
                         let owner = owner.clone();
                         let check_owner = check_owner.clone();
                         { let __dsl_program = { let __dsl_left_program = { let __dsl_program = service! { env: |env: &R| env.cluster_activation_store(), }; effect! { let owner = owner.clone(); let store = __dsl_program.clone()?; {
                                 effect_provide_some! { program: effect_map_error! { program: store
                                     .inspect_activation(owner.address.clone()), map: EntityResourceError::Store, }, project: |_: &R| (), }
-                            }? } }; let __dsl_right_program = effect_try_sync! { once; body: { let __dsl_result = Ok(value); move || __dsl_result }, on_error: ::core::convert::identity, }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }; effect! { let check_owner = check_owner.clone(); let (status , value) = __dsl_program.clone()?; {
-                                effect_try_sync! { once; body: { let __dsl_result = if status.is_some_and(|status| {
+                            }? } }; let __dsl_right_program = crate::effect_from_result! { once; result: Ok(value), }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }; effect! { let check_owner = check_owner.clone(); let (status , value) = __dsl_program.clone()?; {
+                                crate::effect_from_result! { once; result: if status.is_some_and(|status| {
                                         status.phase == super::ActivationPhase::Active
                                             && status.lease.owner == check_owner
                                             && now < status.lease.lease_until
@@ -127,7 +127,7 @@ impl<T: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
                                         Ok(value)
                                     } else {
                                         Err(EntityResourceError::StaleOwnership)
-                                    }; move || __dsl_result }, on_error: ::core::convert::identity, }
+                                    }, }
                             }? } }
                     }? } }
             }? }

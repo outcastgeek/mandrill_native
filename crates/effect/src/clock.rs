@@ -2,7 +2,7 @@
 
 use crate::internal::runtime::{self, Step};
 use crate::internal::waiting::{Position, Waiting};
-use crate::{Cancellation, Defect, Effect, Exit, LibraryDefect};
+use crate::{Cancellation, Defect, Effect, Exit, LibraryDefect, effect_fail};
 use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -291,6 +291,8 @@ struct VirtualState {
 }
 #[derive(Clone)]
 /// A manually advanced clock for deterministic scheduling and timeout behavior.
+#[derive(crate::EffectEnvironment)]
+#[effect_environment(clock(provider = Self, get = self))]
 pub struct TestClock {
     state: Arc<Mutex<VirtualState>>,
 }
@@ -477,16 +479,6 @@ impl Clock for TestClock {
             })
             .await
         })
-    }
-}
-impl HasClock for TestClock {
-    /// Type alias for clock in clock.
-    type Clock = Self;
-    ///
-    /// # Returns
-    /// Type: `&Self`.
-    fn clock(&self) -> &Self {
-        self
     }
 }
 /// Typed sleep registration used by clock.
@@ -679,9 +671,16 @@ impl<
         on_timeout: impl Fn() -> E + Send + Sync + 'static,
     ) -> Self {
         let on_timeout = Arc::new(on_timeout);
-        self.race(Effect::<(), E, R>::sleep(duration).flat_map(move |()| {
-            let on_timeout = Arc::clone(&on_timeout);
-            Effect::fail_with(move || on_timeout())
-        }))
+        crate::effect_race! {
+            program: self,
+            right: crate::effect! {
+                bind;
+                program: crate::effect! { sleep; duration: duration, },
+                body: move |()| {
+                    let on_timeout = Arc::clone(&on_timeout);
+                    effect_fail! { error: on_timeout(), }
+                },
+            },
+        }
     }
 }

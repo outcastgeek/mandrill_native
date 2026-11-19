@@ -3,7 +3,7 @@
 use crate::NativeError;
 use crate::{
     effect_future, effect_map_error, effect_scope_acquire, effect_try_blocking,
-    effect_uninterruptible,
+    effect_uninterruptible, otel,
 };
 use effect::{
     Deferred, Effect, Exit, HasBlockingExecutor, PreparedAdmissionError, PreparedProviderAdmission,
@@ -362,8 +362,8 @@ impl OwnedProviders {
         R: HasBlockingExecutor + Send + Sync + 'static,
     {
         effect_scope_acquire! {
-        scope: scope, acquire: Self::start(factories, policy), release: |providers| {
-                    providers.close()
+        scope: scope, acquire: otel! { start; factories: factories, shutdown: policy, }, release: |providers| {
+                    otel! { close; source: providers, }
                 },
         }
     }
@@ -383,11 +383,14 @@ impl OwnedProviders {
     {
         let on_error = Arc::new(on_error);
         let acquire_error = Arc::clone(&on_error);
-        let acquisition = effect_map_error! { program: Self::start(factories, policy), map: move |error| acquire_error(error), };
+        let acquisition = effect_map_error! {
+            program: otel! { start; factories: factories, shutdown: policy, },
+            map: move |error| acquire_error(error),
+        };
         effect_scope_acquire! {
         scope: scope, acquire: acquisition, release: move |providers| {
                     let on_error = Arc::clone(&on_error);
-                    effect_map_error! { program: providers.close(), map: move |error| on_error(error), }
+                    effect_map_error! { program: otel! { close; source: providers, }, map: move |error| on_error(error), }
                 },
         }
     }
@@ -446,16 +449,24 @@ impl OwnedProviders {
                             shutdown_all(&providers, started, policy, &mut failures);
                             result(failures)
                         }, on_error: std::convert::identity, };
-                    let outcome = context.run(close, Arc::clone(&env)).await;
+                    let outcome = effect::effect! {
+                        run_in_context; context: context, program: close, environment: Arc::clone(&env),
+                    }.await;
                     // Publish even a provider-admission defect so every waiter joins it.
-                    let published = context
-                        .run(completion.complete(outcome), Arc::clone(&env))
-                        .await;
+                    let published = effect::effect! {
+                        run_in_context; context: context,
+                        program: effect::effect! { deferred_complete; source: completion, outcome: outcome, },
+                        environment: Arc::clone(&env),
+                    }.await;
                     if let Exit::Die(defect) = published {
                         return Exit::Die(defect);
                     }
                 }
-                match context.run(completion.await_shared(), env).await {
+                match effect::effect! {
+                    run_in_context; context: context,
+                    program: effect::effect! { deferred_await_shared; source: completion, },
+                    environment: env,
+                }.await {
                     Exit::Success(shared) => shared.with(Clone::clone).unwrap_or_else(Exit::Die),
                     Exit::Fail(error) => Exit::Fail(error),
                     Exit::Die(defect) => Exit::Die(defect),

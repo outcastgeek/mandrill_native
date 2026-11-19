@@ -9,6 +9,7 @@ pub mod cafe_support;
 use cafe_support::{Cafe, key};
 use effect::memory::{Bytes, RegionId};
 use effect::{
+    effect,
     Effect, Exit, PreparedRequestBatch, PreparedResolverCapacity, PreparedResolverIndex, Request,
     RequestGroup, RequestKey, RequestResolverError, Scope, effect_scope, effect_try_sync, memory,
     request_resolver, service,
@@ -139,7 +140,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         NonZeroUsize::MIN.saturating_add(15),
         NonZeroUsize::MIN.saturating_add(3),
     );
-    let result = futures_executor::block_on(resolve_tickets(index, group, keys).run(env.clone()));
+    let result = futures_executor::block_on(effect! {
+        run;
+        program: resolve_tickets(index, group, keys),
+        environment: env.clone(),
+    });
     env.base
         .finish()
         .map_err(|error| error.message().to_owned())?;

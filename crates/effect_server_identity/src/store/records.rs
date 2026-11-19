@@ -12,7 +12,7 @@ pub use prepared::{PreparedRecordCodec, PreparedRecordMemory, RecordWriter};
 use super::SqlxIdentityStore;
 use crate::{effect_future, effect_uninterruptible};
 use effect::{Effect, memory::MemoryError};
-use effect_sql::{NativeOperation, SqlError, kernel::NativeTransactionReservation};
+use effect_sql::{NativeOperation, SqlError, kernel::NativeTransactionReservation, sql};
 pub(super) use prepared::RecordBuffer;
 use prepared::{PayloadBinding, PreparedCodec};
 use sqlx::{AssertSqlSafe, Row};
@@ -197,7 +197,7 @@ impl<'a> RecordWriteAdmission<'a> {
     ) -> Result<Self, RecordError> {
         let transaction = buffer
             .as_ref()
-            .map(|_| backend.kernel.reserve_transaction_operation())
+            .map(|_| sql! { reserve_transaction_operation; kernel: backend.kernel, })
             .transpose()?;
         Ok(Self {
             buffer,
@@ -360,17 +360,17 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
                     .map_err(|error| SqlError::Binding(Box::new(error)))
             }
         }
-        self.backend
-            .kernel
-            .connection_operation(Find {
+        sql! {
+            connection_operation; kernel: self.backend.kernel, operation: Find {
                 adapter: self,
                 owner,
                 id,
                 now,
                 buffer,
-            })
-            .await
-            .map_err(record_sql_error)
+            },
+        }
+        .await
+        .map_err(record_sql_error)
     }
     /// Create a fresh record atomically; uniqueness/commit uncertainty propagate.
     /// This returns the committed revision only after native settlement.
@@ -544,8 +544,8 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
             capacity,
         };
         let result = match admission.transaction {
-            Some(transaction) => transaction.run(operation).await,
-            None => self.backend.kernel.transaction_operation(operation).await,
+            Some(transaction) => sql! { run_transaction_operation; reservation: transaction, operation: operation, }.await,
+            None => sql! { transaction_operation; kernel: self.backend.kernel, operation: operation, }.await,
         };
         let revision = result.map_err(record_sql_error)?;
         Ok((revision, value))
@@ -628,9 +628,8 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
             }
         }
         let mut buffer = self.reserve_buffer()?;
-        self.backend
-            .kernel
-            .transaction_operation(Take {
+        sql! {
+            transaction_operation; kernel: self.backend.kernel, operation: Take {
                 adapter: self,
                 owner,
                 id,
@@ -638,9 +637,10 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
                 now,
                 require_expiry,
                 buffer: buffer.as_mut(),
-            })
-            .await
-            .map_err(record_sql_error)
+            },
+        }
+        .await
+        .map_err(record_sql_error)
     }
     /// Revoke/remove exactly the expected record revision; failed acknowledgment
     /// cannot establish logout, delivery cancellation or completed deletion.
@@ -668,16 +668,16 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
                 Ok(result.rows_affected() == 1)
             }
         }
-        self.backend
-            .kernel
-            .transaction_operation(Remove {
+        sql! {
+            transaction_operation; kernel: self.backend.kernel, operation: Remove {
                 category: self.category.key(),
                 owner,
                 id,
                 expected,
-            })
-            .await
-            .map_err(Into::into)
+            },
+        }
+        .await
+        .map_err(Into::into)
     }
     /// Read one finite page; no transaction or request is retained by its consumer.
     #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
@@ -733,18 +733,18 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlRecordAdapter<A, C> {
             }
         }
         let mut buffer = self.reserve_buffer()?;
-        self.backend
-            .kernel
-            .connection_operation(Page {
+        sql! {
+            connection_operation; kernel: self.backend.kernel, operation: Page {
                 adapter: self,
                 owner,
                 after,
                 limit,
                 now,
                 buffer: buffer.as_mut(),
-            })
-            .await
-            .map_err(record_sql_error)
+            },
+        }
+        .await
+        .map_err(record_sql_error)
     }
     /// Decode native SQL cells and validate both codec version and policy bound.
     #[expect(clippy::result_large_err, reason = "retains owned SQL diagnostics without an extra heap allocation")]
@@ -990,8 +990,8 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlAuditAdapter<A, C> {
             payload: payload.binding(),
         };
         let result = match admission.transaction {
-            Some(transaction) => transaction.run(operation).await,
-            None => self.backend.kernel.transaction_operation(operation).await,
+            Some(transaction) => sql! { run_transaction_operation; reservation: transaction, operation: operation, }.await,
+            None => sql! { transaction_operation; kernel: self.backend.kernel, operation: operation, }.await,
         };
         result.map_err(Into::into)
     }
@@ -1069,16 +1069,16 @@ impl<A: Send + 'static, C: RecordCodec<A>> SqlAuditAdapter<A, C> {
             }
         }
         let mut buffer = self.reserve_buffer()?;
-        self.backend
-            .kernel
-            .connection_operation(Read {
+        sql! {
+            connection_operation; kernel: self.backend.kernel, operation: Read {
                 adapter: self,
                 owner,
                 after: after.unwrap_or(0),
                 limit: limit.get(),
                 buffer: buffer.as_mut(),
-            })
-            .await
-            .map_err(record_sql_error)
+            },
+        }
+        .await
+        .map_err(record_sql_error)
     }
 }

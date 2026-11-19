@@ -17,7 +17,7 @@ use effect::{
     CacheTtl, Effect, HasClock, HasTaskSpawner, PreparedCacheCapacity, PreparedCacheRefusals,
     PreparedCacheStorage, ProviderAdmission, Scope, SharedValue, effect, service,
 };
-use effect_server::reply;
+use effect_server::{reply, server};
 use effect_server::{FiniteReply, HasRequest, Reply, Request, ResourceValidators};
 use http::{HeaderName, HeaderValue, Method};
 use std::num::NonZeroUsize;
@@ -654,18 +654,19 @@ impl<E: Send + 'static, R: HasClock + HasTaskSpawner + HasRequest + Send + Sync 
         let partition = Arc::new(partition);
         effect! {
         bind;
-        program: effect_try_sync! { once; body: { let __dsl_result = valid; move || __dsl_result }, on_error: ::core::convert::identity, },
+        program: effect::effect_from_result! { once; result: valid, },
         body: move |policy| {
                    if source
                        .vary
                        .iter()
                        .any(|name| !policy.vary_headers.contains(name))
                    {
-                       return effect_try_sync! {
-                           once; body: {
-                           let __dsl_result = Err(SharedValue::new(errors(
-                           WebError::Configuration("output Vary missing key dimension".into()),
-                       ))); move || __dsl_result }, on_error: ::core::convert::identity, };
+                       return effect::effect_from_result! {
+                           once;
+                           result: Err(SharedValue::new(errors(
+                                   WebError::Configuration("output Vary missing key dimension".into()),
+                               ))),
+                       };
                    }
                    let load_source = source.clone();
                    let maximum = policy.response_bytes.get();
@@ -801,7 +802,7 @@ impl<E: Send + 'static, R: HasClock + HasTaskSpawner + HasRequest + Send + Sync 
         let owner = self.clone();
         effect! {
             let owner = owner.clone();
-            let request = service! { env |env: &R| { env.request().clone() }, }?;
+            let request = server! { request; }?;
             effect_map_error! { program: (owner.gate)(request.clone()), map: SharedValue::new, }?;
             let key_owner = owner.clone();
             let request_for_key = request.clone();
@@ -809,10 +810,10 @@ impl<E: Send + 'static, R: HasClock + HasTaskSpawner + HasRequest + Send + Sync 
                 env |env: &R| { key_owner.key(env, &request_for_key) },
             }?;
             let failure_owner = owner.clone();
-            let selected = effect_try_sync! { once; body: { let __dsl_result = selected; move || __dsl_result }, on_error: move |error| failure_owner.selection_error(error), }?;
+            let selected = effect::effect_from_result! { once; result: selected, on_error: move |error| failure_owner.selection_error(error), }?;
             let finite = match (owner.cache.clone(), selected) {
                 (CacheBackend::Ordinary { cache, .. }, AuthorizedOutput::Ordinary(AuthorizedKey { key, cacheable: true })) => {
-                    let value = cache.get(key)?;
+                    let value = effect::cache! { cache: cache, get: key, }?;
                     match value.with(Clone::clone) {
                         Ok(reply) => reply,
                         Err(defect) => effect_die! { defect: defect, }?,
@@ -968,8 +969,8 @@ impl<E: Send + 'static, R: Send + Sync + 'static> OutputCache<E, R> {
     /// Evict finite responses and join fenced renderers after a source change.
     pub fn clear(&self) -> Effect<(), SharedValue<E>, R> {
         match &self.cache {
-            CacheBackend::Ordinary { cache, .. } => cache.clear(),
-            CacheBackend::Prepared { cache, .. } => cache.clear(),
+            CacheBackend::Ordinary { cache, .. } => effect::cache! { cache: cache, clear: (), },
+            CacheBackend::Prepared { cache, .. } => effect::cache! { cache: cache, clear: (), },
         }
     }
 }

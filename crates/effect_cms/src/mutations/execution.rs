@@ -47,7 +47,10 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-use effect::{Defect, Effect, effect, effect_die, effect_map_error, effect_ref, effect_sync, effect_try_sync};
+use effect::{
+    Defect, Effect, effect, effect_die, effect_from_result, effect_map_error, effect_ref,
+    effect_sync, effect_try_sync,
+};
 use effect_server::Request;
 
 use crate::commands::{
@@ -602,9 +605,10 @@ where
             _ => validation.validate_action_input(Some(&request), &kind, &action),
         };
         let validation_attempt = effect_map_error! {
-            program: validation_effect.either(),
+            program: effect! { either; program: validation_effect, },
             map |error| {
                 classify_failure(
+                    None,
                     None,
                     ValidationResult::default(),
                     MutationCause::Validation(error),
@@ -621,7 +625,7 @@ where
             let validation = staged.validation.clone();
             effect_map_error! {
                 program: preflight,
-                map: move |cause| classify_failure(None, validation.clone(), MutationCause::Command(cause)),
+                map: move |cause| classify_failure(None, None, validation.clone(), MutationCause::Command(cause)),
             }?;
         }
         let ready = run_before(staged, before.clone())?;
@@ -640,6 +644,7 @@ where
             map move |cause| {
                 classify_failure(
                     None,
+                    None,
                     validation.clone(),
                     MutationCause::Command(cause),
                 )
@@ -649,7 +654,7 @@ where
     };
     if let Some(commands) = admission {
         return commands.with_work(&admission_request, Some(admission_identity), program, |cause| {
-            classify_failure(None, ValidationResult::default(), MutationCause::Command(cause))
+            classify_failure(None, None, ValidationResult::default(), MutationCause::Command(cause))
         });
     }
     program
@@ -673,15 +678,18 @@ where
     effect! {
         let attempt = attempt.clone();
         let options = options.clone();
-        let attempted = attempt().either()?;
-        let outcome = match attempted {
-            Ok(attempted) => classify_attempt(attempted),
-            Err(failure) => Err(failure),
-        };
-        match outcome {
-            Ok(applied) => applied.recover(options),
-            Err(failure) => failure.recover(options),
-        }
+        let attempted = effect! { either; program: attempt(), }?;
+        recover_mutation_outcome(attempted.and_then(classify_attempt), options)
+    }
+}
+
+pub(super) fn recover_mutation_outcome<E>(
+    outcome: Result<AppliedMutation, MutationFailure<E>>,
+    options: RecoveryOptions<E>,
+) -> (Option<MutationResult>, bool) {
+    match outcome {
+        Ok(applied) => applied.recover(options),
+        Err(failure) => failure.recover(options),
     }
 }
 
@@ -698,6 +706,7 @@ where
         Err(error) => {
             return Err(classify_failure(
                 None,
+                None,
                 ValidationResult::default(),
                 MutationCause::Validation(error),
             ));
@@ -707,6 +716,7 @@ where
     if let Some(cause) = cause {
         return Err(classify_failure(
             input,
+            None,
             validation,
             MutationCause::Validation(cause),
         ));
@@ -757,14 +767,12 @@ where
             None => Ok(()),
             Some(cause) => Err(classify_failure(
                 None,
+                None,
                 observation.0,
                 MutationCause::Before(cause),
             )),
         };
-        effect_try_sync! {
-            once;
-            body: move || checked,
-        }?;
+        effect_from_result! { once; result: checked, }?;
         ReadyMutation { validated }
     }
 }
@@ -772,13 +780,14 @@ where
 /// Classify one stopped step by the validation result it carries.
 fn classify_failure<E>(
     input: Option<CommandInputHandle>,
+    result: Option<MutationResult>,
     validation: ValidationResult,
     cause: MutationCause<E>,
 ) -> MutationFailure<E> {
     if validation.code.as_str() == CODE_VALID {
-        MutationFailure::Failed(FailedMutation::new(None, validation, cause))
+        MutationFailure::Failed(FailedMutation::new(result, validation, cause))
     } else {
-        MutationFailure::Rejected(RejectedMutation::new(input, None, validation, cause))
+        MutationFailure::Rejected(RejectedMutation::new(input, result, validation, cause))
     }
 }
 
@@ -789,21 +798,6 @@ fn classify_attempt<E>(
     let (result, validation, cause) = attempted.project();
     match cause {
         None => Ok(AppliedMutation::new(result, validation)),
-        Some(cause) => {
-            if validation.code.as_str() == CODE_VALID {
-                Err(MutationFailure::Failed(FailedMutation::new(
-                    result,
-                    validation,
-                    cause,
-                )))
-            } else {
-                Err(MutationFailure::Rejected(RejectedMutation::new(
-                    None,
-                    result,
-                    validation,
-                    cause,
-                )))
-            }
-        }
+        Some(cause) => Err(classify_failure(None, result, validation, cause)),
     }
 }

@@ -544,7 +544,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Availability<E, R> {
                         duration: definition.deadlines.overall,
                         on_timeout: move || CollectionFailure::Deadline(errors(AvailabilityError::CollectionDeadline)),
                     };
-                    match context.run(collection, env).await {
+                    match effect::effect! { run_in_context; context: context, program: collection, environment: env, }.await {
                         Exit::Success(()) | Exit::Fail(CollectionFailure::Deadline(_)) => {}
                         Exit::Fail(error) => return Exit::Fail(error.into_error(&*definition.errors)),
                         Exit::Die(defect) => return Exit::Die(defect),
@@ -658,7 +658,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Availability<E, R> {
                         },
                         None => ProbeOutput::Ordinary(Vec::new()),
                     };
-                    match context.run(collection, env).await {
+                    match effect::effect! { run_in_context; context: context, program: collection, environment: env, }.await {
                         Exit::Success(report) => match format_report(&report, output) {
                             Ok(reply) => Exit::Success(reply),
                             Err(error) => Exit::Fail(errors(error)),

@@ -60,7 +60,7 @@ fn receipt(total_cents: u32) -> Effect<BackedAdmission<'static, 1, TextLease<'st
                 format: format_args!("Cafe receipt\n2 oat lattes\nTotal: {}.{:02}\n", total_cents / 100, total_cents % 100),
             }.map_err(|_| ReceiptError::OutputCapacity)?;
             Ok::<_, ReceiptError>(output)
-        }, on_error: std::convert::identity, }?
+        }, }?
     }
 }
 
@@ -153,11 +153,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     once; body: move || {
                     receipt.with(|receipt| std::io::stdout().lock().write_all(receipt.owner().as_str().as_bytes()).map_err(ReceiptError::OutputIo))
                         .map_err(ReceiptError::Resource)?
-                }, on_error: std::convert::identity, }?
+                }, }?
             })
         },
     };
-    match futures_executor::block_on(application.run_with_frames(environment, run_frames)) {
+    match futures_executor::block_on(effect! {
+        run_with_frames;
+        program: application,
+        environment: environment,
+        frames: run_frames,
+    }) {
         Exit::Success(()) => Ok(()),
         Exit::Fail(error) => Err(error.into()),
         Exit::Die(error) => Err(std::io::Error::other(format!("{error:?}")).into()),

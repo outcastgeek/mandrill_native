@@ -2,7 +2,7 @@
 //!
 //! [`TokioTasks`], [`TokioBlocking`], and [`TokioClock`] retain a caller-supplied
 //! `Arc<tokio::runtime::Runtime>`; none creates a hidden runtime. An application
-//! can put all three in `R`, combine them with `effect_rayon::RayonCpu`, or
+//! can install all three in `R` with [`TokioProviders`], combine them with `effect_rayon::RayonCpu`, or
 //! supply its own capabilities. Task and blocking adapters enforce explicit
 //! admission and expose a stop/drain boundary. Keep the runtime alive until
 //! application scopes, accepted work, and provider drains have settled.
@@ -20,6 +20,36 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::{Runtime, RuntimeFlavor};
+
+/// Ordinary Effect providers attached to one caller-owned Tokio runtime.
+/// Task and blocking admission have independent limits and independent drains.
+/// Prepare providers explicitly through [`TokioTasks::prepare`],
+/// [`TokioBlocking::prepare`] and [`TokioClock::prepare`].
+pub struct TokioProviders {
+    pub tasks: TokioTasks,
+    pub blocking: TokioBlocking,
+    pub clock: TokioClock,
+}
+
+impl TokioProviders {
+    /// Validate the runtime for independent task execution before attaching the
+    /// blocking executor and clock. The caller supplies both admission limits.
+    pub fn new(
+        runtime: Arc<Runtime>,
+        task_admission: AdmissionCapacity,
+        blocking_admission: AdmissionCapacity,
+        diagnostics: Diagnostics,
+    ) -> Result<Self, Defect> {
+        let tasks = TokioTasks::new(Arc::clone(&runtime), task_admission)?;
+        let blocking = TokioBlocking::new(Arc::clone(&runtime), blocking_admission, diagnostics);
+        let clock = TokioClock::new(runtime);
+        Ok(Self {
+            tasks,
+            blocking,
+            clock,
+        })
+    }
+}
 
 #[derive(Clone)]
 struct TokioPreparedContext(Arc<Runtime>);

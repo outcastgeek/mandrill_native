@@ -164,7 +164,7 @@ where
                     let __dsl_program = effect_provide_some! {
                     program: effect_map_error! {
                     program: store
-                    .get(key, now), map: PersistenceError::Backend, }, project: |_: &R| (), }; effect! { let definition = definition.clone(); let record = __dsl_program.clone()?; effect_try_sync! { once; body: { let __dsl_result = decode_entry(&definition, record); move || __dsl_result }, on_error: ::core::convert::identity, }? } }
+                    .get(key, now), map: PersistenceError::Backend, }, project: |_: &R| (), }; effect! { let definition = definition.clone(); let record = __dsl_program.clone()?; crate::effect_from_result! { once; result: decode_entry(&definition, record), }? } }
             }? } }
         }? }
     }
@@ -247,10 +247,10 @@ where
                                 Err(error) => decoded.push(Err(PersistenceError::Identity(*error))),
                                 Ok(expected) => {
                                     let Some(record) = records.next() else {
-                                        return effect_try_sync! { body: { let __dsl_error = || PersistenceError::BatchMismatch; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
+                                        return crate::effect_fail! { error: PersistenceError::BatchMismatch, };
                                     };
                                     if expected.as_ref() != record.key.as_ref() {
-                                        return effect_try_sync! { body: { let __dsl_error = || PersistenceError::BatchMismatch; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
+                                        return crate::effect_fail! { error: PersistenceError::BatchMismatch, };
                                     }
                                     decoded.push(match record.result {
                                         Ok(read) => decode_entry(&definition, read),
@@ -260,7 +260,7 @@ where
                             }
                         }
                         if records.next().is_some() {
-                            return effect_try_sync! { body: { let __dsl_error = || PersistenceError::BatchMismatch; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
+                            return crate::effect_fail! { error: PersistenceError::BatchMismatch, };
                         }
                         effect_sync! { once; body: move || decoded, }
                     })()? } }
@@ -347,25 +347,21 @@ where
                                 let __dsl_program = __dsl_program.clone(); let key = key.clone(); let revision = __dsl_program?; {
                                     if revision.value() == 0 {
                                         let key = Arc::clone(&key);
-                                        effect_try_sync! {
-                                            body: {
-                                            let __dsl_error = move || {
+                                        crate::effect_fail! { error: {
                                             PersistenceError::InvalidAcknowledgement {
                                                 operation: PersistenceMutation::Write,
                                                 key: Arc::clone(&key),
                                             }
-                                        }; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }
+                                        }, }
                                     } else {
                                         effect_sync! { once; body: move || revision, }
                                     }
                                 }? } },
-                        None => effect_try_sync! {
-                            body: {
-                            let __dsl_error = || {
+                        None => crate::effect_fail! { error: {
                             PersistenceError::Codec(crate::SchemaIssue::new(
                                 crate::SchemaIssueKind::InputConsumed,
                             ))
-                        }; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, },
+                        }, },
                     }
                 }; effect! { __dsl_factory()? } }
             }? } }
@@ -467,13 +463,11 @@ where
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         let Some(replacement) = replacement else {
-            return effect_try_sync! {
-                body: {
-                let __dsl_error = || {
+            return crate::effect_fail! { error: {
                 PersistenceError::Codec(crate::SchemaIssue::new(
                     crate::SchemaIssueKind::InputConsumed,
                 ))
-            }; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
+            }, };
         };
         {
             let __dsl_program = effect_provide_some! {
@@ -490,12 +484,10 @@ where
                 let key = key.clone(); let result = __dsl_program.clone()?; {
                 if matches!(result, CompareExchange::Written(revision) if revision.value() == 0) {
                     let key = Arc::clone(&key);
-                    effect_try_sync! {
-                        body: {
-                        let __dsl_error = move || PersistenceError::InvalidAcknowledgement {
+                    crate::effect_fail! { error: PersistenceError::InvalidAcknowledgement {
                         operation: PersistenceMutation::CompareExchange,
                         key: Arc::clone(&key),
-                    }; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }
+                    }, }
                 } else {
                     effect_sync! { once; body: move || result, }
                 }

@@ -12,12 +12,12 @@ use crate::{effect_future, effect_map_error, effect_sync, effect_try_sync, effec
 use effect::memory::{
     Buffer, BufferLease, BufferView, Bytes, MemoryError, PreparedMemory, RegionId, SlotPool,
 };
-use effect::{Effect, Exit, PreparedAdmissionError, PreparedProviderAdmission, effect, service};
+use effect::{Effect, Exit, PreparedAdmissionError, PreparedProviderAdmission, effect};
 use effect_server::{
     HasRequest, HtmlContent, HttpMethodSet, Reply, Request, Router, ServerError, SsePolicy,
     SseRecord,
 };
-use effect_server::{endpoint, registered, reply, router, stream};
+use effect_server::{endpoint, registered, reply, router, server, stream};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -261,7 +261,7 @@ impl<E: Send + 'static, R: HasRequest + Send + Sync + 'static> ProtectedDashboar
                         .transpose(),
                     on_error: move |error| reserve_error(ServerError::Memory(error)),
                 }?;
-                let request = service! { env |env: &R| { env.request().clone() }, }?;
+                let request = server! { request; }?;
                 (access.authorize)(request)?;
                 let status = effect_map_error! { program: sampler.status(), map: move |error| inject(error), }?;
                 let html = render(DashboardPage {
@@ -270,7 +270,7 @@ impl<E: Send + 'static, R: HasRequest + Send + Sync + 'static> ProtectedDashboar
                     path,
                     interval: sampler.interval,
                 })?;
-                effect_try_sync! { once; body: { let __dsl_result = finite_html(html, bound, &page_error, reserved); move || __dsl_result }, on_error: ::core::convert::identity, }?
+                effect::effect_from_result! { once; result: finite_html(html, bound, &page_error, reserved), }?
             };
             routes = router! {
                 source: routes,
@@ -297,26 +297,29 @@ impl<E: Send + 'static, R: HasRequest + Send + Sync + 'static> ProtectedDashboar
             let access = live_access.clone();
             let output = live_output.clone();
             async move {
-                let request = context
-                    .bind(service! { env: |env: &R| env.request().clone(), })
+                let request = effect! { bind_in_context; context: context, program: server! { request; }, }
                     .await?;
-                context.bind((access.authorize)(request.clone())).await?;
+                effect! { bind_in_context; context: context, program: (access.authorize)(request.clone()), }.await?;
                 let cursor = effect_server::sse_cursor(&request, policy.sse).map_err({
                     let errors = errors.clone();
                     move |error| errors(error)
                 });
-                context.bind(effect_try_sync! { once; body: { let __dsl_result = cursor; move || __dsl_result }, on_error: ::core::convert::identity, }).await?;
+                effect! { bind_in_context; context: context, program: effect::effect_from_result! { once; result: cursor, }, }.await?;
                 let admitted = match admission {
                     DashboardSessions::Ordinary(admission) => {
-                        let reservation = context.bind(admission.reservation()).await?;
+                        let reservation = effect! { bind_in_context; context: context, program: admission.reservation(), }.await?;
                         reservation.with(|result| result.as_ref().map(|_| ()).map_err(|error| *error))
                             .map_err(Exit::Die)?
                     }
                     DashboardSessions::Prepared(admission) => {
-                        let reservation = context.bind(effect_using! {
+                        let reservation = effect! {
+                            bind_in_context;
+                            context: context,
+                            program: effect_using! {
                             binding;
                             acquire: effect_sync! { body: move || admission.admit() },
-                        }).await?;
+                        },
+                        }.await?;
                         reservation.with(|result| match result {
                             Ok(_) => Ok(Ok(())),
                             Err(PreparedAdmissionError::Admission(denial)) => Ok(Err(*denial)),
@@ -328,7 +331,7 @@ impl<E: Send + 'static, R: HasRequest + Send + Sync + 'static> ProtectedDashboar
                 if let Err(denial) = admitted {
                     let reserved = output.as_ref().map(|storage| storage.pages.try_checkout()).transpose()
                         .map_err(|error| Exit::Fail(errors(ServerError::Memory(error))))?;
-                    let html = context.bind((presentation.capacity)(denial)).await?;
+                    let html = effect! { bind_in_context; context: context, program: (presentation.capacity)(denial), }.await?;
                     let reply =
                         finite_html(html, policy.html_bytes, &errors, reserved).map_err(Exit::Fail)?;
                     let status =
@@ -364,12 +367,17 @@ impl<E: Send + 'static, R: HasRequest + Send + Sync + 'static> ProtectedDashboar
                                         Ok(reserved) => reserved,
                                         Err(error) => return Exit::Fail(errors(ServerError::Memory(error))),
                                     };
-                                    let html = match crate::split_exit(context.run(fragment(DashboardPage {
+                                    let html = match effect::effect! {
+                                        run_in_context;
+                                        context: context,
+                                        program: fragment(DashboardPage {
                                         snapshot: status.sample.clone(),
                                         degraded: status.failure.is_some(),
                                         path: policy.page.clone(),
                                         interval,
-                                    }), env.clone()).await) {
+                                    }),
+                                        environment: env.clone(),
+                                    }.await.into_failure() {
                                         Ok(html) => html,
                                         Err(failure) => return failure,
                                     };
@@ -388,7 +396,12 @@ impl<E: Send + 'static, R: HasRequest + Send + Sync + 'static> ProtectedDashboar
                                             Err(error) => return Exit::Fail(errors(error)),
                                         };
                                         drop(finite);
-                                        context.run(writer.write_lease(view), env).await
+                                        effect::effect! {
+                                            run_in_context;
+                                            context: context,
+                                            program: effect_server::stream! { write_lease; writer: writer, view: view, },
+                                            environment: env,
+                                        }.await
                                     } else {
                                         let mut data = String::new();
                                         for (index, line) in html.lines().enumerate() {
@@ -399,12 +412,22 @@ impl<E: Send + 'static, R: HasRequest + Send + Sync + 'static> ProtectedDashboar
                                             data.push_str(line);
                                         }
                                         drop(finite);
-                                        context.run(writer.sse(SseRecord {
+                                        effect::effect! {
+                                            run_in_context;
+                                            context: context,
+                                            program: effect_server::stream! {
+                                                sse;
+                                                writer: writer,
+                                                record: SseRecord {
                                             event: Some("datastar-patch-elements".into()),
                                             id: None,
                                             retry: None,
                                             data,
-                                        }, policy.sse), env).await
+                                        },
+                                                policy: policy.sse,
+                                            },
+                                            environment: env,
+                                        }.await
                                     }
                                 }
                             },

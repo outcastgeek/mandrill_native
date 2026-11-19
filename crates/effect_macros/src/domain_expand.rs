@@ -533,6 +533,29 @@ pub(crate) fn service(mut fields: Fields) -> syn::Result<TokenStream> {
 }
 /// Declare scoped cache acquisition with all caller-supplied configuration and admission options.
 pub(crate) fn cache(mut fields: Fields) -> syn::Result<TokenStream> {
+    if fields.contains("cache") {
+        let cache = fields.transform("cache", |value, _| Ok(quote!(&(#value))))?;
+        let role = ["get", "get_prepared", "get_observed", "try_get", "set", "invalidate", "invalidate_prepared", "invalidate_dependency", "clear", "shutdown"]
+            .into_iter()
+            .find(|role| fields.contains(role))
+            .ok_or_else(|| syn::Error::new(Span::call_site(), "expected a cache operation"))?;
+        let argument = fields.take(role)?;
+        let method = Ident::new(role, Span::mixed_site());
+        let output = match role {
+            "clear" | "shutdown" => quote!({ let (): () = #argument; (#cache).#method() }),
+            "set" => {
+                let value = fields.take("value")?;
+                if fields.contains("dependencies") {
+                    let dependencies = fields.take("dependencies")?;
+                    quote!((#cache).set(#argument, #value, #dependencies))
+                } else {
+                    quote!((#cache).set(#argument, #value))
+                }
+            }
+            _ => quote!((#cache).#method(#argument)),
+        };
+        return fields.finish(output);
+    }
     let path = crate::expand::effect_crate_path()?;
     let scope = fields.take("scope")?;
     let config = fields.take("config")?;
@@ -661,8 +684,13 @@ pub(crate) fn cache(mut fields: Fields) -> syn::Result<TokenStream> {
 pub(crate) fn dependency_cache(mut fields: Fields) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
     let scope = fields.take("scope")?;
-    let policy = fields.take("policy")?;
+    let coalescing = fields.contains("coalescing");
+    let policy_role = if coalescing { "coalescing" } else { "policy" };
+    let policy = fields.take(policy_role)?;
     if fields.contains("dependency_pool") {
+        if coalescing {
+            return Err(syn::Error::new(Span::call_site(), "prepared dependency storage requires its prepared policy"));
+        }
         let (storage_field, storage_type, key_type, method) = if fields.contains("memory") {
             (
                 "memory",
@@ -708,24 +736,20 @@ pub(crate) fn dependency_cache(mut fields: Fields) -> syn::Result<TokenStream> {
             build,
         );
     }
-    let inline = fields
-        .fields
-        .iter()
-        .any(|field| field.name == "load" && field.inline);
-    let load = fields.callback("load", 1)?;
-    let method = if inline {
-        quote!(make_with_shared_key)
+    let load_role = if fields.contains("load_shared") { "load_shared" } else { "load" };
+    let shared = load_role == "load_shared" || fields.inline(load_role);
+    let load = fields.callback(load_role, 1)?;
+    let (policy_type, method, indexed_method) = if coalescing {
+        let method = if shared { quote!(make_coalescing_with_shared_key) } else { quote!(make_coalescing) };
+        (quote!(#path::DependencyCacheCoalescingPolicy<K, D>), method, quote!(make_coalescing_with_prepared_index))
     } else {
-        quote!(make)
+        let method = if shared { quote!(make_with_shared_key) } else { quote!(make) };
+        (quote!(#path::DependencyCachePolicy<K, D, A, E>), method, quote!(make_with_prepared_index))
     };
-    let key = if inline {
-        quote!(::std::sync::Arc<K>)
-    } else {
-        quote!(&K)
-    };
+    let key = if shared { quote!(::std::sync::Arc<K>) } else { quote!(&K) };
     if fields.contains("prepared_index") {
         let index = fields.take("prepared_index")?;
-        let load_shared = if inline {
+        let load_shared = if shared {
             quote!(#load)
         } else {
             quote!(move |key: ::std::sync::Arc<K>| #load(&key))
@@ -733,21 +757,21 @@ pub(crate) fn dependency_cache(mut fields: Fields) -> syn::Result<TokenStream> {
         return fields.finish_inferred(
             quote!(K, D, A, E, R, F),
             &[("scope", quote!(#path::Scope<#path::SharedValue<#path::DependencyCacheError<E>>>)),
-                ("policy", quote!(#path::DependencyCachePolicy<K, D, A, E>)),
+                (policy_role, quote!(#policy_type)),
                 ("prepared_index", quote!(#path::PreparedDependencyCacheIndex<K, D, A, E>)),
-                ("load", quote!(F))],
+                (load_role, quote!(F))],
             quote!(#path::Effect<#path::DependencyCache<K, D, A, E>, #path::SharedValue<#path::DependencyCacheError<E>>, R>),
             quote!(K: Send + Sync + 'static, D: Send + Sync + 'static,
                 A: Send + 'static, E: Send + 'static,
                 R: #path::HasClock + #path::HasTaskSpawner + Send + Sync + 'static,
                 F: Fn(#key) -> #path::Effect<(A, ::std::vec::Vec<D>), E, R> + Send + Sync + 'static),
-            quote!(#path::DependencyCache::make_with_prepared_index(#scope,#policy,#index,#load_shared)),
+            quote!(#path::DependencyCache::#indexed_method(#scope,#policy,#index,#load_shared)),
         );
     }
     fields.finish_inferred(
         quote!(K, D, A, E, R, F),
         &[("scope", quote!(#path::Scope<#path::SharedValue<#path::DependencyCacheError<E>>>)),
-            ("policy", quote!(#path::DependencyCachePolicy<K, D, A, E>)), ("load", quote!(F))],
+            (policy_role, quote!(#policy_type)), (load_role, quote!(F))],
         quote!(#path::Effect<#path::DependencyCache<K, D, A, E>, #path::SharedValue<#path::DependencyCacheError<E>>, R>),
         quote!(K: Send + Sync + 'static, D: Send + Sync + 'static,
             A: Send + 'static, E: Send + 'static,
@@ -808,7 +832,31 @@ pub(crate) fn persisted_queue(mut fields: Fields) -> syn::Result<TokenStream> {
     )
 }
 /// Wrap a queue or execute its existing recorded-result-before-acknowledgement worker boundary.
-pub(crate) fn durable_queue(mut fields: Fields) -> syn::Result<TokenStream> {
+pub(crate) fn durable_queue(input: crate::callback_expand::Input) -> syn::Result<TokenStream> {
+    let mode = input.mode(&["enqueue", "claim", "decode_claim"], "default")?;
+    let mut fields = input.fields;
+    if mode != "default" {
+        let queue = fields.transform("queue", |value, _| Ok(quote!(&(#value))))?;
+        let output = match mode.as_str() {
+            "enqueue" => {
+                let key = fields.take("key")?;
+                let payload = fields.role("payload", 0, BodyCategory::Native)?;
+                let deferred = fields.take("deferred")?;
+                let occurred = fields.take("occurred_at")?;
+                let available = fields.take("available_at")?;
+                quote!((#queue).enqueue(#key, #payload, #deferred, #occurred, #available))
+            }
+            "claim" => {
+                let options = fields.take("options")?;
+                quote!((#queue).claim(#options))
+            }
+            _ => {
+                let claim = fields.take("claim")?;
+                quote!((#queue).decode_claim(#claim))
+            }
+        };
+        return fields.finish(output);
+    }
     let path = crate::expand::effect_crate_path()?;
     let queue = fields.take("queue")?;
     if fields.contains("delivery") {
@@ -918,6 +966,16 @@ pub(crate) fn rpc_stream_operation(mut fields: Fields) -> syn::Result<TokenStrea
         output
     };
     fields.finish(output)
+}
+
+pub(crate) fn rpc_stream_finite(input: crate::callback_expand::Input) -> syn::Result<TokenStream> {
+    input.mode(&["finite"], "finite")?;
+    let mut fields = input.fields;
+    let path = crate::expand::effect_crate_path()?;
+    let chunks = fields.take("chunks")?;
+    let terminal = fields.take("terminal")?;
+    let exhausted = fields.take("exhausted")?;
+    fields.finish(quote!(#path::rpc::RpcStreamProducer::finite(#chunks, #terminal, #exhausted)))
 }
 /// Evaluate a runtime handler list once at its written field position, retaining heterogeneous types.
 fn handler_bindings(fields: &mut Fields, name: &str) -> syn::Result<(TokenStream, Vec<Ident>)> {

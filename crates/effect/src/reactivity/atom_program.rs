@@ -81,7 +81,9 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> AtomProgram
         let map = Arc::new(map);
         AtomProgram::new(move |context| {
             let map = Arc::clone(&map);
-            self.evaluate(context).map_error(move |error| map(error))
+            crate::effect_map_error! {
+                program: self.evaluate(context), map: move |error| map(error),
+            }
         })
     }
     /// Build a dependent helper under the same read context; only executed reads are tracked.

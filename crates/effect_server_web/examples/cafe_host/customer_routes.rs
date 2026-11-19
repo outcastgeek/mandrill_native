@@ -1,10 +1,10 @@
 //! Native Identity entry points and local fixture acquisition for the pickup story.
 
 use super::*;
-use effect::{effect_die, effect_map_error, effect_sync, effect_try_sync, service};
+use effect::{effect_die, effect_sync, effect_try_sync};
 use effect_server::reply;
 use effect_server_identity::IdentityError;
-use effect_sql::sql;
+use http::StatusCode;
 
 /// Render the native login result without exposing credentials or internal outcomes.
 pub(super) fn login_reply(
@@ -30,30 +30,6 @@ pub(super) fn login_reply(
         }
     }
 }
-/// Seed real native accounts and owner-bound orders once; restarts retain collection.
-pub(super) fn seed(
-    account: impl Fn(
-        &'static str,
-    ) -> Effect<effect_server_identity::native::identity::models::UserId, CafeError>
-    + Send
-    + Sync
-    + 'static,
-    sql: SqlClient,
-) -> Effect<(), CafeError> {
-    let account = Arc::new(account);
-    effect! {
-        let account = account.clone(); let sql = sql.clone();
-        effect_map_error! { program: sql.execute(sql! { text("CREATE TABLE IF NOT EXISTS cafe_pickups(ticket INTEGER PRIMARY KEY, customer_id TEXT NOT NULL UNIQUE, customer TEXT NOT NULL, drink TEXT NOT NULL, cups INTEGER NOT NULL CHECK(cups>0), collected INTEGER NOT NULL DEFAULT 0 CHECK(collected IN(0,1)), collections INTEGER NOT NULL DEFAULT 0 CHECK(collections IN(0,1)))"); }), map |error| { cafe_error(CafeProblem::Sql(error)) }, }?;
-        for (name, customer, ticket, drink, cups) in [("maya", "Maya", 104i64, "Oat latte", 2i64), ("lee", "Lee", 105i64, "Espresso", 1i64)] {
-            let owner = account(name)?;
-            effect_map_error! {
-                program: sql.execute(sql! {
-                text("INSERT OR IGNORE INTO cafe_pickups(ticket,customer_id,customer,drink,cups) VALUES(");
-                param(ticket); text(","); param(owner.to_string()); text(","); param(customer); text(","); param(drink); text(","); param(cups); text(")");
-            }), map |error| { cafe_error(CafeProblem::Sql(error)) }, }?;
-        }
-    }
-}
 fn sql_unavailable(error: &effect_sql::SqlError) -> bool {
     matches!(
         error,
@@ -68,58 +44,87 @@ fn sql_unavailable(error: &effect_sql::SqlError) -> bool {
     )
 }
 
+fn pickup_failure(
+    error: &DependencyCacheError<CafeProblem>,
+) -> (StatusCode, Option<pickup::ErrorPage>) {
+    let unknown = (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Some(pickup::ErrorPage::UNKNOWN),
+    );
+    let DependencyCacheError::Load(problem) = error else {
+        return unknown;
+    };
+    let sign_in = (StatusCode::UNAUTHORIZED, Some(pickup::ErrorPage::SIGN_IN));
+    let unavailable = (StatusCode::SERVICE_UNAVAILABLE, None);
+    match problem {
+        CafeProblem::Identity(error) => match error.as_ref() {
+            IdentityError::Unauthorized
+            | IdentityError::StaleGrant
+            | IdentityError::Policy(StatusCode::UNAUTHORIZED) => sign_in,
+            IdentityError::Admission(_) => unavailable,
+            IdentityError::Sql(error) if sql_unavailable(error) => unavailable,
+            IdentityError::Policy(status) => (*status, Some(pickup::ErrorPage::SECURITY)),
+            IdentityError::Configuration(_)
+            | IdentityError::MissingCapability(_)
+            | IdentityError::MissingPolicy(_)
+            | IdentityError::WrongConfiguration
+            | IdentityError::Native(_)
+            | IdentityError::Store(_)
+            | IdentityError::Sql(_)
+            | IdentityError::Record(_)
+            | IdentityError::Input(_)
+            | IdentityError::Bearer(_)
+            | IdentityError::Ticket(_)
+            | IdentityError::Token(_) => unknown,
+        },
+        CafeProblem::Web(WebError::Rejected("authentication")) => sign_in,
+        CafeProblem::Web(WebError::Rejected("antiforgery")) => {
+            (StatusCode::FORBIDDEN, Some(pickup::ErrorPage::SECURITY))
+        }
+        CafeProblem::Http(ServerError::Invalid(_)) => (
+            StatusCode::BAD_REQUEST,
+            Some(pickup::ErrorPage::LOGIN_FIELDS),
+        ),
+        CafeProblem::Http(ServerError::Limit(_)) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Some(pickup::ErrorPage::LOGIN_SIZE),
+        ),
+        CafeProblem::Sql(error) if sql_unavailable(error) => unavailable,
+        CafeProblem::Busy(effect::AdmissionError::Full | effect::AdmissionError::Closed)
+        | CafeProblem::Web(WebError::Memory(
+            MemoryError::NoSlot | MemoryError::Busy | MemoryError::CapacityExceeded { .. },
+        )) => unavailable,
+        CafeProblem::MissingOrder => (StatusCode::NOT_FOUND, Some(pickup::ErrorPage::NO_ORDER)),
+        CafeProblem::Web(_)
+        | CafeProblem::Language(_)
+        | CafeProblem::Http(_)
+        | CafeProblem::Availability(_)
+        | CafeProblem::Busy(_)
+        | CafeProblem::MenuOrigin(_)
+        | CafeProblem::MenuValue(_)
+        | CafeProblem::Sql(_)
+        | CafeProblem::Otel(_)
+        | CafeProblem::Lifecycle(_) => unknown,
+    }
+}
+
 /// Map actual typed request failures to useful status codes without exposing diagnostics.
 pub(super) fn error_reply(
     error: CafeError,
 ) -> Effect<Reply<CafeError, Environment>, CafeError, Environment> {
     effect! {
         let error = error.clone();
-        let (status, error_page) = match error.with(|error| {
-            if let DependencyCacheError::Load(CafeProblem::Identity(error)) = error {
-                if matches!(error.as_ref(), IdentityError::Unauthorized | IdentityError::StaleGrant | IdentityError::Policy(http::StatusCode::UNAUTHORIZED)) {
-                    return (http::StatusCode::UNAUTHORIZED, Some(pickup::ErrorPage::SIGN_IN));
-                }
-                if matches!(error.as_ref(), IdentityError::Admission(_))
-                    || matches!(error.as_ref(), IdentityError::Sql(error) if sql_unavailable(error))
-                {
-                    return (http::StatusCode::SERVICE_UNAVAILABLE, None);
-                }
-                if let IdentityError::Policy(status) = error.as_ref() {
-                    return (*status, Some(pickup::ErrorPage::SECURITY));
-                }
-            }
-            if let DependencyCacheError::Load(CafeProblem::Web(WebError::Rejected("authentication"))) = error {
-                return (http::StatusCode::UNAUTHORIZED, Some(pickup::ErrorPage::SIGN_IN));
-            }
-            if let DependencyCacheError::Load(CafeProblem::Web(WebError::Rejected("antiforgery"))) = error {
-                return (http::StatusCode::FORBIDDEN, Some(pickup::ErrorPage::SECURITY));
-            }
-            if let DependencyCacheError::Load(CafeProblem::Http(ServerError::Invalid(_))) = error {
-                return (http::StatusCode::BAD_REQUEST, Some(pickup::ErrorPage::LOGIN_FIELDS));
-            }
-            if let DependencyCacheError::Load(CafeProblem::Http(ServerError::Limit(_))) = error {
-                return (http::StatusCode::PAYLOAD_TOO_LARGE, Some(pickup::ErrorPage::LOGIN_SIZE));
-            }
-            if matches!(error, DependencyCacheError::Load(CafeProblem::Sql(error)) if sql_unavailable(error))
-                || matches!(error,
-                DependencyCacheError::Load(CafeProblem::Busy(effect::AdmissionError::Full | effect::AdmissionError::Closed)
-                    | CafeProblem::Web(WebError::Memory(effect::memory::MemoryError::NoSlot
-                        | effect::memory::MemoryError::Busy | effect::memory::MemoryError::CapacityExceeded { .. })))
-            ) {
-                return (http::StatusCode::SERVICE_UNAVAILABLE, None);
-            }
-            if let DependencyCacheError::Load(CafeProblem::MissingOrder) = error {
-                return (http::StatusCode::NOT_FOUND, Some(pickup::ErrorPage::NO_ORDER));
-            }
-            (http::StatusCode::INTERNAL_SERVER_ERROR, Some(pickup::ErrorPage::UNKNOWN))
-        }) {
+        let (status, error_page) = match error.with(pickup_failure) {
             Ok(reply) => reply,
             Err(defect) => effect_die! { defect: defect, }?,
         };
-        let status = effect_try_sync! { once; body { effect_server::BodyStatus::new(status) }, on_error |error| { cafe_error(CafeProblem::Http(error)) }, }?;
+        let status = effect_try_sync! {
+            once; body { effect_server::BodyStatus::new(status) },
+            on_error |error| { cafe_error(CafeProblem::Http(error)) },
+        }?;
         if let Some(error_page) = error_page {
-            let request = service! { env |env: &Environment| { env.request().clone() }, }?;
-            let page = effect_try_sync! { once; body: move || pickup::error_page(&request, error_page), on_error: std::convert::identity, }?;
+            let request = effect_server::server! { request; }?;
+            let page = effect_try_sync! { once; body: move || pickup::error_page(&request, error_page), }?;
             reply! { status(status); header(http::header::CACHE_CONTROL, http::HeaderValue::from_static("no-store")); source(page); }
         } else {
             reply! {

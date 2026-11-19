@@ -19,7 +19,27 @@ impl<E:Send+'static,X:Send+'static,R:Send+Sync+'static> RouteService<E,X,R>{
     }
 }
 /// Adapt the canonical managed route service without deferring or dropping startup work.
-pub fn managed_route_registrar<E,X,R>(service:crate::routing::Service<E,R>)->RouteRegistrar<E,X,R>
-where E:fmt::Display+Send+'static,X:From<ManagedStartError<E>>+Send+Sync+'static,R:HasClock+HasConsole+HasTaskSpawner+Send+Sync+'static{
-    Arc::new(move |owner,router,mounter|{effect_map!{program:service.register_and_start_routes(owner,router,mounter),map:|(registered,sync)|RouteRegistrationBatch{registered,synchronizations:sync.into_iter().collect()}}})
+pub fn managed_route_registrar<E, X, R>(
+    service: crate::routing::Service<E, R>,
+) -> RouteRegistrar<E, X, R>
+where
+    E: fmt::Display + Send + 'static,
+    X: From<ManagedStartError<E>> + Send + Sync + 'static,
+    R: HasClock + HasConsole + HasTaskSpawner + Send + Sync + 'static,
+{
+    Arc::new(move |owner, router, mounter| {
+        effect_map! {
+            program: crate::cms! {
+                register_routes;
+                service: service,
+                scope: owner,
+                router: router,
+                mounter: mounter,
+            },
+            map: |(registered, sync)| RouteRegistrationBatch {
+                registered,
+                synchronizations: sync.into_iter().collect(),
+            },
+        }
+    })
 }

@@ -8,13 +8,13 @@
 //! selected callbacks provide their actual native state and native router/service.
 //! Paths, decoding policies, permitted modes and public response fields stay explicit.
 
-use crate::IdentityError;
+use crate::{IdentityError, identity};
 use crate::capabilities::{NativeBackend, StoreSelection};
 use crate::definition::{IdentityComponents, IdentityDefinition, PreparedIdentityInvocation};
 use effect::memory::{BufferLease, BufferView};
 use effect::{Effect, Exit, effect, effect_future, effect_try_future, effect_try_sync, service};
 use effect_server::{BodyLimit, HasRequest, HttpMethodSet, Reply, Request, Router, ServerError};
-use effect_server::{endpoint, registered, reply, router};
+use effect_server::{endpoint, registered, reply, route, router};
 use std::sync::Arc;
 
 /// Selected Identity workflow consuming one typed input under the request owner.
@@ -339,7 +339,7 @@ where
                 body: move |_: Arc<R>, _| {
                     let admit = admit.clone();
                     async move {
-                        match admit.reserve_prepared_invocation() {
+                        match identity! { identity: &admit, reserve_prepared_invocation(), } {
                             Ok(token) => Exit::Success(token),
                             Err(error) => error.into_exit().map_error(|error| admit.map_error(error)),
                         }
@@ -476,11 +476,11 @@ impl<D: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
 {
     /// Retain the definition and validate prefix without executing request work.
     pub fn new(identity: D, prefix: &str) -> Result<Self, EndpointError> {
-        effect_server::Route::literal(prefix)?;
+        route! { literal: prefix }?;
         Ok(Self {
             identity: Arc::new(identity),
             prefix: prefix.to_owned(),
-            router: Router::new(),
+            router: router! {}?,
             groups: Vec::new(),
         })
     }
@@ -501,7 +501,7 @@ impl<D: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
         }
         let router = group.build(self.identity.clone())?;
         self.groups.push(kind);
-        self.router = self.router.include(router);
+        self.router = router! { configure; source: self.router, include(router), };
         Ok(self)
     }
     /// Contextually type an inline group at the installed definition's native boundary.
@@ -539,13 +539,13 @@ impl<D: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
     /// Include an explicit custom typed route module under the same Identity prefix.
     #[must_use]
     pub fn include(mut self, router: Router<E, R>) -> Self {
-        self.router = self.router.include(router);
+        self.router = router! { configure; source: self.router, include(router), };
         self
     }
     /// Apply a selected scoped request pipeline to every Identity group and custom route.
     #[must_use]
     pub fn pipe_through(mut self, pipeline: effect_server::Pipeline<E, R>) -> Self {
-        self.router = self.router.pipe_through(pipeline);
+        self.router = router! { configure; source: self.router, pipe_through(pipeline), };
         self
     }
     /// Retain selected expected-error Effect rendering without recursively rendering renderer errors.
@@ -553,7 +553,7 @@ impl<D: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
         mut self,
         render: impl Fn(E) -> Effect<Reply<E, R>, E, R> + Send + Sync + 'static,
     ) -> Self {
-        self.router = self.router.on_error(render);
+        self.router = router! { configure; source: self.router, on_error(render), };
         self
     }
     /// Finish the actual scoped native Server group; the root prefix includes directly.
@@ -561,7 +561,7 @@ impl<D: Send + Sync + 'static, E: Send + 'static, R: Send + Sync + 'static>
         if self.prefix == "/" {
             Ok(self.router)
         } else {
-            Ok(Router::new().group(&self.prefix, self.router)?)
+            Ok(router! { group(&self.prefix, self.router), }?)
         }
     }
 }

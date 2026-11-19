@@ -9,8 +9,8 @@
 //! to that recorded closing instant; this does not lock a physical café.
 
 use effect::{
-    effect_die, effect_map_error, effect_provide_some, effect_resource, effect_sync,
-    effect_try_sync,
+    effect_die, effect_fail, effect_from_result, effect_map_error, effect_provide_some,
+    effect_resource, effect_sync, effect_using,
 };
 pub mod cafe_support;
 use cafe_support::transport::request;
@@ -126,11 +126,15 @@ fn pickup_status(
 ) -> Effect<OrderStatus, CounterProblem, CoffeeShop> {
     effect! {
         let pad = pad.clone(); let number = number.clone();
-        let status = pad.access(move |pad| {
-            if pad.number == number { Ok(OrderStatus { customer: pad.customer.clone(), cups: pad.cups }) }
-            else { Err(CounterProblem::UnknownTicket) }
-        })?;
-        let status = effect_try_sync! { once; body: { let __dsl_result = status; move || __dsl_result }, on_error: ::core::convert::identity, }?;
+        let status = effect_using! {
+            access;
+            resource: pad.as_ref(),
+            access: move |pad| {
+                if pad.number == number { Ok(OrderStatus { customer: pad.customer.clone(), cups: pad.cups }) }
+                else { Err(CounterProblem::UnknownTicket) }
+            },
+        }?;
+        let status = effect_from_result! { once; result: status, }?;
         use std::io::Write;
         let (status, written) = {
             let written = writeln!(std::io::stdout().lock(), "Pickup pad: {} has {} cups ready.", status.customer, status.cups);
@@ -148,27 +152,25 @@ fn check_pickup_pad() -> Effect<(), ClosingProblem, CoffeeShop> {
             let ticket_type = match ClusterEntityType::new("coffee-pickup-ticket") { Ok(value) => value, Err(error) => effect_die! { defect: effect::Defect::new(format!("ticket type: {error:?}")), }?, };
             let pickup_operation_id = match OperationId::new("pickup-status") { Ok(value) => value, Err(error) => effect_die! { defect: effect::Defect::new(format!("operation: {error:?}")), }?, };
             let pickup_status_codec = match status_schema() { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, };
-            let pickup_error_codec = match problem_schema() { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, };
+            let problem = match problem_schema() { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, };
             let status = rpc_operation! {
                 id: pickup_operation_id, version: RpcVersion::new(NonZeroU32::MIN),
-                request: json_string(), success: pickup_status_codec, error: pickup_error_codec, limits: limits() };
+                request: json_string(), success: pickup_status_codec, error: problem.clone(), limits: limits() };
             let wire_request = request(&status, "maya-pickup", &String::from("104"));
             let wire_request = match wire_request { Ok(request) => request, Err(error) => effect_die! { defect: error, }?, };
             let pad = entity! { entity_type: ticket_type.clone(), resources: pickup_pad(), handlers: [status => pickup_status] };
             let counter_type = match ClusterEntityType::new("coffee-counter") { Ok(value) => value, Err(error) => effect_die! { defect: effect::Defect::new(format!("counter type: {error:?}")), }?, };
             let cups_operation_id = match OperationId::new("waiting-cups") { Ok(value) => value, Err(error) => effect_die! { defect: effect::Defect::new(format!("operation: {error:?}")), }?, };
-            let cups_error_codec = match problem_schema() { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, };
             let cups = rpc_operation! {
                 id: cups_operation_id, version: RpcVersion::new(NonZeroU32::MIN),
-                request: json_string(), success: json_i64(), error: cups_error_codec, limits: limits(),
+                request: json_string(), success: json_i64(), error: problem.clone(), limits: limits(),
             };
             let counter_request = request(&cups, "sam-inspection", &String::from("Sam"));
             let counter_request = match counter_request { Ok(request) => request, Err(error) => effect_die! { defect: error, }?, };
             let notice_operation_id = match OperationId::new("counter-notice") { Ok(value) => value, Err(error) => effect_die! { defect: effect::Defect::new(format!("operation: {error:?}")), }?, };
-            let notice_error_codec = match problem_schema() { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, };
             let notice = rpc_operation! {
                 id: notice_operation_id, version: RpcVersion::new(NonZeroU32::MIN),
-                request: json_string(), success: json_string(), error: notice_error_codec, limits: limits(),
+                request: json_string(), success: json_string(), error: problem, limits: limits(),
             };
             let notice_request = request(&notice, "sam-closing-notice", &String::from("Sam"));
             let notice_request = match notice_request { Ok(request) => request, Err(error) => effect_die! { defect: error, }?, };
@@ -201,14 +203,13 @@ fn check_pickup_pad() -> Effect<(), ClosingProblem, CoffeeShop> {
             let address = ClusterAddress { entity_type: ticket_type, entity: ClusterEntityId::from_stable(match key("order-104") { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, }), shard: ClusterShardId::from_stable(match key("cafe") { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, }) };
             let store = service! {
                 select: |cafe: &CoffeeShop| cafe.activation.clone(),
-                on_error: |problem: ClosingProblem| problem,
                 run |store| { Arc::clone(store) }
             }?;
             let inspection_activation = ActivationId::from_stable(match key("sam-counter-inspection") { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, });
             let counter_ownership = effect_map_error! { program: effect_provide_some! { program: store.activate(counter_address.clone(), inspection_activation, UtcMillis::new(0), UtcMillis::new(100)), project: |_: &CoffeeShop| (), }, map: ClosingProblem::Store, }?;
             let counter_owner = match counter_ownership {
                 ActivationOutcome::Activated { lease, .. } => lease.owner,
-                ActivationOutcome::AlreadyActive(_) | ActivationOutcome::Busy(_) => effect_try_sync! { body: { let __dsl_error = || ClosingProblem::Busy; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }?,
+                ActivationOutcome::AlreadyActive(_) | ActivationOutcome::Busy(_) => effect_fail! { error: ClosingProblem::Busy, }?,
             };
             let live_counter = effect_map_error! { program: catalog.activate(scope.clone(), counter_owner), map: |problem| ClosingProblem::Pad(Box::new(problem)), }?;
             effect_map_error! { program: live_counter.execute(counter_address.clone(), Arc::from(counter_request)), map: ClosingProblem::Pickup, }?;
@@ -217,7 +218,7 @@ fn check_pickup_pad() -> Effect<(), ClosingProblem, CoffeeShop> {
             let ownership = effect_map_error! { program: effect_provide_some! { program: store.activate(address.clone(), order_activation, UtcMillis::new(0), UtcMillis::new(100)), project: |_: &CoffeeShop| (), }, map: ClosingProblem::Store, }?;
             let owner = match ownership {
                 ActivationOutcome::Activated { lease, .. } => lease.owner,
-                ActivationOutcome::AlreadyActive(_) | ActivationOutcome::Busy(_) => effect_try_sync! { body: { let __dsl_error = || ClosingProblem::Busy; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }?,
+                ActivationOutcome::AlreadyActive(_) | ActivationOutcome::Busy(_) => effect_fail! { error: ClosingProblem::Busy, }?,
             };
             let live = effect_map_error! { program: catalog.activate(scope, owner), map: |problem| ClosingProblem::Pad(Box::new(problem)), }?;
             effect_map_error! { program: live.execute(address, Arc::from(wire_request)), map: ClosingProblem::Pickup, }?;
@@ -231,7 +232,6 @@ fn closing_shift() -> Effect<(), ClosingProblem, CoffeeShop> {
         let closing_time = UtcMillis::new(17 * 60 * 60 * 1000);
         service! {
             select: |cafe: &CoffeeShop| cafe.wall.clone(),
-            on_error: |problem: ClosingProblem| problem,
             run |clock: &TestWallClock| { clock.set(closing_time); }
         }?;
         let closing_schedule_key = match key("daily-counter-close") { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, };
@@ -242,11 +242,18 @@ fn closing_shift() -> Effect<(), ClosingProblem, CoffeeShop> {
             transitions: CalendarTransitionPolicy { gap: GapPolicy::Skip, overlap: OverlapPolicy::Earlier },
             catch_up: MissedOccurrencePolicy::Latest, concurrent: ConcurrentOccurrencePolicy::Skip, deadline_after: Duration::from_secs(60) };
         let zone = match FixedOffsetZone::east_seconds(0) { Ok(zone) => zone, Err(error) => effect_die! { defect: effect::Defect::new(format!("UTC café clock: {error:?}")), }?, };
-        let due = effect_map_error! {
-            program: effect_try_sync! {
-            once; body: {
-            let __dsl_result = schedule.plan_due(UtcMillis::new(17 * 60 * 60 * 1000 - 1), closing_time,
-            &zone, CronSearchBudget { days: NonZeroUsize::MIN.saturating_add(2), candidates: NonZeroUsize::MIN.saturating_add(3) }, false); move || __dsl_result }, on_error: ::core::convert::identity, }, map: ClosingProblem::Calendar, }?;
+        let due = effect_from_result! {
+            once;
+            result: schedule.plan_due(
+                UtcMillis::new(17 * 60 * 60 * 1000 - 1), closing_time, &zone,
+                CronSearchBudget {
+                    days: NonZeroUsize::MIN.saturating_add(2),
+                    candidates: NonZeroUsize::MIN.saturating_add(3),
+                },
+                false,
+            ),
+            on_error: ClosingProblem::Calendar,
+        }?;
         for occurrence in due {
             { use std::io::Write; let written = writeln!(std::io::stdout().lock(), "The daily 17:00 UTC closing task is due ({:?}).", occurrence.disposition); match written { Ok(()) => (), Err(error) => effect_die! { defect: effect::Defect::from_io(error), }?, } };
             let closing_entity_type = match ClusterEntityType::new("cafe-closing-shift") { Ok(value) => value, Err(error) => effect_die! { defect: effect::Defect::new(format!("closing type: {error:?}")), }?, };
@@ -282,7 +289,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         NonZeroUsize::MIN.saturating_add(15),
         NonZeroUsize::MIN.saturating_add(3),
     );
-    match futures_executor::block_on(closing_shift().run(cafe.clone())) {
+    match futures_executor::block_on(effect! {
+        run;
+        program: closing_shift(),
+        environment: cafe.clone(),
+    }) {
         Exit::Success(()) => (),
         exit @ (Exit::Fail(_) | Exit::Die(_) | Exit::Interrupted | Exit::FinalizationFailed(_)) => {
             return Err(format!("Café closing failed: {exit:?}").into());

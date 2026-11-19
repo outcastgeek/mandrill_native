@@ -12,7 +12,7 @@ use super::{
     executor::StoreConnection,
     native::*,
 };
-use effect_sql::{NativeOperation, SqlError};
+use effect_sql::{NativeOperation, SqlError, sql};
 use identity_rs::identity::{StoreError, models::*};
 use sqlx::Row;
 
@@ -153,15 +153,15 @@ impl AtomicAccounts {
                 result.map_err(|error| connection.diagnostics().command_error(error))
             }
         }
-        self.backend
-            .kernel
-            .transaction_operation(Read {
+        sql! {
+            transaction_operation; kernel: self.backend.kernel, operation: Read {
                 security: self.backend.security_scope()?,
                 id,
                 capacity: self.token_capacity.get(),
-            })
-            .await
-            .map_err(|error| self.backend.narrow(error))
+            },
+        }
+        .await
+        .map_err(|error| self.backend.narrow(error))
     }
     /// Create metadata/aliases/all bounded security children atomically and return
     /// the actual committed aggregate revision. Duplicate/uncertain outcomes propagate.
@@ -216,15 +216,15 @@ impl AtomicAccounts {
                 result.map_err(|error| connection.diagnostics().command_error(error))
             }
         }
-        self.backend
-            .kernel
-            .transaction_operation(Create {
+        sql! {
+            transaction_operation; kernel: self.backend.kernel, operation: Create {
                 security: self.backend.security_scope()?,
                 snapshot,
                 unique: require_unique_email,
-            })
-            .await
-            .map_err(|error| self.backend.narrow(error))
+            },
+        }
+        .await
+        .map_err(|error| self.backend.narrow(error))
     }
     /// Replace metadata/aliases/security children only at the exact full aggregate
     /// revision, then return its acknowledged new revision. No blind retry is performed.
@@ -285,11 +285,9 @@ impl AtomicAccounts {
                 result.map_err(|error| connection.diagnostics().command_error(error))
             }
         }
-        self.backend
-            .kernel
-            .transaction_operation(Replace { security: self.backend.security_scope()?, expected, snapshot })
-            .await
-            .map_err(|error| self.backend.narrow(error))
+        sql! { transaction_operation; kernel: self.backend.kernel, operation: Replace { security: self.backend.security_scope()?, expected, snapshot }, }
+        .await
+        .map_err(|error| self.backend.narrow(error))
     }
     /// Delete only at the expected aggregate revision; foreign-key cascades remove
     /// related security state. Failed acknowledgment is not successful invalidation.
@@ -319,11 +317,9 @@ impl AtomicAccounts {
                 ensure_rows_changed(changed, StoreError::TransactionConflict).map_err(command_error)
             }
         }
-        self.backend
-            .kernel
-            .transaction_operation(Delete { security: self.backend.security_scope()?, id, expected })
-            .await
-            .map_err(|error| self.backend.narrow(error))
+        sql! { transaction_operation; kernel: self.backend.kernel, operation: Delete { security: self.backend.security_scope()?, id, expected }, }
+        .await
+        .map_err(|error| self.backend.narrow(error))
     }
 }
 impl crate::services::AccountSnapshotMetadata for AccountSnapshot {

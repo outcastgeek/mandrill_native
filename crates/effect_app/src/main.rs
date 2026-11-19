@@ -4,6 +4,7 @@ use clap::{Parser, ValueEnum};
 use effect::memory::Bytes;
 use effect::{
     Console, ConsoleChannel, Effect, Exit, HasCancellation, LogLevel, SharedValue, StandardConsole,
+    effect,
 };
 use effect_app::{
     AppConfig, AppMemoryLimits, AppMemoryMode, Files, LiveApp, ManagedLiveApp, ManagedStartupError,
@@ -195,11 +196,7 @@ fn main() -> Result<ExitCode, CliError> {
     };
     let succeeded = if let Some((mode, limits)) = memory {
         let app = ManagedLiveApp::new(config, mode, limits).map_err(CliError::ManagedStartup)?;
-        let outcome = app.app.runtime.block_on(run_application(
-            &app.app,
-            Arc::clone(&app.env),
-            managed_application(),
-        ));
+        let outcome = run_application(&app.app, Arc::clone(&app.env), managed_application());
         let succeeded = matches!(outcome, Exit::Success(_));
         let text = app.format_outcome(&outcome).map_err(CliError::Output)?;
         write_console(ConsoleChannel::Output, text.as_str())?;
@@ -213,9 +210,7 @@ fn main() -> Result<ExitCode, CliError> {
         succeeded
     } else {
         let app = LiveApp::new(config).map_err(CliError::Provider)?;
-        let outcome =
-            app.runtime
-                .block_on(run_application(&app, Arc::clone(&app.env), application()));
+        let outcome = run_application(&app, Arc::clone(&app.env), application());
         let succeeded = matches!(outcome, Exit::Success(_));
         write_console(ConsoleChannel::Output, &describe(outcome))?;
         for diagnostic in app.diagnostics.drain() {
@@ -236,23 +231,25 @@ fn write_console(channel: ConsoleChannel, text: &str) -> Result<(), CliError> {
         .map_err(CliError::Provider)
 }
 
-async fn run_application<E: Send + 'static, R: HasCancellation + Send + Sync + 'static>(
+fn run_application<E: Send + 'static, R: HasCancellation + Send + Sync + 'static>(
     app: &LiveApp,
     environment: Arc<R>,
     program: Effect<Report, SharedValue<E>, R>,
 ) -> Exit<Report, SharedValue<E>> {
-    let run = pin!(program.run_cancellable(environment));
-    let signal = pin!(tokio::signal::ctrl_c());
-    let outcome = match select(run, signal).await {
-        Either::Left((outcome, _)) => outcome,
-        Either::Right((signal, remaining)) => {
-            if let Err(error) = signal {
-                app.diagnostics.record(effect::Defect::from_io(error));
+    app.runtime.block_on(async move {
+        let run = pin!(effect! { run_cancellable; program: &program, environment: environment, });
+        let signal = pin!(tokio::signal::ctrl_c());
+        let outcome = match select(run, signal).await {
+            Either::Left((outcome, _)) => outcome,
+            Either::Right((signal, remaining)) => {
+                if let Err(error) = signal {
+                    app.diagnostics.record(effect::Defect::from_io(error));
+                }
+                let _ = app.env.cancellation.request();
+                remaining.await
             }
-            let _ = app.env.cancellation.request();
-            remaining.await
-        }
-    };
-    app.drain().await;
-    outcome
+        };
+        app.drain().await;
+        outcome
+    })
 }

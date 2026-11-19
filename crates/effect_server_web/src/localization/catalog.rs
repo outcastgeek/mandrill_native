@@ -540,7 +540,12 @@ impl<C: Send + Sync + 'static, R: Send + Sync + 'static> CatalogDefinition<C, R>
                     None => CatalogEntries::Ordinary(BTreeMap::new()),
                 };
                 for resource in definition.resources.iter() {
-                    let bytes = match context.run((resource.load)(), env.clone()).await {
+                    let bytes = match effect::effect! {
+                        run_in_context;
+                        context: context,
+                        program: (resource.load)(),
+                        environment: env.clone(),
+                    }.await {
                         Exit::Success(bytes) => bytes,
                         Exit::Fail(error) => return Exit::Fail(error),
                         Exit::Die(defect) => return Exit::Die(defect),

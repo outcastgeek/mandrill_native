@@ -51,16 +51,14 @@ impl<T: TxValue> TxDeferred<T> {
     /// Type: `Transaction<bool, E>`.
     pub fn complete<E: Send + 'static>(&self, value: Arc<T>) -> Transaction<bool, E> {
         let cell = self.cell.clone();
-        {
-            let __dsl_transaction = self.cell.read();
-            transaction! {
-            let current = __dsl_transaction.clone()?; match current.as_ref() {
-                            Some(_) => Transaction::succeed_with(|| false),
-                            None => { let __dsl_transaction = cell
-                                .write(Arc::new(Some(Arc::clone(&value)))); transaction! {
-            let () = __dsl_transaction.clone()?; true
-            } },
-                        }?
+        let read = cell.read();
+        transaction! {
+            let current = read.clone()?;
+            if current.is_some() {
+                false
+            } else {
+                cell.write(Arc::new(Some(Arc::clone(&value))))?;
+                true
             }
         }
     }
@@ -75,16 +73,12 @@ impl<T: TxValue> TxDeferred<T> {
     /// # Returns
     /// Type: `Transaction<Arc<T>, E>`.
     pub fn await_value<E: Send + 'static>(&self) -> Transaction<Arc<T>, E> {
-        {
-            let __dsl_transaction = self.cell.read();
-            transaction! {
-            let value = __dsl_transaction.clone()?; match value.as_ref() {
-                        Some(value) => {
-                            let value = Arc::clone(value);
-                            Transaction::succeed_with(move || Arc::clone(&value))
-                        }
-                        None => Transaction::retry(),
-                    }?
+        let read = self.cell.read();
+        transaction! {
+            let current = read.clone()?;
+            match current.as_ref() {
+                Some(value) => Arc::clone(value),
+                None => Transaction::retry()?,
             }
         }
     }

@@ -1590,7 +1590,10 @@ impl<
             };
             let program = batch_effect(group, payloads, tracking, Arc::clone(run));
             let (fork, ordinary) = match parent {
-                BatchParent::Ordinary(parent) => (self.scope.fork(program), Some(parent)),
+                BatchParent::Ordinary(parent) => (
+                    crate::effect_scope! { fork; scope: self.scope, program: program, },
+                    Some(parent),
+                ),
                 BatchParent::Prepared {
                     entries: parent,
                     settlement,

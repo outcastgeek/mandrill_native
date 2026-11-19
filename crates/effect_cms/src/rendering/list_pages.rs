@@ -112,7 +112,7 @@ where
         }?;
         let mut page_vm = match rendering.as_ref() {
             Some(source) => {
-                let selected = source(&request, &kind, query.clone()).either()?;
+                let selected = effect! { either; program: source(&request, &kind, query.clone()), }?;
                 match selected {
                     Ok(rendered) => {
                         let mut rendered = rendered;
@@ -269,10 +269,14 @@ where
         let route_set = route_set.clone();
         let hreflang_path = hreflang_path.clone();
         let hreflangs_for_path = hreflangs_for_path.clone();
-        let empty = view
-            .clone()
-            .with::<bool, E, R>(|props| props.hreflangs.is_empty())
-            .either()?;
+        let empty = effect! {
+            either;
+            program: effect_ref! {
+                inspect;
+                reference: view,
+                inspect: |props| props.hreflangs.is_empty(),
+            },
+        }?;
         if matches!(empty, Ok(true))
             && let (Some(route_set), Some(hreflang_path), Some(hreflangs_for_path)) = (
                 route_set.as_ref(),

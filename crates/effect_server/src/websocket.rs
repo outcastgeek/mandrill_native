@@ -1,12 +1,14 @@
 //! Native axum WebSocket handshakes and core-owned duplex session adaptation.
 
 use crate::{
-    Endpoint, HasRequest, HttpMethodSet, Registration, Reply, Request, Router, ServerError,
+    HasRequest, HttpMethodSet, Request, Router, ServerError, effect_from_result,
+    effect_socket, effect_sync, effect_try_future, endpoint, registered, reply, router, server,
 };
 use axum::extract::ws::{Message, WebSocket as NativeSocket, WebSocketUpgrade};
 use effect::{
     Cancellation, Defect, Effect, ResourceValue, TransportFuture, WebSocket, WebSocketCloseInfo,
     WebSocketConnection, WebSocketFragmentKind, WebSocketFrame, WebSocketLimits, WebSocketMessage,
+    effect, service,
 };
 use futures_util::{SinkExt, StreamExt};
 use http::{HeaderValue, Method};
@@ -215,90 +217,95 @@ where
     ) -> Result<Self, ServerError> {
         let policy = Arc::new(policy);
         let session = Arc::new(session);
-        let effect = Effect::service(|env: &R| env.request().clone()).flat_map(move |request| {
-            let policy = policy.clone();
-            let session = session.clone();
-            let request_for_upgrade = request.clone();
-            policy.authorize.as_ref()(request).flat_map(move |()| {
-                let upgrade = request_for_upgrade
-                    .with_extensions(|extensions| extensions.get::<UpgradeSlot>().cloned())
-                    .and_then(|slot| {
-                        slot.0
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take()
-                    });
-                let Some(upgrade) = upgrade else {
-                    return Effect::from_result_once(Err((policy.native_error)(
-                        ServerError::Invalid("native WebSocket upgrade unavailable".into()),
-                    )));
-                };
-                let options = &policy.options;
-                let upgrade = upgrade
-                    .read_buffer_size(options.read_buffer_bytes.get())
-                    .write_buffer_size(options.write_buffer_bytes.get())
-                    .max_write_buffer_size(options.max_write_buffer_bytes.get())
-                    .max_frame_size(options.max_frame_bytes.get())
-                    .max_message_size(options.limits.max_message_bytes.get())
-                    .accept_unmasked_frames(options.accept_unmasked_frames)
-                    .protocols(
-                        options
-                            .protocols
-                            .iter()
-                            .filter_map(|protocol| protocol.to_str().ok().map(str::to_owned))
-                            .collect::<Vec<_>>(),
-                    );
-                let (send, receive) = oneshot::channel();
-                let send = Arc::new(Mutex::new(Some(send)));
-                let failed = send.clone();
-                let response = upgrade
-                    .on_failed_upgrade(move |error| {
-                        if let Some(send) = failed
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take()
-                        {
-                            let _ = send.send(Err(error));
-                        }
-                    })
-                    .on_upgrade(move |socket| async move {
-                        if let Some(send) = send
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take()
-                        {
-                            let _ = send.send(Ok(socket));
-                        }
-                    });
-                let map = policy.native_error.clone();
-                let acquire = Effect::try_future_once(
-                    move |_| async move {
-                        receive
-                            .await
-                            .map_err(|_| ServerError::Disconnected)?
-                            .map(|socket| Arc::new(AxumSocket::new(socket)) as Arc<dyn WebSocket>)
-                            .map_err(|error| ServerError::Invalid(error.to_string()))
-                    },
-                    move |error| map(error),
-                );
+        let effect = effect! {
+            bind;
+            program: service! { env: |env: &R| env.request().clone(), },
+            body: move |request: Request| {
+                let policy = policy.clone();
                 let session = session.clone();
-                let map = policy.on_error.clone();
-                let work = effect::websocket::with_socket_map_error(
-                    options.limits,
-                    acquire,
-                    move |error| map(error),
-                    move |socket| session(socket),
-                );
-                Effect::from_result_once(Ok(Reply::native_owned(response, work)))
-            })
-        });
-        let mut metadata = Registration::default();
-        metadata.extensions.insert(WebSocketRoute);
-        self.registered(
-            HttpMethodSet::new(vec![Method::GET, Method::CONNECT])?,
-            path,
-            crate::Registered::new(Endpoint::from_effect(effect), metadata),
-        )
+                let request_for_upgrade = request.clone();
+                effect! {
+                    bind;
+                    program: policy.authorize.as_ref()(request),
+                    body: move |()| {
+                        let upgrade = request_for_upgrade
+                            .with_extensions(|extensions| extensions.get::<UpgradeSlot>().cloned())
+                            .and_then(|slot| {
+                                slot.0
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .take()
+                            });
+                        let Some(upgrade) = upgrade else {
+                            return effect_from_result! { once; result: Err((policy.native_error)(
+                                ServerError::Invalid("native WebSocket upgrade unavailable".into()),
+                            )), };
+                        };
+                        let options = &policy.options;
+                        let upgrade = upgrade
+                            .read_buffer_size(options.read_buffer_bytes.get())
+                            .write_buffer_size(options.write_buffer_bytes.get())
+                            .max_write_buffer_size(options.max_write_buffer_bytes.get())
+                            .max_frame_size(options.max_frame_bytes.get())
+                            .max_message_size(options.limits.max_message_bytes.get())
+                            .accept_unmasked_frames(options.accept_unmasked_frames)
+                            .protocols(
+                                options
+                                    .protocols
+                                    .iter()
+                                    .filter_map(|protocol| protocol.to_str().ok().map(str::to_owned))
+                                    .collect::<Vec<_>>(),
+                            );
+                        let (send, receive) = oneshot::channel();
+                        let send = Arc::new(Mutex::new(Some(send)));
+                        let failed = send.clone();
+                        let response = upgrade
+                            .on_failed_upgrade(move |error| {
+                                if let Some(send) = failed
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .take()
+                                {
+                                    let _ = send.send(Err(error));
+                                }
+                            })
+                            .on_upgrade(move |socket| async move {
+                                if let Some(send) = send
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .take()
+                                {
+                                    let _ = send.send(Ok(socket));
+                                }
+                            });
+                        let map = policy.native_error.clone();
+                        let acquire = effect_try_future! {
+                            once; body: move |_| async move {
+                                receive
+                                    .await
+                                    .map_err(|_| ServerError::Disconnected)?
+                                    .map(|socket| Arc::new(AxumSocket::new(socket)) as Arc<dyn WebSocket>)
+                                    .map_err(|error| ServerError::Invalid(error.to_string()))
+                            },
+                            on_error: move |error| map(error),
+                        };
+                        let session = session.clone();
+                        let map = policy.on_error.clone();
+                        let work = effect_socket! {
+                            limits: options.limits, acquire: acquire,
+                            on_error: move |error| map(error),
+                            body: move |socket| session(socket),
+                        };
+                        effect_from_result! {
+                            once;
+                            result: Ok(reply! { native_owned(response, work) }),
+                        }
+                    },
+                }
+            },
+        };
+        let endpoint = registered! { endpoint: endpoint! { effect(effect) }, metadata(WebSocketRoute); };
+        router! { source: self, methods(HttpMethodSet::new(vec![Method::GET, Method::CONNECT])?, path, endpoint); }
     }
 }
 impl<E: Send + 'static, R: Send + Sync + 'static> crate::Server<E, R> {
@@ -306,9 +313,12 @@ impl<E: Send + 'static, R: Send + Sync + 'static> crate::Server<E, R> {
     /// Individual route policies remain responsible for trusted authorization and core session bounds.
     #[must_use]
     pub fn websockets(self, options: WebSocketOptions) -> Self {
-        self.before_environment(move |request| {
-            let options = options.clone();
-            Effect::sync(move || request.insert_extension(options.clone()))
-        })
+        server! {
+            source: self,
+            before_environment(move |request: Request| {
+                let options = options.clone();
+                effect_sync! { body: move || request.insert_extension(options.clone()), }
+            }),
+        }
     }
 }

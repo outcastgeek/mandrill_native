@@ -7,7 +7,7 @@ use crate::pub_sub::{Subscription, SubscriptionEvent};
 use crate::{Chunk, Effect, Exit, ResourceValue, Scope, SharedValue, Stream, StreamReader};
 use crate::{
     effect, effect_die, effect_map, effect_map_error, effect_resource, effect_scope_acquire,
-    effect_sync, effect_try_sync,
+    effect_sync,
 };
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
@@ -195,11 +195,9 @@ where
                             }
                         };
                         let Some(generation) = next else {
-                            return effect_try_sync! {
-                                once; body: {
-                                let __dsl_result = Err(
+                            return crate::effect_from_result! { once; result: Err(
                                 ReactiveQueryError::GenerationExhausted,
-                            ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                            ), };
                         };
                         state.generation = Some(generation);
                         state.stage = QueryStage::Evaluating;
@@ -225,7 +223,7 @@ where
                 QueryStage::Evaluating => evaluate_query(query, subscription, state),
                 QueryStage::Waiting => wait_invalidation(query, subscription, state),
                 QueryStage::Initial | QueryStage::NeedEvaluation | QueryStage::EvaluationActive => {
-                    effect_try_sync! { once; body: { let __dsl_result = Err(ReactiveQueryError::ConcurrentPull); move || __dsl_result }, on_error: ::core::convert::identity, }
+                    crate::effect_from_result! { once; result: Err(ReactiveQueryError::ConcurrentPull), }
                 }
             }
         };
@@ -262,7 +260,7 @@ where
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .generation;
     let Some(generation) = generation else {
-        return effect_try_sync! { once; body: { let __dsl_result = Err(ReactiveQueryError::ConcurrentPull); move || __dsl_result }, on_error: ::core::convert::identity, };
+        return crate::effect_from_result! { once; result: Err(ReactiveQueryError::ConcurrentPull), };
     };
     let dependencies = Arc::clone(&query.dependencies);
     let registry = query.registry.clone();
@@ -384,7 +382,7 @@ where
                 }
                 SubscriptionEvent::Lagged(_) => true,
                 SubscriptionEvent::End => {
-                    return effect_try_sync! { once; body: { let __dsl_result = Err(ReactiveQueryError::SubscriptionEnded); move || __dsl_result }, on_error: ::core::convert::identity, };
+                    return crate::effect_from_result! { once; result: Err(ReactiveQueryError::SubscriptionEnded), };
                 }
             };
             if relevant {

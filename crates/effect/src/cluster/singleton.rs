@@ -4,7 +4,7 @@ use super::{
     ActivationId, ActivationLease, ActivationOutcome, ClusterActivationStore, ClusterAddress,
     ClusterOwner, HasClusterActivationStore, PassivationOutcome,
 };
-use crate::{Effect, HasWallClock, PrimaryOutcomeRef, Release, UtcMillis, WallClock};
+use crate::{Effect, HasWallClock, PrimaryOutcomeRef, UtcMillis, WallClock};
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -85,63 +85,100 @@ impl ClusterSingleton {
     {
         let address = self.address.clone();
         let body = Arc::new(body);
-        Effect::wall_now().map_error(SingletonError::Clock)
-            .flat_map(move |now| {
+        crate::effect! {
+            bind;
+            program: crate::effect_map_error! {
+                program: crate::effect! { wall_now; },
+                map: SingletonError::Clock,
+            },
+            body: move |now| {
                 let address = address.clone();
                 let activation = activation.clone();
                 let body = Arc::clone(&body);
-                Effect::service(|env: &R| env.cluster_activation_store())
-                    .flat_map(move |store| {
+                crate::effect! {
+                    bind;
+                    program: crate::service! { env: |env: &R| env.cluster_activation_store(), },
+                    body: move |store| {
                         let body = Arc::clone(&body);
-                        store.activate(address.clone(), activation.clone(), now, lease_until)
-                            .map_error(SingletonError::Activation)
-                            .provide_some(|_: &R| ())
-                            .flat_map(move |outcome| match outcome {
-                                ActivationOutcome::Busy(lease)
-                                | ActivationOutcome::AlreadyActive(lease) => {
-                                    Effect::sync_once(move || SingletonOutcome::Busy(lease))
+                        crate::effect! {
+                            bind;
+                            program: crate::effect_provide_some! {
+                                program: crate::effect_map_error! {
+                                    program: store.activate(address.clone(), activation.clone(), now, lease_until),
+                                    map: SingletonError::Activation,
+                                },
+                                project: |_: &R| (),
+                            },
+                            body: move |outcome| match outcome {
+                                ActivationOutcome::Busy(lease) | ActivationOutcome::AlreadyActive(lease) => {
+                                    crate::effect_sync! { once; body: move || SingletonOutcome::Busy(lease), }
                                 }
                                 ActivationOutcome::Activated { lease, .. } => {
                                     let owner = lease.owner;
                                     let final_store = Arc::clone(&store);
                                     let final_owner = owner.clone();
-                                    let body=Arc::clone(&body);
-                                    Effect::defer(move || body(owner.clone())).map_error(SingletonError::Body)
-                                        .ensuring_with(move |reason| {
-                                            let store = Arc::clone(&final_store);
-                                            let owner = final_owner.clone();
-                                            let succeeded = matches!(
-                                                reason, PrimaryOutcomeRef::Succeeded
-                                            );
-                                            let cleanup = Effect::wall_now()
-                                                .map_error(SingletonError::Clock)
-                                                .flat_map(move |now| if succeeded {
-                                                    store.passivate(owner.clone(), now)
-                                                        .map_error(SingletonError::UncertainPassivation)
-                                                        .provide_some(|_: &R| ())
-                                                        .flat_map(|status| match status {
-                                                            PassivationOutcome::Passivated
-                                                            | PassivationOutcome::AlreadyPassivated => {
-                                                                Effect::sync(|| ())
-                                                            }
-                                                            PassivationOutcome::OutstandingClaims { count } => {
-                                                                Effect::from_result_once(Err(
-                                                                    SingletonError::OutstandingClaims { count }
-                                                                ))
-                                                            }
-                                                        })
-                                                } else {
-                                                    store.abandon(owner.clone(), now)
-                                                    .map_error(SingletonError::UncertainAbandonment)
-                                                    .provide_some(|_: &R| ())
-                                                    .map(|_| ())
-                                                });
-                                            Release::from_effect(cleanup)
-                                        })
-                                        .map(SingletonOutcome::Ran)
+                                    let body = Arc::clone(&body);
+                                    crate::effect_map! {
+                                        program: crate::effect_resource! {
+                                            ensuring;
+                                            program: crate::effect_map_error! {
+                                                program: crate::effect! { defer; body: move || body(owner.clone()), },
+                                                map: SingletonError::Body,
+                                            },
+                                            release: move |reason| {
+                                                let store = Arc::clone(&final_store);
+                                                let owner = final_owner.clone();
+                                                let succeeded = matches!(reason, PrimaryOutcomeRef::Succeeded);
+                                                crate::effect! {
+                                                    bind;
+                                                    program: crate::effect_map_error! {
+                                                        program: crate::effect! { wall_now; },
+                                                        map: SingletonError::Clock,
+                                                    },
+                                                    body: move |now| if succeeded {
+                                                        crate::effect! {
+                                                            bind;
+                                                            program: crate::effect_provide_some! {
+                                                                program: crate::effect_map_error! {
+                                                                    program: store.passivate(owner.clone(), now),
+                                                                    map: SingletonError::UncertainPassivation,
+                                                                },
+                                                                project: |_: &R| (),
+                                                            },
+                                                            body: |status| match status {
+                                                                PassivationOutcome::Passivated | PassivationOutcome::AlreadyPassivated => {
+                                                                    crate::effect_sync! { body: || (), }
+                                                                }
+                                                                PassivationOutcome::OutstandingClaims { count } => {
+                                                                    crate::effect_from_result! {
+                                                                        once; result: Err(SingletonError::OutstandingClaims { count }),
+                                                                    }
+                                                                }
+                                                            },
+                                                        }
+                                                    } else {
+                                                        crate::effect_map! {
+                                                            program: crate::effect_provide_some! {
+                                                                program: crate::effect_map_error! {
+                                                                    program: store.abandon(owner.clone(), now),
+                                                                    map: SingletonError::UncertainAbandonment,
+                                                                },
+                                                                project: |_: &R| (),
+                                                            },
+                                                            map: |_| (),
+                                                        }
+                                                    },
+                                                }
+                                            },
+                                        },
+                                        map: SingletonOutcome::Ran,
+                                    }
                                 }
-                            })
-                    })
-            })
+                            },
+                        }
+                    },
+                }
+            },
+        }
     }
 }

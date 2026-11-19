@@ -6,12 +6,12 @@
 //! graceful close and native disposal. The in-process transport supplies the feed;
 //! the recipe owns customer messages, bounds and cleanup, without a network service.
 
-use effect::effect_die;
+use effect::{effect_die, effect_using};
 pub mod cafe_support;
 use cafe_support::Cafe;
 use cafe_support::transport::{PhoneSocket, PhoneTransport};
 use effect::websocket::{
-    HasWebSocketTransport, WebSocket, WebSocketConnectOptions, WebSocketConnection, WebSocketError,
+    WebSocket, WebSocketConnectOptions, WebSocketConnection, WebSocketError,
     WebSocketLimits, WebSocketMessage, WebSocketReceive,
 };
 use effect::{
@@ -28,7 +28,7 @@ fn read_phone(connection: ResourceValue<WebSocketConnection>) -> Effect<(), WebS
             stream: messages(connection.clone()),
             body |message: Arc<str>| { { use std::io::Write; let written = writeln!(std::io::stdout().lock(), "Ticket 104: {message}."); match written { Ok(()) => (), Err(error) => effect_die! { defect: effect::Defect::from_io(error), }?, } }; },
         }?;
-        let close = connection.access(|socket| socket.close())?;
+        let close = effect_using! { access; resource: connection, access: |socket| socket.close(), }?;
         close?;
     }
 }
@@ -39,7 +39,7 @@ fn messages(
     stream! {
         let connection = connection.clone();
         loop {
-            let receive = connection.access(|socket| socket.receive())?;
+            let receive = effect_using! { access; resource: connection, access: |socket| socket.receive(), }?;
             match receive? {
                 WebSocketReceive::Message(WebSocketMessage::Text(message)) => yield message,
                 WebSocketReceive::Message(WebSocketMessage::Binary(_)) => effect_die! { defect: effect::Defect::new("unexpected binary status"), }?,
@@ -50,14 +50,6 @@ fn messages(
 }
 /// The phone selects its transport beside the same task/cancellation providers.
 type Phone = Cafe<PhoneTransport>;
-impl HasWebSocketTransport for Phone {
-    /// The configured in-process native transport carries these customer messages.
-    type Transport = PhoneTransport;
-    /// Borrow the selected transport without global discovery.
-    fn websocket_transport(&self) -> &PhoneTransport {
-        self.services.as_ref()
-    }
-}
 /// Choose the customer's connection boundary; both forms retain identical cleanup.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let statuses = vec![
@@ -93,7 +85,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             body: read_phone,
         }
     };
-    let result = futures_executor::block_on(program.run(env.clone()));
+    let result = futures_executor::block_on(effect! {
+        run;
+        program: program,
+        environment: env.clone(),
+    });
     env.base
         .finish()
         .map_err(|error| error.message().to_owned())?;

@@ -77,7 +77,7 @@ where
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| select(&env))).ok();
             let started =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| env.clock().now()));
-            let outcome = context.run(program, env.clone()).await;
+            let outcome = effect::effect! { run_in_context; context: context, program: program, environment: env.clone(), }.await;
             let Some(observer) = observer else {
                 return outcome;
             };

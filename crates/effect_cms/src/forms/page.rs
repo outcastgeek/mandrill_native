@@ -305,20 +305,20 @@ where
         let source = source.clone();
         let selected = match mode.as_str() {
             RESOURCE_VIEW_MODE_NEW => {
-                source.new_page(Arc::clone(&context), &request, &kind).either()?
+                effect! { either; program: source.new_page(Arc::clone(&context), &request, &kind), }?
             }
             RESOURCE_VIEW_MODE_EDIT => {
-                source.edit_page(Arc::clone(&context), &request, &kind).either()?
+                effect! { either; program: source.edit_page(Arc::clone(&context), &request, &kind), }?
             }
-            _ => source
-                .page(Arc::clone(&context), &request, &kind, &mode)
-                .either()?,
+            _ => effect! {
+                either; program: source.page(Arc::clone(&context), &request, &kind, &mode),
+            }?,
         };
         let mut page = selected.ok().flatten();
         if !result.code.as_str().is_empty() && result.code.as_str() != CODE_VALID {
-            let selection = source
-                .rehydrate(context, &request, &kind, &mode, &result)
-                .either()?;
+            let selection = effect! {
+                either; program: source.rehydrate(context, &request, &kind, &mode, &result),
+            }?;
             page = selection.ok().flatten();
         }
         ResourceFormFrame {

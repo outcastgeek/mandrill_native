@@ -455,6 +455,7 @@ pub trait ClusterMessageStore: Send + Sync + 'static {
 pub trait DurableClusterMessageStore: ClusterMessageStore {}
 
 /// Selects the atomic Cluster message store used by an application.
+#[crate::__private::derive_arc_capability(concrete = crate::cluster::MemoryClusterMessageStore)]
 pub trait HasClusterMessageStore {
     /// Store selected by this environment; its trait bound defines the required guarantees.
     type Store: ClusterMessageStore;

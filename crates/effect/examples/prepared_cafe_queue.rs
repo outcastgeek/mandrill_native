@@ -270,7 +270,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cleanup: app_cleanup,
     });
     let invocation = effect_prepare! { admit; run: &run, environment: Arc::clone(&environment), }?;
-    let output = futures_executor::block_on(invocation.run());
+    let output = futures_executor::block_on(effect_prepare! { run; invocation: invocation, });
     let rendered = output
         .map(|outcome| match outcome {
             Exit::Success((snapshot, current)) => {

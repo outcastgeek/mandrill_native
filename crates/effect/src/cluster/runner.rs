@@ -181,7 +181,7 @@ impl ClusterRunner {
                            let programs = claims
                                .into_iter()
                                .map(|claim| {
-                                   run_claim::<R, StoreError, ExecutionError, ClockError>(claim).either()
+                                   crate::effect! { either; program: run_claim::<R, StoreError, ExecutionError, ClockError>(claim), }
                                })
                                .collect();
                            effect_all_concurrent! { concurrency: parallelism, items: programs, }
@@ -243,7 +243,7 @@ where
                                program: effect! {
         bind;
         program: effect_map_error! {
-            program: Effect::wall_now(), map: {
+            program: crate::effect! { wall_now; }, map: {
                                    let error_token = token.clone();
                                    move |source| ClusterRunnerError::UncertainCompletionClock {
                                        token: error_token.clone(),

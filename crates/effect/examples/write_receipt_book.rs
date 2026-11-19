@@ -8,6 +8,7 @@ pub mod cafe_support;
 use cafe_support::Cafe;
 use effect::memory::{Bytes, MemoryError, PreparedMemory, RegionId};
 use effect::{
+    effect,
     Effect, Exit, Pool, PreparedPoolSnapshots, PreparedPoolStorage, PreparedSemaphoreError, Scope,
     effect_permit, effect_scope, effect_try_blocking, memory, pool,
 };
@@ -54,7 +55,7 @@ fn write_book(
                     effect_try_blocking! { once; body |_cancel| { file.sync_all().map_err(BookError::Io) }, }?;
                 },
             }?;
-            files.ensure_size(FILES.get())?;
+            pool! { ensure_size; pool: files, target: FILES.get(), }?;
             let outlet = effect_permit! { partitioned_make; capacity: NonZeroUsize::MIN, };
             let using_files = files.clone(); let using_scope = scope.clone();
             effect_permit! {
@@ -63,7 +64,7 @@ fn write_book(
                 body {
                     let files = using_files.clone(); let scope = using_scope.clone();
                     for receipt in ["104,Maya,950", "105,Lee,325"] {
-                        let file = files.acquire(scope.clone())?;
+                        let file = pool! { acquire; pool: files, scope: scope.clone(), }?;
                         let writing = file.clone();
                         effect_try_blocking! {
                             once;
@@ -72,7 +73,7 @@ fn write_book(
                                     .map_err(BookError::Owner)?.map_err(BookError::Io)
                             },
                         }?;
-                        file.release()?;
+                        pool! { release; lease: file, }?;
                     }
                 },
             }?;
@@ -142,7 +143,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         NonZeroUsize::MIN.saturating_add(3),
     );
     let result =
-        futures_executor::block_on(write_book(path.clone(), memory, snapshots).run(env.clone()));
+        futures_executor::block_on(effect! {
+            run;
+            program: write_book(path.clone(), memory, snapshots),
+            environment: env.clone(),
+        });
     env.base
         .finish()
         .map_err(|error| error.message().to_owned())?;

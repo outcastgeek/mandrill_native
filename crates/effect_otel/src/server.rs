@@ -7,7 +7,7 @@
 //! observation uses `ServerPolicy::on_exit`; response construction is not completion.
 //! This module neither consumes a request body nor constructs an axum/Effect runtime.
 
-use crate::{HasOtel, NativeError, Otel, OtelContext, Propagation};
+use crate::{HasOtel, NativeError, OtelContext, Propagation};
 use crate::{effect_sync, effect_try_sync, otel};
 use effect::{Clock, Effect, Exit, PrimaryOutcomeRef, SpanOutcome};
 use effect::{effect, service};
@@ -178,7 +178,7 @@ pub struct RequestSpan {
 /// or serialized here. Observer errors retain Server's complete primary outcome.
 #[must_use]
 pub fn install<E, R>(
-    mut server: Server<E, R>,
+    server: Server<E, R>,
     propagation: Propagation,
     metadata: impl Fn(&Request) -> RequestSpan + Send + Sync + 'static,
     observe: impl Fn(RequestObservation) -> Effect<(), E, R> + Send + Sync + 'static,
@@ -188,62 +188,97 @@ where
     E: Send + 'static,
     R: HasOtel + Send + Sync + 'static,
 {
-    let on_error = Arc::new(on_error);
-    let metadata = Arc::new(metadata);
-    server = server! {
-           source: server,
-           around_selection(move |request, complete| {
-           let on_error = Arc::clone(&on_error);
-           let metadata = Arc::clone(&metadata);
-           effect! {
-    bind;
-    program: extract_parent(request.clone(), propagation.clone(), move |error| {
-               on_error(error)
-           }),
-    body: move |()| {
-               let metadata = Arc::clone(&metadata);
-               let request_effect = request.clone();
-               let request = request.clone();
-               let complete = complete.clone();
-               effect! {
-    bind;
-    program: service! {
-        env: move |env: &R| {
-                   match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                       metadata(&request_effect)
-                   })) {
-                       Ok(metadata) => Some(metadata),
-                       Err(panic) => {
-                           env.otel()
-                               .diagnostics()
-                               .record(effect::Defect::from_panic(panic));
-                           None
-                       }
-                   }
-               }, },
-    body: move |metadata| match metadata {
-                   Some(metadata) => trace_request(
-                       request.clone(),
-                       metadata.name,
-                       metadata.attributes,
-                       complete.clone(),
-                   ),
-                   None => match incoming_context(&request) {
-                       Some(context) => Otel::envelope(context, complete.clone()),
-                       None => complete.clone(),
-                   },
-               },
+    otel! {
+        install_request_hooks;
+        hooks: RequestHooks::new(metadata, observe, on_error),
+        server: server,
+        propagation: propagation,
     }
-           },
+}
+
+/// Retain the selected metadata, observer and error projection for reuse across
+/// server installations. Each observer produces a typed Effect in the host's R.
+pub struct RequestHooks<E: Send + 'static, R: HasOtel + Send + Sync + 'static> {
+    metadata: Arc<dyn Fn(&Request) -> RequestSpan + Send + Sync>,
+    observe: Arc<dyn Fn(RequestObservation) -> Effect<(), E, R> + Send + Sync>,
+    on_error: Arc<dyn Fn(NativeError) -> E + Send + Sync>,
+}
+
+impl<E: Send + 'static, R: HasOtel + Send + Sync + 'static> Clone for RequestHooks<E, R> {
+    fn clone(&self) -> Self {
+        Self {
+            metadata: Arc::clone(&self.metadata),
+            observe: Arc::clone(&self.observe),
+            on_error: Arc::clone(&self.on_error),
+        }
     }
-           }),
-       };
-    let observe = Arc::new(observe);
-    server.policy = server.policy.on_exit(move |_, request, completion| {
-        let observe = Arc::clone(&observe);
-        observe_completion(request, completion, move |summary| observe(summary))
-    });
-    server
+}
+
+impl<E: Send + 'static, R: HasOtel + Send + Sync + 'static> RequestHooks<E, R> {
+    /// Select the request span metadata, observer and native error mapping.
+    pub fn new(
+        metadata: impl Fn(&Request) -> RequestSpan + Send + Sync + 'static,
+        observe: impl Fn(RequestObservation) -> Effect<(), E, R> + Send + Sync + 'static,
+        on_error: impl Fn(NativeError) -> E + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            metadata: Arc::new(metadata),
+            observe: Arc::new(observe),
+            on_error: Arc::new(on_error),
+        }
+    }
+
+    /// Install the retained hooks using the server's outer selection and completion boundaries.
+    #[must_use]
+    pub fn install(&self, server: Server<E, R>, propagation: Propagation) -> Server<E, R> {
+        let Self {
+            on_error,
+            metadata,
+            observe,
+        } = self.clone();
+        server! {
+            source: server,
+            around_selection(move |request, complete| {
+                let on_error = Arc::clone(&on_error);
+                let metadata = Arc::clone(&metadata);
+                let extract = extract_parent(request.clone(), propagation.clone(), move |error| {
+                    on_error(error)
+                });
+                effect! {
+                    let request = request.clone();
+                    let complete = complete.clone();
+                    let metadata = Arc::clone(&metadata);
+                    extract.clone()?;
+                    let metadata_request = request.clone();
+                    let span = service! {
+                        env: move |env: &R| {
+                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                metadata(&metadata_request)
+                            })) {
+                                Ok(span) => Some(span),
+                                Err(panic) => {
+                                    env.otel().diagnostics().record(effect::Defect::from_panic(panic));
+                                    None
+                                }
+                            }
+                        },
+                    }?;
+                    let program = match span {
+                        Some(span) => trace_request(request, span.name, span.attributes, complete),
+                        None => match incoming_context(&request) {
+                            Some(context) => otel! { envelope; context: context, program: complete, },
+                            None => complete,
+                        },
+                    };
+                    program?
+                }
+            }),
+            on_exit(move |_, request, completion| {
+                let observe = Arc::clone(&observe);
+                observe_completion(request, completion, move |summary| observe(summary))
+            }),
+        }
+    }
 }
 
 /// Wrap the supplied complete request Effect on the existing span lifetime path.
@@ -267,7 +302,7 @@ where
     let parent = incoming_context(&request);
     let captured = effect! {
     bind;
-    program: Otel::current_context(),
+    program: otel! { current_context; },
     body: move |context| {
            let request = request.clone();
            service! {
@@ -376,7 +411,7 @@ where
            })
        }, },
     body: move |summary| match summary {
-           Some(summary) => { let context = summary.context.clone(); Otel::envelope(context, observe(summary)) },
+           Some(summary) => otel! { envelope; context: summary.context.clone(), program: observe(summary), },
            None => effect_sync! { body: || (), },
        },
     }

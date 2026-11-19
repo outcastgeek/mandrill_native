@@ -223,7 +223,6 @@ fn fill_basket() -> Effect<(), BasketProblem, CoffeeShop> {
         let after = checkout_basket.clone();
         let stock = service! {
             select: |cafe: &CoffeeShop| cafe.transactions.clone(),
-            on_error: |problem: BasketProblem| problem,
             run |journal: &Arc<TransactionDomain>| {
                 match journal.reference(Stock { americanos: 4, oat_lattes: 3 }) { Ok(value) => value, Err(error) => effect_die! { defect: effect::Defect::new(format!("counter stock: {error:?}")), }?, }
             }
@@ -231,20 +230,36 @@ fn fill_basket() -> Effect<(), BasketProblem, CoffeeShop> {
         let observed_stock = stock.clone();
         let stock_registry = match InvalidationRegistry::new(basket_updates()) { Ok(value) => value, Err(error) => effect_die! { defect: effect::Defect::new(format!("stock registry: {error:?}")), }?, };
         let stock_key = match key("counter-stock") { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, };
+        let policy = TransactionPolicy { max_conflicts: NonZeroUsize::MIN.saturating_add(3) };
         let availability: ReactiveQuery<Stock, TransactionError<StockProblem>, CoffeeShop> = reactive_query! {
             registry: stock_registry, dependencies: [InvalidationKey::from_stable(stock_key)],
-            evaluate: move || effect_map! { program: observed_stock.read::<StockProblem>().atomically(TransactionPolicy { max_conflicts: NonZeroUsize::MIN.saturating_add(3) }), map: |stock| (*stock).clone(), }
+            evaluate: move || effect_map! {
+                program: transaction! { atomically; program: observed_stock.read::<StockProblem>(), policy: policy, },
+                map: |stock| (*stock).clone(),
+            },
         };
         effect_map_error! { program: show_stock(availability.clone()), map: BasketProblem::Query, }?;
-        let remaining = effect_map_error! { program: reserve_stock(stock.clone(), after.clone()).atomically(TransactionPolicy { max_conflicts: NonZeroUsize::MIN.saturating_add(3) }), map: BasketProblem::Stock, }?;
+        let remaining = effect_map_error! {
+            program: transaction! { atomically; program: reserve_stock(stock.clone(), after.clone()), policy: policy, },
+            map: BasketProblem::Stock,
+        }?;
         { use std::io::Write; let written = writeln!(std::io::stdout().lock(), "Reserved Maya's two drinks together; {} oat-latte portions remain.", remaining.oat_lattes); match written { Ok(()) => (), Err(error) => effect_die! { defect: effect::Defect::from_io(error), }?, } };
         effect_map_error! { program: show_stock(availability.clone()), map: BasketProblem::Query, }?;
-        effect_map_error! { 
+        effect_map_error! {
             program: transaction! {
-            update; reference: stock.clone(),
-            update |available: &Stock| { Ok::<_, StockProblem>(Stock { americanos: available.americanos, oat_lattes: available.oat_lattes + 1 }) },
-        }.atomically(TransactionPolicy { max_conflicts: NonZeroUsize::MIN.saturating_add(3) }), map: BasketProblem::Stock, }?;
-        let replenished = effect_map_error! { program: stock.read::<StockProblem>().atomically(TransactionPolicy { max_conflicts: NonZeroUsize::MIN.saturating_add(3) }), map: BasketProblem::Stock, }?;
+                atomically;
+                program: transaction! {
+                    update; reference: stock,
+                    update |available: &Stock| { Ok::<_, StockProblem>(Stock { americanos: available.americanos, oat_lattes: available.oat_lattes + 1 }) },
+                },
+                policy: policy,
+            },
+            map: BasketProblem::Stock,
+        }?;
+        let replenished = effect_map_error! {
+            program: transaction! { atomically; program: stock.read::<StockProblem>(), policy: policy, },
+            map: BasketProblem::Stock,
+        }?;
         use std::io::Write;
         let (replenished, written) = {
             let written = writeln!(std::io::stdout().lock(), "Staff restocks one oat-latte portion; {} are now available.", replenished.oat_lattes);
@@ -252,9 +267,18 @@ fn fill_basket() -> Effect<(), BasketProblem, CoffeeShop> {
         };
         match written { Ok(()) => (), Err(error) => effect_die! { defect: effect::Defect::from_io(error), }?, };
         let excessive = Arc::new(Basket { customer: "Maya".into(), americanos: 0, oat_lattes: 10 });
-        let rejected = effect_map_error! { program: reserve_stock(stock.clone(), excessive).atomically(TransactionPolicy { max_conflicts: NonZeroUsize::MIN.saturating_add(3) }).either(), map: BasketProblem::Stock, }?;
+        let rejected = effect_map_error! {
+            program: effect! {
+                either;
+                program: transaction! { atomically; program: reserve_stock(stock.clone(), excessive), policy: policy, },
+            },
+            map: BasketProblem::Stock,
+        }?;
         assert!(matches!(rejected, Err(TransactionError::Domain(StockProblem::SoldOut))));
-        let unchanged = effect_map_error! { program: stock.read::<StockProblem>().atomically(TransactionPolicy { max_conflicts: NonZeroUsize::MIN.saturating_add(3) }), map: BasketProblem::Stock, }?;
+        let unchanged = effect_map_error! {
+            program: transaction! { atomically; program: stock.read::<StockProblem>(), policy: policy, },
+            map: BasketProblem::Stock,
+        }?;
         assert_eq!((unchanged.americanos, unchanged.oat_lattes), (replenished.americanos, replenished.oat_lattes));
         { use std::io::Write; let written = writeln!(std::io::stdout().lock(), "A larger request is rejected as SoldOut; stock remains {} americanos and {} oat-latte portions.", unchanged.americanos, unchanged.oat_lattes); match written { Ok(()) => (), Err(error) => effect_die! { defect: effect::Defect::from_io(error), }?, } };
         }?;
@@ -265,7 +289,10 @@ fn fill_basket() -> Effect<(), BasketProblem, CoffeeShop> {
             changes: move || basket_history(history.clone())
         };
         let latest = effect_map_error! { program: display.read(), map: BasketProblem::Basket, }?;
-        let displayed = effect_map_error! { program: display.changes().run_collect(Some(2)), map: BasketProblem::Display, }?;
+        let displayed = effect_map_error! {
+            program: stream! { collect; stream: display.changes(), limit: Some(2), },
+            map: BasketProblem::Display,
+        }?;
         { use std::io::Write; let written = writeln!(std::io::stdout().lock(), "Customer display replayed {} basket changes; latest is {} drinks.", displayed.len(), latest.americanos + latest.oat_lattes); match written { Ok(()) => (), Err(error) => effect_die! { defect: effect::Defect::from_io(error), }?, } };
         effect_map_error! { program: basket.set::<CoffeeShop>(Basket { customer: "Maya".into(), americanos: 0, oat_lattes: 0 }), map: BasketProblem::Basket, }?;
         effect_map_error! { program: saved.import_all(snapshot, HydrationConflictPolicy::ForceMonotonic), map: BasketProblem::Saved, }?;
@@ -282,7 +309,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         NonZeroUsize::MIN.saturating_add(15),
         NonZeroUsize::MIN.saturating_add(3),
     );
-    match futures_executor::block_on(fill_basket().run(cafe.clone())) {
+    match futures_executor::block_on(effect! {
+        run;
+        program: fill_basket(),
+        environment: cafe.clone(),
+    }) {
         Exit::Success(()) => (),
         exit @ (Exit::Fail(_) | Exit::Die(_) | Exit::Interrupted | Exit::FinalizationFailed(_)) => {
             return Err(format!("Maya's basket failed: {exit:?}").into());

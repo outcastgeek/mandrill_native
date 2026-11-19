@@ -512,7 +512,7 @@ where
         let project = Arc::new(project);
         RpcHandler::new(self.operation, move |request| {
             let project = Arc::clone(&project);
-            (self.invoke)(request).provide_some(move |outer| project(outer))
+            crate::effect_provide_some! { program: (self.invoke)(request), project: move |outer| project(outer), }
         })
     }
 

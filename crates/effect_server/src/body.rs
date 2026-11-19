@@ -1,7 +1,7 @@
 //! Pull-driven native response bodies with explicit delivery acknowledgment.
 
 use crate::{Request, ServerError};
-use crate::{effect_future, effect_sync, effect_try_future, effect_try_sync};
+use crate::{effect_from_result, effect_future, effect_sync, effect_try_future};
 use axum::body::Body;
 use bytes::Bytes;
 use effect::effect;
@@ -396,9 +396,9 @@ impl<E: Send + 'static, R: Send + Sync + 'static> BodyWriter<E, R> {
         let writer = self.clone();
         let map = self.map_error.clone();
         effect! {
-        bind;
-        program: effect_try_sync! { once; body: { let __dsl_result = record.frame(policy).map_err(move |error| map(error)); move || __dsl_result }, on_error: ::core::convert::identity, },
-        body: move |bytes| writer.write(bytes),
+            bind;
+            program: effect_from_result! { once; result: record.frame(policy).map_err(|error| map(error)), },
+            body: move |bytes| crate::stream! { write; writer: writer, bytes: bytes, },
         }
     }
     /// Close producer access; the effect still awaits the native body's terminal poll.
@@ -677,11 +677,20 @@ impl<E: Send + 'static, R: Send + Sync + 'static> BodyProgram<E, R> {
                                        let writer = writer.clone();
                                        async move {
                                            loop {
-                                               match context.run(reader.pull(), env.clone()).await {
+                                               match effect::effect! {
+                                                   run_in_context;
+                                                   context: context,
+                                                   program: effect::stream! { pull; reader: reader, },
+                                                   environment: env.clone(),
+                                               }.await {
                                                    Exit::Success(effect::Chunk::Values(values)) => {
                                                        for value in values {
-                                                           let result = context
-                                                               .run(write(value, writer.clone()), env.clone())
+                                                           let result = effect::effect! {
+                                                               run_in_context;
+                                                               context: context,
+                                                               program: write(value, writer.clone()),
+                                                               environment: env.clone(),
+                                                           }
                                                                .await;
                                                            if !matches!(result, Exit::Success(())) {
                                                                return result;
@@ -707,12 +716,12 @@ impl<E: Send + 'static, R: Send + Sync + 'static> BodyProgram<E, R> {
     /// Pull and write owned region byte views, retaining the backing in native DATA.
     #[must_use]
     pub fn leases(source: Stream<effect::memory::BufferView<'static>, E, R>) -> Self {
-        Self::source(source, |view, writer| writer.write_lease(view))
+        Self::source(source, |view, writer| crate::stream! { write_lease; writer: writer, view: view, })
     }
     /// Pull and write prepared native DATA without copying the frames again.
     #[must_use]
     pub fn frames(source: Stream<crate::PreparedNativeFrame, E, R>) -> Self {
-        Self::source(source, |frame, writer| writer.write_frame(frame))
+        Self::source(source, |frame, writer| crate::stream! { write_frame; writer: writer, frame: frame, })
     }
     /// Execute with the supplied owner; no run boundary or native task is introduced.
     pub(crate) fn execute(&self, writer: BodyWriter<E, R>, scope: Scope<E>) -> Effect<(), E, R> {

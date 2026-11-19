@@ -81,8 +81,9 @@ use std::time::Duration;
 
 use effect::{
     ConsoleChannel, Effect, Fiber, HasClock, HasConsole, HasTaskSpawner, Schedule, Scope,
-    Semaphore, SemaphoreError, effect, effect_all_concurrent, effect_map, effect_map_error,
-    effect_permit, effect_recover, effect_retry, effect_sync, effect_try_sync,
+    Semaphore, SemaphoreError, effect, effect_all_concurrent, effect_from_result,
+    effect_map_error, effect_permit, effect_recover, effect_retry, effect_scope, effect_sync,
+    effect_try_sync,
 };
 use effect::memory::MemoryError;
 use effect_server::{Reply, Request, Router, ServerError};
@@ -740,15 +741,16 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Service<E, R> {
             let mut current = router;
             let mut registrations = Vec::new();
             let mut children: Vec<Effect<(), X, R>> = Vec::new();
+            let registration_error = |error| X::from(ManagedStartError::Registration(error));
             if current.is_some() && service.prepared.is_some() {
                 let count = service.routes().len();
                 let reserved = registrations.try_reserve_exact(count)
                     .and_then(|()| children.try_reserve_exact(count))
                     .map_err(|_| registration_memory(MemoryError::CollectionReservationFailed));
-                effect_try_sync! {
+                effect_from_result! {
                     once;
-                    body: move || reserved,
-                    on_error: |error| X::from(ManagedStartError::Registration(error)),
+                    result: reserved,
+                    on_error: registration_error,
                 }?;
             }
             for route in service.routes() {
@@ -768,11 +770,15 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Service<E, R> {
                         };
                         Ok::<_, ManagedRouteError>(access.metadata_sync(&preflight_route, &permissions))
                     },
-                    on_error: |error| X::from(ManagedStartError::Registration(error)),
+                    on_error: registration_error,
                 }?;
                 if let Some(sync) = sync {
-                    let child = owner.fork(sync_child::<E, X, R>(Arc::clone(&slots), sync))?;
-                    children.push(child.join::<R>());
+                    let child = effect_scope! {
+                        fork;
+                        scope: owner,
+                        program: sync_child::<E, X, R>(Arc::clone(&slots), sync),
+                    }?;
+                    children.push(effect_scope! { join; fiber: child, });
                 }
                 let access = service.options.access.clone();
                 let mounter = mounter.clone();
@@ -780,7 +786,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Service<E, R> {
                 let (next, registration) = effect_try_sync! {
                     once;
                     body: move || register(mount_router, &access, mounter.as_ref(), &route),
-                    on_error: |error| X::from(ManagedStartError::Registration(error)),
+                    on_error: registration_error,
                 }?;
                 current = next;
                 if let Some(registration) = registration { registrations.push(registration); }
@@ -799,10 +805,8 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Service<E, R> {
                     drop(completed);
                     ()
                 };
-                effect_map! {
-                    program: owner.fork(batch),
-                    map: |fiber| { Some(fiber) },
-                }?
+                let fiber = effect_scope! { fork; scope: owner, program: batch, }?;
+                Some(fiber)
             };
             (prepared, started)
         }
@@ -1048,7 +1052,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> AccessControl<E, R> {
                             }
                         },
                     };
-                    let create_outcome = create_program.either()?;
+                    let create_outcome = effect! { either; program: create_program, }?;
                     match create_outcome {
                         Ok(record) => record,
                         Err(failure) => {
@@ -1110,7 +1114,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> AccessControl<E, R> {
                         }
                     },
                 };
-                let add_outcome = add_program.either()?;
+                let add_outcome = effect! { either; program: add_program, }?;
                 match add_outcome {
                     Ok(()) => (),
                     Err(failure) => {
@@ -1419,17 +1423,13 @@ where
     let reported = effect_recover! {
         program: effect_map_error! {
             program: program,
-            map: move |error| ManagedStartError::Sync(error),
+            map: ManagedStartError::Sync,
         },
         recover: move |error| {
             let message = format!(
                 "contentmgmt authz metadata sync failed route={route_name} method={method} pattern={pattern} error={error}"
             );
-            effect! {
-                let message = message.clone();
-                Effect::console_write(ConsoleChannel::Error, message)?;
-                ()
-            }
+            effect! { console_write; channel: ConsoleChannel::Error, message: message, }
         },
     };
     effect_map_error! {
@@ -1437,13 +1437,9 @@ where
             semaphore: slots,
             permits: NonZeroUsize::MIN,
             on_error: ManagedStartError::SyncSlots,
-            body {
-                let reported = reported.clone();
-                reported?;
-                ()
-            },
+            program: reported,
         },
-        map: move |error| X::from(error),
+        map: X::from,
     }
 }
 

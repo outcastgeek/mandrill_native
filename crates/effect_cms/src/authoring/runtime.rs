@@ -564,7 +564,7 @@ where
         AuthoringHandlerError<A, T>,
         R,
     > = effect_map_error! {
-        program: build.either(),
+        program: effect! { either; program: build, },
         map: AuthoringHandlerError::<A,T>::Translation,
     };
     effect! {
@@ -654,7 +654,10 @@ where
         let now = service! { env: |env: &R| env.clock().now(), }?;
         let elapsed = now.saturating_sub(started);
         annotations.insert(Arc::from("duration_ms"),Arc::from(elapsed.as_millis().to_string()));
-        span!{annotations:annotations,effect:Effect::<(), AuthoringHandlerError<A, T>, R>::log(LogLevel::Error,"contentmgmt authoring translation failed")}?;
+        span! {
+            annotations: annotations,
+            effect: effect! { log; level: LogLevel::Error, message: "contentmgmt authoring translation failed", },
+        }?;
     }
 }
 

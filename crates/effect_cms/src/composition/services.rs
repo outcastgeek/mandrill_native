@@ -196,8 +196,16 @@ impl<E:Error+Send+'static,R:Send+Sync+'static> DefinitionServiceSet<E,R>{
     pub fn context(&self,request:&Request)->CMSRequestContext{CMSRequestContext::new(request,self.validation_translate.clone())}
 }
 pub fn resolve_definition_validation_service<E:Error+Send+'static,R:Send+Sync+'static>(current:Option<ValidationService<E,R>>,mut options:DefinitionServiceSetOptions<E,R>,binders:&[&dyn validation::Binder<commands::CommandInput,E,R>])->ValidationService<E,R>{
-    if let Some(current)=current{return current}options.validation_bindings=validation::new_bindings(binders);new_definition_service_set(options).validation
+    if let Some(current) = current {
+        return current;
+    }
+    options.validation_bindings = validation::new_bindings(binders);
+    (crate::cms! { definition_services; options: options, }).validation
 }
 pub fn resolve_definition_command_service<E:Error+Send+'static,R:Send+Sync+'static>(current:Option<commands::CommandService<E,R>>,mut options:DefinitionServiceSetOptions<E,R>,binders:&[&dyn commands::ResourceCommandBinder<E,R>])->commands::CommandService<E,R>{
-    if let Some(current)=current{return current}options.command_bindings=commands::new_resource_command_bindings(binders);new_definition_service_set(options).commands
+    if let Some(current) = current {
+        return current;
+    }
+    options.command_bindings = commands::new_resource_command_bindings(binders);
+    (crate::cms! { definition_services; options: options, }).commands
 }

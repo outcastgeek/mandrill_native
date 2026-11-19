@@ -54,13 +54,13 @@ pub fn write_resource_list_component_stream<E:Send+'static,R:Send+Sync+'static>(
 /// Stream a bounded sequence of existing Maud components and signal data through
 /// prepared native DATA backing. Each frame retains its lease through delivery.
 pub fn prepared_resource_search_stream<E: Send + 'static, R: Send + Sync + 'static>(
-    (selector, mode, components, signals): (Arc<str>, Arc<str>, Arc<[Markup]>, Arc<str>),
+    patches: (Arc<str>, Arc<str>, Arc<[Markup]>, Arc<str>),
     frames: Arc<effect::memory::SlotPool<'static, effect::memory::Buffer<'static>>>,
     maximum_components: std::num::NonZeroUsize,
     on_error: impl Fn(effect::memory::MemoryError) -> E + Send + Sync + 'static,
 ) -> effect::Effect<Reply<E, R>, E, R> {
     crate::rendering::datastar::prepared_event_stream(
-        (selector, mode, components, signals),
+        patches,
         frames,
         maximum_components,
         on_error,
@@ -82,6 +82,12 @@ where
         let on_error = on_error.clone();
         let patches = patches.clone();
         let frames = effect::service! { env: |env: &R| env.cms_memory().event_frames().clone(), }?;
-        prepared_resource_search_stream(patches, frames, maximum_components, move |error| on_error(error))?
+        crate::cms! {
+            prepared_resource_search_stream;
+            patches: patches,
+            frames: frames,
+            maximum_components: maximum_components,
+            on_error: move |error| on_error(error),
+        }?
     }
 }

@@ -287,7 +287,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         NonZeroUsize::MIN.saturating_add(3),
     );
     match futures_executor::block_on(
-        receipt_book(std::env::args().skip(1).any(|arg| arg == "--book")).run(cafe.clone()),
+        effect! {
+            run;
+            program: receipt_book(std::env::args().skip(1).any(|arg| arg == "--book")),
+            environment: cafe.clone(),
+        },
     ) {
         Exit::Success(()) => (),
         exit @ (Exit::Fail(_) | Exit::Die(_) | Exit::Interrupted | Exit::FinalizationFailed(_)) => {

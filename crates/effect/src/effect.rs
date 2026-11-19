@@ -460,9 +460,17 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
         self,
         project: impl Fn(&L) -> R + Send + Sync + 'static,
     ) -> Effect<A, E, L> {
+        self.provide_some_arc(move |env| Arc::new(project(env)))
+    }
+
+    /// Borrow a selected shared environment and retain the original run context.
+    pub fn provide_some_arc<L: Send + Sync + 'static>(
+        self,
+        project: impl Fn(&L) -> Arc<R> + Send + Sync + 'static,
+    ) -> Effect<A, E, L> {
         Effect::new(move |env, context, finish| {
             match catch_unwind(AssertUnwindSafe(|| project(&env))) {
-                Ok(env) => self.clone().execute(Arc::new(env), context, finish),
+                Ok(env) => self.clone().execute(env, context, finish),
                 Err(panic) => runtime::finish(finish, Exit::Die(Defect::from_panic(panic))),
             }
         })
@@ -664,7 +672,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
     /// Type: `Effect<Result<A, E>, E, R>`.
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn result(self) -> Effect<Result<A, E>, E, R> {
-        self.either()
+        crate::effect! { either; program: self, }
     }
     /// Expose success as `Some(A)` and an expected failure as `None`.
     ///
@@ -677,7 +685,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
     /// Type: `Effect<Option<A>, E, R>`.
     /// Returns a lazy `Effect` with the declared success, error, and environment types.
     pub fn option(self) -> Effect<Option<A>, E, R> {
-        effect_map! { program: self.either(), map: Result::ok, }
+        effect_map! { program: crate::effect! { either; program: self, }, map: Result::ok, }
     }
 
     /// Map a top-level defect into the expected-error channel using `on_defect`.
@@ -980,7 +988,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
     /// # Returns
     /// Type: `(RunDriver<A, E>, RunObserver<A, E>)`.
     pub fn owned_run(&self, env: Arc<R>) -> (RunDriver<A, E>, RunObserver<A, E>) {
-        crate::owned_run::owned(self.run(env))
+        crate::owned_run::owned(crate::effect! { run; program: self, environment: env, })
     }
 
     /// An owned run whose cancellation source is supplied solely through `R`.
@@ -999,7 +1007,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
     where
         R: HasCancellation,
     {
-        crate::owned_run::owned(self.run_cancellable(env))
+        crate::owned_run::owned(crate::effect! { run_cancellable; program: self, environment: env, })
     }
 }
 
@@ -1407,7 +1415,8 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E
 
 impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Effect<A, E, R> {
     /// Transfer one full owned outcome into execution without cloning errors or cleanup failures; repeated execution yields the consumed-outcome defect.
-    pub(crate) fn from_exit_once(outcome: Exit<A, E>) -> Self {
+    #[doc(hidden)]
+    pub fn from_exit_once(outcome: Exit<A, E>) -> Self {
         let pending = std::sync::Mutex::new(Some(outcome));
         Self::new(move |_, _, finish| {
             let outcome = pending

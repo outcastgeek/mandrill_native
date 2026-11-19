@@ -3,19 +3,25 @@
 use std::fmt;
 
 /// A native cell failure with the original column identity and schema issue.
-#[derive(Debug)]
+#[derive(Debug, effect::EffectErrorLabel)]
 pub enum RowError {
     /// A decoder/choice description is empty or structurally invalid.
+    #[effect_error_label("invalid SQL row decoder")]
     InvalidDecoder,
     /// The decoder has no independent synchronous borrowed projection.
+    #[effect_error_label("SQL row decoder has no borrowed projection")]
     MissingBorrowedDecoder,
     /// A selected row projection could not acquire its prepared storage.
+    #[effect_error_label("SQL row projection memory admission failed")]
     Memory(effect::memory::MemoryError),
     /// A requested name or ordinal is absent.
+    #[effect_error_label("SQL column is absent")]
     MissingColumn(String),
     /// A required cell is SQL NULL; this is distinct from no row.
+    #[effect_error_label("required SQL cell is NULL")]
     NullColumn(String),
     /// SQLx rejected the native representation for the requested Rust type.
+    #[effect_error_label("SQL cell representation is invalid")]
     Native {
         /// Requested column identity.
         column: String,
@@ -23,6 +29,7 @@ pub enum RowError {
         source: sqlx::Error,
     },
     /// A native-cell codec or refinement rejected the value.
+    #[effect_error_label("SQL cell validation failed")]
     Schema {
         /// Requested column identity.
         column: String,
@@ -30,24 +37,10 @@ pub enum RowError {
         issue: effect::SchemaIssue,
     },
     /// A caller's projection failed with an explicitly mapped reason.
+    #[effect_error_label("SQL row projection failed")]
     Validation(String),
 }
 
-impl fmt::Display for RowError {
-    /// Redact cell contents and application validation messages from public error text.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::InvalidDecoder => "invalid SQL row decoder",
-            Self::MissingBorrowedDecoder => "SQL row decoder has no borrowed projection",
-            Self::Memory(_) => "SQL row projection memory admission failed",
-            Self::MissingColumn(_) => "SQL column is absent",
-            Self::NullColumn(_) => "required SQL cell is NULL",
-            Self::Native { .. } => "SQL cell representation is invalid",
-            Self::Schema { .. } => "SQL cell validation failed",
-            Self::Validation(_) => "SQL row projection failed",
-        })
-    }
-}
 impl std::error::Error for RowError {
     /// Preserve the native representation error for trusted diagnostic consumers.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
@@ -86,33 +79,46 @@ pub enum MigrationPhase {
 }
 
 /// SQL expected errors; defects and interruption remain Effect exit channels.
-#[derive(Debug)]
+#[derive(Debug, effect::EffectErrorLabel)]
 pub enum SqlError {
     /// An inert description or selected provider configuration is invalid.
+    #[effect_error_label("invalid SQL configuration")]
     Configuration(String),
     /// Identifier syntax cannot represent a native identifier.
+    #[effect_error_label("invalid SQL identifier")]
     Identifier(String),
     /// SQLx could not encode a bound native value.
+    #[effect_error_label("SQL binding failed")]
     Binding(Box<dyn std::error::Error + Send + Sync>),
     /// Native provider failure before a durable acknowledgment boundary.
+    #[effect_error_label("SQL provider failed")]
     Provider(sqlx::Error),
     /// No row exists for an operation requiring one.
+    #[effect_error_label("required SQL row is absent")]
     RowAbsent,
     /// A present native row failed typed decoding.
+    #[effect_error_label("SQL row decoding failed")]
     Decode(RowError),
     /// An actual prepared SQL resource could not be acquired.
+    #[effect_error_label("SQL memory admission failed")]
     Memory(effect::memory::MemoryError),
     /// Prepared native row backing refused an actual request.
+    #[effect_error_label("SQL prepared row backing failed")]
     PreparedRow(sqlx::PreparedTursoRowMemoryError),
     /// The selected output's physical row or batch-item limit was exceeded.
+    #[effect_error_label("SQL row limit exceeded")]
     RowLimit { limit: usize },
     /// Prepared SQL description validation failed without dynamic diagnostics.
+    #[effect_error_label("invalid prepared SQL statement")]
     PreparedStatement(crate::PreparedSqlStatementError),
     /// A scoped handle was released, outside its frame, or reentered while its cursor owns native access.
+    #[effect_error_label("SQL session is inactive")]
     InactiveSession,
     /// Native commit was attempted but its durable result is unknown. Never retry blindly.
+    #[effect_error_label("SQL commit outcome is unknown")]
     CommitOutcomeUnknown(sqlx::Error),
     /// Cleanup failed separately from the primary native operation.
+    #[effect_error_label("SQL cleanup failed")]
     Cleanup {
         /// Original failure, if the body failed before cleanup.
         primary: Option<Box<SqlError>>,
@@ -120,6 +126,7 @@ pub enum SqlError {
         cleanup: Box<SqlError>,
     },
     /// Migration failure retains phase, identity and uncertainty.
+    #[effect_error_label("SQL migration failed")]
     Migration {
         /// Failed acknowledgment boundary.
         phase: MigrationPhase,
@@ -131,13 +138,17 @@ pub enum SqlError {
         source: Box<SqlError>,
     },
     /// A nontransactional schema step requires explicit exclusive maintenance.
+    #[effect_error_label("exclusive maintenance authority is required")]
     MaintenanceRequired,
     /// Synchronized replicas cannot claim authoritative schema/security writes.
+    #[effect_error_label("replica lacks write authority")]
     ReplicaNotAuthoritative,
     /// Invocation-local complete failure retained when a native trait narrows its error type.
     /// Outer Effect adapters restore these channels; no process-global side channel is used.
+    #[effect_error_label("native SQL invocation failed")]
     NativeInvocation(Box<effect::Exit<(), SqlError>>),
     /// An owned one-shot payload has already been consumed.
+    #[effect_error_label("SQL payload already consumed")]
     Consumed,
 }
 
@@ -177,31 +188,6 @@ impl std::error::Error for SqlStartupError {
     }
 }
 
-impl fmt::Display for SqlError {
-    /// Produce safe category text without SQL, bindings or connection strings.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Configuration(_) => "invalid SQL configuration",
-            Self::Identifier(_) => "invalid SQL identifier",
-            Self::Binding(_) => "SQL binding failed",
-            Self::Provider(_) => "SQL provider failed",
-            Self::RowAbsent => "required SQL row is absent",
-            Self::Decode(_) => "SQL row decoding failed",
-            Self::Memory(_) => "SQL memory admission failed",
-            Self::PreparedRow(_) => "SQL prepared row backing failed",
-            Self::RowLimit { .. } => "SQL row limit exceeded",
-            Self::PreparedStatement(_) => "invalid prepared SQL statement",
-            Self::InactiveSession => "SQL session is inactive",
-            Self::CommitOutcomeUnknown(_) => "SQL commit outcome is unknown",
-            Self::Cleanup { .. } => "SQL cleanup failed",
-            Self::Migration { .. } => "SQL migration failed",
-            Self::MaintenanceRequired => "exclusive maintenance authority is required",
-            Self::ReplicaNotAuthoritative => "replica lacks write authority",
-            Self::NativeInvocation(_) => "native SQL invocation failed",
-            Self::Consumed => "SQL payload already consumed",
-        })
-    }
-}
 impl std::error::Error for SqlError {
     /// Retain native diagnostics for trusted callers while safe Display stays redacted.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {

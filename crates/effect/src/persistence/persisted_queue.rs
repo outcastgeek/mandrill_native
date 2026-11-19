@@ -781,6 +781,7 @@ pub trait PersistedQueueStore: Send + Sync + 'static {
 pub trait DurablePersistedQueueStore: PersistedQueueStore {}
 
 /// Selects the persisted queue store in an application environment.
+#[crate::__private::derive_arc_capability(concrete = crate::persistence::MemoryPersistedQueueStore)]
 pub trait HasPersistedQueueStore {
     /// Store selected by this environment; its trait bound defines the required guarantees.
     type Store: PersistedQueueStore;
@@ -1049,7 +1050,7 @@ impl<P: Send + 'static, D: KeyDomain> PersistedQueue<P, D> {
                                .unwrap_or_else(std::sync::PoisonError::into_inner)
                                .take();
                            let Some(offer) = offer else {
-                               return effect_try_sync! { once; body: { let __dsl_result = Err(PersistedQueueError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, };
+                               return crate::effect_from_result! { once; result: Err(PersistedQueueError::InputConsumed), };
                            };
                            let queue = queue.clone();
                            let id = id.clone();
@@ -1175,7 +1176,7 @@ impl<P: Send + 'static, D: KeyDomain> PersistedQueue<P, D> {
         R: HasPersistedQueueStore + Send + Sync + 'static,
     {
         if token.queue() != &self.inner.name {
-            return effect_try_sync! { body: { let __dsl_error = || PersistedQueueError::WrongQueue; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
+            return crate::effect_fail! { error: PersistedQueueError::WrongQueue, };
         }
         let queue = self.inner.name.clone();
         let id = token.id().clone();
@@ -1189,7 +1190,7 @@ impl<P: Send + 'static, D: KeyDomain> PersistedQueue<P, D> {
                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                        .take();
                    let Some(action) = action else {
-                       return effect_try_sync! { body: { let __dsl_error = || PersistedQueueError::InputConsumed; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
+                       return crate::effect_fail! { error: PersistedQueueError::InputConsumed, };
                    };
                    effect_provide_some! {
                        program: effect_map_error! {
@@ -1282,7 +1283,7 @@ impl<P: Send + 'static, D: KeyDomain> PersistedQueue<P, D> {
                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                        .take();
                    let Some(request) = request else {
-                       return effect_try_sync! { body: { let __dsl_error = || PersistedQueueError::InputConsumed; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, };
+                       return crate::effect_fail! { error: PersistedQueueError::InputConsumed, };
                    };
                    let id = QueueMessageId::from_key(id.clone());
                    effect_provide_some! {

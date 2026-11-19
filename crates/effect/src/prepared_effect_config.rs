@@ -48,12 +48,6 @@ impl<R: Send + Sync + 'static> PreparedConfigSource<R> for PreparedMemoryConfigS
         }, }, }
     }
 }
-impl HasPreparedConfigSource for PreparedMemoryConfigSource {
-    type Source = Self;
-    fn prepared_config_source(&self) -> &Self {
-        self
-    }
-}
 /// Underlying typed source failure wrapped with its configuration path.
 pub type PreparedConfigFailure<D> =
     ConfigError<<<D as HasPreparedConfigSource>::Source as PreparedConfigSource<D>>::SourceError>;
@@ -62,6 +56,12 @@ pub type PreparedConfigLoadError<D> =
     <<D as HasPreparedConfigSource>::Source as PreparedConfigSource<D>>::Error;
 
 /// An owned synchronous store selected directly in one prepared error family.
+#[derive(crate::EffectEnvironment)]
+#[effect_environment(prepared_config_source(
+    provider = Self,
+    get = self,
+    requires(X: Send + 'static, F: Fn(ConfigError<S::Error>) -> X + Send + Sync + 'static),
+))]
 pub struct PreparedConfigStoreSource<
     S: PreparedConfigStore,
     X,
@@ -106,17 +106,6 @@ where
         crate::effect_prepare! { description; program: effect_try_sync! { once; body: move || {
             store.try_get(&path).map_err(|error| map(ConfigError::Source { path, error }))
         }, }, }
-    }
-}
-impl<S, X, F> HasPreparedConfigSource for PreparedConfigStoreSource<S, X, F>
-where
-    S: PreparedConfigStore,
-    X: Send + 'static,
-    F: Fn(ConfigError<S::Error>) -> X + Send + Sync + 'static,
-{
-    type Source = Self;
-    fn prepared_config_source(&self) -> &Self {
-        self
     }
 }
 fn from_failure<D: HasPreparedConfigSource>(

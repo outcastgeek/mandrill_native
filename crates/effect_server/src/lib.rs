@@ -19,8 +19,9 @@ fn try_admission_lock<T>(mutex: &std::sync::Mutex<T>) -> Result<std::sync::Mutex
 
 /// Typed callback blocks using this facade's existing Effect dependency.
 pub use effect::{
-    codec, effect_all, effect_all_concurrent, effect_blocking, effect_cpu, effect_die,
-    effect_finalizer, effect_for_each, effect_for_each_concurrent, effect_from_option,
+    EffectEnvironment,
+    codec, effect_all, effect_all_concurrent, effect_blocking, effect_cpu, effect_die, effect_fail,
+    effect_finalizer, effect_for_each, effect_for_each_concurrent, effect_from_option, effect_from_result,
     effect_future, effect_map, effect_map_error, effect_on_interrupt, effect_permit,
     effect_provide_some, effect_provided, effect_race, effect_recover, effect_ref, effect_repeat,
     effect_resource, effect_retry, effect_sandbox, effect_schema_parse, effect_scope,
@@ -302,6 +303,7 @@ pub mod native {
 #[doc(hidden)]
 pub mod __private {
     pub use effect;
+    pub use tokio::runtime::Handle as TokioHandle;
     pub use effect::__private::{MacroContext, ScopedBody};
 }
 

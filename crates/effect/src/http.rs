@@ -5,7 +5,7 @@ use crate::{
     AdmissionCapacity, Cancellation, Defect, Effect, Exit, ProviderAdmission, Release,
     ResourceValue, Scope,
 };
-use crate::{effect, effect_die, effect_scope, effect_scope_acquire, effect_sync, effect_try_sync};
+use crate::{effect, effect_die, effect_scope, effect_scope_acquire, effect_sync};
 use futures_util::FutureExt;
 use futures_util::future::{Either, select};
 use std::collections::BTreeMap;
@@ -314,7 +314,7 @@ where
            Ok(status) if accept_status(status) => effect_sync! { body: move || response.clone(), },
            Ok(status) => {
                let on_error = Arc::clone(&on_error);
-               effect_try_sync! { body: { let __dsl_error = move || on_error(FetchFailure::Http(status)); move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }
+               crate::effect_fail! { error: on_error(FetchFailure::Http(status)), }
            }
            Err(defect) => effect_die! { defect: defect, },
        },

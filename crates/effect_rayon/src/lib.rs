@@ -6,6 +6,11 @@
 //! provider for asynchronous tasks and blocking I/O. `stop` prevents new jobs,
 //! and its drain waits for accepted jobs to settle. The adapter does not build
 //! a pool or choose a worker count for the application.
+//! Compose native CPU callbacks as Effect operations over `HasCpuExecutor`.
+//! The caller supplies the typed error mapping and the selected pool. Job
+//! admission is acquired before spawn and held through worker settlement.
+//! Use [`RayonCpu::prepare`] when the application provisions fixed worker
+//! storage explicitly.
 
 use effect::{
     AdmissionCapacity, CpuExecutor, Defect, Diagnostics, ProviderAdmission, ProviderDrain,

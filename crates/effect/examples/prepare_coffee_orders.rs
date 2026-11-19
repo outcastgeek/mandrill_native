@@ -77,9 +77,12 @@ fn prepare_and_replay() -> Effect<
                 }?
             },
         };
-        let requested = prepare.run(run, Ticket {
-            number: "104".into(), customer: "Maya".into(), cups: 2,
-        });
+        let requested = workflow! {
+            run;
+            workflow: prepare,
+            run: run,
+            input: Ticket { number: "104".into(), customer: "Maya".into(), cups: 2 },
+        };
         match show_pickup(requested.clone()?) { Ok(()) => (), Err(error) => effect_die! { defect: error, }?, };
         match show_pickup(requested?) { Ok(()) => (), Err(error) => effect_die! { defect: error, }?, };
     }
@@ -124,7 +127,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         NonZeroUsize::MIN.saturating_add(15),
         NonZeroUsize::MIN.saturating_add(3),
     );
-    let result = futures_executor::block_on(prepare_and_replay().run(cafe.clone()));
+    let result = futures_executor::block_on(effect! {
+        run;
+        program: prepare_and_replay(),
+        environment: cafe.clone(),
+    });
     cafe.base
         .finish()
         .map_err(|error| error.message().to_owned())?;

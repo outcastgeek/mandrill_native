@@ -6,7 +6,7 @@ use super::{
     JournalEntry, JournalReadOutcome, JournalReadViolation, JournalStream,
 };
 use crate::{Effect, KeyDomain, StableKey};
-use crate::{effect, effect_map_error, effect_provide_some, effect_sync, effect_try_sync, service};
+use crate::{effect, effect_map_error, effect_provide_some, effect_sync, service};
 use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
@@ -361,24 +361,20 @@ impl<S: Send + Sync + 'static, FoldError: Send + 'static> Projection<S, FoldErro
                                let store = Arc::clone(&store);
                                if let Some(snapshot) = &current {
                                    if snapshot.key != projection.key {
-                                       return effect_try_sync! {
-                                           once; body: {
-                                           let __dsl_result = Err(
+                                       return crate::effect_from_result! { once; result: Err(
                                            ProjectionAdvanceError::ProjectionKeyMismatch {
                                                expected: projection.key.clone(),
                                                actual: snapshot.key.clone(),
                                            },
-                                       ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                       ), };
                                    }
                                    if snapshot.version != projection.version {
-                                       return effect_try_sync! {
-                                           once; body: {
-                                           let __dsl_result = Err(
+                                       return crate::effect_from_result! { once; result: Err(
                                            ProjectionAdvanceError::ProjectionVersionMismatch {
                                                expected: projection.version,
                                                actual: snapshot.version,
                                            },
-                                       ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                       ), };
                                    }
                                }
                                let stream = projection.key.stream.clone();
@@ -399,30 +395,24 @@ impl<S: Send + Sync + 'static, FoldError: Send + 'static> Projection<S, FoldErro
                                        let read = match read {
                                            JournalReadOutcome::Complete(read) => read,
                                            JournalReadOutcome::HistoryTruncated { first_available } => {
-                                               return effect_try_sync! {
-                                                   once; body: {
-                                                   let __dsl_result = Err(
+                                               return crate::effect_from_result! { once; result: Err(
                                                    ProjectionAdvanceError::HistoryTruncated {
                                                        first_available,
                                                    },
-                                               ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                               ), };
                                            }
                                            JournalReadOutcome::CursorAhead { head } => {
-                                               return effect_try_sync! {
-                                                   once; body: {
-                                                   let __dsl_result = Err(
+                                               return crate::effect_from_result! { once; result: Err(
                                                    ProjectionAdvanceError::CursorAhead { head },
-                                               ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                               ), };
                                            }
                                        };
                                        if let Err(issue) =
                                            validate_journal_read(&read, &projection.key.stream, after, limit)
                                        {
-                                           return effect_try_sync! {
-                                               once; body: {
-                                               let __dsl_result = Err(
+                                           return crate::effect_from_result! { once; result: Err(
                                                ProjectionAdvanceError::InvalidJournalRead(issue),
-                                           ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                           ), };
                                        }
                                        if read.entries.is_empty() {
                                            let snapshot = current.unwrap_or_else(|| ProjectionSnapshot {
@@ -443,35 +433,29 @@ impl<S: Send + Sync + 'static, FoldError: Send + 'static> Projection<S, FoldErro
                                        for entry in &read.entries {
                                            let key = (entry.event.group.clone(), entry.event.tag.clone());
                                            let Some(expected) = projection.accepted.get(&key) else {
-                                               return effect_try_sync! {
-                                                   once; body: {
-                                                   let __dsl_result = Err(
+                                               return crate::effect_from_result! { once; result: Err(
                                                    ProjectionAdvanceError::UnexpectedEvent {
                                                        group: key.0,
                                                        tag: key.1,
                                                    },
-                                               ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                               ), };
                                            };
                                            if *expected != entry.event.version {
-                                               return effect_try_sync! {
-                                                   once; body: {
-                                                   let __dsl_result = Err(
+                                               return crate::effect_from_result! { once; result: Err(
                                                    ProjectionAdvanceError::EventVersionMismatch {
                                                        group: key.0,
                                                        tag: key.1,
                                                        expected: *expected,
                                                        actual: entry.event.version,
                                                    },
-                                               ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                               ), };
                                            }
                                            state = match (projection.fold)(&state, entry) {
                                                Ok(next) => Arc::new(next),
                                                Err(error) => {
-                                                   return effect_try_sync! {
-                                                       once; body: {
-                                                       let __dsl_result = Err(
+                                                   return crate::effect_from_result! { once; result: Err(
                                                        ProjectionAdvanceError::Fold(error),
-                                                   ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                                   ), };
                                                }
                                            };
                                        }
@@ -509,14 +493,12 @@ impl<S: Send + Sync + 'static, FoldError: Send + 'static> Projection<S, FoldErro
                                                        }, }
                                                    }
                                                    ProjectionWrite::VersionConflict(actual) => {
-                                                       effect_try_sync! {
-                                                           once; body: {
-                                                           let __dsl_result = Err(
+                                                       crate::effect_from_result! { once; result: Err(
                                                            ProjectionAdvanceError::ProjectionVersionMismatch {
                                                                expected: version,
                                                                actual,
                                                            },
-                                                       ); move || __dsl_result }, on_error: ::core::convert::identity, }
+                                                       ), }
                                                    }
                                                }
                                            },

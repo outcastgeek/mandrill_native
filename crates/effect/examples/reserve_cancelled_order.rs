@@ -5,12 +5,12 @@
 //! reservation, stock 8 after cancellation, and stock 8 after compensation replay.
 //! The stock and workflow history are local to this process.
 
-use effect::{effect_die, effect_map_error, effect_provide_some, effect_try_sync};
+use effect::{effect_die, effect_from_result, effect_map_error, effect_provide_some};
 pub mod cafe_support;
 use cafe_support::{Cafe, key, limits, parse_policy};
 use effect::workflow::{
     CompensationRunError, WorkflowCodecError, WorkflowCompensation, WorkflowCompensationId,
-    WorkflowDefinitionId, WorkflowEngine, WorkflowEngineError, WorkflowHandle, WorkflowRunId,
+    WorkflowDefinitionId, WorkflowEngineError, WorkflowHandle, WorkflowRunId,
     WorkflowVersion,
 };
 use effect::{
@@ -31,8 +31,8 @@ fn cancel_reservation() -> Effect<(), ReservationError, Cafe<AtomicRef<i64>>> {
                 else { (Err(StockError::SoldOut), *available) }
             },
         }?;
-        let cups = effect_map_error! { program: effect_try_sync! { once; body: { let __dsl_result = reserved; move || __dsl_result }, on_error: ::core::convert::identity, }, map: ReservationError::Stock, }?;
-        let available = stock.get()?;
+        let cups = effect_from_result! { once; result: reserved, on_error: ReservationError::Stock, }?;
+        let available = effect_ref! { get; reference: stock, }?;
         { use std::io::Write; let written = writeln!(std::io::stdout().lock(), "Reserved {cups} cups; stock {available}."); match written { Ok(()) => (), Err(error) => effect_die! { defect: effect::Defect::from_io(error), }?, } };
         let workflow_id = match WorkflowDefinitionId::new("cancel-reservation") { Ok(value) => value, Err(error) => effect_die! { defect: effect::Defect::new(format!("definition: {error:?}")), }?, };
         let reservation_errors = match stock_errors() { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, };
@@ -43,13 +43,19 @@ fn cancel_reservation() -> Effect<(), ReservationError, Cafe<AtomicRef<i64>>> {
         };
         let run = WorkflowRunId::from_stable(match key("cancel-ticket-107") { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, });
         let engine = service! { env |env: &Cafe<AtomicRef<i64>>| { env.workflow.clone() }, }?;
-        effect_map_error! { program: effect_provide_some! { program: engine.register(definition.registration()), project: |_: &Cafe<AtomicRef<i64>>| (), }, map: ReservationError::Workflow, }?;
-        let input = effect_map_error! { program: effect_try_sync! { once; body: { let __dsl_result = definition.encode_input_bytes(&cups); move || __dsl_result }, on_error: ::core::convert::identity, }, map: ReservationError::Codec, }?;
+        effect_map_error! { program: effect_provide_some! { program: workflow! { register; engine: engine, registration: definition.registration(), }, project: |_: &Cafe<AtomicRef<i64>>| (), }, map: ReservationError::Workflow, }?;
+        let input = effect_from_result! {
+            once;
+            result: definition.encode_input_bytes(&cups),
+            on_error: ReservationError::Codec,
+        }?;
         effect_map_error! { 
             program: effect_provide_some! { 
-            program: engine.start(WorkflowHandle {
-            run: run.clone(), definition: definition.id,
-            version: definition.version }, input), project: |_: &Cafe<AtomicRef<i64>>| (), }, map: ReservationError::Workflow, }?;
+            program: workflow! {
+                start; engine: engine,
+                handle: WorkflowHandle { run: run.clone(), definition: definition.id, version: definition.version },
+                input: input,
+            }, project: |_: &Cafe<AtomicRef<i64>>| (), }, map: ReservationError::Workflow, }?;
         let returned_stock = stock.clone();
         let return_cups_key = match key("return-reserved-cups") { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, };
         let compensation_errors = match stock_errors() { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, };
@@ -68,13 +74,13 @@ fn cancel_reservation() -> Effect<(), ReservationError, Cafe<AtomicRef<i64>>> {
         };
         let first = effect_map_error! { program: compensation.clone(), map: ReservationError::Compensation, }?;
         assert!(matches!(first, Ok(2)));
-        let available = stock.get()?;
+        let available = effect_ref! { get; reference: stock, }?;
         { use std::io::Write; let written = writeln!(std::io::stdout().lock(), "Cancelled; stock {available}."); match written { Ok(()) => (), Err(error) => effect_die! { defect: effect::Defect::from_io(error), }?, } };
         let replay = effect_map_error! { program: compensation, map: ReservationError::Compensation, }?;
         assert!(matches!(replay, Ok(2)));
-        let available = stock.get()?;
+        let available = effect_ref! { get; reference: stock, }?;
         { use std::io::Write; let written = writeln!(std::io::stdout().lock(), "Compensation replay; stock {available}."); match written { Ok(()) => (), Err(error) => effect_die! { defect: effect::Defect::from_io(error), }?, } };
-        effect_map_error! { program: effect_provide_some! { program: engine.cancel(run), project: |_: &Cafe<AtomicRef<i64>>| (), }, map: ReservationError::Workflow, }?;
+        effect_map_error! { program: effect_provide_some! { program: workflow! { cancel; engine: engine, run: run, }, project: |_: &Cafe<AtomicRef<i64>>| (), }, map: ReservationError::Workflow, }?;
     }
 }
 /// A reservation cannot consume cups that are not available.
@@ -110,7 +116,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         NonZeroUsize::MIN.saturating_add(15),
         NonZeroUsize::MIN.saturating_add(3),
     );
-    let result = futures_executor::block_on(cancel_reservation().run(env.clone()));
+    let result = futures_executor::block_on(effect! {
+        run;
+        program: cancel_reservation(),
+        environment: env.clone(),
+    });
     env.base
         .finish()
         .map_err(|error| error.message().to_owned())?;

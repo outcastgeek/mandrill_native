@@ -1,6 +1,6 @@
 //! Endpoint descriptions, registration metadata and owned middleware continuations.
 
-use crate::effect_future;
+use crate::{effect_die, effect_fail, effect_from_result, effect_future, effect_resource, effect_sync};
 use crate::prepared_request_storage::{Loan, Vacancy};
 use crate::{BodyOutcome, HasRequest, Reply, Request, ResourceValidators, ServerError};
 use effect::{Effect, Exit, PrimaryOutcomeRef, Release, Scope, effect, service};
@@ -181,7 +181,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Endpoint<E, R> {
                 let validators = validators.clone();
                 let request = service! { env |env: &R| { env.request().clone() }, }?;
                 let current = validators(request.clone())?;
-                let decision = Effect::from_result_once(current.evaluate(&request).map_err(|error| map(error)))?;
+                let decision = effect_from_result! { once; result: current.evaluate(&request).map_err(|error| map(error)), }?;
                 match decision {
                     crate::ConditionalOutcome::Proceed => body(scope)?,
                     crate::ConditionalOutcome::NotModified => {
@@ -300,7 +300,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Pipeline<E, R> {
                 if allowed {
                     next()?
                 } else {
-                    Effect::fail_with(move || rejected())?
+                    effect_fail! { error: rejected(), }?
                 }
             }
         })
@@ -316,7 +316,11 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Pipeline<E, R> {
         let release = Arc::new(release);
         self.stage(move |request, next| {
             let release = release.clone();
-            next().ensuring_with(move |outcome| release(request.clone(), outcome))
+            effect_resource! {
+                ensuring_release;
+                program: next(),
+                release: move |outcome| release(request.clone(), outcome),
+            }
         })
     }
     /// Deliberate early response invokes the native reply continuation installed by the request boundary.
@@ -331,19 +335,24 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Pipeline<E, R> {
         self.stage(move |request, _| {
             let reply = reply.clone();
             let request_for_reply = request.clone();
-            Effect::service(move |_: &R| {
-                request.with_extensions(|extensions| {
-                    extensions.get::<WeakReplyContinuation<E, R>>().and_then(WeakReplyContinuation::upgrade)
-                })
-            })
-            .flat_map(move |continuation| match continuation {
-                Some(continuation) => {
-                    reply(request_for_reply.clone()).flat_map(move |reply| continuation.invoke(reply))
-                }
-                None => Effect::die(effect::Defect::new(
-                    "response continuation unavailable outside request boundary",
-                )),
-            })
+            effect! {
+                bind;
+                program: service! { env: move |_: &R| {
+                    request.with_extensions(|extensions| {
+                        extensions.get::<WeakReplyContinuation<E, R>>().and_then(WeakReplyContinuation::upgrade)
+                    })
+                }, },
+                body: move |continuation| match continuation {
+                    Some(continuation) => effect! {
+                        bind;
+                        program: reply(request_for_reply.clone()),
+                        body: move |reply| continuation.invoke(reply),
+                    },
+                    None => effect_die! { defect: effect::Defect::new(
+                        "response continuation unavailable outside request boundary",
+                    ), },
+                },
+            }
         })
     }
     /// Add staged response metadata through the request's explicit response-field owner.
@@ -351,7 +360,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Pipeline<E, R> {
         self.before(move |request| {
             let name = name.clone();
             let value = value.clone();
-            Effect::sync(move || {
+            effect_sync! { body: move || {
                 request.with_extensions(|extensions| {
                     if let Some(headers) = extensions.get::<ResponseHeaders>() {
                         headers
@@ -361,7 +370,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Pipeline<E, R> {
                             .insert(name.clone(), value.clone());
                     }
                 });
-            })
+            }, }
         })
     }
     /// Compose child stages inside these stages, preserving declaration/nesting order.

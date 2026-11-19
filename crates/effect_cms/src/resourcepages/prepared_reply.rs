@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use effect::memory::{Buffer, BufferLease, BufferView, Bytes, MemoryError};
 use effect::{Effect, effect_map_error};
-use effect_server::{HasRequest, Reply, Request, ServerError};
+use effect_server::{HasRequest, Reply, Request, ServerError, server};
 use maud::Markup;
 
 use crate::definitions::ResourceKind;
@@ -260,7 +260,7 @@ where
     effect::effect! {
         let render = render.clone();
         let on_error = on_error.clone();
-        let request = effect::service! { env: |env: &R| env.request().clone(), }?;
+        let request = server! { request; }?;
         effect::effect_try_sync! {
             once;
             body: move || {
@@ -284,6 +284,32 @@ fn prepared_html_reply<E: Send + 'static, R: Send + Sync + 'static>(
 }
 
 impl ResourcePageRenderer {
+    /// Resolve the current request's list query, build its page, and publish the HTML reply.
+    pub fn definition_list_reply<E, R>(
+        &self,
+        services: &DefinitionServiceSet<E, R>,
+        kind: &ResourceKind,
+    ) -> DefinitionPageReply<E, R>
+    where
+        E: Send + 'static,
+        R: HasRequest + Send + Sync + 'static,
+    {
+        let renderer = self.clone();
+        let queries = services.queries.clone();
+        let rendering = services.rendering.clone();
+        let kind = kind.clone();
+        effect::effect! {
+            let renderer = renderer.clone();
+            let queries = queries.clone();
+            let rendering = rendering.clone();
+            let kind = kind.clone();
+            let request = server! { request; }?;
+            let query = queries.list_query(&request, &kind)?;
+            let page = rendering.list_page(&request, &kind, query)?;
+            renderer.list_reply(&request, page)?
+        }
+    }
+
     /// Take the request's prepared output before invoking shell or component callbacks.
     ///
     /// The reply retains this output through transport. The caller's model and
@@ -350,7 +376,7 @@ impl ResourcePageRenderer {
                     let rendering = rendering.clone();
                     let prepared = prepared.clone();
                     let kind = kind.clone();
-                    let request = effect::service! { env: |env: &R| env.request().clone(), }?;
+                    let request = server! { request; }?;
                     let query = effect_map_error! {
                         program: prepared.list_query(&queries, &request, &kind),
                         map: RenderingError::Consumer,
@@ -365,7 +391,7 @@ impl ResourcePageRenderer {
                     let rendering = rendering.clone();
                     let prepared = prepared.clone();
                     let kind = kind.clone();
-                    let request = effect::service! { env: |env: &R| env.request().clone(), }?;
+                    let request = server! { request; }?;
                     let query = effect_map_error! {
                         program: prepared.detail_query(&queries, &request),
                         map: RenderingError::Consumer,
@@ -385,7 +411,7 @@ impl ResourcePageRenderer {
                     let rendering = rendering.clone();
                     let prepared = prepared.clone();
                     let kind = kind.clone();
-                    let request = effect::service! { env: |env: &R| env.request().clone(), }?;
+                    let request = server! { request; }?;
                     let query = effect_map_error! {
                         program: prepared.list_query(&queries, &request, &kind),
                         map: RenderingError::Consumer,
@@ -420,7 +446,7 @@ impl ResourcePageRenderer {
             let renderer = renderer.clone();
             let model = model.clone();
             let on_error = on_error.clone();
-            let request = effect::service! { env: |env: &R| env.request().clone(), }?;
+            let request = server! { request; }?;
             let request_for_output = request.clone();
             let on_reserve_error = on_error.clone();
             let output = effect::effect_try_sync! {

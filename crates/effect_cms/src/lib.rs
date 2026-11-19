@@ -40,6 +40,11 @@
 //! Prepared applications reserve their CMS workspaces at startup with
 //! [`PreparedCmsMemory`] and project the capability through [`HasCmsMemory`].
 //! The Server endpoint owns prepared request and reply buffers.
+//! The `cms_application` example in this package serves a definition-backed
+//! catalogue through Web. `cms!` selects the existing definition services and
+//! reply operation, while the app supplies its request and runtime capabilities
+//! through `EffectEnvironment`. Prepared catalogue replies select the prepared
+//! definition services and keep the response reservation through delivery.
 //!
 //! [`add`] is the pre-existing crate scaffold preserved verbatim. It is
 //! recorded as preserved inventory, not as a CMS contract.
@@ -50,6 +55,9 @@ mod url_text;
 mod form_media;
 mod composition;
 pub mod memory;
+
+extern crate self as effect_cms;
+pub use effect::__private::cms;
 
 pub use composition::*;
 pub use content::{PreparedCmsContent, PreparedCmsContentCapacity};

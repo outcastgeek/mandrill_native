@@ -8,7 +8,7 @@ use effect::{
     Effect, effect, effect_from_option, effect_map_error, effect_try_future, effect_try_sync,
     service,
 };
-use effect_server::{BodyLimit, HasRequest, HtmlContent, Reply, Request, ServerError, reply};
+use effect_server::{BodyLimit, HasRequest, HtmlContent, Reply, Request, ServerError, reply, server};
 use effect_server_identity::authority::SelfGrant;
 use effect_server_web::{
     csp::ResponseNonce,
@@ -46,7 +46,7 @@ pub fn credentials<R: HasRequest + Send + Sync + 'static>(
     bytes: NonZeroUsize,
 ) -> Effect<Credentials, CafeError, R> {
     effect! {
-        let request = service! { env |env: &R| { env.request().clone() }, }?;
+        let request = server! { request; }?;
         if request.headers().get(http::header::CONTENT_TYPE).is_none_or(|value| value != "application/json") {
             effect_try_sync! { body { Err::<(), _>(cafe_error(CafeProblem::Http(effect_server::ServerError::Invalid("login content type".into())))) }, }?;
         }
@@ -65,14 +65,13 @@ pub fn credentials<R: HasRequest + Send + Sync + 'static>(
 pub fn welcome<R: HasRequest + Send + Sync + 'static>() -> Effect<Reply<CafeError, R>, CafeError, R>
 {
     effect! {
-        let request = service! { env |env: &R| { env.request().clone() }, }?;
+        let request = server! { request; }?;
         let nonce = response_nonce::<R>()?;
         let page = effect_try_sync! {
             once;
             body: move || prepared_html::<_, CafeError, R>(&request, nonce, |nonce, out| {
                 pages::welcome(out, nonce.as_str()).map_err(pickup_http_error)
             }, pickup_http_error),
-            on_error: std::convert::identity,
         }?;
         reply! { header(http::header::CACHE_CONTROL, http::HeaderValue::from_static("no-store")); source(page); }
     }
@@ -86,7 +85,7 @@ pub fn show<R: HasRequest + Send + Sync + 'static>(
         let actor = actor::<R>()?;
         let order = load::<R>(sql, actor)?;
         let nonce = response_nonce::<R>()?;
-        let request = service! { env |env: &R| { env.request().clone() }, }?;
+        let request = server! { request; }?;
         let announcement = if order.collected {
             None
         } else {
@@ -105,7 +104,6 @@ pub fn show<R: HasRequest + Send + Sync + 'static>(
                     Ok(())
                 }).map_err(pickup_render_error)
             }, pickup_http_error),
-            on_error: std::convert::identity,
         }?;
         reply! { header(http::header::CACHE_CONTROL, http::HeaderValue::from_static("no-store")); source(page); }
     }
@@ -142,10 +140,14 @@ pub fn collect<R: HasRequest + Send + Sync + 'static>(
         let actor = actor::<R>()?;
         let owner = actor.user_id().to_string();
         let changed = effect_map_error! {
-            program: sql.execute(sql! {
-            text("UPDATE cafe_pickups SET collected=1, collections=collections+1 WHERE customer_id="); param(owner);
-            text(" AND collected=0");
-        }), map |error| { cafe_error(CafeProblem::Sql(error)) }, }?;
+            program: sql! {
+                execute; client: sql, statement: sql! {
+                    text("UPDATE cafe_pickups SET collected=1, collections=collections+1 WHERE customer_id="); param(owner);
+                    text(" AND collected=0");
+                },
+            },
+            map |error| { cafe_error(CafeProblem::Sql(error)) },
+        }?;
         let _order = load::<R>(sql, actor)?;
         let message = if changed == 1 { "Collection recorded. Enjoy your drinks!" } else { "Already collected; no second collection was recorded." };
         let response = reply! {
@@ -195,7 +197,16 @@ fn load<R: Send + Sync + 'static>(
     effect! {
         let sql = sql.clone(); let decoder = decoder.clone();
         let owner = actor.user_id().to_string();
-        let order = effect_map_error! { program: sql.first_prepared_read(sql! { text("SELECT ticket,customer,drink,cups,collected FROM cafe_pickups WHERE customer_id="); param(owner); }, decoder), map |error| { cafe_error(CafeProblem::Sql(error)) }, }?;
+        let order = effect_map_error! {
+            program: sql! {
+                first_prepared; client: sql,
+                statement: sql! {
+                    text("SELECT ticket,customer,drink,cups,collected FROM cafe_pickups WHERE customer_id="); param(owner);
+                },
+                decoder: decoder,
+            },
+            map |error| { cafe_error(CafeProblem::Sql(error)) },
+        }?;
         effect_from_option! { once; value: order, missing { cafe_error(CafeProblem::MissingOrder) }, }?
     }
 }

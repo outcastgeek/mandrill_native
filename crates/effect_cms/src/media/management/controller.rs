@@ -56,7 +56,7 @@ impl<I:Default+Clone+Send+'static,E:std::error::Error+Send+'static,R:Send+Sync+'
         let controller=self.clone();let request=request.clone();
         effect!{let controller=controller.clone();let request=request.clone();let result=result.clone();
             match (controller.options.form_page.as_ref(),controller.options.render_html.as_ref()){
-                (Some(build),Some(render))=>match build(&request,result).either()?{
+                (Some(build),Some(render))=>match effect! { either; program: build(&request,result), }?{
                     Ok(Some(page))=>render(&request,Some(page))?,_=>controller.internal(&request)?,
                 },_=>controller.internal(&request)?,
             }
@@ -67,7 +67,7 @@ impl<I:Default+Clone+Send+'static,E:std::error::Error+Send+'static,R:Send+Sync+'
             let controller=controller.clone();let request=request.clone();
             effect!{let controller=controller.clone();let request=request.clone();
                 match (controller.options.list_page.as_ref(),controller.options.render_html.as_ref()){
-                    (Some(build),Some(render))=>match build(&request,crate::media::surface::media_query_from_request(&request,None,controller.options.list_page_size)).either()?{
+                    (Some(build),Some(render))=>match effect! { either; program: build(&request,crate::media::surface::media_query_from_request(&request,None,controller.options.list_page_size)), }?{
                         Ok(page)=>render(&request,page)?,Err(_)=>controller.internal(&request)?,
                     },_=>controller.internal(&request)?,
                 }
@@ -91,10 +91,10 @@ impl<I:Default+Clone+Send+'static,E:std::error::Error+Send+'static,R:Send+Sync+'
                             if !valid_media_inline_create_flow(&flow){controller.internal(&request)?}
                             else{
                                 let surface=resolve_media_flow_surface(&request,&form,flow.surface.as_ref());
-                                let current=flow.current_inputs.as_ref().expect("admitted inputs")(&request,surface,form.clone()).either()?;
+                                let current=effect! { either; program: flow.current_inputs.as_ref().expect("admitted inputs")(&request,surface,form.clone()), }?;
                                 match current{
                                     Err(_)=>controller.internal(&request)?,
-                                    Ok(inputs)=>match flow.preview_items.as_ref().expect("admitted preview")(&request,inputs).either()?{
+                                    Ok(inputs)=>match effect! { either; program: flow.preview_items.as_ref().expect("admitted preview")(&request,inputs), }?{
                                         Err(_)=>controller.internal(&request)?,
                                         Ok(items)=>{
                                             let rendered=flow.render_create.as_ref().expect("admitted create renderer")(&request,&form,I::default(),String::new(),items);
@@ -114,7 +114,7 @@ impl<I:Default+Clone+Send+'static,E:std::error::Error+Send+'static,R:Send+Sync+'
         let controller=self.clone();self.with_access(request,true,Arc::new(move|request|{
             let controller=controller.clone();let request=request.clone();
             effect!{let controller=controller.clone();let request=request.clone();
-                match controller.exists(&request).either()?{
+                match effect! { either; program: controller.exists(&request), }?{
                     Err(_)=>controller.internal(&request)?,
                     Ok(false)=>controller.error(&request,404,&controller.message(&request,controller.options.not_found_message.as_ref()))?,
                     Ok(true)=>controller.form_page(&request,success_validation_result(ResourceAction::new(RESOURCE_ACTION_UPDATE)))?,
@@ -132,7 +132,7 @@ impl<I:Default+Clone+Send+'static,E:std::error::Error+Send+'static,R:Send+Sync+'
         let controller=self.clone();self.with_access(request,true,Arc::new(move|request|{
             let controller=controller.clone();let request=request.clone();
             effect!{let controller=controller.clone();let request=request.clone();
-                match controller.exists(&request).either()?{
+                match effect! { either; program: controller.exists(&request), }?{
                     Err(_)=>controller.internal(&request)?,Ok(false)=>controller.error(&request,404,&controller.message(&request,controller.options.not_found_message.as_ref()))?,
                     Ok(true)=>controller.execute_mutation(&request,ResourceAction::new(RESOURCE_ACTION_UPDATE))?,
                 }
@@ -150,7 +150,7 @@ impl<I:Default+Clone+Send+'static,E:std::error::Error+Send+'static,R:Send+Sync+'
             let validation=match validation{Some(validation)=>validation,None=>effect_die!{defect:Defect::new("media mutation requires validation service")}?};
             let adapter=controller.options.on_mutation_error.clone();
             let attempt=effect_map_error!{
-                program:crate::mutations::execute_with_optional_commands(&request,&controller.options.resource_kind,&action,&validation,commands.as_ref(),None).either(),
+                program:effect! { either; program: crate::mutations::execute_with_optional_commands(&request,&controller.options.resource_kind,&action,&validation,commands.as_ref(),None), },
                 map move |failure|{adapter(failure)},
             }?;
             match attempt{

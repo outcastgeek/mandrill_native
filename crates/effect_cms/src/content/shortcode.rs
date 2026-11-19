@@ -165,7 +165,12 @@ impl PreparedShortcodeRenderer {
                 let input = input.clone();
                 let memory_error = on_memory.clone();
                 async move {
-                    let (token, options) = match context.run(input, env.clone()).await {
+                    let (token, options) = match effect::effect! {
+                        run_in_context;
+                        context: context,
+                        program: input,
+                        environment: env.clone(),
+                    }.await {
                         Exit::Success(input) => input,
                         Exit::Fail(error) => return Exit::Fail(error),
                         Exit::Die(defect) => return Exit::Die(defect),
@@ -179,7 +184,12 @@ impl PreparedShortcodeRenderer {
                         Ok(output) => output,
                         Err(error) => return Exit::Fail(memory_error(error)),
                     };
-                    match context.run(resolver.resolve(token, options), env).await {
+                    match effect::effect! {
+                        run_in_context;
+                        context: context,
+                        program: resolver.resolve(token, options),
+                        environment: env,
+                    }.await {
                         Exit::Success(fragment) => {
                             let RenderedContentFragment { html, block, cache_key, no_cache } = fragment;
                             if let Err(error) = check_limit(cache_key.len(), storage.limits.cache_key_bytes) {

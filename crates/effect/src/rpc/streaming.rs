@@ -258,24 +258,13 @@ pub trait RpcStreamConnector: Send + Sync + 'static {
 }
 
 /// Selects the streaming RPC connector in an application environment.
+#[crate::__private::derive_arc_capability(generic = RpcStreamConnector)]
 pub trait HasRpcStreamConnector {
     /// Streaming RPC connector selected by this environment.
     type Connector: RpcStreamConnector;
     /// # Returns
     /// Type: `Arc<Self::Connector>`.
     fn rpc_stream_connector(&self) -> Arc<Self::Connector>;
-}
-
-impl<T: RpcStreamConnector> HasRpcStreamConnector for Arc<T> {
-    /// Type alias for connector in rpc streaming.
-    type Connector = T;
-    ///
-    /// # Returns
-    /// Type: `Arc<Self::Connector>`.
-    /// Returns `Arc<Self::Connector>`.
-    fn rpc_stream_connector(&self) -> Arc<Self::Connector> {
-        Arc::clone(self)
-    }
 }
 
 #[derive(Debug)]
@@ -519,7 +508,7 @@ where
                                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                                         .take();
                                     let Some(frame) = frame else {
-                                        return effect_try_sync! { once; body: { let __dsl_result = Err(RpcStreamError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                        return crate::effect_from_result! { once; result: Err(RpcStreamError::InputConsumed), };
                                     };
                                     let reader = RpcStreamReader::new(
                                         source.clone(),
@@ -725,7 +714,7 @@ where
                                 let result = bytes
                                     .ok_or(RpcStreamError::Disconnected)
                                     .and_then(|bytes| reader.decode_next(&bytes));
-                                effect_try_sync! { once; body: { let __dsl_result = result; move || __dsl_result }, on_error: ::core::convert::identity, }
+                                crate::effect_from_result! { once; result: result, }
                             }? } }
                     }? } }; let __dsl_cleanup = effect_sync! {
                         body: move || {
@@ -935,7 +924,7 @@ where
                        {
                            let __dsl_program = {
                            let __dsl_program = {
-                           let __dsl_program = effect_try_sync! { once; body: { let __dsl_result = envelope.encode(reader.policy).map_err(RpcStreamError::Wire); move || __dsl_result }, on_error: ::core::convert::identity, }; effect! {
+                           let __dsl_program = crate::effect_from_result! { once; result: envelope.encode(reader.policy).map_err(RpcStreamError::Wire), }; effect! {
                            let __dsl_program = __dsl_program.clone(); let session_handle = session_handle.clone(); let state = state.clone(); let uncertain_call = uncertain_call.clone(); let frame = __dsl_program?; {
                                let frame = Mutex::new(Some(frame));
                                let state = Arc::clone(&state);
@@ -976,7 +965,7 @@ where
                                                        .awaiting_ack = None;
                                                }
                                            }, },
-                                       None => effect_try_sync! { once; body: { let __dsl_result = Err(RpcStreamError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, },
+                                       None => crate::effect_from_result! { once; result: Err(RpcStreamError::InputConsumed), },
                                    }
                                },
             }
@@ -1074,7 +1063,7 @@ where
                                    program: effect_map_error! {
                                    program: session
                                    .send(frame), map: RpcStreamError::CancellationUncertain, }, project: |_: &R| (), },
-                               None => effect_try_sync! { once; body: { let __dsl_result = Err(RpcStreamError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, },
+                               None => crate::effect_from_result! { once; result: Err(RpcStreamError::InputConsumed), },
                            }
                        },
         }

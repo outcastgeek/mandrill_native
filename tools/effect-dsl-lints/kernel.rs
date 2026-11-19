@@ -121,7 +121,7 @@ pub fn machine(
                 // Finish, including consumed-owned-outcome and caught panic paths.
                 matches!(
                     caller,
-                    "ready" | "future_exit" | "bind_exit" | "from_exit_once"
+                    "ready" | "future_exit" | "bind_exit" | "from_exit_once" | "provide_some_arc"
                 ) || caller == "sleep"
                     && caller_path == "clock::<impl program::Effect<(), E, R>>::sleep"
                     // Keep the existing provider's cancellation/trace Context.
@@ -147,7 +147,11 @@ pub fn inherent_transition(
     callee: &str,
     callee_path: &str,
 ) -> bool {
-    (owner == "eventlog::event_group::EventGroup"
+    (owner == "program::Effect"
+        && caller == "provide_some"
+        && target == Some(owner)
+        && callee == "provide_some_arc")
+        || (owner == "eventlog::event_group::EventGroup"
         && caller == "from_event"
         && target == Some(owner)
         && callee == "register")

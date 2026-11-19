@@ -247,6 +247,8 @@ pub trait HasWallClock {
 /// A controllable, shareable wall-clock capability. Advancing it never starts
 /// a timer or runtime; callers supply it through their environment.
 #[derive(Clone)]
+#[derive(crate::EffectEnvironment)]
+#[effect_environment(wall_clock(provider = Self, get = self))]
 pub struct TestWallClock {
     millis: Arc<AtomicI64>,
 }
@@ -322,17 +324,6 @@ impl WallClock for TestWallClock {
     }
 }
 
-impl HasWallClock for TestWallClock {
-    /// Type alias for clock in duration.
-    type Clock = Self;
-
-    ///
-    /// # Returns
-    /// Type: `&Self::Clock`.
-    fn wall_clock(&self) -> &Self::Clock {
-        self
-    }
-}
 
 impl<E, R> Effect<UtcMillis, E, R>
 where

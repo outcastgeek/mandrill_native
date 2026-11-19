@@ -34,7 +34,7 @@ fn translated(request:Option<&Request>,translate:Option<&TranslateDashboardTextF
 }
 pub fn count_media_assets<E:Send+'static,R:Send+Sync+'static>(store:Option<Arc<dyn MediaAssetStore<E,R>>>,query:MediaQuery,report:Option<DashboardErrorReporter<E>>)->Effect<i64,E,R>{
     effect!{let store=store.clone();let query=query.clone();let report=report.clone();
-        match store{None=>0,Some(store)=>match store.list(query).either()?{
+        match store{None=>0,Some(store)=>match effect! { either; program: store.list(query), }?{
             Ok(result)=>result.map(|result|result.total).unwrap_or(0),Err(error)=>{if let Some(report)=report{report("count media assets",&error);}0}
         }}
     }
@@ -93,7 +93,7 @@ pub fn build_media_dashboard_page<E:Send+'static,R:Send+Sync+'static>(options:Me
         if search.placeholder.trim().is_empty(){search.placeholder=t("contentmgmt.media_dashboard.search_placeholder");}if search.aria_label.trim().is_empty(){search.aria_label=search.placeholder.clone();}
         if search.shortcut_label.trim().is_empty(){search.shortcut_label=t("common.search_shortcut");}if search.action.trim().is_empty(){search.action=request.as_ref().map(|request|request.uri().path().trim().to_owned()).unwrap_or_default();}search.enabled=search.enabled||!search.action.trim().is_empty();
         let status=request.as_ref().map(|request|crate::queries::request_query_value(request,"status")).unwrap_or_default();let kind=request.as_ref().map(|request|crate::queries::request_query_value(request,"kind")).unwrap_or_default();
-        let recent=match options.store.clone(){None=>None,Some(store)=>match store.list(MediaQuery{search:search.value.trim(),status:status.trim(),kind:kind.trim(),limit:page_size,offset:(page-1).wrapping_mul(page_size),..Default::default()}).either()?{
+        let recent=match options.store.clone(){None=>None,Some(store)=>match effect! { either; program: store.list(MediaQuery{search:search.value.trim(),status:status.trim(),kind:kind.trim(),limit:page_size,offset:(page-1).wrapping_mul(page_size),..Default::default()}), }?{
             Ok(result)=>result,Err(error)=>{if let Some(report)=&options.report_error{report("list recent media",&error);}None}
         }};
         let mut filters=Vec::new();

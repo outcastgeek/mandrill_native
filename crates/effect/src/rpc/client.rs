@@ -32,25 +32,13 @@ pub trait RpcChannel: Send + Sync + 'static {
 }
 
 /// Selects the RPC channel used for typed client calls.
+#[crate::__private::derive_arc_capability(generic = RpcChannel)]
 pub trait HasRpcChannel {
     /// RPC channel selected by this environment.
     type Channel: RpcChannel;
     /// # Returns
     /// Type: `Arc<Self::Channel>`.
     fn rpc_channel(&self) -> Arc<Self::Channel>;
-}
-
-impl<T: RpcChannel> HasRpcChannel for Arc<T> {
-    /// Type alias for channel in rpc client.
-    type Channel = T;
-
-    ///
-    /// # Returns
-    /// Type: `Arc<Self::Channel>`.
-    /// Returns `Arc<Self::Channel>`.
-    fn rpc_channel(&self) -> Arc<Self::Channel> {
-        Arc::clone(self)
-    }
 }
 
 #[derive(Debug)]

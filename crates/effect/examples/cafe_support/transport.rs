@@ -2,15 +2,15 @@
 
 use effect::encoding::FrameParts;
 use effect::rpc::{
-    RpcCallId, RpcEnvelope, RpcEnvelopeKind, RpcOperation, RpcProduced, RpcStreamOperation,
-    RpcStreamProducer, RpcStreamSession,
+    RpcCallId, RpcEnvelope, RpcEnvelopeKind, RpcOperation, RpcStreamOperation,
+    RpcStreamSession,
 };
 use effect::websocket::{
     WebSocket, WebSocketCloseInfo, WebSocketConnectOptions, WebSocketFragmentKind, WebSocketFrame,
     WebSocketMessage, WebSocketTransport,
 };
-use effect::{Cancellation, Defect, Effect, TransportFuture, effect};
-use effect::{effect_die, effect_sync, effect_try_sync};
+use effect::{Cancellation, Defect, Effect, TransportFuture};
+use effect::{effect_sync, effect_try_sync};
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::{
@@ -103,37 +103,6 @@ impl RpcStreamSession for Session {
         }, }
     }
 }
-/// Finite owned producer plumbing; the macro handler chooses its business values.
-#[must_use]
-pub fn sequence<
-    C: Send + 'static,
-    T: Send + 'static,
-    E: Send + 'static,
-    R: Send + Sync + 'static,
->(
-    chunks: Vec<C>,
-    terminal: T,
-) -> RpcStreamProducer<C, T, E, R> {
-    let mut values = VecDeque::new();
-    for chunk in chunks {
-        values.push_back(RpcProduced::Chunk(chunk));
-    }
-    values.push_back(RpcProduced::Terminal(terminal));
-    let values = Arc::new(Mutex::new(values));
-    RpcStreamProducer::new(move || {
-        let values = values.clone();
-        effect! {
-            let values = values.clone();
-            let next = effect_sync! { once; body: move || values.lock().map(|mut values| values.pop_front()).map_err(|error| Defect::new(error.to_string())), }?;
-            let next = match next { Ok(next) => next, Err(error) => effect_die! { defect: error, }?, };
-            match next {
-                Some(value) => value,
-                None => effect_die! { defect: Defect::new("coffee order has no further status updates"), }?,
-            }
-        }
-    })
-}
-
 /// Encode a typed customer request at the local transport boundary.
 pub fn request<Q: Send + 'static, A: Send + 'static, E: Send + 'static>(
     operation: &RpcOperation<Q, A, E>,

@@ -11,6 +11,7 @@ use super::{
         RecordPolicy, RecordWriter, SqlRecordAdapter,
     },
 };
+use crate::identity_store;
 use effect::memory::MemoryError;
 use identity_rs::identity::{
     ticket::{AuthenticationTicket, AuthenticationTicketFormat, TicketError},
@@ -138,7 +139,10 @@ impl KeyRepository {
     #[must_use]
     pub fn new(backend: SqlxIdentityStore, owner: String, id: Uuid, policy: RecordPolicy) -> Self {
         Self {
-            records: SqlRecordAdapter::new(backend, RecordCategory::Key, policy, KeyDocumentCodec),
+            records: identity_store! {
+                record_adapter; backend: backend, category: RecordCategory::Key,
+                policy: policy, codec: KeyDocumentCodec,
+            },
             owner,
             id,
             current: RwLock::new(None),
@@ -316,12 +320,10 @@ impl<T: AuthenticationTicketFormat + 'static> SessionRepository<T> {
     /// Select native ticket protection and actual SQL-backed session state without I/O.
     pub fn new(backend: SqlxIdentityStore, policy: RecordPolicy, format: T) -> Self {
         Self {
-            records: SqlRecordAdapter::new(
-                backend,
-                RecordCategory::Session,
-                policy,
-                StoredTicketCodec,
-            ),
+            records: identity_store! {
+                record_adapter; backend: backend, category: RecordCategory::Session,
+                policy: policy, codec: StoredTicketCodec,
+            },
             format: Arc::new(format),
         }
     }

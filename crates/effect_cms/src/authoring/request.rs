@@ -168,7 +168,6 @@ pub fn parse_authoring_translation_request_prepared<R: Send + Sync + 'static>(
             effect_try_sync! {
                 once;
                 body: move || project_prepared_authoring_request(form, &name),
-                on_error: ::core::convert::identity,
             }
         },
     }
@@ -211,7 +210,7 @@ where
         bind;
         program:read_authoring_form(request.clone(),policy,form,InitializeForm::ParseForm),
         body:move |mut form: AuthoringForm| match form.take_diagnostic() {
-            Some(error)=>effect_try_sync! { once; body: move || Err::<AuthoringTranslationRequest,_>(AuthoringTranslationRequestError::Form(error)), on_error: ::core::convert::identity, },
+            Some(error)=>effect_try_sync! { once; body: move || Err::<AuthoringTranslationRequest,_>(AuthoringTranslationRequestError::Form(error)), },
             None=>{ let parsed=parse_authoring_translation_request(&form,&name);effect_sync! {once;body:move || parsed} },
         },
     }

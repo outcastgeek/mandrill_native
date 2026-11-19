@@ -6,7 +6,7 @@ use super::{
     JournalStream,
 };
 use crate::{Effect, UtcMillis};
-use crate::{effect, effect_map_error, effect_provide_some, effect_sync, effect_try_sync, service};
+use crate::{effect, effect_map_error, effect_provide_some, effect_sync, service};
 use std::sync::{Arc, Mutex};
 
 /// Type alias for journal error in eventlog event log.
@@ -272,11 +272,9 @@ impl<P: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> EventLog<P,
                                 ) {
                                     Ok(intent) => intent,
                                     Err(error) => {
-                                        return effect_try_sync! {
-                                            once; body: {
-                                            let __dsl_result = Err(EventRunError::Codec(
+                                        return crate::effect_from_result! { once; result: Err(EventRunError::Codec(
                                             error,
-                                        )); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                        )), };
                                     }
                                 };
                                 if !same_event_intent(&existing.event, &intent) {
@@ -289,7 +287,7 @@ impl<P: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> EventLog<P,
                                         result,
                                         cursor: JournalCursor::new(existing.sequence.get()),
                                     });
-                                return effect_try_sync! { once; body: { let __dsl_result = result; move || __dsl_result }, on_error: ::core::convert::identity, };
+                                return crate::effect_from_result! { once; result: result, };
                             }
                             EventInspection::Compacted => {
                                 return effect_sync! { body: || EventRunOutcome::CompactedEventId, };
@@ -331,11 +329,9 @@ impl<P: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> EventLog<P,
                                 ) {
                                     Ok(value) => value,
                                     Err(error) => {
-                                        return effect_try_sync! {
-                                            once; body: {
-                                            let __dsl_result = Err(EventRunError::Codec(
+                                        return crate::effect_from_result! { once; result: Err(EventRunError::Codec(
                                             error,
-                                        )); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                        )), };
                                     }
                                 };
                                 let result = Arc::new(Mutex::new(Some(result)));
@@ -353,14 +349,12 @@ impl<P: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> EventLog<P,
                                         let __dsl_program = __dsl_program.clone(); let definition_for_receipt = definition_for_receipt.clone(); let expected_envelope = expected_envelope.clone(); let result = result.clone(); let receipt = __dsl_program?; (move || match receipt {
                                         AppendReceipt::Accepted { event } => {
                                             if event != expected_envelope.id {
-                                                effect_try_sync! {
-                                                    once; body: {
-                                                    let __dsl_result = Err(
+                                                crate::effect_from_result! { once; result: Err(
                                                     EventRunError::InvalidCommitReceipt {
                                                         requested: expected_envelope.id.clone(),
                                                         recorded: event,
                                                     },
-                                                ); move || __dsl_result }, on_error: ::core::convert::identity, }
+                                                ), }
                                             } else {
                                                 effect_sync! { body: || EventRunOutcome::Accepted, }
                                             }
@@ -370,14 +364,12 @@ impl<P: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> EventLog<P,
                                                 || expected.value().checked_add(1)
                                                     != Some(entry.sequence.get())
                                             {
-                                                return effect_try_sync! {
-                                                    once; body: {
-                                                    let __dsl_result = Err(
+                                                return crate::effect_from_result! { once; result: Err(
                                                     EventRunError::InvalidCommitReceipt {
                                                         requested: expected_envelope.id.clone(),
                                                         recorded: entry.event.id.clone(),
                                                     },
-                                                ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                                ), };
                                             }
                                             let result = result
                                                 .lock()
@@ -388,7 +380,7 @@ impl<P: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> EventLog<P,
                                                     result,
                                                     cursor: JournalCursor::new(entry.sequence.get()),
                                                 });
-                                            effect_try_sync! { once; body: { let __dsl_result = result; move || __dsl_result }, on_error: ::core::convert::identity, }
+                                            crate::effect_from_result! { once; result: result, }
                                         }
                                         AppendReceipt::Decided(AppendDecision::Duplicate(entry)) => {
                                             if entry.event != expected_envelope {
@@ -404,7 +396,7 @@ impl<P: Send + Sync + 'static, A: Send + 'static, E: Send + 'static> EventLog<P,
                                                     result,
                                                     cursor: JournalCursor::new(entry.sequence.get()),
                                                 });
-                                            effect_try_sync! { once; body: { let __dsl_result = result; move || __dsl_result }, on_error: ::core::convert::identity, }
+                                            crate::effect_from_result! { once; result: result, }
                                         }
                                         AppendReceipt::Decided(AppendDecision::ConflictingEventId) => {
                                             effect_sync! { body: || EventRunOutcome::ConflictingEventId, }

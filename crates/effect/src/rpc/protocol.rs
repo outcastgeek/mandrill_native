@@ -109,16 +109,17 @@ impl<E: Send + 'static, R: Send + Sync + 'static> RpcProtocol<E, R> {
         Arc::make_mut(&mut self.handlers).insert(
             (spec.id, spec.version),
             Arc::new(move |envelope| {
-                server
-                    .handle_envelope(envelope)
-                    .map_error(RpcProtocolError::Server)
-                    .flat_map(|frame| {
-                        Effect::from_result_once(
-                            frame.into_bytes().map_err(|error| {
-                                RpcProtocolError::Wire(RpcWireError::Frame(error))
-                            }),
-                        )
-                    })
+                effect! {
+                    bind;
+                    program: crate::effect_map_error! {
+                        program: server.handle_envelope(envelope),
+                        map: RpcProtocolError::Server,
+                    },
+                    body: |frame| crate::effect_from_result! {
+                        once;
+                        result: frame.into_bytes().map_err(|error| RpcProtocolError::Wire(RpcWireError::Frame(error))),
+                    },
+                }
             }),
         );
         Ok(())
@@ -168,10 +169,10 @@ impl<E: Send + 'static, R: Send + Sync + 'static> RpcProtocol<E, R> {
             }, on_error: std::convert::identity, };
             effect! { let handlers = handlers.clone(); let (key , envelope) = __dsl_program.clone()?; match handlers.get(&key) {
                 Some(handler) => handler(envelope),
-                None => effect_try_sync! { once; body: { let __dsl_result = Err(RpcProtocolError::UnknownOperation {
+                None => crate::effect_from_result! { once; result: Err(RpcProtocolError::UnknownOperation {
                     id: key.0,
                     version: key.1,
-                }); move || __dsl_result }, on_error: ::core::convert::identity, },
+                }), },
             }? }
         }
     }
@@ -224,9 +225,9 @@ impl<E: Send + 'static, R: Send + Sync + 'static> RpcChannel for InProcessRpcPro
         let bytes = match request.into_bytes() {
             Ok(bytes) => bytes,
             Err(error) => {
-                return effect_try_sync! { once; body: { let __dsl_result = Err(RpcProtocolError::Wire(RpcWireError::Frame(
+                return crate::effect_from_result! { once; result: Err(RpcProtocolError::Wire(RpcWireError::Frame(
                     error,
-                ))); move || __dsl_result }, on_error: ::core::convert::identity, };
+                ))), };
             }
         };
         effect_provided! { program: self.protocol

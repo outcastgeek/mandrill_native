@@ -462,7 +462,7 @@ where
                     ActionValidationCause::Contract(error),
                 ),
                 Ok(()) => {
-                    let built = service.input_effect(request.as_ref(), &kind, &action).either()?;
+                    let built = effect! { either; program: service.input_effect(request.as_ref(), &kind, &action), }?;
                     match built {
                         Err(error @ ActionValidationCause::Consumer(_)) => effect_try_sync! {
                             once;
@@ -579,7 +579,8 @@ where
                     let result = effect_map_error! {
                         program: validator(request, input_handle.clone()),
                         map: ActionValidationCause::Consumer,
-                    }.either()?;
+                    };
+                    let result = effect! { either; program: result, }?;
                     match result {
                         Ok(()) => service.accepted(input_handle, &action),
                         Err(cause) => service.rejected(Some(input_handle), &action, ValidationCode::from(CODE_INVALID_REQUEST), cause),
@@ -944,7 +945,8 @@ where
                     once;
                     body: move |_| async move { read_validation_body(&body_request, form_policy).await },
                     on_error: |error| ActionValidationError::invalid_request(format!("parse form: {error}")),
-                }.either()?;
+                };
+                let body = effect! { either; program: body, }?;
                 match body {
                     Ok(body) => match query_form_values(&request) {
                         Ok(query_values) => untrimmed_form_values(body.as_ref(), &query_values),

@@ -844,7 +844,7 @@ impl<A: Send + Sync + 'static> Subscription<A> {
             effect! { let event = __dsl_program.clone()?; match event {
                 SubscriptionEvent::Item(value) => effect_sync! { once; body: move || Chunk::Values(vec![value]), },
                 SubscriptionEvent::Lagged(dropped) => {
-                    effect_try_sync! { body: { let __dsl_error = move || PubSubError::Lagged { dropped }; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }
+                    crate::effect_fail! { error: PubSubError::Lagged { dropped }, }
                 }
                 SubscriptionEvent::End => effect_sync! { body: || Chunk::End, },
             }? }

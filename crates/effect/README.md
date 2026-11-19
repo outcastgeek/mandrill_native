@@ -15,6 +15,24 @@ all selected providers together. [PORTING.md](PORTING.md) maps source contracts;
 The [macro expansion reference](../effect_macros/README.md) maps DSL forms to
 their typed operations and explains evaluation order and ownership.
 
+## Composing applications
+
+Use `effect!` to bind typed operations with `?`. `effect_fail!` builds an
+expected failure and `effect_from_result! { once; ... }` consumes an owned
+native Result. Derive capability projections on the application environment,
+and supply only the runtime providers the program selects. The order-tracking
+example shows a direct domain operation bind. The App executable supplies and
+drains the same providers at its outer interpreter boundary.
+[Order tracking](examples/track_coffee_order.rs) · [App startup](../effect_app/src/main.rs)
+
+The café application binds native Identity into its Web routes. Identity keeps
+SQL ownership within the selected invocation and maps SQL outcomes at the
+store. The café's `/ready` example can select ordinary or prepared SQL with the
+same business predicate and 512 MiB host configuration. The CMS catalogue
+passes its typed definition, query and render program directly to a reusable
+Web endpoint.
+[Identity workflows](../effect_server_identity/src/workflows.rs) · [SQL-backed store](../effect_server_identity/src/store/records.rs) · [Web identity adapter](../effect_server_web/src/identity.rs) · [Café example](../effect_server_web/examples/README.md) · [CMS catalogue](../effect_cms/examples/cms_application.rs)
+
 The additive [`memory`](src/memory/README.md) capability provides fallible owned or
 borrowed fixed backing, explicit prepare/seal policies, prepared slots and shared
 output leases, bounded writers/indexes and transactional admission/control quota.

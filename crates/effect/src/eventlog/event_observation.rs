@@ -7,7 +7,7 @@ use super::{
 };
 use crate::reactivity::{InvalidationError, InvalidationKey, InvalidationRegistry};
 use crate::{Effect, PublishReport};
-use crate::{effect, effect_map_error, effect_provide_some, effect_sync, effect_try_sync, service};
+use crate::{effect, effect_map_error, effect_provide_some, effect_sync, service};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -135,29 +135,23 @@ impl EventObservation {
                            let read = match read {
                                JournalReadOutcome::Complete(read) => read,
                                JournalReadOutcome::HistoryTruncated { first_available } => {
-                                   return effect_try_sync! {
-                                       once; body: {
-                                       let __dsl_result = Err(
+                                   return crate::effect_from_result! { once; result: Err(
                                        EventObservationError::HistoryTruncated { first_available },
-                                   ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                   ), };
                                }
                                JournalReadOutcome::CursorAhead { head } => {
-                                   return effect_try_sync! {
-                                       once; body: {
-                                       let __dsl_result = Err(EventObservationError::CursorAhead {
+                                   return crate::effect_from_result! { once; result: Err(EventObservationError::CursorAhead {
                                        head,
-                                   }); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                   }), };
                                }
                            };
                            if let Err(issue) = validate_journal_read(&read, &validation_stream, after, limit) {
-                               return effect_try_sync! {
-                                   once; body: {
-                                   let __dsl_result = Err(
+                               return crate::effect_from_result! { once; result: Err(
                                    EventObservationError::InvalidJournalRead {
                                        replay_after: after,
                                        issue,
                                    },
-                               ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                               ), };
                            }
                            let mut batch = Vec::new();
                            for entry in &read.entries {
@@ -177,14 +171,12 @@ impl EventObservation {
                                    if let Some(dropped) =
                                        notification.and_then(|report| NonZeroUsize::new(report.dropped))
                                    {
-                                       return effect_try_sync! {
-                                           once; body: {
-                                           let __dsl_result = Err(
+                                       return crate::effect_from_result! { once; result: Err(
                                            EventObservationError::NotificationDropped {
                                                replay_after: after,
                                                dropped,
                                            },
-                                       ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                       ), };
                                    }
                                    effect_sync! {
                                        once; body: move || EventObservationReport {

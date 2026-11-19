@@ -1,10 +1,10 @@
 //! Checked scalar inputs and single-owner native request bodies.
 
-use crate::{effect_provide_some, effect_try_future, effect_try_sync};
+use crate::{effect_from_result, effect_provide_some, effect_try_future};
 use axum::body::Body;
 use axum::extract::{FromRequest, Multipart};
 use bytes::Bytes;
-use effect::{Cancellation, Effect, HasCancellation, HasTaskSpawner};
+use effect::{Cancellation, Effect};
 use effect::memory::{BufferLease, BufferView, MemoryError};
 use effect::{effect, service};
 use headers::{Header, HeaderMapExt};
@@ -1598,38 +1598,55 @@ pub trait HasRequest {
     fn request(&self) -> &Request;
 }
 /// A convenient request environment sharing application services without cloning them.
+#[derive(crate::EffectEnvironment)]
+#[effect_environment(
+    request = request,
+    cancellation = self.request.cancellation(),
+    tokio(get = crate::HasTokio::tokio(self.services.as_ref()), requires(R: crate::HasTokio)),
+    task_spawner(
+        provider = <R as effect::HasTaskSpawner>::Tasks,
+        get = effect::HasTaskSpawner::task_spawner(self.services.as_ref()),
+        requires(R: effect::HasTaskSpawner)
+    ),
+    http_transport(
+        provider = <R as effect::HasHttpTransport>::Transport,
+        get = effect::HasHttpTransport::http_transport(self.services.as_ref()),
+        requires(R: effect::HasHttpTransport)
+    ),
+    blocking_executor(
+        provider = <R as effect::HasBlockingExecutor>::Executor,
+        get = effect::HasBlockingExecutor::blocking_executor(self.services.as_ref()),
+        requires(R: effect::HasBlockingExecutor)
+    ),
+    cpu_executor(
+        provider = <R as effect::HasCpuExecutor>::Executor,
+        get = effect::HasCpuExecutor::cpu_executor(self.services.as_ref()),
+        requires(R: effect::HasCpuExecutor)
+    ),
+    clock(
+        provider = <R as effect::HasClock>::Clock,
+        get = effect::HasClock::clock(self.services.as_ref()),
+        requires(R: effect::HasClock)
+    ),
+    tracer(
+        get = effect::HasTracer::tracer(self.services.as_ref()),
+        requires(R: effect::HasTracer)
+    ),
+    logger(
+        get = effect::HasLogger::logger(self.services.as_ref()),
+        requires(R: effect::HasLogger)
+    ),
+    server_error(
+        error = <R as crate::HasServerError>::Error,
+        map = |error| crate::HasServerError::server_error(self.services.as_ref(), error),
+        requires(R: crate::HasServerError)
+    )
+)]
 pub struct RequestEnv<R> {
     /// Immutable application services and runtime capabilities.
     pub services: Arc<R>,
     /// Fresh metadata/body owner for this request.
     pub request: Request,
-}
-impl<R> HasRequest for RequestEnv<R> {
-    /// Select the original request owner.
-    fn request(&self) -> &Request {
-        &self.request
-    }
-}
-impl<R> HasCancellation for RequestEnv<R> {
-    /// Request cancellation does not cancel unrelated application requests.
-    fn cancellation(&self) -> &Cancellation {
-        self.request.cancellation()
-    }
-}
-impl<R: HasTaskSpawner> HasTaskSpawner for RequestEnv<R> {
-    /// Preserve the application's selected task provider.
-    type Tasks = R::Tasks;
-    /// Delegate task execution to the selected application capability.
-    fn task_spawner(&self) -> &Self::Tasks {
-        self.services.task_spawner()
-    }
-}
-impl<R: effect::HasHttpTransport> effect::HasHttpTransport for RequestEnv<R> {
-    type Transport = R::Transport;
-
-    fn http_transport(&self) -> &Self::Transport {
-        self.services.http_transport()
-    }
 }
 /// Lazy typed request input, suitable for explicit environment/error projection.
 pub struct RequestInput<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> {
@@ -2342,12 +2359,10 @@ where
                        });
                    match (expected, actual) {
                        (Some(expected), Ok(Some(actual))) if expected == actual => read(request),
-                       (_, Err(error)) => effect_try_sync! { once; body: { let __dsl_result = Err(map(error)); move || __dsl_result }, on_error: ::core::convert::identity, },
-                       _ => effect_try_sync! {
-                           once; body: {
-                           let __dsl_result = Err(map(ServerError::Invalid(
-                           "unsupported content type".into(),
-                       ))); move || __dsl_result }, on_error: ::core::convert::identity, },
+                       (_, Err(error)) => effect_from_result! { once; result: Err(map(error)), },
+                       _ => effect_from_result! {
+                           once; result: Err(map(ServerError::Invalid("unsupported content type".into()))),
+                       },
                    }
                },
         };
@@ -2487,51 +2502,6 @@ where
             },
             move |error| map(error),
         )
-    }
-}
-
-impl<R: effect::HasBlockingExecutor> effect::HasBlockingExecutor for RequestEnv<R> {
-    /// Preserve the selected application's blocking provider, separate from its async/CPU provider.
-    type Executor = R::Executor;
-    /// Borrow the existing blocking provider without creating a worker pool.
-    fn blocking_executor(&self) -> &Self::Executor {
-        self.services.blocking_executor()
-    }
-}
-impl<R: effect::HasCpuExecutor> effect::HasCpuExecutor for RequestEnv<R> {
-    /// Preserve the selected CPU provider for mixed native HTTP and application CPU work.
-    type Executor = R::Executor;
-    /// Borrow the original CPU executor.
-    fn cpu_executor(&self) -> &Self::Executor {
-        self.services.cpu_executor()
-    }
-}
-impl<R: effect::HasClock> effect::HasClock for RequestEnv<R> {
-    /// Preserve the application's monotonic clock selection.
-    type Clock = R::Clock;
-    /// Borrow the selected core clock.
-    fn clock(&self) -> &Self::Clock {
-        self.services.clock()
-    }
-}
-impl<R: effect::HasTracer> effect::HasTracer for RequestEnv<R> {
-    /// Borrow the same Effect tracer used by host and business spans.
-    fn tracer(&self) -> &effect::Tracer {
-        self.services.tracer()
-    }
-}
-impl<R: effect::HasLogger> effect::HasLogger for RequestEnv<R> {
-    /// Borrow the original application logger without installing a global subscriber.
-    fn logger(&self) -> &effect::Logger {
-        self.services.logger()
-    }
-}
-impl<R: crate::HasServerError> crate::HasServerError for RequestEnv<R> {
-    /// Preserve the selected application's typed native error family.
-    type Error = R::Error;
-    /// Map native failures through the original selected services.
-    fn server_error(&self, error: ServerError) -> Self::Error {
-        self.services.server_error(error)
     }
 }
 

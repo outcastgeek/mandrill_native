@@ -60,7 +60,7 @@ impl DurableClock {
     {
         {
             let __dsl_program =
-                effect_map_error! { program: Effect::wall_now(), map: DurableClockError::Clock, };
+                effect_map_error! { program: crate::effect! { wall_now; }, map: DurableClockError::Clock, };
             effect! { let deadline = deadline.clone(); let run = run.clone(); let now = __dsl_program.clone()?; {
                             { let __dsl_program = service! { env: |env: &R| env.workflow_engine(), }; let run = run.clone();
             let deadline = deadline.clone(); effect! { let __dsl_program = __dsl_program.clone(); let deadline = deadline.clone(); let run = run.clone(); let engine = __dsl_program?; {
@@ -140,7 +140,7 @@ impl DurableClock {
     {
         {
             let __dsl_program =
-                effect_map_error! { program: Effect::wall_now(), map: DurableClockError::Clock, };
+                effect_map_error! { program: crate::effect! { wall_now; }, map: DurableClockError::Clock, };
             effect! { let now = __dsl_program.clone()?; {
                 { let __dsl_program = service! { env: |env: &R| env.workflow_engine(), }; effect! { let engine = __dsl_program.clone()?; {
                     effect_provide_some! { program: effect_map_error! { program: engine
@@ -170,7 +170,7 @@ impl DurableClock {
     {
         {
             let __dsl_program =
-                effect_map_error! { program: Effect::wall_now(), map: DurableClockError::Clock, };
+                effect_map_error! { program: crate::effect! { wall_now; }, map: DurableClockError::Clock, };
             effect! { let expected = expected.clone(); let run = run.clone(); let now = __dsl_program.clone()?; {
                             { let __dsl_program = service! { env: |env: &R| env.workflow_engine(), }; let run = run.clone();
             let expected = expected.clone(); effect! { let __dsl_program = __dsl_program.clone(); let expected = expected.clone(); let run = run.clone(); let engine = __dsl_program?; {

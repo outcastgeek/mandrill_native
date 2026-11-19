@@ -40,7 +40,7 @@
 //! # Effects
 //!
 //! Effectful operations use the workspace `Effect<A, E, R>` model. Admission is a
-//! pure calculation lifted with `Effect::sync`; the relation workflow sequences the
+//! pure calculation lifted with `effect_sync!`; the relation workflow sequences the
 //! consumer capabilities with `effect!` and maps an expected capability failure into
 //! the rejected/failed outcomes while defects, interruption and cleanup
 //! failures keep their own effect channels. No macro-driven side effect is executed

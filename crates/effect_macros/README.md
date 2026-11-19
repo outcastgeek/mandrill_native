@@ -48,6 +48,8 @@ returns the same error and environment types. `next` runs only after the
 source succeeds. `effect! { while_loop; guard: guard, body: body, }` selects
 `Effect::while_loop(guard, body)`, evaluating the guard before each body
 factory. The prepared form adds its own `on_capacity` field for rearm.
+`effect! { defer; body: factory, }` invokes a reusable Effect-returning factory
+when the program runs.
 
 Native `effect_sync!` selects `Effect::sync`. Its `once;` mode selects
 `Effect::sync_once`. `effect_try_sync!` selects the corresponding
@@ -63,8 +65,43 @@ run's `RunFrames` before invoking the factory. The mapper retains the caller's
 typed memory refusal without switching to an ordinary boxed future.
 
 
+Use `return lookup(id)?;` to delegate to the typed computation and
+propagate its outcome. The return exits the enclosing Effect body, including
+when written inside a branch or loop. A plain `return value;` succeeds with that value.
+Delegation preserves the current environment and resource scope.
+
+Use `effect_fail! { error: DomainError::Rejected }` as a bindable expected
+failure. The error expression runs for each execution and does not need
+`Clone`. For an existing Rust result, `effect_from_result! { result: value }`
+lifts it as a reusable Effect by cloning the stored outcome on each run.
+`effect_from_result! { once; result: value, on_error: DomainError::Input }`
+moves the stored outcome into one run and optionally maps its expected error
+at execution. The result expression runs at leaf construction. Use
+`effect_try_sync!` when the native operation itself should run on each
+execution. Defects still use the explicit defect form.
+
 See the [ordinary expansion](src/expand.rs), [async checkpoints](src/async_expand.rs),
 and [typed callback variants](src/callback_expand.rs).
+
+At the interpreter boundary, `effect! { run; program: program, environment: r, }`
+borrows the description and returns its native future with the complete
+`Exit`. Choose `run_cancellable` for the supplied R cancellation capability,
+and the corresponding `_with_frames` form to supply explicit `frames:`.
+`run_in_context` forwards the program through an existing native context.
+`effect_provide_some! { shared; ... }` borrows an existing selected Arc
+environment while retaining the same cancellation and cleanup context.
+`effect_scope!` has `fork` and `join` forms for the existing live child scope.
+`effect! { either; program: source, }` exposes expected success or failure as
+a `Result` value while defects, interruption and cleanup failure retain their
+existing channels. Its prepared counterpart lowers through the prepared
+graph's matching operation. Use `effect!` with `sleep`, `log` or
+`console_write` to select the existing clock or output capability.
+
+`effect_prepare! { run; invocation: invocation, }` transfers the admitted
+invocation into its native future. `transaction! { atomically; program: tx,
+policy: policy, }` selects the caller's journal policy at the boundary of a
+transaction. `workflow! { run; workflow: definition, run: run, input: value, }`
+passes its input through the engine's existing replay and codec boundary.
 
 ## Memory forms
 
@@ -360,6 +397,141 @@ forms and examples live in the package that re-exports the macro.
 | `identity_store!`, `identity!`, `identity_endpoints!` | [extension_identity.rs](src/extension_identity.rs) selects explicit Identity capabilities and endpoint definitions. See the [Identity examples](../effect_server_identity/examples/README.md). |
 | `web!`, `security!`, `csp!`, `read_through!`, `dependent_read_through!`, `availability!`, `message_arguments!`, `localization!` | [extension_web.rs](src/extension_web.rs) builds typed Web policies and capabilities. See the [Web examples](../effect_server_web/examples/README.md). |
 | `otel!` | [extension_otel.rs](src/extension_otel.rs) composes the selected tracing boundary with the typed program. See the [Effect OTel exports](../effect_otel/src/lib.rs). |
+
+### Web application composition and error labels
+
+Use `web! { prepare; source: application, scope: scope, }` to compose
+startup in the existing host scope. `with_host` invokes the caller's typed
+body and `run` selects the ordinary or prepared definition's existing terminal
+profile. `server! { request; }` binds the current owned request handle through R.
+`dependency_cache!` accepts `load_shared:` for an extracted loader that takes
+the existing shared key, and `coalescing:` for an explicit no-retention policy.
+
+`#[derive(EffectErrorLabel)]` implements Display from the explicit literal
+`#[effect_error_label("...")]` on each enum variant. It never reads payloads,
+changes error sources, or adds Debug formatting.
+
+### Identity operations
+
+Use `identity! { identity: definition, register(input), }` and the equivalent
+named workflow or authentication stage forms with their original typed
+arguments. The selected definition supplies authority, storage and error policy.
+`invoke_prepared_once(admission, input)` consumes the actual predecode
+invocation reservation, while `invoke_once(input)` uses the ordinary path.
+Both forms take the same typed native callback. The macro does not mint an
+authentication grant or acquire a second slot.
+
+`identity_store!` names the selected SQL, prepared invocation, account and
+record owners. A native initializer retains its existing Rust `.await` and
+`Result`. The caller supplies capacities and codecs, including the exact
+record category and schema policy.
+
+### Server operations and capability derives
+
+Use `server! { request_binding; body: resolve, }` to install an extracted
+request environment program. `server! { policy; ... }` describes policy without
+acquiring a listener. Review outer selection, final-body observers and prepared
+capacity in their existing scopes. `router! { configure; source: router, ... }`
+applies infallible routing configuration. `server! { with_host; source: host,
+body: use_host, }` runs the existing scoped host operation. The same form
+retains the prepared owner's typed admission result. `prepared_configure`
+applies one selected prepared provider with its existing error contract.
+
+Use `#[derive(EffectEnvironment)]` with `#[effect_environment(request = request)]`
+to borrow a field. A projection such as `tokio = self.runtime.handle()` is
+an explicit borrow. For an associated provider use
+`task_spawner(provider = Tasks, get = self.tasks.as_ref())`.
+`requires(R: HasTaskSpawner)` attaches bounds to that capability alone,
+leaving the environment's other capabilities available under their own bounds.
+`server_error(error = AppError, map = AppError::Http)` names the actual error
+type and mapper.
+For a capability whose contract returns an owned `Arc`, use an explicit
+projection such as `transaction_domain = Arc::clone(&self.transactions)` or
+`event_journal(provider = Journal, get = Arc::clone(&self.events))`.
+`atomic_projection_store` also takes `state = State` in the environment
+attribute. Independent capability requirements remain visible
+in each projection's `requires(...)` clause.
+
+### Streaming and telemetry
+
+Core `stream!` uses `open_in; stream:, scope:` for an explicitly owned reader
+scope and `collect; stream:, limit:` for the existing bounded collection
+operation. Server's `stream!` selects `sse; writer:, record:, policy:` or
+`flush; writer:` on the existing body writer. These forms retain the stream's
+completion and cleanup path.
+
+`otel!` retains typed provider scope through `acquire; scope:, factories:,
+shutdown:, on_error:`. Use `tag`, `event` or `log` with named fields in a
+program. `event` accepts `name:` and optional `attributes:`. All four operations
+delegate to the same typed OTel provider and instrumentation context.
+
+### Web application handoff
+
+The prepared café passes its existing arena preparation owner to `web!`'s
+`memory:` role using an inferred callback. The application supplies its
+prepared output cache in `web! { prepared_output_cache; ... }` with explicit
+storage, refusal, gate, authentication, key selection and error policy.
+`web! { admit; ... }` selects the admitted body or the caller's refusal Effect
+using the same application environment and transport ownership.
+[Prepared café application](../effect_server_web/examples/cafe_application.rs)
+
+### CMS composition
+
+`cms! { definition_services; options: options, }` builds the existing service
+graph from selected resource definitions. Use `definition_list_reply` with
+`renderer`, `services` and `kind` to obtain the typed CMS reply Effect. Pass it
+to `endpoint! { effect: ..., }` when registering a reusable Web handler.
+`register_routes` retains the caller's scope, router and mounter through startup.
+`EffectEnvironment` supports an explicitly selected `cms_memory` for a local
+environment. CMS generates the forwarding adapter on Server's request wrapper
+from the local capability trait without changing either crate's dependencies.
+[CMS Web catalogue](../effect_cms/examples/cms_application.rs)
+
+### SQL operations
+
+With an explicit `client:`, `sql!` can execute or query through a selected
+client, session, or transaction. `execute` and `scalar` take `statement:`.
+`query`, `first`, and `first_prepared` additionally take `decoder:`.
+Omitting `client:` in `execute`, `query`, `first`, or `scalar` selects
+the existing `HasSqlClient` capability. `statement:` can transfer an
+owned statement or supply a reusable statement factory. `first_prepared`
+retains the existing capacity and borrowed-decoder requirements.
+
+`session`, `transaction`, and `savepoint` select a scoped `body:` Effect
+factory or an inline `body |session| { ... }` computation. The
+`transaction_once` and `savepoint_once` variants transfer owned captures
+into one execution. `native` accepts a checked native callback whose
+future borrows the SQL connection. It retains ordinary Rust `Result`
+propagation inside that callback. `fold` and `fold_effect` take the
+statement, decoder, initial accumulator factory and typed step, using the
+existing cursor owner and cleanup path.
+
+Native forms such as `kernel_transaction`, `connection_operation`,
+`transaction_operation`, `reserve_transaction_operation`, and
+`run_transaction_operation` retain their caller's ordinary Rust
+`.await` and `Result` boundary. The receiver is written before its body or
+operation so its original temporary lifetime is retained. The `open` and
+migration forms compose the original native startup policy and error types.
+`client; session_pool:` transfers the selected session owner after other
+client configuration succeeds.
+
+`#[derive(EffectEnvironment)]` supplies explicitly selected R capabilities.
+`#[effect_environment(sql_client = sql)]` borrows the named field.
+`#[effect_environment(sql_client = self.sql.as_ref())]` uses the supplied
+borrow expression. The derive does not change the trait's environment bounds.
+
+`#[derive(EffectSqlRow)]` uses the named Rust record fields as the row shape.
+Select `R` in the record's `#[effect_sql_row(...)]` attribute and put each
+field's existing `row!` expression in its field attribute. The generated
+`row_decoder()` keeps column names, native types, refinements, and conversions
+under the same typed row scope. [Coffee order decoder](../effect_sql/examples/cafe_orders.rs)
+
+`#[derive(EffectJsonSchema)]` generates the selected factory name from the
+owned record or enum. Supply `policy = ...` and `error_context = ...` in
+`#[effect_json_schema(...)]`, and select each field's codec and each enum
+variant's wire tag. The runtime policy, nested codec errors and explicit tag
+and content fields stay under the author's control. [Order tracking schemas](../effect/examples/order_tracking/mod.rs)
+
 
 ## DSL lint and verification
 

@@ -14,15 +14,15 @@ mod managed;
 pub mod native;
 mod output_memory;
 use effect::{
-    AdmissionCapacity, Cache, CacheCapacity, CacheConfig, Cancellation, Console,
-    DiagnosticCapacity, DiagnosticOverflow, Diagnostics, Effect, Exit, HasBlockingExecutor,
-    HasCancellation, HasClock, HasCpuExecutor, HasLogger, HasTaskSpawner, HasTracer, LogLevel,
-    Logger, Schema, Scope, SharedValue, SpanId, StandardConsole, Tracer, effect, effect_retry,
+    AdmissionCapacity, CacheAdmission, CacheCapacity, CacheConfig, CacheOptions, CacheTtl,
+    Cancellation, Console, DiagnosticCapacity, DiagnosticOverflow, Diagnostics, Effect,
+    EffectEnvironment, Exit, HasCpuExecutor, LogLevel, Logger, Schema, Scope, SharedValue, SpanId,
+    StandardConsole, Tracer, cache, codec, effect, effect_retry, effect_schema_parse,
     effect_scope, effect_scope_acquire, effect_try_blocking, effect_try_cpu, effect_try_future,
     effect_try_sync, service,
 };
 use effect_rayon::RayonCpu;
-use effect_tokio::{TokioBlocking, TokioClock, TokioTasks};
+use effect_tokio::{TokioBlocking, TokioClock, TokioProviders, TokioTasks};
 pub use input_memory::InputLoadError;
 pub use managed::{
     AppMemoryLimits, AppMemoryMode, ManagedAppEnv, ManagedAppError, ManagedLiveApp,
@@ -103,6 +103,16 @@ pub struct AppConfig {
 /// Application environment selecting Tokio tasks, Rayon CPU work, and Tokio
 /// blocking work together. These concrete providers use static trait dispatch;
 /// a vtable is involved only when an application selects a trait object.
+#[derive(EffectEnvironment)]
+#[effect_environment(
+    cancellation = cancellation,
+    task_spawner(provider = TokioTasks, get = tasks),
+    cpu_executor(provider = RayonCpu, get = cpu),
+    blocking_executor(provider = TokioBlocking, get = blocking),
+    clock(provider = TokioClock, get = clock),
+    logger = logger,
+    tracer = tracer,
+)]
 pub struct AppEnv {
     /// The token that requests cancellation. Type: `Cancellation`.
     pub cancellation: Cancellation,
@@ -128,70 +138,6 @@ pub struct AppEnv {
     pub metadata_capacity: NonZeroUsize,
     /// Time to retain cached metadata. Type: `Duration`.
     pub metadata_ttl: Duration,
-}
-impl HasCancellation for AppEnv {
-    ///
-    /// # Returns
-    /// Type: `&Cancellation`.
-    fn cancellation(&self) -> &Cancellation {
-        &self.cancellation
-    }
-}
-impl HasTaskSpawner for AppEnv {
-    /// Type alias for tasks in lib.
-    type Tasks = TokioTasks;
-    ///
-    /// # Returns
-    /// Type: `&TokioTasks`.
-    fn task_spawner(&self) -> &TokioTasks {
-        &self.tasks
-    }
-}
-impl HasCpuExecutor for AppEnv {
-    /// Type alias for executor in lib.
-    type Executor = RayonCpu;
-    ///
-    /// # Returns
-    /// Type: `&RayonCpu`.
-    fn cpu_executor(&self) -> &RayonCpu {
-        &self.cpu
-    }
-}
-impl HasBlockingExecutor for AppEnv {
-    /// Type alias for executor in lib.
-    type Executor = TokioBlocking;
-    ///
-    /// # Returns
-    /// Type: `&TokioBlocking`.
-    fn blocking_executor(&self) -> &TokioBlocking {
-        &self.blocking
-    }
-}
-impl HasClock for AppEnv {
-    /// Type alias for clock in lib.
-    type Clock = TokioClock;
-    ///
-    /// # Returns
-    /// Type: `&TokioClock`.
-    fn clock(&self) -> &TokioClock {
-        &self.clock
-    }
-}
-impl HasLogger for AppEnv {
-    ///
-    /// # Returns
-    /// Type: `&Logger`.
-    fn logger(&self) -> &Logger {
-        &self.logger
-    }
-}
-impl HasTracer for AppEnv {
-    ///
-    /// # Returns
-    /// Type: `&Tracer`.
-    fn tracer(&self) -> &Tracer {
-        &self.tracer
-    }
 }
 /// Owns the configured application environment, runtime, and diagnostics.
 pub struct LiveApp {
@@ -245,23 +191,26 @@ impl LiveApp {
             },
             |_| Ok(()),
         );
+        let TokioProviders {
+            tasks,
+            blocking,
+            clock,
+        } = TokioProviders::new(
+            Arc::clone(&runtime),
+            AdmissionCapacity::Bounded(config.task_admission),
+            AdmissionCapacity::Bounded(config.blocking_admission),
+            diagnostics.clone(),
+        )?;
         let env = Arc::new(AppEnv {
             cancellation: Cancellation::new(),
-            tasks: TokioTasks::new(
-                Arc::clone(&runtime),
-                AdmissionCapacity::Bounded(config.task_admission),
-            )?,
+            tasks,
             cpu: RayonCpu::new(
                 pool,
                 AdmissionCapacity::Bounded(config.cpu_admission),
                 diagnostics.clone(),
             ),
-            blocking: TokioBlocking::new(
-                Arc::clone(&runtime),
-                AdmissionCapacity::Bounded(config.blocking_admission),
-                diagnostics.clone(),
-            ),
-            clock: TokioClock::new(Arc::clone(&runtime)),
+            blocking,
+            clock,
             logger,
             tracer,
             files: Arc::new(config.files),
@@ -305,20 +254,22 @@ type Error = SharedValue<AppError>;
 /// Type: `Schema<Input, AppError>`.
 /// Returns `Schema<Input, AppError>`.
 fn schema() -> Schema<Input, AppError> {
-    Schema::from_decoder(|value| {
-        let input = Input::deserialize(value).map_err(AppError::Document)?;
-        if input.samples.is_empty() {
-            return Err(AppError::EmptySamples);
-        }
-        Ok(input)
-    })
+    codec! {
+        schema_decoder; decode: |value| {
+            let input = Input::deserialize(value).map_err(AppError::Document)?;
+            if input.samples.is_empty() {
+                return Err(AppError::EmptySamples);
+            }
+            Ok(input)
+        },
+    }
 }
 ///
 /// # Returns
 /// Type: `Effect<Vec<u8>, Error, AppEnv>`.
 /// Returns a lazy `Effect` with the declared success, error, and environment types.
 fn fetch() -> Effect<Vec<u8>, Error, AppEnv> {
-    effect_try_future! { with_env; body: |env: Arc<AppEnv>, _| async move { tokio::fs::read(&env.files.input).await }, on_error: |error| SharedValue::new(AppError::Io(error)), }
+    effect_try_future! { with_env; body: |env: Arc<AppEnv>, _| async move { tokio::fs::read(&env.files.input).await }, on_error: shared_io_error::<AppError>, }
 }
 ///
 /// # Returns
@@ -350,15 +301,25 @@ enum LoadedSamples {
 }
 
 impl LoadedSamples {
-    fn sum(&self) -> Result<i128, AppError> {
-        let samples = match self {
-            Self::System(samples) => samples.as_slice(),
-            Self::Managed(samples) => samples.as_slice(),
-        };
-        samples.iter().try_fold(i128::default(), |sum, sample| {
-            sum.checked_add(i128::from(*sample))
-                .ok_or(AppError::ArithmeticOverflow)
-        })
+    fn sum<R, E>(self) -> Effect<i128, SharedValue<E>, R>
+    where
+        R: HasCpuExecutor + Send + Sync + 'static,
+        E: From<AppError> + Send + 'static,
+    {
+        effect_try_cpu! {
+            once;
+            body |_cancel| {
+                let samples = match &self {
+                    Self::System(samples) => samples.as_slice(),
+                    Self::Managed(samples) => samples.as_slice(),
+                };
+                samples.iter().try_fold(i128::default(), |sum, sample| {
+                    sum.checked_add(i128::from(*sample))
+                        .ok_or(AppError::ArithmeticOverflow)
+                })
+            },
+            on_error: shared_error::<E>,
+        }
     }
 }
 
@@ -381,19 +342,29 @@ fn system_input() -> Effect<LoadedSamples, Error, AppEnv> {
     effect! {
         let (retries, delay) = service! { env |env: &AppEnv| { (env.retries, env.retry_delay) }, }?;
         let bytes = effect_retry! {
-            program: fetch(), schedule: effect::Schedule::recurs(retries).intersect(effect::Schedule::spaced(delay)),
+            program: fetch(), schedule: effect::schedule! { retries; count: retries, delay: delay, },
         }?;
         let json = effect_try_sync! {
             once; body { String::from_utf8(bytes) },
             on_error |error| { SharedValue::new(AppError::Resource(effect::Defect::from_utf8(error))) },
         }?;
-        let input = effect_map_error! { program: schema().parse(Arc::<str>::from(json), AppError::JsonSyntax), map: SharedValue::new, }?;
+        let input = effect_map_error! {
+            program: effect_schema_parse! {
+                schema; schema: schema(), text: Arc::<str>::from(json),
+                on_syntax_error: AppError::JsonSyntax,
+            },
+            map: SharedValue::new,
+        }?;
         LoadedSamples::System(input.samples)
     }
 }
 
 fn shared_error<E: From<AppError> + Send + 'static>(error: AppError) -> SharedValue<E> {
     SharedValue::new(E::from(error))
+}
+
+fn shared_io_error<E: From<AppError> + Send + 'static>(error: std::io::Error) -> SharedValue<E> {
+    shared_error(AppError::Io(error))
 }
 
 fn application_stages<E: From<AppError> + Send + 'static>(
@@ -408,21 +379,30 @@ fn application_stages<E: From<AppError> + Send + 'static>(
         name: stringify!(application),
         effect: effect_scope! {
         body |scope: Scope<SharedValue<E>>| {
-            let scope = scope.clone();
             let input = input.clone();
             let prepare_output = prepare_output.clone();
-            let files = service! { env |env: &AppEnv| { Arc::clone(&env.files) }, }?;
-            let (capacity, ttl) = service! { env |env: &AppEnv| { (env.metadata_capacity, env.metadata_ttl) }, }?;
+            let (files, capacity, ttl) = service! { env |env: &AppEnv| {
+                (Arc::clone(&env.files), env.metadata_capacity, env.metadata_ttl)
+            }, }?;
             let samples = input?;
-            let cache = Cache::make(scope.clone(), CacheConfig { equal: Arc::new(|left: &DocumentId, right: &DocumentId| left == right), ttl: Some(ttl), capacity: CacheCapacity::Bounded(capacity), cache_failure: Arc::new(|_: &E| false) }, |_| effect_map_error! { program: metadata(), map: E::from, })?;
-            let compute = scope.fork(effect_try_cpu! {
-                once;
-                body |_cancel| { samples.sum() },
-                on_error: shared_error::<E>,
-            })?;
-            let inspect = scope.fork(cache.get(DocumentId::Input))?;
-            let sum = compute.join()?;
-            let input_bytes = inspect.join()?;
+            let cache = cache! {
+                scope: scope.clone(),
+                config: CacheConfig {
+                    equal: Arc::new(PartialEq::eq),
+                    ttl: Some(ttl),
+                    capacity: CacheCapacity::Bounded(capacity),
+                    cache_failure: Arc::new(|_: &E| false),
+                },
+                options: CacheOptions { ttl: CacheTtl::Fixed(Some(ttl)), admission: CacheAdmission::Unbounded },
+                load: |_| effect_map_error! { program: metadata(), map: E::from, },
+            }?;
+            let compute = effect_scope! { fork; scope: scope, program: samples.sum::<_, E>(), }?;
+            let inspect = effect_scope! {
+                fork; scope: scope,
+                program: cache! { cache: cache, get: DocumentId::Input, },
+            }?;
+            let sum = effect_scope! { join; fiber: compute, }?;
+            let input_bytes = effect_scope! { join; fiber: inspect, }?;
             let input_bytes = effect_try_sync! {
                 body { input_bytes.with(|bytes| *bytes) },
                 on_error |defect| { shared_error::<E>(AppError::Resource(defect)) },
@@ -431,7 +411,7 @@ fn application_stages<E: From<AppError> + Send + 'static>(
             let create_files = Arc::clone(&files);
             let acquire = effect_try_blocking! {
                 body |_cancel| { File::options().write(true).create_new(true).open(&create_files.staging) },
-                on_error |error| { shared_error::<E>(AppError::Io(error)) },
+                on_error: shared_io_error::<E>,
             };
             let release_files = Arc::clone(&files);
             let staging = effect_scope_acquire! {
@@ -446,7 +426,7 @@ fn application_stages<E: From<AppError> + Send + 'static>(
                                 match tokio::fs::remove_file(&files.staging).await {
                                     Ok(()) => Ok(()),
                                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                                    Err(error) => Err(shared_error::<E>(AppError::Io(error))),
+                                    Err(error) => Err(shared_io_error::<E>(error)),
                                 }
                             }
                         },
@@ -468,7 +448,7 @@ fn application_stages<E: From<AppError> + Send + 'static>(
                     let files = Arc::clone(&commit_files);
                     async move { tokio::fs::rename(&files.staging, &files.output).await }
                 },
-                on_error |error| { shared_error::<E>(AppError::Io(error)) },
+                on_error: shared_io_error::<E>,
             }?;
             Report { sum, input_bytes }
         },
@@ -487,9 +467,7 @@ fn application_stages<E: From<AppError> + Send + 'static>(
 pub fn describe(outcome: Exit<Report, Error>) -> String {
     match outcome {
         Exit::Success(report) => format!("sum={} input_bytes={}", report.sum, report.input_bytes),
-        Exit::Fail(error) => error
-            .with(|error| format!("{error:?}"))
-            .unwrap_or_else(|defect| format!("{defect:?}")),
+        Exit::Fail(error) => describe_error(&error),
         Exit::Die(defect) => format!("{defect:?}"),
         Exit::Interrupted => String::from(stringify!(Interrupted)),
         Exit::FinalizationFailed(details) => {
@@ -549,7 +527,7 @@ pub fn sum_documents(
         let documents = factory();
         let mut total = i128::default();
         for input in documents {
-            let partial = effect_try_cpu! { once; body: move |_| input.samples.into_iter().try_fold(i128::default(), |sum, sample| sum.checked_add(i128::from(sample)).ok_or(AppError::ArithmeticOverflow)), on_error: SharedValue::new, }?;
+            let partial = LoadedSamples::System(input.samples).sum::<_, AppError>()?;
             total = effect_try_sync! { once; body: move || total.checked_add(partial).ok_or(AppError::ArithmeticOverflow), on_error: SharedValue::new, }?;
         }
         total

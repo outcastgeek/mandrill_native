@@ -71,7 +71,6 @@ fn update_prices(
             assert_eq!(initial_quote, 475);
             service! {
                 select: |cafe: &CoffeeShop| cafe.services.clone(),
-                on_error: |error: SharedValue<DependencyCacheError<MenuProblem>>| error,
                 run |board: &Arc<MenuBoard>| { board.oat_latte_cents.store(500, Ordering::SeqCst); },
             }?;
             public.invalidate_dependency(Dependency::Board)?;
@@ -92,7 +91,7 @@ fn update_prices(
 /// Select this application's price board when the cache actually loads a choice.
 fn menu_price(drink: Drink) -> Effect<i64, MenuProblem, CoffeeShop> {
     service! {
-        select: |cafe: &CoffeeShop| cafe.services.clone(), on_error: |error: MenuProblem| error,
+        select: |cafe: &CoffeeShop| cafe.services.clone(),
         run |board: &Arc<MenuBoard>| {
             let drink = drink.clone();
             let price = board.price(&drink);
@@ -236,8 +235,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         NonZeroUsize::MIN.saturating_add(3),
     );
     let result = futures_executor::block_on(
-        update_prices(public, quotes, dependencies, price_refusals, quote_refusals)
-            .run(env.clone()),
+        effect! {
+            run;
+            program: update_prices(public, quotes, dependencies, price_refusals, quote_refusals),
+            environment: env.clone(),
+        },
     );
     env.base
         .finish()

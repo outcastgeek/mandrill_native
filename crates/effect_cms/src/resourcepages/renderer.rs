@@ -83,7 +83,7 @@ impl ResourcePageRenderer{
     pub fn form_reply<E:Send+'static,R:Send+Sync+'static>(&self,request:&Request,page:ResourceFormPageVM,on_error:impl Fn(ResourceRenderError)->E+Send+Sync+'static)
         ->effect::Effect<effect_server::Reply<E,R>,E,R>{
         let renderer=self.clone();let request=request.clone();
-        effect::effect_try_sync!{body:move ||renderer.form_page(&request,&page).map(resource_html_reply),on_error:move |error|on_error(error)}
+        effect::effect_try_sync!{body:move ||renderer.form_page(&request,&page).map(resource_html_reply),on_error:on_error}
     }
     pub fn list_reply<E:Send+'static,R:Send+Sync+'static>(&self,request:&Request,page:ResourceListPageVM)->effect::Effect<effect_server::Reply<E,R>,E,R>{
         let renderer=self.clone();let request=request.clone();effect::effect_sync!{body:move ||resource_html_reply(renderer.list_page(&request,&page))}

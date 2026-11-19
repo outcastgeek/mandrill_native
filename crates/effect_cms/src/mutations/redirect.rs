@@ -42,7 +42,7 @@ use crate::definitions::{ResourceAction, ResourceKind};
 use crate::routing::{MutationResultRoutePathBuilder, redirect_mutation_result};
 use crate::validation::ActionValidationService;
 
-use super::execution::execute_with_optional_commands;
+use super::execution::{execute_with_optional_commands, recover_mutation_outcome};
 
 use super::{
     Attempt, MutationFailure, RecoveryOptions,
@@ -153,19 +153,13 @@ where
             }
             None => match validation {
                 Some(validation) => {
-                    let outcome = execute_with_optional_commands::<E, R>(
-                        &mutation_request,
-                        &kind,
-                        &action,
-                        &validation,
-                        commands.as_ref(),
-                        None,
-                    )
-                    .either()?;
-                    match outcome {
-                        Ok(applied) => applied.recover(recovery.clone()),
-                        Err(failure) => failure.recover(recovery),
-                    }
+                    let outcome = effect! {
+                        either;
+                        program: execute_with_optional_commands::<E, R>(
+                            &mutation_request, &kind, &action, &validation, commands.as_ref(), None,
+                        ),
+                    }?;
+                    recover_mutation_outcome(outcome, recovery)
                 }
                 _ => missing_standard_progress::<(Option<MutationResult>, bool), MutationFailure<E>, R>()?,
             },

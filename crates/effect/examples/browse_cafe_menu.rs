@@ -6,7 +6,7 @@
 //! A lazy stream supplies choices; the selected price board supplies each price.
 //! The visit admits cache keys and prices into a region prepared at startup.
 
-use effect::{effect_die, effect_map_error, effect_sync, memory};
+use effect::{effect, effect_die, effect_map_error, effect_sync, memory};
 pub mod cafe_support;
 use cafe_support::Cafe;
 use std::num::NonZeroUsize;
@@ -45,7 +45,10 @@ fn browse_menu(
             memory: storage, refusals: refusals,
             load |drink: CacheKey<Drink>| { menu_price((*drink).clone())? },
         }?;
-        let drinks = effect_map_error! { program: menu_choices().run_collect(Some(3)), map: SharedValue::new, }?;
+        let drinks = effect_map_error! {
+            program: stream! { collect; stream: menu_choices(), limit: Some(3), },
+            map: SharedValue::new,
+        }?;
         let browse_prices = prices.clone();
         { use std::io::Write; let written = writeln!(std::io::stdout().lock(), "Maya reads today's menu:"); match written { Ok(()) => (), Err(error) => effect_die! { defect: effect::Defect::from_io(error), }?, } };
         effect_for_each! {
@@ -78,7 +81,7 @@ type CoffeeShop = Cafe<MenuBoard>;
 /// Extracted business helper selects this café's MenuBoard at execution time.
 fn menu_price(drink: Drink) -> Effect<i64, MenuProblem, CoffeeShop> {
     service! {
-        select: |cafe: &CoffeeShop| cafe.services.clone(), on_error: |problem: MenuProblem| problem, run |board| {
+        select: |cafe: &CoffeeShop| cafe.services.clone(), run |board| {
             let drink = drink.clone();
             service! {
                 operation |board: &Arc<MenuBoard>| {
@@ -138,7 +141,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         NonZeroUsize::MIN.saturating_add(15),
         NonZeroUsize::MIN.saturating_add(3),
     );
-    let result = futures_executor::block_on(browse_menu(cache, refusals).run(cafe.clone()));
+    let result = futures_executor::block_on(effect! {
+        run;
+        program: browse_menu(cache, refusals),
+        environment: cafe.clone(),
+    });
     cafe.base
         .finish()
         .map_err(|error| error.message().to_owned())?;

@@ -17,9 +17,14 @@ pub(crate) fn has_mode(tokens: &TokenStream, modes: &[&str]) -> bool {
 /// Named map/modify/update syntax over the current transactional evaluator.
 /// Both state roles use TxRef::update's borrowed snapshot and Result<(replacement,result),E>.
 pub(crate) fn transaction(input: Input) -> syn::Result<TokenStream> {
-    let mode = input.mode(&["map_error", "modify", "update", "prepare_domain"], "default")?;
+    let mode = input.mode(&["map_error", "modify", "update", "prepare_domain", "atomically"], "default")?;
     let mut fields = input.fields;
     let path = crate::expand::effect_crate_path()?;
+    if mode == "atomically" {
+        let program = fields.transform("program", |value, _| Ok(quote!(&(#value))))?;
+        let policy = fields.take("policy")?;
+        return fields.finish(quote!((#program).atomically(#policy)));
+    }
     if mode == "prepare_domain" {
         let memory = fields.take("memory")?;
         let region = fields.take("region")?;
@@ -88,12 +93,41 @@ pub(crate) fn atom(input: Input) -> syn::Result<TokenStream> {
 /// at its documented engine boundary, not an arbitrary durable coordination body.
 pub(crate) fn workflow(input: Input) -> syn::Result<TokenStream> {
     let mode = input.mode(
-        &["map_error", "for_each", "retry", "compensate", "result", "prepare_engine"],
+        &["map_error", "for_each", "retry", "compensate", "result", "prepare_engine", "run", "register", "start", "cancel", "wait_deferred"],
         "default",
     )?;
     let mut fields = input.fields;
     let path = crate::expand::effect_crate_path()?;
     let output = match mode.as_str() {
+        "register" | "start" | "cancel" => {
+            let engine = fields.transform("engine", |value, _| Ok(quote!(&(#value))))?;
+            let operation = match mode.as_str() {
+                "register" => {
+                    let registration = fields.take("registration")?;
+                    quote!((#engine).register(#registration))
+                }
+                "start" => {
+                    let handle = fields.take("handle")?;
+                    let input = fields.take("input")?;
+                    quote!((#engine).start(#handle, #input))
+                }
+                _ => {
+                    let run = fields.take("run")?;
+                    quote!((#engine).cancel(#run))
+                }
+            };
+            quote!({ use #path::workflow::WorkflowEngine as _; #operation })
+        }
+        "wait_deferred" => {
+            let deferred = fields.transform("deferred", |value, _| Ok(quote!(&(#value))))?;
+            quote!((#deferred).wait())
+        }
+        "run" => {
+            let workflow = fields.transform("workflow", |value, _| Ok(quote!(&(#value))))?;
+            let run = fields.take("run")?;
+            let input = fields.take("input")?;
+            quote!((#workflow).run(#run, #input))
+        }
         "prepare_engine" => {
             let memory = fields.take("memory")?;
             let region = fields.take("region")?;

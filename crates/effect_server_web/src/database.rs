@@ -4,7 +4,7 @@
 //! leases and cleanup. Only fields supported by this workspace's native sync provider
 //! are projected; revision strings, URLs, credentials and failure details are excluded.
 
-use crate::{effect_map, effect_map_error};
+use crate::{effect_fail, effect_map, effect_map_error};
 use effect::Effect;
 use effect::effect;
 use effect_sql::sql;
@@ -35,8 +35,9 @@ pub struct SyncObservation {
 #[expect(clippy::result_large_err, reason = "the statement factory retains the owned native SQL error")]
 pub fn readiness<R: Send + Sync + 'static>(client: &SqlClient) -> Effect<bool, SqlError, R> {
     effect_map! {
-    program: client
-    .scalar::<_, i64, R>(|| sql! { text: "SELECT 1", }), map: |value| value == 1, }
+        program: sql! { scalar; client: client, statement: || sql! { text: "SELECT 1", }, },
+        map: |value: i64| value == 1,
+    }
 }
 /// Execute the fixed readiness statement with the selected session and row backing.
 #[expect(clippy::result_large_err, reason = "prepared statement and row projection retain the owned SQL and row errors")]
@@ -46,10 +47,12 @@ pub fn readiness_prepared<R: Send + Sync + 'static>(client: &SqlClient) -> Effec
     };
     effect! {
         bind;
-        program: client.first_prepared_read(|| sql! { text: "SELECT 1 AS ready", }, decoder),
+        program: sql! { first_prepared; client: client,
+            statement: || sql! { text: "SELECT 1 AS ready", }, decoder: decoder,
+        },
         body: |row| match row {
             Some(value) => effect::effect_sync! { body: move || value == 1, },
-            None => effect::effect_try_sync! { body: || Err(SqlError::RowAbsent), },
+            None => effect_fail! { error: SqlError::RowAbsent, },
         },
     }
 }
@@ -57,22 +60,26 @@ pub fn readiness_prepared<R: Send + Sync + 'static>(client: &SqlClient) -> Effec
 /// lease before returning a safe finite projection. Non-sync configurations return
 /// the actual provider's typed unsupported error rather than fabricated zero stats.
 pub fn sync<R: Send + Sync + 'static>(client: &SqlClient) -> Effect<SyncObservation, SqlError, R> {
-    client.with_session(|session| {
-        session.native(|connection| {
-            Box::pin(async move {
-                let stats = connection.sync_stats().await.map_err(SqlError::Provider)?;
-                Ok(SyncObservation {
-                    cdc_operations: stats.cdc_operations,
-                    main_wal_bytes: stats.main_wal_size,
-                    revert_wal_bytes: stats.revert_wal_size,
-                    network_sent_bytes: stats.network_sent_bytes,
-                    network_received_bytes: stats.network_received_bytes,
-                    last_pull_unix_seconds: stats.last_pull_unix_time,
-                    last_push_unix_seconds: stats.last_push_unix_time,
-                })
-            })
-        })
-    })
+    sql! {
+        session; client: client, body: |session| {
+            sql! {
+                native; client: session, body: |connection| {
+                    Box::pin(async move {
+                        let stats = connection.sync_stats().await.map_err(SqlError::Provider)?;
+                        Ok(SyncObservation {
+                            cdc_operations: stats.cdc_operations,
+                            main_wal_bytes: stats.main_wal_size,
+                            revert_wal_bytes: stats.revert_wal_size,
+                            network_sent_bytes: stats.network_sent_bytes,
+                            network_received_bytes: stats.network_received_bytes,
+                            last_pull_unix_seconds: stats.last_pull_unix_time,
+                            last_push_unix_seconds: stats.last_push_unix_time,
+                        })
+                    })
+                },
+            }
+        },
+    }
 }
 /// Collect a selected native observation and invoke application-owned Effect
 /// presentation. Labels/locale/errors remain application policy; no request is retained.

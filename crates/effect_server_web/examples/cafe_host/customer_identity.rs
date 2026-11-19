@@ -1,8 +1,8 @@
 //! Configure one concrete café Identity definition; no consumer capability bounds escape.
 
 use super::*;
-use effect::{effect_map, effect_try_sync, service};
-use effect_server::{endpoint, pipeline, reply, router};
+use effect::{effect_map, effect_map_error, effect_try_sync};
+use effect_server::{endpoint, pipeline, reply, router, server};
 use effect_server_identity::authority::{
     GrantPolicy, IdentityClock, PermissionDecision, PermissionOperation, PermissionTarget,
     ProtectedRequestGrant, SelfGrant,
@@ -28,8 +28,7 @@ use effect_server_identity::native::identity::{
     validation::DefaultUserValidator,
 };
 use effect_server_identity::{
-    IdentityError, IdentityStoragePolicy, SqlxIdentityStore, identity, identity_endpoints,
-    identity_store,
+    IdentityError, IdentityStoragePolicy, identity, identity_endpoints, identity_store,
 };
 use effect_server_identity::{
     definition::{LoginInput, LoginOutcome, RegistrationInput},
@@ -45,6 +44,7 @@ use effect_server_identity::{
 };
 use effect_server_web::csp::{CspDirective, CspSources, ResponseNonce};
 use effect_server_web::{csp, security};
+use effect_sql::sql;
 
 /// Native sign-in admission cannot waive password, factor or current-user checks.
 #[derive(Debug)]
@@ -108,15 +108,16 @@ pub(super) async fn configure(
         native_window,
         true,
     )?;
-    let backend = SqlxIdentityStore::from_kernel(
-        sql.kernel().clone(),
-        IdentityStoragePolicy {
+    let backend = identity_store! {
+        sqlx_kernel;
+        kernel: sql.kernel().clone(),
+        policy: IdentityStoragePolicy {
             challenge_capacity: capacity,
             utc_now: OffsetDateTime::now_utc,
         },
-    )?
-    .with_prepared_invocations(invocations);
-    backend.initialize().await?;
+    }?;
+    let backend = identity_store! { prepare_invocations; source: backend, invocations: invocations, };
+    identity_store! { initialize; backend: backend, }.await?;
     let role_name = NormalizedUserName::parse("CUSTOMER")?;
     if backend
         .find_role_by_normalized_name(&role_name)
@@ -163,8 +164,9 @@ pub(super) async fn configure(
         tickets: tickets, browser: browser, principal_factory: NativePrincipalPolicy::new(ClaimsIdentityOptions::default()),
         errors |error| { cafe_error(CafeProblem::Identity(Box::new(error))) }, clock: IdentityClock::new(OffsetDateTime::now_utc),
         grant_policy: GrantPolicy { self_lifetime: native_window, recent_lifetime: recent_window }, admission: capacity,
-    }?.with_prepared_admission(admission);
-    let mut selected_security = security! {
+    }?;
+    let definition = identity! { configure; source: definition, prepared_admission: admission, };
+    let selected_security = security! {
         csp: csp! { directive(CspDirective::DefaultSrc, CspSources::self_origin()); directive(CspDirective::ScriptSrc, CspSources::nonce()); directive(CspDirective::StyleSrc, CspSources::nonce()); },
         nonce: || {
         effect_try_sync! {
@@ -174,18 +176,13 @@ pub(super) async fn configure(
             ResponseNonce::from_hex_bytes(nonce)
         }, on_error |error| { cafe_error(CafeProblem::Web(error)) }, }
         },
-        authentication: definition.cookie_stage(),
+        authentication: {
+            let verify = identity! { identity: &definition, cookie_stage(), };
+            // Verify optional credentials globally. Route policies decide which groups require them.
+            move |request| effect_map! { program: verify(request), map |_verified| { true }, }
+        },
         header(http::header::X_CONTENT_TYPE_OPTIONS, http::HeaderValue::from_static("nosniff"));
     }?;
-    let verify = selected_security
-        .authentication
-        .take()
-        .ok_or("selected native authentication stage")?;
-    // Authentication verifies optional credentials globally. Route policies decide
-    // which groups require them; public entry routes need no path allowlist.
-    selected_security.authentication = Some(Arc::new(
-        move |request| effect_map! { program: verify(request), map |_verified| { true }, },
-    ));
     let login_accounts = definition.clone();
     let login_guard = move |_accounts, request: Request| {
         identity! {
@@ -204,7 +201,7 @@ pub(super) async fn configure(
         let accounts = accounts.clone();
         let guard: Effect<(), CafeError, Environment> = effect! {
             let accounts = accounts.clone();
-            let request = service! { env |env: &Environment| { env.request().clone() }, }?;
+            let request = server! { request; }?;
             identity! {
                 identity: accounts, authorize_once(request),
                 authorize |request, authority, policies| {
@@ -263,7 +260,7 @@ pub(super) async fn configure(
             render |response| { response },
         },
     }?;
-    let antiforgery = definition.selected_antiforgery_stage();
+    let antiforgery = identity! { identity: &definition, selected_antiforgery_stage(), };
     let pickup_routes = router! {
         source: pickup_routes,
         pipe_through(pipeline! {
@@ -277,61 +274,100 @@ pub(super) async fn configure(
             guard: login_guard,
             input |_request| { pickup::credentials::<Environment>(bytes)? },
             workflow |accounts, submitted| {
-                let outcome = accounts.login(LoginInput { user_name: submitted.username, password: submitted.password, persistent: false, lockout_on_failure: true })?;
-                if matches!(outcome, LoginOutcome::Completed { .. }) { Some(accounts.sign_in_cookie(outcome)?) } else { None }
+                let outcome = identity! {
+                    identity: &*accounts,
+                    login(LoginInput { user_name: submitted.username, password: submitted.password, persistent: false, lockout_on_failure: true }),
+                }?;
+                if matches!(outcome, LoginOutcome::Completed { .. }) {
+                    Some(identity! { identity: &*accounts, sign_in_cookie(outcome), }?)
+                } else { None }
             },
             render |cookie| { customer_routes::login_reply(cookie)? },
         },
         antiforgery {
             method: http::Method::GET, path: "/identity/csrf",
             input |request| { request.headers().clone() },
-            workflow |accounts, headers| { accounts.issue_antiforgery(headers)? },
+            workflow |accounts, headers| {
+                identity! { identity: &*accounts, issue_antiforgery(headers), }?
+            },
             render |response| { reply! { native(response) } },
         },
         protect(RoleClaimAuthorizationPolicy::require_role("CUSTOMER"), pickup_routes);
         get("/", endpoint! { effect(pickup::welcome::<Environment>()) });
     }?;
-    let account = move |name: &'static str| {
-        let accounts = definition.clone();
-        effect! {
-            let accounts = accounts.clone();
-            let existing = identity! {
-                identity: accounts.clone(), invoke_once(name),
-                native |native, name, _authority, _policies| {
-                    let user = native.user_manager().find_by_name(name).await.map_err(IdentityError::Native)?;
-                    Ok(user.map(|user| user.id()))
-                },
-            }?;
-            let id = match existing {
-                Some(id) => id,
-                None => {
-                    let name = effect_try_sync! { once; body { UserName::parse(name) }, on_error |_error| { cafe_error(CafeProblem::Identity(Box::new(IdentityError::Configuration("demo account name")))) }, }?;
-                    accounts.register(RegistrationInput { user: IdentityUser::with_user_name(name), password: pickup::DEMO_PASSWORD.to_owned() })?.id
-                }
-            };
-            identity! {
-                identity: accounts, invoke_once(id),
-                native |native, id, _authority, _policies| {
-                    let users = native.user_manager();
-                    let user = users.find_by_id(&id).await.map_err(IdentityError::Native)?.ok_or(IdentityError::Unauthorized)?;
-                    if !users.is_in_role(&user, "Customer").await.map_err(IdentityError::Native)? {
-                        let result = users.add_to_role(&user, "Customer").await;
-                        if !result.succeeded() { return Err(IdentityError::Native(result)); }
+    // Seed real Identity accounts and pickup orders; ignore existing rows on restart.
+    let fixture: Effect<(), CafeError> = effect! {
+        let definition = definition.clone();
+        let sql = sql.clone();
+        let account = move |name: &'static str| {
+            let accounts = definition.clone();
+            effect! {
+                let accounts = accounts.clone();
+                let existing = identity! {
+                    identity: accounts.clone(), invoke_once(name),
+                    native |native, name, _authority, _policies| {
+                        let user = native.user_manager().find_by_name(name).await.map_err(IdentityError::Native)?;
+                        Ok(user.map(|user| user.id()))
+                    },
+                }?;
+                let id = match existing {
+                    Some(id) => id,
+                    None => {
+                        let name = effect_try_sync! { once; body { UserName::parse(name) }, on_error |_error| { cafe_error(CafeProblem::Identity(Box::new(IdentityError::Configuration("demo account name")))) }, }?;
+                        identity! {
+                            identity: accounts,
+                            register(RegistrationInput {
+                                user: IdentityUser::with_user_name(name),
+                                password: pickup::DEMO_PASSWORD.to_owned(),
+                            }),
+                        }?.id
                     }
-                    let claims = users.get_claims(&user).await.map_err(IdentityError::Native)?;
-                    for permission in ["pickup.read", "pickup.collect"] {
-                        let claim = IdentityClaim::new(ClaimType::parse("permission").map_err(|_| IdentityError::Configuration("permission claim type"))?, ClaimValue::parse(permission).map_err(|_| IdentityError::Configuration("pickup permission"))?);
-                        if !claims.contains(&claim) {
-                            let result = users.add_claim(&user, claim).await;
+                };
+                identity! {
+                    identity: accounts, invoke_once(id),
+                    native |native, id, _authority, _policies| {
+                        let users = native.user_manager();
+                        let user = users.find_by_id(&id).await.map_err(IdentityError::Native)?.ok_or(IdentityError::Unauthorized)?;
+                        if !users.is_in_role(&user, "Customer").await.map_err(IdentityError::Native)? {
+                            let result = users.add_to_role(&user, "Customer").await;
                             if !result.succeeded() { return Err(IdentityError::Native(result)); }
                         }
-                    }
-                    Ok(id)
-                },
-            }?
+                        let claims = users.get_claims(&user).await.map_err(IdentityError::Native)?;
+                        for permission in ["pickup.read", "pickup.collect"] {
+                            let claim = IdentityClaim::new(ClaimType::parse("permission").map_err(|_| IdentityError::Configuration("permission claim type"))?, ClaimValue::parse(permission).map_err(|_| IdentityError::Configuration("pickup permission"))?);
+                            if !claims.contains(&claim) {
+                                let result = users.add_claim(&user, claim).await;
+                                if !result.succeeded() { return Err(IdentityError::Native(result)); }
+                            }
+                        }
+                        Ok(id)
+                    },
+                }?
+            }
+        };
+        let create_pickups = sql! {
+            text("CREATE TABLE IF NOT EXISTS cafe_pickups(ticket INTEGER PRIMARY KEY, customer_id TEXT NOT NULL UNIQUE, customer TEXT NOT NULL, drink TEXT NOT NULL, cups INTEGER NOT NULL CHECK(cups>0), collected INTEGER NOT NULL DEFAULT 0 CHECK(collected IN(0,1)), collections INTEGER NOT NULL DEFAULT 0 CHECK(collections IN(0,1)))");
+        };
+        effect_map_error! {
+            program: sql! { execute; client: sql, statement: create_pickups, },
+            map |error| { cafe_error(CafeProblem::Sql(error)) },
+        }?;
+        for (name, customer, ticket, drink, cups) in [
+            ("maya", "Maya", 104i64, "Oat latte", 2i64),
+            ("lee", "Lee", 105i64, "Espresso", 1i64),
+        ] {
+            let owner = account(name)?;
+            let insert_pickup = sql! {
+                text("INSERT OR IGNORE INTO cafe_pickups(ticket,customer_id,customer,drink,cups) VALUES(");
+                param(ticket); text(","); param(owner.to_string()); text(","); param(customer);
+                text(","); param(drink); text(","); param(cups); text(")");
+            };
+            effect_map_error! {
+                program: sql! { execute; client: sql, statement: insert_pickup, },
+                map |error| { cafe_error(CafeProblem::Sql(error)) },
+            }?;
         }
     };
-    let fixture = customer_routes::seed(account, sql);
     Ok(CustomerServices {
         security: selected_security,
         routes,

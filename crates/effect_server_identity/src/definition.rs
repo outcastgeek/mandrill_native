@@ -9,7 +9,7 @@ use crate::{
     capabilities::{NativeBackend, StoreSelection},
     components::PreparedPasswordWork,
 };
-use crate::{effect_future, effect_uninterruptible};
+use crate::{effect_future, effect_uninterruptible, identity};
 use effect::{Effect, Exit, PreparedAdmissionPermit, PreparedProviderAdmission};
 use std::{
     future::Future,
@@ -383,29 +383,32 @@ impl<
     {
         let definition = self.clone();
         let operation = Arc::new(operation);
-        Effect::from_exit_future_with_context(move |env: Arc<R>, _| {
-            let definition = definition.clone();
-            let operation = operation.clone();
-            async move {
-                let result = async {
-                    let invocation =
-                        definition.invocation(definition.admission.acquire().await?)?;
-                    definition
-                        .run_invocation(invocation, |native, authority, policies| {
-                            operation(native, env, authority, policies)
-                        })
-                        .await
-                }
-                .await;
-                match result {
-                    Ok(value) => Exit::Success(value),
-                    Err(error) => error
-                        .into_exit()
-                        .map_error(|error| (definition.errors)(error)),
-                }
-            }
-        })
-        .uninterruptible()
+        effect_uninterruptible! {
+            program: effect_future! {
+                exit_with_context; body: move |env: Arc<R>, _| {
+                    let definition = definition.clone();
+                    let operation = operation.clone();
+                    async move {
+                        let result = async {
+                            let invocation =
+                                definition.invocation(definition.admission.acquire().await?)?;
+                            definition
+                                .run_invocation(invocation, |native, authority, policies| {
+                                    operation(native, env, authority, policies)
+                                })
+                                .await
+                        }
+                        .await;
+                        match result {
+                            Ok(value) => Exit::Success(value),
+                            Err(error) => error
+                                .into_exit()
+                                .map_error(|error| (definition.errors)(error)),
+                        }
+                    }
+                },
+            },
+        }
     }
     /// Run a typed native authorization block against this invocation's scoped authority.
     /// Request and resource grants remain minted/revalidated by IdentityAuthority;
@@ -421,9 +424,12 @@ impl<
         F: Fn(I, IdentityAuthority<S::Backend>, Arc<P>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<A, IdentityError>> + Send + 'static,
     {
-        self.invoke_once(input, move |_, input, authority, policies| {
-            authorize(input, authority, policies)
-        })
+        identity! {
+            identity: self, invoke_once(input),
+            native: move |_, input, authority, policies| {
+                authorize(input, authority, policies)
+            },
+        }
     }
     /// Move one owned credential/request/grant into its single native execution;
     /// repeated execution yields core's consumed-factory defect instead of copying it.
@@ -537,9 +543,12 @@ impl<
         Fut: Future<Output = Result<A, IdentityError>> + Send + 'static,
     {
         let storage = self.storage.clone();
-        self.invoke_once(input, move |native, input, authority, policies| {
-            operation(storage.clone(), native, input, authority, policies)
-        })
+        identity! {
+            identity: self, invoke_once(input),
+            native: move |native, input, authority, policies| {
+                operation(storage.clone(), native, input, authority, policies)
+            },
+        }
     }
     /// Execute a public native HTTP service under one invocation-owned native store
     /// and restore its original narrowed SQL outcome. Native protocols with private
@@ -577,26 +586,29 @@ impl<
             + 'static,
     {
         let operation = Arc::new(operation);
-        self.invoke_once(request, move |native, request, authority, policies| {
-            let operation = operation.clone();
-            async move {
-                let method = request.method().clone();
-                let uri = request.uri().clone();
-                let version = request.version();
-                let headers = request.headers().clone();
-                request
-                    .with_native_body(move |body| async move {
-                        let mut request = http::Request::new(body);
-                        *request.method_mut() = method;
-                        *request.uri_mut() = uri;
-                        *request.version_mut() = version;
-                        *request.headers_mut() = headers;
-                        Ok(operation(native, request, authority, policies).await)
-                    })
-                    .await
-                    .map_err(IdentityError::Input)?
-            }
-        })
+        identity! {
+            identity: self, invoke_once(request),
+            native: move |native, request, authority, policies| {
+                let operation = operation.clone();
+                async move {
+                    let method = request.method().clone();
+                    let uri = request.uri().clone();
+                    let version = request.version();
+                    let headers = request.headers().clone();
+                    request
+                        .with_native_body(move |body| async move {
+                            let mut request = http::Request::new(body);
+                            *request.method_mut() = method;
+                            *request.uri_mut() = uri;
+                            *request.version_mut() = version;
+                            *request.headers_mut() = headers;
+                            Ok(operation(native, request, authority, policies).await)
+                        })
+                        .await
+                        .map_err(IdentityError::Input)?
+                }
+            },
+        }
     }
     /// Build a trusted request authentication stage over the selected native access
     /// provider. Invalid/missing proof is false; backend/provider errors remain E.

@@ -596,7 +596,7 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Security<E, R> {
             ));
         }
         if let Some(assets) = &self.static_files {
-            effect_server::Route::literal(&assets.prefix)
+            effect_server::route! { literal: &assets.prefix }
                 .map_err(|_| WebError::Configuration("static asset prefix".into()))?;
         }
         Ok(self)

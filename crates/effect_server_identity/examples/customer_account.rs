@@ -9,19 +9,16 @@
 
 #[cfg(feature = "sqlx-turso")]
 mod account {
-    use effect::{Effect, Exit, effect, effect_die, effect_try_sync};
+    use effect::{Effect, Exit, effect, effect_die, effect_fail, effect_from_option};
     use effect_server_identity::{
-        IdentityError, IdentityStoragePolicy, SqlxIdentityStore,
+        IdentityError, IdentityStoragePolicy,
         authority::{
             GrantPolicy, IdentityClock, PermissionDecision, PermissionOperation, PermissionTarget,
         },
         components::{NativePrincipalPolicy, Retained},
         definition::{LoginInput, LoginOutcome, RegistrationInput},
         identity, identity_store,
-        store::{
-            accounts::AtomicAccounts,
-            records::{RecordCategory, RecordCodec, RecordError, RecordPolicy, SqlRecordAdapter},
-        },
+        store::records::{RecordCategory, RecordCodec, RecordError, RecordPolicy},
     };
     use identity_rs::identity::{
         IdentityOptions, IdentityResult,
@@ -52,17 +49,25 @@ mod account {
         )
         .await?;
         let result = async {
-            let backend = SqlxIdentityStore::new(pool.clone(), IdentityStoragePolicy {
-                challenge_capacity: NonZeroUsize::MIN.saturating_add(15),
-                utc_now: OffsetDateTime::now_utc,
-            })?;
-            backend.initialize().await?;
+            let backend = identity_store! {
+                sqlx; pool: pool.clone(),
+                policy: IdentityStoragePolicy {
+                    challenge_capacity: NonZeroUsize::MIN.saturating_add(15),
+                    utc_now: OffsetDateTime::now_utc,
+                },
+            }?;
+            identity_store! { initialize; backend: backend, }.await?;
             let document = RecordPolicy { max_bytes: NonZeroUsize::MIN.saturating_add(1023),
                 page_limit: NonZeroU16::MIN.saturating_add(15) };
             let stores = identity_store! {
                 backend: backend.clone(),
-                accounts: AtomicAccounts::new(backend.clone(), NonZeroUsize::MIN.saturating_add(15)),
-                consent: SqlRecordAdapter::new(backend, RecordCategory::Consent, document, PreferenceCodec),
+                accounts: identity_store! {
+                    atomic_accounts; backend: backend.clone(), token_capacity: NonZeroUsize::MIN.saturating_add(15),
+                },
+                consent: identity_store! {
+                    record_adapter; backend: backend, category: RecordCategory::Consent,
+                    policy: document, codec: PreferenceCodec,
+                },
             }?;
             let validator = Retained::new(DefaultUserValidator::new());
             let hasher = Retained::new(DefaultPasswordHasher::with_options_and_random(PasswordHasherOptions::new(100_000)?, OsRandomBytes));
@@ -90,47 +95,55 @@ mod account {
                 let accounts = accounts.clone();
                 let name = match UserName::parse(format!("maya-{}", uuid::Uuid::new_v4())) {
                     Ok(name) => name,
-                    Err(error) => { let defect = effect::Defect::new(format!("customer alias: {error:?}")); effect_die! { defect: defect, }? },
+                    Err(error) => effect_die! { defect: effect::Defect::new(format!("customer alias: {error:?}")), }?,
                 };
-                let registered = accounts.register(RegistrationInput {
-                    user: IdentityUser::with_user_name(name), password: "Cafe-Demo-Receipt-42!".into(),
-                })?;
-                let user_name = match registered.user_name {
-                    Some(name) => name,
-                    None => effect_try_sync! { body { Err(IdentityError::Unauthorized) }, }?,
-                };
-                let actor = match accounts.login(LoginInput {
-                    user_name,
-                    password: "Cafe-Demo-Receipt-42!".into(), persistent: false, lockout_on_failure: true,
-                })? {
+                let registered = identity! {
+                    identity: &accounts,
+                    register(RegistrationInput {
+                        user: IdentityUser::with_user_name(name), password: "Cafe-Demo-Receipt-42!".into(),
+                    }),
+                }?;
+                let user_name = effect_from_option! {
+                    once; value: registered.user_name, missing { IdentityError::Unauthorized },
+                }?;
+                let login = identity! {
+                    identity: &accounts,
+                    login(LoginInput {
+                        user_name,
+                        password: "Cafe-Demo-Receipt-42!".into(), persistent: false, lockout_on_failure: true,
+                    }),
+                }?;
+                let actor = match login {
                     LoginOutcome::Completed { actor, .. } => actor,
                     LoginOutcome::Rejected(_) | LoginOutcome::Pending(_) =>
-                        effect_try_sync! { body { Err(IdentityError::Unauthorized) }, }?,
+                        effect_fail! { error: IdentityError::Unauthorized, }?,
                 };
                 // Scope permits this collection; the per-record rule permits only Maya.
                 let scope = identity! {
-                    identity: accounts.clone(), authorize_once(actor.clone()),
+                    identity: &accounts, authorize_once(actor.clone()),
                     authorize |actor, authority, _policies| {
                         let permission = authority.permission(&actor, Arc::from("receipts.read"), Arc::from("accounts"), receipt_visibility).await?;
                         authority.scope(permission)
                     },
                 }?;
                 let visible = identity! {
-                    identity: accounts.clone(), accounts_page(scope, None, NonZeroU16::MIN.saturating_add(15)),
+                    identity: &accounts, accounts_page(scope, None, NonZeroU16::MIN.saturating_add(15)),
                     decide: receipt_visibility,
                     allow |actor, target| { Ok(actor == target) },
                 }?;
                 assert!(visible.accounts.iter().all(|account| account.id == actor.user_id()));
                 let preference_id = uuid::Uuid::new_v4();
-                accounts.update_preferences(actor.clone(), preference_id, None, None,
-                    ReceiptPreference { email_receipts: true })?;
-                let saved = accounts.preferences(actor, preference_id)?;
+                identity! {
+                    identity: &accounts,
+                    update_preferences(actor.clone(), preference_id, None, None, ReceiptPreference { email_receipts: true }),
+                }?;
+                let saved = identity! { identity: &accounts, preferences(actor, preference_id), }?;
                 assert!(saved.is_some_and(|saved| saved.value.email_receipts));
                 use std::io::Write;
                 let written = writeln!(std::io::stdout().lock(), "Maya registered, logged in, and saved email_receipts=true.");
-                match written { Ok(()) => (), Err(error) => { let defect = effect::Defect::from_io(error); effect_die! { defect: defect, }? }, };
+                match written { Ok(()) => (), Err(error) => effect_die! { defect: effect::Defect::from_io(error), }?, };
             };
-            match program.run(Arc::new(())).await {
+            match effect! { run; program: &program, environment: Arc::new(()), }.await {
                 Exit::Success(()) => Ok(()),
                 other @ (Exit::Fail(_) | Exit::Die(_) | Exit::Interrupted | Exit::FinalizationFailed(_)) => Err(format!("account workflow failed: {other:?}").into()),
             }

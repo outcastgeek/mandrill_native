@@ -168,7 +168,7 @@ where
                             effect_map_error! {
                                 program: match child_context(&context, IssueSegment::Index(index)) {
                                 Ok(child) => decode.decode_in(item, child),
-                                Err(issue) => effect_try_sync! { once; body: { let __dsl_result = Err(issue); move || __dsl_result }, on_error: ::core::convert::identity, },
+                                Err(issue) => crate::effect_from_result! { once; result: Err(issue), },
                             }, map: move |issue| issue.at(IssueSegment::Index(index)), }
                         })
                         .collect(),
@@ -179,7 +179,7 @@ where
         }, encode: move |items: Vec<A>, context| {
             let policy = active_policy::<Encoded>(&context, policy);
             if items.len() > policy.limits.collection.get() {
-                return effect_try_sync! { once; body: { let __dsl_result = Err(width()); move || __dsl_result }, on_error: ::core::convert::identity, };
+                return crate::effect_from_result! { once; result: Err(width()), };
             }
             let repr = Arc::clone(&repr);
             {
@@ -191,7 +191,7 @@ where
                         effect_map_error! {
                             program: match child_context(&context, IssueSegment::Index(index)) {
                             Ok(child) => codec.encode_in(item, child),
-                            Err(issue) => effect_try_sync! { once; body: { let __dsl_result = Err(issue); move || __dsl_result }, on_error: ::core::convert::identity, },
+                            Err(issue) => crate::effect_from_result! { once; result: Err(issue), },
                         }, map: move |issue| issue.at(IssueSegment::Index(index)), }
                     })
                     .collect(),
@@ -206,7 +206,7 @@ where
     .with_context_validator(move |items: Vec<A>, context| {
         let policy = active_policy::<Encoded>(&context, policy);
         if items.len() > policy.limits.collection.get() {
-            return effect_try_sync! { once; body: { let __dsl_result = Err(width()); move || __dsl_result }, on_error: ::core::convert::identity, };
+            return crate::effect_from_result! { once; result: Err(width()), };
         }
         all_schema(
             items
@@ -216,7 +216,7 @@ where
                     effect_map_error! {
                         program: match child_context(&context, IssueSegment::Index(index)) {
                         Ok(child) => validate.validate_in(item, child),
-                        Err(issue) => effect_try_sync! { once; body: { let __dsl_result = Err(issue); move || __dsl_result }, on_error: ::core::convert::identity, },
+                        Err(issue) => crate::effect_from_result! { once; result: Err(issue), },
                     }, map: move |issue| issue.at(IssueSegment::Index(index)), }
                 })
                 .collect(),
@@ -227,19 +227,19 @@ where
     if writer_available {
         result.with_writer(move |items: Vec<A>, mut writer| {
             if items.len() > policy.limits.collection.get() {
-                return effect_try_sync! { once; body: { let __dsl_result = Err(width()); move || __dsl_result }, on_error: ::core::convert::identity, };
+                return crate::effect_from_result! { once; result: Err(width()), };
             }
             if let Err(issue) = writer.begin_array() {
-                return effect_try_sync! { once; body: { let __dsl_result = Err(issue); move || __dsl_result }, on_error: ::core::convert::identity, };
+                return crate::effect_from_result! { once; result: Err(issue), };
             }
-            let mut result = effect_try_sync! { once; body: { let __dsl_result = Ok(writer); move || __dsl_result }, on_error: ::core::convert::identity, };
+            let mut result = crate::effect_from_result! { once; result: Ok(writer), };
             for item in items {
                 let codec = writer_codec.clone();
-                result = { let __dsl_program = { let __dsl_left_program = result; let __dsl_right_program = effect_try_sync! { once; body: { let __dsl_result = Ok(item); move || __dsl_result }, on_error: ::core::convert::identity, }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }; effect! { let codec = codec.clone(); let (writer , item) = __dsl_program.clone()?; codec.write_into_once(item, writer)? } };
+                result = { let __dsl_program = { let __dsl_left_program = result; let __dsl_right_program = crate::effect_from_result! { once; result: Ok(item), }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }; effect! { let codec = codec.clone(); let (writer , item) = __dsl_program.clone()?; codec.write_into_once(item, writer)? } };
             }
             { let __dsl_program = result; effect! {
                 let mut writer = __dsl_program.clone()?; {
-                effect_try_sync! { once; body: { let __dsl_result = writer.end_array().map(|()| writer); move || __dsl_result }, on_error: ::core::convert::identity, }
+                crate::effect_from_result! { once; result: writer.end_array().map(|()| writer), }
             }? } }
         })
     } else {
@@ -295,10 +295,10 @@ where
                                 let __dsl_left_program = effect_map_error! {
                                 program: match child_context(&context, IssueSegment::Field(Arc::clone(&path))) {
                                 Ok(child) => decode.decode_in(item, child),
-                                Err(issue) => effect_try_sync! { once; body: { let __dsl_result = Err(issue); move || __dsl_result }, on_error: ::core::convert::identity, },
+                                Err(issue) => crate::effect_from_result! { once; result: Err(issue), },
                             }, map: move |issue| {
                                   issue.at(IssueSegment::Field(Arc::clone(&path)))
-                            }, }; let __dsl_right_program = effect_try_sync! { once; body: { let __dsl_result = Ok(name); move || __dsl_result }, on_error: ::core::convert::identity, }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }, map: |(value, name)| (name, value), }
+                            }, }; let __dsl_right_program = crate::effect_from_result! { once; result: Ok(name), }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }, map: |(value, name)| (name, value), }
                         })
                         .collect(),
                     policy,
@@ -308,7 +308,7 @@ where
         }, encode: move |items: BTreeMap<String, A>, context| {
             let policy = active_policy::<Encoded>(&context, policy);
             if items.len() > policy.limits.collection.get() {
-                return effect_try_sync! { once; body: { let __dsl_result = Err(width()); move || __dsl_result }, on_error: ::core::convert::identity, };
+                return crate::effect_from_result! { once; result: Err(width()), };
             }
             let repr = Arc::clone(&repr);
             {
@@ -322,8 +322,8 @@ where
                             let __dsl_left_program = effect_map_error! {
                             program: match child_context(&context, IssueSegment::Field(Arc::clone(&path))) {
                             Ok(child) => codec.encode_in(item, child),
-                            Err(issue) => effect_try_sync! { once; body: { let __dsl_result = Err(issue); move || __dsl_result }, on_error: ::core::convert::identity, },
-                        }, map: move |issue| issue.at(IssueSegment::Field(Arc::clone(&path))), }; let __dsl_right_program = effect_try_sync! { once; body: { let __dsl_result = Ok(name); move || __dsl_result }, on_error: ::core::convert::identity, }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }, map: |(value, name)| (name, value), }
+                            Err(issue) => crate::effect_from_result! { once; result: Err(issue), },
+                        }, map: move |issue| issue.at(IssueSegment::Field(Arc::clone(&path))), }; let __dsl_right_program = crate::effect_from_result! { once; result: Ok(name), }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }, map: |(value, name)| (name, value), }
                     })
                     .collect(),
                 policy,
@@ -337,7 +337,7 @@ where
     .with_context_validator(move |items: BTreeMap<String, A>, context| {
         let policy = active_policy::<Encoded>(&context, policy);
         if items.len() > policy.limits.collection.get() {
-            return effect_try_sync! { once; body: { let __dsl_result = Err(width()); move || __dsl_result }, on_error: ::core::convert::identity, };
+            return crate::effect_from_result! { once; result: Err(width()), };
         }
         effect_map! {
             program: all_schema(
@@ -350,8 +350,8 @@ where
                         let __dsl_left_program = effect_map_error! {
                         program: match child_context(&context, IssueSegment::Field(Arc::clone(&path))) {
                         Ok(child) => validate.validate_in(item, child),
-                        Err(issue) => effect_try_sync! { once; body: { let __dsl_result = Err(issue); move || __dsl_result }, on_error: ::core::convert::identity, },
-                    }, map: move |issue| issue.at(IssueSegment::Field(Arc::clone(&path))), }; let __dsl_right_program = effect_try_sync! { once; body: { let __dsl_result = Ok(name); move || __dsl_result }, on_error: ::core::convert::identity, }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }, map: |(value, name)| (name, value), }
+                        Err(issue) => crate::effect_from_result! { once; result: Err(issue), },
+                    }, map: move |issue| issue.at(IssueSegment::Field(Arc::clone(&path))), }; let __dsl_right_program = crate::effect_from_result! { once; result: Ok(name), }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }, map: |(value, name)| (name, value), }
                 })
                 .collect(),
             policy,
@@ -361,25 +361,25 @@ where
     if writer_available {
         result.with_writer(move |items: BTreeMap<String, A>, mut writer| {
             if items.len() > policy.limits.collection.get() {
-                return effect_try_sync! { once; body: { let __dsl_result = Err(width()); move || __dsl_result }, on_error: ::core::convert::identity, };
+                return crate::effect_from_result! { once; result: Err(width()), };
             }
             if let Err(issue) = writer.begin_object() {
-                return effect_try_sync! { once; body: { let __dsl_result = Err(issue); move || __dsl_result }, on_error: ::core::convert::identity, };
+                return crate::effect_from_result! { once; result: Err(issue), };
             }
-            let mut result = effect_try_sync! { once; body: { let __dsl_result = Ok(writer); move || __dsl_result }, on_error: ::core::convert::identity, };
+            let mut result = crate::effect_from_result! { once; result: Ok(writer), };
             for (name, item) in items {
                 let codec = writer_codec.clone();
-                result = { let __dsl_program = { let __dsl_left_program = result; let __dsl_right_program = effect_try_sync! { once; body: { let __dsl_result = Ok((name, item)); move || __dsl_result }, on_error: ::core::convert::identity, }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }; effect! {
+                result = { let __dsl_program = { let __dsl_left_program = result; let __dsl_right_program = crate::effect_from_result! { once; result: Ok((name, item)), }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }; effect! {
                     let __dsl_program = __dsl_program.clone(); let codec = codec.clone(); let (mut writer , (name , item)) = __dsl_program.clone()?; (move || {
                         if let Err(issue) = writer.property(&name) {
-                            return effect_try_sync! { once; body: { let __dsl_result = Err(issue); move || __dsl_result }, on_error: ::core::convert::identity, };
+                            return crate::effect_from_result! { once; result: Err(issue), };
                         }
                         codec.write_into_once(item, writer)
                     })()? } };
             }
             { let __dsl_program = result; effect! {
                 let mut writer = __dsl_program.clone()?; {
-                effect_try_sync! { once; body: { let __dsl_result = writer.end_object().map(|()| writer); move || __dsl_result }, on_error: ::core::convert::identity, }
+                crate::effect_from_result! { once; result: writer.end_object().map(|()| writer), }
             }? } }
         })
     } else {
@@ -488,7 +488,7 @@ impl<Encoded: Send + 'static, D: Send + Sync + 'static, E: Send + Sync + 'static
         true
     }
     fn write(&self, _: (), writer: super::JsonWriter) -> Effect<super::JsonWriter, SchemaIssue, E> {
-        effect_try_sync! { once; body: { let __dsl_result = Ok(writer); move || __dsl_result }, on_error: ::core::convert::identity, }
+        crate::effect_from_result! { once; result: Ok(writer), }
     }
     fn properties(&self, _: &mut Vec<SchemaProperty>) -> Result<(), SchemaIssue> {
         Ok(())
@@ -539,10 +539,10 @@ where
         mut writer: super::JsonWriter,
     ) -> Effect<super::JsonWriter, SchemaIssue, E> {
         let field = if self.omit.as_ref().is_some_and(|omit| omit(&value)) {
-            effect_try_sync! { once; body: { let __dsl_result = Ok(writer); move || __dsl_result }, on_error: ::core::convert::identity, }
+            crate::effect_from_result! { once; result: Ok(writer), }
         } else {
             if let Err(issue) = writer.property(&self.name) {
-                return effect_try_sync! { once; body: { let __dsl_result = Err(issue); move || __dsl_result }, on_error: ::core::convert::identity, };
+                return crate::effect_from_result! { once; result: Err(issue), };
             }
             self.codec.write_into_once(value, writer)
         };
@@ -550,7 +550,7 @@ where
         {
             let __dsl_program = {
                 let __dsl_left_program = field;
-                let __dsl_right_program = effect_try_sync! { once; body: { let __dsl_result = Ok(rest); move || __dsl_result }, on_error: ::core::convert::identity, };
+                let __dsl_right_program = crate::effect_from_result! { once; result: Ok(rest), };
                 effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) }
             };
             effect! { let fields = fields.clone(); let (writer , rest) = __dsl_program.clone()?; fields.write(rest, writer)? }
@@ -578,7 +578,7 @@ where
                 match child_context(&context, IssueSegment::Field(Arc::clone(&self.name))) {
                     Ok(child) => self.codec.decode_in(value, child),
                     Err(issue) => {
-                        effect_try_sync! { once; body: { let __dsl_result = Err(issue); move || __dsl_result }, on_error: ::core::convert::identity, }
+                        crate::effect_from_result! { once; result: Err(issue), }
                     }
                 }
             }
@@ -592,11 +592,9 @@ where
                     ) {
                         Ok(child) => child,
                         Err(issue) => {
-                            return effect_try_sync! {
-                                once; body: {
-                                let __dsl_result = Err(
+                            return crate::effect_from_result! { once; result: Err(
                                 issue.at(IssueSegment::Field(Arc::clone(&self.name)))
-                            ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                            ), };
                         }
                     };
                     {
@@ -620,11 +618,9 @@ where
                 }
                 None => {
                     let name = Arc::clone(&self.name);
-                    effect_try_sync! {
-                        body: {
-                        let __dsl_error = move || {
+                    crate::effect_fail! { error: {
                         SchemaIssue::new(SchemaIssueKind::MissingField(Arc::clone(&name)))
-                    }; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }
+                    }, }
                 }
             },
         };
@@ -649,18 +645,16 @@ where
             let child = match child_context(&context, IssueSegment::Field(Arc::clone(&self.name))) {
                 Ok(child) => child,
                 Err(issue) => {
-                    return effect_try_sync! {
-                        once; body: {
-                        let __dsl_result = Err(
+                    return crate::effect_from_result! { once; result: Err(
                         issue.at(IssueSegment::Field(Arc::clone(&self.name)))
-                    ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                    ), };
                 }
             };
             effect_map! {
             program: {
             let __dsl_left_program = effect_map_error! {
             program: self.codec
-            .encode_in(value, child), map: move |issue| issue.at(IssueSegment::Field(Arc::clone(&path))), }; let __dsl_right_program = effect_try_sync! { once; body: { let __dsl_result = Ok(self.name.to_string()); move || __dsl_result }, on_error: ::core::convert::identity, }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }, map: |(value, name)| vec![(name, value)], }
+            .encode_in(value, child), map: move |issue| issue.at(IssueSegment::Field(Arc::clone(&path))), }; let __dsl_right_program = crate::effect_from_result! { once; result: Ok(self.name.to_string()), }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }, map: |(value, name)| vec![(name, value)], }
         };
         effect_map! {
             program: collect_pair(
@@ -681,16 +675,14 @@ where
         budget: IssueBudget,
     ) -> Effect<Self::Values, SchemaIssue, E> {
         let field = if self.omit.as_ref().is_some_and(|omit| omit(&value)) {
-            effect_try_sync! { once; body: { let __dsl_result = Ok(value); move || __dsl_result }, on_error: ::core::convert::identity, }
+            crate::effect_from_result! { once; result: Ok(value), }
         } else {
             match child_context(&context, IssueSegment::Field(Arc::clone(&self.name))) {
                 Ok(child) => self.codec.validate_in(value, child),
                 Err(issue) => {
-                    return effect_try_sync! {
-                        once; body: {
-                        let __dsl_result = Err(
+                    return crate::effect_from_result! { once; result: Err(
                         issue.at(IssueSegment::Field(Arc::clone(&self.name)))
-                    ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                    ), };
                 }
             }
         };
@@ -895,8 +887,9 @@ impl<
                 let known = known.clone();
                 let decode = Arc::clone(&decode);
                 let construct = Arc::clone(&constructor);
-                Effect::try_sync_once(
-                    move || {
+                let object = effect_try_sync! {
+                    once;
+                    body: move || {
                         let object =
                             checked_fields(read.read(input, policy.limits)?, policy.limits)?;
                         if unknown_fields == UnknownFields::Reject
@@ -909,65 +902,70 @@ impl<
                         }
                         Ok(object)
                     },
-                    std::convert::identity,
-                )
-                .flat_map(move |mut object| {
-                    decode
-                        .decode(
+                };
+                effect! {
+                    bind;
+                    program: object,
+                    body: move |mut object| effect_map! {
+                        program: decode.decode(
                             &mut object,
                             context.clone(),
                             policy,
                             budget_for(&context, policy),
-                        )
-                        .map({
+                        ),
+                        map: {
                             let construct = Arc::clone(&construct);
                             move |values| construct(values)
-                        })
-                })
+                        },
+                    },
+                }
             },
             move |value, context| {
                 let policy = active_policy::<Encoded>(&context, policy);
                 let repr = Arc::clone(&repr);
-                fields
-                    .encode(
+                effect! {
+                    bind;
+                    program: fields.encode(
                         destructor(value),
                         context.clone(),
                         policy,
                         budget_for(&context, policy),
-                    )
-                    .flat_map(move |fields| {
+                    ),
+                    body: move |fields| {
                         let repr = Arc::clone(&repr);
-                        Effect::try_sync_once(
-                            move || repr.write(fields, policy.limits),
-                            std::convert::identity,
-                        )
-                    })
+                        effect_try_sync! { once; body: move || repr.write(fields, policy.limits), }
+                    },
+                }
             },
         )
         .with_context_validator(move |value, context| {
             let policy = active_policy::<Encoded>(&context, policy);
-            validate
-                .validate(
+            effect_map! {
+                program: validate.validate(
                     destruct(value),
                     context.clone(),
                     policy,
                     budget_for(&context, policy),
-                )
-                .map({
+                ),
+                map: {
                     let construct = Arc::clone(&construct);
                     move |values| construct(values)
-                })
+                },
+            }
         });
         Ok(if writer_available {
             codec.with_writer(move |value, mut writer| {
                 if let Err(issue) = writer.begin_object() {
-                    return Effect::from_result_once(Err(issue));
+                    return crate::effect_from_result! { once; result: Err(issue), };
                 }
-                writer_fields
-                    .write(writer_destruct(value), writer)
-                    .flat_map(|mut writer| {
-                        Effect::from_result_once(writer.end_object().map(|()| writer))
-                    })
+                effect! {
+                    bind;
+                    program: writer_fields.write(writer_destruct(value), writer),
+                    body: |mut writer| crate::effect_from_result! {
+                        once;
+                        result: writer.end_object().map(|()| writer),
+                    },
+                }
             })
         } else {
             codec
@@ -1041,33 +1039,31 @@ fn collect_pair<A: Send + 'static, B: Send + 'static, R: Send + Sync + 'static>(
             let second = second.clone();
             let budget = budget.clone();
             {
-                let __dsl_program = first.clone().either(); effect! {
+                let __dsl_program = crate::effect! { either; program: first.clone(), }; effect! {
                 let __dsl_program = __dsl_program.clone(); let budget = budget.clone(); let second = second.clone(); let first = __dsl_program.clone()?; (move || {
                 if let Err(issue) = &first {
                     if resource_issue(issue) {
-                        return effect_try_sync! { once; body: { let __dsl_result = Err(issue.clone()); move || __dsl_result }, on_error: ::core::convert::identity, };
+                        return crate::effect_from_result! { once; result: Err(issue.clone()), };
                     }
                     if let Err(issue) = budget
                         .record(before, issue)
                         .and_then(|()| budget.available())
                     {
-                        return effect_try_sync! { once; body: { let __dsl_result = Err(issue); move || __dsl_result }, on_error: ::core::convert::identity, };
+                        return crate::effect_from_result! { once; result: Err(issue), };
                     }
                 }
                 let budget = budget.clone();
                 let before_second = budget.used();
                 {
                     let __dsl_program = {
-                    let __dsl_left_program = second
-                    .clone()
-                    .either(); let __dsl_right_program = effect_try_sync! { once; body: { let __dsl_result = Ok(first); move || __dsl_result }, on_error: ::core::convert::identity, }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }; effect! {
+                    let __dsl_left_program = crate::effect! { either; program: second.clone(), }; let __dsl_right_program = crate::effect_from_result! { once; result: Ok(first), }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }; effect! {
                         let __dsl_program = __dsl_program.clone(); let budget = budget.clone(); let (second , first) = __dsl_program.clone()?; (move || {
                         if let Err(issue) = &second {
                             if resource_issue(issue) {
-                                return effect_try_sync! { once; body: { let __dsl_result = Err(issue.clone()); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                return crate::effect_from_result! { once; result: Err(issue.clone()), };
                             }
                             if let Err(issue) = budget.record(before_second, issue) {
-                                return effect_try_sync! { once; body: { let __dsl_result = Err(issue); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                return crate::effect_from_result! { once; result: Err(issue), };
                             }
                         }
                         let outcome = match (first, second) {
@@ -1081,9 +1077,9 @@ fn collect_pair<A: Send + 'static, B: Send + 'static, R: Send + Sync + 'static>(
                         if let Err(issue) = &outcome
                             && let Err(limit) = budget.record(before, issue)
                         {
-                            return effect_try_sync! { once; body: { let __dsl_result = Err(limit); move || __dsl_result }, on_error: ::core::convert::identity, };
+                            return crate::effect_from_result! { once; result: Err(limit), };
                         }
-                        effect_try_sync! { once; body: { let __dsl_result = outcome; move || __dsl_result }, on_error: ::core::convert::identity, }
+                        crate::effect_from_result! { once; result: outcome, }
                     })()? } }
             })()? } }
         }? }
@@ -1097,7 +1093,7 @@ fn all_schema<A: Send + 'static, R: Send + Sync + 'static>(
     if policy.errors == super::SchemaErrorMode::First {
         return effect_all! { items: effects, };
     }
-    let mut collected = effect_try_sync! { once; body: { let __dsl_result = Ok((Vec::new(), Vec::<SchemaIssue>::new())); move || __dsl_result }, on_error: ::core::convert::identity, };
+    let mut collected = crate::effect_from_result! { once; result: Ok((Vec::new(), Vec::<SchemaIssue>::new())), };
     let beginning = budget.used();
     for effect in effects {
         let budget = budget.clone();
@@ -1106,29 +1102,27 @@ fn all_schema<A: Send + 'static, R: Send + Sync + 'static>(
             effect! {
                 let __dsl_program = __dsl_program.clone(); let budget = budget.clone(); let effect = effect.clone(); let state = __dsl_program.clone()?; (move || {
                 if let Err(issue) = budget.available() {
-                    return effect_try_sync! { once; body: { let __dsl_result = Err(issue); move || __dsl_result }, on_error: ::core::convert::identity, };
+                    return crate::effect_from_result! { once; result: Err(issue), };
                 }
                 let before = budget.used();
                 let budget = budget.clone();
                 {
                     let __dsl_program = {
-                    let __dsl_left_program = effect
-                    .clone()
-                    .either(); let __dsl_right_program = effect_try_sync! { once; body: { let __dsl_result = Ok(state); move || __dsl_result }, on_error: ::core::convert::identity, }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }; effect! {
+                    let __dsl_left_program = crate::effect! { either; program: effect.clone(), }; let __dsl_right_program = crate::effect_from_result! { once; result: Ok(state), }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }; effect! {
                         let __dsl_program = __dsl_program.clone(); let budget = budget.clone(); let (result , (mut values , mut issues)) = __dsl_program.clone()?; (move || {
                         match result {
                             Ok(value) => values.push(value),
                             Err(issue) => {
                                 if resource_issue(&issue) {
-                                    return effect_try_sync! { once; body: { let __dsl_result = Err(issue); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                    return crate::effect_from_result! { once; result: Err(issue), };
                                 }
                                 if let Err(limit) = budget.record(before, &issue) {
-                                    return effect_try_sync! { once; body: { let __dsl_result = Err(limit); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                    return crate::effect_from_result! { once; result: Err(limit), };
                                 }
                                 issues.push(issue);
                             }
                         }
-                        effect_try_sync! { once; body: { let __dsl_result = Ok((values, issues)); move || __dsl_result }, on_error: ::core::convert::identity, }
+                        crate::effect_from_result! { once; result: Ok((values, issues)), }
                     })()? } }
             })()? }
         };
@@ -1147,9 +1141,9 @@ fn all_schema<A: Send + 'static, R: Send + Sync + 'static>(
             if let Err(issue) = &result
                 && let Err(limit) = budget.record(beginning, issue)
             {
-                return effect_try_sync! { once; body: { let __dsl_result = Err(limit); move || __dsl_result }, on_error: ::core::convert::identity, };
+                return crate::effect_from_result! { once; result: Err(limit), };
             }
-            effect_try_sync! { once; body: { let __dsl_result = result; move || __dsl_result }, on_error: ::core::convert::identity, }
+            crate::effect_from_result! { once; result: result, }
         })()? }
     }
 }

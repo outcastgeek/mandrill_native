@@ -123,7 +123,7 @@ where
             .acquire(NonZeroUsize::MIN), map: AtomCacheError::Admission, };
             effect! { let __dsl_program = __dsl_program.clone(); let cache = cache.clone(); let permit = __dsl_program.clone()?; {
                 let cache = cache.clone();
-                let action = { let __dsl_program = effect_map_error! { program: Effect::wall_now(), map: AtomCacheError::Clock, }; effect! { let __dsl_program = __dsl_program.clone(); let cache = cache.clone(); let now = __dsl_program.clone()?; {
+                let action = { let __dsl_program = effect_map_error! { program: crate::effect! { wall_now; }, map: AtomCacheError::Clock, }; effect! { let __dsl_program = __dsl_program.clone(); let cache = cache.clone(); let now = __dsl_program.clone()?; {
                         let cache = cache.clone();
                         let cache_for_status = cache.clone();
                         { let __dsl_program = effect_map_error! { program: cache
@@ -155,7 +155,7 @@ where
                                     }? } }; effect! { let cache_for_settled = cache_for_settled.clone(); let settled = __dsl_program.clone()?; {
                                         let cache = cache_for_settled.clone();
                                         let cache_for_update = cache.clone();
-                                        effect_map! { program: effect_map_error! { program: Effect::wall_now(), map: AtomCacheError::Clock, }, map: move |finished_at| {
+                                        effect_map! { program: effect_map_error! { program: crate::effect! { wall_now; }, map: AtomCacheError::Clock, }, map: move |finished_at| {
                                                 if let Some(generation) = settled.generation()
                                                     && matches!(
                                                         settled.outcome(),
@@ -178,7 +178,7 @@ where
                                     }? } }
                             })()? } }
                     }? } };
-                { let __dsl_program = action; let __dsl_cleanup = effect_sync! { once; body: move || drop(permit), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } }
+                { let __dsl_cleanup = effect_sync! { once; body: move || drop(permit), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| action.clone(), } }
             }? }
         }
     }

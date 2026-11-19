@@ -251,7 +251,7 @@ where
                                 source,
                             }
                         }, }, project: |_: &R| (), }?,
-                    None => effect_try_sync! { once; body: { let __dsl_result = Err(ClusterClientError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, }?,
+                    None => crate::effect_from_result! { once; result: Err(ClusterClientError::InputConsumed), }?,
                 }
         }
     }
@@ -312,7 +312,7 @@ where
                                 }),
                             }
                         };
-            effect_try_sync! { once; body: move || result, on_error: ::core::convert::identity, }?
+            crate::effect_from_result! { once; result: result, }?
         }
     }
 

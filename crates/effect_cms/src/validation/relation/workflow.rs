@@ -129,7 +129,7 @@ where
     effect! {
         let draft = draft.clone();
         let request = request.clone();
-        let attempted = check(draft.clone()).either()?;
+        let attempted = effect! { either; program: check(draft.clone()), }?;
         match attempted {
             Ok(observation) => {
                 if request.cancellation().is_requested() {
@@ -206,7 +206,7 @@ where
     effect! {
         let draft = draft.clone();
         let request = request.clone();
-        let attempted = application.validate(draft.clone()).either()?;
+        let attempted = effect! { either; program: application.validate(draft.clone()), }?;
         match attempted {
             Ok(result) => {
                 if request.cancellation().is_requested() {

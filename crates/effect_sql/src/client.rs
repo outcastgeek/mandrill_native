@@ -7,7 +7,8 @@ use crate::{
 use crate::{PreparedSqlBatch, PreparedSqlBatchItem, PreparedSqlRowLanes};
 use crate::prepared_rows::ReservedNativeRows;
 use crate::{
-    effect_future, effect_provide_some, effect_resource, effect_sync, effect_try_sync, row,
+    effect_fail, effect_from_result, effect_future, effect_provide_some, effect_resource, effect_sync,
+    row, sql,
 };
 use effect::__private::prepared_graph::{Description, Environment, FutureContext};
 use effect::memory::{MemoryError, MemoryPolicy};
@@ -262,17 +263,12 @@ fn prepared_statement_factory(
 }
 
 /// Immutable SQL service configuration; each run acquires a fresh native execution owner.
-#[derive(Clone)]
+#[derive(Clone, crate::EffectEnvironment)]
+#[effect_environment(sql_client = self)]
 #[must_use]
 pub struct SqlClient {
     /// Shared native kernel; cloned clients share configuration, not leases.
     kernel: SqlKernel,
-}
-impl HasSqlClient for SqlClient {
-    /// Select this explicit SQL environment.
-    fn sql_client(&self) -> &SqlClient {
-        self
-    }
 }
 impl SqlClient {
     /// Select a caller-owned local SQLx pool. Construction is inert and never creates a runtime.
@@ -975,12 +971,11 @@ fn batch_into_rows_atomic_selected<A: Send + 'static, R: Send + Sync + 'static>(
                     match session.first(statement).await {
                         Ok(None) if context.cancellation().is_requested() => Exit::Interrupted,
                         Ok(None) => Exit::Success(None),
-                        Ok(Some(row)) => match crate::row::failure_as::<_, Option<A>, _>(
-                            decoder
+                        Ok(Some(row)) => match decoder
                                 .decode(row, env, context.clone())
                                 .await
-                                .map_error(SqlError::Decode),
-                        ) {
+                                .map_error(SqlError::Decode)
+                                .into_failure::<Option<A>>() {
                             Ok(value) => Exit::Success(Some(value)),
                             Err(exit) => exit,
                         },
@@ -1079,23 +1074,25 @@ fn batch_into_rows_atomic_selected<A: Send + 'static, R: Send + Sync + 'static>(
         R: Send + Sync + 'static,
     {
         effect! {
-         bind;
-         program: self.first(
-                    statement,
-                    row! {
-        project: |row| {
+            bind;
+            program: sql! {
+                first;
+                client: self,
+                statement: statement,
+                decoder: row! {
+                    project: |row| {
                         row.try_get(0).map_err(|source| crate::RowError::Native {
                             column: "[0]".into(),
                             source,
                         })
                     },
-        },
-                ),
-         body: |value| match value {
-                    Some(value) => once_value(value),
-                    None => effect_try_sync! { body: { let __dsl_error = || SqlError::RowAbsent; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, },
                 },
-         }
+            },
+            body: |value| match value {
+                Some(value) => effect_sync! { once; body: move || value, },
+                None => effect_fail! { error: SqlError::RowAbsent, },
+            },
+        }
     }
     /// Execute an ordered batch of bound statements on one lease; it is not implicitly transactional.
     /// Each statement retains its own row/result sequence, including provider-supported multi-results.
@@ -1125,7 +1122,7 @@ fn batch_into_rows_atomic_selected<A: Send + 'static, R: Send + Sync + 'static>(
                     Err(error) => return error.into_exit(),
                 };
                 let program = session_batch(session.clone(), move || statements());
-                let outcome = AssertUnwindSafe(context.run(program, env))
+                let outcome = AssertUnwindSafe(effect::effect! { run_in_context; context: context, program: program, environment: env, })
                     .catch_unwind()
                     .await
                     .unwrap_or_else(|panic| Exit::Die(Defect::from_panic(panic)));
@@ -1146,9 +1143,14 @@ fn batch_into_rows_atomic_selected<A: Send + 'static, R: Send + Sync + 'static>(
         S: Send + 'static,
         R: Send + Sync + 'static,
     {
-        self.fold_rows_effect(statement, decoder, initial, move |state, value| {
-            once_result(step(state, value))
-        })
+        sql! {
+            fold_effect;
+            client: self,
+            statement: statement,
+            decoder: decoder,
+            initial: initial,
+            step: move |state, value| effect_from_result! { once; result: step(state, value), },
+        }
     }
     /// Fold decoded rows with Effects through the existing core Stream/Sink scope machinery.
     /// The cursor connection remains private; callbacks may open independent sessions through R.
@@ -1294,7 +1296,7 @@ fn batch_into_rows_atomic_selected<A: Send + 'static, R: Send + Sync + 'static>(
                         session: session.clone(),
                     })
                 })) {
-                    Ok(program) => context.run(program, env).await,
+                    Ok(program) => effect::effect! { run_in_context; context: context, program: program, environment: env, }.await,
                     Err(panic) => Exit::Die(Defect::from_panic(panic)),
                 };
                 append_session_close(outcome, &session).await
@@ -1358,7 +1360,7 @@ impl SqlTransaction {
         &self,
         statement: SqlStatement,
     ) -> Effect<u64, SqlError, R> {
-        self.execute(one_statement(statement))
+        sql! { execute; client: self, statement: one_statement(statement), }
     }
     /// Query decoded rows on the current frame with the original environment for validations.
     pub fn query<M, A: Send + 'static, R: Send + Sync + 'static>(
@@ -1954,7 +1956,7 @@ fn batch_into_rows_atomic_selected<A: Send + 'static, R: Send + Sync + 'static>(
                     Ok(session) => session,
                     Err(error) => return Exit::Fail(SqlError::Memory(error)),
                 };
-                match session.with_native(|connection| body(connection)).await {
+                match sql! { session_native; session: session, body: |connection| body(connection), }.await {
                     Ok(value) => Exit::Success(value),
                     Err(error) => error.into_exit(),
                 }
@@ -1978,7 +1980,7 @@ impl Sql {
         effect! {
             let statement = statement.clone();
             let client = service! { env |env: &R| { env.sql_client().clone() }, }?;
-            client.execute(move || statement())?
+            sql! { execute; client: client, statement: move || statement(), }?
         }
     }
     /// Decode a fresh or transferred statement using the selected client and original R.
@@ -1995,7 +1997,7 @@ impl Sql {
             let statement = statement.clone();
             let decoder = decoder.clone();
             let client = service! { env |env: &R| { env.sql_client().clone() }, }?;
-            client.query(move || statement(), decoder)?
+            sql! { query; client: client, statement: move || statement(), decoder: decoder, }?
         }
     }
     /// Decode one optional row from a factory or owned input; only true absence becomes None.
@@ -2012,7 +2014,7 @@ impl Sql {
             let statement = statement.clone();
             let decoder = decoder.clone();
             let client = service! { env |env: &R| { env.sql_client().clone() }, }?;
-            client.first(move || statement(), decoder)?
+            sql! { first; client: client, statement: move || statement(), decoder: decoder, }?
         }
     }
 }
@@ -2175,7 +2177,7 @@ async fn run_savepoint<A: Send + 'static, R: Send + Sync + 'static>(
 ) -> Exit<A, SqlError> {
     run_savepoint_async(session, reservation, cleanup, env, context, move |tx, env, context| async move {
         match catch_unwind(AssertUnwindSafe(|| body(tx))) {
-            Ok(program) => context.run(program, env).await,
+            Ok(program) => effect::effect! { run_in_context; context: context, program: program, environment: env, }.await,
             Err(panic) => Exit::Die(Defect::from_panic(panic)),
         }
     }).await
@@ -2449,7 +2451,7 @@ async fn run_transaction<A: Send + 'static, R: Send + Sync + 'static>(
 ) -> Exit<A, SqlError> {
     run_transaction_async(kernel, reservation, connection, cleanup, env, context, move |tx, env, context| async move {
         match catch_unwind(AssertUnwindSafe(|| body(tx))) {
-            Ok(program) => context.run(program, env).await,
+            Ok(program) => effect::effect! { run_in_context; context: context, program: program, environment: env, }.await,
             Err(panic) => Exit::Die(Defect::from_panic(panic)),
         }
     }).await
@@ -3229,20 +3231,6 @@ fn session_query_rows_once<A: Send + 'static, R: Send + Sync + 'static>(
     session_query_destination_once(session, statement, RowsDestination { rows: builder, decoder }, first)
 }
 
-/// Lift one moved value into core's existing single-use workflow rather than cloning it.
-fn once_value<A: Send + 'static, R: Send + Sync + 'static>(value: A) -> Effect<A, SqlError, R> {
-    effect_sync! { once; body: move || value, }
-}
-/// Lift an explicit Result without interpreting arbitrary Result ? as an Effect bind.
-#[expect(
-    clippy::result_large_err,
-    reason = "retains the owned SQL error representation without an extra heap allocation"
-)]
-fn once_result<A: Send + 'static, R: Send + Sync + 'static>(
-    result: Result<A, SqlError>,
-) -> Effect<A, SqlError, R> {
-    effect_try_sync! { once; body: { let __dsl_result = result; move || __dsl_result }, on_error: ::core::convert::identity, }
-}
 /// Execute one fresh statement on a scoped frame with cooperative cancellation at boundaries.
 fn session_execute<M, R: Send + Sync + 'static>(
     session: NativeSession,
@@ -3326,7 +3314,7 @@ async fn run_buffered_query<A: Send + 'static, R: Send + Sync + 'static>(
                 return Exit::Fail(SqlError::Memory(effect::memory::MemoryError::CollectionReservationFailed));
             }
             let outcome = decoder.decode(row, env.clone(), context.clone()).await.map_error(SqlError::Decode);
-            match crate::row::failure_as(outcome) {
+            match outcome.into_failure() {
                 Ok(value) => values.push(value),
                 Err(exit) => return exit,
             }
@@ -3369,12 +3357,11 @@ where
                         None => return Exit::Fail(SqlError::InactiveSession),
                     };
                     match cursor.next_row().await {
-                        Ok(Some(row)) => match crate::row::failure_as(
-                            decoder
+                        Ok(Some(row)) => match decoder
                                 .decode(row, env, context)
                                 .await
-                                .map_error(SqlError::Decode),
-                        ) {
+                                .map_error(SqlError::Decode)
+                                .into_failure() {
                             Ok(value) => Exit::Success(effect::Chunk::Values(vec![value])),
                             Err(exit) => exit,
                         },
@@ -3429,15 +3416,32 @@ macro_rules! scoped_operations {
             where T: Send + 'static + Type<Turso>, for<'a> T: Decode<'a, Turso>, R: Send + Sync + 'static {
                 effect! {
  bind;
- program: self.first(statement, row! {
-project: |row| row.try_get(0).map_err(|source| crate::RowError::Native { column: "[0]".into(), source }),
-}),
- body: |value| match value { Some(value) => once_value(value), None => effect_try_sync! { body: { let __dsl_error = || SqlError::RowAbsent; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, } },
+ program: sql! {
+    first;
+    client: self,
+    statement: statement,
+    decoder: row! {
+        project: |row| row.try_get(0).map_err(|source| crate::RowError::Native { column: "[0]".into(), source }),
+    },
+ },
+ body: |value| match value {
+    Some(value) => effect_sync! { once; body: move || value, },
+    None => effect_fail! { error: SqlError::RowAbsent, },
+ },
  }
             }
             /// Incrementally fold native rows without buffering; the enclosing scope retains the lease.
             pub fn fold_rows<M, A, S, R>(&self, statement: impl StatementSource<M>, decoder: RowDecoder<A, R>, initial: impl Fn() -> S + Send + Sync + 'static, step: impl Fn(S, A) -> Result<S, SqlError> + Send + Sync + 'static) -> Effect<S, SqlError, R>
-            where A: Send + 'static, S: Send + 'static, R: Send + Sync + 'static { self.fold_rows_effect(statement, decoder, initial, move |state, row| once_result(step(state, row))) }
+            where A: Send + 'static, S: Send + 'static, R: Send + Sync + 'static {
+                sql! {
+                    fold_effect;
+                    client: self,
+                    statement: statement,
+                    decoder: decoder,
+                    initial: initial,
+                    step: move |state, row| effect_from_result! { once; result: step(state, row), },
+                }
+            }
             /// Fold rows through core Stream/Sink and the selected R; row callbacks cannot reopen this live cursor frame.
             pub fn fold_rows_effect<M, A, S, R>(&self, statement: impl StatementSource<M>, decoder: RowDecoder<A, R>, initial: impl Fn() -> S + Send + Sync + 'static, step: impl Fn(S, A) -> Effect<S, SqlError, R> + Send + Sync + 'static) -> Effect<S, SqlError, R>
             where A: Send + 'static, S: Send + 'static, R: Send + Sync + 'static { session_fold(self.session.clone(), statement, decoder, initial, step) }
@@ -3463,7 +3467,7 @@ impl SqlSession {
         &self,
         statement: SqlStatement,
     ) -> Effect<u64, SqlError, R> {
-        self.execute(one_statement(statement))
+        sql! { execute; client: self, statement: one_statement(statement), }
     }
     /// Execute a checked SQLx/native callback under a lifetime-bound exclusive connection borrow.
     pub fn native<A: Send + 'static, R: Send + Sync + 'static>(
@@ -3473,10 +3477,11 @@ impl SqlSession {
         + Sync
         + 'static,
     ) -> Effect<A, SqlError, R> {
-        SqlTransaction {
-            session: self.session.clone(),
+        sql! {
+            native;
+            client: SqlTransaction { session: self.session.clone() },
+            body: body,
         }
-        .native(body)
     }
 }
 impl SqlClient {
@@ -3504,7 +3509,7 @@ impl SqlClient {
                         session: session.clone(),
                     })
                 })) {
-                    Ok(program) => context.run(program, env).await,
+                    Ok(program) => effect::effect! { run_in_context; context: context, program: program, environment: env, }.await,
                     Err(panic) => Exit::Die(Defect::from_panic(panic)),
                 };
                 append_session_close(outcome, &session).await
@@ -3542,7 +3547,7 @@ impl SqlClient {
                         session: session.clone(),
                     })
                 })) {
-                    Ok(program) => context.run(program, env).await,
+                    Ok(program) => effect::effect! { run_in_context; context: context, program: program, environment: env, }.await,
                     Err(panic) => Exit::Die(Defect::from_panic(panic)),
                 };
                 append_session_close(outcome, &session).await
@@ -3568,7 +3573,7 @@ impl Sql {
         program: service! { env: |env: &R| env.sql_client().clone(), },
         body: move |client| {
                    let statement = statement.clone();
-                   client.scalar(move || statement())
+                   sql! { scalar; client: client, statement: move || statement(), }
                },
         }
     }
@@ -3601,12 +3606,11 @@ fn session_first<M, A: Send + 'static, R: Send + Sync + 'static>(
             match session.first(statement).await {
                 Ok(None) if context.cancellation().is_requested() => Exit::Interrupted,
                 Ok(None) => Exit::Success(None),
-                Ok(Some(row)) => match crate::row::failure_as(
-                    decoder
+                Ok(Some(row)) => match decoder
                         .decode(row, env, context)
                         .await
-                        .map_error(SqlError::Decode),
-                ) {
+                        .map_error(SqlError::Decode)
+                        .into_failure() {
                     Ok(value) => Exit::Success(Some(value)),
                     Err(exit) => exit,
                 },

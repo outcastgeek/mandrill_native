@@ -223,7 +223,7 @@ impl<U: Send + Sync + 'static> JobQueue<U> {
     ) -> Effect<OwnedJob<U>, PreferenceError<W>, R> {
         match self {
             Self::Ordinary(queue, _) => effect_map! {
-                program: effect_map_error! { program: queue.take(), map: PreferenceError::Queue, },
+                program: effect_map_error! { program: effect! { queue_take; queue: queue, }, map: PreferenceError::Queue, },
                 map: OwnedJob::Ordinary,
             },
             Self::Prepared(queue) => {
@@ -241,7 +241,7 @@ impl<U: Send + Sync + 'static> JobQueue<U> {
                                 Err(error) => return Exit::Fail(PreferenceError::Memory(error)),
                             };
                             let outcome = await_queue(cancelled, take).await.map_error(PreferenceError::Queue);
-                            match crate::split_exit(outcome) {
+                            match outcome.into_failure() {
                                 Ok(item) => Exit::Success(OwnedJob::Prepared(item)),
                                 Err(failure) => failure,
                             }
@@ -261,7 +261,7 @@ impl<U: Send + Sync + 'static> JobQueue<U> {
         };
         match self {
             Self::Ordinary(queue, _) => effect_map_error! {
-                program: queue.shutdown(mode), map: PreferenceError::Queue,
+                program: effect! { queue_shutdown; queue: queue, mode: mode, }, map: PreferenceError::Queue,
             },
             Self::Prepared(queue) => {
                 let queue = queue.clone();
@@ -419,7 +419,12 @@ impl<U: Send + Sync + 'static, W: Send + 'static> LocalePreferences<U, W> {
                         let inject = worker_inject.clone();
                         async move {
                             loop {
-                                let job = match context.run(preferences.queue.take(), env.clone()).await {
+                                let job = match effect::effect! {
+                                    run_in_context;
+                                    context: context,
+                                    program: effect! { queue_take; queue: preferences.queue, },
+                                    environment: env.clone(),
+                                }.await {
                                     Exit::Success(job) => job,
                                     Exit::Fail(PreferenceError::Queue(QueueError::Shutdown)) => return Exit::Success(()),
                                     Exit::Fail(error) => return Exit::Fail(inject(error)),
@@ -449,8 +454,12 @@ impl<U: Send + Sync + 'static, W: Send + 'static> LocalePreferences<U, W> {
                                     },
                                     None => None,
                                 };
-                                match context
-                                    .run(writer(job.user.clone(), job.culture.clone()), env.clone())
+                                match effect::effect! {
+                                    run_in_context;
+                                    context: context,
+                                    program: writer(job.user.clone(), job.culture.clone()),
+                                    environment: env.clone(),
+                                }
                                     .await
                                 {
                                     Exit::Success(()) => {
@@ -494,7 +503,7 @@ impl<U: Send + Sync + 'static, W: Send + 'static> LocalePreferences<U, W> {
          program: close,
          body: move |()| {
                         let preferences = preferences.clone();
-                        effect_map! { program: scope.fork(worker.clone()), map: move |_| preferences.clone(), }
+                        effect_map! { program: effect::effect_scope! { fork; scope: scope, program: worker.clone(), }, map: move |_| preferences.clone(), }
                     },
          }
             },
@@ -533,11 +542,14 @@ impl<U: Send + Sync + 'static, W: Send + 'static> LocalePreferences<U, W> {
                 effect_map! {
                     program: effect_timeout! {
                     program: effect_map_error! {
-                    program: queue
-                    .offer_with({
-                        let job = job.clone();
-                        move || job.clone()
-                    }), map: PreferenceError::Queue, },
+                    program: effect! {
+                        queue_offer_with;
+                        queue: queue,
+                        factory: {
+                            let job = job.clone();
+                            move || job.clone()
+                        },
+                    }, map: PreferenceError::Queue, },
                     duration: deadline,
                     on_timeout: || PreferenceError::TimedOut,
                     }, map: |()| PreferenceSubmission::Accepted, }
@@ -552,7 +564,7 @@ impl<U: Send + Sync + 'static, W: Send + 'static> LocalePreferences<U, W> {
             | PreferenceError::Admission(
                 AdmissionError::Closed | AdmissionError::Overflow,
             )
-            | PreferenceError::Definition(_) | PreferenceError::Memory(_)) => effect_try_sync! { once; body: { let __dsl_result = Err(error); move || __dsl_result }, on_error: ::core::convert::identity, },
+            | PreferenceError::Definition(_) | PreferenceError::Memory(_)) => effect::effect_from_result! { once; result: Err(error), },
         }, }
     }
     /// Read protected immutable status without retaining request-scoped capabilities.
@@ -602,7 +614,7 @@ where
                     Err(error) => return Exit::Fail(PreferenceError::Memory(error)),
                 };
                 let outcome = await_queue(cancelled, offer).await.map_error(PreferenceError::Queue);
-                match crate::split_exit(outcome) {
+                match outcome.into_failure() {
                     Ok(()) => Exit::Success(PreferenceSubmission::Accepted),
                     Err(failure) => failure,
                 }
@@ -618,10 +630,7 @@ where
         recover: |error| match error {
             PreferenceError::TimedOut => effect_sync! { body { PreferenceSubmission::Busy }, },
             error @ (PreferenceError::Writer(_) | PreferenceError::Queue(_) | PreferenceError::Admission(_)
-                | PreferenceError::Definition(_) | PreferenceError::Memory(_)) => effect_try_sync! {
-                once; body: { let __dsl_result = Err(error); move || __dsl_result },
-                on_error: ::core::convert::identity,
-            },
+                | PreferenceError::Definition(_) | PreferenceError::Memory(_)) => effect::effect_from_result! { once; result: Err(error), },
         },
     }
 }

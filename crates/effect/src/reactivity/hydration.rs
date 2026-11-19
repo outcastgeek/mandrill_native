@@ -452,8 +452,7 @@ impl<R: Send + Sync + 'static> HydrationSet<R> {
                     .map(|(binding, record)| {
                         let atom = binding.atom.clone();
                         effect_map! {
-                            program: (binding.import)(record, policy)
-                            .either(), map: move |outcome| HydrationRecordResult {
+                            program: crate::effect! { either; program: (binding.import)(record, policy), }, map: move |outcome| HydrationRecordResult {
                                 atom: atom.clone(),
                                 outcome,
                             }, }
@@ -526,7 +525,7 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
         schema: HydrationSchema<A>,
     ) -> Effect<Arc<[u8]>, HydrationError, R> {
         if schema.atom != self.id {
-            return effect_try_sync! { once; body: { let __dsl_result = Err(HydrationError::WrongAtom); move || __dsl_result }, on_error: ::core::convert::identity, };
+            return crate::effect_from_result! { once; result: Err(HydrationError::WrongAtom), };
         }
         let source = self.clone();
         {
@@ -546,9 +545,9 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
                             .revision
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        effect_try_sync! { once; body: { let __dsl_result = schema.encode(&value, revision); move || __dsl_result }, on_error: ::core::convert::identity, }
+                        crate::effect_from_result! { once; result: schema.encode(&value, revision), }
                     }? } };
-                { let __dsl_program = snapshot; let __dsl_cleanup = effect_sync! { once; body: move || drop(permit), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } }
+                { let __dsl_cleanup = effect_sync! { once; body: move || drop(permit), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| snapshot.clone(), } }
             }? }
         }
     }
@@ -574,7 +573,7 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
         policy: HydrationConflictPolicy,
     ) -> Effect<HydrationImportOutcome, HydrationError, R> {
         if schema.atom != self.id {
-            return effect_try_sync! { once; body: { let __dsl_result = Err(HydrationError::WrongAtom); move || __dsl_result }, on_error: ::core::convert::identity, };
+            return crate::effect_from_result! { once; result: Err(HydrationError::WrongAtom), };
         }
         let bytes = Mutex::new(Some(bytes));
         let decoded = effect_try_sync! {
@@ -614,7 +613,7 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                                    .take();
                                let Some(value) = value else {
-                                   return effect_try_sync! { once; body: { let __dsl_result = Err(E::from(HydrationError::InputConsumed)); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                   return crate::effect_from_result! { once; result: Err(E::from(HydrationError::InputConsumed)), };
                                };
                                let current = *source
                                    .revision
@@ -622,12 +621,10 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                                let (revision, forced) = match policy {
                                    HydrationConflictPolicy::OnlyIfNewer if incoming <= current => {
-                                       return effect_try_sync! {
-                                           once; body: {
-                                           let __dsl_result = Err(E::from(HydrationError::Stale {
+                                       return crate::effect_from_result! { once; result: Err(E::from(HydrationError::Stale {
                                            current,
                                            incoming,
-                                       })); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                       })), };
                                    }
                                    HydrationConflictPolicy::OnlyIfNewer => (incoming, false),
                                    HydrationConflictPolicy::ForceMonotonic if incoming > current => {
@@ -637,11 +634,9 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
                                        let Some(revision) =
                                            current.get().checked_add(1).and_then(NonZeroU64::new)
                                        else {
-                                           return effect_try_sync! {
-                                               once; body: {
-                                               let __dsl_result = Err(
+                                           return crate::effect_from_result! { once; result: Err(
                                                E::from(HydrationError::RevisionExhausted),
-                                           ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                           ), };
                                        };
                                        (revision, true)
                                    }

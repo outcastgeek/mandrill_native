@@ -24,7 +24,7 @@ use time::OffsetDateTime;
 
 use super::error::provider_category;
 use super::executor::{StoreConnection, StoreRows};
-use effect_sql::{SqlError, kernel::NativeOperation};
+use effect_sql::{SqlError, kernel::NativeOperation, sql};
 use identity_rs::identity::store::{BrowserContext, BrowserContextStore, RolePage, UserPage};
 use sqlx::Row;
 
@@ -126,10 +126,9 @@ impl UserStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation { security: self.security_scope()?, new_user })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { transaction_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, new_user }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn update_user(&self, update: UserUpdate) -> Result<IdentityUser, StoreError> {
@@ -171,10 +170,9 @@ impl UserStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation { security: self.security_scope()?, update })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { transaction_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, update }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn delete_user(&self, id: &UserId) -> Result<(), StoreError> {
@@ -211,10 +209,9 @@ impl UserStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation { security: self.security_scope()?, id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { transaction_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Reads bounded native state through one operation-owned SQL lease; absence and backend failures remain distinct.
     async fn find_user_by_id(&self, id: &UserId) -> Result<Option<IdentityUser>, StoreError> {
@@ -241,10 +238,9 @@ impl UserStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Reads bounded native state through one operation-owned SQL lease; absence and backend failures remain distinct.
     async fn find_user_by_normalized_name(
@@ -284,10 +280,9 @@ impl UserStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, normalized_name })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, normalized_name }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Reads bounded native state through one operation-owned SQL lease; absence and backend failures remain distinct.
     async fn find_user_by_normalized_email_for_validation(
@@ -327,10 +322,9 @@ impl UserStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, normalized_email })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, normalized_email }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
 }
 impl QueryableUserStore for SqlxIdentityStore {
@@ -388,10 +382,9 @@ impl QueryableUserStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, after, limit })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, after, limit }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
 }
 impl UserEmailStore for SqlxIdentityStore {
@@ -426,10 +419,9 @@ impl UserEmailStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Uses the selected native account/token operation; no hidden provider is acquired.
     async fn set_email(
@@ -474,10 +466,9 @@ impl UserEmailStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Reads bounded native state through one operation-owned SQL lease; absence and backend failures remain distinct.
     async fn find_user_by_normalized_email(
@@ -517,10 +508,9 @@ impl UserEmailStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, normalized_email })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, normalized_email }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Uses the selected native account/token operation; no hidden provider is acquired.
     async fn set_normalized_email(
@@ -565,10 +555,9 @@ impl UserEmailStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Uses the selected native account/token operation; no hidden provider is acquired.
     async fn set_email_confirmed(
@@ -615,10 +604,9 @@ impl UserPhoneNumberStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Uses the selected native account/token operation; no hidden provider is acquired.
     async fn set_phone_number(
@@ -660,10 +648,9 @@ impl UserPhoneNumberStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Uses the selected native account/token operation; no hidden provider is acquired.
     async fn set_phone_number_confirmed(
@@ -736,14 +723,15 @@ impl UserRoleStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation {
+        sql! {
+            transaction_operation; kernel: self.kernel, operation: Operation {
                 security: self.security_scope()?,
                 id,
                 normalized_role_name,
-            })
-            .await
-            .map_err(|error| self.narrow(error))
+            },
+        }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn remove_user_from_role(
@@ -801,14 +789,15 @@ impl UserRoleStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation {
+        sql! {
+            transaction_operation; kernel: self.kernel, operation: Operation {
                 security: self.security_scope()?,
                 id,
                 normalized_role_name,
-            })
-            .await
-            .map_err(|error| self.narrow(error))
+            },
+        }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Reads bounded native state through one operation-owned SQL lease; absence and backend failures remain distinct.
     async fn get_user_roles(&self, id: &UserId) -> Result<Vec<NormalizedUserName>, StoreError> {
@@ -867,10 +856,9 @@ impl UserRoleStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Reads bounded native state through one operation-owned SQL lease; absence and backend failures remain distinct.
     async fn is_user_in_role(
@@ -929,14 +917,15 @@ impl UserRoleStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation {
+        sql! {
+            connection_operation; kernel: self.kernel, operation: Operation {
                 security: self.security_scope()?,
                 id,
                 normalized_role_name,
-            })
-            .await
-            .map_err(|error| self.narrow(error))
+            },
+        }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Reads bounded native state through one operation-owned SQL lease; absence and backend failures remain distinct.
     async fn get_users_in_role_page(
@@ -991,15 +980,16 @@ impl UserRoleStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation {
+        sql! {
+            connection_operation; kernel: self.kernel, operation: Operation {
                 security: self.security_scope()?,
                 normalized_role_name,
                 after,
                 limit,
-            })
-            .await
-            .map_err(|error| self.narrow(error))
+            },
+        }
+        .await
+        .map_err(|error| self.narrow(error))
     }
 }
 impl UserClaimStore for SqlxIdentityStore {
@@ -1047,10 +1037,9 @@ impl UserClaimStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn add_user_claims(
@@ -1117,10 +1106,9 @@ impl UserClaimStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation { security: self.security_scope()?, id, claims })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { transaction_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id, claims }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn replace_user_claim(
@@ -1185,15 +1173,16 @@ impl UserClaimStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation {
+        sql! {
+            transaction_operation; kernel: self.kernel, operation: Operation {
                 security: self.security_scope()?,
                 id,
                 claim,
                 replacement,
-            })
-            .await
-            .map_err(|error| self.narrow(error))
+            },
+        }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn remove_user_claims(
@@ -1253,10 +1242,9 @@ impl UserClaimStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation { security: self.security_scope()?, id, claims })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { transaction_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id, claims }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Reads bounded native state through one operation-owned SQL lease; absence and backend failures remain distinct.
     async fn get_users_for_claim_page(
@@ -1311,15 +1299,16 @@ impl UserClaimStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation {
+        sql! {
+            connection_operation; kernel: self.kernel, operation: Operation {
                 security: self.security_scope()?,
                 claim,
                 after,
                 limit,
-            })
-            .await
-            .map_err(|error| self.narrow(error))
+            },
+        }
+        .await
+        .map_err(|error| self.narrow(error))
     }
 }
 impl UserLoginStore for SqlxIdentityStore {
@@ -1377,10 +1366,9 @@ impl UserLoginStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation { security: self.security_scope()?, id, login })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { transaction_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id, login }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn remove_user_login(
@@ -1445,15 +1433,16 @@ impl UserLoginStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation {
+        sql! {
+            transaction_operation; kernel: self.kernel, operation: Operation {
                 security: self.security_scope()?,
                 id,
                 login_provider,
                 provider_key,
-            })
-            .await
-            .map_err(|error| self.narrow(error))
+            },
+        }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Reads bounded native state through one operation-owned SQL lease; absence and backend failures remain distinct.
     async fn get_user_logins(&self, id: &UserId) -> Result<Vec<UserLoginInfo>, StoreError> {
@@ -1499,10 +1488,9 @@ impl UserLoginStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Reads bounded native state through one operation-owned SQL lease; absence and backend failures remain distinct.
     async fn find_user_by_login(
@@ -1555,14 +1543,15 @@ impl UserLoginStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation {
+        sql! {
+            connection_operation; kernel: self.kernel, operation: Operation {
                 security: self.security_scope()?,
                 login_provider,
                 provider_key,
-            })
-            .await
-            .map_err(|error| self.narrow(error))
+            },
+        }
+        .await
+        .map_err(|error| self.narrow(error))
     }
 }
 impl UserAuthenticationTokenStore for SqlxIdentityStore {
@@ -1632,15 +1621,16 @@ impl UserAuthenticationTokenStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation {
+        sql! {
+            connection_operation; kernel: self.kernel, operation: Operation {
                 security: self.security_scope()?,
                 id,
                 login_provider,
                 name,
-            })
-            .await
-            .map_err(|error| self.narrow(error))
+            },
+        }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn set_authentication_token(
@@ -1715,16 +1705,17 @@ impl UserAuthenticationTokenStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation {
+        sql! {
+            transaction_operation; kernel: self.kernel, operation: Operation {
                 security: self.security_scope()?,
                 id,
                 login_provider,
                 name,
                 value,
-            })
-            .await
-            .map_err(|error| self.narrow(error))
+            },
+        }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn replace_authentication_token_if_matches(
@@ -1797,17 +1788,18 @@ impl UserAuthenticationTokenStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation {
+        sql! {
+            transaction_operation; kernel: self.kernel, operation: Operation {
                 security: self.security_scope()?,
                 id,
                 login_provider,
                 name,
                 expected_value,
                 new_value,
-            })
-            .await
-            .map_err(|error| self.narrow(error))
+            },
+        }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn remove_authentication_token(
@@ -1864,15 +1856,16 @@ impl UserAuthenticationTokenStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation {
+        sql! {
+            transaction_operation; kernel: self.kernel, operation: Operation {
                 security: self.security_scope()?,
                 id,
                 login_provider,
                 name,
-            })
-            .await
-            .map_err(|error| self.narrow(error))
+            },
+        }
+        .await
+        .map_err(|error| self.narrow(error))
     }
 }
 impl UserPasskeyStore for SqlxIdentityStore {
@@ -1971,10 +1964,9 @@ impl UserPasskeyStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation { security: self.security_scope()?, id, passkey })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { transaction_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id, passkey }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn update_passkey_if_matches(
@@ -2032,15 +2024,16 @@ impl UserPasskeyStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation {
+        sql! {
+            transaction_operation; kernel: self.kernel, operation: Operation {
                 security: self.security_scope()?,
                 id,
                 expected,
                 updated,
-            })
-            .await
-            .map_err(|error| self.narrow(error))
+            },
+        }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Reads bounded native state through one operation-owned SQL lease; absence and backend failures remain distinct.
     async fn get_passkey(
@@ -2091,10 +2084,9 @@ impl UserPasskeyStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, id, credential_id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id, credential_id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Reads bounded native state through one operation-owned SQL lease; absence and backend failures remain distinct.
     async fn get_passkeys(&self, id: &UserId) -> Result<Vec<UserPasskeyInfo>, StoreError> {
@@ -2140,10 +2132,9 @@ impl UserPasskeyStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Reads bounded native state through one operation-owned SQL lease; absence and backend failures remain distinct.
     async fn find_user_by_passkey_credential_id(
@@ -2188,10 +2179,9 @@ impl UserPasskeyStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, credential_id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, credential_id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn remove_passkey(
@@ -2242,10 +2232,9 @@ impl UserPasskeyStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation { security: self.security_scope()?, id, credential_id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { transaction_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id, credential_id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
 }
 impl PasskeyChallengeStore for SqlxIdentityStore {
@@ -2337,14 +2326,15 @@ impl PasskeyChallengeStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation {
+        sql! {
+            transaction_operation; kernel: self.kernel, operation: Operation {
                 security: self.security_scope()?,
                 challenge_state,
                 policy: self.policy,
-            })
-            .await
-            .map_err(|error| self.narrow(error))
+            },
+        }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn take_passkey_challenge(
@@ -2424,15 +2414,16 @@ impl PasskeyChallengeStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation {
+        sql! {
+            transaction_operation; kernel: self.kernel, operation: Operation {
                 security: self.security_scope()?,
                 challenge,
                 purpose,
                 now,
-            })
-            .await
-            .map_err(|error| self.narrow(error))
+            },
+        }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn remove_expired_passkey_challenges(
@@ -2475,10 +2466,9 @@ impl PasskeyChallengeStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation { security: self.security_scope()?, now })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { transaction_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, now }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
 }
 impl UserLockoutStore for SqlxIdentityStore {
@@ -2516,10 +2506,9 @@ impl UserLockoutStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Uses the selected native account/token operation; no hidden provider is acquired.
     async fn set_lockout_end_date(
@@ -2573,10 +2562,9 @@ impl UserLockoutStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation { security: self.security_scope()?, id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { transaction_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Uses the selected native account/token operation; no hidden provider is acquired.
     async fn reset_access_failed_count(&self, id: &UserId) -> Result<IdentityUser, StoreError> {
@@ -2614,10 +2602,9 @@ impl UserLockoutStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Reads bounded native state through one operation-owned SQL lease; absence and backend failures remain distinct.
     async fn get_lockout_enabled(&self, id: &UserId) -> Result<bool, StoreError> {
@@ -2650,10 +2637,9 @@ impl UserLockoutStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Uses the selected native account/token operation; no hidden provider is acquired.
     async fn set_lockout_enabled(
@@ -2697,10 +2683,9 @@ impl UserTwoFactorStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Uses the selected native account/token operation; no hidden provider is acquired.
     async fn set_two_factor_enabled(
@@ -2783,10 +2768,9 @@ impl UserAuthenticatorKeyStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation { security: self.security_scope()?, id, key })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { transaction_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id, key }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn reset_authenticator_key(&self, id: &UserId) -> Result<(), StoreError> {
@@ -2827,10 +2811,9 @@ impl UserAuthenticatorKeyStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation { security: self.security_scope()?, id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { transaction_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
 }
 impl UserTwoFactorRecoveryCodeStore for SqlxIdentityStore {
@@ -2905,14 +2888,15 @@ impl UserTwoFactorRecoveryCodeStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation {
+        sql! {
+            transaction_operation; kernel: self.kernel, operation: Operation {
                 security: self.security_scope()?,
                 id,
                 recovery_code_hashes,
-            })
-            .await
-            .map_err(|error| self.narrow(error))
+            },
+        }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn redeem_recovery_code(
@@ -3005,10 +2989,9 @@ impl UserTwoFactorRecoveryCodeStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation { security: self.security_scope()?, id, recovery_code })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { transaction_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id, recovery_code }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Reads bounded native state through one operation-owned SQL lease; absence and backend failures remain distinct.
     async fn count_recovery_codes(&self, id: &UserId) -> Result<usize, StoreError> {
@@ -3059,10 +3042,9 @@ impl UserTwoFactorRecoveryCodeStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
 }
 impl RoleStore for SqlxIdentityStore {
@@ -3120,10 +3102,9 @@ impl RoleStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation { security: self.security_scope()?, new_role })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { transaction_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, new_role }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn update_role(&self, update: RoleUpdate) -> Result<IdentityRole, StoreError> {
@@ -3163,10 +3144,9 @@ impl RoleStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation { security: self.security_scope()?, update })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { transaction_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, update }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn delete_role(&self, id: &RoleId) -> Result<(), StoreError> {
@@ -3203,10 +3183,9 @@ impl RoleStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation { security: self.security_scope()?, id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { transaction_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Reads bounded native state through one operation-owned SQL lease; absence and backend failures remain distinct.
     async fn find_role_by_id(&self, id: &RoleId) -> Result<Option<IdentityRole>, StoreError> {
@@ -3233,10 +3212,9 @@ impl RoleStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Reads bounded native state through one operation-owned SQL lease; absence and backend failures remain distinct.
     async fn find_role_by_normalized_name(
@@ -3276,10 +3254,9 @@ impl RoleStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, normalized_name })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, normalized_name }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
 }
 impl QueryableRoleStore for SqlxIdentityStore {
@@ -3337,10 +3314,9 @@ impl QueryableRoleStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, after, limit })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, after, limit }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
 }
 impl RoleClaimStore for SqlxIdentityStore {
@@ -3388,10 +3364,9 @@ impl RoleClaimStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn add_role_claim(&self, id: &RoleId, claim: IdentityClaim) -> Result<(), StoreError> {
@@ -3445,10 +3420,9 @@ impl RoleClaimStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation { security: self.security_scope()?, id, claim })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { transaction_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id, claim }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn remove_role_claim(
@@ -3501,10 +3475,9 @@ impl RoleClaimStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation { security: self.security_scope()?, id, claim })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { transaction_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id, claim }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
 }
 impl identity_rs::identity::protection::storage::EncryptedPersonalDataStore for SqlxIdentityStore {
@@ -3556,10 +3529,9 @@ impl identity_rs::identity::protection::storage::EncryptedPersonalDataStore for 
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation { security: self.security_scope()?, record })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { transaction_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, record }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn update_protected_user(
@@ -3632,10 +3604,9 @@ impl identity_rs::identity::protection::storage::EncryptedPersonalDataStore for 
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation { security: self.security_scope()?, record, expected })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { transaction_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, record, expected }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Reads bounded native state through one operation-owned SQL lease; absence and backend failures remain distinct.
     async fn find_protected_user(
@@ -3674,10 +3645,9 @@ impl identity_rs::identity::protection::storage::EncryptedPersonalDataStore for 
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Reads bounded native state through one operation-owned SQL lease; absence and backend failures remain distinct.
     async fn find_protected_users(
@@ -3740,10 +3710,9 @@ impl identity_rs::identity::protection::storage::EncryptedPersonalDataStore for 
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, indexes })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, indexes }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
 }
 impl BrowserContextStore for SqlxIdentityStore {
@@ -3831,15 +3800,16 @@ impl BrowserContextStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation {
+        sql! {
+            transaction_operation; kernel: self.kernel, operation: Operation {
                 security: self.security_scope()?,
                 context,
                 now,
                 capacity,
-            })
-            .await
-            .map_err(|error| self.narrow(error))
+            },
+        }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Reads bounded native state through one operation-owned SQL lease; absence and backend failures remain distinct.
     async fn find_browser_context(
@@ -3890,10 +3860,9 @@ impl BrowserContextStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .connection_operation(Operation { security: self.security_scope()?, id, now })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { connection_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id, now }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn replace_browser_pending_authentication(
@@ -3959,17 +3928,18 @@ impl BrowserContextStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation {
+        sql! {
+            transaction_operation; kernel: self.kernel, operation: Operation {
                 security: self.security_scope()?,
                 id,
                 expected_token,
                 expected_pending,
                 value,
                 now,
-            })
-            .await
-            .map_err(|error| self.narrow(error))
+            },
+        }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn remove_browser_context(&self, id: uuid::Uuid) -> Result<(), StoreError> {
@@ -4005,10 +3975,9 @@ impl BrowserContextStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation { security: self.security_scope()?, id })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { transaction_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, id }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
     /// Commits the native command in one operation-owned SQL transaction; acknowledgment failure remains typed.
     async fn remove_expired_browser_contexts(
@@ -4049,10 +4018,9 @@ impl BrowserContextStore for SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Operation { security: self.security_scope()?, now })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { transaction_operation; kernel: self.kernel, operation: Operation { security: self.security_scope()?, now }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
 }
 /// Validate native persisted state or bind its fields inside the caller's owned SQL operation.
@@ -4645,10 +4613,9 @@ impl SqlxIdentityStore {
                 result.map_err(|error| diagnostics.command_error(error))
             }
         }
-        self.kernel
-            .transaction_operation(Contact { security: self.security_scope()?, id, update })
-            .await
-            .map_err(|error| self.narrow(error))
+        sql! { transaction_operation; kernel: self.kernel, operation: Contact { security: self.security_scope()?, id, update }, }
+        .await
+        .map_err(|error| self.narrow(error))
     }
 }
 /// Rotate credential/security metadata inside the caller's existing writer transaction.

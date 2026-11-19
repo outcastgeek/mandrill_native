@@ -1010,7 +1010,12 @@ where
         Ok(crate::endpoint::native_once(
             move |environment, context| async move {
                 let (exit, owner) = OrderedHost {
-                    future: Some(context.run(host, environment)),
+                    future: Some(effect::effect! {
+                        run_in_context;
+                        context: context,
+                        program: host,
+                        environment: environment,
+                    }),
                     owner: Some(owner),
                 }
                 .await;

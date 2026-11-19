@@ -1,12 +1,10 @@
-use crate::{CafeError, CafeHostStorage};
+use super::Environment;
+use crate::CafeError;
 use effect::memory::{Buffer, Bytes, FramePool, MemoryError, PreparedMemory, RegionId, SlotPool};
-use effect::{
-    HasCancellation, HasClock, HasTaskSpawner, PreparedCleanupConfig, PreparedCleanupPool,
-    PreparedSemaphore,
-};
+use effect::{PreparedCleanupConfig, PreparedCleanupPool, PreparedSemaphore};
 use effect_server::native::http::StatusCode;
 use effect_server::{
-    BodyStatus, HasRequest, HasTokio, PreparedEndpointBytePools, PreparedHostCapacity,
+    BodyStatus, PreparedEndpointBytePools, PreparedHostCapacity,
     PreparedHttp1Limits, PreparedHttpLimits, PreparedHttpTimeouts, PreparedRequestControlCapacity,
     PreparedRequestStorageCapacity, PreparedRequestStoragePool, PreparedServer, Server, ServerError,
     StaticOverloadReply, server,
@@ -88,10 +86,7 @@ impl HostStorage {
         })
     }
 
-    pub(super) fn region_bytes<R>(&self) -> Result<Bytes, MemoryError>
-    where
-        R: HasTokio + HasCancellation + HasTaskSpawner + Send + Sync + 'static,
-    {
+    pub(super) fn region_bytes(&self) -> Result<Bytes, MemoryError> {
         // Allow 64 regional allocations per connection and 64 independent
         // allocations, each with 64 bytes for headers, alignment and short tails.
         let connections = self
@@ -103,7 +98,7 @@ impl HostStorage {
         let slots = self.request.requests;
         let request_bytes = buffer_pool_bytes(slots, self.bytes)?.checked_mul(3)?;
         // The configured Web OTel installer contributes one completion observer.
-        PreparedServer::<CafeError, R>::host_region_bytes_with_request_controls(
+        PreparedServer::<CafeError, Environment>::host_region_bytes_with_request_controls(
             self.host,
             self.controls,
             1,
@@ -111,7 +106,7 @@ impl HostStorage {
         .checked_add(PreparedRequestStoragePool::demand(self.request)?.region_bytes)?
         .checked_add(FramePool::storage_bytes(
             1,
-            PreparedServer::<CafeError, R>::result_frame_layout::<()>(),
+            PreparedServer::<CafeError, Environment>::result_frame_layout::<()>(),
         )?)?
         .checked_add(
             PreparedCleanupPool::<CafeError>::storage_bytes_with_return_listeners(
@@ -145,22 +140,10 @@ fn buffer_pool_bytes(slots: usize, capacity: Bytes) -> Result<Bytes, MemoryError
 }
 
 /// Prepare the Web DSL's selected host inputs from the shared startup memory.
-#[allow(clippy::type_complexity)]
-pub(super) fn prepare_cafe_host<R>(
+pub(super) fn prepare_cafe_host(
     memory: PreparedMemory<'static>,
     storage: HostStorage,
-) -> Result<
-    CafeHostStorage<
-        impl Fn(Server<CafeError, R>) -> Result<PreparedServer<CafeError, R>, ServerError>
-        + Send
-        + Sync
-        + 'static,
-    >,
-    ServerError,
->
-where
-    R: HasRequest + HasTokio + HasCancellation + HasClock + HasTaskSpawner + Send + Sync + 'static,
-{
+) -> Result<CafeHostStorage, ServerError> {
     let region = RegionId::named("web_host");
     let buffers = || {
         memory
@@ -181,9 +164,37 @@ where
         BodyStatus::new(StatusCode::SERVICE_UNAVAILABLE)?,
         "The café is busy. Try again shortly.\n".as_bytes(),
     );
-    let memory = Mutex::new(Some(memory));
-    let factory = move |server: Server<CafeError, R>| {
-        let memory = memory
+    Ok(CafeHostStorage {
+        preparation: HostPreparation {
+            memory: Mutex::new(Some(memory)),
+            storage,
+        },
+        pools,
+        overload,
+    })
+}
+
+/// Prepared endpoint inputs and the remaining one-shot host arena.
+pub(crate) struct CafeHostStorage {
+    pub(crate) preparation: HostPreparation,
+    pub(crate) pools: Arc<PreparedEndpointBytePools>,
+    pub(crate) overload: StaticOverloadReply,
+}
+
+pub(crate) struct HostPreparation {
+    memory: Mutex<Option<PreparedMemory<'static>>>,
+    storage: HostStorage,
+}
+
+impl HostPreparation {
+    pub(crate) fn prepare(
+        &self,
+        server: Server<CafeError, Environment>,
+    ) -> Result<PreparedServer<CafeError, Environment>, ServerError> {
+        let storage = &self.storage;
+        let region = RegionId::named("web_host");
+        let memory = self
+            .memory
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
@@ -192,7 +203,7 @@ where
             .frames(
                 region,
                 1,
-                PreparedServer::<CafeError, R>::result_frame_layout::<()>(),
+                PreparedServer::<CafeError, Environment>::result_frame_layout::<()>(),
             )
             .map_err(ServerError::Memory)?;
         let cleanup_pool = PreparedCleanupPool::prepare_with_return_listeners(
@@ -223,20 +234,31 @@ where
             cleanup: PreparedCleanupConfig::new(cleanup_pool, cleanup_frames),
             request_controls: storage.controls,
         }?;
-        let prepared = prepared
-            .with_request_storage(requests)
-            .map_err(ServerError::Memory)?
-            .with_http_limits(PreparedHttpLimits {
+        let prepared = server! {
+            prepared_configure;
+            source: prepared,
+            request_storage(requests),
+        }
+        .map_err(ServerError::Memory)?;
+        let prepared = server! {
+            prepared_configure;
+            source: prepared,
+            http_limits(PreparedHttpLimits {
                 http1: Some(PreparedHttp1Limits {
                     max_headers: 100,
                     read_buffer_bytes: storage.bytes.get().max(8192),
                 }),
                 http2: None,
-            })?
-            .with_http_timeouts(PreparedHttpTimeouts {
+            }),
+        }?;
+        let prepared = server! {
+            prepared_configure;
+            source: prepared,
+            http_timeouts(PreparedHttpTimeouts {
                 first_head: Some(storage.window),
                 idle: Some(storage.window),
-            });
+            }),
+        };
         let prepared = if let Some((capacity, waiters)) = storage.queue {
             let queue = PreparedSemaphore::prepare(
                 &memory,
@@ -253,16 +275,15 @@ where
             })?;
             // Request heads should normally time out before HTTP idle closes
             // the socket, so they can use the existing static overload response.
-            prepared.with_request_queue(Arc::new(queue), storage.window / 2)
+            server! {
+                prepared_configure;
+                source: prepared,
+                request_queue(Arc::new(queue), storage.window / 2),
+            }
         } else {
             prepared
         };
         let _memory = memory.seal();
         Ok(prepared)
-    };
-    Ok(CafeHostStorage {
-        factory,
-        pools,
-        overload,
-    })
+    }
 }

@@ -5,7 +5,7 @@
 //! Request middleware trims the pickup name; the handler validates cup count
 //! and saves the actual ticket in the selected local order desk.
 
-use effect::{effect_die, effect_try_sync};
+use effect::{effect_die, effect_fail};
 pub mod cafe_support;
 use std::num::NonZeroUsize;
 pub mod order_tracking;
@@ -31,14 +31,14 @@ fn place_order() -> Effect<(), RpcProtocolError<OrderError>, CoffeeShop> {
         let operation_id = match OperationId::new("place-order") { Ok(value) => value, Err(error) => effect_die! { defect: effect::Defect::new(format!("operation: {error:?}")), }?, };
         let order_codec = match order_schema() { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, };
         let accepted_ticket_codec = match ticket_schema() { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, };
-        let domain_error_codec = match problem_schema() { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, };
+        let problem = match problem_schema() { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, };
         let accept = rpc_operation! {
             id: operation_id,
             version: RpcVersion::new(NonZeroU32::MIN), request: order_codec,
-            success: accepted_ticket_codec, error: domain_error_codec, limits: limits(),
+            success: accepted_ticket_codec, error: problem.clone(), limits: limits(),
             handler |order: CoffeeOrder| {
                 if !(1..=4).contains(&order.quantity) {
-                    { let __dsl_program: Effect < () , OrderProblem , CoffeeShop > = effect_try_sync! { body: { let __dsl_error = || OrderProblem::InvalidQuantity; move || Err(__dsl_error()) }, on_error: ::core::convert::identity, }; __dsl_program }?;
+                    let () = effect_fail! { error: OrderProblem::InvalidQuantity, }?;
                 }
                 let desk = service! { env |env: &CoffeeShop| { env.services.clone() }, }?;
                 let ticket = OrderTicket {
@@ -49,7 +49,6 @@ fn place_order() -> Effect<(), RpcProtocolError<OrderError>, CoffeeShop> {
                 ticket
             },
         };
-        let problem = match problem_schema() { Ok(problem) => problem, Err(error) => effect_die! { defect: error, }?, };
         let errors = match schema_enum! {
             enum OrderError {
                 Before(problem.clone()) => "input",
@@ -93,7 +92,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         NonZeroUsize::MIN.saturating_add(15),
         NonZeroUsize::MIN.saturating_add(3),
     );
-    let result = futures_executor::block_on(place_order().run(env.clone()));
+    let result = futures_executor::block_on(effect! {
+        run;
+        program: place_order(),
+        environment: env.clone(),
+    });
     env.base
         .finish()
         .map_err(|error| error.message().to_owned())?;

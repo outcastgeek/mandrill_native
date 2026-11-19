@@ -31,7 +31,10 @@ impl<S, A: Send + 'static, P: Send + 'static, R: Send + Sync + 'static>
         operation: impl Fn(&S) -> Result<A, X> + Send + Sync + 'static,
         on_error: impl Fn(X) -> P + Send + Sync + 'static,
     ) -> Self {
-        Self::new(move |service| Effect::from_result_once(operation(service).map_err(&on_error)))
+        Self::new(move |service| crate::effect_from_result! {
+            once;
+            result: operation(service).map_err(&on_error),
+        })
     }
 
     /// Describe a native receiver Future factory. The factory borrows S when

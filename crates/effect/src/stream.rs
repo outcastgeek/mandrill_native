@@ -155,12 +155,16 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Stream<A, E
         Stream::new(move |scope| {
             let for_pull = Arc::clone(&project);
             let for_open = Arc::clone(&project);
-            self.open(scope)
-                .map(move |reader| {
+            let opened = crate::effect_map! {
+                program: self.open(scope),
+                map: move |reader| {
                     let project = Arc::clone(&for_pull);
-                    StreamReader::new(reader.pull().provide_some(move |outer| project(outer)))
-                })
-                .provide_some(move |outer| for_open(outer))
+                    StreamReader::new(crate::effect_provide_some! {
+                        program: reader.pull(), project: move |outer| project(outer),
+                    })
+                },
+            };
+            crate::effect_provide_some! { program: opened, project: move |outer| for_open(outer), }
         })
     }
 
@@ -176,24 +180,32 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Stream<A, E
         Stream::new(move |outer| {
             let source = self.clone();
             let map = Arc::clone(&map);
-            Effect::defer(move || {
+            effect! { defer; body: move || {
                 let inner = Scope::new();
                 let cleanup_map = Arc::clone(&map);
                 let open_map = Arc::clone(&map);
                 let pull_map = Arc::clone(&map);
-                let opened = source
-                    .open(inner.clone())
-                    .map_error(move |error| open_map(error))
-                    .map(move |reader| {
+                let opened = crate::effect_map! {
+                    program: crate::effect_map_error! {
+                        program: source.open(inner.clone()),
+                        map: move |error| open_map(error),
+                    },
+                    map: move |reader| {
                         let map = Arc::clone(&pull_map);
-                        StreamReader::new(reader.pull().map_error(move |error| map(error)))
-                    });
-                outer
-                    .add_finalizer(
-                        inner.own_mapped(Effect::sync(|| ()), move |error| cleanup_map(error)),
-                    )
-                    .flat_map(move |_| opened.clone())
-            })
+                        StreamReader::new(crate::effect_map_error! {
+                            program: reader.pull(), map: move |error| map(error),
+                        })
+                    },
+                };
+                effect! {
+                    bind;
+                    program: crate::effect_finalizer! {
+                        scope: outer,
+                        program: inner.own_mapped(crate::effect_sync! { body: || (), }, move |error| cleanup_map(error)),
+                    },
+                    body: move |_| opened.clone(),
+                }
+            }, }
         })
     }
 
@@ -286,18 +298,25 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Stream<A, E
         let transform = Arc::new(transform);
         Stream::new(move |scope| {
             let transform = Arc::clone(&transform);
-            self.open(scope).map(move |reader| {
-                let transform = Arc::clone(&transform);
-                StreamReader::new(reader.pull().flat_map(move |chunk| {
-                    match chunk {
-                        Chunk::End => Effect::sync(|| Chunk::End),
-                        Chunk::Values(values) => {
-                            Effect::all(values.into_iter().map(|value| transform(value)).collect())
-                                .map(Chunk::Values)
-                        }
-                    }
-                }))
-            })
+            crate::effect_map! {
+                program: self.open(scope),
+                map: move |reader| {
+                    let transform = Arc::clone(&transform);
+                    StreamReader::new(effect! {
+                        bind;
+                        program: reader.pull(),
+                        body: move |chunk| match chunk {
+                            Chunk::End => crate::effect_sync! { body: || Chunk::End, },
+                            Chunk::Values(values) => crate::effect_map! {
+                                program: crate::effect_all! {
+                                    items: values.into_iter().map(|value| transform(value)).collect(),
+                                },
+                                map: Chunk::Values,
+                            },
+                        },
+                    })
+                },
+            }
         })
     }
     /// Pull the stream into a collection under the caller’s explicit bound.

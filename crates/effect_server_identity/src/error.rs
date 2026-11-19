@@ -39,66 +39,58 @@ pub enum CapabilityName {
     NativeRoleQueries,
 }
 /// Safe public failure category with original native/SQL diagnostics retained.
-#[derive(Debug)]
+#[derive(Debug, effect::EffectErrorLabel)]
 pub enum IdentityError {
     /// Inert definition or selected native policy was invalid.
+    #[effect_error_label("invalid identity configuration")]
     Configuration(&'static str),
     /// Selected workflow admission refused before native work.
+    #[effect_error_label("identity workflow capacity unavailable")]
     Admission(effect::PreparedAdmissionError),
     /// An explicitly optional capability was not installed.
+    #[effect_error_label("identity capability not selected")]
     MissingCapability(CapabilityName),
     /// A native replacement point was deliberately left unselected.
+    #[effect_error_label("identity capability not selected")]
     MissingPolicy(&'static str),
     /// A selected handle/grant belongs to another storage/definition owner.
+    #[effect_error_label("identity owner mismatch")]
     WrongConfiguration,
     /// No trusted current authentication/permission proof was established.
+    #[effect_error_label("identity authorization rejected")]
     Unauthorized,
     /// An owned grant expired or current persisted security state changed.
+    #[effect_error_label("identity authority expired or changed")]
     StaleGrant,
     /// Native validation/manager rejection, preserved without replacing its vocabulary.
+    #[effect_error_label("identity operation rejected")]
     Native(IdentityResult),
     /// Narrow native store category outside an invocation diagnostic scope.
+    #[effect_error_label("identity persistence failed")]
     Store(StoreError),
     /// Retained owned SQL primary/cleanup/uncertain acknowledgment diagnostic tree.
     #[cfg(feature = "sqlx-turso")]
+    #[effect_error_label("identity persistence failed")]
     Sql(Box<SqlError>),
     /// Native browser/protocol policy rejected the request before application work.
+    #[effect_error_label("identity request policy rejected")]
     Policy(http::StatusCode),
     /// Retained owned auxiliary persistence/codec failure with its original diagnostics.
     #[cfg(feature = "sqlx-turso")]
+    #[effect_error_label("identity persistence failed")]
     Record(Box<crate::store::records::RecordError>),
     /// Native Server input/body ownership failure, preserving its actual diagnostics.
+    #[effect_error_label("identity request input failed")]
     Input(effect_server::ServerError),
     /// Native token verification/provider failure; outages remain distinct from rejection.
+    #[effect_error_label("identity token verification failed")]
     Bearer(identity_rs::identity::tokens::BearerTokenError),
     /// Native ticket protection, transport or current-user validation failure.
+    #[effect_error_label("identity session verification failed")]
     Ticket(identity_rs::identity::ticket::TicketError),
     /// Selected native factor/provider execution failed; distinct from false proof.
+    #[effect_error_label("identity provider execution failed")]
     Token(identity_rs::identity::tokens::TokenProviderError),
-}
-impl std::fmt::Display for IdentityError {
-    /// Keep secrets/provider wording out of public error rendering.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Configuration(_) => "invalid identity configuration",
-            Self::Admission(_) => "identity workflow capacity unavailable",
-            Self::MissingCapability(_) | Self::MissingPolicy(_) => {
-                "identity capability not selected"
-            }
-            Self::WrongConfiguration => "identity owner mismatch",
-            Self::Unauthorized => "identity authorization rejected",
-            Self::StaleGrant => "identity authority expired or changed",
-            Self::Native(_) => "identity operation rejected",
-            Self::Store(_) => "identity persistence failed",
-            #[cfg(feature = "sqlx-turso")]
-            Self::Sql(_) | Self::Record(_) => "identity persistence failed",
-            Self::Policy(_) => "identity request policy rejected",
-            Self::Input(_) => "identity request input failed",
-            Self::Bearer(_) => "identity token verification failed",
-            Self::Ticket(_) => "identity session verification failed",
-            Self::Token(_) => "identity provider execution failed",
-        })
-    }
 }
 impl std::error::Error for IdentityError {
     /// Preserve actual backend/codec sources for explicit trusted diagnostic consumers.

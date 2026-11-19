@@ -6,7 +6,7 @@ use crate::{
 };
 use crate::body::{BodySignal, BodySignalWait};
 use crate::{
-    effect_die, effect_future, effect_recover, effect_resource, effect_scope, effect_try_sync,
+    effect_die, effect_from_result, effect_future, effect_recover, effect_resource, effect_scope, effect_try_sync,
     effect_uninterruptible, endpoint, pipeline, registered,
 };
 use axum::body::{Body, Bytes};
@@ -82,12 +82,6 @@ struct NativeSelectionGates<E: Send + 'static, R: Send + Sync + 'static> {
 pub trait HasTokio {
     /// Borrow a caller-owned Tokio handle. The caller keeps its runtime alive through drain.
     fn tokio(&self) -> &tokio::runtime::Handle;
-}
-impl<R: HasTokio> HasTokio for crate::RequestEnv<R> {
-    /// Preserve the application's selected native reactor.
-    fn tokio(&self) -> &tokio::runtime::Handle {
-        self.services.tokio()
-    }
 }
 /// Native protocol selection. axum's compiled serving stack supplies these transports.
 #[derive(Clone, Copy)]
@@ -1359,20 +1353,18 @@ where
                 },
         };
         let fork = match fork_owner {
-            Some((control, queue_guard)) => self.scope.fork_unit_with_task_guard(
-                effect_uninterruptible! { program: task, }, control, queue_guard,
-            ),
-            None => self.scope.fork(effect_uninterruptible! { program: task, }),
+            Some((control, queue_guard)) => effect::effect_scope! { fork_unit_with_task_guard; scope: self.scope, program: effect_uninterruptible! { program: task, }, owner: control, guard: queue_guard, },
+            None => effect::effect_scope! { fork; scope: self.scope, program: effect_uninterruptible! { program: task, }, },
         };
-        match self
-            .context
+        match effect::effect! {
+            run_in_context;
+            context: self.context,
             // Native body completion can precede request cleanup. Retain this admitted
             // owner through host-scope closure; explicit disconnect cancellation still
             // reaches its nested work through the existing request token.
-            .run(
-                fork,
-                self.environment.clone(),
-            )
+            program: fork,
+            environment: self.environment.clone(),
+        }
             .await
         {
             Exit::Success(_) => match receive.await {
@@ -1418,8 +1410,12 @@ where
                 }
             } else { None };
             let outcome = match stage {
-                RoutingStage::Ordinary(stage) => match context
-                    .run(stage(current, scope.clone()), root.clone()).await
+                RoutingStage::Ordinary(stage) => match effect::effect! {
+                    run_in_context;
+                    context: context,
+                    program: stage(current, scope.clone()),
+                    environment: root.clone(),
+                }.await
                 {
                     Exit::Success(next) => Exit::Success(Ok(next)),
                     Exit::Fail(error) => Exit::Fail(error),
@@ -1445,7 +1441,12 @@ where
                         } else { None };
                         Some(crate::RoutingSnapshotReservation(vacancy))
                     } else { None };
-                    context.run(stage(current, request.clone(), updated, scope.clone()), root.clone()).await
+                    effect::effect! {
+                        run_in_context;
+                        context: context,
+                        program: stage(current, request.clone(), updated, scope.clone()),
+                        environment: root.clone(),
+                    }.await
                 }
             };
             match outcome {
@@ -1580,9 +1581,19 @@ where
                     Err(error) => match error {},
                 }
             });
-            match context.run(scope.fork(program), root.clone()).await {
+            match effect::effect! {
+                run_in_context;
+                context: context,
+                program: effect::effect_scope! { fork; scope: scope, program: program, },
+                environment: root.clone(),
+            }.await {
                 Exit::Success(fiber) => {
-                    let observing = context.run(fiber.join(), root.clone());
+                    let observing = effect::effect! {
+                        run_in_context;
+                        context: context,
+                        program: effect::effect_scope! { join; fiber: fiber, },
+                        environment: root.clone(),
+                    };
                     pin!(observing);
                     loop {
                         let classified = match classification.snapshot() {
@@ -1649,7 +1660,7 @@ where
                 selection_program = decorate(decorated_request.clone(), selection_program);
             }
         }
-        context.run(selection_program, root).await
+        effect::effect! { run_in_context; context: context, program: selection_program, environment: root, }.await
     }
     /// Start matched authentication under the outer context, then retain that context across
     /// selected-R execution and the uniquely owned terminal/cleanup outcome.
@@ -1680,7 +1691,12 @@ where
             let Some(selected) = selected.as_mut() else { return Exit::Die(effect::LibraryDefect::PreparedConstructionUnbound.into()); };
             selection_start.send(context.clone());
             if let Some(fiber) = routed.take() {
-                let observing = context.run(fiber.join(), root.clone());
+                let observing = effect::effect! {
+                    run_in_context;
+                    context: context,
+                    program: effect::effect_scope! { join; fiber: fiber, },
+                    environment: root.clone(),
+                };
                 pin!(observing);
                 loop {
                     let selection = match selected.snapshot() {
@@ -1713,7 +1729,12 @@ where
         } else {
             if failure.is_none() {
                 for hook in &self.hooks {
-                    let exit = context.run(hook(request.clone()), root.clone()).await;
+                    let exit = effect::effect! {
+                        run_in_context;
+                        context: context,
+                        program: hook(request.clone()),
+                        environment: root.clone(),
+                    }.await;
                     if !matches!(exit, Exit::Success(())) {
                         failure = Some(exit);
                         break;
@@ -1721,8 +1742,12 @@ where
                 }
             }
             if failure.is_none() {
-                match context
-                    .run((self.binding.resolve)(request.clone()), root.clone())
+                match effect::effect! {
+                    run_in_context;
+                    context: context,
+                    program: (self.binding.resolve)(request.clone()),
+                    environment: root.clone(),
+                }
                     .await
                 {
                     Exit::Success(environment) => (environment, true),
@@ -1816,18 +1841,24 @@ where
                         Exit::Fail((policy.native_error)(ServerError::Memory(error))), rest,
                     );
                     if let Some(endpoint) = endpoint {
-                        let endpoint = decorated.run(effect_uninterruptible! { program: endpoint.join(), }, environment.clone()).await;
+                        let endpoint = effect::effect! {
+                            run_in_context;
+                            context: decorated,
+                            program: effect_uninterruptible! { program: effect::effect_scope! { join; fiber: endpoint, }, },
+                            environment: environment.clone(),
+                        }.await;
                         completion.append_cleanup(endpoint);
                     }
                     completion.append_cleanup(exit);
                     prepared_completion = Some(completion);
                     exit = Exit::Success(());
                 } else if let Some(endpoint) = endpoint {
-                    let endpoint = decorated
-                        .run(
-                            effect_uninterruptible! { program: endpoint.join(), },
-                            environment.clone(),
-                        )
+                    let endpoint = effect::effect! {
+                        run_in_context;
+                        context: decorated,
+                        program: effect_uninterruptible! { program: effect::effect_scope! { join; fiber: endpoint, }, },
+                        environment: environment.clone(),
+                    }
                         .await;
                     if let Some(rest) = cleanup {
                         let mut completion =
@@ -1844,11 +1875,12 @@ where
                     ));
                     exit = Exit::Success(());
                 }
-                let closed = decorated
-                    .run(
-                        effect_uninterruptible! { program: effect::__private::close_scope_owned(close_scope), },
-                        environment.clone(),
-                    )
+                let closed = effect::effect! {
+                    run_in_context;
+                    context: decorated,
+                    program: effect_uninterruptible! { program: effect::effect_scope! { close_owned; scope: close_scope, }, },
+                    environment: environment.clone(),
+                }
                     .await;
                 if let Some(completion) = &mut prepared_completion {
                     completion.append_cleanup(closed);
@@ -1897,11 +1929,12 @@ where
                     None
                 };
                 for observation in observations {
-                    let observed = decorated
-                        .run(
-                            effect_uninterruptible! { program: observation, },
-                            environment.clone(),
-                        )
+                    let observed = effect::effect! {
+                        run_in_context;
+                        context: decorated,
+                        program: effect_uninterruptible! { program: observation, },
+                        environment: environment.clone(),
+                    }
                         .await;
                     if let Some(completion) = &mut prepared_completion {
                         completion.append_cleanup(observed);
@@ -1925,9 +1958,14 @@ where
         let reactor = environment.tokio().clone();
         let running = native_io(reactor, async {
             if selected_request {
-                context.run_cancellable(complete, environment).await
+                effect::effect! {
+                    run_cancellable_in_context;
+                    context: context,
+                    program: complete,
+                    environment: environment,
+                }.await
             } else {
-                context.run(complete, environment).await
+                effect::effect! { run_in_context; context: context, program: complete, environment: environment, }.await
             }
         });
         pin!(running);
@@ -2016,10 +2054,7 @@ where
             Err(error) => {
                 let map = self.policy.native_error.clone();
                 endpoint! {
-                    effect: effect_try_sync! {
-                        once;
-                        body: { let result = Err(map(error)); move || result },
-                    },
+                    effect: effect_from_result! { once; result: Err(map(error)), },
                 }
             }
         };
@@ -2048,8 +2083,12 @@ where
             .as_ref()
             .map(|slot| slot.scope.clone())
             .unwrap_or_else(|| self.scope.clone());
-        let admitted = context
-            .run(scope.fork(program), self.environment.clone())
+        let admitted = effect::effect! {
+            run_in_context;
+            context: context,
+            program: effect::effect_scope! { fork; scope: scope, program: program, },
+            environment: self.environment.clone(),
+        }
             .await;
         match admitted {
             Exit::Success(fiber) => {
@@ -2103,8 +2142,12 @@ where
         // original services; they never recursively invoke a failing error renderer.
         let mut selection_failure = None;
         for hook in &self.hooks {
-            let outcome = context
-                .run(hook(request.clone()), self.environment.clone())
+            let outcome = effect::effect! {
+                run_in_context;
+                context: context,
+                program: hook(request.clone()),
+                environment: self.environment.clone(),
+            }
                 .await;
             if !matches!(outcome, Exit::Success(())) {
                 selection_failure = Some(outcome);
@@ -2114,11 +2157,12 @@ where
         let (selected, selected_request) = if selection_failure.is_some() {
             (self.environment.clone(), false)
         } else {
-            match context
-                .run(
-                    (self.binding.resolve)(request.clone()),
-                    self.environment.clone(),
-                )
+            match effect::effect! {
+                run_in_context;
+                context: context,
+                program: (self.binding.resolve)(request.clone()),
+                environment: self.environment.clone(),
+            }
                 .await
             {
                 Exit::Success(environment) => (environment, true),
@@ -2216,7 +2260,7 @@ where
                         Ok(continuation) => continuation,
                         Err(error) => {
                             let error = (policy.native_error)(ServerError::Memory(error));
-                            return effect_try_sync! { once; body: { let result = Err(error); move || result }, on_error: ::core::convert::identity, };
+                            return effect_from_result! { once; result: Err(error), };
                         }
                     };
                     request.insert_extension(continuation.downgrade());
@@ -2241,7 +2285,7 @@ where
                             Ok(continuation) => continuation,
                             Err(error) => {
                                 let error = (policy.native_error)(ServerError::Memory(error));
-                                return effect_try_sync! { once; body: { let result = Err(error); move || result }, on_error: ::core::convert::identity, };
+                                return effect_from_result! { once; result: Err(error), };
                             }
                         };
                         let accepts = endpoint_request.with_extensions(|extensions| {
@@ -2261,14 +2305,14 @@ where
                                             .any(|expected| media_matches(expected, &actual))
                                     }),
                                 Ok(None) => false,
-                                Err(error) => return effect_try_sync! { once; body: { let __dsl_result = Err(input_error(error)); move || __dsl_result }, on_error: ::core::convert::identity, },
+                                Err(error) => return effect_from_result! { once; result: Err(input_error(error)), },
                             };
                             if !checked {
-                                return effect_try_sync! {
-                                    once; body: {
-                                    let __dsl_result = Err(input_error(ServerError::Invalid(
-                                    "request content type not registered in accepts".into(),
-                                ))); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                return effect_from_result! {
+                                    once; result: Err(input_error(ServerError::Invalid(
+                                        "request content type not registered in accepts".into(),
+                                    ))),
+                                };
                             }
                         }
                         effect! {
@@ -2283,14 +2327,14 @@ where
                         Ok(program) => program,
                         Err(error) => {
                             let error = pipeline_error(ServerError::Memory(error));
-                            effect_try_sync! { once; body: { let result = Err(error); move || result }, on_error: ::core::convert::identity, }
+                            effect_from_result! { once; result: Err(error), }
                         }
                     };
                     effect_recover! {
                         program: program, recover: move |error| {
                         if recovery_output.is_none()
                         {
-                            return effect_try_sync! { once; body: { let __dsl_result = Err(error); move || __dsl_result }, on_error: ::core::convert::identity, };
+                            return effect_from_result! { once; result: Err(error), };
                         }
                         let continuation = continuation.clone();
                         effect! {
@@ -2307,7 +2351,12 @@ where
         let completion_output = output.clone();
         let mut complete =
             crate::endpoint::native_once(move |selected: Arc<R>, context| async move {
-                let exit = context.run(work, selected.clone()).await;
+                let exit = effect::effect! {
+                    run_in_context;
+                    context: context,
+                    program: work,
+                    environment: selected.clone(),
+                }.await;
                 if outer_owned {
                     return exit;
                 }
@@ -2325,11 +2374,12 @@ where
                     .collect::<Vec<_>>();
                 let mut exit = completion.exit;
                 for observation in observations {
-                    let observed = context
-                        .run(
-                            effect_uninterruptible! { program: observation, },
-                            selected.clone(),
-                        )
+                    let observed = effect::effect! {
+                        run_in_context;
+                        context: context,
+                        program: effect_uninterruptible! { program: observation, },
+                        environment: selected.clone(),
+                    }
                         .await;
                     exit = combine_completion(exit, observed);
                 }
@@ -2343,9 +2393,14 @@ where
         let reactor = selected.tokio().clone();
         let run = native_io(reactor, async {
             if selected_request {
-                context.run_cancellable(complete, selected).await
+                effect::effect! {
+                    run_cancellable_in_context;
+                    context: context,
+                    program: complete,
+                    environment: selected,
+                }.await
             } else {
-                context.run(complete, selected).await
+                effect::effect! { run_in_context; context: context, program: complete, environment: selected, }.await
             }
         });
         pin!(run);
@@ -2368,21 +2423,23 @@ async fn native_error_reply<E: Send + 'static, R: Send + Sync + 'static>(
         None if body_required => return Exit::Fail(error),
         None => None,
     };
-    match context
-        .run(
-            effect_uninterruptible! { program: (policy.on_error)(error), },
-            env.clone(),
-        )
+    match effect::effect! {
+        run_in_context;
+        context: context,
+        program: effect_uninterruptible! { program: (policy.on_error)(error), },
+        environment: env.clone(),
+    }
         .await
     {
         Exit::Success(reply) => {
-            context
-                .run(
-                    effect_uninterruptible! {
+            effect::effect! {
+                run_in_context;
+                context: context,
+                program: effect_uninterruptible! {
                     program: reply
                     .prepare(request, scope, policy.body, policy.native_error.clone(), body_admission), },
-                    env,
-                )
+                environment: env,
+            }
                 .await
         }
         Exit::Fail(error) => Exit::Fail(error),
@@ -2422,7 +2479,12 @@ async fn finish_native_response<E: Send + 'static, R: Send + Sync + 'static>(
         None => match ready {
             Some(response) => Exit::Success(response),
             None => match routed {
-                Some(routed) => context.run(routed.join(), env.clone()).await,
+                Some(routed) => effect::effect! {
+                    run_in_context;
+                    context: context,
+                    program: effect::effect_scope! { join; fiber: routed, },
+                    environment: env.clone(),
+                }.await,
                 None => return Exit::Die(Defect::new("native response owner missing")),
             },
         },
@@ -2469,8 +2531,12 @@ async fn finish_native_response<E: Send + 'static, R: Send + Sync + 'static>(
     }
     for hook in hooks.as_deref().unwrap_or(&[]) {
         if capacity.is_some() { break; }
-        match context
-            .run(hook(request.clone(), response), env.clone())
+        match effect::effect! {
+            run_in_context;
+            context: context,
+            program: hook(request.clone(), response),
+            environment: env.clone(),
+        }
             .await
         {
             Exit::Success(next) => response = next,
@@ -2507,7 +2573,12 @@ async fn finish_native_response<E: Send + 'static, R: Send + Sync + 'static>(
     if let Some(limits) = response_limits && let Err(limit) = crate::body::check_output_headers(response.headers(), limits.head_fields, limits.head_bytes, crate::OutputLimit::HeadFields, crate::OutputLimit::HeadBytes) {
         drop(response);
         let primary = Exit::Fail((policy.native_error)(ServerError::OutputLimit(limit)));
-        let produced = match producer { Some(producer) => context.run(producer, env.clone()).await, None => Exit::Success(()) };
+        let produced = match producer { Some(producer) => effect::effect! {
+            run_in_context;
+            context: context,
+            program: producer,
+            environment: env.clone(),
+        }.await, None => Exit::Success(()) };
         let cleanup = output.lock().unwrap_or_else(std::sync::PoisonError::into_inner).cleanup[1].take();
         return match cleanup { Some(rest) => { let mut result = effect::PreparedCleanupAccumulator::from_reserved(primary, rest); result.append_cleanup(produced); result.finish() }, None => combine_completion(primary, produced) };
     }
@@ -2562,7 +2633,12 @@ async fn finish_native_response<E: Send + 'static, R: Send + Sync + 'static>(
         None => return Exit::Die(Defect::new("native response already committed")),
     }
     let produced = match producer {
-        Some(producer) => context.run(producer, env.clone()).await,
+        Some(producer) => effect::effect! {
+            run_in_context;
+            context: context,
+            program: producer,
+            environment: env.clone(),
+        }.await,
         None => Exit::Success(()),
     };
     let delivered = match wait.wait().await {
@@ -2602,7 +2678,7 @@ fn deliver<E: Send + 'static, R: Send + Sync + 'static>(
             Ok(vacancy) => Some(vacancy.publish(request.cancellation().clone())),
             Err(error) => {
                 let map = policy.native_error.clone();
-                return effect_try_sync! { once; body: move || Err(map(ServerError::Memory(error))), on_error: ::core::convert::identity, };
+                return effect_try_sync! { once; body: move || Err(map(ServerError::Memory(error))), };
             }
         },
         (None, None) if matches!(&output, InnerOutput::Ordinary(_)) => None,
@@ -2643,11 +2719,11 @@ fn deliver<E: Send + 'static, R: Send + Sync + 'static>(
                        .iter()
                        .any(|expected| media_matches(expected, actual))
                {
-                   return effect_try_sync! {
-                       once; body: {
-                       let __dsl_result = Err((policy.native_error)(ServerError::Invalid(
-                       "response content type not registered in produces".into(),
-                   ))); move || __dsl_result }, on_error: ::core::convert::identity, };
+                   return effect_from_result! {
+                       once; result: Err((policy.native_error)(ServerError::Invalid(
+                           "response content type not registered in produces".into(),
+                       ))),
+                   };
                }
                state.replace(prepared.completion.clone());
                request.insert_extension(EndpointDelivery(prepared.completion.clone()));
@@ -2969,7 +3045,12 @@ where
                                 let _ = stopped.send(true);
                                 result
                             }), };
-                        let running = match context.run(scope.fork(serving), env.clone()).await {
+                        let running = match effect::effect! {
+                            run_in_context;
+                            context: context,
+                            program: effect::effect_scope! { fork; scope: scope, program: serving, },
+                            environment: env.clone(),
+                        }.await {
                             Exit::Success(running) => running,
                             Exit::Fail(error) => return Exit::Fail(error),
                             Exit::Die(defect) => return Exit::Die(defect),
@@ -2978,14 +3059,24 @@ where
                         };
                         let final_host = host.clone();
                         let drain = server.policy.host.drain;
-                        let using = match context.run(scope.fork(use_host(host)), env.clone()).await {
+                        let using = match effect::effect! {
+                            run_in_context;
+                            context: context,
+                            program: effect::effect_scope! { fork; scope: scope, program: use_host(host), },
+                            environment: env.clone(),
+                        }.await {
                             Exit::Success(using) => using,
                             Exit::Fail(error) => return Exit::Fail(error),
                             Exit::Die(defect) => return Exit::Die(defect),
                             Exit::Interrupted => return Exit::Interrupted,
                             Exit::FinalizationFailed(failure) => return Exit::FinalizationFailed(failure),
                         };
-                        let used = context.run(using.join(), env.clone());
+                        let used = effect::effect! {
+                            run_in_context;
+                            context: context,
+                            program: effect::effect_scope! { join; fiber: using, },
+                            environment: env.clone(),
+                        };
                         pin!(used);
                         let result = select! {
                             result=&mut used=>result,
@@ -2993,8 +3084,18 @@ where
                                 if status==effect::OutcomeStatus::Succeeded {used.await}
                                 else {
                                     final_host.stop();
-                                    let stopped=context.run(effect_uninterruptible! { program: running.join(), },env.clone()).await;
-                                    let interrupted=context.run(effect_uninterruptible! { program: using.interrupt(), },env.clone()).await;
+                                    let stopped=effect::effect! {
+                                        run_in_context;
+                                        context: context,
+                                        program: effect_uninterruptible! { program: effect::effect_scope! { join; fiber: running, }, },
+                                        environment: env.clone(),
+                                    }.await;
+                                    let interrupted=effect::effect! {
+                                        run_in_context;
+                                        context: context,
+                                        program: effect_uninterruptible! { program: effect::effect_scope! { interrupt; fiber: using, }, },
+                                        environment: env.clone(),
+                                    }.await;
                                     let primary=match stopped {Exit::Success(())=>Exit::Die(Defect::new("host failure status without failure")),Exit::Fail(error)=>Exit::Fail(error),Exit::Die(defect)=>Exit::Die(defect),Exit::Interrupted=>Exit::Interrupted,Exit::FinalizationFailed(failure)=>Exit::FinalizationFailed(failure)};
                                     return match interrupted {Exit::Success(outcome)=>append_host_cleanup_selected(primary,outcome,host_cleanup,false),Exit::Fail(error)=>append_host_cleanup_selected(primary,Exit::<(),E>::Fail(error),host_cleanup,false),Exit::Die(defect)=>append_host_cleanup_selected(primary,Exit::<(),E>::Die(defect),host_cleanup,false),Exit::Interrupted=>primary,Exit::FinalizationFailed(failure)=>append_host_cleanup_selected(primary,Exit::<(),E>::FinalizationFailed(failure),host_cleanup,false)};
                                 }
@@ -3008,7 +3109,12 @@ where
                         if drain_result.is_err() {
                             let _ = stop.request();
                         }
-                        let stopped = context.run(effect_uninterruptible! { program: running.join(), }, env).await;
+                        let stopped = effect::effect! {
+                            run_in_context;
+                            context: context,
+                            program: effect_uninterruptible! { program: effect::effect_scope! { join; fiber: running, }, },
+                            environment: env,
+                        }.await;
                         match result {
                             Exit::Success(value) => match stopped {
                                 Exit::Success(()) => Exit::Success(value),
@@ -3036,12 +3142,16 @@ where
     }
     /// Serve until the selected environment requests cancellation, then drain and join cleanup.
     pub fn run(self) -> Effect<(), E, R> {
-        self.with_host(|_| {
-            effect_future! {
-                with_env; body: |env: Arc<R>, _| async move {
-                env.cancellation().cancelled().await
-            }, }
-        })
+        crate::server! {
+            with_host;
+            source: self,
+            body: |_| {
+                effect_future! {
+                    with_env;
+                    body: |env: Arc<R>, _| async move { env.cancellation().cancelled().await },
+                }
+            },
+        }
     }
 }
 /// Synchronous signal guard makes unwinding/abandonment request native shutdown;
@@ -3582,7 +3692,7 @@ where
 {
     /// Extracted callbacks are selected once and remain lazy until a request arrives.
     fn into_binding(self) -> RequestBinding<E, R> {
-        RequestBinding::new(self)
+        crate::server! { request_binding; body: self, }
     }
 }
 
@@ -4252,7 +4362,12 @@ where
                     () = stop.cancelled() => break (None, None),
                     Some(connection) = async { match connections.as_mut() { Some(connections) => connections.next().await, None => std::future::pending().await } }, if connections.as_ref().is_some_and(|connections| !connections.is_empty()) => {
                         let connection: effect::Fiber<(), E> = connection;
-                        let exit = context.run(effect_uninterruptible! { program: connection.join(), }, env.clone()).await;
+                        let exit = effect::effect! {
+                            run_in_context;
+                            context: context,
+                            program: effect_uninterruptible! { program: effect::effect_scope! { join; fiber: connection, }, },
+                            environment: env.clone(),
+                        }.await;
                         result.append(exit);
                         continue;
                     },
@@ -4271,7 +4386,12 @@ where
                             () = stop.cancelled() => break (None, None),
                             Some(connection) = async { match connections.as_mut() { Some(connections) => connections.next().await, None => std::future::pending().await } }, if connections.as_ref().is_some_and(|connections| !connections.is_empty()) => {
                                 let connection: effect::Fiber<(), E> = connection;
-                                let exit = context.run(effect_uninterruptible! { program: connection.join(), }, env.clone()).await;
+                                let exit = effect::effect! {
+                                    run_in_context;
+                                    context: context,
+                                    program: effect_uninterruptible! { program: effect::effect_scope! { join; fiber: connection, }, },
+                                    environment: env.clone(),
+                                }.await;
                                 result.append(exit);
                             },
                             exit = next_prepared_connection(&mut selected_drivers), if selected_drivers.as_ref().is_some_and(|drivers| !drivers.records.is_empty()) => result.append(exit),
@@ -4298,7 +4418,12 @@ where
             () = stop.cancelled() => break,
             Some(connection)=async { match connections.as_mut() { Some(connections) => connections.next().await, None => std::future::pending().await } },if connections.as_ref().is_some_and(|connections| !connections.is_empty())=>{
                 let connection:effect::Fiber<(),E>=connection;
-                let exit=context.run(effect_uninterruptible! { program: connection.join(), },env.clone()).await;
+                let exit=effect::effect! {
+                    run_in_context;
+                    context: context,
+                    program: effect_uninterruptible! { program: effect::effect_scope! { join; fiber: connection, }, },
+                    environment: env.clone(),
+                }.await;
                 result.append(exit);continue;
             },
             exit = next_prepared_connection(&mut selected_drivers), if selected_drivers.as_ref().is_some_and(|drivers| !drivers.records.is_empty()) => { result.append(exit); continue; },
@@ -4389,7 +4514,12 @@ where
                 match result { Some(Ok(())) => Exit::Success(()), None=>Exit::Fail(map(ServerError::Limit("HTTP connection drain deadline".into()))), Some(Err(error)) => Exit::Fail(map(ServerError::Transport(Defect::new(error.to_string())))) }
             }).await
         }), };
-        let admitted = context.run(scope.fork(connection), env.clone()).await;
+        let admitted = effect::effect! {
+            run_in_context;
+            context: context,
+            program: effect::effect_scope! { fork; scope: scope, program: connection, },
+            environment: env.clone(),
+        }.await;
         match admitted {
             Exit::Success(connection) => if let Some(connections) = &mut connections { connections.push(async move {
                 let _ = connection.settled().await;
@@ -4415,11 +4545,12 @@ where
     }
     let _ = stop.request();
     while let Some(connection) = match connections.as_mut() { Some(connections) => connections.next().await, None => None } {
-        let exit = context
-            .run(
-                effect_uninterruptible! { program: connection.join(), },
-                env.clone(),
-            )
+        let exit = effect::effect! {
+            run_in_context;
+            context: context,
+            program: effect_uninterruptible! { program: effect::effect_scope! { join; fiber: connection, }, },
+            environment: env.clone(),
+        }
             .await;
         result.append(exit);
     }

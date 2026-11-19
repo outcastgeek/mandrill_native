@@ -11,6 +11,7 @@ pub fn facade(name: &str) -> bool {
             | "effect_server_identity"
             | "effect_server_web"
             | "effect_otel"
+            | "effect_cms"
     )
 }
 pub const MACROS: &[&str] = &[
@@ -83,10 +84,12 @@ pub const MACROS: &[&str] = &[
     "message_arguments",
     "localization",
     "otel",
+    "cms",
     "effect_sync",
     "effect_try_sync",
     "effect_future",
     "effect_die",
+    "effect_fail",
     "effect_try_future",
     "effect_cpu",
     "effect_try_cpu",
@@ -97,6 +100,7 @@ pub const MACROS: &[&str] = &[
     "effect_provide_some",
     "effect_sandbox",
     "effect_from_option",
+    "effect_from_result",
     "effect_timeout",
     "effect_recover",
     "effect_for_each",
@@ -174,6 +178,7 @@ const EFFECT: &[&str] = &[
     "map",
     "map_error",
     "provide_some",
+    "provide_some_arc",
     "sandbox",
     "catch_all",
     "from_option",
@@ -429,9 +434,26 @@ const OWNERS: &[(&str, &[&str])] = &[
     ("PreparedSqlBatchPool", &["prepare", "reserve"]),
     ("PreparedSqlBatchBuilder", &["try_push", "finish"]),
     ("PreparedSqlStatementBuilder", &["text", "identifier", "null", "integer", "real", "text_param", "blob", "finish"]),
-    ("SqlClient", &["query_into_rows_atomic", "batch_into_rows_atomic", "query_bytes_into_rows_atomic", "batch_bytes_into_rows_atomic"]),
-    ("SqlTransaction", &["query_into_rows_atomic", "batch_into_rows_atomic", "query_bytes_into_rows_atomic", "batch_bytes_into_rows_atomic"]),
-    ("SqlKernel", &["reserve_prepared_session", "reserve_prepared_rows"]),
+    ("Sql", &["execute", "query", "first", "scalar"]),
+    ("SqlClient", &[
+        "execute", "query", "first", "first_prepared_read", "scalar", "with_session", "open",
+        "with_session_pool", "batch",
+        "transaction", "transaction_once", "fold_rows", "fold_rows_effect",
+        "query_into_rows_atomic", "batch_into_rows_atomic", "query_bytes_into_rows_atomic", "batch_bytes_into_rows_atomic",
+    ]),
+    ("SqlSession", &["execute", "query", "first", "scalar", "native", "fold_rows", "fold_rows_effect", "batch"]),
+    ("SqlTransaction", &[
+        "execute", "query", "first", "scalar", "native", "savepoint", "savepoint_once", "batch",
+        "fold_rows", "fold_rows_effect", "query_into_rows_atomic", "batch_into_rows_atomic",
+        "query_bytes_into_rows_atomic", "batch_bytes_into_rows_atomic",
+    ]),
+    ("SqlKernel", &[
+        "reserve_prepared_session", "reserve_prepared_rows", "with_connection", "transaction",
+        "connection_operation", "transaction_operation", "reserve_transaction_operation",
+    ]),
+    ("NativeSession", &["with_native"]),
+    ("NativeTransactionReservation", &["run"]),
+    ("SqlMigrator", &["new", "initialize", "up"]),
     (
         "StatementBuilder",
         &[
@@ -478,6 +500,7 @@ const OWNERS: &[(&str, &[&str])] = &[
             "sse",
             "negotiate",
             "native",
+            "native_owned",
             "file_path",
             "no_content",
         ],
@@ -589,9 +612,20 @@ const OWNERS: &[(&str, &[&str])] = &[
             "websockets",
             "with_http1_header_timeout",
             "with_overload_reply",
+            "with_host",
+            "run",
         ],
     ),
-    ("PreparedServer", &["prepare_with_request_controls"]),
+    ("RequestBinding", &["new"]),
+    ("ServerPolicy", &["new", "on_exit"]),
+    ("PreparedServer", &[
+        "prepare_with_request_controls", "with_host", "with_http_timeouts", "with_request_queue",
+        "with_response_limits", "with_http_limits", "with_http2_reset_limits", "with_body_channels",
+        "with_native_bytes_pool", "with_json_writer_pool", "with_native_tasks", "with_request_storage",
+        "with_request_byte_pools", "with_request_control_admission", "with_body_completion_admission",
+        "with_connection_admission", "with_observer_batch_admission", "with_terminal_admission",
+        "with_response_headers_pool", "with_connection_tasks",
+    ]),
     ("BodyProgram", &["new", "from_body", "source", "leases", "frames"]),
     ("BodyWriter", &["source"]),
     (
@@ -659,8 +693,71 @@ const OWNERS: &[(&str, &[&str])] = &[
             "notify",
             "request_personal_data_job",
             "authorization_stage",
+            "invoke_prepared_once",
+            "with_prepared_admission",
+            "register",
+            "login",
+            "account",
+            "change_password",
+            "remove_password",
+            "password_recovery_token",
+            "recover_password",
+            "complete_authenticator",
+            "complete_recovery_code",
+            "complete_external_authenticator",
+            "complete_external_recovery_code",
+            "complete_registry_factor",
+            "complete_external_registry_factor",
+            "pending_factor_providers",
+            "pending_factor_token",
+            "reset_authenticator",
+            "disable_two_factor",
+            "enable_authenticator",
+            "regenerate_recovery_codes",
+            "begin_passkey_enrollment",
+            "enroll_passkey",
+            "passkey_login_options",
+            "passkey_login",
+            "remove_passkey",
+            "verify_external",
+            "external_login",
+            "link_external",
+            "unlink_external",
+            "email_confirmation_token",
+            "confirm_email",
+            "set_email",
+            "set_phone_number",
+            "sign_in_cookie",
+            "authenticate_cookie",
+            "sign_in_bearer",
+            "refresh_bearer",
+            "logout_bearer",
+            "store_session",
+            "authenticate_stored_session",
+            "revoke_session",
+            "preferences",
+            "update_preferences",
+            "account_snapshot",
+            "delete_account",
+            "personal_data_job",
+            "cookie_stage",
+            "prepared_cookie_stage",
+            "selected_bearer_stage",
+            "prepared_bearer_stage",
+            "retain_pending_browser",
+            "resume_pending_browser",
+            "issue_antiforgery",
+            "selected_antiforgery_stage",
+            "logout_cookie",
+            "reserve_prepared_invocation",
+            "bearer_stage",
+            "antiforgery_stage",
         ],
     ),
+    ("SqlxIdentityStore", &["new", "from_kernel", "initialize", "with_prepared_invocations"]),
+    ("PreparedIdentityInvocations", &["prepare"]),
+    ("AtomicAccounts", &["new"]),
+    ("SqlRecordAdapter", &["new"]),
     (
         "IdentityEndpoints",
         &[
@@ -684,6 +781,7 @@ const OWNERS: &[(&str, &[&str])] = &[
     ("Localization", &["new"]),
     ("Probe", &["new", "process_liveness"]),
     ("Availability", &["new", "with_dashboard", "with_prepared_output"]),
+    ("PreparedWeb", &["with_host", "run"]),
     (
         "Web",
         &[
@@ -697,6 +795,9 @@ const OWNERS: &[(&str, &[&str])] = &[
             "output_cache",
             "configure_builder",
             "configure_app",
+            "prepare",
+            "with_host",
+            "run",
         ],
     ),
     ("Otel", &["span"]),
@@ -833,9 +934,14 @@ fn native_owner(krate: &str, owner: &str) -> bool {
             "kernel::PreparedSqlSessionPool",
             "prepared_batch::PreparedSqlBatchPool",
             "prepared_batch::PreparedSqlBatchBuilder",
+            "client::Sql",
             "client::SqlClient",
+            "client::SqlSession",
             "client::SqlTransaction",
             "kernel::SqlKernel",
+            "kernel::NativeSession",
+            "kernel::NativeTransactionReservation",
+            "migration::SqlMigrator",
             "statement::SqlStatement",
             "statement::StatementBuilder",
             "statement::MutationBuilder",
@@ -855,6 +961,8 @@ fn native_owner(krate: &str, owner: &str) -> bool {
             "reply::Representation",
             "reply::Representations",
             "host::Server",
+            "host::RequestBinding",
+            "host::ServerPolicy",
             "prepared_terminal::PreparedServer",
             "body::BodyProgram",
             "body::BodyWriter",
@@ -863,6 +971,10 @@ fn native_owner(krate: &str, owner: &str) -> bool {
             "capabilities::IdentityStores",
             "policies::IdentityPolicies",
             "definition::IdentityDefinition",
+            "store::SqlxIdentityStore",
+            "store::invocation::PreparedIdentityInvocations",
+            "store::accounts::AtomicAccounts",
+            "store::records::SqlRecordAdapter",
             "endpoints::IdentityEndpoints",
             "endpoints::EndpointGroup",
         ],
@@ -876,6 +988,7 @@ fn native_owner(krate: &str, owner: &str) -> bool {
             "availability::Probe",
             "availability::Availability",
             "application::Web",
+            "application::PreparedWeb",
         ],
         "effect_otel" => &["signals::Otel", "signals::SpanOptions"],
         _ => &[],
@@ -905,6 +1018,8 @@ pub fn intended_dsl(owner: Option<&str>, method: &str) -> String {
     let owner = owner.and_then(|owner| owner.rsplit("::").next());
     if owner == Some("Effect") {
         let form = match method {
+            "fail" | "fail_with" => "effect_fail",
+            "from_result" | "from_result_once" => "effect_from_result",
             "sync" | "sync_once" => "effect_sync",
             "try_sync" | "try_sync_once" => "effect_try_sync",
             "from_future"
@@ -916,7 +1031,7 @@ pub fn intended_dsl(owner: Option<&str>, method: &str) -> String {
             "try_future" | "try_future_once" | "try_future_with_env" => "effect_try_future",
             "map" => "effect_map",
             "map_error" => "effect_map_error",
-            "provide_some" => "effect_provide_some",
+            "provide_some" | "provide_some_arc" => "effect_provide_some",
             "provide" => "effect_provided",
             "sandbox" => "effect_sandbox",
             "catch_all" => "effect_recover",
@@ -932,6 +1047,9 @@ pub fn intended_dsl(owner: Option<&str>, method: &str) -> String {
         return format!("{form}!");
     }
     match owner {
+        Some("Sql" | "SqlClient" | "SqlSession" | "SqlTransaction" | "SqlKernel"
+            | "NativeSession" | "NativeTransactionReservation" | "SqlMigrator") => return "sql!".into(),
+        Some("Server" | "PreparedServer" | "ServerPolicy" | "RequestBinding") => return "server!".into(),
         Some("SpanOptions" | "Otel") => return "otel!".into(),
         Some("Codec" | "PureCodec" | "LazyLock") => return "codec!".into(),
         Some("Release") | None => {
@@ -988,7 +1106,9 @@ pub fn protected(krate: &str, owner: Option<&str>, name: &str, kind: DefKind, pa
         // entry points for the DSL. Their other methods remain callable.
         if matches!(
             owner,
-            "SqlClient" | "SqlTransaction" | "PreparedInputEndpointPlan"
+            "Sql" | "SqlClient" | "SqlSession" | "SqlTransaction" | "SqlKernel"
+                | "NativeSession" | "NativeTransactionReservation" | "SqlMigrator"
+                | "PreparedInputEndpointPlan"
                 | "PreparedResourcePlan" | "PreparedFutureResourcePlan" | "PreparedReleasePlan"
                 | "PreparedStream" | "TransactionDomain" | "PreparedRpcOperation"
                 | "MemoryClusterMessageStore" | "MemoryWorkflowEngine"
@@ -996,9 +1116,6 @@ pub fn protected(krate: &str, owner: Option<&str>, name: &str, kind: DefKind, pa
             return OWNERS
                 .iter()
                 .any(|(ty, methods)| *ty == owner && methods.contains(&name));
-        }
-        if owner == "SqlKernel" {
-            return matches!(name, "reserve_prepared_session" | "reserve_prepared_rows");
         }
         if owner == "ScopedBody" {
             return matches!(name, "from_body" | "from_effect");
@@ -1178,6 +1295,7 @@ pub const MACRO_OWNERS: &[(&str, &[&str])] = &[
         ],
     ),
     ("cache", &["Cache"]),
+    ("cms", &["Service", "ResourcePageRenderer", "@new_definition_service_set", "@prepared_cms_search_stream", "@prepared_resource_search_stream"]),
     ("dependency_cache", &["DependencyCache", "PreparedDependencyCache"]),
     ("atom", &["AtomProgram"]),
     ("hydration", &["HydrationSet"]),
@@ -1189,12 +1307,12 @@ pub const MACRO_OWNERS: &[(&str, &[&str])] = &[
     ("stream", &["Stream", "PreparedStream"]),
     ("handled_event", &["HandledEvent", "AggregateEvent"]),
     ("cluster", &["ClusterDefinition", "MemoryClusterMessageStore"]),
-    ("sql", &["@prepare_native_rows", "SqlStatement", "StatementBuilder", "PreparedSqlRowsPool", "PreparedSqlRowLanes", "PreparedSqlStatementPool", "PreparedSqlStatementBuilder", "PreparedSqlSessionPool", "PreparedSqlBatchPool", "PreparedSqlBatchBuilder", "SqlClient", "SqlTransaction", "SqlKernel"]),
+    ("sql", &["@prepare_native_rows", "SqlStatement", "StatementBuilder", "PreparedSqlRowsPool", "PreparedSqlRowLanes", "PreparedSqlStatementPool", "PreparedSqlStatementBuilder", "PreparedSqlSessionPool", "PreparedSqlBatchPool", "PreparedSqlBatchBuilder", "Sql", "SqlClient", "SqlSession", "SqlTransaction", "SqlKernel", "NativeSession", "NativeTransactionReservation", "SqlMigrator"]),
     ("sql_insert", &["MutationBuilder"]),
     ("sql_update", &["MutationBuilder"]),
     ("row", &["RowDecoder", "@row"]),
     ("sql_with", &["@sql_with", "Effect"]),
-    ("server", &["Server", "PreparedServer"]),
+    ("server", &["Server", "PreparedServer", "ServerPolicy", "RequestBinding"]),
     ("endpoint", &["Endpoint", "PreparedEndpointPlan", "PreparedInputEndpointPlan", "PreparedGraphPlan"]),
     ("registered", &["Registered", "Registration"]),
     ("reply", &["Reply", "ReplyDraft"]),
@@ -1207,7 +1325,7 @@ pub const MACRO_OWNERS: &[(&str, &[&str])] = &[
         "server_stream",
         &["BodyProgram", "BodyWriter", "@server_stream"],
     ),
-    ("identity_store", &["IdentityStores"]),
+    ("identity_store", &["IdentityStores", "SqlxIdentityStore", "PreparedIdentityInvocations", "AtomicAccounts", "SqlRecordAdapter"]),
     (
         "identity",
         &["IdentityDefinition", "IdentityPolicies", "@identity"],
@@ -1222,7 +1340,7 @@ pub const MACRO_OWNERS: &[(&str, &[&str])] = &[
             "@identity",
         ],
     ),
-    ("web", &["Web"]),
+    ("web", &["Web", "PreparedWeb"]),
     ("security", &["Security"]),
     ("csp", &["Csp"]),
     ("read_through", &["ReadThrough"]),
@@ -1235,6 +1353,7 @@ pub const MACRO_OWNERS: &[(&str, &[&str])] = &[
     ("effect_try_sync", &["Effect"]),
     ("effect_future", &["Effect", "PreparedQueue", "PreparedPubSub", "PreparedPublication", "PreparedSubscription", "PreparedSubscriptionRef", "PreparedExitMapper"]),
     ("effect_die", &["Effect"]),
+    ("effect_fail", &["Effect"]),
     ("effect_try_future", &["Effect"]),
     ("effect_cpu", &["Effect"]),
     ("effect_try_cpu", &["Effect"]),
@@ -1245,6 +1364,7 @@ pub const MACRO_OWNERS: &[(&str, &[&str])] = &[
     ("effect_provide_some", &["Effect"]),
     ("effect_sandbox", &["Effect"]),
     ("effect_from_option", &["Effect"]),
+    ("effect_from_result", &["Effect"]),
     ("effect_timeout", &["Effect"]),
     ("effect_recover", &["Effect"]),
     ("effect_for_each", &["Effect"]),

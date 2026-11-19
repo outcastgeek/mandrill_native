@@ -19,22 +19,17 @@ mod customer_identity;
 /// Native account entry points and local pickup fixtures.
 mod customer_routes;
 mod prepared;
+pub(super) use prepared::CafeHostStorage;
 use prepared::{HostStorage, prepare_cafe_host};
 
 use super::cafe_telemetry;
 use super::*;
 use effect::memory::{Bytes, FramePool, MemoryError, PreparedMemory, RegionId};
-use effect::{
-    Cancellation, HasBlockingExecutor, HasTracer, PreparedCacheCapacity, Tracer, effect_try_future,
-    memory,
-};
+use effect::{Cancellation, HasCancellation, PreparedCacheCapacity, effect_try_future, memory};
 use effect::{
     PreparedAdmissionError, PreparedCleanupConfig, PreparedCleanupPool, PreparedProviderAdmission,
 };
-use effect_otel::{
-    BorrowedProviders, HasOtel, Otel, OtelBackend, OwnedProviders, Propagation, ProviderFactories,
-    ShutdownPolicy,
-};
+use effect_otel::{BorrowedProviders, Propagation, ProviderFactories, ShutdownPolicy};
 use effect_server::{BodyOutcome, BodyPolicy, HostPolicy};
 use effect_server_identity::native::identity::tokens::data_protection::DataProtectionKeyRing;
 use effect_server_identity::store::invocation::PreparedIdentityInvocations;
@@ -74,67 +69,24 @@ fn cafe_cache_limits(
 }
 
 /// Request projection shares the original provider/clock/tracer owner with the host.
-struct Environment {
+#[derive(effect_server::EffectEnvironment)]
+#[effect_environment(
+    request = request,
+    tokio = self.base.runtime.handle(),
+    cancellation = self.request.cancellation(),
+    clock(provider = TokioClock, get = self.base.clock.as_ref()),
+    task_spawner(provider = TokioTasks, get = &self.base.tasks),
+    blocking_executor(provider = TokioBlocking, get = &self.base.blocking),
+    tracer = effect::HasTracer::tracer(self.base.as_ref()),
+    otel = effect_otel::HasOtel::otel(self.base.as_ref()),
+)]
+pub(super) struct Environment {
     /// Existing telemetry consumer's explicit native runtime/provider configuration.
-    base: Arc<cafe_telemetry::Environment>,
+    pub(super) base: Arc<cafe_telemetry::Environment>,
     /// Exactly one request metadata/body/cancellation owner.
-    request: Request,
+    pub(super) request: Request,
     /// Declared UI culture selected before request environment projection.
-    culture: CultureId,
-}
-impl HasRequest for Environment {
-    /// Borrow the same request whose body survives through cleanup.
-    fn request(&self) -> &Request {
-        &self.request
-    }
-}
-impl HasCancellation for Environment {
-    /// Root and projected requests use their own cooperative cancellation tokens.
-    fn cancellation(&self) -> &Cancellation {
-        self.request.cancellation()
-    }
-}
-impl HasClock for Environment {
-    /// Existing monotonic provider, shared across request projections.
-    type Clock = TokioClock;
-    /// Preserve one time origin for request duration observation.
-    fn clock(&self) -> &Self::Clock {
-        self.base.clock.as_ref()
-    }
-}
-impl HasTaskSpawner for Environment {
-    /// Existing caller-owned native task provider.
-    type Tasks = TokioTasks;
-    /// Select managed tasks through this same R.
-    fn task_spawner(&self) -> &Self::Tasks {
-        &self.base.tasks
-    }
-}
-impl HasBlockingExecutor for Environment {
-    /// Existing independent blocking provider for files and SDK lifecycle work.
-    type Executor = TokioBlocking;
-    /// Reuse the selected service rather than creating another pool.
-    fn blocking_executor(&self) -> &Self::Executor {
-        &self.base.blocking
-    }
-}
-impl HasTracer for Environment {
-    /// Ordinary spans and OTel use the identical native span map.
-    fn tracer(&self) -> &Tracer {
-        &self.base.tracer
-    }
-}
-impl HasOtel for Environment {
-    /// Retain the same native backend across root/request scopes.
-    fn otel(&self) -> &OtelBackend {
-        &self.base.otel
-    }
-}
-impl effect_server::HasTokio for Environment {
-    /// Axum/SQLx use the one caller-owned reactor.
-    fn tokio(&self) -> &tokio::runtime::Handle {
-        self.base.runtime.handle()
-    }
+    pub(super) culture: CultureId,
 }
 /// Read typed caller policy with no fabricated default or secret printing.
 fn configured<T: FromStr>(name: &str) -> Result<T, Box<dyn std::error::Error>>
@@ -241,7 +193,7 @@ fn prepare_cafe_startup(
             output_key_bytes,
         )?
         .checked_add(overhead)?;
-    let host_bytes = host.region_bytes::<Environment>()?;
+    let host_bytes = host.region_bytes()?;
     let queue_bytes = host.queue_region_bytes()?;
     let generations = capacity
         .checked_add(2)
@@ -394,11 +346,12 @@ fn prepare_cafe_startup(
         capacity,
         0,
     )?);
-    let identity_invocations = Arc::new(PreparedIdentityInvocations::prepare(
-        &memory,
-        RegionId::named("identity"),
-        capacity.get(),
-    )?);
+    let identity_invocations = Arc::new(effect_server_identity::identity_store! {
+        invocation_pool;
+        memory: &memory,
+        region: RegionId::named("identity"),
+        capacity: capacity.get(),
+    }?);
     let telemetry = Arc::new(PreparedProviderAdmission::prepare(
         &memory,
         RegionId::named("telemetry"),
@@ -495,9 +448,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .pragma("foreign_keys", Some("ON".into()));
     let pool = runtime.block_on(sqlx::TursoPool::connect_with(options))?;
     let sql = effect_sql::sql! {
-        client; pool: pool.clone(), row_lanes: row_lanes,
-    }?
-    .with_session_pool(sessions);
+        client; pool: pool.clone(), row_lanes: row_lanes, session_pool: sessions,
+    }?;
     let customers = runtime.block_on(customer_identity::configure(
         sql.clone(),
         customer_identity::CustomerPolicy {
@@ -513,7 +465,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
         (identity, identity_invocations),
     ))?;
-    match runtime.block_on(customers.fixture.run(Arc::new(()))) {
+    match runtime.block_on(effect! { run; program: &customers.fixture, environment: Arc::new(()), }) {
         effect::Exit::Success(()) => (),
         other @ (effect::Exit::Fail(_)
         | effect::Exit::Die(_)
@@ -571,21 +523,22 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 BodyOutcome::Failed => failed,
             };
             let message = if summary.cleanup_failed { cleanup_failed } else { settled };
-            Otel::log(effect::LogLevel::Info, message.clone())
+            effect_otel::otel! { log; level: effect::LogLevel::Info, message: message.clone(), }
         },
         |error| cafe_error(CafeProblem::Otel(error)),
     )
     .with_prepared_admission(telemetry, prepared_work_error);
     let policy = CafePolicy {
-        server: ServerPolicy::new(
-            BodyPolicy {
+        server: effect_server::server! {
+            policy;
+            body_policy: BodyPolicy {
                 frames: capacity,
                 chunk_bytes: bytes,
             },
-            HostPolicy { drain: window },
-            |error| cafe_error(CafeProblem::Http(error)),
-            customer_routes::error_reply,
-        ),
+            host_policy: HostPolicy { drain: window },
+            native_error: |error| cafe_error(CafeProblem::Http(error)),
+            on_error: customer_routes::error_reply,
+        },
         listen: address,
         protocols: HttpProtocols::Http1,
         retain,
@@ -598,6 +551,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             overall: window,
         },
         probe_parallelism: capacity,
+        database_readiness: match std::env::var("CAFE_READINESS_SQL").as_deref() {
+            Ok("ordinary") => DatabaseReadiness::Ordinary,
+            Ok("prepared") | Err(std::env::VarError::NotPresent) => DatabaseReadiness::Prepared,
+            Ok(_) => return Err("CAFE_READINESS_SQL must be ordinary or prepared".into()),
+            Err(error) => return Err(error.to_string().into()),
+        },
         retry_seconds: configured("CAFE_RETRY_SECONDS")?,
         output,
     };
@@ -636,38 +595,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             service! { env |env: &Environment| { !env.cancellation().is_requested() }, },
             customers.routes,
         ),
-        (vec![resource], cultures),
-        move |request| {
-            let selection = selection.clone();
-            request.insert_extension(selection.as_ref().clone());
-            effect_sync! { once; body { selection }, }
-        },
-        |_, request| {
-            service! {
-                env |env: &Environment| {
-                Arc::new(Environment {
-                    base: env.base.clone(),
-                    culture: request
-                        .with_extensions(|extensions| {
-                            extensions
-                                .get::<CatalogSelection>()
-                                .map(|selection| selection.ui.clone())
-                        })
-                        .unwrap_or_else(|| env.culture.clone()),
-                    request: request.clone(),
-                })
-            }, }
-        },
-        (
-            move |env: &Environment| MenuKey {
-                culture: env.culture.clone(),
-                ..menu_key.clone()
-            },
-            |env: &Environment| env.request.with_extensions(|extensions| {
-                extensions.get::<effect_server_identity::authority::SelfGrant>().is_some()
-            }),
-            menu_partition,
-        ),
+        (vec![resource], cultures, selection),
+        (menu_key, menu_partition),
         (prepared, host),
     )?;
     let factories = ProviderFactories::new(
@@ -687,7 +616,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         effect! {
             let scope = scope.clone(); let app = app.clone(); let root = root.clone();
             let provider_runtime = provider_runtime.clone(); let factories = factories.clone();
-            let providers = OwnedProviders::acquire_with_error(scope.clone(), factories, shutdown, |error| cafe_error(CafeProblem::Lifecycle(error)))?;
+            let providers = effect_otel::otel! {
+                acquire;
+                scope: scope.clone(),
+                factories: factories,
+                shutdown: shutdown,
+                on_error: |error| cafe_error(CafeProblem::Lifecycle(error)),
+            }?;
             let native = effect_try_sync! { body { providers.with(|owner| owner.borrowed()) }, on_error |error| { cafe_error(CafeProblem::Otel(effect_otel::NativeError::Native(error))) }, }?;
             let mut base = effect_try_sync! { once; body { cafe_telemetry::Environment::new(provider_runtime, native, telemetry_capacity) }, on_error |error| { cafe_error(CafeProblem::Otel(effect_otel::NativeError::Native(effect::Defect::new(error)))) }, }?;
             // The signal backend changes; the inert constructor's unused providers
@@ -696,21 +631,26 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             base.clock = root.base.clock.clone(); base.cancellation = root.base.cancellation.clone();
             let environment = Arc::new(Environment { base: Arc::new(base), request: root.request.clone(), culture: root.culture.clone() });
             let cancellation = environment.cancellation().clone();
-            scope.fork(effect_try_future! {
-                once;
-                body |cancel: Cancellation| {
-                    async move {
-                    tokio::select! {
-                        signal = tokio::signal::ctrl_c() => {
-                            signal?;
-                            let _ = cancellation.request();
+            effect_scope! {
+                fork;
+                scope: scope,
+                program: effect_try_future! {
+                    once;
+                    body |cancel: Cancellation| {
+                        async move {
+                            tokio::select! {
+                                signal = tokio::signal::ctrl_c() => {
+                                    signal?;
+                                    let _ = cancellation.request();
+                                }
+                                () = cancel.cancelled() => {}
+                            }
+                            Ok::<(), std::io::Error>(())
                         }
-                        () = cancel.cancelled() => {}
-                    }
-                    Ok::<(), std::io::Error>(())
-                } },
-                on_error |error| { cafe_error(CafeProblem::Http(ServerError::Io(error))) },
-            })?;
+                    },
+                    on_error |error| { cafe_error(CafeProblem::Http(ServerError::Io(error))) },
+                },
+            }?;
             run_cafe_application(app, environment)?
         }
         },
@@ -720,7 +660,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         std::io::stdout().lock(),
         "Café pickup demo: open http://{address}/ to sign in and collect your order. Ctrl-C drains requests and native providers."
     )?;
-    let outcome = runtime.block_on(program.run(root.clone()));
+    let outcome = runtime.block_on(effect! { run; program: &program, environment: root.clone(), });
     runtime.block_on(root.base.tasks.stop().wait());
     runtime.block_on(root.base.blocking.stop().wait());
     logs.shutdown()?;
@@ -748,10 +688,13 @@ fn finish_cafe<A>(outcome: &effect::Exit<A, CafeError>) -> Result<(), Box<dyn st
             let first = match &failure.first {
                 effect::CleanupFailure::ReleaseFailure(error) => error
                     .with(|error| match error {
-                        effect::DependencyCacheError::Load(CafeProblem::Http(error)) => {
-                            error.to_string()
+                        effect::DependencyCacheError::Load(problem) => {
+                            if let CafeProblem::Http(error) = problem {
+                                error.to_string()
+                            } else {
+                                problem.to_string()
+                            }
                         }
-                        effect::DependencyCacheError::Load(problem) => problem.to_string(),
                         effect::DependencyCacheError::DependencyCapacity { .. } => {
                             "café dependency capacity".into()
                         }

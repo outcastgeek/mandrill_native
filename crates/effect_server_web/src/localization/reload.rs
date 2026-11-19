@@ -5,7 +5,7 @@ use super::{
     BoundMessage, Catalog, CatalogDefinition, CatalogLimits, CatalogResource, CultureId,
     CultureSet, LocalizationError, MessageContract, MissingMessage,
 };
-use crate::{effect_future, effect_map, effect_map_error, effect_ref, effect_try_sync};
+use crate::{effect_future, effect_map, effect_map_error, effect_ref};
 use effect::memory::{Buffer, Bytes, MemoryError, PreparedMemory, RegionId, SharedSlot, SlotPool};
 use effect::{Effect, Exit, HasClock, HasTaskSpawner, Scope, SynchronizedRef, effect};
 use effect_server::Request;
@@ -294,7 +294,12 @@ impl<C: Send + Sync + 'static, R: Send + Sync + 'static> Localization<C, R> {
                         None => None,
                     };
                     let data = definition.generations.as_ref().map(|generations| generations.data.clone());
-                    let catalog = match crate::split_exit(context.run(definition.catalogue.load_with(data), env).await) {
+                    let catalog = match effect::effect! {
+                        run_in_context;
+                        context: context,
+                        program: definition.catalogue.load_with(data),
+                        environment: env,
+                    }.await.into_failure() {
                         Ok(catalog) => catalog,
                         Err(failure) => return failure,
                     };
@@ -339,7 +344,7 @@ impl<C: Send + Sync + 'static, R: Send + Sync + 'static> Localization<C, R> {
                            }),
                        };
                        match definition.reload {
-                           None => effect_try_sync! { once; body: { let __dsl_result = Ok(runtime); move || __dsl_result }, on_error: ::core::convert::identity, },
+                           None => effect::effect_from_result! { once; result: Ok(runtime), },
                            Some(interval) => {
                                let worker_runtime = runtime.clone();
                                let worker_inject = inject.clone();
@@ -350,8 +355,12 @@ impl<C: Send + Sync + 'static, R: Send + Sync + 'static> Localization<C, R> {
                                        let inject = worker_inject.clone();
                                        async move {
                                            loop {
-                                               match context
-                                                   .run(Effect::<(), E, R>::sleep(interval), env.clone())
+                                               match effect::effect! {
+                                                   run_in_context;
+                                                   context: context,
+                                                   program: effect! { sleep; duration: interval, },
+                                                   environment: env.clone(),
+                                               }
                                                    .await
                                                {
                                                    Exit::Success(()) => {}
@@ -363,7 +372,12 @@ impl<C: Send + Sync + 'static, R: Send + Sync + 'static> Localization<C, R> {
                                                    }
                                                }
                                                let result =
-                                                   context.run(runtime.reload(), env.clone()).await;
+                                                   effect::effect! {
+                                                       run_in_context;
+                                                       context: context,
+                                                       program: runtime.reload(),
+                                                       environment: env.clone(),
+                                                   }.await;
                                                match result {
                                                    Exit::Success(()) | Exit::Fail(_) => {}
                                                    Exit::Die(defect) => return Exit::Die(defect),
@@ -376,7 +390,7 @@ impl<C: Send + Sync + 'static, R: Send + Sync + 'static> Localization<C, R> {
                                            }
                                        }
                                    }, };
-                               effect_map! { program: scope.fork(worker), map: move |_| runtime.clone(), }
+                               effect_map! { program: effect::effect_scope! { fork; scope: scope, program: worker, }, map: move |_| runtime.clone(), }
                            }
                        }
                    },
@@ -504,7 +518,7 @@ impl<C: Send + Sync + 'static, R: Send + Sync + 'static> CatalogRuntime<C, R> {
     }
     /// Read protected refresh status without exposing or cloning source/catalogue payloads.
     pub fn status(&self) -> Effect<CatalogStatus, LocalizationError, R> {
-        effect_map! { program: self.state.read(), map: |state| state.status.clone(), }
+        effect_map! { program: effect_ref! { synchronized_read; reference: self.state, }, map: |state| state.status.clone(), }
     }
     /// Select native cultures and pin one exact immutable generation before the
     /// application's request environment projection. The extension stores a handle,
@@ -518,13 +532,14 @@ impl<C: Send + Sync + 'static, R: Send + Sync + 'static> CatalogRuntime<C, R> {
             let state = state.clone();
             let cultures = cultures.clone();
             let selection = selected.clone()?;
-            let state = state.read()?;
-            let culture = effect_try_sync! {
-                once; body: {
-                let __dsl_result = if !cultures.contains(&selection.ui)
-                || !cultures.contains(&selection.formatting) {
-                Err(LocalizationError::Definition("selected cultures".into()))
-            } else { cultures.metadata(&selection.ui) }; move || __dsl_result }, on_error: ::core::convert::identity, }?;
+            let state = effect_ref! { synchronized_read; reference: state, }?;
+            let culture = effect::effect_from_result! {
+                once;
+                result: if !cultures.contains(&selection.ui)
+                        || !cultures.contains(&selection.formatting) {
+                        Err(LocalizationError::Definition("selected cultures".into()))
+                    } else { cultures.metadata(&selection.ui) },
+            }?;
             PinnedCatalog {
                 catalog: state.catalog.clone(), generation: state.status.generation,
                 selection, culture, missing, marker: PhantomData,

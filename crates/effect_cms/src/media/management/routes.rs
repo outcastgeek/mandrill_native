@@ -431,5 +431,5 @@ where
     R: HasClock + HasConsole + HasTaskSpawner + Send + Sync + 'static,
     X: From<ManagedStartError<E>> + Send + Sync + 'static,
 {
-    service.register_and_start_routes(owner, router, mounter)
+    crate::cms! { register_routes; service: service, scope: owner, router: router, mounter: mounter, }
 }

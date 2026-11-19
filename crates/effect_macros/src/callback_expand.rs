@@ -72,6 +72,122 @@ pub(crate) fn continuation(mut fields: Fields) -> syn::Result<TokenStream> {
     )
 }
 
+/// Select the existing native interpreter entry without changing its terminal type.
+pub(crate) fn interpret(mode: Ident, mut fields: Fields) -> syn::Result<TokenStream> {
+    let environment = fields.take("environment")?;
+    if mode == "run_in_context" || mode == "run_cancellable_in_context" {
+        let context = fields.transform("context", |expr, _| Ok(quote!(&(#expr))))?;
+        let program = fields.take("program")?;
+        let method = if mode == "run_in_context" { quote!(run) } else { quote!(run_cancellable) };
+        return fields.finish(quote!(#context.#method(#program, #environment)));
+    }
+    let program = fields.transform("program", |expr, _| Ok(quote!(&(#expr))))?;
+    let method = Ident::new(&mode.to_string(), Span::mixed_site());
+    let output = if matches!(mode.to_string().as_str(), "run_with_frames" | "run_cancellable_with_frames") {
+        let frames = fields.take("frames")?;
+        quote!(#program.#method(#environment, #frames))
+    } else {
+        quote!(#program.#method(#environment))
+    };
+    fields.finish(output)
+}
+
+/// Describe a wait on the clock selected by the existing Effect environment.
+pub(crate) fn sleep(mut fields: Fields) -> syn::Result<TokenStream> {
+    let path = crate::expand::effect_crate_path()?;
+    let duration = fields.take("duration")?;
+    fields.finish(quote!(#path::Effect::sleep(#duration)))
+}
+
+pub(crate) fn either(mut fields: Fields) -> syn::Result<TokenStream> {
+    let program = fields.take("program")?;
+    fields.finish(quote!((#program).either()))
+}
+
+pub(crate) fn log(mut fields: Fields) -> syn::Result<TokenStream> {
+    let path = crate::expand::effect_crate_path()?;
+    let level = fields.take("level")?;
+    let message = fields.take("message")?;
+    fields.finish(quote!(#path::Effect::log(#level, #message)))
+}
+
+pub(crate) fn console_write(mut fields: Fields) -> syn::Result<TokenStream> {
+    let path = crate::expand::effect_crate_path()?;
+    let channel = fields.take("channel")?;
+    let message = fields.take("message")?;
+    fields.finish(quote!(#path::Effect::console_write(#channel, #message)))
+}
+
+pub(crate) fn named_primitive(mode: Ident, mut fields: Fields) -> syn::Result<TokenStream> {
+    let path = crate::expand::effect_crate_path()?;
+    if mode == "from_exit_once" {
+        let exit = fields.take("exit")?;
+        return fields.finish(quote!(#path::Effect::from_exit_once(#exit)));
+    }
+    let method = match mode.to_string().as_str() {
+        "bind_in_context" => Some(("context", "bind", Some("program"))),
+        "queue_take" => Some(("queue", "take", None)),
+        "queue_offer" => Some(("queue", "offer", Some("value"))),
+        "queue_offer_with" => Some(("queue", "offer_with", Some("factory"))),
+        "queue_shutdown" => Some(("queue", "shutdown", Some("mode"))),
+        "watch_read" => Some(("source", "read", None)),
+        "watch_set" => Some(("source", "set", Some("value"))),
+        "watch_subscribe" => Some(("source", "subscribe", None)),
+        "watch_shutdown" => Some(("source", "shutdown", Some("mode"))),
+        "subscription_pull_chunk" => Some(("source", "pull_chunk", None)),
+        "subscription_unsubscribe" => Some(("source", "unsubscribe", None)),
+        _ => None,
+    };
+    if let Some((source, method, argument)) = method {
+        let source = fields.transform(source, |value, _| Ok(quote!(&(#value))))?;
+        let argument = argument.map(|name| fields.take(name)).transpose()?;
+        let method = Ident::new(method, Span::mixed_site());
+        return fields.finish(quote!((#source).#method(#argument)));
+    }
+    if mode == "wall_now" {
+        return fields.finish(quote!(#path::Effect::wall_now()));
+    }
+    if mode == "deferred_complete" || mode == "deferred_await_shared" {
+        let source = fields.transform("source", |value, _| Ok(quote!(&(#value))))?;
+        if mode == "deferred_complete" {
+            let outcome = fields.take("outcome")?;
+            return fields.finish(quote!((#source).complete(#outcome)));
+        }
+        return fields.finish(quote!((#source).await_shared()));
+    }
+    if mode == "trace_context" {
+        return fields.finish(quote!(#path::Effect::trace_context()));
+    }
+    let program = fields.take("program")?;
+    if mode == "with_trace_context" {
+        let context = fields.take("context")?;
+        return fields.finish(quote!((#program).with_trace_context(#context)));
+    }
+    let select = fields.role("select", 1, BodyCategory::Native)?;
+    fields.finish_inferred(
+        quote!(A, E, R, F),
+        &[("program", quote!(#path::Effect<A, E, R>)), ("select", quote!(F))],
+        quote!(#path::Effect<A, E, R>),
+        quote!(A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static,
+            F: Fn(&R) -> ::std::sync::Arc<dyn #path::PollInstrumentation> + Send + Sync + 'static),
+        quote!((#program).with_poll_instrumentation(#select)),
+    )
+}
+
+/// Construct an existing typed Effect lazily for every execution.
+pub(crate) fn defer(mut fields: Fields) -> syn::Result<TokenStream> {
+    let path = crate::expand::effect_crate_path()?;
+    let body = fields.role("body", 0, BodyCategory::Native)?;
+    fields.finish_inferred(
+        quote!(A, E, R, F),
+        &[("body", quote!(F))],
+        quote!(#path::Effect<A, E, R>),
+        quote!(A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static,
+            F: Fn() -> #path::Effect<A, E, R> + Send + Sync + 'static),
+        quote!(#path::Effect::defer(#body)),
+    )
+}
+
 /// Retain native lazy guard and body factories without inserting another loop owner.
 pub(crate) fn while_loop(mut fields: Fields) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
@@ -111,6 +227,46 @@ pub(crate) fn body(fields: &mut Fields) -> syn::Result<TokenStream> {
         )),
     }
 }
+/// Evaluate a fresh expected error when the leaf is executed.
+pub(crate) fn fail(mut fields: Fields) -> syn::Result<TokenStream> {
+    let path = crate::expand::effect_crate_path()?;
+    let error = fields.transform("error", |expr, _| Ok(quote!(move || #expr)))?;
+    fields.finish(quote!(#path::Effect::fail_with(#error)))
+}
+
+/// Lift an already evaluated native Result with the selected ownership contract.
+pub(crate) fn from_result(input: Input) -> syn::Result<TokenStream> {
+    let once = input.mode(&["once"], "reusable")? == "once";
+    let mut fields = input.fields;
+    let path = crate::expand::effect_crate_path()?;
+    let result = fields.take("result")?;
+    if !fields.contains("on_error") {
+        let lift = if once { quote!(from_result_once) } else { quote!(from_result) };
+        return fields.finish(quote!(#path::Effect::#lift(#result)));
+    }
+    let map = fields.role("on_error", 1, BodyCategory::Native)?;
+    let (source_bound, map_bound, output) = if once {
+        (
+            quote!(A: Send + 'static, X: Send + 'static),
+            quote!(F: FnOnce(X) -> E + Send + 'static),
+            quote!(#path::Effect::try_sync_once(move || #result, #map)),
+        )
+    } else {
+        (
+            quote!(A: Clone + Send + Sync + 'static, X: Clone + Send + Sync + 'static),
+            quote!(F: Fn(X) -> E + Send + Sync + 'static),
+            quote!(#path::Effect::from_result(#result).map_error(#map)),
+        )
+    };
+    fields.finish_inferred(
+        quote!(A, E, R, X, F),
+        &[("result", quote!(::core::result::Result<A, X>)), ("on_error", quote!(F))],
+        quote!(#path::Effect<A, E, R>),
+        quote!(#source_bound, #map_bound, E: Send + 'static, R: Send + Sync + 'static),
+        output,
+    )
+}
+
 /// Native leaf lowering: `body` returns a value, Result, or one native Future.
 /// Reusable factories are the default; once forms move owned captures without cloning.
 pub(crate) fn leaf(name: &str, input: Input) -> syn::Result<TokenStream> {
@@ -378,7 +534,8 @@ pub(crate) fn operator(name: &str, input: Input) -> syn::Result<TokenStream> {
         | "effect_provide_some"
         | "effect_sandbox"
         | "effect_recover" => {
-            if mode != "default" {
+            let shared_projection = name == "effect_provide_some" && mode == "shared";
+            if mode != "default" && !shared_projection {
                 return Err(syn::Error::new(
                     Span::call_site(),
                     "mode does not apply to this operator",
@@ -388,6 +545,7 @@ pub(crate) fn operator(name: &str, input: Input) -> syn::Result<TokenStream> {
             let (role, method, category) = match name {
                 "effect_map" => ("map", quote!(map), BodyCategory::Native),
                 "effect_map_error" => ("map", quote!(map_error), BodyCategory::Native),
+                "effect_provide_some" if shared_projection => ("project", quote!(provide_some_arc), BodyCategory::Native),
                 "effect_provide_some" => ("project", quote!(provide_some), BodyCategory::Native),
                 "effect_sandbox" => ("defect", quote!(sandbox), BodyCategory::Native),
                 _ => ("recover", quote!(catch_all), BodyCategory::Effect),
@@ -406,7 +564,7 @@ pub(crate) fn operator(name: &str, input: Input) -> syn::Result<TokenStream> {
                 ),
                 "effect_provide_some" => (
                     quote!(#path::Effect<A, E, B>),
-                    quote!(F: Fn(&B) -> R),
+                    if shared_projection { quote!(F: Fn(&B) -> ::std::sync::Arc<R>) } else { quote!(F: Fn(&B) -> R) },
                     quote!(B: Send + Sync + 'static),
                 ),
                 "effect_sandbox" => (

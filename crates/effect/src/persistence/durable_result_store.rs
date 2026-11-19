@@ -2,7 +2,7 @@
 
 use super::{
     CompareExchange, ConditionalKeyValueStore, DurableKeyValueStore, HasDurableKeyValueStore,
-    HasKeyValueStore, KeyValueStore, Persistable, PersistenceError, StoreRevision, StoredLookup,
+    KeyValueStore, Persistable, PersistenceError, StoreRevision, StoredLookup,
     StoredValue, result_store,
 };
 use crate::effect_provide_some;
@@ -15,20 +15,9 @@ use std::sync::Arc;
 ///
 /// # Type parameters
 /// - `S`: Service or storage type. Bound or type: `DurableKeyValueStore`.
+#[derive(crate::EffectEnvironment)]
+#[effect_environment(key_value_store(provider = S, get = Arc::clone(&self.0)))]
 struct DurableStoreView<S: DurableKeyValueStore>(Arc<S>);
-
-impl<S: DurableKeyValueStore> HasKeyValueStore for DurableStoreView<S> {
-    /// Type alias for store in persistence durable result store.
-    type Store = S;
-
-    ///
-    /// # Returns
-    /// Type: `Arc<Self::Store>`.
-    /// Returns `Arc<Self::Store>`.
-    fn key_value_store(&self) -> Arc<Self::Store> {
-        Arc::clone(&self.0)
-    }
-}
 
 /// Type alias for durable backend in persistence durable result store.
 ///

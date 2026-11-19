@@ -112,6 +112,12 @@ pub use crate::forms::{
 
 /// The witness clock/spawner environment; it exists only for the compile-time
 /// signature proof and performs no execution.
+#[derive(effect::EffectEnvironment)]
+#[effect_environment(
+    clock(provider = effect::TestClock, get = clock),
+    task_spawner(provider = WitnessSpawner, get = tasks),
+    logger = logger,
+)]
 struct WitnessRuntime {
     clock: effect::TestClock,
     tasks: WitnessSpawner,
@@ -124,28 +130,6 @@ struct WitnessSpawner;
 impl effect::TaskSpawner for WitnessSpawner {
     fn spawn(&self, _task: effect::ScheduledTask) -> Result<(), effect::Defect> {
         Err(effect::Defect::new("authoring witness spawner"))
-    }
-}
-
-impl effect::HasClock for WitnessRuntime {
-    type Clock = effect::TestClock;
-
-    fn clock(&self) -> &Self::Clock {
-        &self.clock
-    }
-}
-
-impl effect::HasTaskSpawner for WitnessRuntime {
-    type Tasks = WitnessSpawner;
-
-    fn task_spawner(&self) -> &Self::Tasks {
-        &self.tasks
-    }
-}
-
-impl effect::HasLogger for WitnessRuntime {
-    fn logger(&self) -> &effect::Logger {
-        &self.logger
     }
 }
 

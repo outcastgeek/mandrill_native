@@ -45,7 +45,7 @@
 //! boundaries use the workspace `Effect<A, E, R>` model built with `effect!`: a link
 //! resolution runs the consumer's effectful lookup inside the caller's environment
 //! and error family, and the presentation resolvers lift their pure decisions with
-//! `Effect::sync`. `E` and `R` are the caller's own types; the owner adds no error,
+//! `effect_sync!`. `E` and `R` are the caller's own types; the owner adds no error,
 //! environment or cancellation policy, no timeout and no retry.
 //!
 //! # HTML

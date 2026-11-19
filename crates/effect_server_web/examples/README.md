@@ -82,6 +82,8 @@ The setup creates a fresh directory, random 64-byte native master key with a UUI
 
 The command provisions a single 512 MiB managed region and selects immediate overload refusal. Add `CAFE_QUEUE_CAPACITY=32` to the same command to also allow up to 32 parsed heads to wait for one of the 32 active request places. The queue reserves its FIFO and wake records at startup from the same arena, and the host allows 32 additional connections in that mode. A waiting head holds no Effectful request-body, decode or response buffer. A full queue or wait expiry uses the existing static HTTP 503 response while the connection remains open. The optional queue wait uses half the configured window, leaving time for the reply before the HTTP idle deadline. Earlier connection exhaustion can leave the socket unaccepted. Hyper and the network can retain native input independently.
 
+`/ready` uses the same orders-database probe name, predicate, timeout and error mapping in both SQL modes. Both use the configured SQL session pool and `CAFE_MEMORY_BYTES=536870912` prepared HTTP host. The default, `CAFE_READINESS_SQL=prepared`, preadmits the row, cleanup and session reservations for its borrowed-row cursor. `CAFE_READINESS_SQL=ordinary` selects the same client's native scalar query and decodes its owned row. The transport owns the response reservation through delivery in either mode.
+
 ## Linux configuration for a 2 GB host
 
 This worked starting profile uses a **2,000,000,000-byte host budget** and keeps the same **536,870,912-byte (512 MiB) Effectful arena** as the launch above. The systemd unit uses Linux cgroup v2. Its high threshold starts reclaim and throttling. The maximum is the final containment boundary and can cause a cgroup OOM kill. The café's request limits, deadlines and static 503 response are the application-level overload controls. The numbers below are provisional configuration values. Measure the envelope on the target host before relying on them. [systemd memory controls](https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html#Memory%20Accounting%20and%20Control) · [Linux memory controller](https://docs.kernel.org/admin-guide/cgroup-v2.html#memory-interface-files)
@@ -207,6 +209,7 @@ Successful login returns HTTP 200 with `Signed in. Your pickup order is ready to
 | `CAFE_CAPACITY` | Positive count bound for admission, cache entries/loaders, catalog keys, probes and telemetry capacities. |
 | `CAFE_BYTES` | Positive byte bound for finite resources, key file, body chunks, catalog keys/values/messages and cached responses. |
 | `CAFE_MEMORY_BYTES` | Optional total for the shared Effectful arena, in bytes. Use `536870912` for 512 MiB. When omitted, the host uses the checked sum of the configured regions. Startup refuses a total smaller than the region requests. |
+| `CAFE_READINESS_SQL` | Optional `prepared` (default) or `ordinary` SQL path for the `/ready` orders-database probe. |
 | `CAFE_QUEUE_CAPACITY` | Optional positive number of waiting request heads. Omit it for immediate refusal. |
 | `CAFE_DEPTH` | Positive catalog nesting-depth bound. |
 | `CAFE_HASH_ITERATIONS` | Native password-hash iteration count. |

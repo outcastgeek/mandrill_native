@@ -113,7 +113,7 @@ impl Entry {
     fn callback(&self, path: &TokenStream, count: usize) -> syn::Result<TokenStream> {
         match &self.inline {
             Some((patterns, body)) if patterns.len() == count => {
-                let effect = callback_effect(body.stmts.clone(), path);
+                let effect = crate::extension_support::effect_body_once(body.stmts.clone(), path);
                 Ok(quote!(move |#(#patterns),*| #effect))
             }
             Some(_) => Err(syn::Error::new(
@@ -126,12 +126,6 @@ impl Entry {
             }
         }
     }
-}
-/// Each domain callback invocation owns its inputs once, using the core native-control
-/// lowering instead of requiring Clone payloads in a reusable inner description.
-fn callback_effect(statements: Vec<syn::Stmt>, path: &TokenStream) -> TokenStream {
-    let private = quote!(#path::__private::effect::__private);
-    crate::async_expand::expand_once(statements, &private)
 }
 /// Diagnose unknown operations instead of silently treating names as native methods.
 fn unknown(entry: &Entry) -> syn::Error {
@@ -148,14 +142,127 @@ pub(crate) fn expand(name: &str, input: TokenStream) -> syn::Result<TokenStream>
         "server_stream" => stream(input, &path),
         "reply" => reply(syn::parse2(input)?, &path),
         "route" => route(syn::parse2(input)?, &path),
-        "router" | "routes" => router(syn::parse2(input)?, &path),
+        "router" | "routes" => {
+            let (mode, entries) = mode_entries.parse2(input)?;
+            match mode {
+                None => router(entries, &path),
+                Some(mode) if mode == "configure" => configure_source(entries, &["include", "pipe_through", "on_error"]),
+                Some(mode) => Err(syn::Error::new(mode.span(), "unknown router mode")),
+            }
+        }
         "pipeline" => pipeline(syn::parse2(input)?, &path),
         "registered" => registered(syn::parse2(input)?, &path),
         "representations" => representations(syn::parse2(input)?, &path),
-        "server" => server(syn::parse2(input)?, &path),
+        "server" => {
+            let (mode, entries) = mode_entries.parse2(input)?;
+            match mode {
+                None => server(entries, &path),
+                Some(mode) => server_operation(&mode, entries, &path),
+            }
+        }
         _ => Err(syn::Error::new(Span::call_site(), "unknown HTTP macro")),
     }
 }
+/// Separate explicit modes from existing call-shaped server and router fields.
+fn mode_entries(input: ParseStream<'_>) -> syn::Result<(Option<Ident>, Entries)> {
+    let fork = input.fork();
+    let mode = if fork.call(Ident::parse_any).is_ok() && fork.peek(Token![;]) {
+        let mode = input.call(Ident::parse_any)?;
+        input.parse::<Token![;]>()?;
+        Some(mode)
+    } else {
+        None
+    };
+    Ok((mode, input.parse()?))
+}
+
+fn require_entry<'a>(entries: &'a [Entry], position: usize, name: &str) -> syn::Result<&'a Entry> {
+    let entry = entries
+        .get(position)
+        .ok_or_else(|| syn::Error::new(Span::call_site(), format!("missing {name}")))?;
+    if entry.name != name {
+        return Err(syn::Error::new(entry.name.span(), format!("expected {name}")));
+    }
+    Ok(entry)
+}
+
+/// Preserve infallible configuration when extending an existing owned source.
+fn configure_source(Entries(entries): Entries, allowed: &[&str]) -> syn::Result<TokenStream> {
+    let source = require_entry(&entries, 0, "source")?.value()?;
+    let configured = Ident::new("__configured", Span::mixed_site());
+    let operations = entries.iter().skip(1).map(|entry| {
+        let name = entry.name.to_string();
+        if !allowed.contains(&name.as_str()) {
+            return Err(unknown(entry));
+        }
+        let method = Ident::new(&name, Span::mixed_site());
+        let callback = entry.value()?;
+        Ok(quote!(let #configured = #configured.#method(#callback);))
+    }).collect::<syn::Result<Vec<_>>>()?;
+    Ok(quote!({ let #configured = #source; #(#operations)* #configured }))
+}
+
+/// Typed host and request/policy boundaries without inserting another interpreter.
+fn server_operation(mode: &Ident, entries: Entries, path: &TokenStream) -> syn::Result<TokenStream> {
+    let values = &entries.0;
+    let output = match mode.to_string().as_str() {
+        "with_host" if values.len() == 2 => {
+            let source = require_entry(values, 0, "source")?.value()?;
+            let body = require_entry(values, 1, "body")?.callback(path, 1)?;
+            quote!((#source).with_host(#body))
+        }
+        "run" if values.len() == 1 => {
+            let source = require_entry(values, 0, "source")?.value()?;
+            quote!((#source).run())
+        }
+        "request" if values.is_empty() => quote!({
+            fn __server_request<E, R>() -> #path::__private::effect::Effect<#path::Request, E, R>
+            where
+                E: Send + 'static,
+                R: #path::HasRequest + Send + Sync + 'static,
+            {
+                #path::__private::effect::Effect::service(|env: &R| env.request().clone())
+            }
+            __server_request()
+        }),
+        "prepared_configure" if values.len() == 2 => {
+            let source = require_entry(values, 0, "source")?.value()?;
+            let operation = &values[1];
+            let name = operation.name.to_string();
+            let arity = match name.as_str() {
+                "request_queue" => 2,
+                "body_channels" => 5,
+                "connection_tasks" => 7,
+                "http_timeouts" | "response_limits" | "http_limits" | "http2_reset_limits"
+                | "native_bytes_pool" | "json_writer_pool" | "native_tasks" | "request_storage"
+                | "request_byte_pools" | "request_control_admission" | "body_completion_admission"
+                | "connection_admission" | "observer_batch_admission" | "terminal_admission"
+                | "response_headers_pool" => 1,
+                _ => return Err(unknown(operation)),
+            };
+            let args = operation.arguments(arity)?;
+            let method = Ident::new(&format!("with_{name}"), Span::mixed_site());
+            quote!((#source).#method(#(#args),*))
+        }
+        "request_binding" if values.len() == 1 => {
+            let body = require_entry(values, 0, "body")?.callback(path, 1)?;
+            quote!(#path::RequestBinding::new(#body))
+        }
+        "policy" if values.first().is_some_and(|entry| entry.name == "source") => {
+            return configure_source(entries, &["on_exit"]);
+        }
+        "policy" if values.len() == 4 => {
+            let body = require_entry(values, 0, "body_policy")?.value()?;
+            let host = require_entry(values, 1, "host_policy")?.value()?;
+            let native_error = require_entry(values, 2, "native_error")?.value()?;
+            let on_error = require_entry(values, 3, "on_error")?.value()?;
+            quote!(#path::ServerPolicy::new(#body, #host, #native_error, #on_error))
+        }
+        _ => return Err(syn::Error::new(mode.span(), "unsupported or incomplete server mode")),
+    };
+    Ok(output)
+}
+
 /// Lower direct endpoint statements, an existing source, or one inline/extracted body.
 fn endpoint(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> {
     let endpoint_ident = Ident::new("__endpoint", Span::mixed_site());
@@ -456,7 +563,7 @@ fn reply(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStre
                 operations.push(quote!(let #draft_ident=#draft_ident.#method(#(#args),*);));
             }
             "text" | "html" | "render" | "json" | "json_codec" | "problem" | "validation"
-            | "bytes" | "stream" | "sse" | "negotiate" | "native" | "redirect" | "file_path"
+            | "bytes" | "stream" | "sse" | "negotiate" | "native" | "native_owned" | "redirect" | "file_path"
             | "no_content" | "empty" | "source" | "finite" | "lease" | "frame" => {
                 if terminal.is_some() {
                     return Err(syn::Error::new(
@@ -467,7 +574,7 @@ fn reply(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStre
                 let count = match name.as_str() {
                     "empty" | "no_content" => 0,
                     "bytes" | "stream" | "negotiate" | "redirect" | "file_path" | "lease"
-                    | "frame" => 2,
+                    | "frame" | "native_owned" => 2,
                     "json_codec" => 3,
                     _ => 1,
                 };
@@ -751,7 +858,7 @@ fn pipeline(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenS
                     Some((patterns, block)) if patterns.len() == 2 => {
                         let (prefix, body) =
                             crate::context_expand::split_prefix(block.stmts.clone());
-                        let effect = callback_effect(body, path);
+                        let effect = crate::extension_support::effect_body_once(body, path);
                         quote!(move |#(#patterns),*| {#(#prefix)* #path::__private::effect::Release::from_effect(#effect)})
                     }
                     Some(_) => {
@@ -984,6 +1091,12 @@ fn server(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStr
                     bindings.push(binding);
                 }
             }
+            "on_exit" if source.is_some() => {
+                operations.push(quote!(
+                    let mut #server_ident = #server_ident;
+                    #server_ident.policy = #server_ident.policy.on_exit(#value);
+                ));
+            }
             "configure_app"
             | "configure_builder"
             | "middleware"
@@ -1082,6 +1195,33 @@ fn server(Entries(entries): Entries, path: &TokenStream) -> syn::Result<TokenStr
 /// The writer parameter retains its native type so prefix method calls infer before the body future.
 /// The immediately invoked binder closure names MacroContext explicitly for the same receiver inference.
 fn stream(input: TokenStream, path: &TokenStream) -> syn::Result<TokenStream> {
+    if crate::restricted_expand::has_mode(&input, &["sse", "flush", "write", "write_lease", "write_frame"]) {
+        let input: crate::callback_expand::Input = syn::parse2(input)?;
+        let mode = input.mode(&["sse", "flush", "write", "write_lease", "write_frame"], "flush")?;
+        let mut fields = input.fields;
+        let writer = fields.transform("writer", |value, _| Ok(quote!(&(#value))))?;
+        let output = match mode.as_str() {
+            "sse" => {
+                let record = fields.take("record")?;
+                let policy = fields.take("policy")?;
+                quote!((#writer).sse(#record, #policy))
+            }
+            "write" => {
+                let bytes = fields.take("bytes")?;
+                quote!((#writer).write(#bytes))
+            }
+            "write_lease" => {
+                let view = fields.take("view")?;
+                quote!((#writer).write_lease(#view))
+            }
+            "write_frame" => {
+                let frame = fields.take("frame")?;
+                quote!((#writer).write_frame(#frame))
+            }
+            _ => quote!((#writer).flush()),
+        };
+        return fields.finish(output);
+    }
     let source_ident = Ident::new("__server_source", Span::mixed_site());
     let writer_ident = Ident::new("__server_writer", Span::mixed_site());
     let body_ident = Ident::new("__server_body", Span::mixed_site());

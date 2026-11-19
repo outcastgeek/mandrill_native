@@ -9,9 +9,9 @@
 
 use effect::memory::{MemoryError, PreparedMemory, RegionId};
 use effect::{
-    AdmissionPermit, Annotations, Defect, Diagnostics, LogLevel, Logger, PreparedAdmissionPermit,
-    PreparedDiagnostics, PreparedPollHook, PreparedTraceContext, SharedAnnotations, SpanFinish,
-    SpanId, SpanStart, Tracer,
+    AdmissionPermit, Annotations, Defect, Diagnostics, Effect, HasClock, HasTracer, LogLevel, Logger,
+    PollInstrumentation, PreparedAdmissionPermit, PreparedDiagnostics, PreparedPollHook,
+    PreparedTraceContext, SharedAnnotations, SpanFinish, SpanId, SpanStart, Tracer,
 };
 mod prepared;
 pub use prepared::{PreparedSpanAnnotations, PreparedSpanStart, PreparedTracingCapacity};
@@ -552,6 +552,28 @@ impl TracingBackend {
     }
 }
 
+/// Run a typed program inside a named span and its selected native poll instrumentation.
+///
+/// The environment supplies the tracer and clock. The instrumentation is selected
+/// lazily from that same environment and applies to span start, body and finish.
+/// Each native poll guard restores its caller's context on completion or unwind.
+pub fn with_span<A, E, R>(
+    name: impl Into<Arc<str>>,
+    program: Effect<A, E, R>,
+    select: impl Fn(&R) -> Arc<dyn PollInstrumentation> + Send + Sync + 'static,
+) -> Effect<A, E, R>
+where
+    A: Send + 'static,
+    E: Send + 'static,
+    R: HasTracer + HasClock + Send + Sync + 'static,
+{
+    effect::effect! {
+        poll_instrumentation;
+        program: effect::span! { name: name, effect: program, },
+        select: select,
+    }
+}
+
 /// Thread-local native guards retained only for the duration of one poll.
 #[doc(hidden)]
 pub struct NativePollScope {
@@ -564,6 +586,12 @@ pub struct NativePollScope {
 impl effect::PollScope for NativePollScope {}
 
 impl TracingBackend {
+    /// Enter this run's native span and retain the concrete per-poll guard.
+    #[doc(hidden)]
+    pub fn enter_poll_scope(&self, trace: &effect::TraceContext) -> NativePollScope {
+        self.enter_native(trace.span.as_ref().map(SpanId::as_str))
+    }
+
     fn enter_native(&self, id: Option<&str>) -> NativePollScope {
         let dispatch = tracing::dispatcher::set_default(&self.dispatch);
         let owner = id.and_then(|id| self.find(id));
@@ -579,7 +607,7 @@ impl TracingBackend {
 impl effect::PollInstrumentation for TracingBackend {
     /// Enter the selected dispatch and this execution's native span on this thread.
     fn enter(&self, trace: &effect::TraceContext) -> Box<dyn effect::PollScope> {
-        Box::new(self.enter_native(trace.span.as_ref().map(SpanId::as_str)))
+        Box::new(self.enter_poll_scope(trace))
     }
 }
 

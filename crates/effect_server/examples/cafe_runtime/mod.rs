@@ -1,14 +1,23 @@
 //! Request capability wiring for the finite order lookup; business endpoints stay in the example.
 use super::{CafeError, CustomerId, cafe_telemetry};
 use cafe_telemetry::TelemetryCapacity;
-use effect::{
-    Cancellation, HasBlockingExecutor, HasCancellation, HasClock, HasTaskSpawner, HasTracer,
-    ParsePolicy,
-};
-use effect_otel::{BorrowedProviders, HasOtel, OtelBackend};
-use effect_server::{HasRequest, HasTokio, Request, ServerError};
+use effect::{Cancellation, ParsePolicy};
+use effect_otel::BorrowedProviders;
+use effect_server::{EffectEnvironment, Request};
 use std::{num::NonZeroUsize, sync::Arc};
 /// Caller-owned Tokio I/O and scheduling capabilities beside application request state.
+#[derive(EffectEnvironment)]
+#[effect_environment(
+    request = request,
+    tokio = self.telemetry.runtime.handle(),
+    server_error(error = CafeError, map = CafeError::Http),
+    cancellation = cancellation,
+    clock(provider = effect_tokio::TokioClock, get = &self.telemetry.clock),
+    task_spawner(provider = effect_tokio::TokioTasks, get = &self.telemetry.tasks),
+    blocking_executor(provider = effect_tokio::TokioBlocking, get = &self.telemetry.blocking),
+    tracer = effect::HasTracer::tracer(&self.telemetry),
+    otel = effect_otel::HasOtel::otel(&self.telemetry),
+)]
 pub(crate) struct Cafe {
     /// Existing café provider composition, shared by root and request projections.
     pub(super) telemetry: cafe_telemetry::Environment,
@@ -20,68 +29,6 @@ pub(crate) struct Cafe {
     pub(super) request: Request,
     /// Trusted result of the explicit local demonstration policy.
     pub(super) customer: Option<CustomerId>,
-}
-impl HasTaskSpawner for Cafe {
-    /// Reuse the existing café task provider.
-    type Tasks = effect_tokio::TokioTasks;
-    /// Borrow the selected independent-child scheduler.
-    fn task_spawner(&self) -> &Self::Tasks {
-        &self.telemetry.tasks
-    }
-}
-impl HasBlockingExecutor for Cafe {
-    /// JSON native writes run on the existing independent blocking provider.
-    type Executor = effect_tokio::TokioBlocking;
-    /// Borrow the same provider retained through host drain.
-    fn blocking_executor(&self) -> &Self::Executor {
-        &self.telemetry.blocking
-    }
-}
-impl HasClock for Cafe {
-    /// Request projections preserve the existing monotonic origin.
-    type Clock = effect_tokio::TokioClock;
-    /// Borrow the selected native clock.
-    fn clock(&self) -> &Self::Clock {
-        &self.telemetry.clock
-    }
-}
-impl HasTracer for Cafe {
-    /// Both request and domain spans share the existing OTel-backed tracer.
-    fn tracer(&self) -> &effect::Tracer {
-        &self.telemetry.tracer
-    }
-}
-impl HasOtel for Cafe {
-    /// Borrow the selected native bridge without global discovery.
-    fn otel(&self) -> &OtelBackend {
-        &self.telemetry.otel
-    }
-}
-impl effect_server::HasServerError for Cafe {
-    /// JSON/input failures retain the café HTTP error channel.
-    type Error = CafeError;
-    /// Map the checked native cause once.
-    fn server_error(&self, error: ServerError) -> CafeError {
-        CafeError::Http(error)
-    }
-}
-impl HasTokio for Cafe {
-    /// Borrow the runtime kept alive by main through host drain.
-    fn tokio(&self) -> &tokio::runtime::Handle {
-        self.telemetry.runtime.handle()
-    }
-}
-impl HasCancellation for Cafe {
-    /// Select the cancellation authority belonging to this execution.
-    fn cancellation(&self) -> &Cancellation {
-        &self.cancellation
-    }
-}
-impl HasRequest for Cafe {
-    /// Preserve the real native request and its checked one-body owner.
-    fn request(&self) -> &Request {
-        &self.request
-    }
 }
 /// Root capability state uses caller-owned providers and explicit telemetry/JSON storage bounds.
 pub(crate) fn environment(

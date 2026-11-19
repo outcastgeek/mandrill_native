@@ -7,7 +7,7 @@ use super::{
 };
 use crate::Effect;
 use crate::encoding::{FrameDecodeFailure, FrameDecoder};
-use crate::{effect, effect_map_error, effect_provide_some, effect_recover, effect_try_sync};
+use crate::{effect, effect_map_error, effect_provide_some, effect_recover};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -184,9 +184,10 @@ where
         Arc::make_mut(&mut self.handlers).insert(
             (spec.id, spec.version),
             Arc::new(move |session, first| {
-                server
-                    .serve_prefetched(session, first)
-                    .map_error(RpcStreamProtocolError::Server)
+                effect_map_error! {
+                    program: server.serve_prefetched(session, first),
+                    map: RpcStreamProtocolError::Server,
+                }
             }),
         );
         Ok(())
@@ -348,7 +349,7 @@ where
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take()
                 .unwrap_or(RpcStreamProtocolError::InputConsumed);
-            effect_try_sync! { once; body: { let __dsl_result = Err(error); move || __dsl_result }, on_error: ::core::convert::identity, }
+            crate::effect_from_result! { once; result: Err(error), }
         }? }
     }
 }

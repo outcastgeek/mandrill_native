@@ -20,11 +20,23 @@ pub(crate) fn codec(input: Input) -> syn::Result<TokenStream> {
             "recursive",
             "recursive_pure",
             "lazy",
+            "schema_decoder",
         ],
         "effectful",
     )?;
     let mut fields = input.fields;
     let path = crate::expand::effect_crate_path()?;
+    if mode == "schema_decoder" {
+        let decode = fields.role("decode", 1, BodyCategory::Native)?;
+        return fields.finish_inferred(
+            quote!(A, E, F),
+            &[("decode", quote!(F))],
+            quote!(#path::Schema<A, E>),
+            quote!(A: Send + 'static, E: Send + 'static,
+                F: Fn(&#path::JsonValue) -> ::core::result::Result<A, E> + Send + Sync + 'static),
+            quote!(#path::Schema::from_decoder(#decode)),
+        );
+    }
     let pure = matches!(
         mode.as_str(),
         "pure" | "contextual_pure" | "recursive_pure" | "transform_pure"
@@ -212,8 +224,14 @@ fn finish_codec(
 /// schema/JSON depth, pattern and cumulative issue budgets. Optional mapping
 /// changes SchemaIssue only; encoding remains a separate directional operation.
 pub(crate) fn parse(input: Input) -> syn::Result<TokenStream> {
-    let mode = input.mode(&["prepared"], "default")?;
+    let mode = input.mode(&["prepared", "schema"], "default")?;
     let mut fields = input.fields;
+    if mode == "schema" {
+        let schema = fields.transform("schema", |value, _| Ok(quote!(&(#value))))?;
+        let text = fields.take("text")?;
+        let on_error = fields.role("on_syntax_error", 1, BodyCategory::Native)?;
+        return fields.finish(quote!(#schema.parse(#text, #on_error)));
+    }
     let codec = fields.transform("codec", |codec, _| Ok(quote!(&(#codec))))?;
     let text = fields.take("text")?;
     let output = if mode == "prepared" {

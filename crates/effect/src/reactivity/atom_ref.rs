@@ -208,31 +208,27 @@ impl<A: Send + Sync + 'static> AtomRef<A> {
                                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                                                    .take();
                                                match decision {
-                                                   Some(Ok(keys)) => { let __dsl_program = Effect::from_exit_once(publication); let __dsl_cleanup = effect_map_error! { program: registry.notify(keys), map: AtomRefError::CommittedWithoutInvalidation, }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } },
+                                                   Some(Ok(keys)) => { let __dsl_program = crate::effect! { from_exit_once; exit: publication, }; let __dsl_cleanup = effect_map_error! { program: registry.notify(keys), map: AtomRefError::CommittedWithoutInvalidation, }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } },
                                                    Some(Err(error)) => {
-                                                       let __dsl_program = effect_try_sync! {
-                                                       once; body: {
-                                                       let __dsl_result = Err(
+                                                       let __dsl_program = crate::effect_from_result! { once; result: Err(
                                                        AtomRefError::Registry(error),
-                                                   ); move || __dsl_result }, on_error: ::core::convert::identity, }; let __dsl_cleanup = effect_map! { program: Effect::from_exit_once(publication), map: |_| (), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } },
+                                                   ), }; let __dsl_cleanup = effect_map! { program: crate::effect! { from_exit_once; exit: publication, }, map: |_| (), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } },
                                                    None => {
                                                        {
-                                                           let __dsl_program = Effect::from_exit_once(publication); effect! {
+                                                           let __dsl_program = crate::effect! { from_exit_once; exit: publication, }; effect! {
                                                            let _ = __dsl_program.clone()?; {
-                                                           effect_try_sync! {
-                                                               once; body: {
-                                                               let __dsl_result = Err(
+                                                           crate::effect_from_result! { once; result: Err(
                                                                AtomRefError::InputConsumed,
-                                                           ); move || __dsl_result }, on_error: ::core::convert::identity, }
+                                                           ), }
                                                        }? } }
                                                    }
                                                }
                                            }? } }
                                    }
-                                   None => effect_try_sync! { once; body: { let __dsl_result = Err(AtomRefError::RevisionExhausted); move || __dsl_result }, on_error: ::core::convert::identity, },
+                                   None => crate::effect_from_result! { once; result: Err(AtomRefError::RevisionExhausted), },
                                }
                            }
-                           None => effect_try_sync! { once; body: { let __dsl_result = Err(AtomRefError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, },
+                           None => crate::effect_from_result! { once; result: Err(AtomRefError::InputConsumed), },
                        };
                        { let __dsl_program = effect_uninterruptible! { program: mutation, }; let __dsl_cleanup = effect_sync! { once; body: move || drop(permit), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } }
                    },
@@ -323,7 +319,7 @@ impl AtomReadContext {
         source: &AtomRef<A>,
     ) -> Effect<Arc<A>, AtomRefError, R> {
         if !self.registry.same_instance(&source.registry) {
-            return effect_try_sync! { once; body: { let __dsl_result = Err(AtomRefError::ForeignRegistry); move || __dsl_result }, on_error: ::core::convert::identity, };
+            return crate::effect_from_result! { once; result: Err(AtomRefError::ForeignRegistry), };
         }
         let dependencies = Arc::clone(&self.dependencies);
         let source = source.clone();
@@ -360,7 +356,7 @@ impl AtomReadContext {
                         value
                     }, }
                 }? } };
-                { let __dsl_program = read; let __dsl_cleanup = effect_sync! { once; body: move || drop(permit), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } }
+                { let __dsl_cleanup = effect_sync! { once; body: move || drop(permit), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| read.clone(), } }
             }? }
         }
     }
@@ -389,7 +385,7 @@ impl AtomReadContext {
         R: Send + Sync + 'static,
     {
         if !self.registry.same_instance(derived.registry()) {
-            return effect_try_sync! { once; body: { let __dsl_result = Err(AtomDependencyError::ForeignRegistry); move || __dsl_result }, on_error: ::core::convert::identity, };
+            return crate::effect_from_result! { once; result: Err(AtomDependencyError::ForeignRegistry), };
         }
         let dependencies = Arc::clone(&self.dependencies);
         let id = derived.id().clone();
@@ -426,11 +422,7 @@ impl AtomReadContext {
                         }
                         None => Err(AtomDependencyError::Unavailable),
                     };
-            effect_try_sync! {
-                once;
-                body: move || result,
-                on_error: std::convert::identity,
-            }?
+            crate::effect_from_result! { once; result: result, }?
         }
     }
 }

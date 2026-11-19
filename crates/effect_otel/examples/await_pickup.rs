@@ -135,7 +135,8 @@ mod pickup {
                 series_per_descriptor: maximum,
             },
         )?);
-        let result = runtime.block_on(find_pickup(north, south, window, poll).run(env.clone()));
+        let pickup = find_pickup(north, south, window, poll);
+        let result = runtime.block_on(effect! { run; program: &pickup, environment: env.clone(), });
         runtime.block_on(env.tasks.stop().wait());
         runtime.block_on(env.blocking.stop().wait());
         logs.shutdown()?;

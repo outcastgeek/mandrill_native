@@ -1,7 +1,7 @@
 //! In-memory atomic rate-limit accounting.
 
 use super::super::rate_limiter::{
-    AdaptiveFeedback, AdaptiveSignal, AdaptiveWindowPolicy, FeedbackOutcome, HasRateLimitStore,
+    AdaptiveFeedback, AdaptiveSignal, AdaptiveWindowPolicy, FeedbackOutcome,
     MemoryRateLimitError, RateLimitDecision, RateLimitPolicy, RateLimitStore,
     RateLimitStoreCapacity,
 };
@@ -388,19 +388,6 @@ impl MemoryRateLimitStore {
             RateLimitStoreCapacity::Unbounded => true,
             RateLimitStoreCapacity::Bounded(maximum) => state.entries.len() < maximum.get(),
         }
-    }
-}
-
-impl HasRateLimitStore for Arc<MemoryRateLimitStore> {
-    /// Type alias for store in persistence internal rate limit.
-    type Store = MemoryRateLimitStore;
-
-    ///
-    /// # Returns
-    /// Type: `Arc<Self::Store>`.
-    /// Returns `Arc<Self::Store>`.
-    fn rate_limit_store(&self) -> Arc<Self::Store> {
-        Arc::clone(self)
     }
 }
 

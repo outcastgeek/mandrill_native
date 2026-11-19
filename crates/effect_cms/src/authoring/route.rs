@@ -110,16 +110,13 @@ where
         effect::effect! {
             bind;
             program:effect::effect_try_sync! { once; body:move || {
-                let mut routes=Vec::new();
-                if has_router && !service.options.route_name.is_empty() && !service.options.path.is_empty() {
-                    if let Some(authoring)=&service.options.authoring {
-                        let mut route=ManagedRoute::new(&service.options.route_name,"POST",&service.options.path,authoring.translate_localized_content());
-                        route.permissions=service.options.permissions.clone();route.category=AUTHORING_ROUTE_CATEGORY.to_owned();routes.push(route);
-                    }
-                }
+                let routes=has_router.then(|| service.translation_route()).flatten().into_iter().collect();
                 service.routes.with_routes(routes)
             }, on_error: |error| X::from(crate::routing::ManagedStartError::Registration(error)), },
-            body:move |routes|routes.register_and_start_routes(&owner,router.clone(),mounter.as_ref()),
+            body: move |routes| crate::cms! {
+                register_routes; service: routes, scope: &owner,
+                router: router.clone(), mounter: mounter.as_ref(),
+            },
         }
     }
 
@@ -139,13 +136,20 @@ where
         ),
         ManagedRouteError,
     > {
-        if router.is_none() || self.options.route_name.is_empty() || self.options.path.is_empty() {
+        if router.is_none() {
             return Ok((router, None));
         }
-        let Some(authoring) = self.options.authoring.as_ref() else {
+        let Some(route) = self.translation_route() else {
             return Ok((router, None));
         };
-        let handler = authoring.translate_localized_content();
+        register(router, &self.options.access, mounter, &route)
+    }
+
+    fn translation_route(&self) -> Option<ManagedRoute<AuthoringHandlerError<A, T>, R>> {
+        if self.options.route_name.is_empty() || self.options.path.is_empty() {
+            return None;
+        }
+        let handler = self.options.authoring.as_ref()?.translate_localized_content();
         let mut route = ManagedRoute::new(
             self.options.route_name.as_str(),
             "POST",
@@ -154,6 +158,6 @@ where
         );
         route.permissions = self.options.permissions.clone();
         route.category = AUTHORING_ROUTE_CATEGORY.to_owned();
-        register(router, &self.options.access, mounter, &route)
+        Some(route)
     }
 }

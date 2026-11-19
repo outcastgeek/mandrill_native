@@ -1725,6 +1725,7 @@ dependencies = [
  "chrono-tz",
  "effect",
  "effect-server",
+ "effect-server-web",
  "effect-tokio",
  "futures-executor",
  "html5ever",

@@ -5,7 +5,6 @@ use super::{
     JournalStream, ReplicaBatch, ReplicaCursorStore, ReplicaExport, ReplicaExportError, ReplicaId,
     ReplicaSync, ReplicaSyncError,
 };
-use crate::effect_try_sync;
 use crate::rpc::{RpcHandler, RpcOperation};
 use std::num::NonZeroUsize;
 
@@ -98,7 +97,7 @@ impl EventLogRpc {
             match authorize(&batch) {
                 Ok(permit) => EventReplicator::import_and_ack::<R>(batch, permit),
                 Err(error) => {
-                    effect_try_sync! { once; body: { let __dsl_result = Err(error); move || __dsl_result }, on_error: ::core::convert::identity, }
+                    crate::effect_from_result! { once; result: Err(error), }
                 }
             }
         })

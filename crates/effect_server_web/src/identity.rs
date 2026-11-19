@@ -21,7 +21,7 @@ use effect_server_identity::native::identity::{
 use effect_server_identity::policies::{
     BrowserSelection, PrincipalSelection, TicketSelection, TokenSelection,
 };
-use effect_server_identity::{IdentityComponents, IdentityDefinition, IdentityError};
+use effect_server_identity::{IdentityComponents, IdentityDefinition, IdentityError, identity};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -66,7 +66,7 @@ where
     E: Send + 'static,
     R: Send + Sync + 'static,
 {
-    Arc::new(definition.selected_bearer_stage())
+    Arc::new(identity! { identity: definition, selected_bearer_stage(), })
 }
 /// Build Web's bearer authentication hook with the definition's prepared
 /// invocation and an explicit aggregate credential header byte limit.
@@ -86,7 +86,7 @@ where
     E: Send + 'static,
     R: Send + Sync + 'static,
 {
-    Arc::new(definition.prepared_bearer_stage(header_bytes))
+    Arc::new(identity! { identity: definition, prepared_bearer_stage(header_bytes), })
 }
 /// Adapt D18's selected cookie/ticket, principal and configured current-user manager
 /// before request environment projection. Verified authority is private; native
@@ -108,7 +108,7 @@ where
     E: Send + 'static,
     R: Send + Sync + 'static,
 {
-    Arc::new(definition.cookie_stage())
+    Arc::new(identity! { identity: definition, cookie_stage(), })
 }
 /// Build Web's cookie authentication hook with the definition's prepared
 /// invocation and an explicit aggregate credential header byte limit.
@@ -129,7 +129,7 @@ where
     E: Send + 'static,
     R: Send + Sync + 'static,
 {
-    Arc::new(definition.prepared_cookie_stage(header_bytes))
+    Arc::new(identity! { identity: definition, prepared_cookie_stage(header_bytes), })
 }
 /// Adapt D18's selected server-backed browser factory after authentication and
 /// before writes/cache handling. The factory binds the actual invocation backend,
@@ -149,5 +149,5 @@ where
     E: Send + 'static,
     R: Send + Sync + 'static,
 {
-    Arc::new(definition.selected_antiforgery_stage())
+    Arc::new(identity! { identity: definition, selected_antiforgery_stage(), })
 }

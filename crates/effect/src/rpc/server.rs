@@ -192,9 +192,7 @@ where
         effect! {
         bind;
         program: effect_map_error! {
-            program: handler
-                   .call(request)
-                   .either(), map: RpcServerError::Handler, },
+            program: crate::effect! { either; program: handler.call(request), }, map: RpcServerError::Handler, },
         body: move |outcome| {
                        let encoded = match &outcome {
                            Ok(value) => operation.success_codec().encode_ref(value),
@@ -203,19 +201,19 @@ where
                        .map_err(RpcServerError::ResponseSchema);
                        let payload = match encoded {
                            Ok(payload) => payload,
-                           Err(error) => return effect_try_sync! { once; body: { let __dsl_result = Err(error); move || __dsl_result }, on_error: ::core::convert::identity, },
+                           Err(error) => return crate::effect_from_result! { once; result: Err(error), },
                        };
                        if let Err(error) =
                            crate::schema::internal::parser::check_limits(&payload, &operation.limits())
                        {
-                           return effect_try_sync! { once; body: { let __dsl_result = Err(RpcServerError::ResponseSchema(error)); move || __dsl_result }, on_error: ::core::convert::identity, };
+                           return crate::effect_from_result! { once; result: Err(RpcServerError::ResponseSchema(error)), };
                        }
                        let metadata = metadata
                            .lock()
                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                            .take();
                        let Some(metadata) = metadata else {
-                           return effect_try_sync! { once; body: { let __dsl_result = Err(RpcServerError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, };
+                           return crate::effect_from_result! { once; result: Err(RpcServerError::InputConsumed), };
                        };
                        let kind = if outcome.is_ok() {
                            RpcEnvelopeKind::Success
@@ -231,7 +229,7 @@ where
                            payload,
                            metadata,
                        };
-                       effect_try_sync! { once; body: { let __dsl_result = envelope.encode(policy).map_err(RpcServerError::Wire); move || __dsl_result }, on_error: ::core::convert::identity, }
+                       crate::effect_from_result! { once; result: envelope.encode(policy).map_err(RpcServerError::Wire), }
                    },
         }
     }

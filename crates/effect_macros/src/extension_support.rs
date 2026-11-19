@@ -41,6 +41,7 @@ pub(crate) fn effect_body(
 /// Use this for owned error/loader/request callback parameters, while ordinary
 /// reusable `body` descriptions keep `effect_body` and its existing semantics.
 pub(crate) fn effect_body_once(statements: Vec<syn::Stmt>, extension: &TokenStream) -> TokenStream {
-    let private = quote!(#extension::__private::effect::__private);
-    crate::async_expand::expand_once(statements, &private)
+    // These callbacks already admit native async syntax, including suspension
+    // introduced by Rust macros whose tokens belong to the caller.
+    crate::expand::expand_once_with_path(statements, quote!(#extension::__private::effect), true)
 }

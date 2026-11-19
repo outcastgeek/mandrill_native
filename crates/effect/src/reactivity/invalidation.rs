@@ -195,7 +195,7 @@ impl InvalidationRegistry {
                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                                    .take();
                                let Some(keys) = keys else {
-                                   return effect_try_sync! { once; body: { let __dsl_result = Err(InvalidationError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                   return crate::effect_from_result! { once; result: Err(InvalidationError::InputConsumed), };
                                };
                                let registry = registry.clone();
                                let revision = {
@@ -233,9 +233,9 @@ impl InvalidationRegistry {
                                                },
                                            ), map: InvalidationError::PubSub, }, map: Some, }
                                    }
-                                   Err(error) => effect_try_sync! { once; body: { let __dsl_result = Err(error); move || __dsl_result }, on_error: ::core::convert::identity, },
+                                   Err(error) => crate::effect_from_result! { once; result: Err(error), },
                                };
-                               { let __dsl_program = publication; let __dsl_cleanup = effect_sync! { once; body: move || drop(permit), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } }
+                               { let __dsl_cleanup = effect_sync! { once; body: move || drop(permit), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| publication.clone(), } }
                            },
             }
                    })()? }

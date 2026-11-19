@@ -329,7 +329,7 @@ pub(crate) fn prepared_independent<A: Send + 'static, E: Send + 'static, R: Send
                     Ok(permit) => permit,
                     Err(error) => return Exit::Fail(capacity(error)),
                 };
-                context.run(work(), env).await
+                effect::effect! { run_in_context; context: context, program: work(), environment: env, }.await
             }
         },
     }

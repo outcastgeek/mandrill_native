@@ -35,7 +35,7 @@ pub fn build_resource_dashboard_page_with_state<C: Send + Sync + 'static, E: Sen
         let source = source.clone();
         let build_state = build_state.clone();
         let mut page = match source {
-            Some(source) => match source(&context, request.as_ref(), &kind).either()? {
+            Some(source) => match effect! { either; program: source(&context, request.as_ref(), &kind), }? {
                 Ok(Some(page)) => page,
                 Ok(None) | Err(_) => ResourceDashboardPageVM::default(),
             },

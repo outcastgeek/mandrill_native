@@ -91,7 +91,7 @@ where
         }?;
         let page_vm = match rendering.as_ref() {
             Some(source) => {
-                let selected = source(&request, &kind, query).either()?;
+                let selected = effect! { either; program: source(&request, &kind, query), }?;
                 match selected {
                     Ok(page) => {
                         let mut page = page;
@@ -270,10 +270,14 @@ where
         let request = request.clone();
         let hreflang_path = hreflang_path.clone();
         let hreflangs_for_path = hreflangs_for_path.clone();
-        let empty = view
-            .clone()
-            .with::<bool, E, R>(|props| props.hreflangs.is_empty())
-            .either()?;
+        let empty = effect! {
+            either;
+            program: effect_ref! {
+                inspect;
+                reference: view,
+                inspect: |props| props.hreflangs.is_empty(),
+            },
+        }?;
         if matches!(empty, Ok(true))
             && !hreflang_path.trim().is_empty()
             && let Some(resolve) = hreflangs_for_path.as_ref()

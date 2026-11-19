@@ -48,6 +48,16 @@ impl Fold for Lower {
 
 /// Build a reusable, deferred durable body; no pre-bind initializer runs at construction.
 pub(crate) fn expand(statements: Vec<Stmt>) -> syn::Result<TokenStream> {
+    expand_body(statements, quote!(from_body))
+}
+
+/// Lower a workflow callback's owned input without adding a hidden payload clone.
+/// The workflow executor rebuilds this callback for each durable evaluation/replay.
+pub(crate) fn expand_once(statements: Vec<Stmt>) -> syn::Result<TokenStream> {
+    expand_body(statements, quote!(from_body_once))
+}
+
+fn expand_body(statements: Vec<Stmt>, constructor: TokenStream) -> syn::Result<TokenStream> {
     let path = crate::expand::effect_crate_path()?;
     let context = Ident::new("__durable_context", Span::mixed_site());
     let mut lower = Lower {
@@ -63,26 +73,10 @@ pub(crate) fn expand(statements: Vec<Stmt>) -> syn::Result<TokenStream> {
         return Err(error);
     }
     Ok(
-        quote!(#path::workflow::Durable::from_body(move |#context| {#(#prefix)* async move {
+        quote!(#path::workflow::Durable::#constructor(move |#context| {#(#prefix)* async move {
             #[allow(unreachable_code)] { Ok({ #(#body)* }) }
         } })),
     )
-}
-
-/// Lower a workflow callback's owned input without adding a hidden payload clone.
-/// The workflow executor rebuilds this callback for each durable evaluation/replay.
-pub(crate) fn expand_once(statements: Vec<Stmt>) -> syn::Result<TokenStream> {
-    let tokens = expand(statements)?;
-    let expression: syn::Expr = syn::parse2(tokens)?;
-    let syn::Expr::Call(mut call) = expression else {
-        return Err(syn::Error::new_spanned(
-            expression,
-            "expected durable body constructor",
-        ));
-    };
-    let path = crate::expand::effect_crate_path()?;
-    *call.func = parse_quote!(#path::workflow::Durable::from_body_once);
-    Ok(quote!(#call))
 }
 
 /// Focused native lowering checks for domain control flow and lexical boundaries.

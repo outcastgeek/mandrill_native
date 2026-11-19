@@ -221,7 +221,7 @@ where
                                     .set(running), map: AtomError::Publication, }, map: move |_| (generation, previous.clone()), }
                             }? } }
                     }? } };
-                    { let __dsl_program = beginning; let __dsl_cleanup = effect_sync! { once; body: move || drop(permit), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } }
+                    { let __dsl_cleanup = effect_sync! { once; body: move || drop(permit), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| beginning.clone(), } }
                 }? }
             };
             let atom = self.clone();
@@ -253,14 +253,12 @@ where
                                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                                                        .take();
                                                    let Some((outcome, previous)) = pending else {
-                                                       return effect_try_sync! {
-                                                           once; body: {
-                                                           let __dsl_result = Err(
+                                                       return crate::effect_from_result! { once; result: Err(
                                                            AtomError::InputConsumed,
-                                                       ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                                       ), };
                                                    };
                                                    if !atom.registry.is_current(&atom.id, generation) {
-                                                       return Effect::from_exit_once(discard_value(outcome.map_error(AtomError::Evaluation)));
+                                                       return crate::effect! { from_exit_once; exit: discard_value(outcome.map_error(AtomError::Evaluation)), };
                                                    }
                                                    let outcome=outcome.map_error(AtomError::Evaluation);
                                                    let observed=if matches!(&outcome,Exit::Success(_)){Some(context.collected())}else{None};
@@ -271,15 +269,15 @@ where
                                                        let __dsl_program = __dsl_program.clone(); let atom_for_stale = atom_for_stale.clone(); let decision = decision.clone(); let id = id.clone(); let previous_for_stale = previous_for_stale.clone(); let registry = registry.clone(); let rejected = rejected.clone(); let publication = __dsl_program?; (move || {
                                                        let retained=rejected.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
                                                        let decision=decision.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
-                                                       if !matches!(&publication,Exit::Success(_)){let outcome=rejected_outcome(retained);let result={ let __dsl_program = Effect::from_exit_once(outcome); let __dsl_cleanup = Effect::from_exit_once(discard_value(publication)); effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } };return match decision{Some(Ok((true,keys)))=>{ let __dsl_program = result; let __dsl_cleanup = effect_map_error! { program: registry.notify(keys), map: AtomError::CommittedWithoutInvalidation, }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } },Some(Err(error))=>{ let __dsl_program = result; let __dsl_cleanup = effect_try_sync! { once; body: { let __dsl_result = Err(AtomError::Registry(error)); move || __dsl_result }, on_error: ::core::convert::identity, }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } },Some(Ok((false,_)))|None=>result};}
+                                                       if !matches!(&publication,Exit::Success(_)){let outcome=rejected_outcome(retained);let result={ let __dsl_program = crate::effect! { from_exit_once; exit: outcome, }; let __dsl_cleanup = crate::effect! { from_exit_once; exit: discard_value(publication), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } };return match decision{Some(Ok((true,keys)))=>{ let __dsl_cleanup = effect_map_error! { program: registry.notify(keys), map: AtomError::CommittedWithoutInvalidation, }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| result.clone(), } },Some(Err(error))=>{ let __dsl_cleanup = crate::effect_from_result! { once; result: Err(AtomError::Registry(error)), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| result.clone(), } },Some(Ok((false,_)))|None=>result};}
                                                        match decision{
                                                            Some(Ok((true,keys)))=>effect_map_error! { program: registry.notify(keys), map: AtomError::CommittedWithoutInvalidation, },
                                                            Some(Ok((false,keys)))=>{
                                                                let outcome=rejected_outcome(retained);
-                                                               if !registry.owns_evaluation(&id,generation){return Effect::from_exit_once(outcome);}
+                                                               if !registry.owns_evaluation(&id,generation){return crate::effect! { from_exit_once; exit: outcome, };}
                                                                let registry=registry.clone();let previous=previous_for_stale.clone();
                                                                {
-                                                                   let __dsl_program = Effect::from_exit_once(outcome); let __dsl_cleanup = effect! {
+                                                                   let __dsl_program = crate::effect! { from_exit_once; exit: outcome, }; let __dsl_cleanup = effect! {
             bind;
             program: effect_map_error! { program: atom_for_stale.status.set(AsyncResult::settle(generation,Exit::Interrupted,previous)), map: AtomError::Publication, },
             body: move|_|effect_map_error! { program: registry.notify(keys.clone()), map: AtomError::CommittedWithoutInvalidation, },
@@ -288,9 +286,9 @@ where
                                                            Some(Err(error))=>{
                                                                let error=AtomError::Registry(error);let previous=previous_for_stale.clone();
                                                                // Preserve evaluator failures and append registry/settlement failures.
-                                                               { let __dsl_program = { let __dsl_program = Effect::from_exit_once(rejected_outcome(retained)); let __dsl_cleanup = effect_try_sync! { once; body: { let __dsl_result = Err(error); move || __dsl_result }, on_error: ::core::convert::identity, }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } }; let __dsl_cleanup = effect_map! { program: effect_map_error! { program: atom_for_stale.status.set(AsyncResult::settle(generation,Exit::Interrupted,previous)), map: AtomError::Publication, }, map: |_|(), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } }
+                                                               { let __dsl_program = { let __dsl_program = crate::effect! { from_exit_once; exit: rejected_outcome(retained), }; let __dsl_cleanup = crate::effect_from_result! { once; result: Err(error), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } }; let __dsl_cleanup = effect_map! { program: effect_map_error! { program: atom_for_stale.status.set(AsyncResult::settle(generation,Exit::Interrupted,previous)), map: AtomError::Publication, }, map: |_|(), }; effect_resource! { acquire: effect_sync! { body: || (), }, release: move |(), _| __dsl_cleanup.clone(), body: move |_| __dsl_program.clone(), } }
                                                            },
-                                                           None=>effect_try_sync! { once; body: { let __dsl_result = Err(AtomError::InputConsumed); move || __dsl_result }, on_error: ::core::convert::identity, },
+                                                           None=>crate::effect_from_result! { once; result: Err(AtomError::InputConsumed), },
                                                        }
                                                    })()? } }
                                                }; effect! { __dsl_factory()? } };
@@ -371,7 +369,7 @@ where
             let atom = atom.clone(); let scope = scope.clone(); let resource = __dsl_program.clone()?; {
                         let atom = atom.clone();
                         let driver = { let __dsl_program = atom.refresh(); let atom = atom.clone(); effect! { let __dsl_program = __dsl_program.clone(); let atom = atom.clone(); let resource = resource.clone(); let _ = __dsl_program?; drive_atom(atom.clone(), resource.clone())? } };
-                        scope.fork(driver)
+                        crate::effect_scope! { fork; scope: scope, program: driver, }
                     }? }
         }
     }
@@ -421,7 +419,7 @@ where
                             let dependencies = match atom.registry.dependencies_of(&atom.id) {
                                 Ok(dependencies) => dependencies,
                                 Err(error) => {
-                                    return effect_try_sync! { once; body: { let __dsl_result = Err(AtomError::Registry(error)); move || __dsl_result }, on_error: ::core::convert::identity, };
+                                    return crate::effect_from_result! { once; result: Err(AtomError::Registry(error)), };
                                 }
                             };
                             batch.keys.iter().any(|key| {

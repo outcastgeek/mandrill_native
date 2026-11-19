@@ -352,7 +352,7 @@ impl SqlKernel {
     where
         F: for<'a> FnOnce(&'a mut TursoConnection) -> NativeFuture<'a, A> + Send + 'op,
     {
-        self.connection_operation(ClosureOperation(body))
+        crate::sql! { connection_operation; kernel: self, operation: ClosureOperation(body), }
     }
     /// Execute borrowed-input native work on one fresh lease without copying its inputs.
     pub fn connection_operation<'op, A: Send + 'op, O: NativeOperation<A> + 'op>(
@@ -386,7 +386,7 @@ impl SqlKernel {
     where
         F: for<'a> FnOnce(&'a mut TursoConnection) -> NativeFuture<'a, A> + Send + 'k,
     {
-        self.transaction_operation(ClosureOperation(body))
+        crate::sql! { transaction_operation; kernel: self, operation: ClosureOperation(body), }
     }
     /// Execute one operation-owned BEGIN IMMEDIATE transaction for borrowed native inputs.
     /// This is the same native settlement path used by the closure API. The kernel

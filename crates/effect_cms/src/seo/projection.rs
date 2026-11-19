@@ -22,7 +22,7 @@ where Query:Send+'static,Page:Send+'static,E:Send+'static,R:Send+Sync+'static {
         match (query,render){
             (Some(query),Some(render))=>{
                 let admitted=query(&request,&kind)?;
-                match render(&request,&kind,admitted).either()?{
+                match effect! { either; program: render(&request,&kind,admitted), }?{
                     Ok(Some(page))=>{let vm=view(&page);seo_props_from_view_model(&request,vm.as_ref(),&options)},
                     Ok(None)|Err(_)=>SEOProps::default(),
                 }

@@ -16,7 +16,7 @@ pub mod records;
 pub mod schema;
 
 use effect_sql::{
-    MigrationCatalog, MigrationStep, Rollback, SQLX_JOURNAL, SqlError, SqlKernel, SqlMigrator,
+    MigrationCatalog, MigrationStep, Rollback, SQLX_JOURNAL, SqlError, SqlKernel, sql,
 };
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -202,9 +202,9 @@ impl SqlxIdentityStore {
         reason = "retains owned SQL diagnostics without an extra heap allocation"
     )]
     pub async fn initialize(&self) -> Result<(), SqlError> {
-        let migrator = SqlMigrator::new(self.kernel.clone(), Self::migration_catalog()?)?;
-        migrator.initialize().await?;
-        migrator.up().await?;
+        let migrator = sql! { migrator; kernel: self.kernel.clone(), catalog: Self::migration_catalog()?, }?;
+        sql! { migrate_initialize; migrator: migrator, }.await?;
+        sql! { migrate_up; migrator: migrator, }.await?;
         Ok(())
     }
 }

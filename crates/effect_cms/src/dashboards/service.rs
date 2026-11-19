@@ -47,7 +47,7 @@ impl<E:Send+'static> DashboardService<E>{
         effect! {
             let service=service.clone();let request=request.clone();let kind=kind.clone();let query=query.clone();
             let registry=service.resources.clone();let lookup=kind.clone();
-            let definition=effect_try_sync! {once;body:move ||registry.definition(&lookup).map_err(RenderingError::Definition),on_error:std::convert::identity} ?;
+            let definition=effect_try_sync! {once;body:move ||registry.definition(&lookup),on_error:RenderingError::Definition} ?;
             let text=|key:&str|service.options.translate_key.as_ref().map(|t|t(&request,key)).unwrap_or_else(||key.trim().to_owned());
             let mode=ResourceViewMode::new(RESOURCE_VIEW_MODE_DASHBOARD);
             let title=first_non_blank(&[text(&definition.display.dashboard_title_key),text(&definition.display.list_title_key)]);
@@ -61,7 +61,7 @@ impl<E:Send+'static> DashboardService<E>{
             let search=resource_dashboard_search_vm(Arc::new(request.clone()),Some(request.clone()),definition,query,path,service.options.translate_key.clone())?;
             let mut page=ResourceDashboardPageVM{kind,mode,title,subtitle,breadcrumb,routes,actions,search,sections:Some(SharedList::new(Vec::new()))};
             let validate=service.options.validate_page.clone();
-            effect_try_sync! {once;body:move ||{if let Some(validate)=validate{validate(&mut page).map_err(RenderingError::Consumer)?;}Ok::<_,RenderingError<E>>(page)},on_error:std::convert::identity} ?
+            effect_try_sync! {once;body:move ||{if let Some(validate)=validate{validate(&mut page).map_err(RenderingError::Consumer)?;}Ok::<_,RenderingError<E>>(page)}} ?
         }
     }
 }

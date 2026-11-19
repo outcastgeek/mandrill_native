@@ -15,7 +15,10 @@ mod callback_expand;
 mod codec_expand;
 mod descriptor_expand;
 mod durable_expand;
+mod environment_expand;
+mod error_label_expand;
 mod expand;
+mod extension_cms;
 mod memory_expand;
 mod ownership_expand;
 mod parse;
@@ -27,12 +30,76 @@ mod prepared_program_expand;
 mod prepared_resource_expand;
 mod prepared_scope_expand;
 mod restricted_expand;
+mod row_derive;
+mod schema_derive;
 mod schema_enum_expand;
 mod schema_expand;
 mod transaction_expand;
 
 use proc_macro::TokenStream;
 use syn::parse_macro_input;
+
+/// Delegate environment capabilities using an explicit field or borrowed projection.
+/// `#[effect_environment(sql_client = sql)]` borrows `self.sql`.
+/// Use an expression such as `self.sql.as_ref()` for explicit projection.
+#[proc_macro_derive(EffectEnvironment, attributes(effect_environment))]
+pub fn derive_effect_environment(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as syn::DeriveInput);
+    environment_expand::expand(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Define the existing JSON schema factory from an owned item's fields and wire tags.
+/// Field codecs, runtime parse policy and public defect context are explicit.
+#[proc_macro_derive(EffectJsonSchema, attributes(effect_json_schema))]
+pub fn derive_effect_json_schema(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as syn::DeriveInput);
+    schema_derive::expand(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Select per-field SQL row binds on the record they construct.
+/// The record attribute supplies R. Each field attribute is an existing row DSL expression.
+#[proc_macro_derive(EffectSqlRow, attributes(effect_sql_row))]
+pub fn derive_effect_sql_row(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as syn::DeriveInput);
+    row_derive::expand(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Generate the transparent CMS-memory projection for Server's request wrapper.
+#[doc(hidden)]
+#[proc_macro_attribute]
+pub fn derive_cms_request_environment(args: TokenStream, input: TokenStream) -> TokenStream {
+    parse_macro_input!(args as syn::parse::Nothing);
+    let input = parse_macro_input!(input as syn::ItemTrait);
+    environment_expand::delegate_cms_request_environment(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Generate an existing capability adapter for a selected Arc provider.
+#[doc(hidden)]
+#[proc_macro_attribute]
+pub fn derive_arc_capability(args: TokenStream, input: TokenStream) -> TokenStream {
+    let selection = parse_macro_input!(args as environment_expand::ArcCapability);
+    let input = parse_macro_input!(input as syn::ItemTrait);
+    environment_expand::delegate_arc_capability(selection, input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Bind a CMS route registration or prepare a CMS response with explicit owners.
+#[proc_macro]
+pub fn cms(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as callback_expand::Input);
+    extension_cms::expand(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
 
 /// Declare an inert owned memory configuration, or delegate HasMemory from an
 /// environment. Configuration fields are evaluated once in written order. Use
@@ -87,6 +154,16 @@ pub fn effect_drop_guard(input: TokenStream) -> TokenStream {
         .into()
 }
 
+/// Derive Display from a constant `#[effect_error_label("...")]` on each enum
+/// variant. Display never reads a variant payload. Error sources remain explicit.
+#[proc_macro_derive(EffectErrorLabel, attributes(effect_error_label))]
+pub fn effect_error_label(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as syn::DeriveInput);
+    error_label_expand::expand(definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
 /// Construct a lazy reusable Effect with macro-local `?` binding.
 ///
 /// `bind; program: source, body: factory,` composes an existing Effect-returning
@@ -108,6 +185,13 @@ pub fn effect(input: TokenStream) -> TokenStream {
         parse::EffectInput::Statements(statements) => expand::expand(statements),
         parse::EffectInput::Continuation(fields) => callback_expand::continuation(fields),
         parse::EffectInput::WhileLoop(fields) => callback_expand::while_loop(fields),
+        parse::EffectInput::Defer(fields) => callback_expand::defer(fields),
+        parse::EffectInput::Sleep(fields) => callback_expand::sleep(fields),
+        parse::EffectInput::Either(fields) => callback_expand::either(fields),
+        parse::EffectInput::Log(fields) => callback_expand::log(fields),
+        parse::EffectInput::ConsoleWrite(fields) => callback_expand::console_write(fields),
+        parse::EffectInput::NativePrimitive(mode, fields) => callback_expand::named_primitive(mode, fields),
+        parse::EffectInput::Interpret(mode, fields) => callback_expand::interpret(mode, fields),
     };
     match expanded {
         Ok(output) => output.into(),
@@ -195,7 +279,7 @@ pub fn persistable(input: TokenStream) -> TokenStream {
 /// Returns the expanded Rust tokens.
 pub fn transaction(input: TokenStream) -> TokenStream {
     let tokens: proc_macro2::TokenStream = input.into();
-    let result = if restricted_expand::has_mode(&tokens, &["map_error", "modify", "update", "prepare_domain"]) {
+    let result = if restricted_expand::has_mode(&tokens, &["map_error", "modify", "update", "prepare_domain", "atomically"]) {
         syn::parse2(tokens).and_then(restricted_expand::transaction)
     } else {
         syn::parse::Parser::parse2(syn::Block::parse_within, tokens)
@@ -260,7 +344,7 @@ pub fn workflow(input: TokenStream) -> TokenStream {
     let tokens: proc_macro2::TokenStream = input.into();
     let result = if restricted_expand::has_mode(
         &tokens,
-        &["map_error", "for_each", "retry", "compensate", "result", "prepare_engine"],
+        &["map_error", "for_each", "retry", "compensate", "result", "prepare_engine", "run", "register", "start", "cancel", "wait_deferred"],
     ) {
         syn::parse2(tokens).and_then(restricted_expand::workflow)
     } else {
@@ -346,8 +430,13 @@ pub fn rpc_operation(input: TokenStream) -> TokenStream {
 /// environment; the existing RpcStreamContext and transport ownership remain intact.
 #[proc_macro]
 pub fn rpc_stream_operation(input: TokenStream) -> TokenStream {
-    let fields = parse_macro_input!(input as descriptor_expand::NamedFields);
-    descriptor_expand::rpc_stream_operation(fields)
+    let tokens: proc_macro2::TokenStream = input.into();
+    let expanded = if restricted_expand::has_mode(&tokens, &["finite"]) {
+        syn::parse2(tokens).and_then(domain_expand::rpc_stream_finite)
+    } else {
+        syn::parse2(tokens).and_then(descriptor_expand::rpc_stream_operation)
+    };
+    expanded
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
@@ -618,8 +707,8 @@ pub fn persisted_queue(input: TokenStream) -> TokenStream {
 /// handle Effect with result-recording-before-acknowledgement and fencing preserved.
 #[proc_macro]
 pub fn durable_queue(input: TokenStream) -> TokenStream {
-    let fields = parse_macro_input!(input as domain_expand::Fields);
-    domain_expand::durable_queue(fields)
+    let input = parse_macro_input!(input as callback_expand::Input);
+    domain_expand::durable_queue(input)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
@@ -1035,6 +1124,33 @@ pub fn effect_provide_some(input: TokenStream) -> TokenStream {
 pub fn effect_sandbox(input: TokenStream) -> TokenStream {
     let definition = parse_macro_input!(input as callback_expand::Input);
     callback_expand::operator("effect_sandbox", definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Produce a typed expected failure with `error: expression`.
+///
+/// The expression runs when the Effect runs and creates a fresh error for each
+/// execution. The surrounding program determines the success and environment
+/// types. The error requires no Clone implementation.
+#[proc_macro]
+pub fn effect_fail(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as domain_expand::Fields);
+    callback_expand::fail(definition)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Lift a native `result: expression` into the typed Effect error channel.
+///
+/// The expression is evaluated when this leaf description is constructed.
+/// Reusable descriptions replay a cloned outcome. Use `once;` to move an
+/// owned success or error into a single execution. Optional `on_error` maps
+/// only the expected error when the leaf runs.
+#[proc_macro]
+pub fn effect_from_result(input: TokenStream) -> TokenStream {
+    let definition = parse_macro_input!(input as callback_expand::Input);
+    callback_expand::from_result(definition)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }

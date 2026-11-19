@@ -474,7 +474,7 @@ impl<A: Send + 'static, D: Send + Sync + 'static, E: Send + Sync + 'static>
         let policy = self.policy;
         let codec = self.codec.clone();
         let pool = self.context_pool.clone();
-        (effect_try_sync! { body: move || {
+        let parsed = effect_try_sync! { body: move || {
             let context = match &pool { Some(pool) => pool.try_context(policy).map_err(|error| SchemaIssue::new(SchemaIssueKind::Memory(error)))?, None => ParseContext::new(policy) };
             let mut parse = policy.parse;
             parse.limits.depth = policy.json_depth;
@@ -498,8 +498,12 @@ impl<A: Send + 'static, D: Send + Sync + 'static, E: Send + Sync + 'static>
             })?;
             context.check_json(&value)?;
             Ok((value, context))
-        }, on_error: std::convert::identity, })
-        .flat_map(move |(value, context)| codec.decode_in(value, Some(context)))
+        }, };
+        effect! {
+            bind;
+            program: parsed,
+            body: move |(value, context)| codec.decode_in(value, Some(context)),
+        }
     }
     /// Lazily check an owned JSON tree against configured representation bounds,
     /// then decode it in `D`. The returned effect consumes the input once.

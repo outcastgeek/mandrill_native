@@ -10,7 +10,7 @@ use effect::effect_die;
 pub mod cafe_support;
 use std::num::NonZeroUsize;
 pub mod order_tracking;
-use cafe_support::transport::{Session, sequence, stream_request};
+use cafe_support::transport::{Session, stream_request};
 use cafe_support::{Cafe, limits, parse_policy, rpc_policy};
 use effect::rpc::{
     OperationId, RpcStreamMiddlewareError, RpcStreamProtocol, RpcStreamProtocolError, RpcVersion,
@@ -34,23 +34,26 @@ fn follow_order() -> Effect<(), RpcStreamProtocolError<StatusError, ()>, CoffeeS
     effect! {
         let watch_operation_id = match OperationId::new("follow-pickup") { Ok(value) => value, Err(error) => effect_die! { defect: effect::Defect::new(format!("operation: {error:?}")), }?, };
         let lookup_codec = match find_schema() { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, };
-        let chunk_codec = match status_schema() { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, };
-        let terminal_codec = match status_schema() { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, };
-        let lookup_errors = match problem_schema() { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, };
+        let status = match status_schema() { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, };
+        let problem = match problem_schema() { Ok(value) => value, Err(error) => effect_die! { defect: error, }?, };
         let watch = rpc_stream_operation! {
             id: watch_operation_id,
             version: RpcVersion::new(NonZeroU32::MIN), request: lookup_codec,
-            chunk: chunk_codec, terminal: terminal_codec, error: lookup_errors, limits: limits(),
+            chunk: status.clone(), terminal: status, error: problem.clone(), limits: limits(),
             handler |request: FindOrder, _context| {
                 let mut history = status_history(request)?;
                 let terminal = effect_from_option! {
                     once; value: history.pop(), missing { OrderProblem::NoHistory },
                 }?;
-                sequence(history, terminal)
+                rpc_stream_operation! {
+                    finite;
+                    chunks: history,
+                    terminal: terminal,
+                    exhausted: effect::Defect::new("coffee order has no further status updates"),
+                }
             },
             project |env: &CoffeeShop| { env.services.clone() },
         };
-        let problem = match problem_schema() { Ok(problem) => problem, Err(error) => effect_die! { defect: error, }?, };
         let errors = match schema_enum! {
             enum StatusError {
                 Before(problem.clone()) => "request",
@@ -119,7 +122,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         NonZeroUsize::MIN.saturating_add(15),
         NonZeroUsize::MIN.saturating_add(3),
     );
-    let result = futures_executor::block_on(follow_order().run(env.clone()));
+    let result = futures_executor::block_on(effect! {
+        run;
+        program: follow_order(),
+        environment: env.clone(),
+    });
     env.base
         .finish()
         .map_err(|error| error.message().to_owned())?;

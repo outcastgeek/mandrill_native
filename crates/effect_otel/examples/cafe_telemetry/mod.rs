@@ -7,14 +7,13 @@
 //! Neither mode installs a global subscriber or collector.
 
 use effect::{
-    AdmissionCapacity, Cancellation, DiagnosticCapacity, DiagnosticOverflow, Diagnostics,
-    HasBlockingExecutor, HasCancellation, HasClock, HasTaskSpawner, HasTracer, Tracer,
+    AdmissionCapacity, Cancellation, DiagnosticCapacity, DiagnosticOverflow, Diagnostics, Tracer,
 };
 use effect_otel::{
-    BorrowedProviders, HasOtel, LatencyUnit, LogRouting, MetricDefinition, MetricPolicy,
+    BorrowedProviders, LatencyUnit, LogRouting, MetricDefinition, MetricPolicy,
     NativeInstrumentKind, OtelBackend, OtelContext, OtelMetricRecorder, Redaction,
 };
-use effect_tokio::{TokioBlocking, TokioClock, TokioTasks};
+use effect_tokio::{TokioBlocking, TokioClock, TokioProviders, TokioTasks};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -54,6 +53,17 @@ pub struct TelemetryCapacity {
 
 /// Shared services keep request projections on the same clock and native span map.
 #[derive(Clone)]
+#[derive(effect_server::EffectEnvironment)]
+#[effect_environment(
+    tokio = self.runtime.handle(),
+    server_error(error = CafeError, map = CafeError::Server),
+    clock(provider = TokioClock, get = &self.clock),
+    tracer = tracer,
+    otel = otel,
+    cancellation = cancellation,
+    task_spawner(provider = TokioTasks, get = &self.tasks),
+    blocking_executor(provider = TokioBlocking, get = &self.blocking),
+)]
 pub struct Environment {
     /// Caller-owned reactor survives all managed work and provider shutdown.
     pub runtime: Arc<tokio::runtime::Runtime>,
@@ -81,13 +91,13 @@ impl Environment {
             DiagnosticCapacity::Unbounded,
             DiagnosticOverflow::DiscardOldest,
         );
-        let tasks = TokioTasks::new(runtime.clone(), AdmissionCapacity::Unbounded)
-            .map_err(|e| e.message().to_owned())?;
-        let blocking = TokioBlocking::new(
+        let TokioProviders { tasks, blocking, clock } = TokioProviders::new(
             runtime.clone(),
             AdmissionCapacity::Unbounded,
+            AdmissionCapacity::Unbounded,
             diagnostics.clone(),
-        );
+        )
+        .map_err(|e| e.message().to_owned())?;
         let scope = opentelemetry::InstrumentationScope::builder("cafe.order-progress").build();
         let policy = MetricPolicy::new(
             capacity.metric_descriptors,
@@ -129,7 +139,7 @@ impl Environment {
             metrics,
         );
         Ok(Self {
-            clock: Arc::new(TokioClock::new(runtime.clone())),
+            clock: Arc::new(clock),
             runtime,
             tasks,
             blocking,
@@ -137,61 +147,5 @@ impl Environment {
             otel,
             cancellation: Cancellation::new(),
         })
-    }
-}
-impl HasClock for Environment {
-    /// Request projections share the exact service origin.
-    type Clock = TokioClock;
-    /// Borrow the caller-selected monotonic provider.
-    fn clock(&self) -> &TokioClock {
-        &self.clock
-    }
-}
-impl HasTracer for Environment {
-    /// Ordinary span! and otel! use this same core tracer.
-    fn tracer(&self) -> &Tracer {
-        &self.tracer
-    }
-}
-impl HasOtel for Environment {
-    /// Explicit native provider bridge for this application R.
-    fn otel(&self) -> &OtelBackend {
-        &self.otel
-    }
-}
-impl HasCancellation for Environment {
-    /// Request-specific cancellation does not cancel siblings.
-    fn cancellation(&self) -> &Cancellation {
-        &self.cancellation
-    }
-}
-impl HasTaskSpawner for Environment {
-    /// One caller-owned Tokio executor drives managed children.
-    type Tasks = TokioTasks;
-    /// Borrow its explicit admission boundary.
-    fn task_spawner(&self) -> &TokioTasks {
-        &self.tasks
-    }
-}
-impl HasBlockingExecutor for Environment {
-    /// Native synchronous SDK cleanup runs on this selected provider.
-    type Executor = TokioBlocking;
-    /// Borrow the independent blocking capability.
-    fn blocking_executor(&self) -> &TokioBlocking {
-        &self.blocking
-    }
-}
-impl effect_server::HasTokio for Environment {
-    /// Native axum/Hyper polls use the caller's reactor.
-    fn tokio(&self) -> &tokio::runtime::Handle {
-        self.runtime.handle()
-    }
-}
-impl effect_server::HasServerError for Environment {
-    /// Retain native input/body failures in the application error type.
-    type Error = CafeError;
-    /// Map without flattening into a success response.
-    fn server_error(&self, error: effect_server::ServerError) -> CafeError {
-        CafeError::Server(error)
     }
 }

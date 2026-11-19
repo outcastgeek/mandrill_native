@@ -439,8 +439,7 @@ where
             effect! { let buffer = buffer.clone(); let fork_scope = fork_scope.clone(); let reader = __dsl_program.clone()?; {
                 let producer = buffer.producer(reader);
                 let buffer = buffer.clone();
-                effect_map! { program: fork_scope
-                    .fork(producer), map: move |fiber| buffer.reader(vec![fiber], options.pull_batch), }
+                effect_map! { program: crate::effect_scope! { fork; scope: fork_scope, program: producer, }, map: move |fiber| buffer.reader(vec![fiber], options.pull_batch), }
             }? }
         }
     })
@@ -480,8 +479,8 @@ where
                 let fork_scope = fork_scope.clone();
                 { let __dsl_program = right_open.clone(); effect! { let buffer = buffer.clone(); let fork_scope = fork_scope.clone(); let left_reader = left_reader.clone(); let right_reader = __dsl_program.clone()?; {
                     let producers = effect_all! { items: vec![
-                        fork_scope.fork(buffer.producer(left_reader.clone())),
-                        fork_scope.fork(buffer.producer(right_reader)),
+                        crate::effect_scope! { fork; scope: fork_scope, program: buffer.producer(left_reader.clone()), },
+                        crate::effect_scope! { fork; scope: fork_scope, program: buffer.producer(right_reader), },
                     ], };
                     let buffer = buffer.clone();
                     effect_map! { program: producers, map: move |fibers| buffer.reader(fibers, options.pull_batch), }

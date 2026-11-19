@@ -2,10 +2,7 @@
 
 use super::cafe_support::{Cafe, parse_policy};
 use effect::effect_die;
-use effect::{
-    Effect, JsonValue, PureCodec, effect_from_option, json_i64, json_string, schema, schema_enum,
-    service,
-};
+use effect::{Effect, EffectJsonSchema, effect_fail, effect_from_option, json_i64, json_string, service};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -13,53 +10,85 @@ use std::{
 /// The selected desk is supplied beside local Effect providers.
 pub type CoffeeShop = Cafe<OrderDesk>;
 /// Drinks sold by the order desk.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, EffectJsonSchema)]
+#[effect_json_schema(
+    factory = drink_schema,
+    policy = parse_policy(),
+    error_context = "drink schema",
+    tag_field = "drink",
+    content_field = "options",
+)]
 pub enum Drink {
     /// Dairy-free espresso drink.
+    #[effect_json_schema(tag = "oat-latte")]
     OatLatte,
     /// Espresso and water.
+    #[effect_json_schema(tag = "americano")]
     Americano,
 }
 /// Owned request sent by a customer; no Clone bound is required.
-#[derive(Debug)]
+#[derive(Debug, EffectJsonSchema)]
+#[effect_json_schema(factory = order_schema, policy = parse_policy(), error_context = "order schema")]
 pub struct CoffeeOrder {
     /// Name for the pickup counter.
+    #[effect_json_schema(codec = json_string())]
     pub customer: String,
     /// Requested drink.
+    #[effect_json_schema(codec = drink_schema()?)]
     pub drink: Drink,
     /// Requested cups.
+    #[effect_json_schema(codec = json_i64())]
     pub quantity: i64,
 }
 /// Ticket returned by the café and looked up by its order number.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, EffectJsonSchema)]
+#[effect_json_schema(factory = ticket_schema, policy = parse_policy(), error_context = "ticket schema")]
 pub struct OrderTicket {
     /// Number printed on the pickup ticket.
+    #[effect_json_schema(codec = json_string())]
     pub number: String,
     /// Name to call when ready.
+    #[effect_json_schema(codec = json_string())]
     pub customer: String,
     /// Accepted drink.
+    #[effect_json_schema(codec = drink_schema()?)]
     pub drink: Drink,
     /// Accepted cup count.
+    #[effect_json_schema(codec = json_i64())]
     pub quantity: i64,
 }
 /// Lookup/watch requests share the customer's ticket identity.
-#[derive(Debug)]
+#[derive(Debug, EffectJsonSchema)]
+#[effect_json_schema(factory = find_schema, policy = parse_policy(), error_context = "lookup schema")]
 pub struct FindOrder {
     /// Pickup ticket number, e.g. 104.
+    #[effect_json_schema(codec = json_string())]
     pub number: String,
 }
 /// Human-readable lifecycle shown on Maya's phone.
-#[derive(Debug)]
+#[derive(Debug, EffectJsonSchema)]
+#[effect_json_schema(
+    factory = status_schema,
+    policy = parse_policy(),
+    error_context = "status schema",
+    tag_field = "status",
+    content_field = "details",
+)]
 pub enum OrderStatus {
     /// The counter accepted the order.
+    #[effect_json_schema(tag = "accepted")]
     Accepted,
     /// A barista is making the drinks.
+    #[effect_json_schema(tag = "preparing")]
     Preparing,
     /// Drinks are waiting at the pickup counter.
+    #[effect_json_schema(tag = "ready")]
     Ready {
         /// Customer to call.
+        #[effect_json_schema(codec = json_string())]
         customer: String,
         /// Recorded completed cups.
+        #[effect_json_schema(codec = json_i64())]
         cups: i64,
     },
 }
@@ -69,70 +98,32 @@ pub struct OrderDesk {
     pub tickets: Mutex<BTreeMap<String, TrackedOrder>>,
 }
 /// Business problems understood by the customer or staff.
-#[derive(Debug)]
+#[derive(Debug, EffectJsonSchema)]
+#[effect_json_schema(
+    factory = problem_schema,
+    policy = parse_policy(),
+    error_context = "problem schema",
+    tag_field = "problem",
+    content_field = "details",
+)]
 pub enum OrderProblem {
     /// The requested ticket is unknown.
+    #[effect_json_schema(tag = "unknown-ticket")]
     UnknownTicket,
     /// The counter only accepts one through four cups per request.
+    #[effect_json_schema(tag = "invalid-quantity")]
     InvalidQuantity,
     /// Staff have closed the counter.
+    #[effect_json_schema(tag = "counter-closed")]
     CounterClosed,
     /// The desk has no recorded stages for this ticket.
+    #[effect_json_schema(tag = "no-history")]
     NoHistory,
-}
-/// Explicit drink names define the wire vocabulary.
-pub fn drink_schema() -> Result<PureCodec<Drink, JsonValue>, effect::Defect> {
-    schema_enum! {
-        enum Drink { OatLatte => "oat-latte", Americano => "americano" }
-        tag_field: "drink", content_field: "options", policy: parse_policy()
-    }
-    .map_err(|error| effect::Defect::new(format!("drink schema: {error:?}")))
-}
-/// Customer request shape, separate from its business validation.
-pub fn order_schema() -> Result<PureCodec<CoffeeOrder, JsonValue>, effect::Defect> {
-    let drink = drink_schema()?;
-    schema! {
-        struct CoffeeOrder { customer: json_string(), drink: drink, quantity: json_i64() }
-        policy: parse_policy()
-    }
-    .map_err(|error| effect::Defect::new(format!("order schema: {error:?}")))
-}
-/// Accepted ticket shape shared by placement and lookup handlers.
-pub fn ticket_schema() -> Result<PureCodec<OrderTicket, JsonValue>, effect::Defect> {
-    let drink = drink_schema()?;
-    schema! {
-        struct OrderTicket {
-            number: json_string(), customer: json_string(), drink: drink, quantity: json_i64()
-        } policy: parse_policy()
-    }
-    .map_err(|error| effect::Defect::new(format!("ticket schema: {error:?}")))
-}
-/// Typed identity for both lookup and watch operations.
-pub fn find_schema() -> Result<PureCodec<FindOrder, JsonValue>, effect::Defect> {
-    schema! { struct FindOrder { number: json_string() } policy: parse_policy() }
-        .map_err(|error| effect::Defect::new(format!("lookup schema: {error:?}")))
-}
-/// Lifecycle chunks and the terminal ready message use the same model.
-pub fn status_schema() -> Result<PureCodec<OrderStatus, JsonValue>, effect::Defect> {
-    schema_enum! {
-        enum OrderStatus {
-            Accepted => "accepted", Preparing => "preparing", Ready { customer: json_string(), cups: json_i64() } => "ready"
-        } tag_field: "status", content_field: "details", policy: parse_policy()
-    }.map_err(|error| effect::Defect::new(format!("status schema: {error:?}")))
-}
-/// Preserve typed customer feedback in protocol error replies.
-pub fn problem_schema() -> Result<PureCodec<OrderProblem, JsonValue>, effect::Defect> {
-    schema_enum! {
-        enum OrderProblem {
-            UnknownTicket => "unknown-ticket", InvalidQuantity => "invalid-quantity", CounterClosed => "counter-closed", NoHistory => "no-history"
-        } tag_field: "problem", content_field: "details", policy: parse_policy()
-    }.map_err(|error| effect::Defect::new(format!("problem schema: {error:?}")))
 }
 /// Select the café desk with service! and look up the ticket when the recipe executes.
 pub fn lookup_order(request: FindOrder) -> Effect<OrderTicket, OrderProblem, Arc<OrderDesk>> {
     service! {
         select: |desk: &Arc<OrderDesk>| desk.clone(),
-        on_error: |problem: OrderProblem| problem,
         run |desk: &Arc<OrderDesk>| {
             let number = request.number.clone();
             let found = desk.tickets.lock()
@@ -141,10 +132,7 @@ pub fn lookup_order(request: FindOrder) -> Effect<OrderTicket, OrderProblem, Arc
             let found = match found { Ok(found) => found, Err(error) => effect_die! { defect: error, }?, };
             match found {
                 Some(ticket) => ticket,
-                None => effect_from_option! {
-                    once; value: None::<OrderTicket>,
-                    missing { OrderProblem::UnknownTicket },
-                }?,
+                None => effect_fail! { error: OrderProblem::UnknownTicket, }?,
             }
         }
     }
@@ -172,7 +160,7 @@ pub fn status_history(
     request: FindOrder,
 ) -> Effect<Vec<OrderStatus>, OrderProblem, Arc<OrderDesk>> {
     service! {
-        select: |desk: &Arc<OrderDesk>| desk.clone(), on_error: |error: OrderProblem| error,
+        select: |desk: &Arc<OrderDesk>| desk.clone(),
         run |desk: &Arc<OrderDesk>| {
             let history = desk.tickets.lock().map(|records| records.get(&request.number).map(|record| {
                 record.history.iter().map(|stage| match stage {

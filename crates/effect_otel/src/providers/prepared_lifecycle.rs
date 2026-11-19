@@ -170,8 +170,8 @@ impl<D: ProviderWorkingSet> PreparedOwnedProviders<D> {
     {
         effect_scope_acquire! {
             scope: scope,
-            acquire: Self::start(prepared, policy),
-            release: |providers| providers.close(),
+            acquire: crate::otel! { start_prepared; prepared: prepared, shutdown: policy, },
+            release: |providers| crate::otel! { close; source: providers, },
         }
     }
 

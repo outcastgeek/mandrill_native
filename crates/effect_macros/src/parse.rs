@@ -13,6 +13,20 @@ pub(crate) enum EffectInput {
     Continuation(crate::domain_expand::Fields),
     /// Native guard/body factories retain their lazy loop boundary.
     WhileLoop(crate::domain_expand::Fields),
+    /// A reusable factory constructs one typed computation on every run.
+    Defer(crate::domain_expand::Fields),
+    /// Wait using the environment's monotonic clock capability.
+    Sleep(crate::domain_expand::Fields),
+    /// Observe only the typed expected error of an existing computation.
+    Either(crate::domain_expand::Fields),
+    /// Emit through the environment's logger capability.
+    Log(crate::domain_expand::Fields),
+    /// Write through the selected console capability.
+    ConsoleWrite(crate::domain_expand::Fields),
+    /// Select an existing named ordinary interpreter primitive.
+    NativePrimitive(Ident, crate::domain_expand::Fields),
+    /// Execute at the explicitly selected interpreter boundary.
+    Interpret(Ident, crate::domain_expand::Fields),
 }
 
 impl Parse for EffectInput {
@@ -29,6 +43,76 @@ impl Parse for EffectInput {
             input.parse::<Ident>()?;
             input.parse::<Token![;]>()?;
             return Ok(Self::WhileLoop(input.parse()?));
+        }
+        let interpreter = input.fork();
+        if let Ok(mode) = interpreter.parse::<Ident>()
+            && matches!(
+                mode.to_string().as_str(),
+                "run" | "run_cancellable" | "run_with_frames" | "run_cancellable_with_frames" | "run_in_context" | "run_cancellable_in_context"
+            )
+            && interpreter.parse::<Token![;]>().is_ok()
+            && interpreter.parse::<Ident>().is_ok_and(|name| {
+                matches!(name.to_string().as_str(), "program" | "environment" | "frames" | "context")
+            })
+            && interpreter.peek(Token![:])
+        {
+            let mode = input.parse()?;
+            input.parse::<Token![;]>()?;
+            return Ok(Self::Interpret(mode, input.parse()?));
+        }
+        let sleep = input.fork();
+        if sleep.parse::<Ident>().is_ok_and(|name| name == "sleep")
+            && sleep.parse::<Token![;]>().is_ok()
+            && sleep.parse::<Ident>().is_ok_and(|name| name == "duration")
+            && sleep.peek(Token![:])
+        {
+            input.parse::<Ident>()?;
+            input.parse::<Token![;]>()?;
+            return Ok(Self::Sleep(input.parse()?));
+        }
+        let leaf = input.fork();
+        if let Ok(mode) = leaf.parse::<Ident>()
+            && matches!(mode.to_string().as_str(), "either" | "log" | "console_write")
+            && leaf.parse::<Token![;]>().is_ok()
+            && leaf.parse::<Ident>().is_ok_and(|field| {
+                (mode == "either" && field == "program")
+                    || (mode == "log" && (field == "level" || field == "message"))
+                    || (mode == "console_write" && (field == "channel" || field == "message"))
+            })
+            && leaf.peek(Token![:])
+        {
+            input.parse::<Ident>()?;
+            input.parse::<Token![;]>()?;
+            let fields = input.parse()?;
+            return Ok(match mode.to_string().as_str() {
+                "either" => Self::Either(fields),
+                "log" => Self::Log(fields),
+                _ => Self::ConsoleWrite(fields),
+            });
+        }
+        let deferred = input.fork();
+        if deferred.parse::<Ident>().is_ok_and(|name| name == "defer")
+            && deferred.parse::<Token![;]>().is_ok()
+            && deferred.parse::<Ident>().is_ok_and(|name| name == "body")
+            && (deferred.peek(Token![:]) || deferred.peek(syn::token::Brace))
+        {
+            input.parse::<Ident>()?;
+            input.parse::<Token![;]>()?;
+            return Ok(Self::Defer(input.parse()?));
+        }
+        let trace = input.fork();
+        if let Ok(mode) = trace.parse::<Ident>()
+            && matches!(mode.to_string().as_str(),
+                "trace_context" | "with_trace_context" | "poll_instrumentation" | "deferred_complete" |
+                "deferred_await_shared" | "wall_now" | "bind_in_context" | "queue_take" |
+                "queue_offer" | "queue_offer_with" | "queue_shutdown" | "watch_read" | "watch_set" | "watch_subscribe" |
+                "watch_shutdown" | "subscription_pull_chunk" | "subscription_unsubscribe" | "from_exit_once")
+            && trace.parse::<Token![;]>().is_ok()
+            && (trace.is_empty() || trace.parse::<Ident>().is_ok_and(|_| trace.peek(Token![:])))
+        {
+            let mode = input.parse()?;
+            input.parse::<Token![;]>()?;
+            return Ok(Self::NativePrimitive(mode, input.parse()?));
         }
         let fork = input.fork();
         let continuation = if fork.parse::<Ident>().is_ok_and(|name| name == "bind")
@@ -56,6 +140,7 @@ enum UnsupportedSyntax {
     BranchAssignment,
     NestedTry,
     NestedReturn,
+    NativeAwait,
     LetElse,
 }
 
@@ -79,6 +164,7 @@ impl UnsupportedSyntax {
             Self::NestedReturn => {
                 "Effect return must be a top-level workflow statement; use a branch tail value inside effectful control flow"
             }
+            Self::NativeAwait => "Native await requires the async body lowering",
             Self::LetElse => "let-else workflow bindings are not supported yet",
         };
         syn::Error::new(span, message)
@@ -203,7 +289,7 @@ impl<'ast> Visit<'ast> for Validate {
     /// # Returns
     /// Type: `()`.
     fn visit_expr_try(&mut self, expr: &'ast syn::ExprTry) {
-        self.error = Some(UnsupportedSyntax::NestedTry.at(expr.span()));
+        self.error = Some(UnsupportedSyntax::NestedTry.at(expr.question_token.span));
     }
     ///
     /// # Parameters
@@ -212,7 +298,12 @@ impl<'ast> Visit<'ast> for Validate {
     /// # Returns
     /// Type: `()`.
     fn visit_expr_return(&mut self, expr: &'ast syn::ExprReturn) {
-        self.error = Some(UnsupportedSyntax::NestedReturn.at(expr.span()));
+        self.error = Some(UnsupportedSyntax::NestedReturn.at(expr.return_token.span));
+    }
+
+    /// A native suspension cannot leave the async body as a synchronous prefix.
+    fn visit_expr_await(&mut self, expr: &'ast syn::ExprAwait) {
+        self.error = Some(UnsupportedSyntax::NativeAwait.at(expr.await_token.span));
     }
     ///
     /// # Returns

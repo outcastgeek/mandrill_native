@@ -6,7 +6,7 @@
 //! terminal observation using the existing one-way OTel-to-Server integration.
 
 use effect::{Effect, PreparedAdmissionError, PreparedProviderAdmission};
-use effect_otel::server::{RequestObservation, RequestSpan};
+use effect_otel::server::{RequestHooks, RequestObservation, RequestSpan};
 use effect_otel::{HasOtel, NativeError, Propagation};
 use effect_server::{Request, Server};
 use std::sync::Arc;
@@ -22,12 +22,8 @@ type ObservationAdmission<E> = (
 pub struct Observability<E: Send + 'static, R: HasOtel + Send + Sync + 'static> {
     /// Official selected propagator stack; no custom carrier parser exists in Web.
     propagation: Propagation,
-    /// Explicit safe application span metadata, excluding raw request payloads.
-    metadata: Arc<dyn Fn(&Request) -> RequestSpan + Send + Sync>,
-    /// Explicit final-body signal routing; avoids implicit event/log duplication.
-    observe: Arc<dyn Fn(RequestObservation) -> Effect<(), E, R> + Send + Sync>,
-    /// Checked native propagation errors remain typed application failures.
-    errors: Arc<dyn Fn(NativeError) -> E + Send + Sync>,
+    /// Selected safe span metadata, terminal observation and typed error mapping.
+    hooks: RequestHooks<E, R>,
     admission: Option<ObservationAdmission<E>>,
 }
 impl<E: Send + 'static, R: HasOtel + Send + Sync + 'static> Clone for Observability<E, R> {
@@ -35,9 +31,7 @@ impl<E: Send + 'static, R: HasOtel + Send + Sync + 'static> Clone for Observabil
     fn clone(&self) -> Self {
         Self {
             propagation: self.propagation.clone(),
-            metadata: self.metadata.clone(),
-            observe: self.observe.clone(),
-            errors: self.errors.clone(),
+            hooks: self.hooks.clone(),
             admission: self.admission.clone(),
         }
     }
@@ -52,9 +46,7 @@ impl<E: Send + 'static, R: HasOtel + Send + Sync + 'static> Observability<E, R> 
     ) -> Self {
         Self {
             propagation,
-            metadata: Arc::new(metadata),
-            observe: Arc::new(observe),
-            errors: Arc::new(errors),
+            hooks: RequestHooks::new(metadata, observe, errors),
             admission: None,
         }
     }
@@ -87,15 +79,11 @@ impl<E: Send + 'static, R: HasOtel + Send + Sync + 'static> Observability<E, R> 
         } else {
             server
         };
-        let metadata = self.metadata.clone();
-        let observe = self.observe.clone();
-        let errors = self.errors.clone();
-        effect_otel::server::install(
-            server,
-            self.propagation.clone(),
-            move |request| metadata(request),
-            move |summary| observe(summary),
-            move |error| errors(error),
-        )
+        effect_otel::otel! {
+            install_request_hooks;
+            hooks: self.hooks,
+            server: server,
+            propagation: self.propagation.clone(),
+        }
     }
 }

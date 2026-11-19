@@ -71,21 +71,16 @@ impl<T: TxValue> TxQueue<T> {
     /// Type: `Transaction<Arc<T>, E>`.
     pub fn take<E: Send + 'static>(&self) -> Transaction<Arc<T>, E> {
         let cell = self.cell.clone();
-        {
-            let __dsl_transaction = self.cell.read();
-            transaction! {
-            let queue = __dsl_transaction.clone()?; {
-                        let mut next = queue.as_ref().clone();
-                        match next.pop_front() {
-                            Some(value) => { let __dsl_transaction = cell.write(Arc::new(next)); transaction! {
-            let () = __dsl_transaction.clone()?; {
-                                let value = Arc::clone(&value);
-                                Transaction::succeed_with(move || Arc::clone(&value))
-                            }?
-            } },
-                            None => Transaction::retry(),
-                        }
-                    }?
+        let read = cell.read();
+        transaction! {
+            let queue = read.clone()?;
+            let mut next = queue.as_ref().clone();
+            match next.pop_front() {
+                Some(value) => {
+                    cell.write(Arc::new(next))?;
+                    value
+                }
+                None => Transaction::retry()?,
             }
         }
     }

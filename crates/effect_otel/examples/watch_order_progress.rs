@@ -13,7 +13,7 @@
 //! Optional traceparent/baggage headers carry the caller's distributed context.
 
 use effect::{
-    effect_future, effect_map_error, effect_scope, effect_stream_for_each, effect_try_future,
+    effect_from_result, effect_future, effect_scope, effect_stream_for_each, effect_try_future,
 };
 mod cafe_telemetry;
 use cafe_telemetry::{CafeError, Environment, TelemetryCapacity};
@@ -22,11 +22,12 @@ use effect::stream;
 use effect::{Effect, Exit, LogLevel, Stream, effect, effect_scope_acquire};
 use effect_otel::effect_sync;
 use effect_otel::effect_try_sync;
-use effect_otel::{Otel, OwnedProviders, Propagation, ProviderFactories, ShutdownPolicy, otel};
+use effect_otel::server::{RequestHooks, RequestSpan};
+use effect_otel::{Propagation, ProviderFactories, ShutdownPolicy, otel};
 use effect_server::stream as server_stream;
 use effect_server::{
-    BodyPolicy, BodyWriter, Endpoint, HostPolicy, HttpProtocols, ServerPolicy, SsePolicy,
-    SseRecord, endpoint, reply, router, server,
+    BodyPolicy, BodyWriter, Endpoint, HostPolicy, HttpProtocols, SsePolicy, SseRecord, endpoint,
+    reply, router, server,
 };
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{
@@ -42,8 +43,8 @@ fn publish_status(
     event: &'static str,
 ) -> Effect<String, CafeError, Environment> {
     effect! {
-        Otel::tag("order.status", status)?;
-        Otel::event(event)?;
+        otel! { tag; key: "order.status", value: status, }?;
+        otel! { event; name: event, }?;
         status.to_owned()
     }
 }
@@ -67,7 +68,7 @@ fn order_updates(
             let timeline = timeline.clone();
             let mut previous = Duration::ZERO;
             for record in timeline.iter() {
-                Effect::sleep(record.elapsed - previous)?;
+                effect! { sleep; duration: record.elapsed - previous, }?;
                 previous = record.elapsed;
                 let status = record.status;
                 let update = otel! { name: "cafe.order.recorded-status", effect: publish_status(status.label(), status.event()) }?;
@@ -85,7 +86,7 @@ fn order_updates(
                     effect_sync! { body { registered.fetch_sub(1, Ordering::AcqRel); }, }?;
                 },
             }?;
-            source.open(source_scope)?
+            stream! { open_in; stream: source, scope: source_scope, }?
         }
     }, }
 }
@@ -111,9 +112,13 @@ fn watch_order(
                     let writer = writer.clone();
                     let update_once = update_once.clone();
                     let update = update_once?;
-                    Otel::tag("order.id", "104")?;
-                    writer.sse(SseRecord { event: Some("order-status".into()), id: None, retry: None, data: update }, sse)?;
-                    span! { name: "cafe.flush-status", effect: writer.flush() }?;
+                    otel! { tag; key: "order.id", value: "104", }?;
+                    server_stream! {
+                        sse; writer: writer,
+                        record: SseRecord { event: Some("order-status".into()), id: None, retry: None, data: update },
+                        policy: sse,
+                    }?;
+                    span! { name: "cafe.flush-status", effect: server_stream! { flush; writer: writer, } }?;
                 }}?;
             }
         };
@@ -127,20 +132,21 @@ fn write_status(
     writer: BodyWriter<CafeError, Environment>,
     sse: SsePolicy,
 ) -> Effect<(), CafeError, Environment> {
-    let frame = writer.sse(
-        SseRecord {
+    let frame = server_stream! {
+        sse; writer: writer,
+        record: SseRecord {
             event: Some("order-status".into()),
             id: None,
             retry: None,
             data: update,
         },
-        sse,
-    );
+        policy: sse,
+    };
     effect! {
         let frame = frame.clone();
         let writer = writer.clone();
         frame?;
-        writer.flush()?;
+        server_stream! { flush; writer: writer, }?;
     }
 }
 
@@ -343,13 +349,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let provider_runtime = provider_runtime.clone();
             let watched = watched.clone(); let history = history.clone();
             let scope = scope.clone();
-            let owned = OwnedProviders::acquire_with_error(scope, factories, shutdown, CafeError::Lifecycle)?;
+            let owned = otel! {
+                acquire; scope: scope, factories: factories, shutdown: shutdown, on_error: CafeError::Lifecycle,
+            }?;
             let providers = effect_try_sync! {
                 once;
                 on_error |error| { CafeError::Otel(effect_otel::NativeError::Native(error)) },
                 body { owned.with(|owner| owner.borrowed()) },
             }?;
-            let environment = effect_map_error! { program: effect_try_sync! { once; body: { let __dsl_result = Environment::new(provider_runtime, providers, capacity); move || __dsl_result }, on_error: ::core::convert::identity, }, map: |error| CafeError::Otel(effect_otel::NativeError::Native(effect::Defect::new(error))), }?;
+            let environment = effect_from_result! {
+                once;
+                result: Environment::new(provider_runtime, providers, capacity),
+                on_error: |error| CafeError::Otel(effect_otel::NativeError::Native(effect::Defect::new(error))),
+            }?;
             let environment = Arc::new(environment);
             let selected = environment.clone();
             let history = history.clone();
@@ -361,40 +373,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let routes = router! { get("/orders/104/events", events); };
             // Each source awaits its writer, so one pending frame slot is sufficient;
             // the caller's encoded-frame limit also bounds each native body chunk.
-            let policy = ServerPolicy::new(BodyPolicy { frames: NonZeroUsize::MIN, chunk_bytes: sse.frame_bytes },
-                HostPolicy { drain }, CafeError::Server,
-                |_| effect_sync! { body: || reply! { text("Order tracking failed".into()); }, });
-            let server = effect_map_error! {
-                program: effect_try_sync! {
-                once; body: {
-                let __dsl_result = server! {
-                policy: policy,
-                environment: move |request: effect_server::Request| {
-                    let mut projected = selected.as_ref().clone();
-                    projected.cancellation = request.cancellation().clone();
-                    effect_sync! { body: move || Arc::new(projected.clone()), }
+            let policy = server! {
+                policy;
+                body_policy: BodyPolicy { frames: NonZeroUsize::MIN, chunk_bytes: sse.frame_bytes },
+                host_policy: HostPolicy { drain },
+                native_error: CafeError::Server,
+                on_error: |_| effect_sync! { body: || reply! { text("Order tracking failed".into()); }, },
+            };
+            let server = effect_from_result! {
+                once;
+                result: server! {
+                        policy: policy,
+                        environment: move |request: effect_server::Request| {
+                            let mut projected = selected.as_ref().clone();
+                            projected.cancellation = request.cancellation().clone();
+                            effect_sync! { body: move || Arc::new(projected.clone()), }
+                        },
+                        listen: address,
+                        protocols: HttpProtocols::Http1,
+                        routes: routes,
                 },
-                listen: address,
-                protocols: HttpProtocols::Http1,
-                routes: routes,
-            }; move || __dsl_result }, on_error: ::core::convert::identity, }, map: CafeError::Server, }?;
+                on_error: CafeError::Server,
+            }?;
             let propagation = Propagation::new(opentelemetry::propagation::TextMapCompositePropagator::new(vec![Box::new(opentelemetry_sdk::propagation::TraceContextPropagator::new()), Box::new(opentelemetry_sdk::propagation::BaggagePropagator::new())]));
-            let server = effect_otel::server::install(server, propagation,
-                |_| effect_otel::server::RequestSpan { name: Arc::from("cafe.watch-order"), attributes: vec![] },
-                |summary| Otel::log(LogLevel::Info, format!("order stream {:?}; cleanup_failed={}", summary.body, summary.cleanup_failed)), CafeError::Otel);
+            let hooks = RequestHooks::new(
+                |_| RequestSpan { name: Arc::from("cafe.watch-order"), attributes: vec![] },
+                |summary: effect_otel::server::RequestObservation| otel! {
+                    log; level: LogLevel::Info,
+                    message: format!("order stream {:?}; cleanup_failed={}", summary.body, summary.cleanup_failed),
+                },
+                CafeError::Otel,
+            );
+            let server = otel! { install_request_hooks; hooks: hooks, server: server, propagation: propagation, };
             // Explicit typed R handoff: host/request polls use the acquired native bridge.
             effect_future! {
-                exit_with_context; body: move |_, context| {
-                let server = server.clone();
-                let environment = environment.clone();
-                async move {
-                    context.run(server.with_host(|_| effect_try_future! { with_env; body: |_, _| async { tokio::signal::ctrl_c().await }, on_error: |error| CafeError::Server(effect_server::ServerError::Io(error)), }), environment).await
-                }
-            }, }?;
+                exit_with_context;
+                body: move |_, context| {
+                    let server = server.clone();
+                    let environment = environment.clone();
+                    async move {
+                        let host = server! {
+                            with_host; source: server,
+                            body: |_| effect_try_future! {
+                                with_env;
+                                body: |_, _| async { tokio::signal::ctrl_c().await },
+                                on_error: |error| CafeError::Server(effect_server::ServerError::Io(error)),
+                            },
+                        };
+                        effect! { run_in_context; context: context, program: host, environment: environment, }.await
+                    }
+                },
+            }?;
             }
         },
     };
-    let exit = runtime.block_on(program.run(root.clone()));
+    let exit = runtime.block_on(effect! { run; program: &program, environment: root.clone(), });
     runtime.block_on(root.tasks.stop().wait());
     runtime.block_on(root.blocking.stop().wait());
     bootstrap_logs.shutdown()?;

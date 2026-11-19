@@ -8,9 +8,13 @@
 //! settlement. Construct this adapter and put it in the application environment
 //! when native tasks are desired alongside any other capabilities.
 
-use effect::{Cancellation, Defect, Diagnostics, Exit, LibraryDefect, ScheduledTask, TaskSpawner};
+use effect::{
+    Cancellation, Defect, Diagnostics, Effect, Exit, HasCancellation, LibraryDefect, ScheduledTask,
+    TaskSpawner, effect,
+};
 use futures_util::future::{Either, select};
 use native_async_runtime::{AdmissionError, Completion, RuntimeHandle};
+use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -135,6 +139,42 @@ pub async fn linked<A, E>(
         Either::Right(((), remaining)) => remaining.await,
     }
 }
+/// Submit an Effect and its selected environment to the existing native runtime.
+///
+/// Admission refusal is returned before the program is executed. After
+/// admission, the provider owns the run and links both cancellation tokens.
+/// The completion callback receives the full Effect exit, including any
+/// cleanup failure. The caller retains native shutdown and join authority.
+/// Use [`PreparedNativeSubmitter::reserve`] for a caller-owned prepared receipt.
+pub fn submit_effect<A, E, R>(
+    handle: &RuntimeHandle,
+    native: Arc<native_async_runtime::Cancellation>,
+    program: Effect<A, E, R>,
+    env: Arc<R>,
+    done: impl FnOnce(Exit<A, E>) + Send + 'static,
+) -> Result<(), AdmissionError>
+where
+    A: Send + 'static,
+    E: Send + 'static,
+    R: HasCancellation + Send + Sync + 'static,
+{
+    handle.submit(
+        native,
+        move |native| async move {
+            let cancellation = env.cancellation().clone();
+            let run = effect! { run_cancellable; program: &program, environment: env, };
+            Ok::<_, Infallible>(linked(native, cancellation, run).await)
+        },
+        move |completion| {
+            done(match completion {
+                Completion::Success(outcome) => outcome,
+                Completion::Failure(never) => match never {},
+                Completion::Panicked => Exit::Die(Defect::from(LibraryDefect::NativeCompletionPanicked)),
+            });
+        },
+    )
+}
+
 /// Preserve all five exit families at a native boundary. The consumer chooses
 /// its payload/ABI representation and handles cleanup details explicitly.
 ///

@@ -314,11 +314,13 @@ impl SqlMigrator {
     )]
     pub async fn initialize(&self) -> Result<(), SqlError> {
         let catalog = self.catalog.clone();
-        self.kernel
-            .transaction(move |connection| {
+        crate::sql! {
+            kernel_transaction;
+            kernel: self.kernel,
+            body: move |connection| {
                 Box::pin(async move { ensure(connection, &catalog).await })
-            })
-            .await
+            },
+        }.await
             .map_err(annotate_terminal)
     }
     /// Preflight unapplied versions under a consistent authoritative history snapshot.
@@ -347,16 +349,18 @@ impl SqlMigrator {
         project: impl FnOnce(&MigrationCatalog, usize) -> Result<A, SqlError> + Send + 'static,
     ) -> Result<A, SqlError> {
         let catalog = self.catalog.clone();
-        self.kernel
-            .transaction(move |connection| {
+        crate::sql! {
+            kernel_transaction;
+            kernel: self.kernel,
+            body: move |connection| {
                 Box::pin(async move {
                     ensure(connection, &catalog).await?;
                     reject_dirty(connection, &catalog).await?;
                     let applied = history(connection, &catalog).await?;
                     project(&catalog, applied)
                 })
-            })
-            .await
+            },
+        }.await
             .map_err(annotate_terminal)
     }
     /// Capture exactly count reversible applied tail steps without changing user schema.
@@ -367,8 +371,10 @@ impl SqlMigrator {
     pub async fn plan_down(&self, count: usize) -> Result<DownPlan, SqlError> {
         let catalog = self.catalog.clone();
         let kernel = self.kernel.clone();
-        self.kernel
-            .transaction(move |connection| {
+        crate::sql! {
+            kernel_transaction;
+            kernel: self.kernel,
+            body: move |connection| {
                 Box::pin(async move {
                     ensure(connection, &catalog).await?;
                     reject_dirty(connection, &catalog).await?;
@@ -398,8 +404,8 @@ impl SqlMigrator {
                         kernel,
                     })
                 })
-            })
-            .await
+            },
+        }.await
             .map_err(annotate_terminal)
     }
     /// Apply all pending transactional steps atomically, revalidating history under BEGIN IMMEDIATE.
@@ -413,8 +419,10 @@ impl SqlMigrator {
             return self.up_with_maintenance().await;
         }
         let catalog = self.catalog.clone();
-        self.kernel
-            .transaction(move |connection| {
+        crate::sql! {
+            kernel_transaction;
+            kernel: self.kernel,
+            body: move |connection| {
                 Box::pin(async move {
                     ensure(connection, &catalog).await?;
                     reject_dirty(connection, &catalog).await?;
@@ -425,8 +433,8 @@ impl SqlMigrator {
                     }
                     Ok(catalog.steps.len() - applied)
                 })
-            })
-            .await
+            },
+        }.await
             .map_err(annotate_terminal)
     }
     /// Apply only an opaque preflighted plan after exact locked history/catalog revalidation.
@@ -455,8 +463,10 @@ impl SqlMigrator {
         {
             return self.down_with_maintenance(plan).await;
         }
-        self.kernel
-            .transaction(move |connection| {
+        crate::sql! {
+            kernel_transaction;
+            kernel: self.kernel,
+            body: move |connection| {
                 Box::pin(async move {
                     ensure(connection, &plan.catalog).await?;
                     reject_dirty(connection, &plan.catalog).await?;
@@ -482,8 +492,8 @@ impl SqlMigrator {
                     }
                     Ok(plan.count)
                 })
-            })
-            .await
+            },
+        }.await
             .map_err(annotate_terminal)
     }
     /// Inspect dirty schema state without guessing whether a migration program took effect.
@@ -493,14 +503,16 @@ impl SqlMigrator {
     )]
     pub async fn inspect_dirty(&self) -> Result<Option<DirtyMigration>, SqlError> {
         let catalog = self.catalog.clone();
-        self.kernel
-            .transaction(move |connection| {
+        crate::sql! {
+            kernel_transaction;
+            kernel: self.kernel,
+            body: move |connection| {
                 Box::pin(async move {
                     ensure(connection, &catalog).await?;
                     dirty(connection, &catalog).await
                 })
-            })
-            .await
+            },
+        }.await
             .map_err(annotate_terminal)
     }
     /// Assess actual schema under database write authority, then reconcile the same SQLx history.
@@ -519,8 +531,10 @@ impl SqlMigrator {
             + 'static,
     {
         let catalog = self.catalog.clone();
-        self.kernel
-            .transaction(move |connection| {
+        crate::sql! {
+            kernel_transaction;
+            kernel: self.kernel,
+            body: move |connection| {
                 Box::pin(async move {
                     ensure(connection, &catalog).await?;
                     let dirty = dirty(connection, &catalog).await?.ok_or_else(|| {
@@ -565,8 +579,8 @@ impl SqlMigrator {
                     }
                     clear_dirty(connection, &catalog).await
                 })
-            })
-            .await
+            },
+        }.await
             .map_err(annotate_terminal)
     }
     /// Lift initialization lazily, restoring complete native invocation failures.
@@ -579,7 +593,7 @@ impl SqlMigrator {
                 if context.cancellation().is_requested() {
                     return Exit::Interrupted;
                 }
-                native_exit(this.initialize().await)
+                native_exit(crate::sql! { migrate_initialize; migrator: this, }.await)
             }
         }, }
     }
@@ -625,7 +639,7 @@ impl SqlMigrator {
                 if context.cancellation().is_requested() {
                     return Exit::Interrupted;
                 }
-                native_exit(this.up().await)
+                native_exit(crate::sql! { migrate_up; migrator: this, }.await)
             }
         }, }
     }
@@ -704,8 +718,10 @@ impl SqlMigrator {
                 };
                 let outcome = std::panic::AssertUnwindSafe(async {
                     let catalog = this.catalog.clone();
-                    let dirty = match tx
-                        .with_native(move |connection| {
+                    let dirty = match crate::sql! {
+                        session_native;
+                        session: tx,
+                        body: move |connection| {
                             Box::pin(async move {
                                 ensure(connection, &catalog).await?;
                                 let dirty =
@@ -722,34 +738,33 @@ impl SqlMigrator {
                                 }
                                 Ok(dirty)
                             })
-                        })
-                        .await
+                        },
+                    }.await
                     {
                         Ok(dirty) => dirty,
                         Err(error) => return error.into_exit(),
                     };
                     let version = dirty.version;
                     let direction = dirty.direction;
-                    let decision = match crate::row::failure_as::<_, (), _>(
-                        context
-                            .run(
-                                assess(dirty, crate::SqlTransaction::from_native(tx.clone())),
-                                env,
-                            )
-                            .await,
-                    ) {
+                    let decision = match effect::effect! {
+                            run_in_context; context: context,
+                            program: assess(dirty, crate::SqlTransaction::from_native(tx.clone())),
+                            environment: env,
+                        }.await.into_failure::<()>() {
                         Ok(decision) => decision,
                         Err(exit) => return exit,
                     };
                     let catalog = this.catalog.clone();
-                    let repair = tx
-                        .with_native(move |connection| {
+                    let repair = crate::sql! {
+                        session_native;
+                        session: tx,
+                        body: move |connection| {
                             Box::pin(async move {
                                 repair_recovery(connection, &catalog, version, direction, decision)
                                     .await
                             })
-                        })
-                        .await;
+                        },
+                    }.await;
                     match repair {
                         Ok(()) => match tx.commit().await {
                             Ok(()) => Exit::Success(()),
@@ -843,9 +858,10 @@ impl SqlMigrator {
         let catalog = self.catalog.clone();
         let step = step.clone();
         if !no_tx {
-            return self
-                .kernel
-                .transaction(move |connection| {
+            return crate::sql! {
+                kernel_transaction;
+                kernel: self.kernel,
+                body: move |connection| {
                     Box::pin(async move {
                         ensure(connection, &catalog).await?;
                         reject_dirty(connection, &catalog).await?;
@@ -856,14 +872,16 @@ impl SqlMigrator {
                         validate_boundary(&catalog, current, step.up.version, direction)?;
                         apply_transactional(connection, &catalog, &step, direction).await
                     })
-                })
-                .await
+                },
+            }.await
                 .map_err(annotate_terminal);
         }
         let prepare_catalog = catalog.clone();
         let prepare_step = step.clone();
-        self.kernel
-            .transaction(move |connection| {
+        crate::sql! {
+            kernel_transaction;
+            kernel: self.kernel,
+            body: move |connection| {
                 Box::pin(async move {
                     ensure(connection, &prepare_catalog).await?;
                     reject_dirty(connection, &prepare_catalog).await?;
@@ -879,13 +897,15 @@ impl SqlMigrator {
                     )?;
                     mark_dirty(connection, &prepare_catalog, &prepare_step, direction).await
                 })
-            })
-            .await
+            },
+        }.await
             .map_err(annotate_terminal)?;
         let started = Instant::now();
         let version = step.up.version;
-        self.kernel
-            .with_connection(move |connection| {
+        crate::sql! {
+            kernel_connection;
+            kernel: self.kernel,
+            body: move |connection| {
                 Box::pin(async move {
                     connection
                         .native_execute_batch(sql.as_str())
@@ -894,10 +914,12 @@ impl SqlMigrator {
                             migration_failure(MigrationPhase::Apply, Some(version), error.into())
                         })
                 })
-            })
-            .await?;
-        self.kernel
-            .transaction(move |connection| {
+            },
+        }.await?;
+        crate::sql! {
+            kernel_transaction;
+            kernel: self.kernel,
+            body: move |connection| {
                 Box::pin(async move {
                     let dirty = dirty(connection, &catalog).await?.ok_or_else(stale_plan)?;
                     if dirty.version != step.up.version || dirty.direction != direction {
@@ -907,8 +929,8 @@ impl SqlMigrator {
                         .await?;
                     clear_dirty(connection, &catalog).await
                 })
-            })
-            .await
+            },
+        }.await
             .map_err(annotate_terminal)
     }
 }

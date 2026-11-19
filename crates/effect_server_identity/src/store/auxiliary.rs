@@ -8,6 +8,7 @@ use super::{
     SqlxIdentityStore,
     records::{Record, RecordCategory, RecordCodec, RecordError, RecordPolicy, SqlRecordAdapter},
 };
+use crate::identity_store;
 use identity_rs::identity::models::UserId;
 use std::num::{NonZeroU16, NonZeroUsize};
 use time::OffsetDateTime;
@@ -47,7 +48,10 @@ impl<A: Send + 'static, C: RecordCodec<A>> ChallengeRepository<A, C> {
         codec: C,
     ) -> Self {
         Self {
-            records: SqlRecordAdapter::new(backend, RecordCategory::Challenge, policy, codec),
+            records: identity_store! {
+                record_adapter; backend: backend, category: RecordCategory::Challenge,
+                policy: policy, codec: codec,
+            },
             capacity,
         }
     }
@@ -145,7 +149,10 @@ impl<A: Send + 'static, C: RecordCodec<A>> RequestRepository<A, C> {
         codec: C,
     ) -> Self {
         Self {
-            records: SqlRecordAdapter::new(backend, kind.category(), policy, codec),
+            records: identity_store! {
+                record_adapter; backend: backend, category: kind.category(),
+                policy: policy, codec: codec,
+            },
             kind,
         }
     }

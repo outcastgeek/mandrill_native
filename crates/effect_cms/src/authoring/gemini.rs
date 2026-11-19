@@ -30,8 +30,8 @@ use effect::memory::{
     Buffer, Bytes, FixedVector, MemoryError, PreparedMemory, RegionId, SlotLease, SlotPool,
 };
 use effect::{
-    Effect, Exit, HasHttpTransport, effect, effect_die, effect_future, effect_map, effect_scope,
-    effect_sync, effect_try_sync,
+    Effect, Exit, HasHttpTransport, effect, effect_die, effect_from_result, effect_future,
+    effect_map, effect_scope, effect_sync,
 };
 use effect_server::Request;
 use serde_json::{Value, json};
@@ -373,14 +373,9 @@ impl GeminiTranslator {
             body: move |(status, text)| {
             let fields = fields.clone();
             let target_language = target_language.clone();
-            effect_try_sync! {
+            effect_from_result! {
                 once;
-                body: {
-                    let __dsl_result =
-                        response_result(status, text.as_str(), &fields, &target_language);
-                    move || __dsl_result
-                },
-                on_error: ::core::convert::identity,
+                result: response_result(status, text.as_str(), &fields, &target_language),
             }
             },
         }
@@ -430,7 +425,12 @@ impl GeminiTranslator {
                 let workspace = workspace.clone();
                 let translator = translator.clone();
                         async move {
-                            let input = match context.run(input, env.clone()).await {
+                            let input = match effect::effect! {
+                                run_in_context;
+                                context: context,
+                                program: input,
+                                environment: env.clone(),
+                            }.await {
                                 Exit::Success(input) => input,
                                 Exit::Fail(error) => return Exit::Fail(error),
                                 Exit::Die(defect) => return Exit::Die(defect),
@@ -449,7 +449,12 @@ impl GeminiTranslator {
                                 Err(error) => return Exit::Fail(error),
                             };
                             let request = translator.http_request(timeout, Arc::from(body.as_slice()));
-                            let response = context.run(fetch_generation(request), env).await;
+                            let response = effect::effect! {
+                                run_in_context;
+                                context: context,
+                                program: fetch_generation(request),
+                                environment: env,
+                            }.await;
                             let outcome = match response {
                                 Exit::Success((status, text)) => {
                                     if let Err(error) = check_bytes(text.len(), workspace.limits.response_bytes) {
@@ -660,15 +665,7 @@ fn translator_failure<R>(
 where
     R: Send + Sync + 'static,
 {
-    effect_try_sync! {
-        once;
-        body: {
-            let __dsl_result =
-                Err::<AuthoringTranslationResult, GeminiTranslatorError>(error);
-            move || __dsl_result
-        },
-        on_error: ::core::convert::identity,
-    }
+    effect_from_result! { once; result: Err(error), }
 }
 
 /// The exact source translation prompt.

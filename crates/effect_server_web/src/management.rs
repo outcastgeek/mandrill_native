@@ -6,9 +6,7 @@
 
 use crate::effect_future;
 use effect::{Effect, HasCancellation, HasTaskSpawner};
-use effect_server::{
-    HasTokio, HttpProtocols, RequestBinding, ServerError, ServerHost, ServerPolicy,
-};
+use effect_server::{HasTokio, HttpProtocols, ServerError, ServerHost, ServerPolicy};
 use effect_server::{route, router, server};
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -67,17 +65,18 @@ where
         native: move |router| {
         Ok(router.route(&path, axum::routing::get_service(exporter.clone())))
     } };
-    let environment = RequestBinding::new(|_| {
-        effect_future! { with_env; body: |environment, _| async move { environment }, }
-    });
-    Ok(server! {
+    let environment = server! {
+        request_binding;
+        body: |_| effect_future! { with_env; body: |environment, _| async move { environment }, },
+    };
+    let server = server! {
         policy: policy,
         environment: environment,
         listen: exposure.address(),
         protocols: protocols,
         routes: routes,
-    }?
-    .with_host(use_host))
+    }?;
+    Ok(server! { with_host; source: server, body: use_host, })
 }
 
 #[cfg(feature = "prometheus")]
@@ -245,17 +244,18 @@ where
             endpoint(endpoint! { effect(render) }),
         }),
     }?;
-    let environment = RequestBinding::new(|_| {
-        effect_future! { with_env; body: |environment, _| async move { environment }, }
-    });
-    Ok(server! {
+    let environment = server! {
+        request_binding;
+        body: |_| effect_future! { with_env; body: |environment, _| async move { environment }, },
+    };
+    let server = server! {
         policy: policy,
         environment: environment,
         listen: exposure.address(),
         protocols: protocols,
         routes: routes,
-    }?
-    .with_host(use_host))
+    }?;
+    Ok(server! { with_host; source: server, body: use_host, })
 }
 #[cfg(feature = "prometheus")]
 enum MetricsBytes {

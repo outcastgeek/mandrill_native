@@ -5,7 +5,10 @@ use crate::{
     ResourceValidators, ServerError,
 };
 use crate::body::{BodyAdmission, BodySignal, BodySignalWait};
-use crate::{effect_future, effect_resource, effect_sync, effect_try_future, stream};
+use crate::{
+    effect_blocking, effect_die, effect_from_result, effect_future, effect_map, effect_resource,
+    effect_sync, effect_try_blocking, effect_try_future, stream,
+};
 use axum::body::Body;
 use bytes::Bytes;
 use effect::effect;
@@ -415,19 +418,21 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Reply<E, R> {
                     render: {
                         let render = item.render.clone();
                         let value = Arc::new(std::sync::Mutex::new(Some(value)));
-                        Effect::defer(move || {
-                            let render = render.clone();
-                            let value = value
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .take();
-                            match value {
-                                Some(value) => render(value),
-                                None => Effect::die(effect::Defect::new(
-                                    "selected renderer value consumed",
-                                )),
-                            }
-                        })
+                        effect! {
+                            defer; body: move || {
+                                let render = render.clone();
+                                let value = value
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .take();
+                                match value {
+                                    Some(value) => render(value),
+                                    None => effect_die! {
+                                        defect: effect::Defect::new("selected renderer value consumed"),
+                                    },
+                                }
+                            },
+                        }
                     },
                 })),
                 None => Ok(None),
@@ -526,7 +531,12 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Reply<E, R> {
                                apply_fields(std::mem::take(&mut reply.fields), &mut reply.headers);
                            }
                            match reply.body {
-                               ReplyBody::Render(render) => match context.run(render, env.clone()).await {
+                               ReplyBody::Render(render) => match effect::effect! {
+                                   run_in_context;
+                                   context: context,
+                                   program: render,
+                                   environment: env.clone(),
+                               }.await {
                                    Exit::Success(mut selected) => {
                                        for name in reply.headers.keys() {
                                            selected.headers.remove(name);
@@ -593,7 +603,12 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Reply<E, R> {
                                        let finish_map = map_error.clone();
                                        let close = std::mem::DropGuard::new(raw_writer.clone(), |writer| writer.finish());
                                        let finish = crate::endpoint::native_once(move |environment, context| async move {
-                                           let produced = context.run(production, environment).await;
+                                           let produced = effect::effect! {
+                                               run_in_context;
+                                               context: context,
+                                               program: production,
+                                               environment: environment,
+                                           }.await;
                                            if !matches!(produced, Exit::Success(())) { finish_completion.fail(); }
                                            drop(close);
                                            let body_outcome = BodySignalWait::Prepared(wait).wait().await;
@@ -753,11 +768,12 @@ impl<E: Send + 'static, R: Send + Sync + 'static> Reply<E, R> {
                                                            };
                                                        bytes.truncate(read);
                                                        remaining = remaining.saturating_sub(read as u64);
-                                                       let result = context
-                                                           .run(
-                                                               writer.write(Bytes::from(bytes)),
-                                                               env.clone(),
-                                                           )
+                                                       let result = effect::effect! {
+                                                           run_in_context;
+                                                           context: context,
+                                                           program: crate::stream! { write; writer: writer, bytes: Bytes::from(bytes), },
+                                                           environment: env.clone(),
+                                                       }
                                                            .await;
                                                        if !matches!(result, Exit::Success(())) {
                                                            return result;
@@ -1398,65 +1414,72 @@ where
         R: crate::HasServerError<Error = E>,
     {
         let value = Arc::new(std::sync::Mutex::new(Some(value)));
-        let body = BodyProgram::new(move |writer| {
-            let value = value.clone();
-            let codec = codec.clone();
-            if let Some(sink) = crate::body::NativeJsonSink::ordinary_from_writer(&writer) {
-                return crate::endpoint::native_once(move |env: Arc<R>, context| async move {
-                    let mapper = env.clone();
-                    let encode = Effect::try_blocking_once(
-                        move |_| {
-                            let value = value.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take().ok_or_else(|| effect::SchemaIssue::new(effect::SchemaIssueKind::InvalidDefinition))?;
-                            let mut writer = effect::JsonWriter::with_sink(policy, sink);
-                            codec.codec.write_into(&value, &mut writer)?;
-                            writer.finish_sink()
-                        },
-                        move |issue| mapper.server_error(ServerError::Schema(issue)),
-                    );
-                    context.run(encode, env).await
-                });
-            }
-            crate::endpoint::native_once(move |env: Arc<R>, context| async move {
-                let reservation = match writer.reserve_json_writer(policy) {
-                    Ok(reservation) => reservation,
-                    Err(error) => return Exit::Fail(env.server_error(ServerError::Memory(error))),
-                };
-                let (sink, witness) = match crate::body::NativeJsonSink::from_writer(&writer) {
-                    Ok(admitted) => admitted,
-                    Err(error) => return Exit::Fail(env.server_error(ServerError::Memory(error))),
-                };
-                let mut json_writer = reservation.publish(sink);
-                let encode = Effect::blocking_once(move |_| {
-                    let value = value.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take().ok_or_else(|| effect::SchemaIssue::new(effect::SchemaIssueKind::InvalidDefinition))?;
-                    codec.codec.write_into(&value, &mut json_writer)?;
-                    json_writer.finish_sink()
-                });
-                let worker = context.run(encode, env.clone()).await;
-                match witness {
-                    None => match worker { Exit::Success(Ok(())) => Exit::Success(()), Exit::Success(Err(issue)) => Exit::Fail(env.server_error(ServerError::Schema(issue))), Exit::Fail(error) => Exit::Fail(error), Exit::Die(defect) => Exit::Die(defect), Exit::Interrupted => Exit::Interrupted, Exit::FinalizationFailed(failure) => Exit::FinalizationFailed(failure) },
-                    Some(witness) => {
-                        let failure = witness.receiver.await.ok();
-                        let primary = match worker {
-                            Exit::Success(result) if failure.is_some() => { drop(result); Exit::Success(()) },
-                            Exit::Success(Ok(())) => Exit::Success(()),
-                            Exit::Success(Err(issue)) => Exit::Fail(env.server_error(ServerError::Schema(issue))),
-                            Exit::Fail(error) => Exit::Fail(error), Exit::Die(defect) => Exit::Die(defect), Exit::Interrupted => Exit::Interrupted, Exit::FinalizationFailed(failure) => Exit::FinalizationFailed(failure),
+        let body = stream! {
+            body: move |writer| {
+                let value = value.clone();
+                let codec = codec.clone();
+                if let Some(sink) = crate::body::NativeJsonSink::ordinary_from_writer(&writer) {
+                    return crate::endpoint::native_once(move |env: Arc<R>, context| async move {
+                        let mapper = env.clone();
+                        let encode = effect_try_blocking! {
+                            once; body: move |_| {
+                                let value = value.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take().ok_or_else(|| effect::SchemaIssue::new(effect::SchemaIssueKind::InvalidDefinition))?;
+                                let mut writer = effect::JsonWriter::with_sink(policy, sink);
+                                codec.codec.write_into(&value, &mut writer)?;
+                                writer.finish_sink()
+                            },
+                            on_error: move |issue| mapper.server_error(ServerError::Schema(issue)),
                         };
-                        match failure {
-                            None => primary,
-                            Some(failure) => {
-                                let native = match failure {
-                                    crate::prepared_streaming_channel::RawBlockingFailure::Memory(error) => Exit::Fail(env.server_error(ServerError::Memory(error))),
-                                    crate::prepared_streaming_channel::RawBlockingFailure::Disconnected => Exit::Fail(env.server_error(ServerError::Disconnected)),
-                                    crate::prepared_streaming_channel::RawBlockingFailure::Queue(exit) => witness.mapper.map(exit, |_| env.server_error(ServerError::Disconnected)),
-                                };
-                                if matches!(primary, Exit::Success(())) { native } else { let mut combined = effect::PreparedCleanupAccumulator::from_reserved(primary, witness.cleanup); combined.append_cleanup(native); combined.finish() }
+                        effect::effect! { run_in_context; context: context, program: encode, environment: env, }.await
+                    });
+                }
+                crate::endpoint::native_once(move |env: Arc<R>, context| async move {
+                    let reservation = match writer.reserve_json_writer(policy) {
+                        Ok(reservation) => reservation,
+                        Err(error) => return Exit::Fail(env.server_error(ServerError::Memory(error))),
+                    };
+                    let (sink, witness) = match crate::body::NativeJsonSink::from_writer(&writer) {
+                        Ok(admitted) => admitted,
+                        Err(error) => return Exit::Fail(env.server_error(ServerError::Memory(error))),
+                    };
+                    let mut json_writer = reservation.publish(sink);
+                    let encode = effect_blocking! { once; body: move |_| {
+                        let value = value.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take().ok_or_else(|| effect::SchemaIssue::new(effect::SchemaIssueKind::InvalidDefinition))?;
+                        codec.codec.write_into(&value, &mut json_writer)?;
+                        json_writer.finish_sink()
+                    }, };
+                    let worker = effect::effect! {
+                        run_in_context;
+                        context: context,
+                        program: encode,
+                        environment: env.clone(),
+                    }.await;
+                    match witness {
+                        None => match worker { Exit::Success(Ok(())) => Exit::Success(()), Exit::Success(Err(issue)) => Exit::Fail(env.server_error(ServerError::Schema(issue))), Exit::Fail(error) => Exit::Fail(error), Exit::Die(defect) => Exit::Die(defect), Exit::Interrupted => Exit::Interrupted, Exit::FinalizationFailed(failure) => Exit::FinalizationFailed(failure) },
+                        Some(witness) => {
+                            let failure = witness.receiver.await.ok();
+                            let primary = match worker {
+                                Exit::Success(result) if failure.is_some() => { drop(result); Exit::Success(()) },
+                                Exit::Success(Ok(())) => Exit::Success(()),
+                                Exit::Success(Err(issue)) => Exit::Fail(env.server_error(ServerError::Schema(issue))),
+                                Exit::Fail(error) => Exit::Fail(error), Exit::Die(defect) => Exit::Die(defect), Exit::Interrupted => Exit::Interrupted, Exit::FinalizationFailed(failure) => Exit::FinalizationFailed(failure),
+                            };
+                            match failure {
+                                None => primary,
+                                Some(failure) => {
+                                    let native = match failure {
+                                        crate::prepared_streaming_channel::RawBlockingFailure::Memory(error) => Exit::Fail(env.server_error(ServerError::Memory(error))),
+                                        crate::prepared_streaming_channel::RawBlockingFailure::Disconnected => Exit::Fail(env.server_error(ServerError::Disconnected)),
+                                        crate::prepared_streaming_channel::RawBlockingFailure::Queue(exit) => witness.mapper.map(exit, |_| env.server_error(ServerError::Disconnected)),
+                                    };
+                                    if matches!(primary, Exit::Success(())) { native } else { let mut combined = effect::PreparedCleanupAccumulator::from_reserved(primary, witness.cleanup); combined.append_cleanup(native); combined.finish() }
+                                }
                             }
                         }
                     }
-                }
-            })
-        });
+                })
+            },
+        };
         Self::json(body)
     }
 }
@@ -1492,7 +1515,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Representat
         Self {
             media: HeaderValue::from_static("text/plain; charset=utf-8"),
             language: None,
-            render: Arc::new(move |value| render(value).map(Reply::text)),
+            render: Arc::new(move |value| effect_map! { program: render(value), map: Reply::text, }),
         }
     }
     /// Lazy escaped/trusted HTML alternative with an extracted application renderer.
@@ -1500,7 +1523,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Representat
         Self {
             media: HeaderValue::from_static("text/html; charset=utf-8"),
             language: None,
-            render: Arc::new(move |value| render(value).map(Reply::html)),
+            render: Arc::new(move |value| effect_map! { program: render(value), map: Reply::html, }),
         }
     }
     /// Incremental representation with an explicit concrete native media type.
@@ -1511,7 +1534,7 @@ impl<A: Send + 'static, E: Send + 'static, R: Send + Sync + 'static> Representat
         let reply_media = media.clone();
         Self::new(media, None, move |value| {
             let media = reply_media.clone();
-            render(value).map(move |body| Reply::stream(body, media.clone()))
+            effect_map! { program: render(value), map: move |body| Reply::stream(body, media.clone()), }
         })
     }
 }
@@ -1528,7 +1551,7 @@ where
             media: HeaderValue::from_static("application/json"),
             language: None,
             render: Arc::new(move |value| {
-                Effect::from_result_once(Ok(Reply::json_codec(codec.clone(), value, policy)))
+                effect_from_result! { once; result: Ok(Reply::json_codec(codec.clone(), value, policy)), }
             }),
         }
     }
@@ -1578,59 +1601,75 @@ where
     pub fn problem(problem: HttpProblem) -> Self {
         let status = problem.status.0;
         let problem = Arc::new(std::sync::Mutex::new(Some(problem)));
-        let body = BodyProgram::new(move |writer| {
-            let problem = problem.clone();
-            crate::endpoint::native_once(move |env: Arc<R>, context| async move {
-                let Some(problem) = problem
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-                else {
-                    return Exit::Die(effect::Defect::new("problem body already consumed"));
-                };
-                let fields = [
-                    ("type", Some(problem.type_uri)),
-                    ("title", Some(problem.title)),
-                    ("detail", problem.detail),
-                    ("instance", problem.instance),
-                ];
-                let begin = context
-                    .run(writer.write(Bytes::from_static(b"{")), env.clone())
-                    .await;
-                if !matches!(begin, Exit::Success(())) {
-                    return begin;
-                }
-                let mut first = true;
-                for (name, value) in fields {
-                    if let Some(value) = value {
-                        let prefix = if first { "" } else { "," };
-                        first = false;
-                        let value = match serde_json::to_string(&value) {
-                            Ok(value) => value,
-                            Err(_) => {
-                                return Exit::Fail(env.server_error(ServerError::Invalid(
-                                    "problem string encoding".into(),
-                                )));
+        let body = stream! {
+            body: move |writer| {
+                let problem = problem.clone();
+                crate::endpoint::native_once(move |env: Arc<R>, context| async move {
+                    let Some(problem) = problem
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                    else {
+                        return Exit::Die(effect::Defect::new("problem body already consumed"));
+                    };
+                    let fields = [
+                        ("type", Some(problem.type_uri)),
+                        ("title", Some(problem.title)),
+                        ("detail", problem.detail),
+                        ("instance", problem.instance),
+                    ];
+                    let begin = effect::effect! {
+                        run_in_context;
+                        context: context,
+                        program: crate::stream! { write; writer: writer, bytes: Bytes::from_static(b"{"), },
+                        environment: env.clone(),
+                    }
+                        .await;
+                    if !matches!(begin, Exit::Success(())) {
+                        return begin;
+                    }
+                    let mut first = true;
+                    for (name, value) in fields {
+                        if let Some(value) = value {
+                            let prefix = if first { "" } else { "," };
+                            first = false;
+                            let value = match serde_json::to_string(&value) {
+                                Ok(value) => value,
+                                Err(_) => {
+                                    return Exit::Fail(env.server_error(ServerError::Invalid(
+                                        "problem string encoding".into(),
+                                    )));
+                                }
+                            };
+                            let chunk = Bytes::from(format!("{prefix}\"{name}\":{value}"));
+                            let result = effect::effect! {
+                                run_in_context;
+                                context: context,
+                                program: crate::stream! { write; writer: writer, bytes: chunk, },
+                                environment: env.clone(),
+                            }.await;
+                            if !matches!(result, Exit::Success(())) {
+                                return result;
                             }
-                        };
-                        let chunk = Bytes::from(format!("{prefix}\"{name}\":{value}"));
-                        let result = context.run(writer.write(chunk), env.clone()).await;
-                        if !matches!(result, Exit::Success(())) {
-                            return result;
                         }
                     }
-                }
-                context
-                    .run(
-                        writer.write(Bytes::from(format!(
-                            ",\"status\":{}}}",
-                            problem.status.0.as_u16()
-                        ))),
-                        env,
-                    )
-                    .await
-            })
-        });
+                    effect::effect! {
+                        run_in_context;
+                        context: context,
+                        program: crate::stream! {
+                            write;
+                            writer: writer,
+                            bytes: Bytes::from(format!(
+                                ",\"status\":{}}}",
+                                problem.status.0.as_u16()
+                            )),
+                        },
+                        environment: env,
+                    }
+                        .await
+                })
+            },
+        };
         let mut reply = Self::stream(body, HeaderValue::from_static("application/problem+json"));
         reply.status = status;
         reply
@@ -1640,91 +1679,108 @@ where
     pub fn validation(problem: ValidationProblem) -> Self {
         let status = problem.status.0;
         let problem = Arc::new(std::sync::Mutex::new(Some(problem)));
-        let body = BodyProgram::new(move |writer| {
-            let problem = problem.clone();
-            crate::endpoint::native_once(move |env: Arc<R>, context| async move {
-                let Some(problem) = problem
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-                else {
-                    return Exit::Die(effect::Defect::new("validation body consumed"));
-                };
-                let title = match serde_json::to_string(&problem.title) {
-                    Ok(value) => value,
-                    Err(_) => {
-                        return Exit::Fail(
-                            env.server_error(ServerError::Invalid("validation encoding".into())),
-                        );
-                    }
-                };
-                let result = context
-                    .run(
-                        writer.write(Bytes::from(format!(
-                            "{{\"title\":{title},\"status\":{},\"errors\":{{",
-                            status.as_u16()
-                        ))),
-                        env.clone(),
-                    )
-                    .await;
-                if !matches!(result, Exit::Success(())) {
-                    return result;
-                }
-                let mut first_field = true;
-                for (name, errors) in problem.errors {
-                    let name = match serde_json::to_string(&name) {
+        let body = stream! {
+            body: move |writer| {
+                let problem = problem.clone();
+                crate::endpoint::native_once(move |env: Arc<R>, context| async move {
+                    let Some(problem) = problem
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                    else {
+                        return Exit::Die(effect::Defect::new("validation body consumed"));
+                    };
+                    let title = match serde_json::to_string(&problem.title) {
                         Ok(value) => value,
                         Err(_) => {
                             return Exit::Fail(
-                                env.server_error(ServerError::Invalid("validation field".into())),
+                                env.server_error(ServerError::Invalid("validation encoding".into())),
                             );
                         }
                     };
-                    let prefix = if first_field { "" } else { "," };
-                    first_field = false;
-                    let result = context
-                        .run(
-                            writer.write(Bytes::from(format!("{prefix}{name}:["))),
-                            env.clone(),
-                        )
+                    let result = effect::effect! {
+                        run_in_context;
+                        context: context,
+                        program: crate::stream! {
+                            write;
+                            writer: writer,
+                            bytes: Bytes::from(format!(
+                                "{{\"title\":{title},\"status\":{},\"errors\":{{",
+                                status.as_u16()
+                            )),
+                        },
+                        environment: env.clone(),
+                    }
                         .await;
                     if !matches!(result, Exit::Success(())) {
                         return result;
                     }
-                    let mut first = true;
-                    for error in errors {
-                        let error = match serde_json::to_string(&error) {
+                    let mut first_field = true;
+                    for (name, errors) in problem.errors {
+                        let name = match serde_json::to_string(&name) {
                             Ok(value) => value,
                             Err(_) => {
-                                return Exit::Fail(env.server_error(ServerError::Invalid(
-                                    "validation message".into(),
-                                )));
+                                return Exit::Fail(
+                                    env.server_error(ServerError::Invalid("validation field".into())),
+                                );
                             }
                         };
-                        let prefix = if first { "" } else { "," };
-                        first = false;
-                        let result = context
-                            .run(
-                                writer.write(Bytes::from(format!("{prefix}{error}"))),
-                                env.clone(),
-                            )
+                        let prefix = if first_field { "" } else { "," };
+                        first_field = false;
+                        let result = effect::effect! {
+                            run_in_context;
+                            context: context,
+                            program: crate::stream! { write; writer: writer, bytes: Bytes::from(format!("{prefix}{name}:[")), },
+                            environment: env.clone(),
+                        }
+                            .await;
+                        if !matches!(result, Exit::Success(())) {
+                            return result;
+                        }
+                        let mut first = true;
+                        for error in errors {
+                            let error = match serde_json::to_string(&error) {
+                                Ok(value) => value,
+                                Err(_) => {
+                                    return Exit::Fail(env.server_error(ServerError::Invalid(
+                                        "validation message".into(),
+                                    )));
+                                }
+                            };
+                            let prefix = if first { "" } else { "," };
+                            first = false;
+                            let result = effect::effect! {
+                                run_in_context;
+                                context: context,
+                                program: crate::stream! { write; writer: writer, bytes: Bytes::from(format!("{prefix}{error}")), },
+                                environment: env.clone(),
+                            }
+                                .await;
+                            if !matches!(result, Exit::Success(())) {
+                                return result;
+                            }
+                        }
+                        let result = effect::effect! {
+                            run_in_context;
+                            context: context,
+                            program: crate::stream! { write; writer: writer, bytes: Bytes::from_static(b"]"), },
+                            environment: env.clone(),
+                        }
                             .await;
                         if !matches!(result, Exit::Success(())) {
                             return result;
                         }
                     }
-                    let result = context
-                        .run(writer.write(Bytes::from_static(b"]")), env.clone())
-                        .await;
-                    if !matches!(result, Exit::Success(())) {
-                        return result;
+                    effect::effect! {
+                        run_in_context;
+                        context: context,
+                        program: crate::stream! { write; writer: writer, bytes: Bytes::from_static(b"}}"), },
+                        environment: env,
                     }
-                }
-                context
-                    .run(writer.write(Bytes::from_static(b"}}")), env)
-                    .await
-            })
-        });
+                        .await
+                })
+            },
+        };
         let mut reply = Self::stream(body, HeaderValue::from_static("application/problem+json"));
         reply.status = status;
         reply

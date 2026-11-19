@@ -177,13 +177,13 @@ impl<
                     effect_map! { program: decode.decode_once(value), map: Some, }
                 }
                 None => {
-                    effect_try_sync! { once; body: { let __dsl_result = Ok(None); move || __dsl_result }, on_error: ::core::convert::identity, }
+                    crate::effect_from_result! { once; result: Ok(None), }
                 }
             },
             move |input| match input {
                 Some(value) => effect_map! { program: self.encode_once(value), map: Some, },
                 None => {
-                    effect_try_sync! { once; body: { let __dsl_result = Ok(None); move || __dsl_result }, on_error: ::core::convert::identity, }
+                    crate::effect_from_result! { once; result: Ok(None), }
                 }
             },
             move |input| match input {
@@ -191,7 +191,7 @@ impl<
                     effect_map! { program: validate.validate_once(value), map: Some, }
                 }
                 None => {
-                    effect_try_sync! { once; body: { let __dsl_result = Ok(None); move || __dsl_result }, on_error: ::core::convert::identity, }
+                    crate::effect_from_result! { once; result: Ok(None), }
                 }
             },
         )
@@ -211,7 +211,7 @@ impl<
             SchemaAst::opaque(),
             move |input| {
                 if is_null(&input) {
-                    effect_try_sync! { once; body: { let __dsl_result = Ok(None); move || __dsl_result }, on_error: ::core::convert::identity, }
+                    crate::effect_from_result! { once; result: Ok(None), }
                 } else {
                     effect_map! { program: decode.decode_once(input), map: Some, }
                 }
@@ -219,7 +219,7 @@ impl<
             move |input| match input {
                 Some(value) => self.encode_once(value),
                 None => {
-                    effect_try_sync! { once; body: { let __dsl_result = Ok(null()); move || __dsl_result }, on_error: ::core::convert::identity, }
+                    crate::effect_from_result! { once; result: Ok(null()), }
                 }
             },
             move |input| match input {
@@ -227,7 +227,7 @@ impl<
                     effect_map! { program: validate.validate_once(value), map: Some, }
                 }
                 None => {
-                    effect_try_sync! { once; body: { let __dsl_result = Ok(None); move || __dsl_result }, on_error: ::core::convert::identity, }
+                    crate::effect_from_result! { once; result: Ok(None), }
                 }
             },
         )
@@ -276,11 +276,11 @@ impl<
             },
             move |items: Vec<A>| {
                 if items.len() > limits.collection.get() {
-                    return effect_try_sync! { once; body: { let __dsl_result = Err(encode_issue(super::SchemaIssue::new(
+                    return crate::effect_from_result! { once; result: Err(encode_issue(super::SchemaIssue::new(
                         super::SchemaIssueKind::LimitExceeded {
                             resource: super::SchemaResource::Width,
                         },
-                    ))); move || __dsl_result }, on_error: ::core::convert::identity, };
+                    ))), };
                 }
                 let repr = Arc::clone(&repr);
                 let issue = Arc::clone(&encode_issue);
@@ -297,11 +297,11 @@ impl<
             },
             move |items: Vec<A>| {
                 if items.len() > limits.collection.get() {
-                    return effect_try_sync! { once; body: { let __dsl_result = Err(validation_issue(
+                    return crate::effect_from_result! { once; result: Err(validation_issue(
                         super::SchemaIssue::new(super::SchemaIssueKind::LimitExceeded {
                             resource: super::SchemaResource::Width,
                         }),
-                    )); move || __dsl_result }, on_error: ::core::convert::identity, };
+                    )), };
                 }
                 effect_all! { items: items
                 .into_iter()
@@ -361,25 +361,25 @@ impl<
                             .into_iter()
                             .map(|(name, item)| {
                                 effect_map! { program: { let __dsl_left_program = decode
-                                    .decode_once(item); let __dsl_right_program = effect_try_sync! { once; body: { let __dsl_result = Ok(name); move || __dsl_result }, on_error: ::core::convert::identity, }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }, map: |(value, name)| (name, value), }
+                                    .decode_once(item); let __dsl_right_program = crate::effect_from_result! { once; result: Ok(name), }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }, map: |(value, name)| (name, value), }
                             })
                             .collect(), }, map: |fields| fields.into_iter().collect(), }?
                 }
             },
             move |items: std::collections::BTreeMap<String, A>| {
                 if items.len() > limits.collection.get() {
-                    return effect_try_sync! { once; body: { let __dsl_result = Err(encode_issue(SchemaIssue::new(
+                    return crate::effect_from_result! { once; result: Err(encode_issue(SchemaIssue::new(
                         super::SchemaIssueKind::LimitExceeded {
                             resource: super::SchemaResource::Width,
                         },
-                    ))); move || __dsl_result }, on_error: ::core::convert::identity, };
+                    ))), };
                 }
                 let repr = Arc::clone(&repr);
                 let issue = Arc::clone(&encode_issue);
                 let encoded = effect_all! { items: items
                 .into_iter()
                 .map(|(name, item)| {
-                    effect_map! { program: { let __dsl_left_program = self.encode_once(item); let __dsl_right_program = effect_try_sync! { once; body: { let __dsl_result = Ok(name); move || __dsl_result }, on_error: ::core::convert::identity, }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }, map: |(value, name)| (name, value), }
+                    effect_map! { program: { let __dsl_left_program = self.encode_once(item); let __dsl_right_program = crate::effect_from_result! { once; result: Ok(name), }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }, map: |(value, name)| (name, value), }
                 })
                 .collect(), };
                 effect! {
@@ -391,17 +391,17 @@ impl<
             },
             move |items: std::collections::BTreeMap<String, A>| {
                 if items.len() > limits.collection.get() {
-                    return effect_try_sync! { once; body: { let __dsl_result = Err(validation_issue(SchemaIssue::new(
+                    return crate::effect_from_result! { once; result: Err(validation_issue(SchemaIssue::new(
                         super::SchemaIssueKind::LimitExceeded {
                             resource: super::SchemaResource::Width,
                         },
-                    ))); move || __dsl_result }, on_error: ::core::convert::identity, };
+                    ))), };
                 }
                 effect_map! { program: effect_all! { items: items
                 .into_iter()
                 .map(|(name, item)| {
                     effect_map! { program: { let __dsl_left_program = validate
-                        .validate_once(item); let __dsl_right_program = effect_try_sync! { once; body: { let __dsl_result = Ok(name); move || __dsl_result }, on_error: ::core::convert::identity, }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }, map: |(value, name)| (name, value), }
+                        .validate_once(item); let __dsl_right_program = crate::effect_from_result! { once; result: Ok(name), }; effect! { let __dsl_right_program = __dsl_right_program.clone(); let __dsl_left_program = __dsl_left_program.clone(); let __dsl_left = __dsl_left_program?; let __dsl_right = __dsl_right_program?; (__dsl_left, __dsl_right) } }, map: |(value, name)| (name, value), }
                 })
                 .collect(), }, map: |fields| fields.into_iter().collect(), }
             },

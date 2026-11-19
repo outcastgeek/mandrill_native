@@ -169,6 +169,8 @@ impl<A, E> Exit<A, E> {
         }
     }
 
+    /// Extract a success value or retain the complete failure with a new success type.
+    ///
     /// # Type parameters
     /// - `B`: Transformed value type.
     /// - `A`: Success or application-value type.
@@ -176,7 +178,7 @@ impl<A, E> Exit<A, E> {
     ///
     /// # Returns
     /// Type: `Result<A, Exit<B, E>>`.
-    pub(crate) fn into_failure<B>(self) -> Result<A, Exit<B, E>> {
+    pub fn into_failure<B>(self) -> Result<A, Exit<B, E>> {
         match self {
             Self::Success(value) => Ok(value),
             Self::Fail(error) => Err(Exit::Fail(error)),

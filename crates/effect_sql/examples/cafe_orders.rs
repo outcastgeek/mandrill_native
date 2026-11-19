@@ -18,13 +18,12 @@ use effect::{effect_die, effect_map_error, memory, service};
 mod cafe_database;
 
 use effect::{Effect, Exit, SchemaIssue, SchemaIssueKind, effect};
-use effect_sql::effect_from_option;
-use effect_sql::effect_try_sync;
 use effect_sql::{
     CellCodec, ColumnKey, PreparedNativeRowsError, PreparedSqlBatchCapacity, PreparedSqlBatchItem,
     PreparedSqlBatchPool, PreparedSqlBytesKind, PreparedSqlRowsCapacity, PreparedSqlRowsPool,
-    PreparedSqlStatementCapacity, PreparedSqlStatementPool, RowDecoder, SqlClient, SqlError,
-    SqlPredicate, SqlStartupError, SqlTransaction, row, sql, sql_insert, sql_update, sql_with,
+    PreparedSqlStatementCapacity, PreparedSqlStatementPool, SqlClient, SqlError,
+    SqlPredicate, SqlStartupError, SqlTransaction, effect_fail, effect_from_option, effect_from_result,
+    effect_try_sync, sql, sql_insert, sql_update, sql_with,
 };
 use effect_sql::sqlx::PreparedTursoRowsCapacity;
 use std::sync::Arc;
@@ -46,15 +45,23 @@ struct NewOrder {
     price_cents: i64,
 }
 /// Decoded application view, independent of native rows and cursor ownership.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, effect_sql::EffectSqlRow)]
+#[effect_sql_row(SqlClient)]
 struct CoffeeOrder {
     /// Decoded application order identity.
+    #[effect_sql_row(OrderId(native_column::<i64, SqlClient>("id")?))]
     id: OrderId,
     /// Owned drink name decoded from the native row.
+    #[effect_sql_row(native_column::<String, SqlClient>("drink")?)]
     drink: String,
     /// Validated nonnegative price in cents.
+    #[effect_sql_row({
+        let cents = native_column::<i64, SqlClient>("price_cents")?;
+        refine(cents, |value: &i64| if *value >= 0 { Ok(()) } else { Err(SchemaIssue::new(SchemaIssueKind::OutOfRange)) }, "price_cents")?
+    })]
     price_cents: i64,
     /// Preparation state decoded with the strict boolean codec.
+    #[effect_sql_row(column("ready", CellCodec::<bool, i64, SqlClient>::boolean())?)]
     ready: bool,
 }
 /// The application's declared error boundary, including expected absence and invalid input.
@@ -111,50 +118,32 @@ struct DrinkProjection {
     buffers: Arc<SlotPool<'static, Buffer<'static>>>,
 }
 
-/// Decode a native row, retaining structured refinement and strict boolean policy.
-fn order_row() -> RowDecoder<CoffeeOrder, SqlClient> {
-    row! {
-        let id = native_column::<i64, SqlClient>("id")?;
-        let drink = native_column::<String, SqlClient>("drink")?;
-        let price_cents = native_column::<i64, SqlClient>("price_cents")?;
-        let price_cents = refine(price_cents, |value: &i64| if *value >= 0 { Ok(()) } else { Err(SchemaIssue::new(SchemaIssueKind::OutOfRange)) }, "price_cents")?;
-        let ready = column("ready", CellCodec::<bool, i64, SqlClient>::boolean())?;
-        CoffeeOrder { id: OrderId(id), drink, price_cents, ready }
-    }
-}
-
 /// Update the operator-corrected price using the transaction's checked handle.
 /// Each invocation shares the checked transaction owner through a handle clone.
-#[expect(clippy::result_large_err, reason = "retains the complete SQL failure without boxing")]
 fn correct_price(tx: SqlTransaction, id: i64) -> Effect<u64, SqlError, SqlClient> {
     effect! {
         let tx = tx.clone();
-        let predicate = effect_try_sync! { once; body: { let __dsl_result = SqlPredicate::equal("id", id); move || __dsl_result }, on_error: ::core::convert::identity, }?;
+        let predicate = effect_from_result! { once; result: SqlPredicate::equal("id", id), }?;
         let statement = sql_update! { table: "coffee_orders", set("price_cents", 425i64); where(predicate); };
-        tx.execute(statement)?
+        sql! { execute; client: tx, statement: statement, }?
     }
 }
 
 /// Move the non-Clone order once; all statement construction stays inside execution.
-#[expect(clippy::result_large_err, reason = "retains the complete SQL failure without boxing")]
 fn save_order(order: NewOrder) -> Effect<OrderId, CafeError, CafeEnv> {
     sql_with! {
         select: |env: &CafeEnv| Arc::clone(&env.sql),
         on_error: CafeError::Sql,
         run |sql| {
-            let order = effect_try_sync! {
-                once;
-                body {
-                    if order.price_cents >= 0 && !order.drink.is_empty() { Ok(order) }
-                    else { Err(SqlError::Configuration("invalid café order".into())) }
-                },
-            }?;
+            if order.price_cents < 0 || order.drink.is_empty() {
+                return effect_fail! { error: SqlError::Configuration("invalid café order".into()), }?;
+            }
             let id = order.id.0;
             let insert = sql_insert! {
                 table: "coffee_orders", value("id", id); value("customer_id", order.customer.0);
                 value("drink", order.drink); value("price_cents", order.price_cents); value("ready", false);
             };
-            sql.execute(insert)?;
+            sql! { execute; client: sql, statement: insert, }?;
             OrderId(id)
         }
     }
@@ -175,7 +164,7 @@ fn load_order_program(
             text(" WHERE id=");
             integer(id.0);
         };
-        sql.first(statement, order_row())?
+        sql! { first; client: sql, statement: statement, decoder: CoffeeOrder::row_decoder(), }?
     }
 }
 
@@ -194,7 +183,7 @@ fn load_order(
 /// Extract a client callback, selected by D06's `run: order_count` form in the workflow.
 #[expect(clippy::result_large_err, reason = "retains the complete SQL failure without boxing")]
 fn order_count(sql: SqlClient) -> Effect<i64, SqlError, SqlClient> {
-    sql.scalar(|| sql! { text("SELECT COUNT(*) FROM coffee_orders"); })
+    sql! { scalar; client: sql, statement: || sql! { text("SELECT COUNT(*) FROM coffee_orders"); }, }
 }
 
 /// Read the saved drink into prepared buffers using both atomic SQL forms.
@@ -239,13 +228,9 @@ fn verify_drink(sql: SqlClient, storage: Arc<DrinkProjection>) -> Effect<(), Sql
         let blob_matches = blob.as_slice().iter().any(|item| {
             item.value.as_ref().right().is_some_and(|drink| drink.as_slice() == b"flat white")
         });
-        effect_try_sync! {
-            once;
-            body {
-                if text_matches && blob_matches { Ok(()) }
-                else { Err(SqlError::Configuration("saved drink projection does not match".into())) }
-            },
-        }?
+        if !(text_matches && blob_matches) {
+            effect_fail! { error: SqlError::Configuration("saved drink projection does not match".into()), }?
+        }
     }
 }
 
@@ -317,7 +302,7 @@ async fn main() -> Result<(), CafeError> {
         effect_map_error! {
             program: sql_with! {
             handle: selected_sql,
-            run |sql| { sql.transaction_once(move |tx| correct_price(tx, 1))? },
+            run |sql| { sql! { transaction_once; client: sql, body: move |tx| correct_price(tx, 1), }? },
         }, map: CafeError::Sql, }?;
         let order = load_order(id, statements.clone())?;
         let order = effect_from_option! {
@@ -330,14 +315,13 @@ async fn main() -> Result<(), CafeError> {
             run: move |sql| verify_drink(sql, drink_projection.clone()),
         }?;
         use std::io::Write;
-        let (order, written) = {
-            let written = writeln!(std::io::stdout().lock(), "Order {}: {}, {} cents, ready={}; {count} saved order.", order.id.0, order.drink, order.price_cents, order.ready);
-            (order, written)
-        };
+        let written = writeln!(std::io::stdout().lock(), "Order {}: {}, {} cents, ready={}; {count} saved order.", order.id.0, order.drink, order.price_cents, order.ready);
         match written { Ok(()) => (), Err(error) => effect_die! { defect: effect::Defect::from_io(error), }?, };
-        effect_try_sync! { once; body: { let __dsl_result = if order.id.0 == 1 && !order.ready && order.drink == "flat white" && order.price_cents == 425 && count == 1 { Ok(()) } else { Err(CafeError::InvalidOrder) }; move || __dsl_result }, on_error: ::core::convert::identity, }?
+        if !(order.id.0 == 1 && !order.ready && order.drink == "flat white" && order.price_cents == 425 && count == 1) {
+            return effect_fail! { error: CafeError::InvalidOrder, }?;
+        }
     };
-    let outcome = workflow.run(env.clone()).await;
+    let outcome = effect! { run; program: &workflow, environment: env.clone(), }.await;
     let close = database.close().await;
     match outcome {
         Exit::Success(()) => {}

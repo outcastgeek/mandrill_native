@@ -6,8 +6,8 @@ use effect_sql::sqlx::{
     migrate::{Migration, MigrationType},
 };
 use effect_sql::{
-    MigrationCatalog, MigrationStep, Rollback, SQLX_JOURNAL, SqlClient, SqlError, SqlMigrator,
-    SqlStartupError,
+    MigrationCatalog, MigrationStep, Rollback, SQLX_JOURNAL, SqlClient, SqlError, SqlStartupError,
+    sql,
 };
 use std::{
     borrow::Cow,
@@ -41,19 +41,21 @@ impl CafeDatabase {
             .as_nanos();
         let directory =
             std::env::temp_dir().join(format!("effect-sql-cafe-{}-{stamp}", std::process::id()));
-        let client = SqlClient::open(native_memory, || async {
-            std::fs::create_dir(&directory)
-                .map_err(|error| SqlError::Configuration(error.to_string()))?;
-            let options = TursoConnectOptions::new()
-                .filename(directory.join("cafe.db"))
-                .create_if_missing(true)
-                .statement_cache_capacity(0)
-                .busy_timeout(DEMO_WRITE_WAIT);
-            Ok(TursoPoolOptions::new()
-                .max_connections(DEMO_POOL_CONNECTIONS)
-                .connect_with(options)
-                .await?)
-        })
+        let client = sql! {
+            open; memory: native_memory, pool: || async {
+                std::fs::create_dir(&directory)
+                    .map_err(|error| SqlError::Configuration(error.to_string()))?;
+                let options = TursoConnectOptions::new()
+                    .filename(directory.join("cafe.db"))
+                    .create_if_missing(true)
+                    .statement_cache_capacity(0)
+                    .busy_timeout(DEMO_WRITE_WAIT);
+                Ok(TursoPoolOptions::new()
+                    .max_connections(DEMO_POOL_CONNECTIONS)
+                    .connect_with(options)
+                    .await?)
+            },
+        }
         .await?;
         let pool = client.kernel().pool().clone();
         let database = Self {
@@ -77,10 +79,12 @@ impl CafeDatabase {
                 Rollback::Reversible(rollback),
             )],
         )?;
-        if let Err(error) = SqlMigrator::new(database.client.kernel().clone(), catalog)?
-            .up()
-            .await
-        {
+        let migrated = {
+            let migrator =
+                sql! { migrator; kernel: database.client.kernel().clone(), catalog: catalog, }?;
+            sql! { migrate_up; migrator: migrator, }.await
+        };
+        if let Err(error) = migrated {
             database.pool.close().await;
             return Err(error.into());
         }

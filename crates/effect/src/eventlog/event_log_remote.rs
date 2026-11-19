@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{Effect, KeyDomain, StableKey};
 use crate::{
-    effect, effect_map, effect_map_error, effect_provide_some, effect_sync, effect_try_sync,
+    effect, effect_map, effect_map_error, effect_provide_some, effect_sync,
     service,
 };
 use std::num::NonZeroUsize;
@@ -542,11 +542,9 @@ impl EventReplicator {
                     }
                     JournalReadOutcome::Complete(read) => {
                         if let Err(issue) = validate_journal_read(&read, &stream, after, limit) {
-                            return effect_try_sync! {
-                                once; body: {
-                                let __dsl_result = Err(
+                            return crate::effect_from_result! { once; result: Err(
                                 ReplicaExportError::InvalidJournalRead(issue),
-                            ); move || __dsl_result }, on_error: ::core::convert::identity, };
+                            ), };
                         }
                         let batch = ReplicaBatch::new(
                             source.clone(),
@@ -556,12 +554,10 @@ impl EventReplicator {
                             limit,
                         )
                         .map_err(ReplicaExportError::InvalidJournalBatch);
-                        effect_try_sync! {
-                            once; body: {
-                            let __dsl_result = batch.map(|batch| ReplicaExport::Batch {
+                        crate::effect_from_result! { once; result: batch.map(|batch| ReplicaExport::Batch {
                             batch,
                             has_more: read.has_more,
-                        }); move || __dsl_result }, on_error: ::core::convert::identity, }
+                        }), }
                     }
                 },
             }
@@ -583,11 +579,9 @@ impl EventReplicator {
         R: HasEventJournal + HasReplicaCursorStore + Send + Sync + 'static,
     {
         if !permit.accepts(&batch) {
-            return effect_try_sync! {
-                once; body: {
-                let __dsl_result = Err(ReplicaSyncError::Import(
+            return crate::effect_from_result! { once; result: Err(ReplicaSyncError::Import(
                 ReplicaImportError::Unauthorized,
-            )); move || __dsl_result }, on_error: ::core::convert::identity, };
+            )), };
         }
         let key = ReplicaCursorKey {
             source: batch.source.clone(),
@@ -650,7 +644,7 @@ impl EventReplicator {
         R: HasEventJournal + Send + Sync + 'static,
     {
         if !permit.accepts(&batch) {
-            return effect_try_sync! { once; body: { let __dsl_result = Err(ReplicaImportError::Unauthorized); move || __dsl_result }, on_error: ::core::convert::identity, };
+            return crate::effect_from_result! { once; result: Err(ReplicaImportError::Unauthorized), };
         }
         if batch.entries.len() > batch.maximum_entries.get()
             || batch

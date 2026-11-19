@@ -55,8 +55,8 @@ where
                         }
                     },
                     on_error: move |error| map(error),
-                }
-                .either()?;
+                };
+                let read = effect! { either; program: read, }?;
                 read.ok()
             }
             _ => None,

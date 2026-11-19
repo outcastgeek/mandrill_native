@@ -12,8 +12,8 @@
 //! request environment/error channel; absence and authorization remain separate domain failures.
 
 use effect::{
-    codec, effect_die, effect_map_error, effect_provide_some, effect_resource, effect_sync,
-    effect_try_sync, service,
+    codec, effect, effect_die, effect_from_result, effect_map_error, effect_provide_some, effect_resource,
+    effect_sync, effect_try_sync, service,
 };
 #[path = "../../effect_otel/examples/cafe_telemetry/mod.rs"]
 pub mod cafe_telemetry;
@@ -22,13 +22,13 @@ use effect::effect_try_future;
 use effect::schema;
 use effect::{Effect, JsonWriterPolicy, ParsePolicy};
 use effect_otel::BorrowedProviders;
-use effect_otel::{Otel, otel};
+use effect_otel::otel;
+use effect_otel::server::{RequestHooks, RequestSpan};
 use effect_server::effect_from_option;
 use effect_server::{
     BodyPolicy, Endpoint, HostPolicy, HtmlContent, HttpProtocols, HttpStatus, JsonWriterCodec,
-    Reply, Request, RequestBinding, ResourceValidators, Route, Scalar, Server, ServerError,
-    ServerPolicy, endpoint, pipeline, registered, reply, representations, route, router, routes,
-    server,
+    Reply, Request, ResourceValidators, Route, Scalar, Server, ServerError, endpoint, pipeline,
+    registered, reply, representations, route, router, routes, server,
 };
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -44,12 +44,12 @@ fn get_order(id: OrderId) -> Endpoint<CafeError, Cafe> {
             let loaded=effect_provide_some! { program: effect_map_error! { program: load_order(id), map: |never|match never {}, }, project: |_:&Cafe|(), }?;
             let order=require_order(loaded)?;
             authorize_order(customer,&order)?;
-            Otel::tag("order.id",order.id.0.to_string())?;
-            Otel::event("order.loaded")?;
+            otel! { tag; key: "order.id", value: order.id.0.to_string(), }?;
+            otel! { event; name: "order.loaded", }?;
             order
         }}?;
         let policy=service! { env: |env:&Cafe|env.json, }?;
-        let choices=effect_try_sync! { once; body: { let __dsl_result = order_representations(policy).map_err(CafeError::Http); move || __dsl_result }, on_error: ::core::convert::identity, }?;
+        let choices = effect_from_result! { once; result: order_representations(policy), on_error: CafeError::Http, }?;
         let etag = match "\"order-42\"".parse() {
             Ok(etag) => etag,
             Err(error) => effect_die! { defect: effect::Defect::new(format!("order ETag: {error:?}")), }?,
@@ -154,13 +154,10 @@ fn authorize_order(
     customer: Option<CustomerId>,
     order: &CoffeeOrder,
 ) -> Effect<(), CafeError, Cafe> {
-    effect_try_sync! {
-        once; body: {
-        let __dsl_result = if customer == Some(order.owner) {
-        Ok(())
-    } else {
-        Err(CafeError::Unauthorized)
-    }; move || __dsl_result }, on_error: ::core::convert::identity, }
+    effect_from_result! {
+        once;
+        result: if customer == Some(order.owner) { Ok(()) } else { Err(CafeError::Unauthorized) },
+    }
 }
 /// Expected errors select a fresh finite reply; renderer failure is never recursively handled.
 fn error_reply(error: CafeError) -> Effect<Reply<CafeError, Cafe>, CafeError, Cafe> {
@@ -189,13 +186,13 @@ fn health_endpoint() -> Endpoint<CafeError, Cafe> {
 }
 /// Record safe method metadata in the selected request span before endpoint work.
 fn begin_request(request: Request) -> Effect<(), CafeError, Cafe> {
-    Otel::event_with(
-        "cafe.request.started",
-        vec![effect_otel::KeyValue::new(
+    otel! {
+        event; name: "cafe.request.started",
+        attributes: vec![effect_otel::KeyValue::new(
             "http.request.method",
             request.method().to_string(),
         )],
-    )
+    }
 }
 /// Borrow the original outcome only while selecting owned telemetry; release remains awaited.
 fn record_request_outcome(
@@ -209,10 +206,11 @@ fn record_request_outcome(
         effect::PrimaryOutcomeRef::WasInterrupted => "interrupted",
     };
     effect_resource! {
-        release_effect; program: Otel::event_with(
-        "cafe.request.finished",
-        vec![effect_otel::KeyValue::new("cafe.outcome", status)],
-    ), }
+        release_effect; program: otel! {
+            event; name: "cafe.request.finished",
+            attributes: vec![effect_otel::KeyValue::new("cafe.outcome", status)],
+        },
+    }
 }
 /// Inert DSL-led assembly demonstrates typed routes, extracted modules and anonymous metadata.
 pub(crate) fn describe(
@@ -224,7 +222,7 @@ pub(crate) fn describe(
     let policy = pipeline! { set_header(http::HeaderName::from_static("x-cafe"),http::HeaderValue::from_static("neighborhood")); before |request| {begin_request(request)?;} on_exit(record_request_outcome); };
     let orders = router! {pipe_through:policy, on_error(error_reply); get(order_route()?,get_order); get("/health",health);};
     let cafe_routes = routes! {include(orders);};
-    let binding = RequestBinding::new(|request: Request| {
+    let binding = server! { request_binding; body: |request: Request| {
         service! {
             env: move |root: &Cafe| {
             Arc::new(Cafe {
@@ -239,21 +237,21 @@ pub(crate) fn describe(
                 request: request.clone(),
             })
         }, }
-    });
-    let server = server! {policy:ServerPolicy::new(body,host,CafeError::Http,error_reply),environment:binding,listen:std::net::SocketAddr::from(([127,0,0,1],0)),protocols:protocols,routes:cafe_routes}?;
+    }, };
+    let policy = server! { policy; body_policy: body, host_policy: host, native_error: CafeError::Http, on_error: error_reply, };
+    let server = server! { policy: policy, environment: binding, listen: std::net::SocketAddr::from(([127,0,0,1],0)), protocols: protocols, routes: cafe_routes, }?;
     let propagation = effect_otel::Propagation::new(
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
-    Ok(effect_otel::server::install(
-        server,
-        propagation,
-        |_| effect_otel::server::RequestSpan {
+    let observability = RequestHooks::new(
+        |_| RequestSpan {
             name: Arc::from("cafe.http"),
             attributes: Vec::new(),
         },
         |_| effect_sync! { body: || (), },
         CafeError::Otel,
-    ))
+    );
+    Ok(otel! { install_request_hooks; hooks: observability, server: server, propagation: propagation, })
 }
 /// Native client support for this finite example; the caller selects method, fields and body.
 pub(crate) async fn exchange(
@@ -317,12 +315,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         HostPolicy { drain },
     )?;
-    let execution=host.with_host(move |host| {let link=link.clone();effect_try_future! {
-        once; body: move |_|async move {
-        for media in ["text/html","application/json"] {let response=exchange(host.address,&format!("GET {link} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer cafe-demo-customer-7\r\nAccept: {media}\r\nConnection: close\r\n\r\n")).await?;use std::io::Write;writeln!(std::io::stdout().lock(), "{response}").map_err(ServerError::Io)?;}
-        Ok::<_,ServerError>(())
-    }, on_error: CafeError::Http, }});
-    let exit = runtime.block_on(execution.run(root.clone()));
+    let execution = server! {
+        with_host; source: host, body: move |host| {
+            let link = link.clone();
+            effect_try_future! {
+                once; body: move |_| async move {
+                    for media in ["text/html", "application/json"] {
+                        let request = format!("GET {link} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer cafe-demo-customer-7\r\nAccept: {media}\r\nConnection: close\r\n\r\n");
+                        let response = exchange(host.address, &request).await?;
+                        use std::io::Write;
+                        writeln!(std::io::stdout().lock(), "{response}").map_err(ServerError::Io)?;
+                    }
+                    Ok::<_, ServerError>(())
+                }, on_error: CafeError::Http,
+            }
+        },
+    };
+    let exit = runtime.block_on(effect! { run; program: &execution, environment: root.clone(), });
     runtime.block_on(drain_providers(&root));
     traces.force_flush()?;
     use std::io::Write;

@@ -70,6 +70,11 @@ impl Entry {
     }
 }
 /// A fixed-entry source that retains each complete prepared document owner.
+#[derive(crate::EffectEnvironment)]
+#[effect_environment(
+    prepared_config_source(provider = Self, get = self),
+    prepared_config_store(provider = Self, get = self),
+)]
 pub struct PreparedMemoryConfigSource {
     state: Option<SharedSlot<'static, Mutex<State>>>,
 }
@@ -259,12 +264,6 @@ impl PreparedConfigStore for PreparedMemoryConfigSource {
             })
             .transpose()
             .map(Option::flatten)
-    }
-}
-impl HasPreparedConfigStore for PreparedMemoryConfigSource {
-    type Store = Self;
-    fn prepared_config_store(&self) -> &Self {
-        self
     }
 }
 impl Drop for PreparedMemoryConfigSource {

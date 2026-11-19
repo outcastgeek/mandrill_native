@@ -5,7 +5,7 @@ use crate::{
     Cache, CacheAdmission, CacheCapacity, CacheConfig, CacheLookup, CacheOptions, CacheTtl, Effect,
     HasClock, HasTaskSpawner, PreparedCacheIndex, Scope, SharedValue,
 };
-use crate::{cache, effect, effect_die, effect_map, effect_map_error, effect_try_sync};
+use crate::{cache, effect, effect_die, effect_map, effect_map_error};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 mod prepared;
@@ -267,10 +267,10 @@ impl<K: Send + Sync + 'static, D: Send + Sync + 'static, A: Send + 'static, E: S
                     map: DependencyCacheError::Load,
                 }?;
                     if dependencies.len() > maximum_dependencies.get() {
-                        effect_try_sync! { once; body: { let __dsl_result = Err(DependencyCacheError::DependencyCapacity {
+                        crate::effect_from_result! { once; result: Err(DependencyCacheError::DependencyCapacity {
                             maximum: maximum_dependencies.get(),
                             observed: dependencies.len(),
-                        }); move || __dsl_result }, on_error: ::core::convert::identity, }?
+                        }), }?
                     } else {
                         DependencyValue {
                             value: SharedValue::new(value),
@@ -364,12 +364,12 @@ impl<K: Send + Sync + 'static, D: Send + Sync + 'static, A: Send + 'static, E: S
         dependencies: Vec<D>,
     ) -> Effect<(), SharedValue<DependencyCacheError<E>>, R> {
         if dependencies.len() > self.maximum_dependencies.get() {
-            return effect_try_sync! { once; body: { let __dsl_result = Err(SharedValue::new(
+            return crate::effect_from_result! { once; result: Err(SharedValue::new(
                 DependencyCacheError::DependencyCapacity {
                     maximum: self.maximum_dependencies.get(),
                     observed: dependencies.len(),
                 },
-            )); move || __dsl_result }, on_error: ::core::convert::identity, };
+            )), };
         }
         self.cache.set(
             key,
